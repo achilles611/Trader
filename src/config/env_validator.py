@@ -16,6 +16,7 @@ class EnvCheck:
     present: bool
     message: str
     aliases: tuple[str, ...] = ()
+    source: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -50,7 +51,43 @@ def _value_for(key: str, env_values: dict[str, str | None], aliases: tuple[str, 
     return None
 
 
-def _check_key(key: str, env_values: dict[str, str | None], *, required_for: str, aliases: tuple[str, ...] = ()) -> EnvCheck:
+def _has_runtime_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip() != ""
+    return True
+
+
+def _check_runtime_key(
+    key: str,
+    env_values: dict[str, str | None],
+    *,
+    runtime_value: Any,
+    required_for: str,
+    aliases: tuple[str, ...] = (),
+) -> EnvCheck:
+    value = _value_for(key, env_values, aliases)
+    source = "env" if value not in (None, "") else "runtime" if _has_runtime_value(runtime_value) else ""
+    present = source != ""
+    alias_text = f" aliases={list(aliases)}" if aliases else ""
+    if source == "env":
+        message = f"{key} present"
+    elif source == "runtime":
+        message = f"{key} resolved from runtime settings"
+    else:
+        message = f"{key} missing{alias_text}"
+    return EnvCheck(
+        key=key,
+        aliases=aliases,
+        required_for=required_for,
+        present=present,
+        message=message,
+        source=source,
+    )
+
+
+def _check_env_only_key(key: str, env_values: dict[str, str | None], *, required_for: str, aliases: tuple[str, ...] = ()) -> EnvCheck:
     value = _value_for(key, env_values, aliases)
     present = value not in (None, "")
     alias_text = f" aliases={list(aliases)}" if aliases else ""
@@ -60,6 +97,7 @@ def _check_key(key: str, env_values: dict[str, str | None], *, required_for: str
         required_for=required_for,
         present=present,
         message=f"{key} present" if present else f"{key} missing{alias_text}",
+        source="env" if present else "",
     )
 
 
@@ -79,26 +117,26 @@ def validate_environment(settings, *, root_dir: Path) -> EnvValidationReport:
     env_values = dotenv_values(env_path) if env_path.exists() else {}
     mode = "dry_run" if settings.dry_run else "live" if settings.live_trading_enabled else "paper"
     checks: list[EnvCheck] = [
-        _check_key("DRY_RUN", env_values, required_for="dry-run", aliases=("SWARM_DRY_RUN",)),
-        _check_key("LIVE_TRADING_ENABLED", env_values, required_for="all"),
-        _check_key("PATCHING_ENABLED", env_values, required_for="all"),
-        _check_key("SCHEDULER_TIMEZONE", env_values, required_for="all"),
-        _check_key("TRADER_ARTIFACT_ROOT", env_values, required_for="all", aliases=("ARTIFACT_ROOT",)),
-        _check_key("TRADER_DB_PATH", env_values, required_for="all", aliases=("SQLITE_DB_PATH",)),
-        _check_key("RUN_LOCK_PATH", env_values, required_for="all"),
-        _check_key("OPENAI_MODEL_ANALYSIS", env_values, required_for="analysis"),
+        _check_runtime_key("DRY_RUN", env_values, runtime_value=settings.dry_run, required_for="dry-run", aliases=("SWARM_DRY_RUN",)),
+        _check_runtime_key("LIVE_TRADING_ENABLED", env_values, runtime_value=settings.live_trading_enabled, required_for="all"),
+        _check_runtime_key("PATCHING_ENABLED", env_values, runtime_value=settings.patching.enabled, required_for="all"),
+        _check_runtime_key("SCHEDULER_TIMEZONE", env_values, runtime_value=settings.scheduler.timezone, required_for="all"),
+        _check_runtime_key("TRADER_ARTIFACT_ROOT", env_values, runtime_value=str(settings.artifact_root), required_for="all", aliases=("ARTIFACT_ROOT",)),
+        _check_runtime_key("TRADER_DB_PATH", env_values, runtime_value=str(settings.db_path), required_for="all", aliases=("SQLITE_DB_PATH",)),
+        _check_runtime_key("RUN_LOCK_PATH", env_values, runtime_value=str(settings.lock_path), required_for="all"),
+        _check_runtime_key("OPENAI_MODEL_ANALYSIS", env_values, runtime_value=settings.analysis.model, required_for="analysis"),
     ]
     warnings: list[str] = []
 
     if settings.analysis.enabled:
-        checks.append(_check_key("OPENAI_API_KEY", env_values, required_for=mode))
+        checks.append(_check_env_only_key("OPENAI_API_KEY", env_values, required_for=mode))
     if settings.patching.enabled:
-        checks.append(_check_key("OPENAI_MODEL_PATCH", env_values, required_for="patching"))
-        checks.append(_check_key("CODEX_PATCH_COMMAND", env_values, required_for="patching"))
+        checks.append(_check_runtime_key("OPENAI_MODEL_PATCH", env_values, runtime_value=settings.analysis.patch_model, required_for="patching"))
+        checks.append(_check_runtime_key("CODEX_PATCH_COMMAND", env_values, runtime_value=settings.patching.codex_patch_command, required_for="patching"))
     if not settings.dry_run and settings.live_trading_enabled:
-        checks.append(_check_key("COINBASE_API_KEY", env_values, required_for="live"))
-        checks.append(_check_key("COINBASE_API_SECRET", env_values, required_for="live"))
-        checks.append(_check_key("BOT_MODE", env_values, required_for="live"))
+        checks.append(_check_env_only_key("COINBASE_API_KEY", env_values, required_for="live"))
+        checks.append(_check_env_only_key("COINBASE_API_SECRET", env_values, required_for="live"))
+        checks.append(_check_env_only_key("BOT_MODE", env_values, required_for="live"))
     else:
         bot_mode = _value_for("BOT_MODE", env_values, ())
         if bot_mode and bot_mode.lower() == "live":
