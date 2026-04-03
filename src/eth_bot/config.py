@@ -351,6 +351,7 @@ class StrategyProfile:
     allow_near_recent_high_long: bool = False
     allow_near_recent_low_short: bool = False
     allow_countertrend: bool = False
+    prefer_countertrend: bool = False
     max_hold_seconds: int = 3600
     cooldown_after_loss_seconds: int = 180
     cooldown_after_win_seconds: int = 45
@@ -439,4 +440,3 @@ def apply_instance_overrides(
         trade_log_path=paths.trade_log_path,
         signal_log_path=paths.signal_log_path,
     )
-

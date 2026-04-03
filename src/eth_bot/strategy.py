@@ -302,23 +302,47 @@ class MomentumStrategy:
                     network_scores=network_scores,
                 )
 
-            long_structural_ready = (
-                long_confirmation_count >= profile.min_confirmation_signals
-                and (
-                    (trend_up and (pullback_detected_long or bullish_cross or profile.aggressive_entries))
-                    or (profile.allow_countertrend and near_recent_low and long_rsi_ok)
-                )
-                and (momentum_resume_up or bullish_cross or profile.allow_countertrend)
+            countertrend_long_ready = (
+                profile.allow_countertrend
+                and near_recent_low
+                and long_rsi_ok
+                and (momentum_resume_up or bullish_cross or profile.aggressive_entries)
             )
-            short_structural_ready = (
-                self.config.enable_shorts
-                and short_confirmation_count >= profile.min_confirmation_signals
-                and (
-                    (trend_down and (pullback_detected_short or bearish_cross or profile.aggressive_entries))
-                    or (profile.allow_countertrend and near_recent_high and short_rsi_ok)
-                )
-                and (momentum_resume_down or bearish_cross or profile.allow_countertrend)
+            countertrend_short_ready = (
+                profile.allow_countertrend
+                and near_recent_high
+                and short_rsi_ok
+                and (momentum_resume_down or bearish_cross or profile.aggressive_entries)
             )
+
+            if profile.prefer_countertrend:
+                long_structural_ready = (
+                    long_confirmation_count >= profile.min_confirmation_signals
+                    and countertrend_long_ready
+                )
+                short_structural_ready = (
+                    self.config.enable_shorts
+                    and short_confirmation_count >= profile.min_confirmation_signals
+                    and countertrend_short_ready
+                )
+            else:
+                long_structural_ready = (
+                    long_confirmation_count >= profile.min_confirmation_signals
+                    and (
+                        (trend_up and (pullback_detected_long or bullish_cross or profile.aggressive_entries))
+                        or countertrend_long_ready
+                    )
+                    and (momentum_resume_up or bullish_cross or profile.allow_countertrend)
+                )
+                short_structural_ready = (
+                    self.config.enable_shorts
+                    and short_confirmation_count >= profile.min_confirmation_signals
+                    and (
+                        (trend_down and (pullback_detected_short or bearish_cross or profile.aggressive_entries))
+                        or countertrend_short_ready
+                    )
+                    and (momentum_resume_down or bearish_cross or profile.allow_countertrend)
+                )
 
             if long_structural_ready and cross_required and not bullish_cross:
                 return StrategyDecision(
