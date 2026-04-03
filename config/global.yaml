@@ -1,6 +1,7 @@
 scheduler:
   interval_minutes: 30
   session_minutes: 30
+  dry_run_session_minutes: 1.0
   timezone: UTC
 
 storage:

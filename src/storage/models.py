@@ -14,6 +14,8 @@ class ArtifactLayout:
     cycle_report_path: Path
     analysis_json_path: Path
     analysis_summary_path: Path
+    analysis_request_path: Path
+    analysis_raw_response_path: Path
     patch_request_path: Path
     patch_diff_path: Path
     validation_report_path: Path
@@ -96,6 +98,8 @@ class NormalizedBotRun:
 class NormalizedCycleBundle:
     cycle_id: str
     status: str
+    dry_run: bool
+    run_mode: str
     git_sha: str
     repo_branch: str
     market: str
@@ -128,6 +132,8 @@ class RunCycleRecord:
     actual_trigger_at: str
     git_sha: str
     status: str
+    dry_run: bool
+    run_mode: str
     summary_artifact_path: str
     analysis_artifact_path: str = ""
     finished_at: str | None = None
@@ -136,6 +142,8 @@ class RunCycleRecord:
     total_trades: int = 0
     drift_seconds: float = 0.0
     duration_seconds: float = 0.0
+    failure_code: str | None = None
+    failure_details: dict[str, Any] = field(default_factory=dict)
     error_message: str | None = None
 
 
@@ -173,6 +181,11 @@ class AIAnalysisRecord:
     json_result: dict[str, Any]
     recommendation_grade: str
     patch_request_artifact_path: str
+    request_size_bytes: int = 0
+    response_size_bytes: int = 0
+    latency_ms: float = 0.0
+    schema_validation_result: str = "valid"
+    analysis_status: str = "ok"
     response_id: str = ""
     request_id: str = ""
 

@@ -10,7 +10,13 @@ class RepoSyncError(RuntimeError):
 
 
 class DirtyWorktreeError(RepoSyncError):
-    pass
+    def __init__(self, dirty_files: list[str]) -> None:
+        self.dirty_files = dirty_files
+        super().__init__(
+            "Working tree is dirty; aborting live orchestration cycle. "
+            f"Dirty files: {', '.join(dirty_files)}. "
+            "Remediation: commit the changes, stash them intentionally, or reset them explicitly."
+        )
 
 
 @dataclass(frozen=True)
@@ -42,10 +48,17 @@ def get_repo_state(root_dir: Path) -> RepoState:
     return RepoState(branch=branch, git_sha=git_sha, is_dirty=bool(dirty_files), dirty_files=dirty_files)
 
 
+def resolve_ref_sha(root_dir: Path, ref: str) -> str | None:
+    try:
+        return _git(root_dir, "rev-parse", "--verify", ref)
+    except RepoSyncError:
+        return None
+
+
 def ensure_clean_worktree(root_dir: Path) -> RepoState:
     state = get_repo_state(root_dir)
     if state.is_dirty:
-        raise DirtyWorktreeError("Working tree is dirty; aborting live orchestration cycle.")
+        raise DirtyWorktreeError(state.dirty_files)
     return state
 
 

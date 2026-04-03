@@ -28,6 +28,10 @@ class AnalysisResponse:
     prompt_cache_key: str
     request_tokens_est: int
     response_tokens_est: int
+    request_size_bytes: int
+    response_size_bytes: int
+    latency_ms: float
+    schema_validation_result: str
 
 
 class OpenAIAnalysisClient:
@@ -96,12 +100,15 @@ class OpenAIAnalysisClient:
 
         for attempt in range(1, attempts + 1):
             try:
+                request_size_bytes = len(json.dumps(current_payload, sort_keys=True).encode("utf-8"))
+                started = time.perf_counter()
                 response = self.session.post(
                     "https://api.openai.com/v1/responses",
                     headers=headers,
                     json=current_payload,
                     timeout=self.settings.timeout_seconds,
                 )
+                latency_ms = (time.perf_counter() - started) * 1000
                 if response.status_code in RETRYABLE_STATUS_CODES and attempt < attempts:
                     time.sleep(self.settings.backoff_seconds * attempt)
                     continue
@@ -126,6 +133,10 @@ class OpenAIAnalysisClient:
                     prompt_cache_key=current_payload.get("prompt_cache_key", ""),
                     request_tokens_est=int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0),
                     response_tokens_est=int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0),
+                    request_size_bytes=request_size_bytes,
+                    response_size_bytes=len(response.content or b""),
+                    latency_ms=latency_ms,
+                    schema_validation_result="valid",
                 )
             except (requests.RequestException, json.JSONDecodeError) as exc:
                 if attempt < attempts:

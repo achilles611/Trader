@@ -37,6 +37,8 @@ class SwarmDatabase:
                     finished_at TEXT,
                     git_sha TEXT,
                     status TEXT NOT NULL,
+                    dry_run INTEGER NOT NULL DEFAULT 0,
+                    run_mode TEXT NOT NULL DEFAULT 'paper',
                     total_pnl REAL DEFAULT 0,
                     total_drawdown REAL DEFAULT 0,
                     total_trades INTEGER DEFAULT 0,
@@ -44,6 +46,8 @@ class SwarmDatabase:
                     analysis_artifact_path TEXT NOT NULL DEFAULT '',
                     drift_seconds REAL DEFAULT 0,
                     duration_seconds REAL DEFAULT 0,
+                    failure_code TEXT,
+                    failure_details TEXT NOT NULL DEFAULT '{}',
                     error_message TEXT
                 );
 
@@ -83,6 +87,11 @@ class SwarmDatabase:
                     json_result TEXT NOT NULL,
                     recommendation_grade TEXT NOT NULL,
                     patch_request_artifact_path TEXT NOT NULL,
+                    request_size_bytes INTEGER NOT NULL DEFAULT 0,
+                    response_size_bytes INTEGER NOT NULL DEFAULT 0,
+                    latency_ms REAL NOT NULL DEFAULT 0,
+                    schema_validation_result TEXT NOT NULL DEFAULT 'valid',
+                    analysis_status TEXT NOT NULL DEFAULT 'ok',
                     response_id TEXT NOT NULL DEFAULT '',
                     request_id TEXT NOT NULL DEFAULT ''
                 );
@@ -103,6 +112,22 @@ class SwarmDatabase:
                 CREATE INDEX IF NOT EXISTS idx_patch_attempts_cycle_id ON patch_attempts(cycle_id);
                 """
             )
+            self._ensure_column(connection, "run_cycles", "dry_run", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "run_cycles", "run_mode", "TEXT NOT NULL DEFAULT 'paper'")
+            self._ensure_column(connection, "run_cycles", "failure_code", "TEXT")
+            self._ensure_column(connection, "run_cycles", "failure_details", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column(connection, "ai_analyses", "request_size_bytes", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "ai_analyses", "response_size_bytes", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "ai_analyses", "latency_ms", "REAL NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "ai_analyses", "schema_validation_result", "TEXT NOT NULL DEFAULT 'valid'")
+            self._ensure_column(connection, "ai_analyses", "analysis_status", "TEXT NOT NULL DEFAULT 'ok'")
+
+    def _ensure_column(self, connection: sqlite3.Connection, table_name: str, column_name: str, definition: str) -> None:
+        rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+        existing = {str(row["name"]) for row in rows}
+        if column_name in existing:
+            return
+        connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
 
     def ping(self) -> bool:
         with self._connect() as connection:
@@ -121,6 +146,8 @@ class SwarmDatabase:
                     finished_at,
                     git_sha,
                     status,
+                    dry_run,
+                    run_mode,
                     total_pnl,
                     total_drawdown,
                     total_trades,
@@ -128,8 +155,10 @@ class SwarmDatabase:
                     analysis_artifact_path,
                     drift_seconds,
                     duration_seconds,
+                    failure_code,
+                    failure_details,
                     error_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.cycle_id,
@@ -139,6 +168,8 @@ class SwarmDatabase:
                     record.finished_at,
                     record.git_sha,
                     record.status,
+                    int(record.dry_run),
+                    record.run_mode,
                     record.total_pnl,
                     record.total_drawdown,
                     record.total_trades,
@@ -146,6 +177,8 @@ class SwarmDatabase:
                     record.analysis_artifact_path,
                     record.drift_seconds,
                     record.duration_seconds,
+                    record.failure_code,
+                    _dump_json(record.failure_details),
                     record.error_message,
                 ),
             )
@@ -160,6 +193,8 @@ class SwarmDatabase:
                     finished_at = ?,
                     git_sha = ?,
                     status = ?,
+                    dry_run = ?,
+                    run_mode = ?,
                     total_pnl = ?,
                     total_drawdown = ?,
                     total_trades = ?,
@@ -167,6 +202,8 @@ class SwarmDatabase:
                     analysis_artifact_path = ?,
                     drift_seconds = ?,
                     duration_seconds = ?,
+                    failure_code = ?,
+                    failure_details = ?,
                     error_message = ?
                 WHERE id = ?
                 """,
@@ -174,6 +211,8 @@ class SwarmDatabase:
                     record.finished_at,
                     record.git_sha,
                     record.status,
+                    int(record.dry_run),
+                    record.run_mode,
                     record.total_pnl,
                     record.total_drawdown,
                     record.total_trades,
@@ -181,6 +220,8 @@ class SwarmDatabase:
                     record.analysis_artifact_path,
                     record.drift_seconds,
                     record.duration_seconds,
+                    record.failure_code,
+                    _dump_json(record.failure_details),
                     record.error_message,
                     cycle_db_id,
                 ),
@@ -257,9 +298,14 @@ class SwarmDatabase:
                     json_result,
                     recommendation_grade,
                     patch_request_artifact_path,
+                    request_size_bytes,
+                    response_size_bytes,
+                    latency_ms,
+                    schema_validation_result,
+                    analysis_status,
                     response_id,
                     request_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     cycle_db_id,
@@ -270,6 +316,11 @@ class SwarmDatabase:
                     _dump_json(record.json_result),
                     record.recommendation_grade,
                     record.patch_request_artifact_path,
+                    record.request_size_bytes,
+                    record.response_size_bytes,
+                    record.latency_ms,
+                    record.schema_validation_result,
+                    record.analysis_status,
                     record.response_id,
                     record.request_id,
                 ),
@@ -304,7 +355,7 @@ class SwarmDatabase:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT cycle_id, started_at, finished_at, git_sha, status, total_pnl, total_drawdown, total_trades
+                SELECT cycle_id, started_at, finished_at, git_sha, status, dry_run, run_mode, total_pnl, total_drawdown, total_trades, failure_code
                 FROM run_cycles
                 WHERE finished_at IS NOT NULL
                 ORDER BY finished_at DESC
@@ -321,7 +372,7 @@ class SwarmDatabase:
                 SELECT br.bot_id, br.config_hash, rc.finished_at
                 FROM bot_runs br
                 JOIN run_cycles rc ON rc.id = br.cycle_id
-                WHERE rc.status = 'completed'
+                WHERE rc.status IN ('completed', 'completed_with_analysis_failure')
                 ORDER BY rc.finished_at DESC
                 """
             ).fetchall()
@@ -336,7 +387,7 @@ class SwarmDatabase:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT cycle_id, started_at, finished_at, git_sha, status, total_pnl, total_drawdown, total_trades
+                SELECT cycle_id, started_at, finished_at, git_sha, status, dry_run, run_mode, total_pnl, total_drawdown, total_trades, failure_code, error_message
                 FROM run_cycles
                 ORDER BY id DESC
                 LIMIT 1

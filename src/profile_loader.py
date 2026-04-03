@@ -29,6 +29,14 @@ def _resolve_path(root_dir: Path, value: str) -> Path:
     return path if path.is_absolute() else (root_dir / path)
 
 
+def _first_env(*names: str) -> str | None:
+    for name in names:
+        value = os.getenv(name)
+        if value not in (None, ""):
+            return value
+    return None
+
+
 def _get_bool_env(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value in (None, ""):
@@ -55,7 +63,8 @@ def _fingerprint(payload: dict[str, Any]) -> str:
 @dataclass(frozen=True)
 class SchedulerSettings:
     interval_minutes: int
-    session_minutes: int
+    session_minutes: float
+    dry_run_session_minutes: float
     timezone: str
 
 
@@ -204,10 +213,12 @@ def load_runtime_settings(root_dir: Path, config_path: Path | None = None) -> Ru
     validation_payload = payload.get("validation", {})
     notification_payload = payload.get("notifications", {})
 
-    artifact_root = _resolve_path(root_dir, os.getenv("TRADER_ARTIFACT_ROOT", storage_payload.get("artifact_root", "artifacts")))
-    db_path = _resolve_path(root_dir, os.getenv("TRADER_DB_PATH", storage_payload.get("db_path", "artifacts/trader_swarm.sqlite3")))
-    lock_path = _resolve_path(root_dir, os.getenv("RUN_LOCK_PATH", storage_payload.get("lock_path", "artifacts/run.lock")))
+    artifact_root = _resolve_path(root_dir, _first_env("TRADER_ARTIFACT_ROOT", "ARTIFACT_ROOT") or storage_payload.get("artifact_root", "artifacts"))
+    db_path = _resolve_path(root_dir, _first_env("TRADER_DB_PATH", "SQLITE_DB_PATH") or storage_payload.get("db_path", "artifacts/trader_swarm.sqlite3"))
+    lock_path = _resolve_path(root_dir, _first_env("RUN_LOCK_PATH") or storage_payload.get("lock_path", "artifacts/run.lock"))
     bots_dir = _resolve_path(root_dir, swarm_payload.get("bot_config_dir", "config/bots"))
+    dry_run = _get_bool_env("DRY_RUN", _get_bool_env("SWARM_DRY_RUN", bool(swarm_payload.get("dry_run", True))))
+    live_trading_enabled = False if dry_run else _get_bool_env("LIVE_TRADING_ENABLED", bool(swarm_payload.get("live_trading_enabled", False)))
 
     return RuntimeSettings(
         root_dir=root_dir,
@@ -217,11 +228,12 @@ def load_runtime_settings(root_dir: Path, config_path: Path | None = None) -> Ru
         db_path=db_path,
         lock_path=lock_path,
         generation=int(os.getenv("SWARM_GENERATION", swarm_payload.get("generation", 1))),
-        dry_run=_get_bool_env("SWARM_DRY_RUN", bool(swarm_payload.get("dry_run", True))),
-        live_trading_enabled=_get_bool_env("LIVE_TRADING_ENABLED", bool(swarm_payload.get("live_trading_enabled", False))),
+        dry_run=dry_run,
+        live_trading_enabled=live_trading_enabled,
         scheduler=SchedulerSettings(
             interval_minutes=int(scheduler_payload.get("interval_minutes", 30)),
-            session_minutes=int(scheduler_payload.get("session_minutes", 30)),
+            session_minutes=float(scheduler_payload.get("session_minutes", 30)),
+            dry_run_session_minutes=float(scheduler_payload.get("dry_run_session_minutes", 1.0)),
             timezone=str(os.getenv("SCHEDULER_TIMEZONE", scheduler_payload.get("timezone", "UTC"))),
         ),
         git=GitSettings(
@@ -302,6 +314,13 @@ def load_bot_definitions(settings: RuntimeSettings) -> list[BotDefinition]:
         strategy_profile.validate()
 
         effective_base = _replace_dataclass(base_config, payload.get("bot_config_overrides", {}))
+        if settings.dry_run or not settings.live_trading_enabled:
+            effective_base = replace(
+                effective_base,
+                mode="paper",
+                coinbase_api_key=None,
+                coinbase_api_secret=None,
+            )
         effective_base.validate()
 
         network_payload = payload.get("network", {})

@@ -95,6 +95,12 @@ Run the production orchestration cycle wrapper:
 python -m src.orchestrator run-cycle
 ```
 
+Force a non-live dry-run orchestration pass:
+
+```powershell
+python -m src.orchestrator run-cycle --dry-run
+```
+
 Check orchestration health:
 
 ```powershell

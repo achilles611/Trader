@@ -211,6 +211,8 @@ def normalize_cycle(
     bundle = NormalizedCycleBundle(
         cycle_id=timing.cycle_id,
         status="completed",
+        dry_run=settings.dry_run,
+        run_mode="dry_run" if settings.dry_run else "live" if settings.live_trading_enabled else "paper",
         git_sha=repo_state.git_sha,
         repo_branch=repo_state.branch,
         market=bot_definitions[0].base_config.product_id,
