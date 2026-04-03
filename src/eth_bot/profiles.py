@@ -113,8 +113,8 @@ def build_swarm_instance_configs(
                 aggressive_entries=True,
             ),
             {
-                "max_trades_total": 300,
-                "max_trades_per_hour": 300,
+                "max_trades_total": 240,
+                "max_trades_per_hour": 240,
                 "pullback_min_pct": 0.0015,
                 "fast_ema_period": 5,
                 "slow_ema_period": 13,
@@ -149,8 +149,8 @@ def build_swarm_instance_configs(
                 aggressive_entries=True,
             ),
             {
-                "max_trades_total": 300,
-                "max_trades_per_hour": 300,
+                "max_trades_total": 240,
+                "max_trades_per_hour": 240,
                 "pullback_min_pct": 0.0015,
                 "rsi_entry_floor": 45.0,
                 "rsi_entry_ceiling": 75.0,

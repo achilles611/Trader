@@ -161,7 +161,7 @@ class BotConfig:
             risk_per_trade_pct=_get_float("BOT_RISK_PER_TRADE_PCT", 0.01),
             max_notional_pct=_get_float("BOT_MAX_NOTIONAL_PCT", 0.20),
             max_concurrent_trades=_get_int("BOT_MAX_CONCURRENT_TRADES", 1),
-            max_position_size=_get_float("BOT_MAX_POSITION_SIZE", 250.0),
+            max_position_size=_get_float("BOT_MAX_POSITION_SIZE", 150.0),
             min_position_size=_get_float("BOT_MIN_POSITION_SIZE", 25.0),
             min_order_notional=_get_float("BOT_MIN_ORDER_NOTIONAL", 25.0),
             min_cash_reserve=_get_float("BOT_MIN_CASH_RESERVE", 50.0),

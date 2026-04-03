@@ -50,7 +50,7 @@ patching:
 safety:
   global_kill_switch: false
   global_kill_switch_path: state/global_kill_switch.txt
-  max_notional_per_bot: 250.0
+  max_notional_per_bot: 150.0
   max_portfolio_notional: 1500.0
   max_drawdown_per_cycle: 0.05
   max_open_positions: 10
