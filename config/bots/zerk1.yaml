@@ -1,0 +1,37 @@
+bot_id: zerk1
+family: zerk
+profile_name: hyperactive_momentum_raider
+network:
+  mutation_scale: 0.08
+  version_tag: swarm-v1
+strategy_profile:
+  entry_threshold_long: 0.42
+  entry_threshold_short: 0.42
+  weight_trend: 0.8
+  weight_pullback: 0.4
+  weight_momentum: 1.8
+  weight_cross: 0.25
+  weight_rsi: 0.35
+  weight_near_extreme_penalty: 0.05
+  weight_network: 0.65
+  rule_weight: 0.55
+  exploration_bonus: 0.12
+  block_entries_in_chop: false
+  allow_near_recent_high_long: true
+  allow_near_recent_low_short: true
+  allow_countertrend: false
+  max_hold_seconds: 60
+  cooldown_after_loss_seconds: 0
+  cooldown_after_win_seconds: 0
+  flip_cooldown_seconds: 0
+  min_confirmation_signals: 1
+  aggressive_entries: true
+bot_config_overrides:
+  max_trades_total: 300
+  max_trades_per_hour: 300
+  pullback_min_pct: 0.0015
+  fast_ema_period: 5
+  slow_ema_period: 13
+genome:
+  archetype: explorer
+  notes: Fast momentum scalp searcher

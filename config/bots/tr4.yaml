@@ -1,0 +1,21 @@
+bot_id: tr4
+family: tr
+profile_name: breakout_confirmer
+network:
+  mutation_scale: 0.03
+  version_tag: swarm-v1
+strategy_profile:
+  entry_threshold_long: 0.76
+  entry_threshold_short: 0.76
+  weight_trend: 1.2
+  weight_pullback: 0.75
+  weight_momentum: 1.45
+  weight_cross: 1.55
+  weight_rsi: 0.55
+  weight_network: 0.18
+  rule_weight: 0.82
+bot_config_overrides:
+  pullback_min_pct: 0.002
+genome:
+  archetype: breakout
+  notes: Confirmation-heavy breakout follower

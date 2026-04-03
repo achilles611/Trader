@@ -1,0 +1,12 @@
+[Unit]
+Description=Run trader swarm every 30 minutes
+
+[Timer]
+OnCalendar=*:0/30
+AccuracySec=1s
+Persistent=true
+RandomizedDelaySec=0
+Unit=trader-swarm.service
+
+[Install]
+WantedBy=timers.target

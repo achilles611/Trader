@@ -1,0 +1,11 @@
+bot_id: tr1
+family: tr
+profile_name: baseline_conservative
+network:
+  mutation_scale: 0.03
+  version_tag: swarm-v1
+strategy_profile: {}
+bot_config_overrides: {}
+genome:
+  archetype: baseline
+  notes: Baseline conservative reference

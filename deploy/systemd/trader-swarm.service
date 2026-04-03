@@ -1,0 +1,22 @@
+[Unit]
+Description=Trader swarm orchestration cycle
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=__APP_USER__
+Group=__APP_USER__
+WorkingDirectory=__APP_DIR__
+EnvironmentFile=__APP_DIR__/.env
+ExecStart=__APP_DIR__/scripts/run_cycle.sh
+TimeoutStartSec=55min
+Nice=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=__APP_DIR__
+
+[Install]
+WantedBy=multi-user.target

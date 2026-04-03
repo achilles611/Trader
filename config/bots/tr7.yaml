@@ -1,0 +1,20 @@
+bot_id: tr7
+family: tr
+profile_name: short_biased_hunter
+network:
+  mutation_scale: 0.03
+  version_tag: swarm-v1
+strategy_profile:
+  entry_threshold_long: 0.73
+  entry_threshold_short: 0.68
+  weight_momentum: 1.15
+  weight_cross: 1.2
+  weight_network: 0.2
+  rule_weight: 0.8
+  short_bias: 0.08
+bot_config_overrides:
+  take_profit_pct: 0.02
+  stop_loss_pct: 0.012
+genome:
+  archetype: short_bias
+  notes: Slightly favors bearish momentum

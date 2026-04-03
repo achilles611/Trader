@@ -1,0 +1,78 @@
+scheduler:
+  interval_minutes: 30
+  session_minutes: 30
+  timezone: UTC
+
+storage:
+  artifact_root: artifacts
+  db_path: artifacts/trader_swarm.sqlite3
+  lock_path: artifacts/run.lock
+
+swarm:
+  generation: 1
+  bot_config_dir: config/bots
+  dry_run: true
+  live_trading_enabled: false
+
+git:
+  remote: origin
+  production_branch: main
+  develop_branch: develop
+
+analysis:
+  enabled: true
+  model: gpt-5.4-mini
+  patch_model: gpt-5.4-mini
+  prompt_path: config/analysis_prompt.md
+  schema_path: config/analysis_schema.json
+  prompt_cache_key: trader-swarm-analysis-v1
+  prompt_cache_retention: in_memory
+  timeout_seconds: 45
+  max_retries: 3
+  backoff_seconds: 2.0
+  store_responses: true
+  rolling_cycles: 5
+  max_signal_events: 20
+  log_excerpt_lines: 40
+  use_previous_response: false
+
+patching:
+  enabled: false
+  require_validation_for_promotion: true
+  diff_line_limit: 400
+  experiment_branch_prefix: exp
+  base_branch: main
+  codex_patch_command: ""
+  auto_promote_to_develop: false
+  auto_promote_to_main: false
+
+safety:
+  global_kill_switch: false
+  global_kill_switch_path: state/global_kill_switch.txt
+  max_notional_per_bot: 250.0
+  max_portfolio_notional: 1500.0
+  max_drawdown_per_cycle: 0.05
+  max_open_positions: 10
+  max_order_rate_per_minute: 10.0
+  max_hold_sec_per_profile:
+    zerk: 60
+    tr: 3600
+  skip_run_if_volatility_spike: false
+  volatility_spike_threshold_pct: 3.0
+  skip_run_if_api_down: true
+  require_validation_for_promotion: true
+
+validation:
+  lint_command: ""
+  test_command: python -m unittest discover -s tests
+  backtest_candles: 400
+  regression_max_drawdown_pct: 8.0
+  regression_min_return_pct: -5.0
+  regression_min_win_rate_pct: 20.0
+  secret_patterns:
+    - OPENAI_API_KEY=
+    - COINBASE_API_SECRET=
+    - COINBASE_API_KEY=
+
+notifications:
+  discord_webhook_url: ""

@@ -1,0 +1,20 @@
+bot_id: tr5
+family: tr
+profile_name: chop_survivor
+network:
+  mutation_scale: 0.03
+  version_tag: swarm-v1
+strategy_profile:
+  entry_threshold_long: 0.82
+  entry_threshold_short: 0.82
+  weight_network: 0.12
+  rule_weight: 0.88
+  block_entries_in_chop: true
+  min_confirmation_signals: 4
+  aggressive_entries: false
+bot_config_overrides:
+  chop_high_confidence_signals: 5
+  max_trades_per_hour: 4
+genome:
+  archetype: defensive
+  notes: Conservative in chop

@@ -1,0 +1,19 @@
+bot_id: tr3
+family: tr
+profile_name: pullback_purist
+network:
+  mutation_scale: 0.03
+  version_tag: swarm-v1
+strategy_profile:
+  entry_threshold_long: 0.74
+  entry_threshold_short: 0.74
+  weight_pullback: 1.7
+  weight_momentum: 0.8
+  weight_cross: 0.5
+  weight_network: 0.18
+  rule_weight: 0.82
+bot_config_overrides:
+  pullback_min_pct: 0.006
+genome:
+  archetype: pullback
+  notes: Requires cleaner pullbacks

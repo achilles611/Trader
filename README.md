@@ -89,6 +89,24 @@ Dump the current swarm profiles:
 python main.py profile-dump --generation 1
 ```
 
+Run the production orchestration cycle wrapper:
+
+```powershell
+python -m src.orchestrator run-cycle
+```
+
+Check orchestration health:
+
+```powershell
+python -m src.orchestrator health-check
+```
+
+Replay AI analysis from a saved cycle bundle:
+
+```powershell
+python -m src.orchestrator replay-analysis --bundle artifacts\cycles\YYYY\MM\DD\cycle_...\cycle_bundle.json
+```
+
 ## Live Trading Warning
 
 If you enable live mode:
@@ -150,6 +168,12 @@ The main knobs live in `.env`:
 - `tr1` through `tr8` are structured descendants of the current rule engine with different weighting, thresholds, and network trust.
 - All swarm bots share one Coinbase market frame per cycle, then decide independently with isolated capital buckets and isolated state/log paths.
 - After a swarm session, the orchestrator emits `reports/generation_XXX/swarm_session_report.json` and `reports/generation_XXX/next_generation_proposals.json`.
+
+## Production Wrapper
+
+- `config/global.yaml` and `config/bots/*.yaml` define the 30-minute orchestration loop, guardrails, and per-bot templates.
+- `src/orchestrator.py` adds repo sync, run locking, SQLite persistence, artifact writing, OpenAI Responses analysis, and branch-only patch request staging.
+- `scripts/bootstrap_server.sh` installs the app on Ubuntu and enables `deploy/systemd/trader-swarm.timer`.
 
 ## Sources
 

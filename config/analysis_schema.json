@@ -1,0 +1,128 @@
+{
+  "name": "trader_swarm_analysis",
+  "strict": true,
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "cycle_verdict": {
+        "type": "string",
+        "enum": ["go", "hold", "rollback", "anomaly"]
+      },
+      "summary": {
+        "type": "string",
+        "minLength": 1
+      },
+      "global_findings": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "bot_findings": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "bot_id": {
+              "type": "string"
+            },
+            "diagnosis": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "recommended_parameter_changes": {
+              "type": "object"
+            },
+            "confidence": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          },
+          "required": [
+            "bot_id",
+            "diagnosis",
+            "recommended_parameter_changes",
+            "confidence"
+          ]
+        }
+      },
+      "cross_bot_patterns": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "risk_flags": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "next_experiments": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "priority": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "scope": {
+              "type": "string",
+              "enum": ["config", "code", "risk", "scheduler"]
+            },
+            "description": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": ["priority", "scope", "description"]
+        }
+      },
+      "patch_requests": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "target_file": {
+              "type": "string",
+              "minLength": 1
+            },
+            "change_type": {
+              "type": "string",
+              "enum": ["config", "logic", "logging", "validation"]
+            },
+            "instruction": {
+              "type": "string",
+              "minLength": 1
+            },
+            "bounded_constraints": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": ["target_file", "change_type", "instruction", "bounded_constraints"]
+        }
+      }
+    },
+    "required": [
+      "cycle_verdict",
+      "summary",
+      "global_findings",
+      "bot_findings",
+      "cross_bot_patterns",
+      "risk_flags",
+      "next_experiments",
+      "patch_requests"
+    ]
+  }
+}

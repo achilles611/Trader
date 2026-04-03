@@ -1,0 +1,23 @@
+bot_id: tr2
+family: tr
+profile_name: faster_trend_follower
+network:
+  mutation_scale: 0.03
+  version_tag: swarm-v1
+strategy_profile:
+  entry_threshold_long: 0.64
+  entry_threshold_short: 0.64
+  weight_momentum: 1.35
+  weight_rsi: 0.65
+  weight_network: 0.2
+  rule_weight: 0.8
+  block_entries_in_chop: true
+  min_confirmation_signals: 2
+  aggressive_entries: true
+bot_config_overrides:
+  fast_ema_period: 6
+  slow_ema_period: 15
+  pullback_min_pct: 0.0025
+genome:
+  archetype: trend
+  notes: Faster trend-following variant

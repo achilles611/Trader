@@ -1,0 +1,17 @@
+bot_id: tr8
+family: tr
+profile_name: hybrid_network_experimental
+network:
+  mutation_scale: 0.03
+  version_tag: swarm-v1
+strategy_profile:
+  entry_threshold_long: 0.61
+  entry_threshold_short: 0.61
+  weight_network: 0.52
+  rule_weight: 0.48
+  block_entries_in_chop: false
+  aggressive_entries: true
+bot_config_overrides: {}
+genome:
+  archetype: hybrid
+  notes: Higher network trust exploratory trader

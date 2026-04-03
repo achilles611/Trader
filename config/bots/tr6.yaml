@@ -1,0 +1,20 @@
+bot_id: tr6
+family: tr
+profile_name: rsi_sensitive
+network:
+  mutation_scale: 0.03
+  version_tag: swarm-v1
+strategy_profile:
+  entry_threshold_long: 0.71
+  entry_threshold_short: 0.71
+  weight_rsi: 1.55
+  weight_network: 0.22
+  rule_weight: 0.78
+bot_config_overrides:
+  rsi_entry_floor: 50.0
+  rsi_entry_ceiling: 64.0
+  short_rsi_entry_floor: 36.0
+  short_rsi_entry_ceiling: 50.0
+genome:
+  archetype: oscillator
+  notes: RSI-led sensitivity variant
