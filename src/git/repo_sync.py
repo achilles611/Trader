@@ -55,6 +55,16 @@ def resolve_ref_sha(root_dir: Path, ref: str) -> str | None:
         return None
 
 
+def resolve_remote_head_sha(root_dir: Path, remote: str, branch: str) -> str | None:
+    try:
+        output = _git(root_dir, "ls-remote", "--heads", remote, branch)
+    except RepoSyncError:
+        return None
+    if not output:
+        return None
+    return output.split()[0]
+
+
 def ensure_clean_worktree(root_dir: Path) -> RepoState:
     state = get_repo_state(root_dir)
     if state.is_dirty:

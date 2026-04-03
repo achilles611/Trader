@@ -18,7 +18,7 @@ from .analysis.schema import AnalysisSchemaError, load_analysis_schema
 from .config.env_validator import validate_environment, validate_writable_targets
 from .failure import FailureCode, OrchestratorFailure
 from .git.branch_ops import capture_diff, create_experiment_branch
-from .git.repo_sync import DirtyWorktreeError, RepoSyncError, get_repo_state, resolve_ref_sha, sync_to_production
+from .git.repo_sync import DirtyWorktreeError, RepoSyncError, get_repo_state, resolve_ref_sha, resolve_remote_head_sha, sync_to_production
 from .profile_loader import load_bot_definitions, load_runtime_settings
 from .result_normalizer import normalize_cycle
 from .safety.kill_switch import global_kill_switch_reason
@@ -86,7 +86,7 @@ def _build_health_report(root_dir: Path, config_path: Path | None = None) -> tup
 
     production_branch = settings.git.production_branch if settings is not None else "main"
     production_ref = settings.git.remote if settings is not None else "origin"
-    origin_sha = resolve_ref_sha(root_dir, f"{production_ref}/{production_branch}")
+    origin_sha = resolve_remote_head_sha(root_dir, production_ref, production_branch) or resolve_ref_sha(root_dir, f"{production_ref}/{production_branch}")
     lock_info = _lock_status((settings.lock_path if settings is not None else (root_dir / "artifacts" / "run.lock")))
 
     db_status = {"ok": False, "message": "settings unavailable", "path": ""}
