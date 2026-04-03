@@ -7,7 +7,7 @@ from typing import Any
 import requests
 
 from .config import GRANULARITY_TO_SECONDS
-from .models import Candle, ProductInfo
+from .models import Candle, MarketFrame, ProductInfo
 
 
 class MarketDataError(RuntimeError):
@@ -144,3 +144,25 @@ class CoinbasePublicClient:
         if len(candles) > limit:
             candles = candles[-limit:]
         return candles
+
+    def get_market_frame(
+        self,
+        *,
+        product_id: str,
+        granularity: str,
+        limit: int,
+    ) -> MarketFrame:
+        product = self.get_product_info(product_id)
+        candles = self.get_candles(
+            product_id=product_id,
+            granularity=granularity,
+            limit=limit,
+        )
+        if not candles:
+            raise FatalMarketDataError("No candles returned from Coinbase public market data.")
+        return MarketFrame(
+            timestamp=candles[-1].start,
+            product=product,
+            candles=candles,
+            current_price=candles[-1].close,
+        )

@@ -3,18 +3,36 @@ from __future__ import annotations
 import logging
 import time
 from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
-from .config import BotConfig
+from .config import BotConfig, BotInstanceConfig
 from .exchange import CoinbaseLiveTrader
 from .market_data import CoinbasePublicClient, FatalMarketDataError, TransientMarketDataError
-from .models import BotState, Candle, ClosedTrade, Position, ProductInfo, TradeResult, utc_now
-from .storage import append_jsonl, append_trade, load_state, save_state
+from .models import BotState, Candle, ClosedTrade, MarketFrame, Position, ProductInfo, TradeResult, utc_now
+from .network import NeuralNetwork
+from .profiles import build_singleton_instance_config
+from .storage import append_jsonl, append_trade, append_training_sample, load_state, save_state
 from .strategy import MomentumStrategy
+from .visualize import save_network_bundle
 
 
 LOGGER = logging.getLogger("eth_bot")
+
+
+@dataclass
+class SessionTracker:
+    started_at: datetime
+    duration_minutes: float
+    starting_snapshot: dict[str, Any]
+    starting_trade_count: int
+    cycles: int = 0
+    errors: int = 0
+    transient_market_data_errors: int = 0
+    session_peak_equity: float = 0.0
+    session_max_drawdown: float = 0.0
+    signal_events: list[dict[str, Any]] = field(default_factory=list)
 
 
 def parse_timestamp(value: str | None) -> datetime | None:
@@ -217,43 +235,78 @@ def paper_exit_fill(price: float, quantity: float, fee_rate: float, slippage_bps
 
 
 class TradingBot:
-    def __init__(self, config: BotConfig) -> None:
-        self.config = config
-        self.market_data = CoinbasePublicClient(
-            timeout_seconds=config.market_data_timeout_seconds,
-            max_retries=config.market_data_max_retries,
-            retry_backoff_seconds=config.market_data_retry_backoff_seconds,
+    def __init__(
+        self,
+        config: BotConfig,
+        *,
+        instance_config: BotInstanceConfig | None = None,
+        market_data: CoinbasePublicClient | None = None,
+        network: NeuralNetwork | None = None,
+    ) -> None:
+        self.instance = instance_config or build_singleton_instance_config(config)
+        self.config = self.instance.base_config
+        self.market_data = market_data or CoinbasePublicClient(
+            timeout_seconds=self.config.market_data_timeout_seconds,
+            max_retries=self.config.market_data_max_retries,
+            retry_backoff_seconds=self.config.market_data_retry_backoff_seconds,
         )
-        self.strategy = MomentumStrategy(config)
+        self.network = network or NeuralNetwork.load_or_create(
+            self.instance.storage_paths.network_snapshot_path,
+            self.instance.network_config,
+        )
+        self.strategy = MomentumStrategy(
+            self.config,
+            profile=self.instance.strategy_profile,
+            network=self.network,
+            profile_name=self.instance.profile_name,
+        )
         self.live_exchange = None
-        if config.mode == "live":
+        self.log_prefix = (
+            f"[instance={self.instance.instance_id} family={self.instance.family} "
+            f"generation={self.instance.generation} profile={self.instance.profile_name}]"
+        )
+        self.logger = logging.getLogger(self.instance.logger_name)
+        if self.config.mode == "live":
             self.live_exchange = CoinbaseLiveTrader(
-                api_key=config.coinbase_api_key or "",
-                api_secret=config.coinbase_api_secret or "",
+                api_key=self.config.coinbase_api_key or "",
+                api_secret=self.config.coinbase_api_secret or "",
             )
-            if config.enable_shorts:
-                LOGGER.warning(
-                    "BOT_ENABLE_SHORTS is on, but live short entries are disabled for the current spot adapter."
+            if self.config.enable_shorts:
+                self.logger.warning(
+                    "%s BOT_ENABLE_SHORTS is on, but live short entries are disabled for the current spot adapter.",
+                    self.log_prefix,
                 )
-        if config.max_concurrent_trades > 1:
-            LOGGER.warning(
-                "BOT_MAX_CONCURRENT_TRADES=%s requested, but the current runtime is still single-position. "
+        if self.config.max_concurrent_trades > 1:
+            self.logger.warning(
+                "%s BOT_MAX_CONCURRENT_TRADES=%s requested, but the current runtime is still single-position. "
                 "Re-entry after exit is supported; true parallel positions need a state refactor.",
-                config.max_concurrent_trades,
+                self.log_prefix,
+                self.config.max_concurrent_trades,
             )
 
     def load_state(self) -> BotState:
         return load_state(self.config.state_path, self.config.starting_cash)
 
     def snapshot(self) -> dict[str, Any]:
+        frame = self.market_data.get_market_frame(
+            product_id=self.config.product_id,
+            granularity=self.config.granularity,
+            limit=self.config.lookback_candles,
+        )
+        return self.snapshot_from_frame(frame)
+
+    def snapshot_from_frame(self, frame: MarketFrame) -> dict[str, Any]:
         state = self.load_state()
-        product = self.market_data.get_product_info(self.config.product_id)
-        price = product.price
+        price = frame.current_price
         equity = current_equity(state, price)
-        now = utc_now()
+        now = frame.timestamp
         self._clear_expired_pause(state, now)
         return {
             "captured_at": now.isoformat(),
+            "instance_id": self.instance.instance_id,
+            "family": self.instance.family,
+            "generation": self.instance.generation,
+            "profile_name": self.instance.profile_name,
             "price": price,
             "cash": state.cash,
             "equity": equity,
@@ -271,37 +324,41 @@ class TradingBot:
         }
 
     def run_forever(self) -> None:
-        LOGGER.info("Starting bot in %s mode for %s", self.config.mode, self.config.product_id)
+        self.logger.info("%s Starting bot in %s mode for %s", self.log_prefix, self.config.mode, self.config.product_id)
         while True:
             try:
                 self.run_once()
             except TransientMarketDataError as exc:
-                LOGGER.warning("Transient market-data failure: %s", exc)
+                self.logger.warning("%s Transient market-data failure: %s", self.log_prefix, exc)
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
                 self._handle_system_error(exc)
-                LOGGER.exception("Loop failed.")
+                self.logger.exception("%s Loop failed.", self.log_prefix)
             time.sleep(self.config.loop_seconds)
 
     def run_once(self) -> dict[str, Any]:
-        state = self.load_state()
-        now = utc_now()
-        self._clear_expired_pause(state, now)
-
-        product = self.market_data.get_product_info(self.config.product_id)
-        if product.trading_disabled:
-            raise RuntimeError(f"{product.product_id} is currently disabled for trading.")
-
-        candles = self.market_data.get_candles(
+        frame = self.market_data.get_market_frame(
             product_id=self.config.product_id,
             granularity=self.config.granularity,
             limit=self.config.lookback_candles,
         )
+        return self.run_once_with_frame(frame)
+
+    def run_once_with_frame(self, frame: MarketFrame) -> dict[str, Any]:
+        state = self.load_state()
+        now = frame.timestamp
+        self._clear_expired_pause(state, now)
+
+        product = frame.product
+        if product.trading_disabled:
+            raise RuntimeError(f"{product.product_id} is currently disabled for trading.")
+
+        candles = frame.candles
         if not candles:
             raise RuntimeError("No candles returned from Coinbase public market data.")
 
-        current_price = candles[-1].close
+        current_price = frame.current_price
         equity = current_equity(state, current_price)
         reset_daily_guard_if_needed(state, now, equity)
         state.peak_equity = max(state.peak_equity, equity)
@@ -320,8 +377,9 @@ class TradingBot:
         save_state(self.config.state_path, state)
 
         halt_reason = self._current_halt_reason(state, now)
-        LOGGER.info(
-            "mode=%s price=%.2f cash=%.2f equity=%.2f position=%s halted=%s",
+        self.logger.info(
+            "%s mode=%s price=%.2f cash=%.2f equity=%.2f position=%s halted=%s",
+            self.log_prefix,
             self.config.mode,
             current_price,
             state.cash,
@@ -329,8 +387,13 @@ class TradingBot:
             f"{state.position.side}:{state.position.quantity:.6f}" if state.position else "flat",
             halt_reason or "no",
         )
+        self._write_network_artifacts(state, signal_event, refreshed_equity)
         return {
             "captured_at": now.isoformat(),
+            "instance_id": self.instance.instance_id,
+            "family": self.instance.family,
+            "generation": self.instance.generation,
+            "profile_name": self.instance.profile_name,
             "price": current_price,
             "equity": refreshed_equity,
             "halt_reason": halt_reason,
@@ -353,7 +416,7 @@ class TradingBot:
 
     def _disable_trading(self, state: BotState, reason: str) -> None:
         if not state.trading_disabled or state.trading_disabled_reason != reason:
-            LOGGER.warning("Trading disabled: %s", reason)
+            self.logger.warning("%s Trading disabled: %s", self.log_prefix, reason)
         state.trading_disabled = True
         state.trading_disabled_reason = reason
         state.trading_paused_until = None
@@ -361,7 +424,7 @@ class TradingBot:
     def _pause_trading(self, state: BotState, until: datetime, reason: str) -> None:
         existing_pause = parse_timestamp(state.trading_paused_until)
         if existing_pause is None or until > existing_pause:
-            LOGGER.warning("Trading paused until %s: %s", until.isoformat(), reason)
+            self.logger.warning("%s Trading paused until %s: %s", self.log_prefix, until.isoformat(), reason)
             state.trading_paused_until = until.isoformat()
             if not state.trading_disabled:
                 state.trading_disabled_reason = reason
@@ -388,7 +451,7 @@ class TradingBot:
             self._disable_trading(state, f"system_error:{type(exc).__name__}")
             save_state(self.config.state_path, state)
         except Exception:
-            LOGGER.exception("Failed to persist system-error halt.")
+            self.logger.exception("%s Failed to persist system-error halt.", self.log_prefix)
 
     def _enforce_global_circuit_breakers(self, state: BotState, now: datetime, equity: float) -> None:
         drawdown_pct = current_drawdown_pct(state, equity)
@@ -470,6 +533,10 @@ class TradingBot:
         resolved_action_candidate = action_candidate or decision.action
         event = {
             "timestamp": now.isoformat(),
+            "instance_id": self.instance.instance_id,
+            "family": self.instance.family,
+            "generation": self.instance.generation,
+            "profile_name": self.instance.profile_name,
             "action_candidate": resolved_action_candidate,
             "reason": reason or decision.reason,
             "market_state": decision.market_state,
@@ -492,6 +559,10 @@ class TradingBot:
             "near_recent_high": indicators.get("near_recent_high"),
             "near_recent_low": indicators.get("near_recent_low"),
             "entry_market_state_ok": indicators.get("entry_market_state_ok"),
+            "network_prob_win_long": indicators.get("network_prob_win_long"),
+            "network_prob_win_short": indicators.get("network_prob_win_short"),
+            "final_long_score": indicators.get("final_long_score"),
+            "final_short_score": indicators.get("final_short_score"),
             "move_from_previous_pct": move_from_previous_pct(indicators) * 100,
             "missed_trend": is_missed_trend(
                 indicators,
@@ -525,12 +596,12 @@ class TradingBot:
         new_side = "long" if decision.action == "buy" else "short"
         block_reason = self._entry_block_reason(state, candles, equity, now, new_side)
         if block_reason is not None:
-            LOGGER.info("Entry blocked: %s", block_reason)
+            self.logger.info("%s Entry blocked: %s", self.log_prefix, block_reason)
             return self._log_signal_event(now, decision, block_reason=block_reason, price=current_price)
 
         quote_size = calculate_quote_size(state.cash, equity, current_price, product, self.config)
         if quote_size <= 0:
-            LOGGER.info("Position sizing blocked the trade. Cash or risk budget is too small.")
+            self.logger.info("%s Position sizing blocked the trade. Cash or risk budget is too small.", self.log_prefix)
             return self._log_signal_event(now, decision, block_reason="position_sizing", price=current_price)
         if not expected_move_covers_costs(
             current_price=current_price,
@@ -538,7 +609,7 @@ class TradingBot:
             notional=quote_size,
             config=self.config,
         ):
-            LOGGER.info("Entry blocked: expected move does not cover modeled fees.")
+            self.logger.info("%s Entry blocked: expected move does not cover modeled fees.", self.log_prefix)
             return self._log_signal_event(
                 now,
                 decision,
@@ -547,7 +618,10 @@ class TradingBot:
             )
 
         if decision.action == "short" and self.config.mode == "live":
-            LOGGER.warning("Short entries are only supported in paper mode with the current spot adapter.")
+            self.logger.warning(
+                "%s Short entries are only supported in paper mode with the current spot adapter.",
+                self.log_prefix,
+            )
             return self._log_signal_event(
                 now,
                 decision,
@@ -617,11 +691,21 @@ class TradingBot:
             market_state=decision.market_state,
             entry_indicators=decision.indicators,
             entry_quality_score=decision_quality_score(decision.action, decision.indicators),
+            instance_id=self.instance.instance_id,
+            family=self.instance.family,
+            generation=self.instance.generation,
+            profile_name=self.instance.profile_name,
+            network_version=decision.network_scores.version if decision.network_scores else "",
+            entry_network_scores=decision.network_scores.to_json() if decision.network_scores else {},
+            entry_feature_vector=[float(value) for value in decision.indicators.get("feature_vector", [])],
+            max_favorable_excursion_pct=0.0,
+            max_adverse_excursion_pct=0.0,
         )
         state.entry_timestamps.append(now.isoformat())
         state.last_signal_at = now.isoformat()
-        LOGGER.info(
-            "Opened %s position qty=%.6f notional=%.2f entry=%.2f stop=%.2f take=%.2f reason=%s market_state=%s",
+        self.logger.info(
+            "%s Opened %s position qty=%.6f notional=%.2f entry=%.2f stop=%.2f take=%.2f reason=%s market_state=%s",
+            self.log_prefix,
             state.position.side,
             trade.quantity,
             position_size,
@@ -659,6 +743,7 @@ class TradingBot:
         if position.lowest_price is None:
             position.lowest_price = position.entry_price
         position.lowest_price = min(position.lowest_price, current_price)
+        self._update_excursions(position)
 
         unrealized_move = move_pct_from_entry(position, current_price)
         if market_state == "CHOPPY" and unrealized_move >= self.config.chop_profit_lock_trigger_pct:
@@ -757,17 +842,18 @@ class TradingBot:
         if position.side == "long":
             gross_proceeds = trade.price * trade.quantity
             state.cash += gross_proceeds - trade.fees_paid
-            pnl = (trade.price - position.entry_price) * trade.quantity
+            pnl_raw = (trade.price - position.entry_price) * trade.quantity
         else:
             total_cover_cost = (trade.price * trade.quantity) + trade.fees_paid
             state.cash -= total_cover_cost
-            pnl = (position.entry_price - trade.price) * trade.quantity
+            pnl_raw = (position.entry_price - trade.price) * trade.quantity
 
         total_fees = trade.fees_paid + position.entry_fees_paid
-        pnl -= total_fees
+        pnl = pnl_raw - total_fees
         pnl_pct = pnl / position.position_size if position.position_size > 0 else 0.0
         duration_seconds = max(0.0, (now - opened_at).total_seconds())
         result = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"
+        drawdown_contribution_pct = current_drawdown_pct(state, current_equity(state, trade.price))
 
         closed_trade = ClosedTrade(
             opened_at=position.opened_at,
@@ -791,9 +877,24 @@ class TradingBot:
             market_state=position.market_state,
             entry_indicators=position.entry_indicators,
             entry_quality_score=position.entry_quality_score,
+            instance_id=self.instance.instance_id,
+            family=self.instance.family,
+            generation=self.instance.generation,
+            profile_name=self.instance.profile_name,
+            network_version=position.network_version,
+            network_scores_at_entry=position.entry_network_scores,
+            entry_feature_vector=position.entry_feature_vector,
+            pnl_raw=pnl_raw,
+            pnl_fee_aware=pnl,
+            label_win_raw=1 if pnl_raw > 0 else 0,
+            label_win_fee_aware=1 if pnl > 0 else 0,
+            max_favorable_excursion_pct=position.max_favorable_excursion_pct,
+            max_adverse_excursion_pct=position.max_adverse_excursion_pct,
+            drawdown_contribution_pct=drawdown_contribution_pct,
         )
         state.closed_trades.append(closed_trade)
         append_trade(self.config.trade_log_path, closed_trade)
+        append_training_sample(self.config.training_sample_log_path, self._training_sample_payload(closed_trade))
         if pnl < 0:
             state.last_loss_at = now.isoformat()
             state.consecutive_losses += 1
@@ -802,8 +903,9 @@ class TradingBot:
         else:
             state.consecutive_losses = 0
 
-        LOGGER.info(
-            "Closed %s position qty=%.6f exit=%.2f pnl=%.2f result=%s reason=%s",
+        self.logger.info(
+            "%s Closed %s position qty=%.6f exit=%.2f pnl=%.2f result=%s reason=%s",
+            self.log_prefix,
             position.side,
             trade.quantity,
             trade.price,
@@ -824,41 +926,162 @@ class TradingBot:
             price=trade.price,
         )
 
+    def _update_excursions(self, position: Position) -> None:
+        if position.entry_price <= 0:
+            return
+        if position.side == "long":
+            favorable = max(0.0, (position.highest_price - position.entry_price) / position.entry_price)
+            adverse = max(0.0, (position.entry_price - (position.lowest_price or position.entry_price)) / position.entry_price)
+        else:
+            favorable = max(0.0, (position.entry_price - (position.lowest_price or position.entry_price)) / position.entry_price)
+            adverse = max(0.0, (position.highest_price - position.entry_price) / position.entry_price)
+        position.max_favorable_excursion_pct = max(position.max_favorable_excursion_pct, favorable)
+        position.max_adverse_excursion_pct = max(position.max_adverse_excursion_pct, adverse)
+
+    def _training_sample_payload(self, trade: ClosedTrade) -> dict[str, Any]:
+        return {
+            "instance_id": trade.instance_id,
+            "generation": trade.generation,
+            "family": trade.family,
+            "profile_name": trade.profile_name,
+            "side": trade.side,
+            "entry_timestamp": trade.opened_at,
+            "exit_timestamp": trade.closed_at,
+            "entry_features": trade.entry_feature_vector,
+            "entry_feature_names": trade.entry_indicators.get("feature_names", []),
+            "network_scores_at_entry": trade.network_scores_at_entry,
+            "market_state_at_entry": trade.market_state,
+            "entry_reason": trade.entry_reason,
+            "exit_reason": trade.reason,
+            "pnl_raw": trade.pnl_raw,
+            "pnl_fee_aware": trade.pnl_fee_aware,
+            "label_win_raw": trade.label_win_raw,
+            "label_win_fee_aware": trade.label_win_fee_aware,
+            "trade_duration_seconds": trade.trade_duration_seconds,
+            "fees_paid": trade.fees_paid,
+            "max_favorable_excursion_pct": trade.max_favorable_excursion_pct,
+            "max_adverse_excursion_pct": trade.max_adverse_excursion_pct,
+            "drawdown_contribution_pct": trade.drawdown_contribution_pct,
+        }
+
+    def start_session_tracker(self, *, minutes: float, frame: MarketFrame | None = None) -> SessionTracker:
+        started_at = utc_now()
+        starting_snapshot = self.snapshot_from_frame(frame) if frame is not None else self.snapshot()
+        starting_state = self.load_state()
+        return SessionTracker(
+            started_at=started_at,
+            duration_minutes=minutes,
+            starting_snapshot=starting_snapshot,
+            starting_trade_count=len(starting_state.closed_trades),
+            session_peak_equity=starting_snapshot["equity"],
+        )
+
+    def update_session_tracker(self, tracker: SessionTracker, cycle: dict[str, Any]) -> None:
+        tracker.cycles += 1
+        if "signal_event" in cycle:
+            tracker.signal_events.append(cycle["signal_event"])
+        tracker.session_peak_equity = max(tracker.session_peak_equity, cycle["equity"])
+        if tracker.session_peak_equity > 0:
+            drawdown = (tracker.session_peak_equity - cycle["equity"]) / tracker.session_peak_equity
+            tracker.session_max_drawdown = max(tracker.session_max_drawdown, drawdown)
+
+    def build_session_report(self, tracker: SessionTracker, *, ending_frame: MarketFrame | None = None) -> dict[str, Any]:
+        ending_snapshot = self.snapshot_from_frame(ending_frame) if ending_frame is not None else self.snapshot()
+        ending_state = self.load_state()
+        session_trades = ending_state.closed_trades[tracker.starting_trade_count :]
+        realized_pnl = sum(trade.pnl for trade in session_trades)
+        wins = sum(1 for trade in session_trades if trade.result == "WIN")
+        losses = sum(1 for trade in session_trades if trade.result == "LOSS")
+        total_trades = len(session_trades)
+        final_pnl = ending_snapshot["equity"] - tracker.starting_snapshot["equity"]
+        halt_reason = self._current_halt_reason(ending_state, utc_now())
+        reason_histogram = signal_reason_histogram(tracker.signal_events, field="reason")
+        hold_reason_histogram = signal_reason_histogram(tracker.signal_events, field="reason", require_hold=True)
+        block_reason_histogram = signal_reason_histogram(tracker.signal_events, field="block_reason")
+        market_state_histogram = signal_reason_histogram(tracker.signal_events, field="market_state")
+        missed_trend_count = sum(1 for event in tracker.signal_events if event.get("missed_trend"))
+
+        return {
+            "started_at": tracker.started_at.isoformat(),
+            "ended_at": utc_now().isoformat(),
+            "duration_minutes": tracker.duration_minutes,
+            "instance_id": self.instance.instance_id,
+            "family": self.instance.family,
+            "generation": self.instance.generation,
+            "profile_name": self.instance.profile_name,
+            "mode": self.config.mode,
+            "product_id": self.config.product_id,
+            "granularity": self.config.granularity,
+            "loop_seconds": self.config.loop_seconds,
+            "cycles": tracker.cycles,
+            "errors": tracker.errors,
+            "transient_market_data_errors": tracker.transient_market_data_errors,
+            "starting": tracker.starting_snapshot,
+            "ending": ending_snapshot,
+            "total_trades": total_trades,
+            "session_closed_trades": total_trades,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": (wins / total_trades * 100) if total_trades else 0.0,
+            "max_drawdown": tracker.session_max_drawdown * 100,
+            "max_drawdown_pct": tracker.session_max_drawdown * 100,
+            "realized_pnl": realized_pnl,
+            "final_pnl": final_pnl,
+            "equity_change": final_pnl,
+            "signal_events": len(tracker.signal_events),
+            "reason_histogram": reason_histogram,
+            "hold_reason_histogram": hold_reason_histogram,
+            "block_reason_histogram": block_reason_histogram,
+            "market_state_histogram": market_state_histogram,
+            "missed_trend_count": missed_trend_count,
+            "return_pct": (
+                ((ending_snapshot["equity"] / tracker.starting_snapshot["equity"]) - 1) * 100
+                if tracker.starting_snapshot["equity"]
+                else 0.0
+            ),
+            "halt_reason": halt_reason,
+            "trades": [trade.to_json() for trade in session_trades],
+        }
+
+    def _write_network_artifacts(self, state: BotState, signal_event: dict[str, Any], equity: float) -> None:
+        indicators = signal_event.get("indicators", {})
+        network_scores = self.strategy.network.forward(indicators["feature_vector"]) if indicators.get("feature_vector") else None
+        last_trade = state.closed_trades[-1].to_json() if state.closed_trades else None
+        save_network_bundle(
+            self.network,
+            self.instance.storage_paths,
+            instance_id=self.instance.instance_id,
+            family=self.instance.family,
+            generation=self.instance.generation,
+            profile_name=self.instance.profile_name,
+            profile=self.instance.strategy_profile,
+            network_scores=network_scores,
+            current_market_state=signal_event.get("market_state"),
+            current_equity=equity,
+            last_trade=last_trade,
+        )
+
     def run_session(self, minutes: float) -> dict[str, Any]:
         if minutes <= 0:
             raise ValueError("Session duration must be greater than 0 minutes.")
 
-        started_at = utc_now()
-        starting_snapshot = self.snapshot()
-        starting_state = self.load_state()
-        starting_trade_count = len(starting_state.closed_trades)
+        tracker = self.start_session_tracker(minutes=minutes)
         deadline = time.monotonic() + (minutes * 60)
-        cycles = 0
-        errors = 0
-        session_peak_equity = starting_snapshot["equity"]
-        session_max_drawdown = 0.0
-        signal_events: list[dict[str, Any]] = []
-        transient_market_data_errors = 0
+        ending_frame: MarketFrame | None = None
 
         while True:
             try:
                 cycle = self.run_once()
-                cycles += 1
-                if "signal_event" in cycle:
-                    signal_events.append(cycle["signal_event"])
-                session_peak_equity = max(session_peak_equity, cycle["equity"])
-                if session_peak_equity > 0:
-                    drawdown = (session_peak_equity - cycle["equity"]) / session_peak_equity
-                    session_max_drawdown = max(session_max_drawdown, drawdown)
+                self.update_session_tracker(tracker, cycle)
             except TransientMarketDataError as exc:
-                transient_market_data_errors += 1
-                LOGGER.warning("Transient market-data failure: %s", exc)
+                tracker.transient_market_data_errors += 1
+                self.logger.warning("%s Transient market-data failure: %s", self.log_prefix, exc)
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
-                errors += 1
+                tracker.errors += 1
                 self._handle_system_error(exc)
-                LOGGER.exception("Session cycle failed.")
+                self.logger.exception("%s Session cycle failed.", self.log_prefix)
                 break
 
             remaining_seconds = deadline - time.monotonic()
@@ -866,55 +1089,12 @@ class TradingBot:
                 break
             time.sleep(min(self.config.loop_seconds, remaining_seconds))
 
-        ending_snapshot = self.snapshot()
-        ending_state = self.load_state()
-        session_trades = ending_state.closed_trades[starting_trade_count:]
-        realized_pnl = sum(trade.pnl for trade in session_trades)
-        wins = sum(1 for trade in session_trades if trade.result == "WIN")
-        losses = sum(1 for trade in session_trades if trade.result == "LOSS")
-        total_trades = len(session_trades)
-        final_pnl = ending_snapshot["equity"] - starting_snapshot["equity"]
-        halt_reason = self._current_halt_reason(ending_state, utc_now())
-        reason_histogram = signal_reason_histogram(signal_events, field="reason")
-        hold_reason_histogram = signal_reason_histogram(signal_events, field="reason", require_hold=True)
-        block_reason_histogram = signal_reason_histogram(signal_events, field="block_reason")
-        market_state_histogram = signal_reason_histogram(signal_events, field="market_state")
-        missed_trend_count = sum(1 for event in signal_events if event.get("missed_trend"))
-
-        return {
-            "started_at": started_at.isoformat(),
-            "ended_at": utc_now().isoformat(),
-            "duration_minutes": minutes,
-            "mode": self.config.mode,
-            "product_id": self.config.product_id,
-            "granularity": self.config.granularity,
-            "loop_seconds": self.config.loop_seconds,
-            "cycles": cycles,
-            "errors": errors,
-            "transient_market_data_errors": transient_market_data_errors,
-            "starting": starting_snapshot,
-            "ending": ending_snapshot,
-            "total_trades": total_trades,
-            "session_closed_trades": total_trades,
-            "wins": wins,
-            "losses": losses,
-            "win_rate": (wins / total_trades * 100) if total_trades else 0.0,
-            "max_drawdown": session_max_drawdown * 100,
-            "max_drawdown_pct": session_max_drawdown * 100,
-            "realized_pnl": realized_pnl,
-            "final_pnl": final_pnl,
-            "equity_change": final_pnl,
-            "signal_events": len(signal_events),
-            "reason_histogram": reason_histogram,
-            "hold_reason_histogram": hold_reason_histogram,
-            "block_reason_histogram": block_reason_histogram,
-            "market_state_histogram": market_state_histogram,
-            "missed_trend_count": missed_trend_count,
-            "return_pct": (
-                ((ending_snapshot["equity"] / starting_snapshot["equity"]) - 1) * 100
-                if starting_snapshot["equity"]
-                else 0.0
-            ),
-            "halt_reason": halt_reason,
-            "trades": [trade.to_json() for trade in session_trades],
-        }
+        try:
+            ending_frame = self.market_data.get_market_frame(
+                product_id=self.config.product_id,
+                granularity=self.config.granularity,
+                limit=self.config.lookback_candles,
+            )
+        except (FatalMarketDataError, TransientMarketDataError):
+            ending_frame = None
+        return self.build_session_report(tracker, ending_frame=ending_frame)

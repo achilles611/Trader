@@ -11,11 +11,13 @@ Use this as a paper-trading and research bot first.
 ## What It Does
 
 - Pulls public ETH candles from Coinbase.
-- Uses pullback-resume entries with EMA trend checks, RSI filters, directional pullback detection, and optional market-state gating.
+- Uses pullback-resume entries with EMA trend checks, RSI filters, directional pullback detection, optional market-state gating, and per-profile weighted scoring.
 - Can optionally take paper-trading short positions on bearish momentum.
 - Sizes positions with a fixed risk budget, aggressiveness scaling, and hard size clamps.
 - Manages stop loss, take profit, market-state-aware trailing stops, chop profit locks, cooldowns, flip guards, trade-rate limits, stall exits, and a max-duration watchdog.
 - Includes circuit breakers for drawdown, consecutive losses, trade count, and a manual kill switch file.
+- Includes a baseline neural scorer (`24 -> 32 -> 24 -> 16 -> 8 -> 2`) that scores long-vs-short win probability from the rule feature vector.
+- Can run a 10-instance paper-trading swarm with isolated state, per-instance logs, per-instance network snapshots, SVG visualizations, and next-generation profile proposals.
 - Runs in `paper` mode by default.
 - Can place Coinbase live market orders only if you explicitly switch to `BOT_MODE=live` and provide API keys.
 - Live shorting is not enabled in this starter because the current adapter is built around Coinbase spot orders.
@@ -30,6 +32,8 @@ Copy-Item .env.example .env
 ```
 
 ## Commands
+
+All commands below also work through the module shim, for example `python -m trader.cli swarm-session --minutes 60 --generation 1`.
 
 Run one cycle:
 
@@ -53,6 +57,36 @@ Run a backtest on recent candles:
 
 ```powershell
 python main.py backtest --candles 1000
+```
+
+Run the 10-bot swarm for one generation:
+
+```powershell
+python main.py swarm-session --minutes 60 --generation 1
+```
+
+Train the baseline network from captured trade samples:
+
+```powershell
+python main.py train-network --input logs\training\trade_samples.jsonl --epochs 12
+```
+
+Emit next-generation mutation proposals:
+
+```powershell
+python main.py evolve --from-generation 1 --to-generation 2
+```
+
+Render one instance network bundle:
+
+```powershell
+python main.py viz-network --instance tr4 --generation 1
+```
+
+Dump the current swarm profiles:
+
+```powershell
+python main.py profile-dump --generation 1
 ```
 
 ## Live Trading Warning
@@ -91,6 +125,8 @@ The main knobs live in `.env`:
 - `BOT_MAX_SPREAD_THRESHOLD`: public-data candle-range proxy for unstable entries
 - `BOT_MIN_EXPECTED_MOVE_MULTIPLE`: rejects entries when the target move does not cover modeled fees/slippage
 - `BOT_KILL_SWITCH_PATH`: if this file exists, new entries are blocked immediately
+- `BOT_TRAINING_SAMPLE_LOG_PATH`: shared JSONL sink for per-trade training samples
+- `BOT_BASELINE_NETWORK_PATH`: baseline network snapshot used to seed per-instance network clones
 - `BOT_RISK_PER_TRADE_PCT`: fraction of equity risked on each trade
 - `BOT_STOP_LOSS_PCT`: hard stop distance
 - `BOT_TAKE_PROFIT_PCT`: profit target
@@ -105,6 +141,15 @@ The main knobs live in `.env`:
 - Each closed trade is appended to `logs/trades.jsonl` with timestamp, direction, entry/exit, position size, entry reason, `entry_quality_score`, indicator snapshot, market state, reason tag, result, P&L, and trade duration.
 - Each signal evaluation is appended to `logs/signals.jsonl` with the candidate action, market state, `entry_quality_score`, indicators, and any explicit block reason such as `blocked_choppy_market`.
 - Each timed `session` run emits a JSON summary with total trades, wins, losses, win rate, max drawdown, final P&L, and halt reason.
+- Each closed trade also emits a training row to `logs/training/trade_samples.jsonl` with the exact entry feature vector, network scores, fee-aware/raw labels, holding time, and excursion stats.
+- Swarm runs write isolated artifacts per instance under `state/instances/`, `logs/instances/`, `reports/generation_*/instances/`, `models/instances/`, and `viz/instances/`.
+
+## Swarm Overview
+
+- `zerk1` and `zerk2` are reckless exploration agents that bias toward fast momentum and contrarian scalp discovery.
+- `tr1` through `tr8` are structured descendants of the current rule engine with different weighting, thresholds, and network trust.
+- All swarm bots share one Coinbase market frame per cycle, then decide independently with isolated capital buckets and isolated state/log paths.
+- After a swarm session, the orchestrator emits `reports/generation_XXX/swarm_session_report.json` and `reports/generation_XXX/next_generation_proposals.json`.
 
 ## Sources
 

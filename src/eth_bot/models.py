@@ -31,6 +31,25 @@ class ProductInfo:
 
 
 @dataclass
+class MarketFrame:
+    timestamp: datetime
+    product: ProductInfo
+    candles: list[Candle]
+    current_price: float
+
+
+@dataclass
+class NetworkScores:
+    prob_win_long: float
+    prob_win_short: float
+    hidden_activations: list[list[float]] = field(default_factory=list)
+    version: str = ""
+
+    def to_json(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class Position:
     side: str
     quantity: float
@@ -49,6 +68,15 @@ class Position:
     market_state: str = "UNKNOWN"
     entry_indicators: dict[str, Any] = field(default_factory=dict)
     entry_quality_score: int = 0
+    instance_id: str = "singleton"
+    family: str = "single"
+    generation: int = 0
+    profile_name: str = "default"
+    network_version: str = ""
+    entry_network_scores: dict[str, Any] = field(default_factory=dict)
+    entry_feature_vector: list[float] = field(default_factory=list)
+    max_favorable_excursion_pct: float = 0.0
+    max_adverse_excursion_pct: float = 0.0
 
 
 @dataclass
@@ -74,6 +102,20 @@ class ClosedTrade:
     market_state: str = "UNKNOWN"
     entry_indicators: dict[str, Any] = field(default_factory=dict)
     entry_quality_score: int = 0
+    instance_id: str = "singleton"
+    family: str = "single"
+    generation: int = 0
+    profile_name: str = "default"
+    network_version: str = ""
+    network_scores_at_entry: dict[str, Any] = field(default_factory=dict)
+    entry_feature_vector: list[float] = field(default_factory=list)
+    pnl_raw: float = 0.0
+    pnl_fee_aware: float = 0.0
+    label_win_raw: int = 0
+    label_win_fee_aware: int = 0
+    max_favorable_excursion_pct: float = 0.0
+    max_adverse_excursion_pct: float = 0.0
+    drawdown_contribution_pct: float = 0.0
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -114,6 +156,15 @@ class BotState:
             legacy_position.setdefault("market_state", "UNKNOWN")
             legacy_position.setdefault("entry_indicators", {})
             legacy_position.setdefault("entry_quality_score", 0)
+            legacy_position.setdefault("instance_id", "singleton")
+            legacy_position.setdefault("family", "single")
+            legacy_position.setdefault("generation", 0)
+            legacy_position.setdefault("profile_name", "default")
+            legacy_position.setdefault("network_version", "")
+            legacy_position.setdefault("entry_network_scores", {})
+            legacy_position.setdefault("entry_feature_vector", [])
+            legacy_position.setdefault("max_favorable_excursion_pct", 0.0)
+            legacy_position.setdefault("max_adverse_excursion_pct", 0.0)
             position = Position(**legacy_position)
         else:
             position = None
@@ -133,6 +184,20 @@ class BotState:
             legacy_trade.setdefault("market_state", "UNKNOWN")
             legacy_trade.setdefault("entry_indicators", {})
             legacy_trade.setdefault("entry_quality_score", 0)
+            legacy_trade.setdefault("instance_id", "singleton")
+            legacy_trade.setdefault("family", "single")
+            legacy_trade.setdefault("generation", 0)
+            legacy_trade.setdefault("profile_name", "default")
+            legacy_trade.setdefault("network_version", "")
+            legacy_trade.setdefault("network_scores_at_entry", {})
+            legacy_trade.setdefault("entry_feature_vector", [])
+            legacy_trade.setdefault("pnl_raw", pnl_value)
+            legacy_trade.setdefault("pnl_fee_aware", pnl_value)
+            legacy_trade.setdefault("label_win_raw", 1 if float(legacy_trade["pnl_raw"]) > 0 else 0)
+            legacy_trade.setdefault("label_win_fee_aware", 1 if float(legacy_trade["pnl_fee_aware"]) > 0 else 0)
+            legacy_trade.setdefault("max_favorable_excursion_pct", 0.0)
+            legacy_trade.setdefault("max_adverse_excursion_pct", 0.0)
+            legacy_trade.setdefault("drawdown_contribution_pct", 0.0)
             opened_at = legacy_trade.get("opened_at")
             closed_at = legacy_trade.get("closed_at")
             duration_seconds = 0.0
@@ -180,3 +245,4 @@ class StrategyDecision:
     trailing_stop: float | None = None
     market_state: str = "UNKNOWN"
     indicators: dict[str, Any] = field(default_factory=dict)
+    network_scores: NetworkScores | None = None

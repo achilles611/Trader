@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -109,6 +110,8 @@ class BotConfig:
     state_path: Path
     trade_log_path: Path
     signal_log_path: Path
+    training_sample_log_path: Path
+    baseline_network_path: Path
     coinbase_api_key: str | None
     coinbase_api_secret: str | None
 
@@ -207,6 +210,10 @@ class BotConfig:
             state_path=Path(os.getenv("BOT_STATE_PATH", "state/bot_state.json")),
             trade_log_path=Path(os.getenv("BOT_TRADE_LOG_PATH", "logs/trades.jsonl")),
             signal_log_path=Path(os.getenv("BOT_SIGNAL_LOG_PATH", "logs/signals.jsonl")),
+            training_sample_log_path=Path(
+                os.getenv("BOT_TRAINING_SAMPLE_LOG_PATH", "logs/training/trade_samples.jsonl")
+            ),
+            baseline_network_path=Path(os.getenv("BOT_BASELINE_NETWORK_PATH", "models/baseline/network.json")),
             coinbase_api_key=os.getenv("COINBASE_API_KEY") or None,
             coinbase_api_secret=os.getenv("COINBASE_API_SECRET") or None,
         )
@@ -313,3 +320,123 @@ class BotConfig:
             raise ValueError("BOT_RSI_ENTRY_FLOOR must be <= BOT_RSI_ENTRY_CEILING.")
         if self.mode == "live" and (not self.coinbase_api_key or not self.coinbase_api_secret):
             raise ValueError("Live mode requires COINBASE_API_KEY and COINBASE_API_SECRET.")
+
+
+@dataclass(frozen=True)
+class InstancePaths:
+    state_path: Path
+    trade_log_path: Path
+    signal_log_path: Path
+    report_path: Path
+    network_snapshot_path: Path
+    network_viz_path: Path
+    network_json_path: Path
+    activations_path: Path
+
+
+@dataclass(frozen=True)
+class StrategyProfile:
+    entry_threshold_long: float
+    entry_threshold_short: float
+    weight_trend: float
+    weight_pullback: float
+    weight_momentum: float
+    weight_cross: float
+    weight_rsi: float
+    weight_near_extreme_penalty: float
+    weight_network: float
+    rule_weight: float = 1.0
+    exploration_bonus: float = 0.0
+    block_entries_in_chop: bool = True
+    allow_near_recent_high_long: bool = False
+    allow_near_recent_low_short: bool = False
+    allow_countertrend: bool = False
+    max_hold_seconds: int = 3600
+    cooldown_after_loss_seconds: int = 180
+    cooldown_after_win_seconds: int = 45
+    flip_cooldown_seconds: int = 180
+    min_confirmation_signals: int = 3
+    aggressive_entries: bool = False
+    long_bias: float = 0.0
+    short_bias: float = 0.0
+
+    def validate(self) -> None:
+        if self.entry_threshold_long < 0 or self.entry_threshold_short < 0:
+            raise ValueError("Entry thresholds must be >= 0.")
+        if self.max_hold_seconds < 1:
+            raise ValueError("max_hold_seconds must be at least 1.")
+        if self.min_confirmation_signals < 1:
+            raise ValueError("min_confirmation_signals must be at least 1.")
+
+
+@dataclass(frozen=True)
+class NetworkConfig:
+    layer_sizes: tuple[int, ...] = (24, 32, 24, 16, 8, 2)
+    learning_rate: float = 0.01
+    seed: int = 7
+    mutation_scale: float = 0.05
+    version: str = "baseline-v1"
+
+    def validate(self) -> None:
+        if len(self.layer_sizes) < 2:
+            raise ValueError("layer_sizes must include at least an input and output layer.")
+        if self.layer_sizes[0] != 24:
+            raise ValueError("The baseline network expects 24 input features.")
+        if self.layer_sizes[-1] != 2:
+            raise ValueError("The baseline network expects two output logits.")
+        if self.learning_rate <= 0:
+            raise ValueError("learning_rate must be > 0.")
+        if self.mutation_scale < 0:
+            raise ValueError("mutation_scale must be >= 0.")
+
+
+@dataclass(frozen=True)
+class BotInstanceConfig:
+    instance_id: str
+    family: str
+    generation: int
+    profile_name: str
+    base_config: BotConfig
+    strategy_profile: StrategyProfile
+    network_config: NetworkConfig
+    storage_paths: InstancePaths
+
+    @property
+    def logger_name(self) -> str:
+        return f"eth_bot.{self.instance_id}"
+
+
+def build_instance_paths(root_dir: Path, instance_id: str, generation: int = 0) -> InstancePaths:
+    generation_segment = f"generation_{generation:03d}" if generation > 0 else "singleton"
+    return InstancePaths(
+        state_path=root_dir / "state" / "instances" / instance_id / "state.json",
+        trade_log_path=root_dir / "logs" / "instances" / instance_id / "trades.jsonl",
+        signal_log_path=root_dir / "logs" / "instances" / instance_id / "signals.jsonl",
+        report_path=root_dir / "reports" / generation_segment / "instances" / instance_id / "session_report.json",
+        network_snapshot_path=root_dir / "models" / "instances" / instance_id / "network.json",
+        network_viz_path=root_dir / "viz" / "instances" / instance_id / "network.svg",
+        network_json_path=root_dir / "viz" / "instances" / instance_id / "network.json",
+        activations_path=root_dir / "viz" / "instances" / instance_id / "activations_latest.json",
+    )
+
+
+def apply_instance_overrides(
+    base_config: BotConfig,
+    profile: StrategyProfile,
+    paths: InstancePaths,
+) -> BotConfig:
+    profile.validate()
+    return replace(
+        base_config,
+        aggressive_entries=profile.aggressive_entries,
+        block_entries_in_chop=profile.block_entries_in_chop,
+        min_confirmation_signals=profile.min_confirmation_signals,
+        cooldown_after_loss_seconds=profile.cooldown_after_loss_seconds,
+        cooldown_after_win_seconds=profile.cooldown_after_win_seconds,
+        flip_cooldown_seconds=profile.flip_cooldown_seconds,
+        max_trade_duration_minutes=max(1, math.ceil(profile.max_hold_seconds / 60)),
+        state_path=paths.state_path,
+        trade_log_path=paths.trade_log_path,
+        signal_log_path=paths.signal_log_path,
+    )
+

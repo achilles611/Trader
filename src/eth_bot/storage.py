@@ -42,3 +42,12 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
 
 def append_trade(path: Path, trade: ClosedTrade) -> None:
     append_jsonl(path, trade.to_json())
+
+
+def append_training_sample(path: Path, payload: dict[str, Any]) -> None:
+    append_jsonl(path, payload)
+
+
+def save_json(path: Path, payload: dict[str, Any]) -> None:
+    ensure_parent(path)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

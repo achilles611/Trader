@@ -8,6 +8,7 @@ from pathlib import Path
 from .backtest import run_backtest
 from .bot import TradingBot
 from .config import BotConfig
+from .orchestrator import SwarmOrchestrator, evolve_generation, profile_dump, render_instance_visual, train_baseline_network
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,6 +39,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=1000,
         help="How many candles to pull from Coinbase public data.",
     )
+
+    swarm_parser = subparsers.add_parser("swarm-session", help="Run the 10-bot paper swarm.")
+    swarm_parser.add_argument("--minutes", type=float, default=60.0, help="How long to run the swarm session.")
+    swarm_parser.add_argument("--generation", type=int, default=1, help="Generation number for reports and profiles.")
+
+    evolve_parser = subparsers.add_parser("evolve", help="Score one generation and emit next-generation proposals.")
+    evolve_parser.add_argument("--from-generation", type=int, required=True, help="Generation to read reports from.")
+    evolve_parser.add_argument("--to-generation", type=int, required=True, help="Generation number to emit proposals for.")
+
+    train_parser = subparsers.add_parser("train-network", help="Train the baseline neural scorer from trade samples.")
+    train_parser.add_argument("--input", type=str, default="", help="Training sample JSONL path.")
+    train_parser.add_argument("--epochs", type=int, default=12, help="Training epochs.")
+
+    viz_parser = subparsers.add_parser("viz-network", help="Render one instance network bundle.")
+    viz_parser.add_argument("--instance", type=str, required=True, help="Instance id, for example tr4.")
+    viz_parser.add_argument("--generation", type=int, default=1, help="Generation number for instance paths.")
+
+    profile_parser = subparsers.add_parser("profile-dump", help="Print the configured swarm profiles for a generation.")
+    profile_parser.add_argument("--generation", type=int, default=1, help="Generation number to inspect.")
     return parser
 
 
@@ -81,6 +101,37 @@ def main(argv: list[str] | None = None) -> int:
             report_path = Path(args.report_file)
             report_path.parent.mkdir(parents=True, exist_ok=True)
             report_path.write_text(dumps(report, indent=2), encoding="utf-8")
+        print(dumps(report, indent=2))
+        return 0
+
+    if args.command == "swarm-session":
+        orchestrator = SwarmOrchestrator(config, generation=args.generation)
+        report = orchestrator.run_session(minutes=args.minutes)
+        print(dumps(report, indent=2))
+        return 0
+
+    if args.command == "evolve":
+        report = evolve_generation(
+            config,
+            from_generation=args.from_generation,
+            to_generation=args.to_generation,
+        )
+        print(dumps(report, indent=2))
+        return 0
+
+    if args.command == "train-network":
+        input_path = Path(args.input) if args.input else config.training_sample_log_path
+        report = train_baseline_network(config, input_path, epochs=args.epochs)
+        print(dumps(report, indent=2))
+        return 0
+
+    if args.command == "viz-network":
+        report = render_instance_visual(config, args.instance, generation=args.generation)
+        print(dumps(report, indent=2))
+        return 0
+
+    if args.command == "profile-dump":
+        report = profile_dump(config, generation=args.generation)
         print(dumps(report, indent=2))
         return 0
 
