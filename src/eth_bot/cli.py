@@ -8,7 +8,9 @@ from pathlib import Path
 from .backtest import run_backtest
 from .bot import TradingBot
 from .config import BotConfig
+from .dashboard import serve_dashboard, write_swarm_dashboard
 from .orchestrator import SwarmOrchestrator, evolve_generation, profile_dump, render_instance_visual, train_baseline_network
+from .profiles import SWARM_INSTANCE_IDS
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -58,6 +60,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     profile_parser = subparsers.add_parser("profile-dump", help="Print the configured swarm profiles for a generation.")
     profile_parser.add_argument("--generation", type=int, default=1, help="Generation number to inspect.")
+
+    dashboard_parser = subparsers.add_parser("dashboard", help="Write the live swarm dashboard shell for a generation.")
+    dashboard_parser.add_argument("--generation", type=int, default=1, help="Generation number to render.")
+
+    dashboard_serve_parser = subparsers.add_parser(
+        "dashboard-serve",
+        help="Write the swarm dashboard shell and serve it locally.",
+    )
+    dashboard_serve_parser.add_argument("--generation", type=int, default=1, help="Generation number to render.")
+    dashboard_serve_parser.add_argument("--port", type=int, default=8000, help="Local HTTP port.")
     return parser
 
 
@@ -72,13 +84,14 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging()
     args = build_parser().parse_args(argv)
     config = BotConfig.from_env()
-    bot = TradingBot(config)
 
     if args.command == "run":
+        bot = TradingBot(config)
         bot.run_forever()
         return 0
 
     if args.command == "once":
+        bot = TradingBot(config)
         bot.run_once()
         return 0
 
@@ -96,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "session":
+        bot = TradingBot(config)
         report = bot.run_session(minutes=args.minutes)
         if args.report_file:
             report_path = Path(args.report_file)
@@ -133,6 +147,36 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "profile-dump":
         report = profile_dump(config, generation=args.generation)
         print(dumps(report, indent=2))
+        return 0
+
+    if args.command == "dashboard":
+        dashboard_path = write_swarm_dashboard(Path("."), args.generation, list(SWARM_INSTANCE_IDS))
+        print(
+            dumps(
+                {
+                    "generation": args.generation,
+                    "dashboard_path": str(dashboard_path),
+                    "manifest_path": str(dashboard_path.parent / "dashboard_manifest.json"),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "dashboard-serve":
+        dashboard_path = write_swarm_dashboard(Path("."), args.generation, list(SWARM_INSTANCE_IDS))
+        print(
+            dumps(
+                {
+                    "generation": args.generation,
+                    "dashboard_path": str(dashboard_path),
+                    "manifest_path": str(dashboard_path.parent / "dashboard_manifest.json"),
+                    "port": args.port,
+                },
+                indent=2,
+            )
+        )
+        serve_dashboard(dashboard_path, port=args.port)
         return 0
 
     return 1

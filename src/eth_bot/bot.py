@@ -323,6 +323,35 @@ class TradingBot:
             "open_position_market_state": state.position.market_state if state.position else None,
         }
 
+    def write_visual_snapshot(self, frame: MarketFrame | None = None) -> None:
+        active_frame = frame or self.market_data.get_market_frame(
+            product_id=self.config.product_id,
+            granularity=self.config.granularity,
+            limit=self.config.lookback_candles,
+        )
+        state = self.load_state()
+        snapshot = self.snapshot_from_frame(active_frame)
+        decision = self.strategy.evaluate(active_frame.candles, state.position) if active_frame.candles else None
+        self._save_visual_bundle(
+            state,
+            equity=snapshot["equity"],
+            current_price=active_frame.current_price,
+            halt_reason=snapshot["halt_reason"],
+            updated_at=snapshot["captured_at"],
+            current_market_state=decision.market_state if decision else snapshot["open_position_market_state"],
+            network_scores=decision.network_scores if decision else None,
+            latest_signal=(
+                {
+                    "action_candidate": decision.action,
+                    "reason": decision.reason,
+                    "block_reason": decision.reason if decision.action == "hold" else None,
+                    "executed": False,
+                }
+                if decision is not None
+                else None
+            ),
+        )
+
     def run_forever(self) -> None:
         self.logger.info("%s Starting bot in %s mode for %s", self.log_prefix, self.config.mode, self.config.product_id)
         while True:
@@ -387,7 +416,14 @@ class TradingBot:
             f"{state.position.side}:{state.position.quantity:.6f}" if state.position else "flat",
             halt_reason or "no",
         )
-        self._write_network_artifacts(state, signal_event, refreshed_equity)
+        self._write_network_artifacts(
+            state,
+            signal_event,
+            refreshed_equity,
+            current_price=current_price,
+            halt_reason=halt_reason,
+            updated_at=now.isoformat(),
+        )
         return {
             "captured_at": now.isoformat(),
             "instance_id": self.instance.instance_id,
@@ -1043,9 +1079,51 @@ class TradingBot:
             "trades": [trade.to_json() for trade in session_trades],
         }
 
-    def _write_network_artifacts(self, state: BotState, signal_event: dict[str, Any], equity: float) -> None:
-        indicators = signal_event.get("indicators", {})
-        network_scores = self.strategy.network.forward(indicators["feature_vector"]) if indicators.get("feature_vector") else None
+    def _current_position_payload(self, position: Position | None) -> dict[str, Any]:
+        if position is None:
+            return {
+                "side": "flat",
+                "quantity": 0.0,
+                "entry_price": None,
+                "entry_reason": None,
+                "market_state": None,
+            }
+        return {
+            "side": position.side,
+            "quantity": position.quantity,
+            "entry_price": position.entry_price,
+            "entry_reason": position.entry_reason,
+            "market_state": position.market_state,
+            "opened_at": position.opened_at,
+            "position_size": position.position_size,
+        }
+
+    def _live_stats_payload(self, state: BotState) -> dict[str, Any]:
+        total_trades = len(state.closed_trades)
+        wins = sum(1 for trade in state.closed_trades if trade.result == "WIN")
+        losses = sum(1 for trade in state.closed_trades if trade.result == "LOSS")
+        realized_pnl = sum(trade.pnl for trade in state.closed_trades)
+        return {
+            "total_trades": total_trades,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": (wins / total_trades * 100) if total_trades else 0.0,
+            "realized_pnl": realized_pnl,
+            "consecutive_losses": state.consecutive_losses,
+        }
+
+    def _save_visual_bundle(
+        self,
+        state: BotState,
+        *,
+        equity: float,
+        current_price: float | None,
+        halt_reason: str | None,
+        updated_at: str,
+        current_market_state: str | None,
+        network_scores,
+        latest_signal: dict[str, Any] | None,
+    ) -> None:
         last_trade = state.closed_trades[-1].to_json() if state.closed_trades else None
         save_network_bundle(
             self.network,
@@ -1056,9 +1134,43 @@ class TradingBot:
             profile_name=self.instance.profile_name,
             profile=self.instance.strategy_profile,
             network_scores=network_scores,
-            current_market_state=signal_event.get("market_state"),
+            current_market_state=current_market_state,
             current_equity=equity,
+            current_price=current_price,
+            halt_reason=halt_reason,
+            current_position=self._current_position_payload(state.position),
+            live_stats=self._live_stats_payload(state),
+            latest_signal=latest_signal,
+            updated_at=updated_at,
             last_trade=last_trade,
+        )
+
+    def _write_network_artifacts(
+        self,
+        state: BotState,
+        signal_event: dict[str, Any],
+        equity: float,
+        *,
+        current_price: float | None,
+        halt_reason: str | None,
+        updated_at: str,
+    ) -> None:
+        indicators = signal_event.get("indicators", {})
+        network_scores = self.strategy.network.forward(indicators["feature_vector"]) if indicators.get("feature_vector") else None
+        self._save_visual_bundle(
+            state,
+            equity=equity,
+            current_price=current_price,
+            halt_reason=halt_reason,
+            updated_at=updated_at,
+            current_market_state=signal_event.get("market_state"),
+            network_scores=network_scores,
+            latest_signal={
+                "action_candidate": signal_event.get("action_candidate"),
+                "reason": signal_event.get("reason"),
+                "block_reason": signal_event.get("block_reason"),
+                "executed": signal_event.get("executed"),
+            },
         )
 
     def run_session(self, minutes: float) -> dict[str, Any]:

@@ -8,12 +8,12 @@ from typing import Any
 
 from .bot import SessionTracker, TradingBot
 from .config import BotConfig, BotInstanceConfig
+from .dashboard import write_swarm_dashboard
 from .evolution import load_generation_reports, propose_next_generation
 from .market_data import CoinbasePublicClient, TransientMarketDataError
 from .network import NeuralNetwork, load_training_samples
 from .profiles import SWARM_INSTANCE_IDS, build_swarm_instance_configs
 from .storage import save_json
-from .visualize import save_network_bundle
 
 
 class SwarmOrchestrator:
@@ -60,10 +60,22 @@ class SwarmOrchestrator:
             )
         return bots
 
+    @property
+    def dashboard_path(self) -> Path:
+        return self.root_dir / "viz" / "dashboard" / f"generation_{self.generation:03d}" / "dashboard.html"
+
+    def write_dashboard(self) -> Path:
+        return write_swarm_dashboard(
+            self.root_dir,
+            self.generation,
+            [instance.instance_id for instance in self.instances],
+        )
+
     def run_session(self, minutes: float) -> dict[str, Any]:
         if minutes <= 0:
             raise ValueError("Session duration must be greater than 0 minutes.")
 
+        dashboard_path = self.write_dashboard()
         initial_frame = self.market_data.get_market_frame(
             product_id=self.base_config.product_id,
             granularity=self.base_config.granularity,
@@ -73,6 +85,8 @@ class SwarmOrchestrator:
             bot.instance.instance_id: bot.start_session_tracker(minutes=minutes, frame=initial_frame)
             for bot in self.bots
         }
+        for bot in self.bots:
+            bot.write_visual_snapshot(initial_frame)
         deadline = time.monotonic() + (minutes * 60)
         last_frame = initial_frame
         transient_market_data_errors = 0
@@ -117,21 +131,14 @@ class SwarmOrchestrator:
             report["shared_transient_market_data_errors"] = transient_market_data_errors
             reports[bot.instance.instance_id] = report
             save_json(bot.instance.storage_paths.report_path, report)
-            save_network_bundle(
-                bot.network,
-                bot.instance.storage_paths,
-                instance_id=bot.instance.instance_id,
-                family=bot.instance.family,
-                generation=bot.instance.generation,
-                profile_name=bot.instance.profile_name,
-                profile=bot.instance.strategy_profile,
-            )
+            bot.write_visual_snapshot(last_frame)
 
         summary = {
             "generation": self.generation,
             "started_at": min(tracker.started_at for tracker in trackers.values()).isoformat(),
             "ended_at": datetime.utcnow().isoformat(),
             "minutes": minutes,
+            "dashboard_path": str(dashboard_path),
             "instance_reports": reports,
             "next_generation_proposals": propose_next_generation(self.instances, reports, to_generation=self.generation + 1),
         }
@@ -140,6 +147,7 @@ class SwarmOrchestrator:
             self.generation_root / "next_generation_proposals.json",
             summary["next_generation_proposals"],
         )
+        self.write_dashboard()
         return summary
 
     @property
@@ -201,15 +209,17 @@ def render_instance_visual(config: BotConfig, instance_id: str, generation: int,
         raise ValueError(f"Unknown instance_id={instance_id}. Expected one of: {', '.join(SWARM_INSTANCE_IDS)}")
     instance = instances[instance_id]
     network = NeuralNetwork.load_or_create(instance.storage_paths.network_snapshot_path, instance.network_config)
-    save_network_bundle(
-        network,
-        instance.storage_paths,
-        instance_id=instance.instance_id,
-        family=instance.family,
-        generation=instance.generation,
-        profile_name=instance.profile_name,
-        profile=instance.strategy_profile,
+    bot = TradingBot(
+        instance.base_config,
+        instance_config=instance,
+        market_data=CoinbasePublicClient(
+            timeout_seconds=config.market_data_timeout_seconds,
+            max_retries=config.market_data_max_retries,
+            retry_backoff_seconds=config.market_data_retry_backoff_seconds,
+        ),
+        network=network,
     )
+    bot.write_visual_snapshot()
     return {
         "instance_id": instance_id,
         "network_snapshot_path": str(instance.storage_paths.network_snapshot_path),

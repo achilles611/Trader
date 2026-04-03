@@ -20,6 +20,19 @@ def _line_width(weight: float) -> float:
     return max(0.5, min(4.5, abs(weight) * 8))
 
 
+def _profile_traits_payload(profile: StrategyProfile) -> dict[str, Any]:
+    return {
+        "aggressive_entries": profile.aggressive_entries,
+        "block_entries_in_chop": profile.block_entries_in_chop,
+        "max_hold_seconds": profile.max_hold_seconds,
+        "rule_weight": profile.rule_weight,
+        "weight_network": profile.weight_network,
+        "entry_threshold_long": profile.entry_threshold_long,
+        "entry_threshold_short": profile.entry_threshold_short,
+        "min_confirmation_signals": profile.min_confirmation_signals,
+    }
+
+
 def save_network_bundle(
     network: NeuralNetwork,
     paths: InstancePaths,
@@ -32,6 +45,12 @@ def save_network_bundle(
     network_scores: NetworkScores | None = None,
     current_market_state: str | None = None,
     current_equity: float | None = None,
+    current_price: float | None = None,
+    halt_reason: str | None = None,
+    current_position: dict[str, Any] | None = None,
+    live_stats: dict[str, Any] | None = None,
+    latest_signal: dict[str, Any] | None = None,
+    updated_at: str | None = None,
     last_trade: dict[str, Any] | None = None,
 ) -> None:
     payload = network.to_json()
@@ -48,9 +67,16 @@ def save_network_bundle(
         "family": family,
         "generation": generation,
         "profile_name": profile_name,
+        "updated_at": updated_at,
         "current_market_state": current_market_state,
         "current_equity": current_equity,
+        "current_price": current_price,
+        "halt_reason": halt_reason,
+        "current_position": current_position,
         "network_scores": network_scores.to_json() if network_scores else None,
+        "profile_traits": _profile_traits_payload(profile),
+        "live_stats": live_stats,
+        "latest_signal": latest_signal,
         "last_trade": last_trade,
     }
     paths.activations_path.write_text(json.dumps(activations_payload, indent=2), encoding="utf-8")
