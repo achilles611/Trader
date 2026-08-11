@@ -76,18 +76,41 @@ class CopyTradeService:
             raise KeyError(f"Target not found: {wallet}")
 
     def backfill(self, wallet: str, *, start: object | None = None, end: object | None = None) -> dict[str, object]:
+        return self._backfill_with_adapter(wallet, self.adapter, start=start, end=end)
+
+    def backfill_for_analysis(self, wallet: str, *, start: object, end: object | None = None) -> dict[str, object]:
+        """Phase B worker-safe public backfill using a dedicated adapter/session.
+
+        The public adapter stores coverage from its most recent request, so a
+        separate instance prevents concurrent analysis workers from crossing
+        that bookkeeping.  This remains source ingestion only.
+        """
+        return self._backfill_with_adapter(wallet, HyperliquidPublicAdapter(self.config.source), start=start, end=end)
+
+    def _backfill_with_adapter(
+        self, wallet: str, adapter: HyperliquidPublicAdapter, *, start: object | None, end: object | None,
+    ) -> dict[str, object]:
         target = self.database.get_target(wallet)
         if not target:
             raise KeyError(f"Target must be imported before backfill: {wallet}")
         start_at = start or self.database.latest_fill_time(wallet) or (utc_now() - timedelta(days=90))
-        fills = self.adapter.backfill_fills(wallet, start_at, end)
-        coverage = self.adapter.last_backfill_coverage
+        try:
+            fills = adapter.backfill_fills(wallet, start_at, end)
+        except Exception:
+            # Dense public-history intervals explicitly mark coverage known
+            # incomplete before raising. Persist that evidence for Phase B's
+            # hard quarantine instead of collapsing it into a generic retry.
+            coverage = adapter.last_backfill_coverage
+            if coverage:
+                self.database.insert_backfill_coverage(wallet, coverage)
+            raise
+        coverage = adapter.last_backfill_coverage
         if coverage:
             self.database.insert_backfill_coverage(wallet, coverage)
         inserted = self.database.insert_raw_fills(fills)
-        snapshot = self.adapter.fetch_clearinghouse_state(wallet)
+        snapshot = adapter.fetch_clearinghouse_state(wallet)
         self.database.insert_snapshot(snapshot)
-        portfolio = self.adapter.fetch_portfolio(wallet)
+        portfolio = adapter.fetch_portfolio(wallet)
         self._store_portfolio_snapshot(wallet, portfolio)
         reconstruction = self.reconstruct(wallet)
         return {

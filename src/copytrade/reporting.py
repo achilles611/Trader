@@ -9,7 +9,7 @@ from typing import Callable, Iterable
 from .analytics import campaign_return_series, calculate_trader_metrics, drawdown_curve, equity_curve
 from .backtest import CopyTradeBacktester
 from .config import CopyTradeConfig
-from .models import BacktestRun, CandidateScore, PositionCampaign, PositionEvent, TraderMetrics
+from .models import BacktestRun, CandidateAnalysis, CandidateScore, PositionCampaign, PositionEvent, TraderMetrics
 from .storage import CopyTradeDatabase
 
 
@@ -31,10 +31,11 @@ class ObsidianExporter:
         events = self._enriched_events(wallet)
         metrics = self.database.latest_metrics(wallet) or calculate_trader_metrics(wallet, campaigns, events, self.config.sizing)
         score = next((item for item in self.database.latest_scores() if item.target_wallet == wallet.lower()), None)
+        analysis = self.database.get_candidate_analysis(wallet)
         charts = self._target_charts(wallet, campaigns, metrics, events)
         note = self.root / "Targets" / f"{wallet.lower()}.md"
         note.parent.mkdir(parents=True, exist_ok=True)
-        note.write_text(self._target_markdown(target.status, wallet, metrics, score, charts), encoding="utf-8")
+        note.write_text(self._target_markdown(target.status, wallet, metrics, score, analysis, charts), encoding="utf-8")
         return note
 
     def export_dashboard(self) -> Path:
@@ -146,7 +147,8 @@ class ObsidianExporter:
         return paths
 
     def _target_markdown(
-        self, status: str, wallet: str, metrics: TraderMetrics, score: CandidateScore | None, charts: dict[str, Path]
+        self, status: str, wallet: str, metrics: TraderMetrics, score: CandidateScore | None,
+        analysis: CandidateAnalysis | None, charts: dict[str, Path],
     ) -> str:
         score_value = score.total_score if score else 0.0
         frontmatter = {
@@ -162,6 +164,18 @@ class ObsidianExporter:
             f"### {name.replace('_', ' ').title()}\n\n![]({(Path('..') / path.relative_to(self.root)).as_posix()})"
             for name, path in charts.items()
         )
+        phase_b = ""
+        if analysis:
+            summary = analysis.summary
+            follower = summary.get("follower", {}) if isinstance(summary, dict) else {}
+            copyability = summary.get("copyability", {}) if isinstance(summary, dict) else {}
+            phase_b = (
+                "\n## Phase B research analysis\n\n"
+                f"- Lifecycle: {analysis.lifecycle_status}; reasons: {', '.join(analysis.prefilter_reasons) or 'none'}\n"
+                f"- Follower net P&L: {float(follower.get('net_pnl', 0.0)):.2f}; follower drawdown: {float(follower.get('max_drawdown', 0.0)):.2%}\n"
+                f"- Copyability: {copyability.get('status', 'unavailable')} ({copyability.get('score', 'n/a')})\n"
+                f"- Analysis errors: {', '.join(analysis.errors) or 'none'}\n"
+            )
         return (
             "---\n" + frontmatter_text + "\n---\n\n# " + wallet.lower() +
             "\n\n## Target performance\n\n"
@@ -170,7 +184,7 @@ class ObsidianExporter:
             f"- Historical coverage: {metrics.raw.get('coverage_state', 'UNPROVEN')} ({metrics.raw.get('coverage_quality', 'not recorded')})\n"
             f"- Win rate: {metrics.win_rate:.2%}; profit factor: {metrics.profit_factor:.2f}; expectancy: {metrics.expectancy:.2f}\n"
             f"- Martingale indicator: {metrics.martingale_indicator}; adverse averaging: {metrics.adverse_averaging_indicator}\n\n"
-            "## Simulated follower performance\n\nLatency and follower-equity charts below are deterministic paper simulations using the report configuration. These are deliberately not inferred from target fills alone.\n\n" + embeds + "\n"
+            "## Simulated follower performance\n\nLatency and follower-equity charts below are deterministic paper simulations using the report configuration. These are deliberately not inferred from target fills alone.\n" + phase_b + "\n" + embeds + "\n"
         )
 
 

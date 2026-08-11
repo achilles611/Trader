@@ -49,6 +49,7 @@ SQLite tables are deliberately isolated in `artifacts/copytrade.sqlite3`:
 - `copy_trader_snapshots`, `copy_daily_metrics`, and `copy_candidate_scores`
 - `copy_signals`, `copy_virtual_positions`, `copy_execution_attempts`, `copy_execution_claims`, and `copy_execution_fills`
 - `copy_backtest_runs`, `copy_portfolio_snapshots`, and `copy_backfill_coverage`
+- `copy_analysis_runs`, `copy_analysis_run_wallets`, and `copy_candidate_analyses`
 
 The small `CopyTradeStore` contract means a PostgreSQL backend can replace the
 SQLite implementation without changing the research, risk, or paper-execution
@@ -195,6 +196,61 @@ Backfill coverage has three states: `PROVEN_COMPLETE`, `UNPROVEN`, and
 visible warning and source-quality penalty, but remains research-eligible by
 default. `KNOWN_INCOMPLETE` is a hard gate. Set
 `candidates.require_proven_history` only when archive-quality proof is required.
+
+## Phase B candidate analysis
+
+`copy-analyze-candidates` consumes the Phase A candidate universe without
+changing its providers, evidence, candidate registration, or operator target
+statuses. It creates an auditable analysis run and a per-wallet research
+lifecycle separate from manual target status:
+
+```text
+new → prefilter_rejected
+new → backfill_pending → analysis_pending → analyzed / qualified
+                         ↘ backfill_failed / quarantined
+```
+
+The local prefilter rejects invalid wallets, stale activity, insufficient Phase
+A evidence, and already known incomplete coverage with recorded reason codes.
+Survivors use bounded, retrying public backfill workers; each worker has its
+own public adapter so coverage bookkeeping cannot cross wallets. A failure is
+stored per wallet and does not abort the remaining candidate set. `--resume`
+continues an interrupted run, completed analysis is skipped on later runs, and
+`--force` intentionally recalculates it.
+
+```powershell
+# Cheap local sieve only; no public API calls
+python main.py copy-analyze-candidates --status new --limit 500 --cheap-only
+
+# Research-only backfill, reconstruction, follower replay, scoring, and finalists
+python main.py copy-analyze-candidates --status new --limit 500 --workers 4 --output artifacts\candidate-analysis.json
+
+# Resume the newest interrupted run; completed wallets stay skipped unless forced
+python main.py copy-analyze-candidates --resume --workers 4
+python main.py copy-analyze-candidates --status new --force --limit 50
+
+# Future-dashboard-friendly persisted rows and current run state
+python main.py copy-analysis-status --limit 1000
+python main.py copy-rank --count 20
+```
+
+Phase B persists target metrics, follower metrics, sizing/equity-quality
+coverage, slippage scenarios (including 0 bps), latency availability, optional
+walk-forward windows, transparent score components/penalties, and reason codes
+in the candidate-analysis summary. The Follower Capture Ratio is dimensionless:
+simulated follower return on initial follower capital divided by target net P&L
+over the documented target capital denominator. It is marked `unavailable`
+when there are no filled follower entries or no positive observable target
+return; it never falls back to a raw-dollar follower/target P&L ratio.
+
+`KNOWN_INCOMPLETE` backfill coverage is a hard quarantine. `UNPROVEN` remains
+analyzable with the existing source-quality penalty and an explicit reason.
+Latency is `unavailable` unless a historical price path exists, and its absent
+evidence is reweighted out of the score. Historical follower replays are
+in-memory and do not write signals, execution attempts/fills, sleeves, claims,
+or operational portfolio marks. Finalists are diversified greedily using
+time-aligned UTC-day campaign return series; selecting a finalist does not set
+its target state to `shadow` or `approved`.
 
 ## Research outputs and dashboard
 

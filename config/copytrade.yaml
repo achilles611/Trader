@@ -76,7 +76,7 @@ latency:
 
 backtest:
   detection_delays_ms: [100, 250, 500, 1000, 2000, 5000, 15000]
-  slippage_scenarios_bps: [1, 2, 5, 10, 25]
+  slippage_scenarios_bps: [0, 1, 2, 5, 10, 25]
   training_windows_days: [30, 60, 90, 180]
   forward_windows_days: [7, 14, 30]
   default_training_days: 90
@@ -93,6 +93,15 @@ candidates:
   require_positive_follower_expectancy: true
   activity_max_age_days: 30
   require_proven_history: false
+
+# Phase B candidate-analysis orchestration remains public-data research only.
+analysis:
+  default_workers: 4
+  retry_attempts: 3
+  retry_initial_seconds: 0.25
+  history_days: 180
+  min_discovery_activity: 2
+  shadow_finalist_count: 20
 
 artifacts: {}
 

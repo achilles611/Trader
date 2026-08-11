@@ -49,8 +49,10 @@ class CopyTradeBacktester:
         attempts = []
         market_observations: list[dict[str, object]] = []
         execution_details: list[dict[str, object]] = []
+        follower_fees = 0.0
         signals_created = 0
         sizing_decisions: list[dict[str, object]] = []
+        sleeve_buckets: dict[str, str] = {}
         for event in replay_events:
             signals = factory.from_position_event(event, engine.portfolio.cash or 0.0)
             for signal in signals:
@@ -83,8 +85,25 @@ class CopyTradeBacktester:
                         market_metadata = {"source": "unavailable", "quality": "missing_historical_price", "market_timestamp": None}
                 market_observations.append({"event_id": event.event_id, "target_fill_price": event.price, "execution_price": market_price, **market_metadata})
                 attempts.append(engine.process_signal(signal, received_at=received, market_price=market_price, market_metadata=market_metadata))
+                if signal.action in {"open", "add"}:
+                    for fill in engine._pending_fills:
+                        if fill.sleeve_id:
+                            sleeve_buckets[fill.sleeve_id] = signal.reason.removeprefix("size_")
+                follower_fees += sum(fill.fee for fill in engine._pending_fills)
                 execution_details.extend(fill.raw for fill in engine._pending_fills)
         ending = engine.portfolio.equity
+        closed_sleeve_pnl = [sleeve.realized_pnl - sleeve.entry_fee for sleeve in engine.portfolio.sleeves.values() if not sleeve.is_open]
+        positive = sum(value for value in closed_sleeve_pnl if value > 0)
+        negative = abs(sum(value for value in closed_sleeve_pnl if value < 0))
+        pnl_by_wallet: dict[str, float] = {}
+        pnl_by_symbol: dict[str, float] = {}
+        pnl_by_bucket: dict[str, float] = {}
+        for sleeve in engine.portfolio.sleeves.values():
+            pnl = sleeve.realized_pnl - sleeve.entry_fee
+            pnl_by_wallet[sleeve.target_wallet] = pnl_by_wallet.get(sleeve.target_wallet, 0.0) + pnl
+            pnl_by_symbol[sleeve.symbol] = pnl_by_symbol.get(sleeve.symbol, 0.0) + pnl
+            bucket = sleeve_buckets.get(sleeve.sleeve_id, "unclassified")
+            pnl_by_bucket[bucket] = pnl_by_bucket.get(bucket, 0.0) + pnl
         summary = {
             "events_replayed": len(replay_events), "signals_created": signals_created,
             "attempts": len(attempts), "filled_attempts": sum(item.status == "filled" for item in attempts),
@@ -95,6 +114,13 @@ class CopyTradeBacktester:
             "committed_capital": engine.portfolio.committed_capital,
             "open_virtual_positions": len([item for item in engine.portfolio.sleeves.values() if item.is_open]),
             "max_drawdown_fraction": engine.portfolio.max_drawdown_fraction,
+            "follower_profit_factor": positive / negative if negative else (None if positive else 0.0),
+            "follower_expectancy": sum(closed_sleeve_pnl) / len(closed_sleeve_pnl) if closed_sleeve_pnl else 0.0,
+            "follower_closed_campaigns": len(closed_sleeve_pnl),
+            "follower_pnl_by_wallet": pnl_by_wallet,
+            "follower_pnl_by_symbol": pnl_by_symbol,
+            "follower_pnl_by_sizing_bucket": pnl_by_bucket,
+            "follower_fees": follower_fees,
             "follower_equity_curve": engine.equity_history,
             "price_assumption": (
                 "Historical market-price provider plus configured deterministic slippage; historical L2 was not used."

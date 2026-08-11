@@ -8,6 +8,8 @@ from typing import Any, Iterable, Iterator, Protocol
 
 from .models import (
     BacktestRun,
+    AnalysisRun,
+    CandidateAnalysis,
     CandidateScore,
     CopySignal,
     DiscoveryObservation,
@@ -251,6 +253,28 @@ class CopyTradeDatabase:
                 CREATE INDEX IF NOT EXISTS idx_copy_discovery_observations_run ON copy_discovery_observations(run_id, source);
                 CREATE INDEX IF NOT EXISTS idx_copy_discovery_observations_source_wallet ON copy_discovery_observations(source, wallet);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_copy_discovery_observations_event ON copy_discovery_observations(run_id, source_event_id);
+                CREATE TABLE IF NOT EXISTS copy_analysis_runs (
+                    run_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT,
+                    status TEXT NOT NULL, configuration_json TEXT NOT NULL,
+                    wallets_considered INTEGER NOT NULL DEFAULT 0, cheap_rejected INTEGER NOT NULL DEFAULT 0,
+                    backfill_attempted INTEGER NOT NULL DEFAULT 0, backfill_failed INTEGER NOT NULL DEFAULT 0,
+                    reconstructed INTEGER NOT NULL DEFAULT 0, scored INTEGER NOT NULL DEFAULT 0,
+                    eligible INTEGER NOT NULL DEFAULT 0, rejected INTEGER NOT NULL DEFAULT 0,
+                    deferred INTEGER NOT NULL DEFAULT 0, errors_json TEXT NOT NULL DEFAULT '[]'
+                );
+                CREATE TABLE IF NOT EXISTS copy_analysis_run_wallets (
+                    run_id TEXT NOT NULL, wallet TEXT NOT NULL, stage TEXT NOT NULL, status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0, error TEXT, payload_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL, PRIMARY KEY(run_id, wallet)
+                );
+                CREATE INDEX IF NOT EXISTS idx_copy_analysis_run_wallets_status ON copy_analysis_run_wallets(run_id, status);
+                CREATE TABLE IF NOT EXISTS copy_candidate_analyses (
+                    wallet TEXT PRIMARY KEY, lifecycle_status TEXT NOT NULL, last_run_id TEXT,
+                    started_at TEXT, completed_at TEXT, prefilter_reasons_json TEXT NOT NULL DEFAULT '[]',
+                    errors_json TEXT NOT NULL DEFAULT '[]', summary_json TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE INDEX IF NOT EXISTS idx_copy_candidate_analyses_state ON copy_candidate_analyses(lifecycle_status, completed_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_copy_candidate_analyses_run ON copy_candidate_analyses(last_run_id);
                 """
             )
             self._ensure_column(connection, "copy_signals", "target_position_before", "REAL NOT NULL DEFAULT 0")
@@ -538,6 +562,134 @@ class CopyTradeDatabase:
             rows = connection.execute("SELECT * FROM copy_discovery_runs ORDER BY started_at DESC LIMIT ?", (limit,)).fetchall()
         return [dict(row) for row in rows]
 
+    def start_analysis_run(self, run: AnalysisRun) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO copy_analysis_runs(run_id, started_at, finished_at, status, configuration_json,
+                wallets_considered, cheap_rejected, backfill_attempted, backfill_failed, reconstructed, scored,
+                eligible, rejected, deferred, errors_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (run.run_id, iso(run.started_at), iso(run.finished_at) if run.finished_at else None, run.status,
+                 _dump(run.configuration), run.wallets_considered, run.cheap_rejected, run.backfill_attempted,
+                 run.backfill_failed, run.reconstructed, run.scored, run.eligible, run.rejected, run.deferred,
+                 _dump(run.errors)),
+            )
+
+    def finish_analysis_run(
+        self, run_id: str, *, status: str, wallets_considered: int, cheap_rejected: int,
+        backfill_attempted: int, backfill_failed: int, reconstructed: int, scored: int, eligible: int,
+        rejected: int, deferred: int, errors: tuple[str, ...] = (),
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE copy_analysis_runs SET finished_at=?, status=?, wallets_considered=?, cheap_rejected=?,
+                backfill_attempted=?, backfill_failed=?, reconstructed=?, scored=?, eligible=?, rejected=?,
+                deferred=?, errors_json=? WHERE run_id=?""",
+                (iso(None), status, wallets_considered, cheap_rejected, backfill_attempted, backfill_failed,
+                 reconstructed, scored, eligible, rejected, deferred, _dump(errors), run_id),
+            )
+
+    def get_analysis_run(self, run_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM copy_analysis_runs WHERE run_id=?", (run_id,)).fetchone()
+        return dict(row) if row else None
+
+    def latest_resumable_analysis_run(self) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM copy_analysis_runs WHERE status='running' ORDER BY started_at DESC LIMIT 1"
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_analysis_runs(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM copy_analysis_runs ORDER BY started_at DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_analysis_wallet(
+        self, run_id: str, wallet: str, *, stage: str, status: str, attempts: int = 0,
+        error: str | None = None, payload: dict[str, Any] | None = None,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO copy_analysis_run_wallets(run_id, wallet, stage, status, attempts, error, payload_json, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, wallet) DO UPDATE SET stage=excluded.stage, status=excluded.status,
+                attempts=excluded.attempts, error=excluded.error, payload_json=excluded.payload_json, updated_at=excluded.updated_at""",
+                (run_id, wallet.lower(), stage, status, attempts, error, _dump(payload or {}), iso(None)),
+            )
+
+    def get_analysis_wallet(self, run_id: str, wallet: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM copy_analysis_run_wallets WHERE run_id=? AND wallet=?", (run_id, wallet.lower())
+            ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_candidate_analysis(self, analysis: CandidateAnalysis) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO copy_candidate_analyses(wallet, lifecycle_status, last_run_id, started_at, completed_at,
+                prefilter_reasons_json, errors_json, summary_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(wallet) DO UPDATE SET lifecycle_status=excluded.lifecycle_status,
+                last_run_id=excluded.last_run_id, started_at=excluded.started_at, completed_at=excluded.completed_at,
+                prefilter_reasons_json=excluded.prefilter_reasons_json, errors_json=excluded.errors_json,
+                summary_json=excluded.summary_json""",
+                (analysis.wallet.lower(), analysis.lifecycle_status, analysis.last_run_id,
+                 iso(analysis.started_at) if analysis.started_at else None,
+                 iso(analysis.completed_at) if analysis.completed_at else None,
+                 _dump(analysis.prefilter_reasons), _dump(analysis.errors), _dump(analysis.summary)),
+            )
+
+    def get_candidate_analysis(self, wallet: str) -> CandidateAnalysis | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM copy_candidate_analyses WHERE wallet=?", (wallet.lower(),)).fetchone()
+        if not row:
+            return None
+        return CandidateAnalysis(
+            wallet=row["wallet"], lifecycle_status=row["lifecycle_status"], last_run_id=row["last_run_id"],
+            started_at=as_utc(row["started_at"]) if row["started_at"] else None,
+            completed_at=as_utc(row["completed_at"]) if row["completed_at"] else None,
+            prefilter_reasons=tuple(_load(row["prefilter_reasons_json"], [])), errors=tuple(_load(row["errors_json"], [])),
+            summary=_load(row["summary_json"], {}),
+        )
+
+    def list_analysis_candidates(
+        self, *, status: str | None = None, lifecycle_status: str | None = None, limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if status:
+            clauses.append("target.status=?")
+            values.append(status)
+        if lifecycle_status:
+            clauses.append("analysis.lifecycle_status=?")
+            values.append(lifecycle_status)
+        query = """SELECT candidate.*, target.status AS current_status, analysis.lifecycle_status,
+                   analysis.last_run_id AS analysis_run_id, analysis.completed_at AS analysis_completed_at,
+                   analysis.prefilter_reasons_json, analysis.errors_json, analysis.summary_json,
+                   score.total_score, score.eligible AS score_eligible, score.reasons_json
+                   FROM copy_discovery_candidates candidate
+                   JOIN copy_targets target ON target.wallet=candidate.wallet
+                   LEFT JOIN copy_candidate_analyses analysis ON analysis.wallet=candidate.wallet
+                   LEFT JOIN copy_candidate_scores score ON score.target_wallet=candidate.wallet
+                     AND score.calculated_at=(SELECT MAX(calculated_at) FROM copy_candidate_scores WHERE target_wallet=candidate.wallet)"""
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY score.total_score DESC NULLS LAST, candidate.recent_activity_at DESC, candidate.wallet LIMIT ?"
+        values.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(query, values).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            value = dict(row)
+            value["prefilter_reasons"] = _load(value.pop("prefilter_reasons_json", None), [])
+            value["analysis_errors"] = _load(value.pop("errors_json", None), [])
+            value["analysis_summary"] = _load(value.pop("summary_json", None), {})
+            value["score_reasons"] = _load(value.pop("reasons_json", None), [])
+            result.append(value)
+        return result
+
     def insert_raw_fill(self, fill: RawFill) -> bool:
         with self._connect() as connection:
             cursor = connection.execute(
@@ -583,6 +735,13 @@ class CopyTradeDatabase:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT MAX(event_timestamp) AS event_timestamp FROM copy_raw_fills WHERE target_wallet=?", (wallet.lower(),)
+            ).fetchone()
+        return as_utc(row["event_timestamp"]) if row and row["event_timestamp"] else None
+
+    def earliest_fill_time(self, wallet: str) -> object | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT MIN(event_timestamp) AS event_timestamp FROM copy_raw_fills WHERE target_wallet=?", (wallet.lower(),)
             ).fetchone()
         return as_utc(row["event_timestamp"]) if row and row["event_timestamp"] else None
 

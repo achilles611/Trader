@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .analytics import campaign_return_series
+from .analysis import CandidateAnalysisPipeline
 from .backtest import CopyTradeBacktester
 from .config import CopyTradeConfig
 from .dashboard import serve_dashboard
@@ -48,6 +49,18 @@ def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
     discovery.add_argument("--max-activity-age", default="30d",
                            help="Newest activity allowed for Phase A eligibility (e.g. 24h, 7d, 30d; use 'none' to disable).")
     discovery.add_argument("--output", help="Optional path for the JSON completion payload.")
+
+    analysis = command("copy-analyze-candidates", "Run resumable Phase B public-data candidate analysis and ranking inputs.")
+    analysis.add_argument("--limit", type=int, default=500, help="Maximum Phase A candidates considered in this run.")
+    analysis.add_argument("--status", default="new", help="Target status to consume from the Phase A candidate universe; use 'all' for non-operator states.")
+    analysis.add_argument("--resume", action="store_true", help="Resume the newest interrupted analysis run.")
+    analysis.add_argument("--force", action="store_true", help="Recompute candidates already in a final analysis state.")
+    analysis.add_argument("--workers", type=int, help="Bounded public-backfill workers; default comes from analysis configuration.")
+    analysis.add_argument("--cheap-only", action="store_true", help="Run only local Phase A/data-quality prefiltering; defer public backfills.")
+    analysis.add_argument("--output", help="Optional path for machine-readable analysis results.")
+
+    analysis_status = command("copy-analysis-status", "Show persisted Phase B runs and GUI-ready candidate-analysis rows.")
+    analysis_status.add_argument("--limit", type=int, default=1000, help="Maximum candidate rows to return.")
 
     score = command("copy-score", "Reconstruct, analyze, simulate, and score copy-trading candidates.")
     score.add_argument("--wallet", action="append", default=[], help="Wallet to score; default scores every imported target.")
@@ -125,6 +138,23 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
             payload["output"] = str(output)
         _print(payload)
         return 0
+    if command == "copy-analyze-candidates":
+        pipeline = CandidateAnalysisPipeline(service)
+        selected_status = None if args.status == "all" else args.status
+        payload = pipeline.run(
+            limit=args.limit, status=selected_status, resume=args.resume, force=args.force,
+            workers=args.workers, cheap_only=args.cheap_only,
+        )
+        if args.output:
+            output = Path(args.output)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(dumps(payload, indent=2, default=str), encoding="utf-8")
+            payload["output"] = str(output)
+        _print(payload)
+        return 0
+    if command == "copy-analysis-status":
+        _print(CandidateAnalysisPipeline(service).status(limit=args.limit))
+        return 0
     if command == "copy-score":
         wallets = args.wallet or [target.wallet for target in service.database.list_targets()]
         reports = []
@@ -135,11 +165,9 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
             coverage = service.database.latest_backfill_coverage(wallet) or {}
             baseline = CopyTradeBacktester(config).run(events=events, coverage_metadata=coverage)  # type: ignore[arg-type]
             latency = () if args.no_latency_grid else tuple(CopyTradeBacktester(config).latency_decay_curve(events=events))  # type: ignore[arg-type]
-            target_net = float(metrics.net_pnl)  # type: ignore[union-attr]
             follower_net = float(baseline.summary["net_pnl"])
             follower = FollowerMetrics(
                 net_pnl=follower_net, expectancy=follower_net / max(int(baseline.summary["filled_attempts"]), 1),
-                target_edge_retained=follower_net / target_net if abs(target_net) > 1e-12 else 0.0,
                 missed_trade_rate=float(baseline.summary["skipped_attempts"]) / max(int(baseline.summary["attempts"]), 1),
                 latency_curve=latency,
                 latency_status="available" if latency else "unavailable",
@@ -153,7 +181,8 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
         scores = service.database.latest_scores()
         returns = {wallet: campaign_return_series(service.database.list_campaigns(wallet, closed_only=True)) for wallet in {score.target_wallet for score in scores}}
         selected = select_diverse_targets(scores, returns, target_count=args.count)
-        _print({"ranked": [_score_payload(score) for score in scores], "selected": [_score_payload(score) for score in selected]})
+        _print({"ranked": [_score_payload(score) for score in scores], "selected": [_score_payload(score) for score in selected],
+                "shadow_finalists": CandidateAnalysisPipeline(service).shadow_finalists(count=args.count)})
         return 0
     if command in {"copy-approve", "copy-reject"}:
         service.set_status(args.wallet, "approved" if command == "copy-approve" else "rejected")

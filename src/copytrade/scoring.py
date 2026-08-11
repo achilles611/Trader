@@ -18,6 +18,9 @@ class FollowerMetrics:
     missed_trade_rate: float = 0.0
     latency_curve: tuple[dict[str, float], ...] = ()
     latency_status: str = "unavailable"
+    return_fraction: float | None = None
+    copyability_score: float | None = None
+    slippage_robustness: float | None = None
 
 
 def score_candidate(
@@ -55,6 +58,8 @@ def score_candidate(
     latency_available = latency_survival is not None
     if not latency_available:
         reasons.append("latency_unavailable")
+    if follower.copyability_score is None:
+        reasons.append("copyability_unavailable")
     components = {
         "risk_adjusted_expectancy": _clamp01(0.5 + metrics.expectancy / max(abs(metrics.average_loser), 1.0) / 2),
         "drawdown_tail": _clamp01((1 - metrics.max_drawdown / max(config.max_drawdown_hard, 1e-12)) * (0.5 if metrics.fifth_percentile < 0 else 1.0)),
@@ -64,6 +69,11 @@ def score_candidate(
         "diversification": _clamp01(diversification),
         "source_quality": _clamp01(source_quality),
     }
+    if follower.return_fraction is not None:
+        components["follower_performance"] = _clamp01(0.5 + follower.return_fraction / 0.20)
+    if follower.copyability_score is not None:
+        friction = follower.slippage_robustness if follower.slippage_robustness is not None else 1.0
+        components["copyability"] = _clamp01((follower.copyability_score + friction) / 2)
     active_weights = {name: weight for name, weight in config.score_weights.items() if name in components}
     if latency_available:
         components["latency_survivability"] = latency_survival
@@ -93,7 +103,7 @@ def score_candidate(
         target_wallet=metrics.target_wallet, calculated_at=utc_now(), total_score=total,
         component_scores=weighted, penalties=penalties,
         eligible=not [reason for reason in reasons if reason not in {
-            "latency_unavailable", "coverage_unproven",
+            "latency_unavailable", "copyability_unavailable", "coverage_unproven",
         } or (reason == "coverage_unproven" and config.require_proven_history)], reasons=tuple(reasons),
         source_quality=source_quality,
     )

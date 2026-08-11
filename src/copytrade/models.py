@@ -74,6 +74,19 @@ class TargetStatus(str, Enum):
     REJECTED = "rejected"
 
 
+class CandidateAnalysisState(str, Enum):
+    """Machine-owned research lifecycle kept separate from operator target status."""
+
+    NEW = "new"
+    PREFILTER_REJECTED = "prefilter_rejected"
+    BACKFILL_PENDING = "backfill_pending"
+    BACKFILL_FAILED = "backfill_failed"
+    ANALYSIS_PENDING = "analysis_pending"
+    ANALYZED = "analyzed"
+    QUALIFIED = "qualified"
+    QUARANTINED = "quarantined"
+
+
 class ConnectionState(str, Enum):
     CONNECTED = "CONNECTED"
     RECONNECTING = "RECONNECTING"
@@ -146,6 +159,39 @@ class DiscoverySummary:
     filtered_wallets: int
     queued_for_analysis: int
     errors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class AnalysisRun:
+    """Auditable Phase B orchestration run; execution state remains out of scope."""
+
+    run_id: str
+    started_at: datetime
+    configuration: dict[str, Any]
+    finished_at: datetime | None = None
+    status: str = "running"
+    wallets_considered: int = 0
+    cheap_rejected: int = 0
+    backfill_attempted: int = 0
+    backfill_failed: int = 0
+    reconstructed: int = 0
+    scored: int = 0
+    eligible: int = 0
+    rejected: int = 0
+    deferred: int = 0
+    errors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CandidateAnalysis:
+    wallet: str
+    lifecycle_status: str
+    last_run_id: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    prefilter_reasons: tuple[str, ...] = ()
+    errors: tuple[str, ...] = ()
+    summary: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

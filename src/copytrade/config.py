@@ -104,7 +104,7 @@ class PaperExecutionConfig:
 @dataclass(frozen=True)
 class BacktestConfig:
     detection_delays_ms: tuple[int, ...] = (100, 250, 500, 1000, 2000, 5000, 15000)
-    slippage_scenarios_bps: tuple[float, ...] = (1.0, 2.0, 5.0, 10.0, 25.0)
+    slippage_scenarios_bps: tuple[float, ...] = (0.0, 1.0, 2.0, 5.0, 10.0, 25.0)
     training_windows_days: tuple[int, ...] = (30, 60, 90, 180)
     forward_windows_days: tuple[int, ...] = (7, 14, 30)
     default_training_days: int = 90
@@ -125,13 +125,15 @@ class CandidateConfig:
     require_proven_history: bool = False
     score_weights: dict[str, float] = field(
         default_factory=lambda: {
-            "risk_adjusted_expectancy": 20.0,
+            "follower_performance": 20.0,
+            "copyability": 15.0,
+            "risk_adjusted_expectancy": 15.0,
             "drawdown_tail": 15.0,
-            "consistency": 15.0,
-            "latency_survivability": 15.0,
-            "history_quality": 10.0,
-            "position_size_stability": 10.0,
-            "diversification": 10.0,
+            "consistency": 10.0,
+            "latency_survivability": 5.0,
+            "history_quality": 5.0,
+            "position_size_stability": 5.0,
+            "diversification": 5.0,
             "source_quality": 5.0,
         }
     )
@@ -147,6 +149,18 @@ class CandidateConfig:
             "latency_decay": 15.0,
         }
     )
+
+
+@dataclass(frozen=True)
+class AnalysisConfig:
+    """Bounded Phase B research-orchestration settings."""
+
+    default_workers: int = 4
+    retry_attempts: int = 3
+    retry_initial_seconds: float = 0.25
+    history_days: int = 180
+    min_discovery_activity: int = 2
+    shadow_finalist_count: int = 20
 
 
 @dataclass(frozen=True)
@@ -168,6 +182,7 @@ class CopyTradeConfig:
     paper_execution: PaperExecutionConfig = field(default_factory=PaperExecutionConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     candidates: CandidateConfig = field(default_factory=CandidateConfig)
+    analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
     artifacts: ArtifactConfig = field(default_factory=ArtifactConfig)
     targets: tuple[dict[str, Any], ...] = ()
     config_path: Path = Path("config/copytrade.yaml")
@@ -192,6 +207,7 @@ class CopyTradeConfig:
         latency = _section(document, "latency")
         backtest = _section(document, "backtest")
         candidates = _section(document, "candidates")
+        analysis = _section(document, "analysis")
         artifacts = _section(document, "artifacts")
         database = _section(document, "database")
         obsidian = _section(document, "obsidian")
@@ -240,6 +256,7 @@ class CopyTradeConfig:
                 }
             ),
             candidates=CandidateConfig(**candidates),
+            analysis=AnalysisConfig(**analysis),
             artifacts=ArtifactConfig(
                 **{
                     **artifacts,
@@ -286,6 +303,10 @@ class CopyTradeConfig:
             raise ValueError("risk.insufficient_capital_action must be scale or skip.")
         if self.risk.risk_cap_base not in {"initial_capital", "start_of_day_equity", "current_equity"}:
             raise ValueError("risk.risk_cap_base must be initial_capital, start_of_day_equity, or current_equity.")
+        if self.analysis.default_workers <= 0 or self.analysis.retry_attempts <= 0:
+            raise ValueError("analysis.default_workers and analysis.retry_attempts must be positive.")
+        if self.analysis.retry_initial_seconds < 0 or self.analysis.history_days <= 0 or self.analysis.min_discovery_activity <= 0:
+            raise ValueError("analysis retry delay, history days, and minimum discovery activity must be positive.")
 
     def snapshot(self) -> dict[str, Any]:
         return jsonable(asdict(self))
