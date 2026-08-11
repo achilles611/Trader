@@ -48,11 +48,12 @@ class CopyTradeService:
 
     def discover_candidates(
         self, provider: CandidateDiscoveryAdapter, *, limit: int, min_activity: int, refresh: bool = False,
-        configuration: dict[str, object] | None = None,
+        max_activity_age: timedelta | None = timedelta(days=30), configuration: dict[str, object] | None = None,
     ):
         """Register cheap, public discovery evidence only; no scoring or paper execution occurs here."""
         return DiscoveryPipeline(self.database).run(
-            provider, limit=limit, min_activity=min_activity, refresh=refresh, configuration=configuration,
+            provider, limit=limit, min_activity=min_activity, refresh=refresh,
+            max_activity_age=max_activity_age, configuration=configuration,
         )
 
     def import_wallet_file(self, path: str | Path) -> list[Target]:

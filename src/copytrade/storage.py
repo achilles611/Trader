@@ -52,6 +52,42 @@ def _is_wallet(value: str) -> bool:
     return value.startswith("0x") and len(value) == 42 and all(character in "0123456789abcdef" for character in value[2:].lower())
 
 
+def _discovery_source_event_id(observation: DiscoveryObservation) -> str:
+    """Identify one source event deterministically before per-run aggregation.
+
+    Provider-supplied evidence IDs are preferred.  The fallback deliberately
+    includes every source field that can distinguish fills/trades when an
+    archive omits a dedicated ID, so overlapping files cannot manufacture
+    activity while different real events remain distinguishable.
+    """
+    raw = observation.raw_evidence
+    source_identifier = observation.evidence_id or next(
+        (
+            raw.get(key)
+            for key in ("tid", "tradeId", "fillId", "id", "hash", "transactionHash")
+            if raw.get(key) not in (None, "")
+        ),
+        None,
+    )
+    if source_identifier is not None:
+        return stable_id(
+            "discovery_source_event", observation.source, observation.normalized_wallet(), str(source_identifier),
+        )
+    return stable_id(
+        "discovery_source_event",
+        observation.source,
+        observation.normalized_wallet(),
+        raw.get("hash") or raw.get("transactionHash") or "",
+        raw.get("oid") or raw.get("orderId") or "",
+        raw.get("time") or raw.get("timestamp") or iso(observation.recent_activity_at or observation.observed_at),
+        raw.get("coin") or raw.get("symbol") or "",
+        raw.get("px") or raw.get("price") or "",
+        raw.get("sz") or raw.get("size") or "",
+        observation.discovery_rank,
+        observation.source_score,
+    )
+
+
 class CopyTradeDatabase:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -82,6 +118,7 @@ class CopyTradeDatabase:
                     status TEXT NOT NULL, label TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}'
                 );
+                CREATE INDEX IF NOT EXISTS idx_copy_targets_status ON copy_targets(status);
                 CREATE TABLE IF NOT EXISTS copy_raw_fills (
                     event_id TEXT PRIMARY KEY, source TEXT NOT NULL, venue TEXT NOT NULL,
                     chain_network TEXT, target_wallet TEXT NOT NULL, target_order_id TEXT,
@@ -190,7 +227,8 @@ class CopyTradeDatabase:
                 CREATE TABLE IF NOT EXISTS copy_discovery_runs (
                     run_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT,
                     status TEXT NOT NULL, sources_json TEXT NOT NULL, configuration_json TEXT NOT NULL,
-                    wallets_seen INTEGER NOT NULL DEFAULT 0, new_wallets INTEGER NOT NULL DEFAULT 0,
+                    wallets_seen INTEGER NOT NULL DEFAULT 0, eligible_wallets INTEGER NOT NULL DEFAULT 0,
+                    limit_deferred_wallets INTEGER NOT NULL DEFAULT 0, new_wallets INTEGER NOT NULL DEFAULT 0,
                     existing_wallets_refreshed INTEGER NOT NULL DEFAULT 0, filtered_wallets INTEGER NOT NULL DEFAULT 0,
                     queued_for_analysis INTEGER NOT NULL DEFAULT 0, errors_json TEXT NOT NULL DEFAULT '[]'
                 );
@@ -202,13 +240,17 @@ class CopyTradeDatabase:
                 );
                 CREATE INDEX IF NOT EXISTS idx_copy_discovery_candidates_seen ON copy_discovery_candidates(last_seen_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_copy_discovery_candidates_activity ON copy_discovery_candidates(recent_activity_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_copy_discovery_candidates_run ON copy_discovery_candidates(last_discovery_run_id);
                 CREATE TABLE IF NOT EXISTS copy_discovery_observations (
                     observation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, wallet TEXT NOT NULL, source TEXT NOT NULL,
                     observed_at TEXT NOT NULL, recent_activity_at TEXT, discovery_rank INTEGER, source_score REAL,
-                    metadata_json TEXT NOT NULL DEFAULT '{}', raw_evidence_json TEXT NOT NULL DEFAULT '{}', evidence_id TEXT
+                    metadata_json TEXT NOT NULL DEFAULT '{}', raw_evidence_json TEXT NOT NULL DEFAULT '{}', evidence_id TEXT,
+                    source_event_id TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_copy_discovery_observations_wallet ON copy_discovery_observations(wallet, observed_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_copy_discovery_observations_run ON copy_discovery_observations(run_id, source);
+                CREATE INDEX IF NOT EXISTS idx_copy_discovery_observations_source_wallet ON copy_discovery_observations(source, wallet);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_copy_discovery_observations_event ON copy_discovery_observations(run_id, source_event_id);
                 """
             )
             self._ensure_column(connection, "copy_signals", "target_position_before", "REAL NOT NULL DEFAULT 0")
@@ -238,6 +280,15 @@ class CopyTradeDatabase:
             self._ensure_column(connection, "copy_portfolio_snapshots", "peak_equity", "REAL")
             self._ensure_column(connection, "copy_portfolio_snapshots", "max_drawdown_fraction", "REAL NOT NULL DEFAULT 0")
             self._ensure_column(connection, "copy_backfill_coverage", "coverage_state", "TEXT NOT NULL DEFAULT 'UNPROVEN'")
+            self._ensure_column(connection, "copy_discovery_runs", "eligible_wallets", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "copy_discovery_runs", "limit_deferred_wallets", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "copy_discovery_observations", "source_event_id", "TEXT")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_copy_targets_status ON copy_targets(status)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_copy_discovery_candidates_run ON copy_discovery_candidates(last_discovery_run_id)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_copy_discovery_observations_source_wallet ON copy_discovery_observations(source, wallet)")
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_copy_discovery_observations_event ON copy_discovery_observations(run_id, source_event_id)"
+            )
             duplicate_attempt = connection.execute(
                 "SELECT 1 FROM copy_execution_attempts GROUP BY signal_id HAVING COUNT(*) > 1 LIMIT 1"
             ).fetchone()
@@ -302,87 +353,123 @@ class CopyTradeDatabase:
         with self._connect() as connection:
             connection.execute(
                 """INSERT INTO copy_discovery_runs(run_id, started_at, finished_at, status, sources_json, configuration_json,
-                wallets_seen, new_wallets, existing_wallets_refreshed, filtered_wallets, queued_for_analysis, errors_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                wallets_seen, eligible_wallets, limit_deferred_wallets, new_wallets, existing_wallets_refreshed,
+                filtered_wallets, queued_for_analysis, errors_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (run.run_id, iso(run.started_at), iso(run.finished_at) if run.finished_at else None, run.status,
-                 _dump(run.sources), _dump(run.configuration), run.wallets_seen, run.new_wallets,
-                 run.existing_wallets_refreshed, run.filtered_wallets, run.queued_for_analysis, _dump(run.errors)),
+                 _dump(run.sources), _dump(run.configuration), run.wallets_seen, run.eligible_wallets,
+                 run.limit_deferred_wallets, run.new_wallets, run.existing_wallets_refreshed,
+                 run.filtered_wallets, run.queued_for_analysis, _dump(run.errors)),
             )
 
     def finish_discovery_run(
         self, run_id: str, *, status: str, errors: tuple[str, ...] = (), wallets_seen: int = 0,
-        new_wallets: int = 0, existing_wallets_refreshed: int = 0, filtered_wallets: int = 0,
-        queued_for_analysis: int = 0,
+        eligible_wallets: int = 0, limit_deferred_wallets: int = 0, new_wallets: int = 0,
+        existing_wallets_refreshed: int = 0, filtered_wallets: int = 0, queued_for_analysis: int = 0,
     ) -> None:
         with self._connect() as connection:
             connection.execute(
-                """UPDATE copy_discovery_runs SET finished_at=?, status=?, wallets_seen=?, new_wallets=?,
-                existing_wallets_refreshed=?, filtered_wallets=?, queued_for_analysis=?, errors_json=? WHERE run_id=?""",
-                (iso(None), status, wallets_seen, new_wallets, existing_wallets_refreshed, filtered_wallets,
-                 queued_for_analysis, _dump(errors), run_id),
+                """UPDATE copy_discovery_runs SET finished_at=?, status=?, wallets_seen=?, eligible_wallets=?,
+                limit_deferred_wallets=?, new_wallets=?, existing_wallets_refreshed=?, filtered_wallets=?,
+                queued_for_analysis=?, errors_json=? WHERE run_id=?""",
+                (iso(None), status, wallets_seen, eligible_wallets, limit_deferred_wallets, new_wallets,
+                 existing_wallets_refreshed, filtered_wallets, queued_for_analysis, _dump(errors), run_id),
             )
 
-    def persist_discovery_observations(
-        self, run: DiscoveryRun, observations: Iterable[DiscoveryObservation], *, limit: int, min_activity: int,
-    ) -> DiscoverySummary:
-        """Persist auditable observations and cheaply register only eligible candidate wallets.
+    def stage_discovery_observations(
+        self, run_id: str, observations: Iterable[DiscoveryObservation], *, batch_size: int = 500,
+    ) -> int:
+        """Append de-duplicated run evidence in bounded transactions before candidate selection."""
+        if batch_size <= 0:
+            raise ValueError("Discovery observation batch size must be positive.")
+        invalid_wallets = 0
+        batch: list[tuple[Any, ...]] = []
 
-        Target status is intentionally inserted only for a never-before-seen wallet;
-        rediscovery can therefore never overwrite an operator's decision.
-        """
-        valid: dict[str, list[DiscoveryObservation]] = {}
-        invalid_wallets: set[str] = set()
+        def flush() -> None:
+            if not batch:
+                return
+            with self._connect() as connection:
+                connection.executemany(
+                    """INSERT OR IGNORE INTO copy_discovery_observations(observation_id, run_id, wallet, source, observed_at,
+                    recent_activity_at, discovery_rank, source_score, metadata_json, raw_evidence_json, evidence_id, source_event_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    batch,
+                )
+            batch.clear()
+
         for observation in observations:
             wallet = observation.normalized_wallet()
             if not _is_wallet(wallet) or not observation.source:
-                invalid_wallets.add(wallet or "<missing>")
+                invalid_wallets += 1
                 continue
-            valid.setdefault(wallet, []).append(observation)
-        eligible = [
-            (wallet, items) for wallet, items in valid.items() if len(items) >= min_activity
-        ]
-        eligible.sort(key=lambda item: (
-            -len(item[1]),
-            -max(as_utc(observation.recent_activity_at or observation.observed_at).timestamp() for observation in item[1]),
-            item[0],
-        ))
-        selected = eligible[:limit]
-        filtered_wallets = (len(valid) - len(eligible)) + len(invalid_wallets)
-        errors = (f"invalid_wallets_rejected:{len(invalid_wallets)}",) if invalid_wallets else ()
-        new_wallets = 0
-        existing_wallets_refreshed = 0
-        queued_for_analysis = 0
+            source_event_id = _discovery_source_event_id(observation)
+            batch.append((
+                stable_id("discovery_observation", run_id, source_event_id), run_id, wallet, observation.source,
+                iso(observation.observed_at), iso(observation.recent_activity_at) if observation.recent_activity_at else None,
+                observation.discovery_rank, observation.source_score, _dump(observation.metadata),
+                _dump(observation.raw_evidence), observation.evidence_id, source_event_id,
+            ))
+            if len(batch) >= batch_size:
+                flush()
+        flush()
+        return invalid_wallets
+
+    def discard_discovery_observations(self, run_id: str) -> None:
         with self._connect() as connection:
-            for index, observation in enumerate(item for values in valid.values() for item in values):
-                wallet = observation.normalized_wallet()
-                observation_id = stable_id(
-                    "discovery_observation", run.run_id, index, wallet, observation.source,
-                    observation.evidence_id or "", observation.metadata,
-                )
-                connection.execute(
-                    """INSERT INTO copy_discovery_observations(observation_id, run_id, wallet, source, observed_at,
-                    recent_activity_at, discovery_rank, source_score, metadata_json, raw_evidence_json, evidence_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (observation_id, run.run_id, wallet, observation.source, iso(observation.observed_at),
-                     iso(observation.recent_activity_at) if observation.recent_activity_at else None,
-                     observation.discovery_rank, observation.source_score, _dump(observation.metadata),
-                     _dump(observation.raw_evidence), observation.evidence_id),
-                )
-            for wallet, items in selected:
+            connection.execute("DELETE FROM copy_discovery_observations WHERE run_id=?", (run_id,))
+
+    def complete_discovery_run(
+        self, run: DiscoveryRun, *, limit: int, min_activity: int, max_activity_age_seconds: float | None,
+        invalid_wallets: int = 0,
+    ) -> DiscoverySummary:
+        """Aggregate staged evidence without retaining the raw input in process memory."""
+        cutoff = run.started_at.timestamp() - max_activity_age_seconds if max_activity_age_seconds is not None else None
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT wallet, COUNT(*) AS activity_count, MIN(observed_at) AS first_seen, MAX(observed_at) AS last_seen,
+                MAX(recent_activity_at) AS recent_activity_at, MIN(discovery_rank) AS discovery_rank,
+                MAX(source_score) AS source_score FROM copy_discovery_observations WHERE run_id=? GROUP BY wallet""",
+                (run.run_id,),
+            ).fetchall()
+            aggregates = [dict(row) for row in rows]
+            eligible = [
+                row for row in aggregates
+                if int(row["activity_count"]) >= min_activity
+                and (cutoff is None or (
+                    row["recent_activity_at"] is not None
+                    and as_utc(row["recent_activity_at"]).timestamp() >= cutoff
+                ))
+            ]
+            eligible.sort(key=lambda row: (
+                -int(row["activity_count"]),
+                -as_utc(row["recent_activity_at"] or row["last_seen"]).timestamp(),
+                row["wallet"],
+            ))
+            selected = eligible[:limit]
+            wallets_seen = len(aggregates)
+            eligible_wallets = len(eligible)
+            limit_deferred_wallets = eligible_wallets - len(selected)
+            filtered_wallets = wallets_seen - eligible_wallets
+            errors = (f"invalid_wallets_rejected:{invalid_wallets}",) if invalid_wallets else ()
+            new_wallets = 0
+            existing_wallets_refreshed = 0
+            queued_for_analysis = 0
+            for aggregate in selected:
+                wallet = str(aggregate["wallet"])
                 target = connection.execute("SELECT status FROM copy_targets WHERE wallet=?", (wallet,)).fetchone()
                 existing = connection.execute("SELECT * FROM copy_discovery_candidates WHERE wallet=?", (wallet,)).fetchone()
                 candidate_status = str(target["status"]) if target is not None else TargetStatus.NEW.value
-                first_seen = min(as_utc(item.observed_at) for item in items)
-                last_seen = max(as_utc(item.observed_at) for item in items)
-                activity = max((as_utc(item.recent_activity_at) for item in items if item.recent_activity_at), default=None)
-                ranks = [item.discovery_rank for item in items if item.discovery_rank is not None]
-                scores = [float(item.source_score) for item in items if item.source_score is not None]
+                first_seen = as_utc(aggregate["first_seen"])
+                last_seen = as_utc(aggregate["last_seen"])
+                activity = as_utc(aggregate["recent_activity_at"]) if aggregate["recent_activity_at"] else None
                 source_count = int(connection.execute(
                     "SELECT COUNT(DISTINCT source) FROM copy_discovery_observations WHERE wallet=?", (wallet,)
                 ).fetchone()[0])
                 metadata = {
-                    "latest_sources": sorted({item.source for item in items}),
-                    "latest_activity_observations": len(items),
+                    "latest_sources": sorted(row["source"] for row in connection.execute(
+                        "SELECT DISTINCT source FROM copy_discovery_observations WHERE run_id=? AND wallet=?", (run.run_id, wallet)
+                    ).fetchall()),
+                    "latest_activity_observations": int(aggregate["activity_count"]),
                 }
                 if target is None:
                     connection.execute(
@@ -398,7 +485,7 @@ class CopyTradeDatabase:
                         discovery_rank, source_score, source_count, discovery_status, last_discovery_run_id, metadata_json)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (wallet, iso(first_seen), iso(last_seen), iso(activity) if activity else None,
-                         min(ranks) if ranks else None, max(scores) if scores else None, source_count,
+                         aggregate["discovery_rank"], aggregate["source_score"], source_count,
                          candidate_status, run.run_id, _dump(metadata)),
                     )
                 else:
@@ -408,23 +495,26 @@ class CopyTradeDatabase:
                     connection.execute(
                         """UPDATE copy_discovery_candidates SET last_seen_at=?, recent_activity_at=?, discovery_rank=?,
                         source_score=?, source_count=?, discovery_status=?, last_discovery_run_id=?, metadata_json=? WHERE wallet=?""",
-                        (iso(max(prior_seen, last_seen)), iso(max(filter(None, (prior_activity, activity)))) if prior_activity or activity else None,
-                         min([int(existing["discovery_rank"])] + ranks) if existing["discovery_rank"] is not None else (min(ranks) if ranks else None),
-                         max([float(existing["source_score"])] + scores) if existing["source_score"] is not None else (max(scores) if scores else None),
+                        (iso(max(prior_seen, last_seen)),
+                         iso(max(filter(None, (prior_activity, activity)))) if prior_activity or activity else None,
+                         min([int(existing["discovery_rank"]), int(aggregate["discovery_rank"])] if existing["discovery_rank"] is not None and aggregate["discovery_rank"] is not None else [value for value in (existing["discovery_rank"], aggregate["discovery_rank"]) if value is not None]) if existing["discovery_rank"] is not None or aggregate["discovery_rank"] is not None else None,
+                         max([float(existing["source_score"]), float(aggregate["source_score"])] if existing["source_score"] is not None and aggregate["source_score"] is not None else [value for value in (existing["source_score"], aggregate["source_score"]) if value is not None]) if existing["source_score"] is not None or aggregate["source_score"] is not None else None,
                          source_count, candidate_status, run.run_id, _dump(metadata), wallet),
                     )
                 if candidate_status in {TargetStatus.NEW.value, TargetStatus.QUEUED.value, TargetStatus.PENDING.value}:
                     queued_for_analysis += 1
             connection.execute(
-                """UPDATE copy_discovery_runs SET finished_at=?, status='completed', wallets_seen=?, new_wallets=?,
-                existing_wallets_refreshed=?, filtered_wallets=?, queued_for_analysis=?, errors_json=? WHERE run_id=?""",
-                (iso(None), len(valid), new_wallets, existing_wallets_refreshed, filtered_wallets,
-                 queued_for_analysis, _dump(errors), run.run_id),
+                """UPDATE copy_discovery_runs SET finished_at=?, status='completed', wallets_seen=?, eligible_wallets=?,
+                limit_deferred_wallets=?, new_wallets=?, existing_wallets_refreshed=?, filtered_wallets=?,
+                queued_for_analysis=?, errors_json=? WHERE run_id=?""",
+                (iso(None), wallets_seen, eligible_wallets, limit_deferred_wallets, new_wallets,
+                 existing_wallets_refreshed, filtered_wallets, queued_for_analysis, _dump(errors), run.run_id),
             )
         return DiscoverySummary(
-            run_id=run.run_id, status="completed", sources=run.sources, wallets_seen=len(valid), new_wallets=new_wallets,
-            existing_wallets_refreshed=existing_wallets_refreshed, filtered_wallets=filtered_wallets,
-            queued_for_analysis=queued_for_analysis, errors=errors,
+            run_id=run.run_id, status="completed", sources=run.sources, wallets_seen=wallets_seen,
+            eligible_wallets=eligible_wallets, limit_deferred_wallets=limit_deferred_wallets,
+            new_wallets=new_wallets, existing_wallets_refreshed=existing_wallets_refreshed,
+            filtered_wallets=filtered_wallets, queued_for_analysis=queued_for_analysis, errors=errors,
         )
 
     def list_discovery_candidates(self, *, limit: int = 100, source: str | None = None) -> list[dict[str, Any]]:

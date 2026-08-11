@@ -91,16 +91,21 @@ reduce the matching virtual sleeve; they cannot become reverse entries.
 
 `copy-discover` builds a cheap research queue; it does not backfill, score,
 approve, watch, or paper-copy a wallet. The initial native source is documented
-HyperCore node-trade data. Its `side_info` array attributes the buyer and seller
-through `side_info[].user`, so one trade can register both public wallets. No
-leaderboard endpoint is assumed or scraped.
+HyperCore node data: older `node_trades` (both counterparties from
+`side_info[].user`), API-shaped `node_fills`, and the current block-batched
+`node_fills_by_block` (`block_*` metadata plus `events`). It detects those shapes
+explicitly and fails a valid-but-unsupported JSON/LZ4 input instead of reporting
+a misleading zero-wallet run. No leaderboard endpoint is assumed or scraped.
 
 ```powershell
-# A locally downloaded node-trade JSON/JSONL (or .lz4 with optional lz4 installed)
-python main.py copy-discover --source hypercore-file --input path\to\node_trades.jsonl --limit 1000 --min-activity 2 --output artifacts\discovery.json
+# A locally downloaded node-data JSON/JSONL (or .lz4 with optional lz4 installed)
+python main.py copy-discover --source hypercore-file --input path\to\node_fills_by_block.jsonl --limit 1000 --min-activity 2 --max-activity-age 30d --output artifacts\discovery.json
 
 # An exact requester-pays historical-node object; requires optional boto3 plus AWS billing/credentials
-python main.py copy-discover --source hypercore-s3 --input s3://hl-mainnet-node-data/node_trades/hourly/DATE/HOUR --refresh
+python main.py copy-discover --source hypercore-s3 --input s3://hl-mainnet-node-data/node_fills_by_block/DATE/HOUR --refresh
+
+# Archive research explicitly disables the default 30-day Phase A recency gate
+python main.py copy-discover --source hypercore-file --input path\to\node_trades.jsonl --max-activity-age none
 ```
 
 The S3 transport sends `RequestPayer=requester` and fails clearly if `boto3`,
@@ -109,12 +114,19 @@ It never falls back to a scraped or undocumented HTTP endpoint. The transport
 interface also accepts local fixtures, downloaded data, local-node streams, or
 a future indexer while keeping their normalized observations identical.
 
-Discovery stores `copy_discovery_runs`, `copy_discovery_observations`, and
-`copy_discovery_candidates`. Each run records configuration, source, timestamps,
-counts, and errors. Observations are append-only; a wallet candidate is merged
-by normalized address, retains independent-source count, and refreshes its
-activity/last-seen values. A new wallet is added to `copy_targets` with status
-`new`; rediscovery never overwrites a manually set status.
+Discovery streams JSONL and large JSON arrays, normalizes each event, and writes
+bounded SQLite batches; requester-pays S3 objects are likewise read as streams.
+Within a run, a deterministic identity based on source, wallet, fill/trade ID,
+hash, order ID, time, symbol, price, and size deduplicates overlapping files
+before `--min-activity` or ranking. Separate runs remain append-only audit
+history. Each run persists valid observed, eligible, registered/refreshed,
+limit-deferred, filtered, and invalid-wallet counts, so a `--limit` never makes
+eligible wallets disappear from accounting. The default `--max-activity-age
+30d` filters stale activity before Phase B; `none` disables that gate.
+
+Candidates are merged by normalized address, retain independent-source count,
+and refresh activity/last-seen values. A new wallet is added to `copy_targets`
+with status `new`; rediscovery never overwrites a manually set status.
 
 On watcher startup (and after each reconnect), it first receives an `allMids`
 frame to warm the market cache, then reconciles from the durable latest-fill
@@ -136,7 +148,7 @@ creating an execution attempt.
 
 ```powershell
 python main.py copy-import --wallet 0xYOUR_PUBLIC_WALLET
-python main.py copy-discover --source hypercore-file --input path\to\node_trades.jsonl --limit 1000
+python main.py copy-discover --source hypercore-file --input path\to\node_fills_by_block.jsonl --limit 1000 --max-activity-age 30d
 python main.py copy-backfill --wallet 0xYOUR_PUBLIC_WALLET --start 2026-01-01T00:00:00Z
 python main.py copy-score --wallet 0xYOUR_PUBLIC_WALLET
 python main.py copy-rank --count 7
@@ -214,8 +226,9 @@ no-lookahead, marked long/short sleeves, partial loss risk, atomic fault replay,
 restart drawdown, walk-forward boundaries, time-aligned correlation, websocket
 payload shapes, official plural clearinghouse-state parsing, enriched-event
 backtests, contemporaneous live-paper price deterioration, fee-risk ledgers,
-coverage eligibility, repeatable HyperCore-node discovery, and the earlier
-baseline behaviors.
+coverage eligibility, all documented HyperCore-node discovery formats,
+duplicate-evidence rejection, limit/recency accounting, streaming discovery,
+and the earlier baseline behaviors.
 
 ## Hyperliquid limitations
 

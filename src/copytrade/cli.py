@@ -11,7 +11,7 @@ from .analytics import campaign_return_series
 from .backtest import CopyTradeBacktester
 from .config import CopyTradeConfig
 from .dashboard import serve_dashboard
-from .discovery import build_discovery_provider
+from .discovery import build_discovery_provider, parse_activity_age
 from .hyperliquid import HyperliquidWatcher
 from .market import HyperliquidMarketData
 from .paper import TargetSizeClassifier
@@ -36,15 +36,17 @@ def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
     backfill.add_argument("--start", help="Inclusive ISO-8601 start time; default is latest stored fill or 90 days ago.")
     backfill.add_argument("--end", help="Inclusive ISO-8601 end time; default is now.")
 
-    discovery = command("copy-discover", "Discover active public HyperCore trader wallets from documented node-trade data.")
+    discovery = command("copy-discover", "Discover active public HyperCore trader wallets from documented node-data files.")
     discovery.add_argument("--source", choices=("hypercore-file", "hypercore-s3"), default="hypercore-file",
-                           help="Node-trade transport: downloaded/local data or explicit requester-pays S3 objects.")
+                           help="Node-data transport: downloaded/local data or explicit requester-pays S3 objects.")
     discovery.add_argument("--input", action="append", default=[],
-                           help="Repeatable node-trade JSON/JSONL/LZ4 file path or exact s3://bucket/key object.")
+                           help="Repeatable node-trades/node-fills JSON/JSONL/LZ4 file path or exact s3://bucket/key object.")
     discovery.add_argument("--limit", type=int, default=1000, help="Maximum eligible wallets to register per run.")
     discovery.add_argument("--refresh", action="store_true", help="Request a fresh source read; recorded with the discovery run.")
     discovery.add_argument("--min-activity", type=int, default=1,
-                           help="Minimum observed node trades for a wallet in this run (default: 1).")
+                           help="Minimum distinct observed node events for a wallet in this run (default: 1).")
+    discovery.add_argument("--max-activity-age", default="30d",
+                           help="Newest activity allowed for Phase A eligibility (e.g. 24h, 7d, 30d; use 'none' to disable).")
     discovery.add_argument("--output", help="Optional path for the JSON completion payload.")
 
     score = command("copy-score", "Reconstruct, analyze, simulate, and score copy-trading candidates.")
@@ -102,13 +104,16 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
         return 0
     if command == "copy-discover":
         provider = build_discovery_provider(args.source, args.input)
+        max_activity_age = parse_activity_age(args.max_activity_age)
         summary = service.discover_candidates(
             provider, limit=args.limit, min_activity=args.min_activity, refresh=args.refresh,
-            configuration={"source": args.source, "inputs": list(args.input)},
+            max_activity_age=max_activity_age,
+            configuration={"source": args.source, "inputs": list(args.input), "max_activity_age": args.max_activity_age},
         )
         payload: dict[str, Any] = {
             "message": "Discovery complete", "run_id": summary.run_id, "status": summary.status,
             "sources": summary.sources, "wallets_observed": summary.wallets_seen,
+            "eligible_wallets": summary.eligible_wallets, "limit_deferred_wallets": summary.limit_deferred_wallets,
             "new_candidates": summary.new_wallets, "existing_refreshed": summary.existing_wallets_refreshed,
             "filtered": summary.filtered_wallets, "queued_for_analysis": summary.queued_for_analysis,
             "errors": summary.errors,

@@ -124,6 +124,8 @@ class DiscoveryRun:
     finished_at: datetime | None = None
     status: str = "running"
     wallets_seen: int = 0
+    eligible_wallets: int = 0
+    limit_deferred_wallets: int = 0
     new_wallets: int = 0
     existing_wallets_refreshed: int = 0
     filtered_wallets: int = 0
@@ -137,6 +139,8 @@ class DiscoverySummary:
     status: str
     sources: tuple[str, ...]
     wallets_seen: int
+    eligible_wallets: int
+    limit_deferred_wallets: int
     new_wallets: int
     existing_wallets_refreshed: int
     filtered_wallets: int
