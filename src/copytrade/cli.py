@@ -11,6 +11,7 @@ from .analytics import campaign_return_series
 from .backtest import CopyTradeBacktester
 from .config import CopyTradeConfig
 from .dashboard import serve_dashboard
+from .discovery import build_discovery_provider
 from .hyperliquid import HyperliquidWatcher
 from .market import HyperliquidMarketData
 from .paper import TargetSizeClassifier
@@ -34,6 +35,17 @@ def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
     backfill.add_argument("--wallet", required=True, help="Previously imported wallet address.")
     backfill.add_argument("--start", help="Inclusive ISO-8601 start time; default is latest stored fill or 90 days ago.")
     backfill.add_argument("--end", help="Inclusive ISO-8601 end time; default is now.")
+
+    discovery = command("copy-discover", "Discover active public HyperCore trader wallets from documented node-trade data.")
+    discovery.add_argument("--source", choices=("hypercore-file", "hypercore-s3"), default="hypercore-file",
+                           help="Node-trade transport: downloaded/local data or explicit requester-pays S3 objects.")
+    discovery.add_argument("--input", action="append", default=[],
+                           help="Repeatable node-trade JSON/JSONL/LZ4 file path or exact s3://bucket/key object.")
+    discovery.add_argument("--limit", type=int, default=1000, help="Maximum eligible wallets to register per run.")
+    discovery.add_argument("--refresh", action="store_true", help="Request a fresh source read; recorded with the discovery run.")
+    discovery.add_argument("--min-activity", type=int, default=1,
+                           help="Minimum observed node trades for a wallet in this run (default: 1).")
+    discovery.add_argument("--output", help="Optional path for the JSON completion payload.")
 
     score = command("copy-score", "Reconstruct, analyze, simulate, and score copy-trading candidates.")
     score.add_argument("--wallet", action="append", default=[], help="Wallet to score; default scores every imported target.")
@@ -87,6 +99,26 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
         return 0
     if command == "copy-backfill":
         _print(service.backfill(args.wallet, start=args.start, end=args.end))
+        return 0
+    if command == "copy-discover":
+        provider = build_discovery_provider(args.source, args.input)
+        summary = service.discover_candidates(
+            provider, limit=args.limit, min_activity=args.min_activity, refresh=args.refresh,
+            configuration={"source": args.source, "inputs": list(args.input)},
+        )
+        payload: dict[str, Any] = {
+            "message": "Discovery complete", "run_id": summary.run_id, "status": summary.status,
+            "sources": summary.sources, "wallets_observed": summary.wallets_seen,
+            "new_candidates": summary.new_wallets, "existing_refreshed": summary.existing_wallets_refreshed,
+            "filtered": summary.filtered_wallets, "queued_for_analysis": summary.queued_for_analysis,
+            "errors": summary.errors,
+        }
+        if args.output:
+            output = Path(args.output)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(dumps(payload, indent=2, default=str), encoding="utf-8")
+            payload["output"] = str(output)
+        _print(payload)
         return 0
     if command == "copy-score":
         wallets = args.wallet or [target.wallet for target in service.database.list_targets()]

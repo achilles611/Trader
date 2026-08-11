@@ -87,6 +87,35 @@ and allow/block lists. Exposure-cap denominators are explicit; the research
 default is current marked equity. Target reductions and closes proportionally
 reduce the matching virtual sleeve; they cannot become reverse entries.
 
+## Repeatable candidate discovery
+
+`copy-discover` builds a cheap research queue; it does not backfill, score,
+approve, watch, or paper-copy a wallet. The initial native source is documented
+HyperCore node-trade data. Its `side_info` array attributes the buyer and seller
+through `side_info[].user`, so one trade can register both public wallets. No
+leaderboard endpoint is assumed or scraped.
+
+```powershell
+# A locally downloaded node-trade JSON/JSONL (or .lz4 with optional lz4 installed)
+python main.py copy-discover --source hypercore-file --input path\to\node_trades.jsonl --limit 1000 --min-activity 2 --output artifacts\discovery.json
+
+# An exact requester-pays historical-node object; requires optional boto3 plus AWS billing/credentials
+python main.py copy-discover --source hypercore-s3 --input s3://hl-mainnet-node-data/node_trades/hourly/DATE/HOUR --refresh
+```
+
+The S3 transport sends `RequestPayer=requester` and fails clearly if `boto3`,
+AWS requester-pays billing, credentials, or the exact object are unavailable.
+It never falls back to a scraped or undocumented HTTP endpoint. The transport
+interface also accepts local fixtures, downloaded data, local-node streams, or
+a future indexer while keeping their normalized observations identical.
+
+Discovery stores `copy_discovery_runs`, `copy_discovery_observations`, and
+`copy_discovery_candidates`. Each run records configuration, source, timestamps,
+counts, and errors. Observations are append-only; a wallet candidate is merged
+by normalized address, retains independent-source count, and refreshes its
+activity/last-seen values. A new wallet is added to `copy_targets` with status
+`new`; rediscovery never overwrites a manually set status.
+
 On watcher startup (and after each reconnect), it first receives an `allMids`
 frame to warm the market cache, then reconciles from the durable latest-fill
 timestamp with a one-millisecond overlap, and finally processes the subscribed
@@ -107,6 +136,7 @@ creating an execution attempt.
 
 ```powershell
 python main.py copy-import --wallet 0xYOUR_PUBLIC_WALLET
+python main.py copy-discover --source hypercore-file --input path\to\node_trades.jsonl --limit 1000
 python main.py copy-backfill --wallet 0xYOUR_PUBLIC_WALLET --start 2026-01-01T00:00:00Z
 python main.py copy-score --wallet 0xYOUR_PUBLIC_WALLET
 python main.py copy-rank --count 7
@@ -184,7 +214,8 @@ no-lookahead, marked long/short sleeves, partial loss risk, atomic fault replay,
 restart drawdown, walk-forward boundaries, time-aligned correlation, websocket
 payload shapes, official plural clearinghouse-state parsing, enriched-event
 backtests, contemporaneous live-paper price deterioration, fee-risk ledgers,
-coverage eligibility, and the earlier baseline behaviors.
+coverage eligibility, repeatable HyperCore-node discovery, and the earlier
+baseline behaviors.
 
 ## Hyperliquid limitations
 
@@ -201,3 +232,5 @@ coverage eligibility, and the earlier baseline behaviors.
   label this execution-price assumption rather than manufacturing L2 precision.
 - Public wallet behavior is not proof of strategy ownership, persistence, or
   future copyability. Treat scores as research inputs, not investment advice.
+- Hyperliquid's historical node buckets may be delayed or incomplete. Discovery
+  is only a candidate-universe source; it is not evidence of a trader's edge.

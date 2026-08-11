@@ -64,8 +64,13 @@ class PositionEventType(str, Enum):
 
 
 class TargetStatus(str, Enum):
+    NEW = "new"
+    QUEUED = "queued"
     PENDING = "pending"
     APPROVED = "approved"
+    SHADOW = "shadow"
+    ACTIVE = "active"
+    MUTED = "muted"
     REJECTED = "rejected"
 
 
@@ -90,6 +95,53 @@ class Target:
 
     def normalized_wallet(self) -> str:
         return self.wallet.lower()
+
+
+@dataclass(frozen=True)
+class DiscoveryObservation:
+    """One source-preserving public observation of a potentially useful wallet."""
+
+    wallet: str
+    source: str
+    observed_at: datetime
+    recent_activity_at: datetime | None = None
+    discovery_rank: int | None = None
+    source_score: float | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    raw_evidence: dict[str, Any] = field(default_factory=dict)
+    evidence_id: str | None = None
+
+    def normalized_wallet(self) -> str:
+        return self.wallet.lower()
+
+
+@dataclass(frozen=True)
+class DiscoveryRun:
+    run_id: str
+    started_at: datetime
+    sources: tuple[str, ...]
+    configuration: dict[str, Any]
+    finished_at: datetime | None = None
+    status: str = "running"
+    wallets_seen: int = 0
+    new_wallets: int = 0
+    existing_wallets_refreshed: int = 0
+    filtered_wallets: int = 0
+    queued_for_analysis: int = 0
+    errors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class DiscoverySummary:
+    run_id: str
+    status: str
+    sources: tuple[str, ...]
+    wallets_seen: int
+    new_wallets: int
+    existing_wallets_refreshed: int
+    filtered_wallets: int
+    queued_for_analysis: int
+    errors: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

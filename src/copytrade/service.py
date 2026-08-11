@@ -8,7 +8,7 @@ from typing import Iterable
 
 from .analytics import calculate_trader_metrics
 from .config import CopyTradeConfig
-from .discovery import CandidateDiscoveryAdapter
+from .discovery import CandidateDiscoveryAdapter, DiscoveryPipeline
 from .hyperliquid import HyperliquidPublicAdapter
 from .models import PositionEvent, PositionEventType, RawFill, Target, TargetStatus, TraderSnapshot, as_utc, utc_now
 from .market import LiveMarketCache
@@ -46,6 +46,15 @@ class CopyTradeService:
             imported.append(target)
         return imported
 
+    def discover_candidates(
+        self, provider: CandidateDiscoveryAdapter, *, limit: int, min_activity: int, refresh: bool = False,
+        configuration: dict[str, object] | None = None,
+    ):
+        """Register cheap, public discovery evidence only; no scoring or paper execution occurs here."""
+        return DiscoveryPipeline(self.database).run(
+            provider, limit=limit, min_activity=min_activity, refresh=refresh, configuration=configuration,
+        )
+
     def import_wallet_file(self, path: str | Path) -> list[Target]:
         source = Path(path)
         if not source.exists():
@@ -58,16 +67,6 @@ class CopyTradeService:
             if first.lower() not in {"wallet", "address", ""}:
                 tokens.append(first)
         return self.import_wallets(tokens)
-
-    def import_discovered(self, adapter: CandidateDiscoveryAdapter) -> list[Target]:
-        """Register future discovery-adapter results through the same audit path."""
-        imported: list[Target] = []
-        for target in adapter.discover():
-            if not _is_wallet(target.wallet.lower()):
-                raise ValueError(f"Discovery adapter emitted an invalid wallet: {target.wallet}")
-            self.database.upsert_target(target)
-            imported.append(target)
-        return imported
 
     def set_status(self, wallet: str, status: str) -> None:
         if status not in {item.value for item in TargetStatus}:
