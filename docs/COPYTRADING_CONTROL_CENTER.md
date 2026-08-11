@@ -34,6 +34,18 @@ npm run dev
 
 The development server proxies `/api` and `/ws` to the FastAPI process at port 8090.
 
+## Turnkey candidate discovery
+
+The **Discovery** page is the fresh-install entry point. It resolves the recent official HyperCore `node_fills_by_block` source through the documented `s3://hl-mainnet-node-data/node_fills_by_block/` requester-pays S3 prefix, caches verified objects under `artifacts/hypercore-cache/`, and passes those cached files to the unchanged Phase A `hypercore-file` parser.
+
+Hyperliquid documents this node-data distribution and its requester-pays transfer requirement at [Historical data](https://hyperliquid.gitbook.io/hyperliquid-docs/historical-data). Trader uses the standard boto3/AWS credential chain only; it never asks for credentials in the browser, stores credentials, accepts arbitrary URLs, or accepts local paths from the API. Click **Test Source Access** after configuring normal AWS credentials and requester-pays billing access. Missing access is shown with actionable setup guidance.
+
+- **Quick Scan**: roughly one hour of recent source objects, up to 1,000 candidates.
+- **Standard Scan**: roughly six hours, up to 2,500 candidates.
+- **Deep Scan**: roughly 24 hours, up to 5,000 candidates.
+
+All three presets require at least two observed events and preserve Phase A's 30-day recency rule. A durable Phase C orchestration job reports source resolution/acquisition, parsing, and frozen Phase A completion via `/ws` as `discovery_job_update`. Its result carries the Phase A discovery run ID and safe source provenance. Rediscovery preserves existing operator states and does not create Active targets, paper positions, or watcher membership. Phase B analysis remains a deliberately manual next step. The cache uses atomic `.partial` downloads, reuses validated objects, and prunes to a 5 GiB bounded local cache; cache objects are never committed to Git.
+
 ## Operator controls
 
 - **Pause Paper Entries** persists `ENTRIES_PAUSED`: it blocks only new `OPEN`/`ADD` paper signals. Existing `REDUCE`, `CLOSE`, and flip-close handling continues.
@@ -51,3 +63,4 @@ REST is used for research tables and details; `/ws` publishes incremental `contr
 Phase C reads B.2 through a read-only normalization boundary. Candidate score, eligibility, ranking, and activation all use only the canonical `provenance='phase_b'` score tied to the candidate analysis `last_run_id`; legacy scores can be displayed as compatibility context but never influence paper-entry decisions. The dossier renders the canonical `score.total`, `score.eligible`, `score.components`, `score.penalties`, and `score.reasons` fields, with hard-gate failures shown separately. Activation also requires the parent Phase B run to be `completed` or `completed_with_errors`.
 
 All Phase C state is persisted in the existing SQLite database via the additive `copy_control_center_state` and `copy_control_center_activity` tables.
+Candidate-discovery orchestration is additionally persisted in `copy_control_center_jobs`; downloaded public node-data cache objects are ignored by Git with the rest of `artifacts/`.

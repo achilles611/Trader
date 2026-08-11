@@ -18,9 +18,11 @@ from typing import Any, Iterator
 
 from .config import CopyTradeConfig
 from .control_center_read_model import phase_b_candidate_view
+from .discovery import build_discovery_provider, parse_activity_age
 from .models import CopySignal, as_utc, iso, jsonable, stable_id, utc_now
 from .paper import PaperExecutionEngine
 from .scoring import select_diverse_targets_with_metadata
+from .source_acquisition import HyperCoreSourceAcquisition, HyperCoreSourceError, cache_directory, discovery_preset
 from .storage import CopyTradeDatabase
 
 
@@ -281,6 +283,24 @@ class ControlCenterStore:
                     ON copy_control_center_activity(occurred_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_copy_control_activity_wallet
                     ON copy_control_center_activity(wallet, occurred_at DESC);
+                CREATE TABLE IF NOT EXISTS copy_control_center_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    job_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    progress_current INTEGER,
+                    progress_total INTEGER,
+                    stage TEXT NOT NULL DEFAULT '',
+                    message TEXT NOT NULL DEFAULT '',
+                    cancellation_requested INTEGER NOT NULL DEFAULT 0,
+                    configuration_json TEXT NOT NULL DEFAULT '{}',
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    error_json TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE INDEX IF NOT EXISTS idx_copy_control_jobs_type_time
+                    ON copy_control_center_jobs(job_type, created_at DESC);
                 """
             )
 
@@ -336,6 +356,83 @@ class ControlCenterStore:
         with self._connect() as connection:
             rows = connection.execute(query, values).fetchall()
         return [{**dict(row), "payload": _load(row["payload_json"], {})} for row in rows]
+
+    def create_job(self, *, job_type: str, configuration: dict[str, Any], job_id: str | None = None) -> dict[str, Any]:
+        self.initialize()
+        created_at = iso(utc_now())
+        identifier = job_id or stable_id("control_center_job", job_type, created_at, configuration)
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO copy_control_center_jobs(job_id, job_type, status, created_at, stage, message, configuration_json)
+                   VALUES (?, ?, 'queued', ?, 'queued', 'Discovery job queued.', ?)""",
+                (identifier, job_type, created_at, _dump(configuration)),
+            )
+        return self.get_job(identifier) or {}
+
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
+        self.initialize()
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM copy_control_center_jobs WHERE job_id=?", (job_id,)).fetchone()
+        return self._job_payload(row) if row else None
+
+    def list_jobs(self, *, job_type: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        self.initialize()
+        query = "SELECT * FROM copy_control_center_jobs"
+        values: list[Any] = []
+        if job_type:
+            query += " WHERE job_type=?"
+            values.append(job_type)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        values.append(max(1, min(int(limit), 200)))
+        with self._connect() as connection:
+            rows = connection.execute(query, values).fetchall()
+        return [self._job_payload(row) for row in rows]
+
+    def update_job(
+        self, job_id: str, *, status: str | None = None, stage: str | None = None, message: str | None = None,
+        progress_current: int | None = None, progress_total: int | None = None, result: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None, started: bool = False, finished: bool = False,
+    ) -> dict[str, Any]:
+        self.initialize()
+        assignments, values = [], []
+        for column, value in (("status", status), ("stage", stage), ("message", message),
+                              ("progress_current", progress_current), ("progress_total", progress_total)):
+            if value is not None:
+                assignments.append(f"{column}=?")
+                values.append(value)
+        if result is not None:
+            assignments.append("result_json=?")
+            values.append(_dump(result))
+        if error is not None:
+            assignments.append("error_json=?")
+            values.append(_dump(error))
+        if started:
+            assignments.append("started_at=COALESCE(started_at, ?)")
+            values.append(iso(utc_now()))
+        if finished:
+            assignments.append("finished_at=?")
+            values.append(iso(utc_now()))
+        if not assignments:
+            return self.get_job(job_id) or {}
+        values.append(job_id)
+        with self._connect() as connection:
+            connection.execute(f"UPDATE copy_control_center_jobs SET {', '.join(assignments)} WHERE job_id=?", values)
+        return self.get_job(job_id) or {}
+
+    def request_job_cancellation(self, job_id: str) -> dict[str, Any] | None:
+        self.initialize()
+        with self._connect() as connection:
+            connection.execute("UPDATE copy_control_center_jobs SET cancellation_requested=1 WHERE job_id=?", (job_id,))
+        return self.get_job(job_id)
+
+    @staticmethod
+    def _job_payload(row: sqlite3.Row) -> dict[str, Any]:
+        value = dict(row)
+        value["cancellation_requested"] = bool(value["cancellation_requested"])
+        value["configuration"] = _load(value.pop("configuration_json"), {})
+        value["result"] = _load(value.pop("result_json"), {})
+        value["error"] = _load(value.pop("error_json"), {})
+        return value
 
     def entry_block_reason(self, wallet: str, action: str) -> str | None:
         """Return an auditable paper-entry gate reason; exits are never gated here."""
@@ -926,11 +1023,104 @@ class CopyControlCenter:
         return self.close_all_paper_positions(pause_after=True)
 
 
+class CandidateDiscoveryOrchestrator:
+    """Run official-source acquisition around, never inside, frozen Phase A."""
+
+    def __init__(self, service: Any, store: ControlCenterStore, source: HyperCoreSourceAcquisition) -> None:
+        self.service = service
+        self.store = store
+        self.source = source
+
+    def run(self, job_id: str) -> None:
+        job = self.store.get_job(job_id)
+        if not job:
+            return
+        configuration = dict(job.get("configuration") or {})
+        try:
+            self.store.update_job(job_id, status="acquiring", stage="source_resolution", message="Resolving recent official HyperCore source objects.", started=True)
+            window = timedelta(seconds=int(configuration["source_window_seconds"]))
+            objects = self.source.resolve_recent(window)
+            self.store.update_job(job_id, status="acquiring", stage="acquisition", message="Acquiring official HyperCore source objects.", progress_current=0, progress_total=len(objects))
+            cached_paths, provenance = [], []
+            for index, source_object in enumerate(objects, 1):
+                if self._cancelled(job_id):
+                    return
+                path, metadata = self.source.acquire(source_object)
+                cached_paths.append(str(path))
+                provenance.append(metadata)
+                self.store.update_job(job_id, status="acquiring", stage="acquisition", message=f"Acquired {index} of {len(objects)} official source objects.", progress_current=index, progress_total=len(objects))
+            if self._cancelled(job_id):
+                return
+            self.store.update_job(job_id, status="parsing", stage="parsing", message="Preparing cached HyperCore fills for frozen Phase A discovery.")
+            # Phase A remains the only parser/normalizer and the only writer of
+            # discovery evidence.  Cached objects take the identical local-file
+            # path used by the pre-existing reproducible CLI command.
+            provider = build_discovery_provider("hypercore-file", cached_paths)
+            self.store.update_job(job_id, status="discovering", stage="discovering", message="Running frozen Phase A candidate discovery.")
+            summary = self.service.discover_candidates(
+                provider, limit=int(configuration["candidate_limit"]), min_activity=int(configuration["min_activity"]),
+                refresh=False, max_activity_age=parse_activity_age(str(configuration["max_activity_age"])),
+                configuration={
+                    "source": "official_hypercore_requester_pays_cache",
+                    "source_transport": "aws_s3_requester_pays",
+                    "official_source_identifier": "s3://hl-mainnet-node-data/node_fills_by_block/",
+                    "source_window_seconds": int(configuration["source_window_seconds"]),
+                    "preset": configuration["preset"], "objects": provenance,
+                },
+            )
+            result = {
+                "discovery_run_id": summary.run_id, "status": summary.status, "wallets_observed": summary.wallets_seen,
+                "eligible_wallets": summary.eligible_wallets, "registered_candidates": summary.new_wallets + summary.existing_wallets_refreshed,
+                "new_candidates": summary.new_wallets, "existing_refreshed": summary.existing_wallets_refreshed,
+                "filtered": summary.filtered_wallets, "deferred_by_limit": summary.limit_deferred_wallets,
+                "invalid": len(summary.errors), "source_objects": len(objects), "source_metadata": provenance,
+            }
+            status = "completed_with_warnings" if summary.errors else "completed"
+            message = "Candidate discovery completed with warnings." if summary.errors else "Candidate discovery completed."
+            self.store.update_job(job_id, status=status, stage="completed", message=message, result=result, finished=True)
+            self.store.record_activity(category="discovery", severity="warning" if summary.errors else "info", message=message,
+                                       payload={"job_id": job_id, **result})
+        except HyperCoreSourceError as exc:
+            self._fail(job_id, str(exc), "source_access")
+        except Exception as exc:  # Phase A errors stay auditable without taking FastAPI down.
+            self._fail(job_id, str(exc), "discovery")
+
+    def _cancelled(self, job_id: str) -> bool:
+        job = self.store.get_job(job_id)
+        if not job or not job.get("cancellation_requested"):
+            return False
+        self.store.update_job(job_id, status="cancelled", stage="cancelled", message="Discovery cancelled before frozen Phase A processing started.", finished=True)
+        return True
+
+    def _fail(self, job_id: str, message: str, stage: str) -> None:
+        self.store.update_job(job_id, status="failed", stage=stage, message=message, error={"message": message}, finished=True)
+        self.store.record_activity(category="discovery", severity="warning", message="Candidate discovery failed.", payload={"job_id": job_id, "error": message, "stage": stage})
+
+
+def discovery_job_configuration(body: dict[str, Any] | None) -> dict[str, Any]:
+    """Accept small bounded operator overrides; never source keys, URLs, or paths."""
+    body = body or {}
+    preset = discovery_preset(str(body.get("preset") or "standard"))
+    limit = int(body.get("candidate_limit", preset["candidate_limit"]))
+    min_activity = int(body.get("min_activity", preset["min_activity"]))
+    window_hours = float(body.get("window_hours", preset["window"].total_seconds() / 3600))
+    max_activity_age = str(body.get("max_activity_age", preset["max_activity_age"]))
+    if not 1 <= limit <= 5_000:
+        raise ValueError("Candidate limit must be between 1 and 5000.")
+    if not 1 <= min_activity <= 100:
+        raise ValueError("Minimum activity must be between 1 and 100.")
+    if not 0 < window_hours <= 24:
+        raise ValueError("Source window must be greater than zero and no more than 24 hours.")
+    parse_activity_age(max_activity_age)
+    return {"preset": preset["preset"], "candidate_limit": limit, "min_activity": min_activity,
+            "max_activity_age": max_activity_age, "source_window_seconds": int(window_hours * 3600)}
+
+
 def create_control_center_app(
     config: CopyTradeConfig, database: CopyTradeDatabase | None = None, watcher_health: dict[str, Any] | Any | None = None,
     *, watcher_service: Any | None = None, watcher_factory: Any | None = None,
     watcher_poll_interval_seconds: float = 1.0, watcher_retry_delay_seconds: float = 3.0,
-    watcher_stop_timeout_seconds: float = 3.0,
+    watcher_stop_timeout_seconds: float = 3.0, discovery_source: HyperCoreSourceAcquisition | None = None,
 ) -> Any:
     """Create the local FastAPI Phase C application; no live-trading routes exist."""
     try:
@@ -942,6 +1132,11 @@ def create_control_center_app(
 
     center = CopyControlCenter(config, database)
     watcher_runtime: dict[str, Any] = {}
+    job_runtime: dict[str, asyncio.Task[Any]] = {}
+    source = discovery_source or HyperCoreSourceAcquisition(cache_directory(config.artifacts.database_path))
+    # Import lazily: CopyTradeService itself owns Phase C control-state setup.
+    from .service import CopyTradeService
+    discovery_orchestrator = CandidateDiscoveryOrchestrator(CopyTradeService(config, center.database), center.store, source)
 
     def live_watcher_health() -> dict[str, Any] | None:
         supervisor = watcher_runtime.get("supervisor")
@@ -958,6 +1153,13 @@ def create_control_center_app(
 
     @asynccontextmanager
     async def lifespan(_: Any) -> Any:
+        # A thread cannot be safely resumed after a process restart.  Preserve
+        # its durable record and make the interruption explicit to operators.
+        for job in center.store.list_jobs(job_type="candidate_discovery", limit=200):
+            if job["status"] in {"queued", "acquiring", "parsing", "discovering"}:
+                center.store.update_job(job["job_id"], status="failed", stage="interrupted", finished=True,
+                                        message="Control Center restarted before this discovery job completed.",
+                                        error={"message": "Control Center restarted before this discovery job completed."})
         if watcher_service is not None:
             if watcher_factory is None:
                 from .hyperliquid import HyperliquidWatcher
@@ -983,7 +1185,7 @@ def create_control_center_app(
                 await asyncio.gather(task, return_exceptions=True)
 
     app = FastAPI(title="Trader Copy Control Center", version="1.0", docs_url=None, redoc_url=None,
-                  lifespan=lifespan if watcher_service is not None else None)
+                  lifespan=lifespan)
 
     @app.exception_handler(sqlite3.Error)
     async def database_unavailable(_: Any, __: sqlite3.Error) -> Any:
@@ -1001,6 +1203,69 @@ def create_control_center_app(
     @app.get("/api/overview")
     async def api_overview() -> dict[str, Any]:
         return center.overview()
+
+    @app.get("/api/discovery/status")
+    async def api_discovery_status() -> dict[str, Any]:
+        overview = center.overview()
+        health = center.health(live_watcher_health)
+        jobs = center.store.list_jobs(job_type="candidate_discovery", limit=1)
+        return {
+            "paper_only": True, "source": source.source_status(), "candidate_universe_count": overview["counts"]["total_discovered"],
+            "last_successful_discovery": health["last_discovery_run"], "current_job": jobs[0] if jobs else None,
+            "presets": {name: {"window_hours": int(value["window"].total_seconds() / 3600), "candidate_limit": value["candidate_limit"],
+                               "min_activity": value["min_activity"], "max_activity_age": value["max_activity_age"]} for name, value in {
+                                   "quick": discovery_preset("quick"), "standard": discovery_preset("standard"), "deep": discovery_preset("deep"),
+                               }.items()},
+        }
+
+    @app.get("/api/discovery/source")
+    async def api_discovery_source() -> dict[str, Any]:
+        return {"paper_only": True, **source.source_status()}
+
+    @app.post("/api/discovery/source/test")
+    async def api_discovery_source_test() -> dict[str, Any]:
+        return {"paper_only": True, **source.source_status(test_access=True)}
+
+    @app.post("/api/discovery/jobs")
+    async def api_discovery_job(body: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Discovery job body must be an object.")
+        allowed = {"preset", "candidate_limit", "min_activity", "max_activity_age", "window_hours"}
+        unexpected = sorted(set(body) - allowed)
+        if unexpected:
+            raise HTTPException(status_code=400, detail="Unsupported discovery job fields: " + ", ".join(unexpected))
+        try:
+            configuration = discovery_job_configuration(body)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        existing = center.store.list_jobs(job_type="candidate_discovery", limit=20)
+        if any(item["status"] in {"queued", "acquiring", "parsing", "discovering"} for item in existing):
+            raise HTTPException(status_code=409, detail="A candidate discovery job is already running.")
+        job = center.store.create_job(job_type="candidate_discovery", configuration=configuration)
+        job_runtime[job["job_id"]] = asyncio.create_task(asyncio.to_thread(discovery_orchestrator.run, job["job_id"]))
+        return job
+
+    @app.get("/api/discovery/jobs")
+    async def api_discovery_jobs() -> dict[str, Any]:
+        return {"items": center.store.list_jobs(job_type="candidate_discovery"), "paper_only": True}
+
+    @app.get("/api/discovery/jobs/{job_id}")
+    async def api_discovery_job_detail(job_id: str) -> dict[str, Any]:
+        job = center.store.get_job(job_id)
+        if not job or job["job_type"] != "candidate_discovery":
+            raise HTTPException(status_code=404, detail="Discovery job not found.")
+        return job
+
+    @app.post("/api/discovery/jobs/{job_id}/cancel")
+    async def api_discovery_job_cancel(job_id: str) -> dict[str, Any]:
+        job = center.store.get_job(job_id)
+        if not job or job["job_type"] != "candidate_discovery":
+            raise HTTPException(status_code=404, detail="Discovery job not found.")
+        if job["status"] in {"completed", "completed_with_warnings", "failed", "cancelled"}:
+            raise HTTPException(status_code=409, detail="This discovery job has already finished.")
+        result = center.store.request_job_cancellation(job_id)
+        assert result is not None
+        return result
 
     @app.get("/api/candidates")
     async def api_candidates(
@@ -1061,7 +1326,7 @@ def create_control_center_app(
 
     @app.get("/api/system")
     async def api_system() -> dict[str, Any]:
-        return {"health": center.health(live_watcher_health), "risk": center.risk_panel(), "paper_only": True}
+        return {"health": center.health(live_watcher_health), "risk": center.risk_panel(), "source": source.source_status(), "paper_only": True}
 
     @app.get("/api/controls")
     async def api_controls() -> dict[str, Any]:
@@ -1100,6 +1365,9 @@ def create_control_center_app(
                     "watcher_health": center.health(live_watcher_health)["watcher"],
                     "activity": {"items": center.activity(limit=20)},
                 }
+                latest_job = center.store.list_jobs(job_type="candidate_discovery", limit=1)
+                if latest_job:
+                    events["discovery_job_update"] = latest_job[0]
                 for name, payload in events.items():
                     signature = _dump(payload)
                     if previous.get(name) != signature:
