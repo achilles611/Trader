@@ -125,10 +125,9 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
     if command == "copy-watch":
         watcher = HyperliquidWatcher(service.adapter)
         async def watch() -> dict[str, int]:
-            reconciled = await service.reconcile_approved_wallets()
-            await watcher.run(service.approved_wallets(), service.ingest_watched_fills, service.ingest_watched_state,
-                              service.ingest_market_update, duration_seconds=args.duration)
-            return reconciled
+            return await watcher.run(service.approved_wallets(), service.ingest_watched_fills, service.ingest_watched_state,
+                                     service.ingest_market_update, service.reconcile_approved_wallets,
+                                     duration_seconds=args.duration)
         reconciled = asyncio.run(watch())
         _print({"health": watcher.health.as_dict(), "mode": config.mode, "reconciled_fills": reconciled})
         return 0
@@ -163,7 +162,7 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
             _print(payload)
         return 0
     if command in {"copy-report", "copy-export-obsidian"}:
-        exporter = ObsidianExporter(config, service.database)
+        exporter = ObsidianExporter(config, service.database, lambda wallet: service.reconstruct(wallet)["events"])
         paths = [str(exporter.export_target(wallet)) for wallet in (args.wallet or [target.wallet for target in service.database.list_targets()])]
         _print({"target_notes": paths, "dashboard": str(exporter.export_dashboard()), "report": str(exporter.export_report())})
         return 0

@@ -164,6 +164,7 @@ def _optional_float(value: Any) -> float | None:
 FillHandler = Callable[[str, list[RawFill], bool], Awaitable[None] | None]
 StateHandler = Callable[[str, dict[str, Any]], Awaitable[None] | None]
 MarketHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
+ReconcileHandler = Callable[[], Awaitable[dict[str, int]] | dict[str, int]]
 
 
 @dataclass
@@ -193,31 +194,37 @@ class HyperliquidWatcher:
     def stop(self) -> None:
         self._stopped.set()
 
-    async def reconcile(self, wallets: Iterable[str], on_fills: FillHandler) -> None:
+    async def reconcile(self, wallets: Iterable[str], on_fills: FillHandler) -> dict[str, int]:
         """Use a small overlap so restart/disconnect reconciliation is idempotent."""
+        reconciled: dict[str, int] = {}
         for wallet in wallets:
             try:
                 fills = await asyncio.to_thread(self.adapter.fetch_user_fills, wallet)
                 result = on_fills(wallet.lower(), fills, True)
                 if asyncio.iscoroutine(result):
                     await result
+                reconciled[wallet.lower()] = len(fills)
             except Exception as exc:  # A watcher should continue monitoring other targets.
                 self.health.per_target[wallet.lower()] = ConnectionState.ERROR
                 self.health.error = str(exc)
+                reconciled[wallet.lower()] = 0
+        return reconciled
 
     async def run(
         self, wallets: Iterable[str], on_fills: FillHandler, on_state: StateHandler | None = None,
         on_market: MarketHandler | None = None,
+        on_reconcile: ReconcileHandler | None = None,
         *, duration_seconds: float | None = None,
-    ) -> None:
+    ) -> dict[str, int]:
         target_wallets = [wallet.lower() for wallet in wallets]
         if not target_wallets:
             raise ValueError("No approved copy-trade targets to watch.")
         if len(set(target_wallets)) > 10:
             raise ValueError("Hyperliquid allows at most 10 unique users across user-specific websocket subscriptions.")
-        await self.reconcile(target_wallets, on_fills)
         deadline = asyncio.get_running_loop().time() + duration_seconds if duration_seconds else None
         backoff = self.adapter.config.reconnect_initial_seconds
+        needs_reconcile = True
+        initial_reconciled: dict[str, int] = {}
         self.health.state = ConnectionState.RECONNECTING
         self.health.per_target = {wallet: ConnectionState.RECONNECTING for wallet in target_wallets}
         try:
@@ -228,10 +235,17 @@ class HyperliquidWatcher:
         while not self._stopped.is_set() and (deadline is None or asyncio.get_running_loop().time() < deadline):
             try:
                 async with websockets.connect(self.adapter.config.websocket_url, ping_interval=20, ping_timeout=20) as socket:
-                    if on_market and self.adapter.config.subscribe_market_data:
+                    if on_market:
+                        if not self.adapter.config.subscribe_market_data:
+                            raise ValueError("copy-watch requires source.subscribe_market_data=true to warm its paper-price cache.")
                         # allMids is a single public stream.  The service filters
                         # it to active/open symbols and labels it a midpoint.
                         await socket.send(json.dumps({"method": "subscribe", "subscription": {"type": "allMids"}}))
+                        # Do not gap-reconcile into a cold cache: new paper
+                        # entries would be rejected or use an invalid fallback.
+                        # A current allMids frame establishes the cache before
+                        # any gap fill is handed to the operational service.
+                        await self._warm_market_cache(socket, on_fills, on_state, on_market)
                     for wallet in target_wallets:
                         await socket.send(json.dumps({"method": "subscribe", "subscription": {"type": "userFills", "user": wallet}}))
                         # Shared userFills carries its `user` field.  Do not
@@ -239,6 +253,12 @@ class HyperliquidWatcher:
                         # safely attributable shared multiwallet contract.
                         if self.adapter.config.subscribe_position_state:
                             await socket.send(json.dumps({"method": "subscribe", "subscription": {"type": "allDexsClearinghouseState", "user": wallet}}))
+                    if needs_reconcile:
+                        result = on_reconcile() if on_reconcile else self.reconcile(target_wallets, on_fills)
+                        reconciled = await result if asyncio.iscoroutine(result) else result
+                        if not initial_reconciled:
+                            initial_reconciled = reconciled
+                        needs_reconcile = False
                     self.health.state = ConnectionState.CONNECTED
                     self.health.per_target = {wallet: ConnectionState.CONNECTED for wallet in target_wallets}
                     self.health.error = ""
@@ -262,8 +282,26 @@ class HyperliquidWatcher:
                 self.health.error = str(exc)
                 await asyncio.sleep(backoff)
                 backoff = min(self.adapter.config.reconnect_max_seconds, backoff * 2)
-                await self.reconcile(target_wallets, on_fills)
+                # Reconciliation is deliberately deferred until the next
+                # connection has refreshed the market cache.
+                needs_reconcile = True
         self.health.state = ConnectionState.STOPPED
+        return initial_reconciled
+
+    async def _warm_market_cache(
+        self, socket: Any, on_fills: FillHandler, on_state: StateHandler | None, on_market: MarketHandler,
+    ) -> None:
+        """Wait for one allMids frame before replaying the source-fill gap."""
+        try:
+            while not self._stopped.is_set():
+                message = await asyncio.wait_for(socket.recv(), timeout=self.adapter.config.stale_after_seconds)
+                decoded = json.loads(message)
+                if isinstance(decoded, dict) and decoded.get("channel") == "allMids" and isinstance(decoded.get("data"), dict):
+                    await self._handle_message(decoded, on_fills, on_state, on_market)
+                    return
+                await self._handle_message(decoded, on_fills, on_state, on_market)
+        except TimeoutError as exc:
+            raise HyperliquidAPIError("Timed out waiting for initial allMids market-cache warmup.") from exc
 
     async def _handle_message(
         self, message: dict[str, Any], on_fills: FillHandler, on_state: StateHandler | None,

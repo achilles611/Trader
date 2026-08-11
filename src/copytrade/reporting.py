@@ -4,30 +4,34 @@ import html
 import math
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .analytics import campaign_return_series, calculate_trader_metrics, drawdown_curve, equity_curve
 from .backtest import CopyTradeBacktester
 from .config import CopyTradeConfig
-from .models import BacktestRun, CandidateScore, PositionCampaign, TraderMetrics
+from .models import BacktestRun, CandidateScore, PositionCampaign, PositionEvent, TraderMetrics
 from .storage import CopyTradeDatabase
 
 
 class ObsidianExporter:
-    def __init__(self, config: CopyTradeConfig, database: CopyTradeDatabase) -> None:
+    def __init__(
+        self, config: CopyTradeConfig, database: CopyTradeDatabase,
+        event_provider: Callable[[str], Iterable[PositionEvent]] | None = None,
+    ) -> None:
         self.config = config
         self.database = database
         self.root = config.artifacts.obsidian_root
+        self.event_provider = event_provider
 
     def export_target(self, wallet: str) -> Path:
         target = self.database.get_target(wallet)
         if not target:
             raise KeyError(f"Target not found: {wallet}")
         campaigns = self.database.list_campaigns(wallet)
-        events = self.database.list_position_events(wallet)
-        metrics = self.database.latest_metrics(wallet) or calculate_trader_metrics(wallet, campaigns, events)
+        events = self._enriched_events(wallet)
+        metrics = self.database.latest_metrics(wallet) or calculate_trader_metrics(wallet, campaigns, events, self.config.sizing)
         score = next((item for item in self.database.latest_scores() if item.target_wallet == wallet.lower()), None)
-        charts = self._target_charts(wallet, campaigns, metrics)
+        charts = self._target_charts(wallet, campaigns, metrics, events)
         note = self.root / "Targets" / f"{wallet.lower()}.md"
         note.parent.mkdir(parents=True, exist_ok=True)
         note.write_text(self._target_markdown(target.status, wallet, metrics, score, charts), encoding="utf-8")
@@ -90,7 +94,18 @@ class ObsidianExporter:
         )
         return path
 
-    def _target_charts(self, wallet: str, campaigns: list[PositionCampaign], metrics: TraderMetrics) -> dict[str, Path]:
+    def _enriched_events(self, wallet: str) -> tuple[PositionEvent, ...]:
+        if self.event_provider:
+            return tuple(self.event_provider(wallet))
+        # Direct exporter use must retain the same prior-only equity enrichment
+        # as the CLI's service path, not reconstitute raw fills in a backtest.
+        from .service import CopyTradeService
+        result = CopyTradeService(self.config, self.database).reconstruct(wallet)
+        return tuple(result["events"])
+
+    def _target_charts(
+        self, wallet: str, campaigns: list[PositionCampaign], metrics: TraderMetrics, events: Iterable[PositionEvent],
+    ) -> dict[str, Path]:
         chart_dir = self.root / "charts"
         chart_dir.mkdir(parents=True, exist_ok=True)
         closed = [campaign for campaign in campaigns if campaign.closed_at]
@@ -100,14 +115,14 @@ class ObsidianExporter:
         holding = [campaign.holding_seconds / 60 for campaign in closed]
         size = [campaign.entry_notional for campaign in campaigns]
         symbol_pnl = metrics.by_symbol
-        fills = self.database.list_raw_fills(wallet)
+        events = tuple(events)
         follower_curve: list[float] = []
         latency_values: list[float] = []
-        if fills:
+        if events:
             backtester = CopyTradeBacktester(self.config)
-            follower_run = backtester.run(fills)
+            follower_run = backtester.run(events=events)
             follower_curve = [float(value) for value in follower_run.summary.get("follower_equity_curve", [])]
-            latency_values = [float(value["net_pnl"]) for value in backtester.latency_decay_curve(fills)]
+            latency_values = [float(value["net_pnl"]) for value in backtester.latency_decay_curve(events=events)]
         paths = {
             "equity_curve": chart_dir / f"{wallet}_equity.svg",
             "drawdown_curve": chart_dir / f"{wallet}_drawdown.svg",

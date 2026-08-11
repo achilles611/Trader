@@ -87,10 +87,12 @@ and allow/block lists. Exposure-cap denominators are explicit; the research
 default is current marked equity. Target reductions and closes proportionally
 reduce the matching virtual sleeve; they cannot become reverse entries.
 
-On watcher startup, the service fetches from the durable latest-fill timestamp
-with a one-millisecond overlap before subscribing. The subsequent Hyperliquid
-websocket snapshot is also accepted. Both paths pass through the same
-deterministic raw-event ID and execution-attempt boundary, so reconnect data is
+On watcher startup (and after each reconnect), it first receives an `allMids`
+frame to warm the market cache, then reconciles from the durable latest-fill
+timestamp with a one-millisecond overlap, and finally processes the subscribed
+user-fill stream. There is one initial reconciliation, not a duplicate startup
+pass. The websocket snapshot is also accepted. Both paths pass through the
+same deterministic raw-event ID and execution-attempt boundary, so overlap is
 replayed safely rather than silently skipped or copied twice.
 
 For live paper research, `allMids` is cached as a websocket midpoint reference.
@@ -123,9 +125,13 @@ running.
 
 ## Backtesting and candidate selection
 
-The backtester replays reconstructed position events chronologically. It seeds
-size history only from events before the replay window and supports rolling
-train/forward windows. Without a latency-sensitive historical market provider,
+The backtester replays reconstructed, equity-enriched position events
+chronologically. Its execution engine is in-memory: it never writes operational
+signals, execution attempts/fills, virtual sleeves, claims, or portfolio marks.
+Only an optional `copy_backtest_runs` research record is persisted. Obsidian
+follower and latency charts, as well as slippage scenarios, use the same
+enriched events. It seeds size history only from events before the replay window
+and supports rolling train/forward windows. Without a latency-sensitive historical market provider,
 latency survivability is explicitly unavailable and is reweighted out of the
 score; a shifted target-fill-price replay is never latency evidence. With a
 provider, the reference price is queried at detection plus order latency and

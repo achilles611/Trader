@@ -23,7 +23,10 @@ class CopyTradeBacktester:
         self, config: CopyTradeConfig, store: CopyTradeStore | None = None, market_data: MarketDataProvider | None = None
     ) -> None:
         self.config = config
-        self.store = store
+        # The optional store is solely the research-run archive.  A replay must
+        # never share the operational paper engine's signals, attempts, fills,
+        # sleeves, or portfolio snapshots.
+        self.research_store = store
         self.market_data = market_data
 
     def run(
@@ -40,7 +43,9 @@ class CopyTradeBacktester:
         classifier = TargetSizeClassifier(self.config.sizing)
         self._seed_prior_size_history(classifier, prior_events)
         factory = SignalFactory(classifier, self.config)
-        engine = PaperExecutionEngine(self.config, self.store)
+        # Keep every execution artifact in memory.  The only optional durable
+        # result of a backtest is its BacktestRun record below.
+        engine = PaperExecutionEngine(self.config)
         attempts = []
         market_observations: list[dict[str, object]] = []
         execution_details: list[dict[str, object]] = []
@@ -62,8 +67,6 @@ class CopyTradeBacktester:
                         "event_id": event.event_id, "allocation_fraction": signal.allocation_fraction,
                         "bucket": signal.reason.removeprefix("size_"), "equity_source": signal.equity_source,
                     })
-                if self.store:
-                    self.store.insert_signal(signal)  # type: ignore[attr-defined]
                 received = event.event_timestamp + timedelta(milliseconds=self.config.paper_execution.detection_latency_ms)
                 execution_at = received + timedelta(milliseconds=self.config.paper_execution.order_latency_ms)
                 market_price = event.price
@@ -121,8 +124,8 @@ class CopyTradeBacktester:
             seed=self.config.paper_execution.random_seed, configuration=self.config.snapshot(), summary=summary,
             git_commit=_git_commit(),
         )
-        if self.store:
-            self.store.insert_backtest_run(run)  # type: ignore[attr-defined]
+        if self.research_store:
+            self.research_store.insert_backtest_run(run)  # type: ignore[attr-defined]
         return run
 
     def latency_decay_curve(
@@ -145,12 +148,15 @@ class CopyTradeBacktester:
                            "return_fraction": float(run.summary["return_fraction"])})
         return values
 
-    def slippage_scenarios(self, fills: Iterable[RawFill]) -> list[dict[str, float]]:
+    def slippage_scenarios(
+        self, fills: Iterable[RawFill] | None = None, *, events: Iterable[PositionEvent] | None = None,
+    ) -> list[dict[str, float]]:
         values: list[dict[str, float]] = []
-        fills = list(fills)
+        fill_list = list(fills or ())
+        event_list = list(events) if events is not None else None
         for slippage_bps in self.config.backtest.slippage_scenarios_bps:
             config = replace(self.config, paper_execution=replace(self.config.paper_execution, slippage_bps=slippage_bps))
-            run = CopyTradeBacktester(config, market_data=self.market_data).run(fills)
+            run = CopyTradeBacktester(config, market_data=self.market_data).run(fill_list, events=event_list)
             values.append({"slippage_bps": float(slippage_bps), "net_pnl": float(run.summary["net_pnl"]),
                            "return_fraction": float(run.summary["return_fraction"])})
         return values

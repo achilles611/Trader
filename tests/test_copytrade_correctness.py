@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
 import json
+import sys
 import tempfile
+import types
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from src.copytrade.analytics import calculate_trader_metrics
 from src.copytrade.backtest import CopyTradeBacktester
 from src.copytrade.config import ArtifactConfig, CandidateConfig, CopyTradeConfig, PaperExecutionConfig, RiskConfig, SizingConfig
+from src.copytrade.cli import run_copytrade_command
 from src.copytrade.hyperliquid import HyperliquidPublicAdapter, HyperliquidWatcher
 from src.copytrade.market import HyperliquidMarketData, MarketPrice
 from src.copytrade.models import RawFill, TraderSnapshot, as_utc, stable_id, utc_now
@@ -80,6 +85,75 @@ class CandleAdapter:
 
 
 class CopytradeCorrectnessTests(unittest.TestCase):
+    def test_copy_backtest_does_not_mutate_operational_paper_tables(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = config(Path(temp))
+            service = CopyTradeService(cfg)
+            service.database.insert_raw_fill(raw(1, "B", 1, 0))
+            self.assertEqual(PaperExecutionEngine(cfg, service.database).process_signal(signal("operational")).status, "filled")
+
+            operational_tables = (
+                "copy_signals", "copy_execution_claims", "copy_execution_attempts", "copy_execution_fills",
+                "copy_virtual_positions", "copy_portfolio_snapshots",
+            )
+            def counts() -> dict[str, int]:
+                with service.database._connect() as connection:  # type: ignore[attr-defined]
+                    return {table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in operational_tables}
+
+            before = counts()
+            args = argparse.Namespace(
+                command="copy-backtest", config="ignored.yaml", wallet=[WALLET], walk_forward=False,
+                export=False, market_price_proxy=False,
+            )
+            with patch("src.copytrade.cli.CopyTradeConfig.from_yaml", return_value=cfg), patch("src.copytrade.cli._print"):
+                self.assertEqual(run_copytrade_command(args), 0)
+            self.assertEqual(counts(), before)
+            with service.database._connect() as connection:  # type: ignore[attr-defined]
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM copy_backtest_runs").fetchone()[0], 1)
+
+    def test_watcher_warms_market_cache_once_before_initial_reconcile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            adapter = HyperliquidPublicAdapter(config(Path(temp)).source)
+            calls: list[str] = []
+            adapter.fetch_user_fills = lambda wallet: (_ for _ in ()).throw(AssertionError("watcher fallback reconcile must not run"))  # type: ignore[method-assign]
+            watcher = HyperliquidWatcher(adapter)
+
+            class Socket:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *args):
+                    return None
+
+                async def send(self, message):
+                    return None
+
+                async def recv(self):
+                    return json.dumps({"channel": "allMids", "data": {"mids": {"BTC": "100"}}})
+
+                async def ping(self):
+                    return None
+
+            async def on_fills(wallet, fills, is_snapshot):
+                calls.append("fills")
+                watcher.stop()
+
+            async def on_market(payload):
+                calls.append("market")
+
+            async def gap_reconcile():
+                calls.append("reconcile")
+                await on_fills(WALLET, [], True)
+                return {WALLET: 0}
+
+            fake_websockets = types.SimpleNamespace(connect=lambda *args, **kwargs: Socket())
+            with patch.dict(sys.modules, {"websockets": fake_websockets}):
+                reconciled = asyncio.run(watcher.run(
+                    [WALLET], on_fills, on_market=on_market, on_reconcile=gap_reconcile, duration_seconds=1,
+                ))
+            self.assertEqual(calls, ["market", "reconcile", "fills"])
+            self.assertEqual(reconciled, {WALLET: 0})
+
     def test_enriched_events_drive_backtest_five_ten_twenty_and_ignore_future(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             cfg = config(Path(temp))
