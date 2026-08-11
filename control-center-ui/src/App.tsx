@@ -17,6 +17,8 @@ const bytes = (value: unknown) => {
 
 type Toast = { tone: "error" | "success" | "warning"; message: string } | null;
 type Confirmation = { title: string; body: string; action: () => Promise<void>; confirm: string } | null;
+const terminalDiscoveryStatuses = new Set(["completed", "completed_with_warnings", "failed", "cancelled"]);
+const isTerminalDiscoveryJob = (status?: string) => terminalDiscoveryStatuses.has(String(status || ""));
 
 export function App() {
   const [page, setPage] = useState<Page>("Overview");
@@ -134,18 +136,43 @@ function DiscoveryPage({ discoveryJob, navigate, confirmation, refresh }: { disc
   const [activityOverride, setActivityOverride] = useState("");
   const [windowOverride, setWindowOverride] = useState("");
   const [ageOverride, setAgeOverride] = useState("");
-  const [localJob, setLocalJob] = useState<Record<string, any> | null>(null);
+  const [trackedJobId, setTrackedJobId] = useState<string | null>(null);
+  const [polledJob, setPolledJob] = useState<Record<string, any> | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
   const load = useCallback(async () => { try { setData(await api("/api/discovery/status")); setError(null); } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to load discovery status."); } }, []);
   useEffect(() => { void load(); }, [load]);
-  const source = data?.source || {}; const job = discoveryJob || localJob || data?.current_job;
+  const source = data?.source || {}; const job = trackedJobId ? polledJob : discoveryJob || data?.current_job;
   const presets = data?.presets || { quick: { window_hours: 1, candidate_limit: 1000, min_activity: 2, max_activity_age: "30d" }, standard: { window_hours: 6, candidate_limit: 2500, min_activity: 2, max_activity_age: "30d" }, deep: { window_hours: 24, candidate_limit: 5000, min_activity: 2, max_activity_age: "30d" } };
   const sourceReady = source.connection_state === "READY";
   const running = ["queued", "acquiring", "parsing", "discovering"].includes(job?.status);
+  useEffect(() => {
+    if (!trackedJobId || discoveryJob?.job_id !== trackedJobId) return;
+    setPolledJob((current) => current && isTerminalDiscoveryJob(current.status) && !isTerminalDiscoveryJob(discoveryJob.status) ? current : discoveryJob);
+  }, [discoveryJob, trackedJobId]);
+  useEffect(() => {
+    if (!trackedJobId) return;
+    let active = true;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const current = await api<Record<string, any>>(`/api/discovery/jobs/${trackedJobId}`);
+        if (!active) return;
+        setPolledJob((previous) => previous && isTerminalDiscoveryJob(previous.status) && !isTerminalDiscoveryJob(current.status) ? previous : current);
+        if (isTerminalDiscoveryJob(current.status)) { void load(); return; }
+        timer = window.setTimeout(() => void poll(), 1_000);
+      } catch (cause) {
+        if (!active) return;
+        setError(cause instanceof Error ? cause.message : "Unable to refresh discovery job status.");
+        timer = window.setTimeout(() => void poll(), 1_000);
+      }
+    };
+    void poll();
+    return () => { active = false; if (timer !== undefined) window.clearTimeout(timer); };
+  }, [trackedJobId, load]);
   const testSource = async () => { setTesting(true); try { const value = await post<any>("/api/discovery/source/test"); setData((current) => ({ ...(current || {}), source: value })); setError(null); } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to test source access."); } finally { setTesting(false); } };
-  const start = async () => { try { const created = await post<any>("/api/discovery/jobs", { preset: selectedPreset, ...(limitOverride ? { candidate_limit: Number(limitOverride) } : {}), ...(activityOverride ? { min_activity: Number(activityOverride) } : {}), ...(windowOverride ? { window_hours: Number(windowOverride) } : {}), ...(ageOverride ? { max_activity_age: ageOverride } : {}) }); setLocalJob(created); setError(null); } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to start candidate discovery."); } };
-  const cancel = async () => { if (!job?.job_id) return; try { setLocalJob(await post(`/api/discovery/jobs/${job.job_id}/cancel`)); } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to request cancellation."); } };
+  const start = async () => { try { const created = await post<any>("/api/discovery/jobs", { preset: selectedPreset, ...(limitOverride ? { candidate_limit: Number(limitOverride) } : {}), ...(activityOverride ? { min_activity: Number(activityOverride) } : {}), ...(windowOverride ? { window_hours: Number(windowOverride) } : {}), ...(ageOverride ? { max_activity_age: ageOverride } : {}) }); setTrackedJobId(created.job_id); setPolledJob(created); setError(null); } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to start candidate discovery."); } };
+  const cancel = async () => { if (!job?.job_id) return; try { setPolledJob(await post(`/api/discovery/jobs/${job.job_id}/cancel`)); } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to request cancellation."); } };
   const result = job?.result || {};
   return <div className="page-grid">
     {error && <section className="panel span-12"><p className="empty-note">{error}</p></section>}
@@ -153,6 +180,7 @@ function DiscoveryPage({ discoveryJob, navigate, confirmation, refresh }: { disc
     <section className="panel span-6"><PanelTitle title="Research workflow" /><MetricList values={[["Step 1", "Discover traders"], ["Step 2", "Analyze traders"], ["Step 3", "Build Shadow cohort"], ["Step 4", "Select Active PAPER cohort"], ["Step 5", "Observe PAPER performance"]]} /><p className="muted">Discovery acquires bounded recent public data, invokes frozen Phase A, and never activates, shadows, watches, or paper-copies traders.</p></section>
     <section className="panel span-12"><PanelTitle title="Start Candidate Discovery" subtitle="Choose a deterministic count of completed UTC source hours; Phase B is never started automatically." /><div className="funnel">{(["quick", "standard", "deep"] as const).map((preset) => <button key={preset} className={selectedPreset === preset ? "selected" : ""} aria-pressed={selectedPreset === preset} onClick={() => setSelectedPreset(preset)}><strong>{preset.toUpperCase()} SCAN</strong><span>{presets[preset]?.hourly_objects || presets[preset]?.window_hours} completed hours · {Number(presets[preset]?.candidate_limit || 0).toLocaleString()} candidates · min {presets[preset]?.min_activity} events</span></button>)}</div><details><summary>Advanced scan overrides</summary><div className="toolbar"><input aria-label="Candidate limit override" type="number" min="1" max="5000" placeholder={`Candidate limit (${presets[selectedPreset]?.candidate_limit || 2500})`} value={limitOverride} onChange={(event) => setLimitOverride(event.target.value)} /><input aria-label="Minimum activity override" type="number" min="1" max="100" placeholder={`Minimum activity (${presets[selectedPreset]?.min_activity || 2})`} value={activityOverride} onChange={(event) => setActivityOverride(event.target.value)} /><input aria-label="Source window hours override" type="number" min="1" max="24" placeholder={`Source hours (${presets[selectedPreset]?.window_hours || 6})`} value={windowOverride} onChange={(event) => setWindowOverride(event.target.value)} /><input aria-label="Maximum activity age override" placeholder={`Max activity age (${presets[selectedPreset]?.max_activity_age || "30d"})`} value={ageOverride} onChange={(event) => setAgeOverride(event.target.value)} /></div></details><div className="toolbar"><span className="muted">Recency: {ageOverride || presets[selectedPreset]?.max_activity_age || "30d"}</span><button className="button positive" disabled={running || !sourceReady} onClick={() => confirmation({ title: "Start a PAPER research candidate scan?", body: "This will acquire recent public HyperCore data and run the frozen Phase A discovery pipeline. It will not place trades, activate traders, run Phase B automatically, or change existing operator states.", confirm: "Start Candidate Discovery", action: start })}>Start Candidate Discovery</button></div></section>
     {job && <section className="panel span-12"><PanelTitle title={`${String(job.configuration?.preset || selectedPreset).toUpperCase()} SCAN — ${String(job.status || "queued").toUpperCase()}`} subtitle={job.message || "Waiting for status."} /><MetricList values={[["Stage", job.stage || "queued"], ["Source hours", result.hourly_objects ?? result.source_plan?.objects_planned ?? job.configuration?.source_hour_count ?? "—"], ["Cached", result.source_plan ? `${result.source_plan.objects_cached} objects · ${bytes(result.source_plan.bytes_cached)}` : "—"], ["Download plan", result.source_plan ? `${result.source_plan.objects_planned - result.source_plan.objects_cached} objects · ${bytes(result.source_plan.bytes_to_download)}` : "—"], ["Acquisition", job.progress_total ? `${job.progress_current || 0} / ${job.progress_total} source objects` : "Indeterminate"], ["Source interval", result.source_first_hour ? `${result.source_first_hour} to ${result.source_last_hour}` : "—"], ["Observed wallets", result.wallets_observed === undefined ? "—" : Number(result.wallets_observed).toLocaleString()], ["Currently eligible", result.eligible_wallets === undefined ? "—" : Number(result.eligible_wallets).toLocaleString()], ["Candidates registered", result.registered_candidates === undefined ? "—" : Number(result.registered_candidates).toLocaleString()], ["New candidates", result.new_candidates === undefined ? "—" : Number(result.new_candidates).toLocaleString()], ["Existing refreshed", result.existing_refreshed === undefined ? "—" : Number(result.existing_refreshed).toLocaleString()], ["Filtered", result.filtered === undefined ? "—" : Number(result.filtered).toLocaleString()], ["Deferred by limit", result.deferred_by_limit === undefined ? "—" : Number(result.deferred_by_limit).toLocaleString()], ["Invalid", result.invalid === undefined ? "—" : Number(result.invalid).toLocaleString()], ["Candidate limit", job.configuration?.candidate_limit ?? "—"]]} />{running && <button className="button warning" onClick={() => void cancel()}>Cancel Discovery</button>}{["completed", "completed_with_warnings"].includes(job.status) && <div className="toolbar"><button className="button positive" onClick={() => { void refresh(); navigate("Candidates"); }}>Open Candidates</button><span className="muted">Analyze Candidates is intentionally manual; use the existing Phase B workflow after reviewing the discovery universe.</span></div>}</section>}
+    {job?.status === "failed" && <section className="panel span-12 discovery-failure"><PanelTitle title="Discovery failed" subtitle="The persisted backend error is shown below; no cancellation remains pending." /><MetricList values={[["Stage", job.stage || "discovery"], ["Error", job.error?.message || job.message || "Unknown discovery error."], ["Downloaded", job.progress_total ? `${job.progress_current || 0} / ${job.progress_total}` : "—"], ["Download size", result.source_plan ? bytes(result.source_plan.bytes_total) : "—"]]} /><button className="button warning" onClick={() => confirmation({ title: "Retry candidate discovery?", body: "This retries the same bounded public-data workflow. Valid cached source objects are reused when they remain in the selected plan.", confirm: "Retry Discovery", action: start })}>Retry Discovery</button></section>}
   </div>;
 }
 

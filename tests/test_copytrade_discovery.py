@@ -103,16 +103,21 @@ class CopytradeDiscoveryTests(unittest.TestCase):
                 for table in ("copy_signals", "copy_execution_claims", "copy_execution_attempts", "copy_execution_fills", "copy_virtual_positions"):
                     self.assertEqual(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0)
 
-    def test_node_fills_and_node_fills_by_block_normalize_wallets(self) -> None:
+    def test_production_node_fills_by_block_pairs_normalize_outer_wallets_and_empty_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             database = CopyTradeDatabase(config(Path(temp)).artifacts.database_path)
             database.initialize()
             provider = HyperCoreNodeTradeDiscoveryProvider(IterableNodeTradeTransport([
-                fill(T0, BUYER, fill_id="api-fill"),
                 {
                     "local_time": timestamp(T0), "block_time": timestamp(T0), "block_number": 123,
-                    "events": [fill(T0, SELLER, fill_id="block-fill", include_time=False)],
+                    # Production node_fills_by_block events are [outer wallet,
+                    # API-shaped fill], not fill mappings with user embedded.
+                    "events": [
+                        [BUYER, {"coin": "ETH", "px": "200", "sz": "1", "side": "B", "time": timestamp(T0), "tid": "pair-buyer"}],
+                        [SELLER, {"coin": "BTC", "px": "100", "sz": "2", "side": "A", "tid": "pair-seller"}],
+                    ],
                 },
+                {"local_time": timestamp(T0), "block_time": timestamp(T0), "block_number": 124, "events": []},
             ]))
             summary = DiscoveryPipeline(database).run(provider, limit=10, min_activity=1, max_activity_age=None)
             self.assertEqual((summary.wallets_seen, summary.new_wallets), (2, 2))
@@ -123,7 +128,51 @@ class CopytradeDiscoveryTests(unittest.TestCase):
                     json.loads(row[0])["format"]
                     for row in connection.execute("SELECT metadata_json FROM copy_discovery_observations").fetchall()
                 }
-            self.assertEqual(formats, {"node_fills", "node_fills_by_block"})
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM copy_analysis_runs").fetchone()[0], 0)
+                for table in ("copy_signals", "copy_execution_claims", "copy_execution_attempts", "copy_execution_fills", "copy_virtual_positions"):
+                    self.assertEqual(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0)
+            self.assertEqual(formats, {"node_fills_by_block"})
+
+    def test_mapping_form_node_fills_by_block_remains_compatibility_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = CopyTradeDatabase(config(Path(temp)).artifacts.database_path)
+            database.initialize()
+            provider = HyperCoreNodeTradeDiscoveryProvider(IterableNodeTradeTransport([{
+                "local_time": timestamp(T0), "block_time": timestamp(T0), "block_number": 125,
+                "events": [fill(T0, BUYER, fill_id="mapping-compat", include_time=False)],
+            }]))
+            summary = DiscoveryPipeline(database).run(provider, limit=10, min_activity=1, max_activity_age=None)
+            self.assertEqual((summary.wallets_seen, summary.new_wallets), (1, 1))
+
+    def test_node_fills_by_block_pair_validation_invalid_wallet_and_deduplication(self) -> None:
+        valid_fill = {"coin": "ETH", "px": "200", "sz": "1", "time": timestamp(T0), "tid": "same-pair"}
+        malformed_events = (
+            [BUYER],
+            [BUYER, "not-a-fill"],
+            ["", valid_fill],
+            [123, valid_fill],
+            [BUYER, {"coin": "ETH", "sz": "1", "time": timestamp(T0)}],
+        )
+        for event in malformed_events:
+            provider = HyperCoreNodeTradeDiscoveryProvider(IterableNodeTradeTransport([{
+                "local_time": timestamp(T0), "block_time": timestamp(T0), "block_number": 126, "events": [event],
+            }]))
+            with self.subTest(event=event), self.assertRaisesRegex(DiscoveryProviderError, "node_fills_by_block event"):
+                list(provider.discover())
+
+        with tempfile.TemporaryDirectory() as temp:
+            database = CopyTradeDatabase(config(Path(temp)).artifacts.database_path)
+            database.initialize()
+            provider = HyperCoreNodeTradeDiscoveryProvider(IterableNodeTradeTransport([{
+                "local_time": timestamp(T0), "block_time": timestamp(T0), "block_number": 127,
+                "events": [[BUYER, valid_fill], [BUYER, dict(valid_fill)], ["not-a-wallet", {**valid_fill, "tid": "invalid-pair"}]],
+            }]))
+            summary = DiscoveryPipeline(database).run(provider, limit=10, min_activity=2, max_activity_age=None)
+            self.assertEqual((summary.wallets_seen, summary.eligible_wallets, summary.filtered_wallets), (1, 0, 1))
+            self.assertIn("invalid_wallets_rejected:1", summary.errors)
+            self.assertEqual(database.list_discovery_candidates(), [])
+            with database._connect() as connection:  # type: ignore[attr-defined]
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM copy_discovery_observations").fetchone()[0], 1)
 
     def test_unsupported_valid_schema_fails_without_creating_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -74,6 +74,8 @@ button:disabled {
 .nav-item:hover:not(:disabled) { background: #162432; }
 .funnel button { --button-accent: var(--accent); }
 .sort.active { border-radius: 2px; }
+.discovery-failure { border-color: color-mix(in srgb, var(--warning-accent) 58%, #202c39); background: #18170f; }
+.discovery-failure .button { margin-top: 13px; }
 
 @media (prefers-reduced-motion: reduce) {
   button { transition: none; }

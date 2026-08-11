@@ -20,6 +20,7 @@ let closeAllResponse: Record<string, unknown> | null = null;
 let emptyUniverse = false;
 let filteredEmpty = false;
 let discoveryJobResponse: Record<string, unknown> | null = null;
+let discoveryJobDetailResponse: Record<string, unknown> | null = null;
 
 function payload(path: string) {
   if (path.startsWith("/api/overview")) return { counts: { total_discovered: emptyUniverse ? 0 : 20, qualified: 2, shadow: 1, active: 0 }, funnel: [], top_candidates: [candidate], recent_activity: [] };
@@ -28,6 +29,7 @@ function payload(path: string) {
   if (path.startsWith("/api/controls")) return { state: "RUNNING", entries_allowed: true, paper_only: true };
   if (path.startsWith("/api/discovery/status")) return { candidate_universe_count: emptyUniverse ? 0 : 20, source: { source: "Official HyperCore node data", connection_state: "SETUP REQUIRED", aws_credentials_detected: false, requester_pays_access: "not tested", message: "No usable AWS credentials were detected on this machine. No credentials are stored by Trader.", cache: { object_count: 0, size_bytes: 0 } }, presets: { quick: { window_hours: 1, candidate_limit: 1000, min_activity: 2, max_activity_age: "30d" }, standard: { window_hours: 6, candidate_limit: 2500, min_activity: 2, max_activity_age: "30d" }, deep: { window_hours: 24, candidate_limit: 5000, min_activity: 2, max_activity_age: "30d" } } };
   if (path.startsWith("/api/discovery/source/test")) return { source: "Official HyperCore node data", connection_state: "READY", aws_credentials_detected: true, requester_pays_access: "ready", cache: { object_count: 1, size_bytes: 42 } };
+  if (path.startsWith("/api/discovery/jobs/")) return discoveryJobDetailResponse || { job_id: "discovery-1", status: "queued", stage: "queued", configuration: { preset: "standard", candidate_limit: 2500 } };
   if (path.startsWith("/api/discovery/jobs")) return discoveryJobResponse || { job_id: "discovery-1", status: "queued", stage: "queued", configuration: { preset: "standard", candidate_limit: 2500 } };
   if (path.startsWith("/api/system")) return { health: { mode: "paper", paper_only: true, database: { connected: true }, websocket: { available: true }, watcher: { state: "NOT_ATTACHED", desired_target_count: 0, subscribed_target_count: 0, membership_in_sync: true } }, risk: { limits: [] } };
   if (path.startsWith("/api/candidates?")) return { items: emptyUniverse || filteredEmpty ? [] : [candidate], page: path.includes("page=2") ? 2 : 1, page_size: 50, total: emptyUniverse ? 0 : filteredEmpty ? 1 : 51, pages: 2 };
@@ -41,6 +43,7 @@ beforeEach(() => {
   emptyUniverse = false;
   filteredEmpty = false;
   discoveryJobResponse = null;
+  discoveryJobDetailResponse = null;
   vi.stubGlobal("WebSocket", WebSocketStub);
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => new Response(JSON.stringify(payload(String(input))), { status: 200, headers: { "Content-Type": "application/json" } })));
 });
@@ -142,6 +145,26 @@ describe("copy control center", () => {
     const start = screen.getByRole("button", { name: "Start Candidate Discovery" });
     expect(start).toBeDisabled();
     expect(start).not.toHaveAttribute("aria-pressed");
+  });
+
+  it("supersedes a locally queued discovery with the polled persisted failure", async () => {
+    discoveryJobDetailResponse = {
+      job_id: "discovery-1", status: "failed", stage: "discovery", progress_current: 1, progress_total: 1,
+      message: "Unsupported node_fills_by_block event: expected a fill object.",
+      error: { message: "Unsupported node_fills_by_block event: expected a fill object." },
+      configuration: { preset: "quick", candidate_limit: 1000 }, result: { source_plan: { bytes_total: 32246406 } },
+    };
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Discovery" }));
+    await screen.findByText("Candidate Source");
+    fireEvent.click(screen.getByRole("button", { name: "Test Source Access" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start Candidate Discovery" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Start Candidate Discovery" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Start Candidate Discovery" }));
+    expect(await screen.findByText("Discovery failed")).toBeInTheDocument();
+    expect(screen.getAllByText("Unsupported node_fills_by_block event: expected a fill object.").length).toBeGreaterThan(0);
+    expect(screen.queryByRole("button", { name: "Cancel Discovery" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry Discovery" })).toBeInTheDocument();
   });
 
   it("shows discovery websocket progress and completion navigation", async () => {

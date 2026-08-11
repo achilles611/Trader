@@ -212,9 +212,28 @@ def _normalize_hypercore_record(
             raise DiscoveryProviderError("Unsupported HyperCore block record: expected node_fills_by_block {block_number, events:[fill...] }.")
         block_meta = {key: record.get(key) for key in ("local_time", "block_time", "block_number") if record.get(key) is not None}
         for event in events:
-            if not isinstance(event, Mapping):
-                raise DiscoveryProviderError("Unsupported node_fills_by_block event: expected a fill object.")
-            yield from _normalize_node_fill(event, observed_at, transport_name, "node_fills_by_block", block_meta)
+            if isinstance(event, Mapping):
+                # Compatibility for existing mapping-form node-fill fixtures.
+                yield from _normalize_node_fill(event, observed_at, transport_name, "node_fills_by_block", block_meta)
+                continue
+            if not isinstance(event, (list, tuple)) or len(event) != 2:
+                raise DiscoveryProviderError(
+                    "Unsupported node_fills_by_block event: expected a [wallet, fill] pair or compatible fill object."
+                )
+            wallet, fill = event
+            if not isinstance(wallet, str) or not wallet:
+                raise DiscoveryProviderError("Malformed node_fills_by_block event pair: expected a non-empty wallet string.")
+            if not isinstance(fill, Mapping):
+                raise DiscoveryProviderError("Malformed node_fills_by_block event pair: expected an API-shaped fill object.")
+            if (not str(fill.get("coin") or fill.get("symbol") or "")
+                    or (fill.get("px") is None and fill.get("price") is None)
+                    or (fill.get("sz") is None and fill.get("size") is None)
+                    or (fill.get("time") in (None, "") and fill.get("timestamp") in (None, "")
+                        and block_meta.get("block_time") in (None, "") and block_meta.get("local_time") in (None, ""))):
+                raise DiscoveryProviderError(
+                    "Malformed node_fills_by_block event pair: expected coin/symbol, px/price, sz/size, and time/timestamp or block time."
+                )
+            yield from _normalize_node_fill(fill, observed_at, transport_name, "node_fills_by_block", block_meta, user_override=wallet)
         return
     if _looks_like_fill(record):
         yield from _normalize_node_fill(record, observed_at, transport_name, "node_fills", {})
