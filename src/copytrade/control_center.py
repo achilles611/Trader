@@ -1037,18 +1037,35 @@ class CandidateDiscoveryOrchestrator:
             return
         configuration = dict(job.get("configuration") or {})
         try:
-            self.store.update_job(job_id, status="acquiring", stage="source_resolution", message="Resolving recent official HyperCore source objects.", started=True)
-            window = timedelta(seconds=int(configuration["source_window_seconds"]))
-            objects = self.source.resolve_recent(window)
-            self.store.update_job(job_id, status="acquiring", stage="acquisition", message="Acquiring official HyperCore source objects.", progress_current=0, progress_total=len(objects))
+            self.store.update_job(job_id, status="acquiring", stage="source_resolution", message="Resolving recent official HyperCore UTC-hour source objects.", started=True)
+            objects = self.source.resolve_hourly_objects(int(configuration["source_hour_count"]))
+            if self._cancelled(job_id):
+                return
+            preflight = self.source.preflight(objects)
+            self.store.update_job(
+                job_id, status="acquiring", stage="preflight", message=(
+                    f"Preflight complete: {preflight['objects_planned']} source hours; "
+                    f"{preflight['objects_cached']} cached; {preflight['bytes_to_download']} bytes to download."
+                ), progress_current=preflight["objects_cached"], progress_total=len(objects), result={"source_plan": preflight},
+            )
+            if self._cancelled(job_id):
+                return
+            protected_paths = set(preflight["protected_paths"])
+            cached_identifiers = set(preflight["cached_source_identifiers"])
+            self.store.update_job(job_id, status="acquiring", stage="acquisition", message="Acquiring preflighted official HyperCore source objects.", progress_current=0, progress_total=len(objects))
             cached_paths, provenance = [], []
+            bytes_acquired, bytes_reused = 0, 0
             for index, source_object in enumerate(objects, 1):
                 if self._cancelled(job_id):
                     return
-                path, metadata = self.source.acquire(source_object)
+                path, metadata = self.source.acquire(source_object, protected_paths=protected_paths)
                 cached_paths.append(str(path))
                 provenance.append(metadata)
-                self.store.update_job(job_id, status="acquiring", stage="acquisition", message=f"Acquired {index} of {len(objects)} official source objects.", progress_current=index, progress_total=len(objects))
+                if source_object.identifier in cached_identifiers:
+                    bytes_reused += source_object.size
+                else:
+                    bytes_acquired += source_object.size
+                self.store.update_job(job_id, status="acquiring", stage="acquisition", message=f"Acquired {index} of {len(objects)} official hourly source objects.", progress_current=index, progress_total=len(objects))
             if self._cancelled(job_id):
                 return
             self.store.update_job(job_id, status="parsing", stage="parsing", message="Preparing cached HyperCore fills for frozen Phase A discovery.")
@@ -1064,7 +1081,7 @@ class CandidateDiscoveryOrchestrator:
                     "source": "official_hypercore_requester_pays_cache",
                     "source_transport": "aws_s3_requester_pays",
                     "official_source_identifier": "s3://hl-mainnet-node-data/node_fills_by_block/",
-                    "source_window_seconds": int(configuration["source_window_seconds"]),
+                    "source_hour_count": int(configuration["source_hour_count"]),
                     "preset": configuration["preset"], "objects": provenance,
                 },
             )
@@ -1073,7 +1090,10 @@ class CandidateDiscoveryOrchestrator:
                 "eligible_wallets": summary.eligible_wallets, "registered_candidates": summary.new_wallets + summary.existing_wallets_refreshed,
                 "new_candidates": summary.new_wallets, "existing_refreshed": summary.existing_wallets_refreshed,
                 "filtered": summary.filtered_wallets, "deferred_by_limit": summary.limit_deferred_wallets,
-                "invalid": len(summary.errors), "source_objects": len(objects), "source_metadata": provenance,
+                "invalid": len(summary.errors), "source_objects": len(objects), "hourly_objects": len(objects),
+                "source_first_hour": objects[0].data_hour_start, "source_last_hour": objects[-1].data_hour_start,
+                "bytes_acquired": bytes_acquired, "bytes_reused_from_cache": bytes_reused,
+                "source_plan": preflight, "source_metadata": provenance,
             }
             status = "completed_with_warnings" if summary.errors else "completed"
             message = "Candidate discovery completed with warnings." if summary.errors else "Candidate discovery completed."
@@ -1081,7 +1101,8 @@ class CandidateDiscoveryOrchestrator:
             self.store.record_activity(category="discovery", severity="warning" if summary.errors else "info", message=message,
                                        payload={"job_id": job_id, **result})
         except HyperCoreSourceError as exc:
-            self._fail(job_id, str(exc), "source_access")
+            current = self.store.get_job(job_id) or {}
+            self._fail(job_id, str(exc), str(current.get("stage") or "source_access"))
         except Exception as exc:  # Phase A errors stay auditable without taking FastAPI down.
             self._fail(job_id, str(exc), "discovery")
 
@@ -1103,7 +1124,7 @@ def discovery_job_configuration(body: dict[str, Any] | None) -> dict[str, Any]:
     preset = discovery_preset(str(body.get("preset") or "standard"))
     limit = int(body.get("candidate_limit", preset["candidate_limit"]))
     min_activity = int(body.get("min_activity", preset["min_activity"]))
-    window_hours = float(body.get("window_hours", preset["window"].total_seconds() / 3600))
+    window_hours = float(body.get("window_hours", preset["hourly_object_count"]))
     max_activity_age = str(body.get("max_activity_age", preset["max_activity_age"]))
     if not 1 <= limit <= 5_000:
         raise ValueError("Candidate limit must be between 1 and 5000.")
@@ -1113,7 +1134,9 @@ def discovery_job_configuration(body: dict[str, Any] | None) -> dict[str, Any]:
         raise ValueError("Source window must be greater than zero and no more than 24 hours.")
     parse_activity_age(max_activity_age)
     return {"preset": preset["preset"], "candidate_limit": limit, "min_activity": min_activity,
-            "max_activity_age": max_activity_age, "source_window_seconds": int(window_hours * 3600)}
+            "max_activity_age": max_activity_age,
+            "source_hour_count": max(1, int(window_hours) if window_hours.is_integer() else int(window_hours) + 1),
+            "window_hours": window_hours}
 
 
 def create_control_center_app(
@@ -1212,7 +1235,7 @@ def create_control_center_app(
         return {
             "paper_only": True, "source": source.source_status(), "candidate_universe_count": overview["counts"]["total_discovered"],
             "last_successful_discovery": health["last_discovery_run"], "current_job": jobs[0] if jobs else None,
-            "presets": {name: {"window_hours": int(value["window"].total_seconds() / 3600), "candidate_limit": value["candidate_limit"],
+            "presets": {name: {"window_hours": value["hourly_object_count"], "hourly_objects": value["hourly_object_count"], "candidate_limit": value["candidate_limit"],
                                "min_activity": value["min_activity"], "max_activity_age": value["max_activity_age"]} for name, value in {
                                    "quick": discovery_preset("quick"), "standard": discovery_preset("standard"), "deep": discovery_preset("deep"),
                                }.items()},
@@ -1238,6 +1261,8 @@ def create_control_center_app(
             configuration = discovery_job_configuration(body)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if source.source_status().get("connection_state") != "READY":
+            raise HTTPException(status_code=409, detail="Test official requester-pays source access successfully before starting discovery.")
         existing = center.store.list_jobs(job_type="candidate_discovery", limit=20)
         if any(item["status"] in {"queued", "acquiring", "parsing", "discovering"} for item in existing):
             raise HTTPException(status_code=409, detail="A candidate discovery job is already running.")

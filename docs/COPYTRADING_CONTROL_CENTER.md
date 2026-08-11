@@ -40,11 +40,17 @@ The **Discovery** page is the fresh-install entry point. It resolves the recent 
 
 Hyperliquid documents this node-data distribution and its requester-pays transfer requirement at [Historical data](https://hyperliquid.gitbook.io/hyperliquid-docs/historical-data). Trader uses the standard boto3/AWS credential chain only; it never asks for credentials in the browser, stores credentials, accepts arbitrary URLs, or accepts local paths from the API. Click **Test Source Access** after configuring normal AWS credentials and requester-pays billing access. Missing access is shown with actionable setup guidance.
 
-- **Quick Scan**: roughly one hour of recent source objects, up to 1,000 candidates.
-- **Standard Scan**: roughly six hours, up to 2,500 candidates.
-- **Deep Scan**: roughly 24 hours, up to 5,000 candidates.
+- **Quick Scan**: exactly one most-recent available completed UTC-hour object, up to 1,000 candidates.
+- **Standard Scan**: exactly six most-recent available completed UTC-hour objects, up to 2,500 candidates.
+- **Deep Scan**: exactly 24 most-recent available completed UTC-hour objects, up to 5,000 candidates.
 
-All three presets require at least two observed events and preserve Phase A's 30-day recency rule. A durable Phase C orchestration job reports source resolution/acquisition, parsing, and frozen Phase A completion via `/ws` as `discovery_job_update`. Its result carries the Phase A discovery run ID and safe source provenance. Rediscovery preserves existing operator states and does not create Active targets, paper positions, or watcher membership. Phase B analysis remains a deliberately manual next step. The cache uses atomic `.partial` downloads, reuses validated objects, and prunes to a 5 GiB bounded local cache; cache objects are never committed to Git.
+All three presets require at least two observed events and preserve Phase A's 30-day recency rule. The resolver starts at the most recently completed UTC hour (one publication-lag hour behind the current UTC hour), derives only narrow `node_fills_by_block/hourly/YYYYMMDD/HOUR` prefixes, and walks backward no more than 48 hours to collect the requested count. It never lists or paginates the historical root prefix and never uses S3 `LastModified` to define the source interval.
+
+The official node README documents the corresponding UTC hourly node-output organization as `hourly/{date}/{hour}` ([node output documentation](https://github.com/hyperliquid-dex/node)). The exact official S3 key returned by the narrow requester-pays listing is validated and persisted, including its actual suffix when present; Trader does not pre-assume `.lz4`, hour padding, or a manifest name. Source provenance distinguishes the path-authoritative `data_hour_start` / `data_hour_end` from storage-only `last_modified`, and retains bucket, key, size, ETag/checksum, local cache path, and acquisition time.
+
+Click **Test Source Access** before starting discovery. This is one `ListObjectsV2` requester-pays probe below a recent UTC-date prefix with `MaxKeys=1`; credentials alone show `UNTESTED`, a successful probe shows `READY`, requester-pays denial shows `SETUP_REQUIRED`, and other source errors show `UNAVAILABLE`. The selected `AWS_PROFILE` name may be displayed, but no credential material is displayed or stored.
+
+A durable Phase C orchestration job reports source resolution, preflight, acquisition, parsing, and frozen Phase A completion via `/ws` as `discovery_job_update`. Before its first download it resolves the complete plan, identifies valid cached objects, totals transfer bytes, reserves disk/cache capacity, and pins every current-job cache path so cleanup can remove only unrelated cached objects. A plan larger than the 5 GiB cache or insufficient disk fails before the first GET. The cache uses atomic `.partial` downloads and validated reuse; cache objects are never committed to Git. Job results include source interval, hourly-object count, bytes acquired/reused, Phase A run ID, and safe source provenance. Rediscovery preserves existing operator states and does not create Active targets, paper positions, or watcher membership. Phase B analysis remains a deliberately manual next step.
 
 ## Operator controls
 

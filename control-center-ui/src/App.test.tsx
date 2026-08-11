@@ -110,6 +110,9 @@ describe("copy control center", () => {
     expect(screen.getByText("STANDARD SCAN")).toBeInTheDocument();
     expect(screen.getByText("DEEP SCAN")).toBeInTheDocument();
     expect(screen.getByText("No usable AWS credentials were detected on this machine. No credentials are stored by Trader.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start Candidate Discovery" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Test Source Access" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start Candidate Discovery" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "Start Candidate Discovery" }));
     expect(screen.getByRole("dialog")).toHaveTextContent("will not place trades");
   });

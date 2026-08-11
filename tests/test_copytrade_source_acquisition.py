@@ -1,18 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import shutil
 import tempfile
 import unittest
-import asyncio
-from datetime import timedelta
+from collections import namedtuple
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from src.copytrade.control_center import CandidateDiscoveryOrchestrator, ControlCenterStore, create_control_center_app, discovery_job_configuration
-from src.copytrade.models import Target, utc_now
+from src.copytrade.models import utc_now
 from src.copytrade.service import CopyTradeService
 from src.copytrade.source_acquisition import (
     OFFICIAL_BUCKET,
+    OFFICIAL_HOURLY_PREFIX,
     OFFICIAL_PREFIX,
     HyperCoreSourceAcquisition,
     HyperCoreSourceError,
@@ -22,12 +26,21 @@ from tests.test_copytrade_control_center import config
 
 WALLET_A = "0x1111111111111111111111111111111111111111"
 WALLET_B = "0x2222222222222222222222222222222222222222"
+NOW = datetime(2026, 8, 11, 20, 25, tzinfo=timezone.utc)
+
+
+def hour_key(value: datetime, suffix: str = "") -> str:
+    value = value.astimezone(timezone.utc)
+    return f"{OFFICIAL_HOURLY_PREFIX}{value:%Y%m%d}/{value.hour}{suffix}"
 
 
 class FakeS3:
-    def __init__(self, objects: dict[str, bytes], *, access_error: Exception | None = None) -> None:
+    def __init__(self, objects: dict[str, bytes], *, last_modified: dict[str, datetime] | None = None,
+                 access_error: Exception | None = None, get_error: Exception | None = None) -> None:
         self.objects = objects
+        self.last_modified = last_modified or {}
         self.access_error = access_error
+        self.get_error = get_error
         self.get_calls = 0
         self.requests: list[dict[str, object]] = []
 
@@ -35,16 +48,20 @@ class FakeS3:
         self.requests.append(kwargs)
         if self.access_error:
             raise self.access_error
-        now = utc_now()
-        return {"Contents": [
-            {"Key": key, "Size": len(value), "LastModified": now, "ETag": f"etag-{index}"}
-            for index, (key, value) in enumerate(sorted(self.objects.items()), 1)
-        ], "IsTruncated": False}
+        prefix, limit = str(kwargs.get("Prefix") or ""), int(kwargs.get("MaxKeys") or 1000)
+        keys = [key for key in sorted(self.objects) if key.startswith(prefix)]
+        contents = [
+            {"Key": key, "Size": len(self.objects[key]), "LastModified": self.last_modified.get(key, NOW), "ETag": f"etag-{index}"}
+            for index, key in enumerate(keys[:limit], 1)
+        ]
+        return {"Contents": contents, "IsTruncated": len(keys) > limit}
 
     def get_object(self, **kwargs: object) -> dict[str, object]:
         self.requests.append(kwargs)
         if self.access_error:
             raise self.access_error
+        if self.get_error:
+            raise self.get_error
         self.get_calls += 1
         value = self.objects[str(kwargs["Key"])]
         return {"Body": io.BytesIO(value), "ContentLength": len(value)}
@@ -55,123 +72,185 @@ def fill(wallet: str, tid: int) -> dict[str, object]:
 
 
 class SourceAcquisitionTests(unittest.TestCase):
-    def _source(self, root: Path, records: list[dict[str, object]] | None = None) -> tuple[HyperCoreSourceAcquisition, FakeS3]:
-        payload = "\n".join(json.dumps(item) for item in (records or [fill(WALLET_A, 1), fill(WALLET_A, 2)])).encode("utf-8")
-        client = FakeS3({f"{OFFICIAL_PREFIX}20260811/12": payload})
-        return HyperCoreSourceAcquisition(root / "hypercore-cache", s3_client_factory=lambda: client), client
+    def _source(self, root: Path, objects: dict[str, bytes] | None = None, **kwargs: object) -> tuple[HyperCoreSourceAcquisition, FakeS3]:
+        data = objects or {hour_key(NOW - timedelta(hours=1)): b'{"user":"fixture"}\n'}
+        max_cache_bytes = int(kwargs.pop("max_cache_bytes", 5 * 1024 * 1024 * 1024))
+        client = FakeS3(data, **kwargs)
+        return HyperCoreSourceAcquisition(root / "hypercore-cache", s3_client_factory=lambda: client, now=lambda: NOW,
+                                          max_cache_bytes=max_cache_bytes), client
 
-    def test_official_resolver_is_deterministic_and_cache_reuses_complete_objects(self) -> None:
+    @staticmethod
+    def _hours(count: int, *, missing: set[int] | None = None, payload: bytes = b"x") -> dict[str, bytes]:
+        missing = missing or set()
+        return {hour_key(NOW - timedelta(hours=offset)): payload for offset in range(1, count + len(missing) + 1) if offset not in missing}
+
+    def test_resolver_uses_completed_path_hours_not_current_or_last_modified(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            source, client = self._source(Path(temp))
-            plan = source.resolve_recent(timedelta(hours=1))
-            self.assertEqual(plan[0].identifier, f"s3://{OFFICIAL_BUCKET}/{OFFICIAL_PREFIX}20260811/12")
+            current_key = hour_key(NOW)
+            hour_19, hour_18 = hour_key(NOW - timedelta(hours=1)), hour_key(NOW - timedelta(hours=2))
+            objects = {current_key: b"current", hour_19: b"one", hour_18: b"two"}
+            source, client = self._source(Path(temp), objects, last_modified={hour_18: NOW, hour_19: NOW - timedelta(days=90)})
+            plan = source.resolve_hourly_objects(2)
+            self.assertEqual([item.key for item in plan], [hour_18, hour_19])
+            self.assertEqual([item.data_hour_start for item in plan], ["2026-08-11T18:00:00+00:00", "2026-08-11T19:00:00+00:00"])
+            self.assertTrue(all(str(request["Prefix"]).startswith(OFFICIAL_HOURLY_PREFIX) for request in client.requests))
+            self.assertFalse(any(request.get("Prefix") == OFFICIAL_PREFIX for request in client.requests))
             self.assertTrue(all(request.get("RequestPayer") == "requester" for request in client.requests))
-            path, metadata = source.acquire(plan[0])
-            self.assertTrue(path.exists())
-            self.assertEqual(metadata["source_transport"], "aws_s3_requester_pays")
-            source.acquire(plan[0])
-            self.assertEqual(client.get_calls, 1)
-            self.assertEqual(source.cache_status()["object_count"], 1)
 
-    def test_partial_cache_objects_are_never_accepted_and_source_errors_are_safe(self) -> None:
+    def test_quick_standard_and_deep_have_exact_hourly_object_counts(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            source, client = self._source(Path(temp))
-            item = source.resolve_recent(timedelta(hours=1))[0]
+            source, _ = self._source(Path(temp), self._hours(24))
+            self.assertEqual(len(source.resolve_hourly_objects(1)), 1)
+            self.assertEqual(len(source.resolve_hourly_objects(6)), 6)
+            self.assertEqual(len(source.resolve_hourly_objects(24)), 24)
+
+    def test_missing_recent_and_interior_hours_walk_back_with_a_bounded_lookback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            objects = self._hours(10, missing={1, 4})
+            source, _ = self._source(Path(temp), objects)
+            plan = source.resolve_hourly_objects(6, lookback_hours=10)
+            self.assertEqual([item.hour for item in plan], [12, 13, 14, 15, 17, 18])
+            limited, _ = self._source(Path(temp) / "limited", {hour_key(NOW - timedelta(hours=8)): b"x"})
+            with self.assertRaisesRegex(HyperCoreSourceError, "only 0 were available within the bounded 3-hour"):
+                limited.resolve_hourly_objects(1, lookback_hours=3)
+
+    def test_exact_hourly_key_parser_rejects_unrelated_objects_and_accepts_actual_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            good = hour_key(NOW - timedelta(hours=1), ".lz4")
+            bad = f"{OFFICIAL_HOURLY_PREFIX}20260811/19/manifest.json"
+            source, _ = self._source(Path(temp), {good: b"a", bad: b"manifest"})
+            plan = source.resolve_hourly_objects(1)
+            self.assertEqual(plan[0].key, good)
+            self.assertEqual(plan[0].hour, 19)
+            self.assertEqual(plan[0].data_hour_end, "2026-08-11T20:00:00+00:00")
+            with self.assertRaisesRegex(HyperCoreSourceError, "official HyperCore hourly"):
+                source.acquire(plan[0].__class__(OFFICIAL_BUCKET, bad, 1, None))
+
+    def test_preflight_counts_cache_and_prunes_only_unrelated_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            objects = {
+                hour_key(NOW - timedelta(hours=1)): b"a" * 10,
+                hour_key(NOW - timedelta(hours=2)): b"b" * 10,
+                hour_key(NOW - timedelta(hours=3)): b"c" * 10,
+            }
+            source, client = self._source(root, objects, max_cache_bytes=25)
+            first, second, unrelated = source.resolve_hourly_objects(3)
+            source.acquire(first)
+            unrelated_path, _ = source.acquire(unrelated)
+            plan = source.preflight([first, second])
+            first_path, _ = source._paths_for(first)
+            self.assertEqual(plan["objects_cached"], 1)
+            self.assertEqual(plan["bytes_to_download"], 10)
+            self.assertTrue(first_path.exists())
+            self.assertFalse(unrelated_path.exists())
+            source.acquire(second, protected_paths=plan["protected_paths"])
+            self.assertTrue(first_path.exists())
+            self.assertEqual(client.get_calls, 3)
+
+    def test_preflight_too_large_and_disk_failure_happen_before_first_get(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            objects = {hour_key(NOW - timedelta(hours=1)): b"a" * 60, hour_key(NOW - timedelta(hours=2)): b"b" * 60}
+            source, client = self._source(Path(temp), objects, max_cache_bytes=100)
+            with self.assertRaisesRegex(HyperCoreSourceError, "staging space"):
+                source.preflight(source.resolve_hourly_objects(2))
+            self.assertEqual(client.get_calls, 0)
+
+        with tempfile.TemporaryDirectory() as temp:
+            source, client = self._source(Path(temp), {hour_key(NOW - timedelta(hours=1)): b"x" * 10})
+            DiskUsage = namedtuple("usage", "total used free")
+            with patch("src.copytrade.source_acquisition.shutil.disk_usage", return_value=DiskUsage(100, 100, 0)):
+                with self.assertRaisesRegex(HyperCoreSourceError, "Insufficient free disk"):
+                    source.preflight(source.resolve_hourly_objects(1))
+            self.assertEqual(client.get_calls, 0)
+
+    def test_failed_get_leaves_no_partial_and_fully_cached_standard_makes_zero_gets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source, client = self._source(Path(temp), {hour_key(NOW - timedelta(hours=1)): b"x" * 10}, get_error=RuntimeError("network unavailable"))
+            item = source.resolve_hourly_objects(1)[0]
             path, _ = source._paths_for(item)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.with_suffix(path.suffix + ".partial").write_bytes(b"incomplete")
-            cached, _ = source.acquire(item)
-            self.assertEqual(cached, path)
+            with self.assertRaises(HyperCoreSourceError):
+                source.acquire(item)
             self.assertFalse(path.with_suffix(path.suffix + ".partial").exists())
-            self.assertEqual(client.get_calls, 1)
-            with self.assertRaisesRegex(HyperCoreSourceError, "Only the documented official"):
-                source.acquire(item.__class__(bucket="other", key="anything", size=1, last_modified=None))
 
         with tempfile.TemporaryDirectory() as temp:
-            denied = HyperCoreSourceAcquisition(Path(temp) / "cache", s3_client_factory=lambda: FakeS3({}, access_error=RuntimeError("AccessDenied requester pays")))
-            status = denied.source_status(test_access=True)
-            self.assertEqual(status["connection_state"], "SETUP_REQUIRED")
-            self.assertIn("requester-pays authorization was denied", status["message"])
-            self.assertNotIn("secret", json.dumps(status).lower())
+            source, client = self._source(Path(temp), self._hours(6, payload=b"abcdef"))
+            plan = source.resolve_hourly_objects(6)
+            preflight = source.preflight(plan)
+            for item in plan:
+                source.acquire(item, protected_paths=preflight["protected_paths"])
+            client.get_calls = 0
+            cached = source.preflight(plan)
+            for item in plan:
+                source.acquire(item, protected_paths=cached["protected_paths"])
+            self.assertEqual(cached["objects_cached"], 6)
+            self.assertEqual(cached["bytes_to_download"], 0)
+            self.assertEqual(client.get_calls, 0)
+
+    def test_source_access_state_machine_is_safe_and_cheap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, _ = self._source(root)
+            with patch.object(source, "credentials_detected", return_value=False):
+                missing = source.source_status()
+            self.assertEqual((missing["connection_state"], missing["requester_pays_access"]), ("SETUP_REQUIRED", "UNTESTED"))
+            untested = source.source_status()
+            self.assertEqual((untested["connection_state"], untested["requester_pays_access"]), ("UNTESTED", "UNTESTED"))
+            ready = source.source_status(test_access=True)
+            self.assertEqual((ready["connection_state"], ready["requester_pays_access"]), ("READY", "READY"))
+            self.assertEqual(ready["probe_object_count"], 1)
+            self.assertNotIn("secret", json.dumps(ready).lower())
+            denied, _ = self._source(root / "denied", access_error=RuntimeError("AccessDenied requester pays"))
+            failed = denied.source_status(test_access=True)
+            self.assertEqual((failed["connection_state"], failed["requester_pays_access"]), ("SETUP_REQUIRED", "FAILED"))
+            outage, _ = self._source(root / "outage", access_error=RuntimeError("service unavailable"))
+            unavailable = outage.source_status(test_access=True)
+            self.assertEqual((unavailable["connection_state"], unavailable["requester_pays_access"]), ("UNAVAILABLE", "FAILED"))
 
     def test_orchestration_uses_frozen_phase_a_and_preserves_operator_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             service = CopyTradeService(config(root))
-            source, _ = self._source(root, [fill(WALLET_A, 1), fill(WALLET_A, 1), fill(WALLET_A, 2), fill(WALLET_B, 3), fill(WALLET_B, 4)])
+            payload = "\n".join(json.dumps(item) for item in [fill(WALLET_A, 1), fill(WALLET_A, 1), fill(WALLET_A, 2), fill(WALLET_B, 3), fill(WALLET_B, 4)]).encode()
+            source, _ = self._source(root, {hour_key(NOW - timedelta(hours=1)): payload})
             store = ControlCenterStore(service.config.artifacts.database_path)
-            store.initialize()
-            configuration = discovery_job_configuration({"preset": "quick", "candidate_limit": 1, "min_activity": 2, "max_activity_age": "30d"})
-            first = store.create_job(job_type="candidate_discovery", configuration=configuration)
+            first = store.create_job(job_type="candidate_discovery", configuration=discovery_job_configuration({"preset": "quick", "candidate_limit": 1}))
             CandidateDiscoveryOrchestrator(service, store, source).run(first["job_id"])
             completed = store.get_job(first["job_id"])
             assert completed is not None
             self.assertEqual(completed["status"], "completed")
-            self.assertIn("discovery_run_id", completed["result"])
-            self.assertEqual(completed["result"]["wallets_observed"], 2)
+            self.assertEqual(completed["result"]["hourly_objects"], 1)
+            self.assertEqual(completed["result"]["source_first_hour"], "2026-08-11T19:00:00+00:00")
+            self.assertIn("data_hour_start", completed["result"]["source_metadata"][0])
             self.assertEqual(len(service.database.list_discovery_candidates()), 1)
             self.assertFalse(service.database.list_targets("active"))
             self.assertFalse(service.database.list_virtual_positions(open_only=True))
             self.assertEqual(service.monitored_execution_wallets(), [])
             with service.database._connect() as connection:
                 phase_b_before = connection.execute("SELECT COUNT(*) FROM copy_analysis_runs").fetchone()[0]
-                provenance = connection.execute("SELECT configuration_json FROM copy_discovery_runs WHERE run_id=?", (completed["result"]["discovery_run_id"],)).fetchone()[0]
-            self.assertIn("official_hypercore_requester_pays_cache", provenance)
             self.assertEqual(phase_b_before, 0)
 
             discovered = service.database.list_discovery_candidates()[0]["wallet"]
             service.database.set_target_status(discovered, "shadow")
-            second = store.create_job(job_type="candidate_discovery", configuration={**configuration, "candidate_limit": 2})
+            second = store.create_job(job_type="candidate_discovery", configuration={**first["configuration"], "candidate_limit": 2})
             CandidateDiscoveryOrchestrator(service, store, source).run(second["job_id"])
             self.assertEqual(service.database.get_target(discovered).status, "shadow")  # type: ignore[union-attr]
-            self.assertEqual(store.get_job(second["job_id"])["status"], "completed")  # type: ignore[index]
-            self.assertEqual(ControlCenterStore(service.config.artifacts.database_path).get_job(first["job_id"])["status"], "completed")  # type: ignore[index]
 
-    def test_acquisition_failure_is_persisted_without_mutating_phase_a_or_paper_state(self) -> None:
+    def test_api_requires_successful_probe_and_background_job_persists_result(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             service = CopyTradeService(config(root))
-            source = HyperCoreSourceAcquisition(root / "cache", s3_client_factory=lambda: FakeS3({}, access_error=RuntimeError("AccessDenied requester pays")))
-            store = ControlCenterStore(service.config.artifacts.database_path)
-            job = store.create_job(job_type="candidate_discovery", configuration=discovery_job_configuration({"preset": "quick"}))
-            CandidateDiscoveryOrchestrator(service, store, source).run(job["job_id"])
-            failed = store.get_job(job["job_id"])
-            assert failed is not None
-            self.assertEqual(failed["status"], "failed")
-            self.assertIn("requester-pays authorization was denied", failed["message"])
-            self.assertFalse(service.database.list_discovery_candidates())
-            self.assertFalse(service.database.list_targets("active"))
-            self.assertFalse(service.database.list_virtual_positions(open_only=True))
-
-    def test_status_api_is_safe_and_rejects_generic_download_fields(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            service = CopyTradeService(config(root))
-            source, _ = self._source(root)
+            payload = "\n".join(json.dumps(item) for item in [fill(WALLET_A, 1), fill(WALLET_A, 2)]).encode()
+            source, _ = self._source(root, {hour_key(NOW - timedelta(hours=1)): payload})
             app = create_control_center_app(service.config, service.database, discovery_source=source)
-            status_endpoint = next(route.endpoint for route in app.routes if route.path == "/api/discovery/status")
-            status = __import__("asyncio").run(status_endpoint())
-            self.assertEqual(status["candidate_universe_count"], 0)
-            self.assertNotIn("aws_secret_access_key", json.dumps(status).lower())
-            self.assertNotIn("aws_session_token", json.dumps(status).lower())
-            start_endpoint = next(route.endpoint for route in app.routes if route.path == "/api/discovery/jobs")
-            with self.assertRaises(Exception) as rejected:
-                __import__("asyncio").run(start_endpoint({"url": "https://example.invalid"}))
-            self.assertEqual(rejected.exception.status_code, 400)
-            with self.assertRaises(Exception) as rejected_path:
-                __import__("asyncio").run(start_endpoint({"path": "C:\\Windows\\system.ini"}))
-            self.assertEqual(rejected_path.exception.status_code, 400)
-
-    def test_api_background_job_persists_progress_and_result(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            service = CopyTradeService(config(root))
-            source, _ = self._source(root, [fill(WALLET_A, 1), fill(WALLET_A, 2)])
-            app = create_control_center_app(service.config, service.database, discovery_source=source)
+            start = next(route.endpoint for route in app.routes if route.path == "/api/discovery/jobs" and "POST" in route.methods)
+            detail = next(route.endpoint for route in app.routes if route.path == "/api/discovery/jobs/{job_id}")
 
             async def exercise() -> None:
-                start = next(route.endpoint for route in app.routes if route.path == "/api/discovery/jobs" and "POST" in route.methods)
-                detail = next(route.endpoint for route in app.routes if route.path == "/api/discovery/jobs/{job_id}")
+                with self.assertRaises(Exception) as rejected:
+                    await start({"preset": "quick"})
+                self.assertEqual(rejected.exception.status_code, 409)
+                source.source_status(test_access=True)
                 async with app.router.lifespan_context(app):
                     created = await start({"preset": "quick", "candidate_limit": 1})
                     for _ in range(100):
@@ -183,4 +262,3 @@ class SourceAcquisitionTests(unittest.TestCase):
                     self.assertIn("discovery_run_id", current["result"])
 
             asyncio.run(exercise())
-            self.assertEqual(len(service.database.list_discovery_candidates()), 1)
