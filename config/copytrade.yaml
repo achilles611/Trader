@@ -88,6 +88,9 @@ candidates:
   closed_campaigns_min: 100
   max_drawdown_preferred: 0.15
   max_drawdown_hard: 0.25
+  max_follower_drawdown_preferred: 0.15
+  max_follower_drawdown_hard: 0.30
+  liquidation_frequency_hard: 0.10
   profit_factor_preferred: 1.40
   require_positive_expectancy: true
   require_positive_follower_expectancy: true
@@ -102,6 +105,7 @@ analysis:
   history_days: 180
   min_discovery_activity: 2
   shadow_finalist_count: 20
+  walk_forward_min_windows: 2
 
 artifacts: {}
 

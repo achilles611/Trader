@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from datetime import timedelta
 from statistics import fmean
 from typing import Any, Callable, Iterable
@@ -11,7 +13,7 @@ from .analytics import campaign_return_series
 from .backtest import CopyTradeBacktester
 from .config import CopyTradeConfig
 from .models import AnalysisRun, CandidateAnalysis, CandidateAnalysisState, PositionCampaign, PositionEvent, as_utc, new_run_id, utc_now
-from .scoring import FollowerMetrics, score_candidate, select_diverse_targets
+from .scoring import FollowerMetrics, score_candidate, select_diverse_targets_with_metadata
 from .service import CopyTradeService
 
 
@@ -50,40 +52,76 @@ class CandidateAnalysisPipeline:
         self, *, limit: int = 500, status: str | None = "new", resume: bool = False,
         force: bool = False, workers: int | None = None, cheap_only: bool = False,
     ) -> dict[str, object]:
-        if limit <= 0:
-            raise ValueError("--limit must be positive.")
-        worker_count = workers or self.config.analysis.default_workers
-        if worker_count <= 0:
-            raise ValueError("--workers must be positive.")
-        run, resumed = self._start_or_resume(
-            resume=resume, configuration={
-                "limit": limit, "status": status, "force": force, "workers": worker_count,
-                "cheap_only": cheap_only, "history_days": self.config.analysis.history_days,
+        existing_run = self.database.latest_resumable_analysis_run() if resume else None
+        if existing_run:
+            run = existing_run
+            configuration = _json_object(run.get("configuration_json"))
+            self._validate_resumed_configuration(configuration)
+            invocation = _json_object(configuration.get("invocation"))
+            if not invocation:
+                raise ValueError("Cannot resume a pre-Phase-B.1 run without an immutable invocation manifest.")
+            candidate_wallets = [str(wallet).lower() for wallet in configuration.get("candidate_wallets", [])]
+            if not candidate_wallets:
+                raise ValueError("Cannot resume analysis run without its immutable candidate manifest.")
+            candidate_rows = self.database.list_analysis_candidates(wallets=candidate_wallets, limit=len(candidate_wallets))
+            rows_by_wallet = {str(row["wallet"]).lower(): row for row in candidate_rows}
+            candidates = [rows_by_wallet[wallet] for wallet in candidate_wallets if wallet in rows_by_wallet]
+            worker_count = int(invocation["workers"])
+            force = bool(invocation["force"])
+            cheap_only = bool(invocation["cheap_only"])
+            required_start = as_utc(configuration["analysis_window"]["required_start"])
+            required_end = as_utc(configuration["analysis_window"]["required_end"])
+        else:
+            if limit <= 0:
+                raise ValueError("--limit must be positive.")
+            worker_count = workers or self.config.analysis.default_workers
+            if worker_count <= 0:
+                raise ValueError("--workers must be positive.")
+            candidates = self.database.list_analysis_candidates(status=status, limit=limit)
+            if status is None:
+                candidates = [row for row in candidates if row.get("current_status") not in _OPERATOR_CONTROLLED_TARGET_STATES]
+            required_end = utc_now()
+            required_start = required_end - timedelta(days=self.config.analysis.history_days)
+            configuration = {
+                "invocation": {"limit": limit, "status": status, "force": force, "workers": worker_count, "cheap_only": cheap_only},
+                "analysis_window": {"required_start": required_start.isoformat(), "required_end": required_end.isoformat()},
+                "history_days": self.config.analysis.history_days,
                 "min_discovery_activity": self.config.analysis.min_discovery_activity,
-                "copytrade_config": self.config.snapshot(),
-            },
-        )
-        counters = self._counters(run) if resumed else _empty_counters()
-        errors: list[str] = list(_json_list(run.get("errors_json"))) if resumed else []
-        candidates = self.database.list_analysis_candidates(status=status, limit=limit)
-        if status is None:
-            candidates = [row for row in candidates if row.get("current_status") not in _OPERATOR_CONTROLLED_TARGET_STATES]
+                "copytrade_config": self.config.snapshot(), "config_fingerprint": _config_fingerprint(self.config.snapshot()),
+                "candidate_wallets": [str(row["wallet"]).lower() for row in candidates],
+            }
+            run, _ = self._start_or_resume(resume=False, configuration=configuration)
+        errors: list[str] = list(_json_list(run.get("errors_json")))
         pending: list[dict[str, Any]] = []
+        ready_for_analysis: list[str] = []
         try:
             for candidate in candidates:
                 wallet = str(candidate["wallet"]).lower()
                 existing = self.database.get_candidate_analysis(wallet)
+                run_wallet = self.database.get_analysis_wallet(run["run_id"], wallet)
                 if not force and existing and existing.completed_at and existing.lifecycle_status in _FINAL_STATES:
-                    counters["deferred"] += 1
-                    self.database.record_analysis_wallet(run["run_id"], wallet, stage="resume", status="skipped", payload={
-                        "reason": "already_complete", "lifecycle_status": existing.lifecycle_status,
-                    })
+                    # A resume of this very run must not rewrite its successful
+                    # terminal state as "deferred".  A new run records why it
+                    # deliberately skipped a result from a prior run.
+                    if existing.last_run_id != run["run_id"]:
+                        self.database.record_analysis_wallet(run["run_id"], wallet, stage="resume", status="skipped", payload={
+                            "reason": "already_complete", "lifecycle_status": existing.lifecycle_status,
+                        })
                     continue
-                counters["wallets_considered"] += 1
+                if run_wallet and run_wallet["stage"] == "backfill" and run_wallet["status"] == "completed":
+                    ready_for_analysis.append(wallet)
+                    continue
+                if run_wallet and run_wallet["stage"] == "analysis" and run_wallet["status"] == "failed":
+                    ready_for_analysis.append(wallet)
+                    continue
+                if run_wallet and run_wallet["stage"] == "analysis" and run_wallet["status"] == "completed":
+                    continue
+                if run_wallet and run_wallet["stage"] == "backfill" and run_wallet["status"] == "quarantined":
+                    continue
+                if run_wallet and run_wallet["stage"] == "prefilter" and run_wallet["status"] == "rejected":
+                    continue
                 reasons = self._cheap_prefilter(candidate)
                 if reasons:
-                    counters["cheap_rejected"] += 1
-                    counters["rejected"] += 1
                     self._save_candidate(
                         wallet, CandidateAnalysisState.PREFILTER_REJECTED.value, run["run_id"],
                         reasons=reasons, summary={"prefilter": {"accepted": False, "reasons": reasons}}, completed=True,
@@ -98,21 +136,18 @@ class CandidateAnalysisPipeline:
                 pending.append(candidate)
 
             if cheap_only:
-                counters["deferred"] += len(pending)
                 for candidate in pending:
                     self.database.record_analysis_wallet(
                         run["run_id"], str(candidate["wallet"]), stage="backfill", status="deferred",
                         payload={"reason": "cheap_only"},
                     )
-                return self._finish(run["run_id"], counters, errors, status="completed")
+                return self._finish(run["run_id"], errors, status="completed")
 
-            required_start = utc_now() - timedelta(days=self.config.analysis.history_days)
+            for candidate in pending:
+                self.database.record_analysis_wallet(run["run_id"], str(candidate["wallet"]), stage="backfill", status="started")
             outcomes = self._backfill_all(pending, required_start, worker_count)
             for wallet, attempts, result, error in outcomes:
-                counters["backfill_attempted"] += 1
                 if error:
-                    counters["backfill_failed"] += 1
-                    counters["deferred"] += 1
                     errors.append(f"{wallet}: {error}")
                     self._save_candidate(
                         wallet, CandidateAnalysisState.BACKFILL_FAILED.value, run["run_id"], errors=(error,), completed=False,
@@ -121,10 +156,9 @@ class CandidateAnalysisPipeline:
                         run["run_id"], wallet, stage="backfill", status="failed", attempts=attempts, error=error,
                     )
                     continue
-                coverage = self.database.latest_backfill_coverage(wallet) or {}
+                coverage = self.database.analysis_window_coverage(wallet, required_start, required_end)
                 coverage_state = str(coverage.get("coverage_state", "UNPROVEN"))
                 if coverage_state == "KNOWN_INCOMPLETE":
-                    counters["rejected"] += 1
                     self._save_candidate(
                         wallet, CandidateAnalysisState.QUARANTINED.value, run["run_id"],
                         reasons=("known_incomplete",), summary={"coverage": coverage, "backfill": result}, completed=True,
@@ -139,58 +173,36 @@ class CandidateAnalysisPipeline:
                     payload={"coverage": coverage, "backfill": result},
                 )
                 self._save_candidate(wallet, CandidateAnalysisState.ANALYSIS_PENDING.value, run["run_id"], completed=False)
-                try:
-                    analysis = self._analyze_wallet(wallet, coverage)
-                except Exception as exc:  # reconstruction/simulation failure remains per-wallet and resumable
-                    message = str(exc)
-                    counters["deferred"] += 1
-                    errors.append(f"{wallet}: analysis failed: {message}")
-                    self._save_candidate(
-                        wallet, CandidateAnalysisState.ANALYSIS_PENDING.value, run["run_id"], errors=(message,), completed=False,
-                    )
-                    self.database.record_analysis_wallet(run["run_id"], wallet, stage="analysis", status="failed", error=message)
-                    continue
-                counters["reconstructed"] += 1
-                counters["scored"] += 1
-                if analysis["eligible"]:
-                    counters["eligible"] += 1
-                    lifecycle = CandidateAnalysisState.QUALIFIED.value
+                self._complete_analysis_wallet(wallet, run["run_id"], coverage, configuration, errors)
+            for wallet in ready_for_analysis:
+                coverage = self.database.analysis_window_coverage(wallet, required_start, required_end)
+                if coverage.get("coverage_state") == "KNOWN_INCOMPLETE":
+                    self._save_candidate(wallet, CandidateAnalysisState.QUARANTINED.value, run["run_id"], reasons=("known_incomplete",), summary={"coverage": coverage}, completed=True)
+                    self.database.record_analysis_wallet(run["run_id"], wallet, stage="backfill", status="quarantined", payload={"reason": "known_incomplete", "coverage": coverage})
                 else:
-                    counters["rejected"] += 1
-                    lifecycle = CandidateAnalysisState.ANALYZED.value
-                self._save_candidate(
-                    wallet, lifecycle, run["run_id"], reasons=tuple(analysis["score"]["reasons"]),
-                    summary=analysis, completed=True,
-                )
-                self.database.record_analysis_wallet(
-                    run["run_id"], wallet, stage="analysis", status="completed", payload={
-                        "eligible": analysis["eligible"], "score": analysis["score"], "copyability": analysis["copyability"],
-                    },
-                )
+                    self._complete_analysis_wallet(wallet, run["run_id"], coverage, configuration, errors)
         except Exception as exc:
             errors.append(f"run failure: {exc}")
-            return self._finish(run["run_id"], counters, errors, status="failed")
-        return self._finish(run["run_id"], counters, errors, status="completed_with_errors" if errors else "completed")
+            return self._finish(run["run_id"], errors, status="failed")
+        return self._finish(run["run_id"], errors, status="completed_with_errors" if errors else "completed")
 
     def status(self, *, limit: int = 1000) -> dict[str, object]:
         rows = self.database.list_analysis_candidates(limit=limit)
-        state_counts: dict[str, int] = {}
-        for row in rows:
-            state = str(row.get("lifecycle_status") or CandidateAnalysisState.NEW.value)
-            state_counts[state] = state_counts.get(state, 0) + 1
-        return {"runs": self.database.list_analysis_runs(), "state_counts": state_counts, "candidates": rows}
+        state_counts = self.database.count_analysis_candidates_by_state()
+        return {"runs": self.database.list_analysis_runs(), "state_counts": state_counts, "total_candidates": sum(state_counts.values()), "candidates": rows}
 
     def shadow_finalists(self, *, count: int | None = None) -> list[dict[str, object]]:
         target_count = count or self.config.analysis.shadow_finalist_count
-        scores = self.database.latest_scores()
+        scores = self.database.phase_b_qualified_scores()
         series = {
             score.target_wallet: campaign_return_series(self.database.list_campaigns(score.target_wallet, closed_only=True))
             for score in scores
         }
-        selected = select_diverse_targets(scores, series, target_count=target_count)
+        exposures = {score.target_wallet: _exposure_profile(self.database.list_campaigns(score.target_wallet, closed_only=True)) for score in scores}
+        selected = select_diverse_targets_with_metadata(scores, series, target_count=target_count, exposures=exposures)
         candidates = {row["wallet"]: row for row in self.database.list_analysis_candidates(limit=10_000)}
         finalists = []
-        for rank, score in enumerate(selected, 1):
+        for rank, (score, diversification) in enumerate(selected, 1):
             candidate = candidates.get(score.target_wallet, {})
             analysis = candidate.get("analysis_summary", {}) if isinstance(candidate, dict) else {}
             target = analysis.get("target_metrics", {}) if isinstance(analysis, dict) else {}
@@ -199,7 +211,8 @@ class CandidateAnalysisPipeline:
                 "rank": rank, "wallet": score.target_wallet, "score": score.total_score,
                 "target": target, "follower": follower, "copyability": analysis.get("copyability", {}),
                 "data_quality": analysis.get("coverage", {}), "principal_risks": score.reasons,
-                "selection_reason": "eligible score with lower time-aligned return correlation to already selected finalists",
+                "diversification": diversification,
+                "selection_reason": "current qualified Phase B score with return-correlation and exposure-overlap diversification penalties",
             })
         return finalists
 
@@ -225,6 +238,16 @@ class CandidateAnalysisPipeline:
         created = self.database.get_analysis_run(new.run_id)
         assert created is not None
         return created, False
+
+    def _validate_resumed_configuration(self, configuration: dict[str, Any]) -> None:
+        stored_fingerprint = str(configuration.get("config_fingerprint") or "")
+        if not stored_fingerprint:
+            raise ValueError("Cannot resume analysis run without a Phase B.1 configuration fingerprint.")
+        current_fingerprint = _config_fingerprint(self.config.snapshot())
+        if stored_fingerprint != current_fingerprint:
+            raise ValueError(
+                "Refusing to resume with a changed copy-trading configuration; restore the original configuration or start a new run."
+            )
 
     def _backfill_all(
         self, candidates: Iterable[dict[str, Any]], start: object, workers: int,
@@ -273,12 +296,43 @@ class CandidateAnalysisPipeline:
             reasons.append("known_incomplete")
         return tuple(sorted(set(reasons)))
 
-    def _analyze_wallet(self, wallet: str, coverage: dict[str, Any]) -> dict[str, object]:
+    def _complete_analysis_wallet(
+        self, wallet: str, run_id: str, coverage: dict[str, Any], configuration: dict[str, Any], errors: list[str],
+    ) -> None:
+        try:
+            analysis = self._analyze_wallet(wallet, coverage, run_id=run_id, config_fingerprint=str(configuration["config_fingerprint"]))
+        except Exception as exc:  # reconstruction/simulation failure remains per-wallet and resumable
+            message = str(exc)
+            errors.append(f"{wallet}: analysis failed: {message}")
+            self._save_candidate(wallet, CandidateAnalysisState.ANALYSIS_PENDING.value, run_id, errors=(message,), completed=False)
+            self.database.record_analysis_wallet(run_id, wallet, stage="analysis", status="failed", error=message)
+            return
+        lifecycle = CandidateAnalysisState.QUALIFIED.value if analysis["eligible"] else CandidateAnalysisState.ANALYZED.value
+        self._save_candidate(
+            wallet, lifecycle, run_id, reasons=tuple(analysis["score"]["reasons"]), summary=analysis, completed=True,
+        )
+        self.database.record_analysis_wallet(
+            run_id, wallet, stage="analysis", status="completed", payload={
+                "eligible": analysis["eligible"], "score": analysis["score"], "copyability": analysis["copyability"],
+                "reconstructed": True, "scored": True,
+            },
+        )
+
+    def _analyze_wallet(
+        self, wallet: str, coverage: dict[str, Any], *, run_id: str, config_fingerprint: str,
+    ) -> dict[str, object]:
         reconstructed = self._reconstruct_wallet(wallet)
         events = tuple(reconstructed["events"])
         metrics = reconstructed["metrics"]
         if metrics is None:
             raise RuntimeError("reconstruction returned no trader metrics")
+        # ``service.reconstruct`` reports the latest physical request.  Phase B
+        # eligibility instead uses the immutable full analysis interval.
+        metrics.raw["coverage_state"] = coverage.get("coverage_state", "UNPROVEN")
+        metrics.raw["coverage_complete"] = coverage.get("coverage_state") == "PROVEN_COMPLETE"
+        metrics.raw["coverage_quality"] = coverage.get("coverage_quality", "analysis_window")
+        metrics.raw["analysis_window_coverage"] = coverage
+        self.database.upsert_metrics(metrics)
         campaigns = self.database.list_campaigns(wallet)
         backtester = CopyTradeBacktester(self.config)
         baseline = backtester.run(events=events, coverage_metadata=coverage)
@@ -288,6 +342,7 @@ class CandidateAnalysisPipeline:
             backtester.walk_forward(events=events)
             if metrics.closed_campaign_count >= self.config.candidates.closed_campaigns_min else []
         )
+        walk_forward_evaluation = _walk_forward_evidence(walk_forward, self.config.analysis.walk_forward_min_windows)
         follower = _follower_summary(baseline.summary, slippage, latency)
         copyability = _copyability(metrics.net_pnl, metrics.raw, baseline.summary, coverage)
         follower_metrics = FollowerMetrics(
@@ -300,8 +355,14 @@ class CandidateAnalysisPipeline:
             return_fraction=float(follower["return_fraction"]),
             copyability_score=copyability["score"] if copyability["status"] == "available" else None,
             slippage_robustness=follower.get("slippage_robustness_score"),
+            walk_forward_score=walk_forward_evaluation["score"],
+            walk_forward_status=str(walk_forward_evaluation["status"]),
+            walk_forward_window_count=int(walk_forward_evaluation["window_count"]),
         )
-        score = score_candidate(metrics, self.config.candidates, follower_metrics)
+        score = replace(
+            score_candidate(metrics, self.config.candidates, follower_metrics), provenance="phase_b",
+            analysis_run_id=run_id, config_fingerprint=config_fingerprint,
+        )
         self.database.upsert_candidate_score(score)
         return {
             "target_metrics": _target_summary(metrics, campaigns, events),
@@ -311,6 +372,7 @@ class CandidateAnalysisPipeline:
             "slippage_scenarios": slippage,
             "latency": {"status": "available" if latency else "unavailable", "curve": latency},
             "walk_forward": walk_forward,
+            "walk_forward_evaluation": walk_forward_evaluation,
             "score": {
                 "total": score.total_score, "eligible": score.eligible, "components": score.component_scores,
                 "penalties": score.penalties, "reasons": list(score.reasons), "source_quality": score.source_quality,
@@ -330,20 +392,10 @@ class CandidateAnalysisPipeline:
             summary=summary if summary is not None else (existing.summary if existing else {}),
         ))
 
-    def _finish(self, run_id: str, counters: dict[str, int], errors: list[str], *, status: str) -> dict[str, object]:
+    def _finish(self, run_id: str, errors: list[str], *, status: str) -> dict[str, object]:
+        counters = self.database.analysis_run_counters(run_id)
         self.database.finish_analysis_run(run_id, status=status, errors=tuple(sorted(errors)), **counters)
         return {"run_id": run_id, "status": status, **counters, "errors": sorted(errors), "shadow_finalists": self.shadow_finalists()}
-
-    @staticmethod
-    def _counters(run: dict[str, Any]) -> dict[str, int]:
-        return {key: int(run.get(key, 0)) for key in _empty_counters()}
-
-
-def _empty_counters() -> dict[str, int]:
-    return {
-        "wallets_considered": 0, "cheap_rejected": 0, "backfill_attempted": 0, "backfill_failed": 0,
-        "reconstructed": 0, "scored": 0, "eligible": 0, "rejected": 0, "deferred": 0,
-    }
 
 
 def _follower_summary(
@@ -387,19 +439,27 @@ def _follower_summary(
 
 
 def _copyability(target_net_pnl: float, raw: dict[str, Any], follower: dict[str, Any], coverage: dict[str, Any]) -> dict[str, object]:
-    denominator = float(raw.get("drawdown_denominator") or 0.0)
+    denominator = float(raw.get("copyability_capital_denominator") or 0.0)
+    denominator_source = raw.get("copyability_capital_source")
+    denominator_quality = raw.get("copyability_capital_quality", "unavailable")
     target_return = target_net_pnl / denominator if denominator > 0 else None
     follower_return = float(follower.get("return_fraction", 0.0))
     if int(follower.get("filled_attempts", 0)) <= 0:
-        return {"status": "unavailable", "score": None, "reason": "no_filled_follower_entries"}
+        return {"status": "unavailable", "score": None, "reason": "no_filled_follower_entries",
+                "denominator": denominator or None, "denominator_source": denominator_source, "denominator_quality": denominator_quality}
+    if denominator <= 0 or denominator_quality != "genuine_usable_target_equity":
+        return {"status": "unavailable", "score": None, "reason": "target_equity_denominator_unavailable",
+                "denominator": None, "denominator_source": denominator_source, "denominator_quality": denominator_quality}
     if target_return is None or target_return <= 0:
-        return {"status": "unavailable", "score": None, "reason": "non_positive_or_unavailable_target_return"}
+        return {"status": "unavailable", "score": None, "reason": "non_positive_or_unavailable_target_return",
+                "denominator": denominator, "denominator_source": denominator_source, "denominator_quality": denominator_quality}
     ratio = follower_return / target_return
     return {
         "status": "available", "score": max(0.0, min(1.0, ratio)), "normalized_return_ratio": ratio,
         "target_return_on_capital": target_return, "follower_return_on_capital": follower_return,
+        "denominator": denominator, "denominator_source": denominator_source, "denominator_quality": denominator_quality,
         "coverage_state": coverage.get("coverage_state", "UNPROVEN"),
-        "basis": "follower return on initial follower capital divided by target net P&L over documented capital denominator",
+        "basis": "follower return on initial follower capital divided by target net P&L over a genuine usable target-equity observation",
     }
 
 
@@ -431,12 +491,14 @@ def _target_summary(metrics: Any, campaigns: Iterable[PositionCampaign], events:
         },
         "profitability": {
             "gross_pnl": metrics.realized_pnl, "net_pnl": metrics.net_pnl, "fees": metrics.raw.get("target_fees", 0.0),
-            "expectancy": metrics.expectancy, "median_campaign_pnl": metrics.median_winner - metrics.median_loser,
+            "expectancy": metrics.expectancy,
+            "median_campaign_pnl": _median_campaign_pnl(closed),
             "average_win": metrics.average_winner, "average_loss": metrics.average_loser,
             "win_rate": metrics.win_rate, "profit_factor": metrics.profit_factor,
         },
         "risk": {
-            "max_drawdown": metrics.max_drawdown, "average_drawdown": fmean(metrics.raw.get("drawdown_curve", []) or [0.0]),
+            "max_drawdown_fraction": metrics.max_drawdown,
+            "average_drawdown_dollars": fmean(metrics.raw.get("drawdown_curve", []) or [0.0]),
             "worst_campaign": metrics.worst_campaign, "tail_loss_percentile": metrics.fifth_percentile,
             "largest_loss_relative_to_equity": abs(min(metrics.worst_campaign, 0.0)) / max(float(metrics.raw.get("drawdown_denominator") or 1.0), 1e-12),
             "liquidation_frequency": metrics.raw.get("liquidation_frequency", 0.0), "loss_streak": metrics.longest_losing_streak,
@@ -501,3 +563,42 @@ def _recent_vs_historical(values: list[float]) -> float | None:
 
 def _is_wallet(value: str) -> bool:
     return value.startswith("0x") and len(value) == 42 and all(character in "0123456789abcdef" for character in value[2:])
+
+
+def _config_fingerprint(snapshot: dict[str, Any]) -> str:
+    payload = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _walk_forward_evidence(windows: Iterable[dict[str, object]], minimum_windows: int) -> dict[str, object]:
+    values = [float(window.get("forward_return_fraction", 0.0)) for window in windows]
+    if len(values) < minimum_windows:
+        return {"status": "unavailable", "score": None, "window_count": len(values), "reason": "insufficient_walk_forward_windows"}
+    profitable_fraction = sum(value > 0 for value in values) / len(values)
+    mean_return = fmean(values)
+    worst_return = min(values)
+    # Positive, repeated forward performance is modest evidence.  A string of
+    # weak/negative windows reduces this component but never becomes a hard
+    # rejection solely because forward history is short.
+    score = max(0.0, min(1.0, (profitable_fraction + max(0.0, min(1.0, 0.5 + mean_return / 0.10))) / 2))
+    return {
+        "status": "available", "score": score, "window_count": len(values),
+        "profitable_window_fraction": profitable_fraction, "mean_forward_return": mean_return,
+        "worst_forward_return": worst_return,
+    }
+
+
+def _median_campaign_pnl(campaigns: Iterable[PositionCampaign]) -> float:
+    values = sorted(campaign.realized_pnl - campaign.target_fees for campaign in campaigns)
+    if not values:
+        return 0.0
+    middle = len(values) // 2
+    return values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) / 2
+
+
+def _exposure_profile(campaigns: Iterable[PositionCampaign]) -> dict[str, object]:
+    items = list(campaigns)
+    return {
+        "symbols": sorted({campaign.symbol for campaign in items}),
+        "directions": sorted({campaign.direction for campaign in items}),
+    }

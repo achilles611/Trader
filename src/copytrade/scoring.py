@@ -21,6 +21,9 @@ class FollowerMetrics:
     return_fraction: float | None = None
     copyability_score: float | None = None
     slippage_robustness: float | None = None
+    walk_forward_score: float | None = None
+    walk_forward_status: str = "unavailable"
+    walk_forward_window_count: int = 0
 
 
 def score_candidate(
@@ -35,6 +38,8 @@ def score_candidate(
         reasons.append("insufficient_closed_campaigns")
     if metrics.max_drawdown > config.max_drawdown_hard:
         reasons.append("max_drawdown_hard_limit")
+    if follower.max_drawdown > config.max_follower_drawdown_hard:
+        reasons.append("follower_drawdown_hard_limit")
     if config.require_positive_expectancy and metrics.expectancy <= 0:
         reasons.append("non_positive_expectancy")
     if config.require_positive_follower_expectancy and follower.expectancy <= 0:
@@ -60,9 +65,12 @@ def score_candidate(
         reasons.append("latency_unavailable")
     if follower.copyability_score is None:
         reasons.append("copyability_unavailable")
+    if follower.walk_forward_score is None or follower.walk_forward_status != "available":
+        reasons.append("walk_forward_unavailable")
     components = {
         "risk_adjusted_expectancy": _clamp01(0.5 + metrics.expectancy / max(abs(metrics.average_loser), 1.0) / 2),
         "drawdown_tail": _clamp01((1 - metrics.max_drawdown / max(config.max_drawdown_hard, 1e-12)) * (0.5 if metrics.fifth_percentile < 0 else 1.0)),
+        "follower_drawdown": _clamp01(1 - follower.max_drawdown / max(config.max_follower_drawdown_hard, 1e-12)),
         "consistency": _clamp01((metrics.shrunk_win_rate + min(metrics.profit_factor, 2.0) / 2) / 2),
         "history_quality": _clamp01(min(metrics.history_days / max(config.history_days_preferred, 1), metrics.closed_campaign_count / max(config.closed_campaigns_min, 1))),
         "position_size_stability": _clamp01(1 - metrics.entry_size_variance / max(metrics.median_entry_size_fraction ** 2, 0.01)),
@@ -74,6 +82,8 @@ def score_candidate(
     if follower.copyability_score is not None:
         friction = follower.slippage_robustness if follower.slippage_robustness is not None else 1.0
         components["copyability"] = _clamp01((follower.copyability_score + friction) / 2)
+    if follower.walk_forward_score is not None and follower.walk_forward_status == "available":
+        components["walk_forward"] = _clamp01(follower.walk_forward_score)
     active_weights = {name: weight for name, weight in config.score_weights.items() if name in components}
     if latency_available:
         components["latency_survivability"] = latency_survival
@@ -88,6 +98,18 @@ def score_candidate(
         penalties["martingale"] = config.penalty_weights.get("martingale", 0.0)
     if metrics.adverse_averaging_indicator:
         penalties["adverse_averaging"] = config.penalty_weights.get("adverse_averaging", 0.0)
+    if follower.max_drawdown > config.max_follower_drawdown_preferred:
+        excess = (follower.max_drawdown - config.max_follower_drawdown_preferred) / max(
+            config.max_follower_drawdown_hard - config.max_follower_drawdown_preferred, 1e-12,
+        )
+        penalties["follower_drawdown"] = config.penalty_weights.get("follower_drawdown", 0.0) * _clamp01(excess)
+    liquidation_frequency = float(metrics.raw.get("liquidation_frequency", 0.0) or 0.0)
+    if liquidation_frequency > 0:
+        penalties["liquidation"] = config.penalty_weights.get("liquidation", 0.0) * _clamp01(
+            liquidation_frequency / max(config.liquidation_frequency_hard, 1e-12)
+        )
+    if liquidation_frequency >= config.liquidation_frequency_hard:
+        reasons.append("liquidation_frequency_hard_limit")
     if metrics.pnl_concentration_best > 0.5:
         penalties["concentration"] = config.penalty_weights.get("concentration", 0.0) * metrics.pnl_concentration_best
     if metrics.closed_campaign_count < config.closed_campaigns_min:
@@ -103,7 +125,7 @@ def score_candidate(
         target_wallet=metrics.target_wallet, calculated_at=utc_now(), total_score=total,
         component_scores=weighted, penalties=penalties,
         eligible=not [reason for reason in reasons if reason not in {
-            "latency_unavailable", "copyability_unavailable", "coverage_unproven",
+            "latency_unavailable", "copyability_unavailable", "coverage_unproven", "walk_forward_unavailable",
         } or (reason == "coverage_unproven" and config.require_proven_history)], reasons=tuple(reasons),
         source_quality=source_quality,
     )
@@ -112,18 +134,27 @@ def score_candidate(
 def select_diverse_targets(
     scores: Iterable[CandidateScore], return_series: Mapping[str, Mapping[str, float] | list[float]], *, target_count: int = 7,
 ) -> list[CandidateScore]:
-    """Greedy selection balances candidate quality with independently varying returns."""
+    return [score for score, _ in select_diverse_targets_with_metadata(scores, return_series, target_count=target_count)]
+
+
+def select_diverse_targets_with_metadata(
+    scores: Iterable[CandidateScore], return_series: Mapping[str, Mapping[str, float] | list[float]], *,
+    target_count: int = 7, exposures: Mapping[str, Mapping[str, object]] | None = None,
+) -> list[tuple[CandidateScore, dict[str, object]]]:
+    """Greedy quality selection with explicit uncertainty and exposure overlap."""
     candidates = sorted((score for score in scores if score.eligible), key=lambda score: (-score.total_score, score.target_wallet))
     selected: list[CandidateScore] = []
+    details_by_wallet: dict[str, dict[str, object]] = {}
+    exposures = exposures or {}
     while candidates and len(selected) < target_count:
         def value(score: CandidateScore) -> tuple[float, str]:
-            correlations = [abs(pairwise_correlation(return_series.get(score.target_wallet, {}), return_series.get(item.target_wallet, {}))) for item in selected]
-            penalty = sum(correlations) / len(correlations) if correlations else 0.0
-            return (score.total_score - 25 * penalty, score.target_wallet)
+            detail = _diversification_detail(score.target_wallet, selected, return_series, exposures)
+            details_by_wallet[score.target_wallet] = detail
+            return (score.total_score - float(detail["penalty"]), score.target_wallet)
         best = max(candidates, key=value)
         selected.append(best)
         candidates.remove(best)
-    return selected
+    return [(score, details_by_wallet.get(score.target_wallet, _diversification_detail(score.target_wallet, [], return_series, exposures))) for score in selected]
 
 
 def pairwise_correlation_details(
@@ -148,6 +179,17 @@ def pairwise_correlation_details(
     if denominator_x == 0 or denominator_y == 0:
         return 0.0, size
     return max(-1.0, min(1.0, numerator / (denominator_x * denominator_y))), size
+
+
+def pairwise_correlation_status(
+    left: Mapping[str, float] | list[float], right: Mapping[str, float] | list[float], *, minimum_buckets: int = 7,
+) -> dict[str, object]:
+    correlation, bucket_count = pairwise_correlation_details(left, right, minimum_buckets=minimum_buckets)
+    return {
+        "status": "available" if bucket_count >= minimum_buckets else "insufficient_history",
+        "correlation": correlation if bucket_count >= minimum_buckets else None,
+        "bucket_count": bucket_count,
+    }
 
 
 def pairwise_correlation(left: Mapping[str, float] | list[float], right: Mapping[str, float] | list[float]) -> float:
@@ -186,3 +228,47 @@ def _latency_survival(follower: FollowerMetrics) -> float | None:
 
 def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, value))
+
+
+def _diversification_detail(
+    wallet: str, selected: Iterable[CandidateScore],
+    return_series: Mapping[str, Mapping[str, float] | list[float]], exposures: Mapping[str, Mapping[str, object]],
+) -> dict[str, object]:
+    cohort = list(selected)
+    correlations: list[float] = []
+    buckets: list[int] = []
+    insufficient = 0
+    symbol_overlaps: list[float] = []
+    directional_overlaps: list[float] = []
+    profile = exposures.get(wallet, {})
+    for item in cohort:
+        detail = pairwise_correlation_status(return_series.get(wallet, {}), return_series.get(item.target_wallet, {}))
+        buckets.append(int(detail["bucket_count"]))
+        if detail["status"] == "available":
+            correlations.append(abs(float(detail["correlation"])))
+        else:
+            insufficient += 1
+        other = exposures.get(item.target_wallet, {})
+        symbol_overlaps.append(_set_overlap(profile.get("symbols", ()), other.get("symbols", ())))
+        directional_overlaps.append(_set_overlap(profile.get("directions", ()), other.get("directions", ())))
+    average_correlation = sum(correlations) / len(correlations) if correlations else None
+    maximum_correlation = max(correlations) if correlations else None
+    average_symbols = sum(symbol_overlaps) / len(symbol_overlaps) if symbol_overlaps else 0.0
+    average_directions = sum(directional_overlaps) / len(directional_overlaps) if directional_overlaps else 0.0
+    # Missing return history is not assumed to be zero correlation.  It earns
+    # neither a diversification bonus nor a free pass against better-known peers.
+    penalty = 25 * (average_correlation or 0.0) + 8 * average_symbols + 3 * average_directions + 2.5 * insufficient
+    return {
+        "correlation_status": "available" if not insufficient and cohort else ("insufficient_history" if insufficient else "not_applicable"),
+        "correlation_bucket_count": min(buckets) if buckets else 0,
+        "average_correlation": average_correlation, "max_correlation": maximum_correlation,
+        "symbol_overlap": average_symbols, "directional_overlap": average_directions,
+        "insufficient_correlation_pairs": insufficient, "penalty": penalty,
+    }
+
+
+def _set_overlap(left: object, right: object) -> float:
+    left_set, right_set = set(left or ()), set(right or ())
+    if not left_set and not right_set:
+        return 0.0
+    return len(left_set & right_set) / max(len(left_set | right_set), 1)

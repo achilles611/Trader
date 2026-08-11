@@ -85,10 +85,13 @@ class CopyTradeService:
         separate instance prevents concurrent analysis workers from crossing
         that bookkeeping.  This remains source ingestion only.
         """
-        return self._backfill_with_adapter(wallet, HyperliquidPublicAdapter(self.config.source), start=start, end=end)
+        return self._backfill_with_adapter(
+            wallet, HyperliquidPublicAdapter(self.config.source), start=start, end=end, reconstruct_after_ingestion=False,
+        )
 
     def _backfill_with_adapter(
         self, wallet: str, adapter: HyperliquidPublicAdapter, *, start: object | None, end: object | None,
+        reconstruct_after_ingestion: bool = True,
     ) -> dict[str, object]:
         target = self.database.get_target(wallet)
         if not target:
@@ -112,10 +115,8 @@ class CopyTradeService:
         self.database.insert_snapshot(snapshot)
         portfolio = adapter.fetch_portfolio(wallet)
         self._store_portfolio_snapshot(wallet, portfolio)
-        reconstruction = self.reconstruct(wallet)
-        return {
+        payload: dict[str, object] = {
             "wallet": wallet.lower(), "fetched_fills": len(fills), "new_raw_fills": inserted,
-            "position_events": len(reconstruction["events"]), "campaigns": len(reconstruction["campaigns"]),
             "snapshot_id": snapshot.snapshot_id,
             "coverage": {
                 "coverage_complete": coverage.coverage_complete,
@@ -124,6 +125,12 @@ class CopyTradeService:
                 "source_limit_detected": coverage.source_limit_detected,
             } if coverage else None,
         }
+        if reconstruct_after_ingestion:
+            reconstruction = self.reconstruct(wallet)
+            payload.update({"position_events": len(reconstruction["events"]), "campaigns": len(reconstruction["campaigns"])})
+        else:
+            payload["reconstruction_deferred"] = True
+        return payload
 
     def reconstruct(self, wallet: str) -> dict[str, object]:
         fills = self.database.list_raw_fills(wallet)

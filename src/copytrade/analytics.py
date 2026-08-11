@@ -106,6 +106,14 @@ def calculate_trader_metrics(
     equity_observations = [
         event.target_equity for event in event_list if event.target_equity is not None and event.target_equity > 0
     ]
+    # A campaign notional can be a drawdown normalization proxy, but it is not
+    # account capital.  Keep a separate genuine, prior-usable equity basis for
+    # Phase B copyability.
+    usable_equity_observations = [
+        event for event in event_list
+        if is_equity_observation_usable(sizing or SizingConfig(), event.target_equity, event.equity_source, event.equity_age_seconds)
+    ]
+    copyability_equity = min(usable_equity_observations, key=lambda event: event.event_timestamp, default=None)
     max_drawdown_dollars = max(drawdowns, default=0.0)
     # Candidate gates are configured as fractions.  Prefer actual account value;
     # if the public fill stream did not expose it, retain a conservative
@@ -146,6 +154,10 @@ def calculate_trader_metrics(
             "trade_frequency_per_day": len(all_campaigns) / max(history_days, 1.0),
             "rolling_drawdowns": drawdowns, "max_drawdown_dollars": max_drawdown_dollars,
             "drawdown_denominator": drawdown_denominator,
+            "drawdown_denominator_source": "target_equity" if equity_observations else "campaign_entry_notional_proxy",
+            "copyability_capital_denominator": copyability_equity.target_equity if copyability_equity else None,
+            "copyability_capital_source": copyability_equity.equity_source if copyability_equity else None,
+            "copyability_capital_quality": "genuine_usable_target_equity" if copyability_equity else "unavailable",
             "liquidation_frequency": sum(campaign.liquidation_count for campaign in all_campaigns) / max(len(all_campaigns), 1),
             "truncated_campaign_count": len(truncated), "excluded_closed_campaign_count": sum(item.closed_at is not None for item in truncated),
             "eligible_campaign_count": len(all_campaigns) - len(truncated),

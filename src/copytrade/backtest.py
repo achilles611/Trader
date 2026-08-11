@@ -224,6 +224,7 @@ class CopyTradeBacktester:
                 "forward_end": forward_end.isoformat(), "training_campaigns": training_metrics.closed_campaign_count,
                 "training_expectancy": training_metrics.expectancy, "forward_run_id": run.run_id,
                 "forward_net_pnl": run.summary["net_pnl"],
+                "forward_return_fraction": run.summary["return_fraction"],
                 "boundary_policy": "exclude_campaigns_open_at_forward_start",
                 "boundary_campaigns_excluded": len(open_campaign_ids),
             })
@@ -282,6 +283,7 @@ class CopyTradeBacktester:
             windows.append({
                 "training_start": cursor.isoformat(), "training_end": training_end.isoformat(), "forward_end": forward_end.isoformat(),
                 "training_campaigns": 0, "forward_run_id": run.run_id, "forward_net_pnl": run.summary["net_pnl"],
+                "forward_return_fraction": run.summary["return_fraction"],
                 "boundary_policy": "exclude_campaigns_open_at_forward_start", "boundary_campaigns_excluded": len(active),
                 "equity_enrichment": run.summary["equity_enrichment"],
             })

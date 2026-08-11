@@ -169,11 +169,15 @@ class ObsidianExporter:
             summary = analysis.summary
             follower = summary.get("follower", {}) if isinstance(summary, dict) else {}
             copyability = summary.get("copyability", {}) if isinstance(summary, dict) else {}
+            coverage = summary.get("coverage", {}) if isinstance(summary, dict) else {}
+            walk_forward = summary.get("walk_forward_evaluation", {}) if isinstance(summary, dict) else {}
             phase_b = (
                 "\n## Phase B research analysis\n\n"
                 f"- Lifecycle: {analysis.lifecycle_status}; reasons: {', '.join(analysis.prefilter_reasons) or 'none'}\n"
                 f"- Follower net P&L: {float(follower.get('net_pnl', 0.0)):.2f}; follower drawdown: {float(follower.get('max_drawdown', 0.0)):.2%}\n"
-                f"- Copyability: {copyability.get('status', 'unavailable')} ({copyability.get('score', 'n/a')})\n"
+                f"- Copyability: {copyability.get('status', 'unavailable')} ({copyability.get('score', 'n/a')}); denominator: {copyability.get('denominator', 'n/a')} from {copyability.get('denominator_source', 'unavailable')}\n"
+                f"- Analysis-window coverage: {coverage.get('coverage_state', 'UNPROVEN')} ({coverage.get('required_start', 'not recorded')} to {coverage.get('required_end', 'not recorded')})\n"
+                f"- Walk-forward evidence: {walk_forward.get('status', 'unavailable')}; windows: {walk_forward.get('window_count', 0)}; score: {walk_forward.get('score', 'n/a')}\n"
                 f"- Analysis errors: {', '.join(analysis.errors) or 'none'}\n"
             )
         return (

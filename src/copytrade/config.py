@@ -118,6 +118,9 @@ class CandidateConfig:
     closed_campaigns_min: int = 100
     max_drawdown_preferred: float = 0.15
     max_drawdown_hard: float = 0.25
+    max_follower_drawdown_preferred: float = 0.15
+    max_follower_drawdown_hard: float = 0.30
+    liquidation_frequency_hard: float = 0.10
     profit_factor_preferred: float = 1.40
     require_positive_expectancy: bool = True
     require_positive_follower_expectancy: bool = True
@@ -125,16 +128,18 @@ class CandidateConfig:
     require_proven_history: bool = False
     score_weights: dict[str, float] = field(
         default_factory=lambda: {
-            "follower_performance": 20.0,
-            "copyability": 15.0,
-            "risk_adjusted_expectancy": 15.0,
-            "drawdown_tail": 15.0,
+            "follower_performance": 18.0,
+            "copyability": 14.0,
+            "risk_adjusted_expectancy": 14.0,
+            "drawdown_tail": 12.0,
+            "follower_drawdown": 7.0,
+            "walk_forward": 5.0,
             "consistency": 10.0,
             "latency_survivability": 5.0,
             "history_quality": 5.0,
             "position_size_stability": 5.0,
-            "diversification": 5.0,
-            "source_quality": 5.0,
+            "diversification": 3.0,
+            "source_quality": 2.0,
         }
     )
     penalty_weights: dict[str, float] = field(
@@ -147,6 +152,7 @@ class CandidateConfig:
             "small_sample": 10.0,
             "inactivity": 10.0,
             "latency_decay": 15.0,
+            "follower_drawdown": 8.0,
         }
     )
 
@@ -161,6 +167,7 @@ class AnalysisConfig:
     history_days: int = 180
     min_discovery_activity: int = 2
     shadow_finalist_count: int = 20
+    walk_forward_min_windows: int = 2
 
 
 @dataclass(frozen=True)
@@ -307,6 +314,12 @@ class CopyTradeConfig:
             raise ValueError("analysis.default_workers and analysis.retry_attempts must be positive.")
         if self.analysis.retry_initial_seconds < 0 or self.analysis.history_days <= 0 or self.analysis.min_discovery_activity <= 0:
             raise ValueError("analysis retry delay, history days, and minimum discovery activity must be positive.")
+        if self.analysis.walk_forward_min_windows <= 0:
+            raise ValueError("analysis.walk_forward_min_windows must be positive.")
+        if not 0 <= self.candidates.max_follower_drawdown_preferred <= self.candidates.max_follower_drawdown_hard <= 1:
+            raise ValueError("Follower drawdown thresholds must be ordered fractions in [0, 1].")
+        if not 0 < self.candidates.liquidation_frequency_hard <= 1:
+            raise ValueError("candidates.liquidation_frequency_hard must be in (0, 1].")
 
     def snapshot(self) -> dict[str, Any]:
         return jsonable(asdict(self))

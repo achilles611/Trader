@@ -49,7 +49,7 @@ SQLite tables are deliberately isolated in `artifacts/copytrade.sqlite3`:
 - `copy_trader_snapshots`, `copy_daily_metrics`, and `copy_candidate_scores`
 - `copy_signals`, `copy_virtual_positions`, `copy_execution_attempts`, `copy_execution_claims`, and `copy_execution_fills`
 - `copy_backtest_runs`, `copy_portfolio_snapshots`, and `copy_backfill_coverage`
-- `copy_analysis_runs`, `copy_analysis_run_wallets`, and `copy_candidate_analyses`
+- `copy_analysis_runs`, `copy_analysis_run_wallets`, append-only `copy_analysis_run_wallet_events`, and `copy_candidate_analyses`
 
 The small `CopyTradeStore` contract means a PostgreSQL backend can replace the
 SQLite implementation without changing the research, risk, or paper-execution
@@ -213,10 +213,16 @@ new → backfill_pending → analysis_pending → analyzed / qualified
 The local prefilter rejects invalid wallets, stale activity, insufficient Phase
 A evidence, and already known incomplete coverage with recorded reason codes.
 Survivors use bounded, retrying public backfill workers; each worker has its
-own public adapter so coverage bookkeeping cannot cross wallets. A failure is
-stored per wallet and does not abort the remaining candidate set. `--resume`
-continues an interrupted run, completed analysis is skipped on later runs, and
-`--force` intentionally recalculates it.
+own public adapter so coverage bookkeeping cannot cross wallets. Network
+ingestion persists raw data and coverage first; a wallet is reconstructed once
+afterward for Phase B scoring. A failure is stored per wallet and does not
+abort the remaining candidate set. Each run records an immutable candidate
+manifest, analysis window, and configuration fingerprint. `--resume` restores
+that manifest and invocation policy (its new CLI limit/status/worker options
+are ignored), and refuses a changed copy-trading configuration rather than
+mixing assumptions inside one run. Wallet stage events are append-only, while
+the current wallet table is only a convenient projection; final counters are
+reconstructed from that event history.
 
 ```powershell
 # Cheap local sieve only; no public API calls
@@ -225,7 +231,8 @@ python main.py copy-analyze-candidates --status new --limit 500 --cheap-only
 # Research-only backfill, reconstruction, follower replay, scoring, and finalists
 python main.py copy-analyze-candidates --status new --limit 500 --workers 4 --output artifacts\candidate-analysis.json
 
-# Resume the newest interrupted run; completed wallets stay skipped unless forced
+# Resume the newest interrupted run with its original manifest/configuration.
+# Do not pass a changed configuration; it will be rejected.
 python main.py copy-analyze-candidates --resume --workers 4
 python main.py copy-analyze-candidates --status new --force --limit 50
 
@@ -235,22 +242,35 @@ python main.py copy-rank --count 20
 ```
 
 Phase B persists target metrics, follower metrics, sizing/equity-quality
-coverage, slippage scenarios (including 0 bps), latency availability, optional
-walk-forward windows, transparent score components/penalties, and reason codes
-in the candidate-analysis summary. The Follower Capture Ratio is dimensionless:
-simulated follower return on initial follower capital divided by target net P&L
-over the documented target capital denominator. It is marked `unavailable`
-when there are no filled follower entries or no positive observable target
-return; it never falls back to a raw-dollar follower/target P&L ratio.
+coverage, slippage scenarios (including 0 bps), latency availability,
+walk-forward evidence, transparent score components/penalties, and reason
+codes in the candidate-analysis summary. Coverage is evaluated over the full
+immutable analysis window: only continuous `PROVEN_COMPLETE` request segments
+prove it; any intersecting `KNOWN_INCOMPLETE` segment quarantines it; a small
+recent request can never certify old stored fills. The Follower Capture Ratio
+is dimensionless: simulated follower return on initial follower capital divided
+by target net P&L over a genuine usable target-equity observation. It records
+the denominator, source, and quality and is `unavailable` without real target
+capital, no filled follower entries, or a non-positive target return; it never
+uses campaign notional or a raw-dollar follower/target P&L ratio.
 
 `KNOWN_INCOMPLETE` backfill coverage is a hard quarantine. `UNPROVEN` remains
 analyzable with the existing source-quality penalty and an explicit reason.
-Latency is `unavailable` unless a historical price path exists, and its absent
-evidence is reweighted out of the score. Historical follower replays are
-in-memory and do not write signals, execution attempts/fills, sleeves, claims,
-or operational portfolio marks. Finalists are diversified greedily using
-time-aligned UTC-day campaign return series; selecting a finalist does not set
-its target state to `shadow` or `approved`.
+Follower drawdown above `max_follower_drawdown_hard` and repeated liquidation
+behavior above `liquidation_frequency_hard` are hard gates; lesser follower
+drawdown/liquidation risk receives a transparent penalty. Sufficient stable
+walk-forward windows add modest score evidence; insufficient windows are
+explicitly unavailable and reweighted rather than punished. Latency is
+`unavailable` unless a historical price path exists, and its absent evidence is
+also reweighted out of the score. Historical follower replays are in-memory
+and do not write signals, execution attempts/fills, sleeves, claims, or
+operational portfolio marks. Finalists must be current, eligible Phase B
+qualified analyses with run-stamped Phase B scores; legacy `copy-score` rows,
+pre-filter rejects, quarantines, muted/rejected targets, and active targets
+cannot enter. Selection uses time-aligned correlation when enough daily
+buckets exist, treats missing correlation as uncertainty, and adds symbol and
+directional exposure-overlap penalties. It returns the diversification
+breakdown but never changes a target state to `shadow` or `approved`.
 
 ## Research outputs and dashboard
 

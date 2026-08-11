@@ -531,6 +531,11 @@ class CandidateScore:
     eligible: bool
     reasons: tuple[str, ...] = ()
     source_quality: float = 1.0
+    # Scores can be produced by the legacy one-wallet command or by a
+    # complete Phase B analysis.  Selection must never confuse the two.
+    provenance: str = "legacy"
+    analysis_run_id: str | None = None
+    config_fingerprint: str | None = None
 
 
 def new_run_id(prefix: str = "copyrun") -> str:
