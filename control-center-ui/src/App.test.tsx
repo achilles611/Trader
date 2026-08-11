@@ -117,6 +117,33 @@ describe("copy control center", () => {
     expect(screen.getByRole("dialog")).toHaveTextContent("will not place trades");
   });
 
+  it("exposes persistent selection semantics only for retained UI choices", async () => {
+    render(<App />);
+    const overview = screen.getByRole("button", { name: "Overview" });
+    expect(overview).toHaveClass("selected");
+    expect(overview).toHaveAttribute("aria-current", "page");
+    fireEvent.click(screen.getByRole("button", { name: "Discovery" }));
+    expect(screen.getByRole("button", { name: "Discovery" })).toHaveAttribute("aria-current", "page");
+    expect(overview).not.toHaveAttribute("aria-current");
+
+    await screen.findByText("Candidate Source");
+    const quick = screen.getByRole("button", { name: /QUICK SCAN/ });
+    const standard = screen.getByRole("button", { name: /STANDARD SCAN/ });
+    const deep = screen.getByRole("button", { name: /DEEP SCAN/ });
+    expect(standard).toHaveAttribute("aria-pressed", "true");
+    expect(quick).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(quick);
+    expect(quick).toHaveAttribute("aria-pressed", "true");
+    expect(standard).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(deep);
+    expect(deep).toHaveAttribute("aria-pressed", "true");
+    expect(quick).toHaveAttribute("aria-pressed", "false");
+
+    const start = screen.getByRole("button", { name: "Start Candidate Discovery" });
+    expect(start).toBeDisabled();
+    expect(start).not.toHaveAttribute("aria-pressed");
+  });
+
   it("shows discovery websocket progress and completion navigation", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Discovery" }));

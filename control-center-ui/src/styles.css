@@ -14,3 +14,67 @@
 .chart { height: 220px; background: #0b1118; border: 1px solid #202d39; border-radius: 3px; display: grid; place-items: center; }.chart svg { width: 100%; height: 100%; }.small-table table { min-width: 410px; }.small-table th, .small-table td { font-size: 10px; }.activity-panel { min-height: 630px; }.activity-list { list-style: none; margin: 0; padding: 0; max-height: 310px; overflow: auto; }.activity-list.full { max-height: none; }.activity-list li { display: grid; grid-template-columns: 74px 8px 1fr; gap: 9px; padding: 10px 0; border-bottom: 1px solid #1e2a36; }.activity-list time, .activity-list small { color: #76889a; font-size: 10px; }.activity-list p { color: #c8d4de; font-size: 12px; margin-top: 3px; }.activity-list strong { color: #86b9ce; font-size: 10px; text-transform: uppercase; letter-spacing: .06em; }.event-dot, .status-dot { width: 7px; height: 7px; border-radius: 50%; background: #4bbf90; margin-top: 5px; }.event-dot.warning { background: #d8a957; }.event-dot.error { background: #d76d73; }.risk-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 28px; }.risk-grid > div > div:first-child { display: flex; justify-content: space-between; font-size: 12px; color: #acb9c7; margin-bottom: 6px; }.risk-grid strong { color: #e5edf5; }.progress { height: 6px; background: #25313d; border-radius: 6px; overflow: hidden; }.progress i { display: block; height: 100%; background: #e4ac54; }.muted { color: #8292a3; font-size: 12px; line-height: 1.6; }
 .toast { position: fixed; right: 22px; bottom: 22px; z-index: 9; min-width: 370px; max-width: 520px; display: grid; grid-template-columns: 92px 1fr 20px; gap: 9px; align-items: start; padding: 13px; border-radius: 4px; font-size: 12px; border: 1px solid #385669; background: #12202a; color: #d8e5ed; box-shadow: 0 10px 30px rgba(0,0,0,.4); }.toast.error { border-color: #7d484c; background: #2b171c; }.toast.warning { border-color: #806738; background: #302715; }.toast span { font-weight: 800; }.toast button { border: 0; color: inherit; background: transparent; font-size: 17px; line-height: 12px; }.modal-backdrop { z-index: 10; position: fixed; inset: 0; background: rgba(3, 7, 11, .72); display: grid; place-items: center; }.modal { width: 460px; background: #101822; border: 1px solid #3a4f62; padding: 22px; border-radius: 5px; box-shadow: 0 20px 60px rgba(0,0,0,.5); }.modal h2 { margin: 5px 0 10px; font-size: 18px; }.modal p { color: #a9b7c5; line-height: 1.6; font-size: 13px; }.modal > div { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
 @media (max-width: 1300px) { .sidebar { width: 190px; flex-basis: 190px; }.main { padding: 18px; }.header-controls { max-width: 650px; }.stat-grid { grid-template-columns: repeat(3, minmax(0,1fr)); }.span-7, .span-5 { grid-column: span 12; }.span-8 { grid-column: span 7; }.span-4 { grid-column: span 5; } }
+
+/* Shared control-state system: semantic color stays with each action while
+   persistent selections receive an unmistakable illuminated perimeter. */
+:root {
+  --accent: #65bcd7;
+  --positive-accent: #33745c;
+  --warning-accent: #806533;
+  --critical-accent: #81454d;
+  --nav-accent: #4ecb9a;
+}
+
+button {
+  --button-accent: var(--accent);
+  transition: border-color 120ms ease, background-color 120ms ease, box-shadow 120ms ease, transform 80ms ease;
+}
+
+.button.positive { --button-accent: var(--positive-accent); }
+.button.warning { --button-accent: var(--warning-accent); }
+.button.critical { --button-accent: var(--critical-accent); }
+.nav-item { --button-accent: var(--nav-accent); }
+
+button:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--button-accent) 72%, #eff6fb);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--button-accent) 24%, transparent);
+}
+
+button:focus-visible {
+  outline: 1px solid color-mix(in srgb, var(--button-accent) 88%, #eff6fb);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--button-accent) 38%, transparent), 0 0 12px color-mix(in srgb, var(--button-accent) 30%, transparent);
+}
+
+button:active:not(:disabled) {
+  transform: translateY(1px);
+  box-shadow: 0 0 4px color-mix(in srgb, var(--button-accent) 18%, transparent);
+}
+
+button.selected:not(:disabled),
+button[aria-pressed="true"]:not(:disabled) {
+  border-color: var(--button-accent);
+  background-color: color-mix(in srgb, var(--button-accent) 14%, #141f2a);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--button-accent) 65%, transparent), 0 0 10px color-mix(in srgb, var(--button-accent) 38%, transparent), inset 0 0 10px color-mix(in srgb, var(--button-accent) 8%, transparent);
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: .48;
+  box-shadow: none !important;
+  transform: none !important;
+}
+
+.nav-item.selected {
+  border: 1px solid color-mix(in srgb, var(--nav-accent) 42%, transparent);
+  background: #162432;
+  box-shadow: inset 2px 0 var(--nav-accent), 0 0 0 1px color-mix(in srgb, var(--nav-accent) 30%, transparent), 0 0 8px color-mix(in srgb, var(--nav-accent) 22%, transparent);
+}
+
+.nav-item:hover:not(:disabled) { background: #162432; }
+.funnel button { --button-accent: var(--accent); }
+.sort.active { border-radius: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  button { transition: none; }
+}
