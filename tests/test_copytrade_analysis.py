@@ -8,11 +8,11 @@ from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from src.copytrade.analysis import CandidateAnalysisPipeline, _copyability, _walk_forward_evidence
+from src.copytrade.analysis import CandidateAnalysisPipeline, _config_fingerprint, _copyability, _walk_forward_evidence
 from src.copytrade.config import AnalysisConfig, ArtifactConfig, CandidateConfig, CopyTradeConfig, PaperExecutionConfig, RiskConfig, SizingConfig
 from src.copytrade.discovery import DiscoveryPipeline
 from src.copytrade.hyperliquid import BackfillCoverage
-from src.copytrade.models import CandidateScore, DiscoveryObservation, RawFill, as_utc, utc_now
+from src.copytrade.models import AnalysisRun, CandidateAnalysis, CandidateScore, DiscoveryObservation, RawFill, as_utc, utc_now
 from src.copytrade.scoring import FollowerMetrics, pairwise_correlation_status, score_candidate
 from src.copytrade.service import CopyTradeService
 
@@ -56,6 +56,25 @@ def fills(wallet: str) -> list[RawFill]:
                                   "startPosition": "0", "oid": 1, "tid": 1, "fee": "0", "accountValue": "1000"}, wallet),
         RawFill.from_hyperliquid({"coin": "BTC", "px": "110", "sz": "1", "side": "A", "time": int((start + timedelta(minutes=1)).timestamp() * 1000),
                                   "startPosition": "1", "oid": 2, "tid": 2, "fee": "0", "accountValue": "1000"}, wallet),
+    ]
+
+
+def window_fills(wallet: str, start: object, end: object) -> list[RawFill]:
+    """One left-boundary BTC campaign, one clean ETH campaign, one future DOGE campaign."""
+    start_at, end_at = as_utc(start), as_utc(end)
+    records = [
+        ("BTC", "100", "1", "B", start_at - timedelta(days=1), "0", 101, 101),
+        ("BTC", "130", "1", "A", start_at + timedelta(hours=1), "1", 102, 102),
+        ("ETH", "100", "1", "B", end_at - timedelta(days=2), "0", 103, 103),
+        ("ETH", "110", "1", "A", end_at - timedelta(days=1), "1", 104, 104),
+        ("DOGE", "10", "1", "B", end_at + timedelta(days=1), "0", 105, 105),
+        ("DOGE", "20", "1", "A", end_at + timedelta(days=2), "1", 106, 106),
+    ]
+    return [
+        RawFill.from_hyperliquid({"coin": coin, "px": price, "sz": size, "side": side,
+                                  "time": int(when.timestamp() * 1000), "startPosition": position,
+                                  "oid": order_id, "tid": trade_id, "fee": "0", "accountValue": "1000"}, wallet)
+        for coin, price, size, side, when, position, order_id, trade_id in records
     ]
 
 
@@ -343,6 +362,130 @@ class PhaseBAnalysisTests(unittest.TestCase):
             self.assertIn("max_drawdown_fraction", summary["risk"])
             self.assertIn("average_drawdown_dollars", summary["risk"])
             self.assertEqual(summary["profitability"]["median_campaign_pnl"], 10.0)
+
+    def test_immutable_window_bounds_all_phase_b_outputs_and_survives_later_ingestion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            seed_candidates(service, [GOOD])
+            end = utc_now()
+            start = end - timedelta(days=service.config.analysis.history_days)
+            source = window_fills(GOOD, start, end)
+            def backfill(wallet: str, requested_start: object) -> dict[str, object]:
+                service.database.insert_raw_fills(source)
+                return {"new_raw_fills": len(source)}
+            pipeline = CandidateAnalysisPipeline(service, backfill_wallet=backfill)
+            with patch("src.copytrade.analysis.utc_now", return_value=end):
+                result = pipeline.run(limit=10)
+            analysis = service.database.get_candidate_analysis(GOOD)
+            summary = analysis.summary  # type: ignore[union-attr]
+            window = summary["analysis_window"]
+            self.assertEqual((window["campaigns_excluded_at_left_boundary"], window["campaigns_analyzed"]), (1, 1))
+            self.assertEqual((window["events_excluded_before_window"], window["events_excluded_after_window"]), (1, 2))
+            self.assertEqual(summary["target_metrics"]["profitability"]["net_pnl"], 10.0)
+            self.assertEqual(summary["diversification_input"]["symbols"], ["ETH"])
+            self.assertEqual(summary["diversification_input"]["directions"], ["long"])
+            first_finalists = result["shadow_finalists"]
+            later = RawFill.from_hyperliquid({"coin": "SOL", "px": "200", "sz": "1", "side": "B",
+                                               "time": int((end + timedelta(days=3)).timestamp() * 1000), "startPosition": "0",
+                                               "oid": 107, "tid": 107, "fee": "0", "accountValue": "1000"}, GOOD)
+            service.database.insert_raw_fill(later)
+            with patch("src.copytrade.analytics.utc_now", return_value=end + timedelta(days=120)):
+                repeated = pipeline._analyze_wallet(
+                    GOOD, summary["coverage"], run_id=result["run_id"],
+                    config_fingerprint=_config_fingerprint(service.config.snapshot()), required_start=start, required_end=end,
+                )
+            self.assertEqual(repeated["score"]["total"], summary["score"]["total"])
+            self.assertEqual(repeated["diversification_input"], summary["diversification_input"])
+            # Ranking uses the stored bounded summary, not newly ingested raw/campaign rows.
+            self.assertEqual(CandidateAnalysisPipeline(service).shadow_finalists(), first_finalists)
+            self.assertEqual(service.database.get_candidate_analysis(GOOD).summary["analysis_window"], window)  # type: ignore[union-attr]
+
+    def test_phase_b_score_is_authoritative_per_wallet_run_and_current_fingerprint_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            seed_candidates(service, [GOOD, FAILED])
+            fingerprint = _config_fingerprint(service.config.snapshot())
+            old_fingerprint = "old-config"
+            def qualified(wallet: str, run_id: str, score_value: float, score_fingerprint: str) -> None:
+                service.database.start_analysis_run(AnalysisRun(run_id, utc_now(), {"fixture": True}))
+                service.database.finish_analysis_run(run_id, status="completed", wallets_considered=1, cheap_rejected=0,
+                                                     backfill_attempted=1, backfill_failed=0, reconstructed=1, scored=1,
+                                                     eligible=1, rejected=0, deferred=0)
+                service.database.upsert_candidate_analysis(CandidateAnalysis(
+                    wallet, "qualified", run_id, utc_now(), utc_now(), summary={"diversification_input": {"daily_return_series": {}, "symbols": [], "directions": []}},
+                ))
+                service.database.upsert_candidate_score(CandidateScore(
+                    wallet, utc_now(), score_value, {}, {}, True, provenance="phase_b", analysis_run_id=run_id,
+                    config_fingerprint=score_fingerprint,
+                ))
+            qualified(GOOD, "analysis_authoritative", 40, fingerprint)
+            # This simulates an orphan score followed by a resumed scoring pass:
+            # the second write must update, not append.
+            service.database.upsert_candidate_score(CandidateScore(
+                GOOD, utc_now(), 60, {}, {}, True, provenance="phase_b", analysis_run_id="analysis_authoritative",
+                config_fingerprint=fingerprint,
+            ))
+            qualified(FAILED, "analysis_stale", 99, old_fingerprint)
+            with service.database._connect() as connection:  # type: ignore[attr-defined]
+                count = connection.execute("SELECT COUNT(*) FROM copy_candidate_scores WHERE target_wallet=? AND analysis_run_id=? AND provenance='phase_b'", (GOOD, "analysis_authoritative")).fetchone()[0]
+            self.assertEqual(count, 1)
+            current = service.database.phase_b_qualified_scores(config_fingerprint=fingerprint)
+            self.assertEqual([(score.target_wallet, score.total_score) for score in current], [(GOOD, 60.0)])
+            pipeline = CandidateAnalysisPipeline(service)
+            finalist_wallets = [item["wallet"] for item in pipeline.shadow_finalists()]
+            self.assertEqual(finalist_wallets, [GOOD])
+            self.assertEqual(pipeline.status()["stale_qualified_candidates"], 1)
+            self.assertEqual(service.database.get_candidate_analysis(FAILED).lifecycle_status, "qualified")  # type: ignore[union-attr]
+
+    def test_window_aware_prefilter_and_retry_ignore_unrelated_known_incomplete_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            seed_candidates(service, [GOOD])
+            end, start = utc_now(), utc_now() - timedelta(days=10)
+            candidate = service.database.list_analysis_candidates(limit=1)[0]
+            service.database.insert_backfill_coverage(GOOD, BackfillCoverage(
+                requested_start=start - timedelta(days=20), requested_end=start - timedelta(days=11), earliest_observed_fill=None,
+                latest_observed_fill=None, source_limit_detected=True, coverage_complete=False, coverage_quality="fixture", coverage_state="KNOWN_INCOMPLETE",
+            ))
+            attempts = {"count": 0}
+            def network_error(wallet: str, requested_start: object) -> dict[str, object]:
+                attempts["count"] += 1
+                raise RuntimeError("network")
+            pipeline = CandidateAnalysisPipeline(service, backfill_wallet=network_error, sleep=lambda _: None)
+            self.assertNotIn("known_incomplete", pipeline._cheap_prefilter(candidate, start, end))
+            self.assertIsNotNone(pipeline._retry_backfill(GOOD, start, end)[3])
+            self.assertEqual(attempts["count"], service.config.analysis.retry_attempts)
+            def known_current(wallet: str, requested_start: object) -> dict[str, object]:
+                attempts["count"] += 1
+                service.database.insert_backfill_coverage(wallet, BackfillCoverage(
+                    requested_start=start, requested_end=end, earliest_observed_fill=None, latest_observed_fill=None,
+                    source_limit_detected=True, coverage_complete=False, coverage_quality="fixture", coverage_state="KNOWN_INCOMPLETE",
+                ))
+                raise RuntimeError("dense interval")
+            pipeline = CandidateAnalysisPipeline(service, backfill_wallet=known_current, sleep=lambda _: None)
+            outcome = pipeline._retry_backfill(GOOD, start, end)
+            self.assertEqual((outcome[1], outcome[3]), (1, None))
+            self.assertIn("known_incomplete", pipeline._cheap_prefilter(candidate, start, end))
+
+    def test_copy_rank_selected_is_canonical_phase_b_finalists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = config(Path(temp))
+            service = CopyTradeService(cfg)
+            legacy_only = "0x5555555555555555555555555555555555555555"
+            seed_candidates(service, [GOOD, legacy_only], stale={legacy_only})
+            def backfill(wallet: str, start: object) -> dict[str, object]:
+                service.database.insert_raw_fills(fills(wallet))
+                return {"new_raw_fills": 2}
+            CandidateAnalysisPipeline(service, backfill_wallet=backfill).run(limit=10)
+            service.database.upsert_candidate_score(CandidateScore(legacy_only, utc_now(), 99, {}, {}, True))
+            with patch("src.copytrade.cli.CopyTradeConfig.from_yaml", return_value=cfg), patch("src.copytrade.cli._print") as printed:
+                from src.copytrade.cli import run_copytrade_command
+                import argparse
+                self.assertEqual(run_copytrade_command(argparse.Namespace(command="copy-rank", config="ignored", count=20)), 0)
+            payload = printed.call_args.args[0]
+            self.assertEqual(payload["selected"], payload["shadow_finalists"])
+            self.assertEqual([item["wallet"] for item in payload["selected"]], [GOOD])
+            self.assertEqual(payload["legacy_scores_label"], "research_compatibility_only")
 
 
 if __name__ == "__main__":

@@ -254,6 +254,17 @@ the denominator, source, and quality and is `unavailable` without real target
 capital, no filled follower entries, or a non-positive target return; it never
 uses campaign notional or a raw-dollar follower/target P&L ratio.
 
+The immutable analysis window also bounds the analytical population itself.
+Phase B reconstructs prior source state only to identify a position already
+open at the left boundary, then excludes that boundary-crossing campaign rather
+than inventing an entry basis. It scores only complete campaigns whose economic
+open and close are inside the saved `required_start` to `required_end` window;
+post-window fills never affect target metrics, follower replay, copyability,
+walk-forward, or diversification. The summary stores this boundary policy,
+excluded-event counts, analyzed campaign IDs, daily return series, and bounded
+symbol/directional exposure inputs. Finalists reuse those stored inputs rather
+than mutable all-time campaign tables.
+
 `KNOWN_INCOMPLETE` backfill coverage is a hard quarantine. `UNPROVEN` remains
 analyzable with the existing source-quality penalty and an explicit reason.
 Follower drawdown above `max_follower_drawdown_hard` and repeated liquidation
@@ -271,6 +282,19 @@ cannot enter. Selection uses time-aligned correlation when enough daily
 buckets exist, treats missing correlation as uncertainty, and adds symbol and
 directional exposure-overlap penalties. It returns the diversification
 breakdown but never changes a target state to `shadow` or `approved`.
+
+There is exactly one authoritative `phase_b` score for each wallet/run. A
+resume after a score-write crash updates that same record. Finalist selection
+also requires the score fingerprint to equal the current configuration
+fingerprint; prior qualified analyses remain auditable but are reported as
+stale and are not compared with current settings. Coverage prefiltering and
+backfill retry decisions use the run window, so an unrelated historical
+`KNOWN_INCOMPLETE` segment cannot reject or short-circuit current work.
+
+`copy-rank` now makes `ranked_phase_b`, `selected`, and `shadow_finalists`
+canonical Phase B recommendations using that same current fingerprint and
+bounded evidence. It retains `legacy_scores` only with the explicit
+`research_compatibility_only` label.
 
 ## Research outputs and dashboard
 

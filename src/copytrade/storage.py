@@ -327,6 +327,22 @@ class CopyTradeDatabase:
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_copy_discovery_observations_event ON copy_discovery_observations(run_id, source_event_id)"
             )
+            # B.1 could leave an orphan score if a process died after scoring
+            # and before qualification. Keep the latest as the authoritative
+            # historical record before enforcing the B.2 run-level invariant.
+            connection.execute(
+                """DELETE FROM copy_candidate_scores
+                   WHERE provenance='phase_b' AND analysis_run_id IS NOT NULL AND rowid NOT IN (
+                     SELECT MAX(rowid) FROM copy_candidate_scores
+                     WHERE provenance='phase_b' AND analysis_run_id IS NOT NULL
+                     GROUP BY target_wallet, analysis_run_id, provenance
+                   )"""
+            )
+            connection.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS idx_copy_phase_b_score_authority
+                   ON copy_candidate_scores(target_wallet, analysis_run_id, provenance)
+                   WHERE provenance='phase_b' AND analysis_run_id IS NOT NULL"""
+            )
             duplicate_attempt = connection.execute(
                 "SELECT 1 FROM copy_execution_attempts GROUP BY signal_id HAVING COUNT(*) > 1 LIMIT 1"
             ).fetchone()
@@ -773,12 +789,19 @@ class CopyTradeDatabase:
         query = """SELECT candidate.*, target.status AS current_status, analysis.lifecycle_status,
                    analysis.last_run_id AS analysis_run_id, analysis.completed_at AS analysis_completed_at,
                    analysis.prefilter_reasons_json, analysis.errors_json, analysis.summary_json,
-                   score.total_score, score.eligible AS score_eligible, score.reasons_json
+                   score.total_score, score.eligible AS score_eligible, score.reasons_json,
+                   phase_score.config_fingerprint AS candidate_config_fingerprint
                    FROM copy_discovery_candidates candidate
                    JOIN copy_targets target ON target.wallet=candidate.wallet
                    LEFT JOIN copy_candidate_analyses analysis ON analysis.wallet=candidate.wallet
                    LEFT JOIN copy_candidate_scores score ON score.target_wallet=candidate.wallet
-                     AND score.calculated_at=(SELECT MAX(calculated_at) FROM copy_candidate_scores WHERE target_wallet=candidate.wallet)"""
+                     AND score.calculated_at=(SELECT MAX(calculated_at) FROM copy_candidate_scores WHERE target_wallet=candidate.wallet)
+                   LEFT JOIN copy_candidate_scores phase_score ON phase_score.target_wallet=candidate.wallet
+                     AND phase_score.analysis_run_id=analysis.last_run_id AND phase_score.provenance='phase_b'
+                     AND phase_score.rowid=(SELECT MAX(current_score.rowid) FROM copy_candidate_scores current_score
+                                            WHERE current_score.target_wallet=candidate.wallet
+                                              AND current_score.analysis_run_id=analysis.last_run_id
+                                              AND current_score.provenance='phase_b')"""
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY score.total_score DESC NULLS LAST, candidate.recent_activity_at DESC, candidate.wallet LIMIT ?"
@@ -1016,15 +1039,33 @@ class CopyTradeDatabase:
 
     def upsert_candidate_score(self, score: CandidateScore) -> None:
         with self._connect() as connection:
-            connection.execute(
-                """INSERT OR REPLACE INTO copy_candidate_scores(target_wallet, calculated_at, total_score,
-                component_scores_json, penalties_json, eligible, reasons_json, source_quality,
-                provenance, analysis_run_id, config_fingerprint)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (score.target_wallet, iso(score.calculated_at), score.total_score, _dump(score.component_scores),
-                 _dump(score.penalties), int(score.eligible), _dump(score.reasons), score.source_quality,
-                 score.provenance, score.analysis_run_id, score.config_fingerprint),
+            values = (
+                score.target_wallet, iso(score.calculated_at), score.total_score, _dump(score.component_scores),
+                _dump(score.penalties), int(score.eligible), _dump(score.reasons), score.source_quality,
+                score.provenance, score.analysis_run_id, score.config_fingerprint,
             )
+            if score.provenance == "phase_b" and score.analysis_run_id:
+                connection.execute(
+                    """INSERT INTO copy_candidate_scores(target_wallet, calculated_at, total_score,
+                    component_scores_json, penalties_json, eligible, reasons_json, source_quality,
+                    provenance, analysis_run_id, config_fingerprint)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(target_wallet, analysis_run_id, provenance)
+                    WHERE provenance='phase_b' AND analysis_run_id IS NOT NULL DO UPDATE SET
+                      calculated_at=excluded.calculated_at, total_score=excluded.total_score,
+                      component_scores_json=excluded.component_scores_json, penalties_json=excluded.penalties_json,
+                      eligible=excluded.eligible, reasons_json=excluded.reasons_json,
+                      source_quality=excluded.source_quality, config_fingerprint=excluded.config_fingerprint""",
+                    values,
+                )
+            else:
+                connection.execute(
+                    """INSERT OR REPLACE INTO copy_candidate_scores(target_wallet, calculated_at, total_score,
+                    component_scores_json, penalties_json, eligible, reasons_json, source_quality,
+                    provenance, analysis_run_id, config_fingerprint)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    values,
+                )
 
     def latest_scores(self) -> list[CandidateScore]:
         with self._connect() as connection:
@@ -1044,8 +1085,10 @@ class CopyTradeDatabase:
             for row in rows
         ]
 
-    def phase_b_qualified_scores(self) -> list[CandidateScore]:
-        """Current qualified analysis scores, immune to later legacy scoring."""
+    def phase_b_qualified_scores(self, *, config_fingerprint: str | None = None) -> list[CandidateScore]:
+        """Current qualified Phase B scores, one authoritative row per wallet."""
+        fingerprint_clause = " AND score.config_fingerprint=?" if config_fingerprint is not None else ""
+        values: tuple[Any, ...] = (config_fingerprint,) if config_fingerprint is not None else ()
         with self._connect() as connection:
             rows = connection.execute(
                 """SELECT score.* FROM copy_candidate_analyses analysis
@@ -1056,7 +1099,12 @@ class CopyTradeDatabase:
                    WHERE analysis.lifecycle_status='qualified' AND analysis.completed_at IS NOT NULL
                      AND run.status IN ('completed', 'completed_with_errors')
                      AND target.status NOT IN ('muted', 'rejected', 'active') AND score.eligible=1
-                   ORDER BY score.total_score DESC, score.target_wallet"""
+                     AND score.rowid=(SELECT MAX(current_score.rowid) FROM copy_candidate_scores current_score
+                                      WHERE current_score.target_wallet=score.target_wallet
+                                        AND current_score.analysis_run_id=score.analysis_run_id
+                                        AND current_score.provenance='phase_b')""" + fingerprint_clause +
+                " ORDER BY score.total_score DESC, score.target_wallet",
+                values,
             ).fetchall()
         return [
             CandidateScore(
@@ -1068,6 +1116,18 @@ class CopyTradeDatabase:
             )
             for row in rows
         ]
+
+    def count_stale_qualified_candidates(self, current_config_fingerprint: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT COUNT(DISTINCT analysis.wallet) AS count FROM copy_candidate_analyses analysis
+                   JOIN copy_candidate_scores score ON score.target_wallet=analysis.wallet
+                     AND score.analysis_run_id=analysis.last_run_id AND score.provenance='phase_b'
+                   WHERE analysis.lifecycle_status='qualified' AND analysis.completed_at IS NOT NULL
+                     AND score.config_fingerprint<>?""",
+                (current_config_fingerprint,),
+            ).fetchone()
+        return int(row["count"] if row else 0)
 
     def insert_signal(self, signal: CopySignal) -> bool:
         with self._connect() as connection:

@@ -9,7 +9,7 @@ from datetime import timedelta
 from statistics import fmean
 from typing import Any, Callable, Iterable
 
-from .analytics import campaign_return_series
+from .analytics import calculate_trader_metrics, campaign_return_series
 from .backtest import CopyTradeBacktester
 from .config import CopyTradeConfig
 from .models import AnalysisRun, CandidateAnalysis, CandidateAnalysisState, PositionCampaign, PositionEvent, as_utc, new_run_id, utc_now
@@ -120,7 +120,7 @@ class CandidateAnalysisPipeline:
                     continue
                 if run_wallet and run_wallet["stage"] == "prefilter" and run_wallet["status"] == "rejected":
                     continue
-                reasons = self._cheap_prefilter(candidate)
+                reasons = self._cheap_prefilter(candidate, required_start, required_end)
                 if reasons:
                     self._save_candidate(
                         wallet, CandidateAnalysisState.PREFILTER_REJECTED.value, run["run_id"],
@@ -145,7 +145,7 @@ class CandidateAnalysisPipeline:
 
             for candidate in pending:
                 self.database.record_analysis_wallet(run["run_id"], str(candidate["wallet"]), stage="backfill", status="started")
-            outcomes = self._backfill_all(pending, required_start, worker_count)
+            outcomes = self._backfill_all(pending, required_start, required_end, worker_count)
             for wallet, attempts, result, error in outcomes:
                 if error:
                     errors.append(f"{wallet}: {error}")
@@ -173,14 +173,14 @@ class CandidateAnalysisPipeline:
                     payload={"coverage": coverage, "backfill": result},
                 )
                 self._save_candidate(wallet, CandidateAnalysisState.ANALYSIS_PENDING.value, run["run_id"], completed=False)
-                self._complete_analysis_wallet(wallet, run["run_id"], coverage, configuration, errors)
+                self._complete_analysis_wallet(wallet, run["run_id"], coverage, configuration, required_start, required_end, errors)
             for wallet in ready_for_analysis:
                 coverage = self.database.analysis_window_coverage(wallet, required_start, required_end)
                 if coverage.get("coverage_state") == "KNOWN_INCOMPLETE":
                     self._save_candidate(wallet, CandidateAnalysisState.QUARANTINED.value, run["run_id"], reasons=("known_incomplete",), summary={"coverage": coverage}, completed=True)
                     self.database.record_analysis_wallet(run["run_id"], wallet, stage="backfill", status="quarantined", payload={"reason": "known_incomplete", "coverage": coverage})
                 else:
-                    self._complete_analysis_wallet(wallet, run["run_id"], coverage, configuration, errors)
+                    self._complete_analysis_wallet(wallet, run["run_id"], coverage, configuration, required_start, required_end, errors)
         except Exception as exc:
             errors.append(f"run failure: {exc}")
             return self._finish(run["run_id"], errors, status="failed")
@@ -189,18 +189,40 @@ class CandidateAnalysisPipeline:
     def status(self, *, limit: int = 1000) -> dict[str, object]:
         rows = self.database.list_analysis_candidates(limit=limit)
         state_counts = self.database.count_analysis_candidates_by_state()
-        return {"runs": self.database.list_analysis_runs(), "state_counts": state_counts, "total_candidates": sum(state_counts.values()), "candidates": rows}
+        fingerprint = _config_fingerprint(self.config.snapshot())
+        for row in rows:
+            candidate_fingerprint = row.get("candidate_config_fingerprint")
+            row["stale_for_current_config"] = bool(candidate_fingerprint and candidate_fingerprint != fingerprint)
+        return {
+            "runs": self.database.list_analysis_runs(), "state_counts": state_counts,
+            "total_candidates": sum(state_counts.values()), "candidates": rows,
+            "current_config_fingerprint": fingerprint,
+            "stale_qualified_candidates": self.database.count_stale_qualified_candidates(fingerprint),
+        }
 
     def shadow_finalists(self, *, count: int | None = None) -> list[dict[str, object]]:
         target_count = count or self.config.analysis.shadow_finalist_count
-        scores = self.database.phase_b_qualified_scores()
-        series = {
-            score.target_wallet: campaign_return_series(self.database.list_campaigns(score.target_wallet, closed_only=True))
+        current_fingerprint = _config_fingerprint(self.config.snapshot())
+        scores = self.database.phase_b_qualified_scores(config_fingerprint=current_fingerprint)
+        candidates = {row["wallet"]: row for row in self.database.list_analysis_candidates(limit=10_000)}
+        analysis_by_wallet = {
+            score.target_wallet: _json_object(candidates.get(score.target_wallet, {}).get("analysis_summary", {}))
             for score in scores
         }
-        exposures = {score.target_wallet: _exposure_profile(self.database.list_campaigns(score.target_wallet, closed_only=True)) for score in scores}
+        # Never derive selection inputs from mutable all-time tables.  The
+        # summary is the bounded evidence population which generated this score.
+        series = {
+            score.target_wallet: _json_object(analysis_by_wallet[score.target_wallet].get("diversification_input", {})).get("daily_return_series", {})
+            for score in scores
+        }
+        exposures = {
+            score.target_wallet: {
+                "symbols": _json_object(analysis_by_wallet[score.target_wallet].get("diversification_input", {})).get("symbols", []),
+                "directions": _json_object(analysis_by_wallet[score.target_wallet].get("diversification_input", {})).get("directions", []),
+            }
+            for score in scores
+        }
         selected = select_diverse_targets_with_metadata(scores, series, target_count=target_count, exposures=exposures)
-        candidates = {row["wallet"]: row for row in self.database.list_analysis_candidates(limit=10_000)}
         finalists = []
         for rank, (score, diversification) in enumerate(selected, 1):
             candidate = candidates.get(score.target_wallet, {})
@@ -212,6 +234,9 @@ class CandidateAnalysisPipeline:
                 "target": target, "follower": follower, "copyability": analysis.get("copyability", {}),
                 "data_quality": analysis.get("coverage", {}), "principal_risks": score.reasons,
                 "diversification": diversification,
+                "current_config_fingerprint": current_fingerprint,
+                "candidate_config_fingerprint": score.config_fingerprint,
+                "stale_for_current_config": score.config_fingerprint != current_fingerprint,
                 "selection_reason": "current qualified Phase B score with return-correlation and exposure-overlap diversification penalties",
             })
         return finalists
@@ -250,33 +275,33 @@ class CandidateAnalysisPipeline:
             )
 
     def _backfill_all(
-        self, candidates: Iterable[dict[str, Any]], start: object, workers: int,
+        self, candidates: Iterable[dict[str, Any]], start: object, end: object, workers: int,
     ) -> list[tuple[str, int, dict[str, object], str | None]]:
         items = [str(candidate["wallet"]).lower() for candidate in candidates]
         if not items:
             return []
         outcomes: list[tuple[str, int, dict[str, object], str | None]] = []
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="copy-analysis") as pool:
-            futures = {pool.submit(self._retry_backfill, wallet, start): wallet for wallet in items}
+            futures = {pool.submit(self._retry_backfill, wallet, start, end): wallet for wallet in items}
             for future in as_completed(futures):
                 outcomes.append(future.result())
         return sorted(outcomes, key=lambda item: item[0])
 
-    def _retry_backfill(self, wallet: str, start: object) -> tuple[str, int, dict[str, object], str | None]:
+    def _retry_backfill(self, wallet: str, start: object, end: object) -> tuple[str, int, dict[str, object], str | None]:
         attempts = self.config.analysis.retry_attempts
         for attempt in range(1, attempts + 1):
             try:
                 return wallet, attempt, self._backfill_wallet(wallet, start), None
             except Exception as exc:
-                coverage = self.database.latest_backfill_coverage(wallet)
-                if coverage and str(coverage.get("coverage_state")) == "KNOWN_INCOMPLETE":
+                coverage = self.database.analysis_window_coverage(wallet, start, end)
+                if str(coverage.get("coverage_state")) == "KNOWN_INCOMPLETE":
                     return wallet, attempt, {"coverage": coverage}, None
                 if attempt == attempts:
                     return wallet, attempt, {}, str(exc)
                 self._sleep(self.config.analysis.retry_initial_seconds * (2 ** (attempt - 1)))
         raise AssertionError("retry loop must return")  # pragma: no cover
 
-    def _cheap_prefilter(self, candidate: dict[str, Any]) -> tuple[str, ...]:
+    def _cheap_prefilter(self, candidate: dict[str, Any], required_start: object, required_end: object) -> tuple[str, ...]:
         reasons: list[str] = []
         wallet = str(candidate.get("wallet") or "").lower()
         if not _is_wallet(wallet):
@@ -285,22 +310,26 @@ class CandidateAnalysisPipeline:
         if status in _OPERATOR_CONTROLLED_TARGET_STATES:
             reasons.append("operator_managed_status")
         activity = candidate.get("recent_activity_at")
-        if not activity or (utc_now() - as_utc(activity)).total_seconds() > self.config.candidates.activity_max_age_days * 86_400:
+        if not activity or (as_utc(required_end) - as_utc(activity)).total_seconds() > self.config.candidates.activity_max_age_days * 86_400:
             reasons.append("inactive")
         metadata = _json_object(candidate.get("metadata_json"))
         observed = int(metadata.get("latest_activity_observations", 0) or 0)
         if observed < self.config.analysis.min_discovery_activity:
             reasons.append("insufficient_activity")
-        coverage = self.database.latest_backfill_coverage(wallet) if wallet else None
+        coverage = self.database.analysis_window_coverage(wallet, required_start, required_end) if wallet else None
         if coverage and str(coverage.get("coverage_state")) == "KNOWN_INCOMPLETE":
             reasons.append("known_incomplete")
         return tuple(sorted(set(reasons)))
 
     def _complete_analysis_wallet(
-        self, wallet: str, run_id: str, coverage: dict[str, Any], configuration: dict[str, Any], errors: list[str],
+        self, wallet: str, run_id: str, coverage: dict[str, Any], configuration: dict[str, Any],
+        required_start: object, required_end: object, errors: list[str],
     ) -> None:
         try:
-            analysis = self._analyze_wallet(wallet, coverage, run_id=run_id, config_fingerprint=str(configuration["config_fingerprint"]))
+            analysis = self._analyze_wallet(
+                wallet, coverage, run_id=run_id, config_fingerprint=str(configuration["config_fingerprint"]),
+                required_start=required_start, required_end=required_end,
+            )
         except Exception as exc:  # reconstruction/simulation failure remains per-wallet and resumable
             message = str(exc)
             errors.append(f"{wallet}: analysis failed: {message}")
@@ -320,12 +349,38 @@ class CandidateAnalysisPipeline:
 
     def _analyze_wallet(
         self, wallet: str, coverage: dict[str, Any], *, run_id: str, config_fingerprint: str,
+        required_start: object, required_end: object,
     ) -> dict[str, object]:
         reconstructed = self._reconstruct_wallet(wallet)
-        events = tuple(reconstructed["events"])
-        metrics = reconstructed["metrics"]
-        if metrics is None:
-            raise RuntimeError("reconstruction returned no trader metrics")
+        all_events = tuple(reconstructed["events"])
+        all_campaigns = tuple(reconstructed["campaigns"])
+        start, end = as_utc(required_start), as_utc(required_end)
+        boundary_campaigns = [
+            campaign for campaign in all_campaigns
+            if as_utc(campaign.opened_at) < start and (campaign.closed_at is None or as_utc(campaign.closed_at) >= start)
+        ]
+        # Reconstructing all source fills is only used to identify the state at
+        # the left boundary.  No campaign whose economic entry predates the
+        # immutable window is given a fabricated entry basis.  To prevent a
+        # future close from leaking P&L into the run, score only campaigns that
+        # both open and close inside the window.
+        campaigns = tuple(
+            campaign for campaign in all_campaigns
+            if start <= as_utc(campaign.opened_at) <= end
+            and campaign.closed_at is not None and as_utc(campaign.closed_at) <= end
+            and campaign.history_complete
+        )
+        campaign_ids = {campaign.campaign_id for campaign in campaigns}
+        events = tuple(
+            event for event in all_events
+            if start <= as_utc(event.event_timestamp) <= end and event.campaign_id in campaign_ids
+        )
+        metrics = calculate_trader_metrics(wallet, campaigns, events, self.config.sizing)
+        latest_activity = max(((campaign.closed_at or campaign.opened_at) for campaign in campaigns), default=None)
+        metrics = replace(
+            metrics,
+            activity_recency_days=((end - as_utc(latest_activity)).total_seconds() / 86_400) if latest_activity else None,
+        )
         # ``service.reconstruct`` reports the latest physical request.  Phase B
         # eligibility instead uses the immutable full analysis interval.
         metrics.raw["coverage_state"] = coverage.get("coverage_state", "UNPROVEN")
@@ -333,7 +388,6 @@ class CandidateAnalysisPipeline:
         metrics.raw["coverage_quality"] = coverage.get("coverage_quality", "analysis_window")
         metrics.raw["analysis_window_coverage"] = coverage
         self.database.upsert_metrics(metrics)
-        campaigns = self.database.list_campaigns(wallet)
         backtester = CopyTradeBacktester(self.config)
         baseline = backtester.run(events=events, coverage_metadata=coverage)
         slippage = backtester.slippage_scenarios(events=events)
@@ -364,11 +418,34 @@ class CandidateAnalysisPipeline:
             analysis_run_id=run_id, config_fingerprint=config_fingerprint,
         )
         self.database.upsert_candidate_score(score)
+        diversification_input = {
+            "daily_return_series": campaign_return_series(campaigns),
+            "symbols": sorted({campaign.symbol for campaign in campaigns}),
+            "directions": sorted({campaign.direction for campaign in campaigns}),
+            "campaign_ids": sorted(campaign_ids),
+        }
+        boundary_metadata = {
+            "required_start": start.isoformat(), "required_end": end.isoformat(),
+            "boundary_policy": "reconstruct_prior_state_then_exclude_campaigns_open_at_required_start; score_only_campaigns_opened_and_closed_within_window",
+            "campaigns_excluded_at_left_boundary": len(boundary_campaigns),
+            "events_excluded_before_window": sum(as_utc(event.event_timestamp) < start for event in all_events),
+            "events_excluded_after_window": sum(as_utc(event.event_timestamp) > end for event in all_events),
+            "events_excluded_boundary_campaigns": sum(
+                event.campaign_id in {campaign.campaign_id for campaign in boundary_campaigns}
+                for event in all_events if start <= as_utc(event.event_timestamp) <= end
+            ),
+            "campaigns_analyzed": len(campaigns),
+            "analyzed_first_event": events[0].event_timestamp.isoformat() if events else None,
+            "analyzed_last_event": events[-1].event_timestamp.isoformat() if events else None,
+        }
         return {
             "target_metrics": _target_summary(metrics, campaigns, events),
             "follower": follower,
             "copyability": copyability,
             "coverage": coverage,
+            "analysis_window": boundary_metadata,
+            **boundary_metadata,
+            "diversification_input": diversification_input,
             "slippage_scenarios": slippage,
             "latency": {"status": "available" if latency else "unavailable", "curve": latency},
             "walk_forward": walk_forward,

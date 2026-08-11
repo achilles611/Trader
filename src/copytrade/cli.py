@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .analytics import campaign_return_series
-from .analysis import CandidateAnalysisPipeline
+from .analysis import CandidateAnalysisPipeline, _config_fingerprint
 from .backtest import CopyTradeBacktester
 from .config import CopyTradeConfig
 from .dashboard import serve_dashboard
@@ -178,11 +178,19 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
         _print({"scores": reports})
         return 0
     if command == "copy-rank":
-        scores = service.database.latest_scores()
-        returns = {wallet: campaign_return_series(service.database.list_campaigns(wallet, closed_only=True)) for wallet in {score.target_wallet for score in scores}}
-        selected = select_diverse_targets(scores, returns, target_count=args.count)
-        _print({"ranked": [_score_payload(score) for score in scores], "selected": [_score_payload(score) for score in selected],
-                "shadow_finalists": CandidateAnalysisPipeline(service).shadow_finalists(count=args.count)})
+        pipeline = CandidateAnalysisPipeline(service)
+        fingerprint = _config_fingerprint(config.snapshot())
+        phase_b_scores = service.database.phase_b_qualified_scores(config_fingerprint=fingerprint)
+        finalists = pipeline.shadow_finalists(count=args.count)
+        _print({
+            "ranked_phase_b": [_score_payload(score) for score in phase_b_scores],
+            "selected": finalists,
+            "shadow_finalists": finalists,
+            "current_config_fingerprint": fingerprint,
+            "stale_qualified_candidates": service.database.count_stale_qualified_candidates(fingerprint),
+            "legacy_scores": [_score_payload(score) for score in service.database.latest_scores()],
+            "legacy_scores_label": "research_compatibility_only",
+        })
         return 0
     if command in {"copy-approve", "copy-reject"}:
         service.set_status(args.wallet, "approved" if command == "copy-approve" else "rejected")
@@ -251,7 +259,12 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
 
 
 def _score_payload(score: Any) -> dict[str, Any]:
-    return {"wallet": score.target_wallet, "score": score.total_score, "eligible": score.eligible, "reasons": score.reasons}
+    return {
+        "wallet": score.target_wallet, "score": score.total_score, "eligible": score.eligible,
+        "reasons": score.reasons, "provenance": getattr(score, "provenance", "legacy"),
+        "analysis_run_id": getattr(score, "analysis_run_id", None),
+        "config_fingerprint": getattr(score, "config_fingerprint", None),
+    }
 
 
 def _print(payload: object) -> None:
