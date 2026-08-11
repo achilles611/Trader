@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .analytics import calculate_trader_metrics
+from .control_center import ControlCenterStore
 from .config import CopyTradeConfig
 from .discovery import CandidateDiscoveryAdapter, DiscoveryPipeline
 from .hyperliquid import HyperliquidPublicAdapter
@@ -24,6 +25,10 @@ class CopyTradeService:
         self.config = config
         self.database = database or CopyTradeDatabase(config.artifacts.database_path)
         self.database.initialize()
+        # Phase C owns its separate durable operator/control schema.  Keeping
+        # it additive preserves the Phase A/B evidence tables and APIs.
+        self.control_store = ControlCenterStore(config.artifacts.database_path)
+        self.control_store.initialize()
         self.adapter = HyperliquidPublicAdapter(config.source)
         self.market_cache = LiveMarketCache()
         self._live_engine: PaperExecutionEngine | None = None
@@ -170,7 +175,8 @@ class CopyTradeService:
                 # A persisted attempt is the idempotency boundary.  If a crash
                 # happened after raw/signal persistence but before an attempt,
                 # the same deterministic signal is recovered on the next pass.
-                if not self.database.has_signal(signal.signal_id):
+                new_signal = not self.database.has_signal(signal.signal_id)
+                if new_signal:
                     self.database.insert_signal(signal)
                 received_at = utc_now()
                 observation, age_ms = self.market_cache.latest_available(
@@ -182,7 +188,10 @@ class CopyTradeService:
                     "local_receive_timestamp": received_at.isoformat(),
                     "market_reference_age_ms": age_ms,
                 }
-                if observation:
+                entry_block = self.control_store.entry_block_reason(wallet, signal.action)
+                if entry_block:
+                    attempt = engine.process_signal(signal, received_at=received_at, market_metadata=metadata, forced_reason=entry_block)
+                elif observation:
                     metadata.update({
                         "market_reference_price": observation.price,
                         "market_reference_timestamp": observation.timestamp.isoformat(),
@@ -190,19 +199,27 @@ class CopyTradeService:
                         "market_reference_quality": observation.quality,
                         "source_to_receive_latency_ms": max(0.0, (received_at - event.event_timestamp).total_seconds() * 1000),
                     })
-                    engine.process_signal(signal, received_at=received_at, market_price=observation.price, market_metadata=metadata)
+                    attempt = engine.process_signal(signal, received_at=received_at, market_price=observation.price, market_metadata=metadata)
                 elif signal.action in {"open", "add"}:
                     metadata.update({"market_reference_source": "unavailable", "market_reference_quality": "stale_or_missing"})
-                    engine.process_signal(signal, received_at=received_at, market_metadata=metadata, forced_reason="stale_market_data")
+                    attempt = engine.process_signal(signal, received_at=received_at, market_metadata=metadata, forced_reason="stale_market_data")
                 elif self.config.paper_execution.stale_exit_market_policy == "skip":
                     metadata.update({"market_reference_source": "unavailable", "market_reference_quality": "stale_or_missing"})
-                    engine.process_signal(signal, received_at=received_at, market_metadata=metadata, forced_reason="stale_market_data_exit")
+                    attempt = engine.process_signal(signal, received_at=received_at, market_metadata=metadata, forced_reason="stale_market_data_exit")
                 else:
                     # Explicit emergency paper fallback for exits only; it is
                     # recorded as such rather than passing for a live quote.
                     metadata.update({"market_reference_price": event.price, "market_reference_source": "target_fill_fallback",
                                      "market_reference_quality": "exit_only_not_contemporaneous"})
-                    engine.process_signal(signal, received_at=received_at, market_price=event.price, market_metadata=metadata)
+                    attempt = engine.process_signal(signal, received_at=received_at, market_price=event.price, market_metadata=metadata)
+                if new_signal:
+                    self.control_store.record_activity(
+                        category="execution", severity="info" if attempt.status == "filled" else "warning",
+                        wallet=signal.target_wallet, symbol=signal.symbol,
+                        message=f"Paper {signal.action} {attempt.status}: {signal.symbol}",
+                        payload={"reason": attempt.reason, "paper": True, "signal_id": signal.signal_id},
+                        occurred_at=attempt.decided_at,
+                    )
 
     async def ingest_watched_state(self, wallet: str, payload: dict[str, object]) -> None:
         attributed = str(payload.get("user") or "").lower()
@@ -267,7 +284,12 @@ class CopyTradeService:
         return result
 
     def approved_wallets(self) -> list[str]:
-        return [target.wallet for target in self.database.list_targets(TargetStatus.APPROVED.value)]
+        # Shadow and muted traders remain monitored for research and safe exit
+        # handling; the persisted Phase C entry gate decides whether an OPEN
+        # may be copied.  This avoids unsubscribing a wallet merely because
+        # the operator paused entries or muted it.
+        monitored = {TargetStatus.APPROVED.value, TargetStatus.SHADOW.value, TargetStatus.ACTIVE.value, TargetStatus.MUTED.value}
+        return [target.wallet for target in self.database.list_targets() if str(target.status) in monitored]
 
     def _store_portfolio_snapshot(self, wallet: str, portfolio: object) -> None:
         if not isinstance(portfolio, list):

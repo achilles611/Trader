@@ -9,3 +9,6 @@ models/
 reports/
 viz/
 run_archives/
+control-center-ui/node_modules/
+control-center-ui/dist/
+control-center-ui/*.tsbuildinfo

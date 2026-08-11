@@ -1,0 +1,185 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { api, post } from "./api";
+import type { Candidate, CandidatesResponse, ControlState, Portfolio } from "./types";
+
+type Page = "Overview" | "Candidates" | "Shadow" | "Active" | "Portfolio" | "Positions" | "Activity" | "System";
+const pages: Page[] = ["Overview", "Candidates", "Shadow", "Active", "Portfolio", "Positions", "Activity", "System"];
+
+const money = (value: unknown) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(Number(value || 0));
+const percent = (value: unknown) => `${(Number(value || 0) * 100).toFixed(1)}%`;
+const number = (value: unknown, digits = 1) => value === null || value === undefined ? "—" : Number(value).toFixed(digits);
+const walletLabel = (wallet: string) => wallet.length > 14 ? `${wallet.slice(0, 8)}…${wallet.slice(-6)}` : wallet;
+const timeLabel = (value?: string | null) => value ? new Date(value).toLocaleString() : "—";
+
+type Toast = { tone: "error" | "success" | "warning"; message: string } | null;
+type Confirmation = { title: string; body: string; action: () => Promise<void>; confirm: string } | null;
+
+export function App() {
+  const [page, setPage] = useState<Page>("Overview");
+  const [overview, setOverview] = useState<Record<string, any> | null>(null);
+  const [portfolio, setPortfolio] = useState<Portfolio | null>(null);
+  const [control, setControl] = useState<ControlState | null>(null);
+  const [toast, setToast] = useState<Toast>(null);
+  const [confirmation, setConfirmation] = useState<Confirmation>(null);
+
+  const reportError = useCallback((error: unknown) => setToast({ tone: "error", message: error instanceof Error ? error.message : "The action failed. No state change was made." }), []);
+  const refresh = useCallback(async () => {
+    try {
+      const [nextOverview, nextPortfolio, nextControl] = await Promise.all([api<Record<string, any>>("/api/overview"), api<Portfolio>("/api/portfolio"), api<ControlState>("/api/controls")]);
+      setOverview(nextOverview); setPortfolio(nextPortfolio); setControl(nextControl);
+    } catch (error) { reportError(error); }
+  }, [reportError]);
+
+  useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
+    ws.onmessage = (event) => {
+      const message = JSON.parse(event.data) as { type: string; data: any };
+      if (message.type === "portfolio_update") setPortfolio(message.data);
+      if (message.type === "control_state") setControl(message.data);
+    };
+    ws.onerror = () => undefined;
+    return () => ws.close();
+  }, []);
+
+  const command = async (path: string, success: string) => {
+    try { const result = await post<ControlState & { control?: ControlState }>(path); setControl(result.control || result); setToast({ tone: "success", message: success }); await refresh(); }
+    catch (error) { reportError(error); }
+  };
+
+  return <div className="shell">
+    <aside className="sidebar">
+      <div className="brand"><span className="brand-mark">T</span><div><strong>TRADER</strong><small>COPY CONTROL CENTER</small></div></div>
+      <div className="mode-stamp">PAPER ONLY</div>
+      <nav aria-label="Primary navigation">{pages.map((item) => <button key={item} className={page === item ? "nav-item selected" : "nav-item"} onClick={() => setPage(item)}>{item}</button>)}</nav>
+      <div className="sidebar-foot"><span className="status-dot good" /> Local research terminal<br />No live execution capability</div>
+    </aside>
+    <main className="main">
+      <header className="topbar">
+        <div><div className="eyebrow">PAPER-COPY OPERATIONS</div><h1>{page}</h1></div>
+        <div className="header-controls">
+          <span className={`control-chip ${control?.entries_allowed ? "running" : "paused"}`}>{control?.state || "CONNECTING"}</span>
+          {control?.entries_allowed
+            ? <button className="button warning" onClick={() => void command("/api/controls/pause-entries", "New PAPER entries are paused. Existing exits remain enabled.")}>Pause Paper Entries</button>
+            : <button className="button positive" onClick={() => void command("/api/controls/resume-entries", "New PAPER entries are enabled.")}>Resume Paper Entries</button>}
+          <button className="button critical" onClick={() => setConfirmation({ title: "Close all PAPER positions?", body: "This will flatten every current paper sleeve using the latest valid market reference. Trader statuses will not change.", confirm: "Close All Paper Positions", action: async () => { await command("/api/controls/close-all-paper-positions", "Close-all PAPER action completed."); } })}>Close All Paper Positions</button>
+          <button className="button critical outline" onClick={() => setConfirmation({ title: "Exit + pause PAPER trading?", body: "This will first flatten every current PAPER sleeve using valid market references, then disable new PAPER entries. Trader statuses will not change.", confirm: "Exit + Pause Paper Trading", action: async () => { await command("/api/controls/exit-and-pause", "PAPER exit + pause action completed."); } })}>Exit + Pause</button>
+        </div>
+      </header>
+      <section className="paper-banner"><strong>PAPER POSITIONS ONLY</strong><span>Research and simulated execution only. No credentials, signing, order submission, or live-mode controls exist in this application.</span></section>
+      {page === "Overview" && <Overview data={overview} portfolio={portfolio} navigate={setPage} />}
+      {page === "Candidates" && <CandidatesPage notify={setToast} refresh={refresh} />}
+      {page === "Shadow" && <ShadowPage notify={setToast} refresh={refresh} />}
+      {page === "Active" && <ActivePage notify={setToast} confirmation={setConfirmation} refresh={refresh} />}
+      {page === "Portfolio" && <PortfolioPage portfolio={portfolio} />}
+      {page === "Positions" && <PositionsPage />}
+      {page === "Activity" && <ActivityPage />}
+      {page === "System" && <SystemPage control={control} />}
+    </main>
+    {toast && <div className={`toast ${toast.tone}`} role="alert"><span>{toast.tone === "error" ? "Action failed" : toast.tone === "warning" ? "Warning" : "Updated"}</span>{toast.message}<button onClick={() => setToast(null)} aria-label="Dismiss notification">×</button></div>}
+    {confirmation && <ConfirmationDialog item={confirmation} close={() => setConfirmation(null)} />}
+  </div>;
+}
+
+function Overview({ data, portfolio, navigate }: { data: Record<string, any> | null; portfolio: Portfolio | null; navigate: (page: Page) => void }) {
+  const counts = data?.counts || {};
+  const cards = [
+    ["Discovered", counts.total_discovered, "Research universe"], ["Qualified", counts.qualified, "Current Phase B evidence"],
+    ["Shadow", counts.shadow, "Monitored finalists"], ["Active", counts.active, "PAPER cohort"],
+    ["Open PAPER P&L", money(portfolio?.open_pnl), "Unrealized"], ["Paper equity", money(portfolio?.equity), `Max DD ${percent(portfolio?.max_drawdown)}`],
+  ];
+  return <div className="page-grid">
+    <section className="stat-grid">{cards.map(([label, value, sub]) => <article className="panel stat" key={String(label)}><span>{label}</span><strong>{value ?? "—"}</strong><small>{sub}</small></article>)}</section>
+    <section className="panel span-8"><PanelTitle title="Research funnel" action="Open candidates" onAction={() => navigate("Candidates")} /><div className="funnel">{(data?.funnel || []).map((stage: any) => <button key={stage.key} onClick={() => navigate("Candidates")}><strong>{Number(stage.count).toLocaleString()}</strong><span>{stage.label}</span></button>)}</div></section>
+    <section className="panel span-4"><PanelTitle title="Paper portfolio" action="Open portfolio" onAction={() => navigate("Portfolio")} /><MetricList values={[["Free cash", money(portfolio?.cash)], ["Committed", money(portfolio?.committed_capital)], ["Realized total", money(portfolio?.realized_pnl_total)], ["Open positions", portfolio?.open_positions ?? "—"]]} /></section>
+    <section className="panel span-7"><PanelTitle title="Top research candidates" action="Candidate table" onAction={() => navigate("Candidates")} /><CandidateRows candidates={data?.top_candidates || []} /></section>
+    <section className="panel span-5"><PanelTitle title="Recent activity" action="Full activity" onAction={() => navigate("Activity")} /><ActivityList items={data?.recent_activity || []} /></section>
+  </div>;
+}
+
+function CandidatesPage({ notify, refresh }: { notify: (toast: Toast) => void; refresh: () => Promise<void> }) {
+  const [response, setResponse] = useState<CandidatesResponse | null>(null);
+  const [search, setSearch] = useState(""); const [status, setStatus] = useState(""); const [lifecycle, setLifecycle] = useState("");
+  const [sort, setSort] = useState("score"); const [direction, setDirection] = useState("desc"); const [compact, setCompact] = useState(false);
+  const [selected, setSelected] = useState<string[]>([]); const [detail, setDetail] = useState<Record<string, any> | null>(null);
+  const load = useCallback(async () => {
+    try {
+      const params = new URLSearchParams({ page_size: "50", search, status, lifecycle, sort, direction });
+      setResponse(await api<CandidatesResponse>(`/api/candidates?${params}`));
+    } catch (error) { notify({ tone: "error", message: error instanceof Error ? error.message : "Could not load candidates." }); }
+  }, [search, status, lifecycle, sort, direction, notify]);
+  useEffect(() => { const timer = window.setTimeout(() => void load(), 180); return () => window.clearTimeout(timer); }, [load]);
+  const order = (key: string) => { if (key === sort) setDirection(direction === "desc" ? "asc" : "desc"); else { setSort(key); setDirection("desc"); } };
+  const act = async (wallet: string, state: string) => { try { await post(`/api/candidates/${wallet}/operator-state`, { state }); notify({ tone: "success", message: `Operator state updated to ${state}.` }); await load(); await refresh(); } catch (error) { notify({ tone: "error", message: error instanceof Error ? error.message : "Failed to update wallet. No state change was made." }); } };
+  const showDetail = async (wallet: string) => { try { setDetail(await api(`/api/candidates/${wallet}`)); } catch (error) { notify({ tone: "error", message: error instanceof Error ? error.message : "Could not open research detail." }); } };
+  const toggle = (wallet: string) => setSelected((items) => items.includes(wallet) ? items.filter((item) => item !== wallet) : [...items, wallet]);
+  return <div className="table-layout"><section className="panel table-panel">
+    <div className="toolbar"><div><input aria-label="Search wallet" placeholder="Search wallet" value={search} onChange={(e) => setSearch(e.target.value)} /><select aria-label="Operator state" value={status} onChange={(e) => setStatus(e.target.value)}><option value="">All operator states</option>{["new", "approved", "shadow", "active", "muted", "rejected"].map((item) => <option key={item}>{item}</option>)}</select><select aria-label="Research state" value={lifecycle} onChange={(e) => setLifecycle(e.target.value)}><option value="">All research states</option>{["new", "prefilter_rejected", "backfill_pending", "analyzed", "qualified", "quarantined"].map((item) => <option key={item}>{item}</option>)}</select></div><div><button className="button minor" onClick={() => setCompact(!compact)}>{compact ? "Comfortable density" : "Compact density"}</button>{selected.length > 0 && <button className="button minor" onClick={() => void Promise.all(selected.map((wallet) => act(wallet, "shadow"))).then(() => setSelected([]))}>Add {selected.length} to Shadow</button>}</div></div>
+    <div className="table-scroll"><table className={compact ? "dense" : ""}><thead><tr><th /><SortHead label="Status" /><SortHead label="Wallet" active={sort === "wallet"} onClick={() => order("wallet")} /><SortHead label="Score" active={sort === "score"} onClick={() => order("score")} /><SortHead label="Last active" active={sort === "last_active"} onClick={() => order("last_active")} /><SortHead label="Campaigns" active={sort === "campaigns"} onClick={() => order("campaigns")} /><SortHead label="Target P&L" active={sort === "target_pnl"} onClick={() => order("target_pnl")} /><SortHead label="Follower P&L" active={sort === "follower_pnl"} onClick={() => order("follower_pnl")} /><SortHead label="Win rate" active={sort === "win_rate"} onClick={() => order("win_rate")} /><SortHead label="PF" active={sort === "profit_factor"} onClick={() => order("profit_factor")} /><SortHead label="Target DD" active={sort === "target_drawdown"} onClick={() => order("target_drawdown")} /><SortHead label="Follower DD" active={sort === "follower_drawdown"} onClick={() => order("follower_drawdown")} /><th>Copyability</th><th>Coverage</th><th>Sources</th></tr></thead>
+      <tbody>{response?.items.map((item) => <tr key={item.wallet} className="click-row" onClick={() => void showDetail(item.wallet)}><td onClick={(e) => e.stopPropagation()}><input aria-label={`Select ${item.wallet}`} type="checkbox" checked={selected.includes(item.wallet)} onChange={() => toggle(item.wallet)} /></td><td><DualStatus candidate={item} /></td><td className="mono" title={item.wallet}>{walletLabel(item.wallet)}{item.stale_analysis && <span className="badge warning">STALE</span>}</td><td>{number(item.score)}</td><td>{timeLabel(item.last_active)}</td><td>{item.campaigns ?? "—"}</td><td className={Number(item.target_net_pnl) >= 0 ? "positive-text" : "negative-text"}>{money(item.target_net_pnl)}</td><td className={Number(item.follower_net_pnl) >= 0 ? "positive-text" : "negative-text"}>{money(item.follower_net_pnl)}</td><td>{percent(item.win_rate)}</td><td>{number(item.profit_factor, 2)}</td><td>{percent(item.target_max_drawdown)}</td><td>{percent(item.follower_max_drawdown)}</td><td>{item.copyability ?? "—"}</td><td><span className="badge neutral">{item.coverage || "UNPROVEN"}</span></td><td>{item.source_count ?? 0}</td></tr>)}{!response?.items.length && <tr><td colSpan={15} className="empty">No candidates match these filters.</td></tr>}</tbody></table></div>
+    <div className="table-footer"><span>{response?.total ?? 0} candidates · server-side query</span><span>Sorted {sort} {direction}</span></div>
+  </section>{detail && <CandidateDossier detail={detail} close={() => setDetail(null)} action={act} />}</div>;
+}
+
+function ShadowPage({ notify, refresh }: { notify: (toast: Toast) => void; refresh: () => Promise<void> }) {
+  const [items, setItems] = useState<any[]>([]);
+  const load = useCallback(async () => { try { setItems((await api<{ items: any[] }>("/api/shadow-finalists")).items); } catch (error) { notify({ tone: "error", message: error instanceof Error ? error.message : "Unable to load Phase B finalists." }); } }, [notify]);
+  useEffect(() => { void load(); }, [load]);
+  const action = async (wallet: string, state: string) => { try { await post(`/api/candidates/${wallet}/operator-state`, { state }); notify({ tone: "success", message: `${walletLabel(wallet)} is now ${state}.` }); await load(); await refresh(); } catch (error) { notify({ tone: "error", message: error instanceof Error ? error.message : "Failed to update wallet. No state change was made." }); } };
+  return <section className="panel table-panel"><PanelTitle title="Canonical Phase B shadow finalists" subtitle="Ranked by persisted Phase B qualification and diversification evidence — React does not recompute ranking." /><div className="table-scroll"><table><thead><tr><th>Rank</th><th>Wallet</th><th>Score</th><th>Primary strength</th><th>Principal risk</th><th>Target P&L</th><th>Follower P&L</th><th>Copyability</th><th>Diversification</th><th>Operator state</th><th>Actions</th></tr></thead><tbody>{items.map((item) => <tr key={item.wallet}><td>{item.rank}</td><td className="mono">{walletLabel(item.wallet)}</td><td>{number(item.score)}</td><td>{Object.keys(item.target || {})[0] || "Research evidence"}</td><td>{(item.principal_risks || ["—"])[0]}</td><td>{money(item.target?.net_pnl)}</td><td>{money(item.follower?.net_pnl)}</td><td>{item.copyability?.score ?? item.copyability?.status ?? "—"}</td><td>{item.diversification?.reason || item.diversification?.correlation_status || "—"}</td><td><span className="badge state">{item.operator_state}</span></td><td className="action-cell"><button onClick={() => void action(item.wallet, "shadow")}>Add Shadow</button><button onClick={() => void action(item.wallet, "active")}>Activate PAPER</button><button onClick={() => void action(item.wallet, "muted")}>Mute</button></td></tr>)}{!items.length && <tr><td colSpan={11} className="empty">No current Phase B shadow finalists. Run Phase B analysis first.</td></tr>}</tbody></table></div></section>;
+}
+
+function ActivePage({ notify, confirmation, refresh }: { notify: (toast: Toast) => void; confirmation: (value: Confirmation) => void; refresh: () => Promise<void> }) {
+  const [cohort, setCohort] = useState<Record<string, any> | null>(null);
+  const load = useCallback(async () => { try { setCohort(await api("/api/active-cohort")); } catch (error) { notify({ tone: "error", message: error instanceof Error ? error.message : "Could not load active PAPER cohort." }); } }, [notify]);
+  useEffect(() => { void load(); }, [load]);
+  const remove = (wallet: string) => confirmation({ title: "Remove active PAPER trader?", body: "This removes the wallet from the active PAPER cohort. Existing PAPER positions retain normal exit handling and trader history remains intact.", confirm: "Remove From Active Cohort", action: async () => { try { await post(`/api/candidates/${wallet}/operator-state`, { state: "shadow" }); notify({ tone: "success", message: "Wallet removed from active PAPER cohort." }); await load(); await refresh(); } catch (error) { notify({ tone: "error", message: error instanceof Error ? error.message : "Failed to remove active wallet. No state change was made." }); } } });
+  return <div className="page-grid"><section className="panel span-12"><PanelTitle title="Manual active PAPER cohort" subtitle={`Target size 5–7 · ${cohort?.count ?? 0} active · activation is manual only`} /><div className="table-scroll"><table><thead><tr><th>Wallet</th><th>Score</th><th>Allocation state</th><th>Open P&L</th><th>Total P&L</th><th>DD</th><th>Research state</th><th>Status</th><th /></tr></thead><tbody>{(cohort?.members || []).map((item: any) => <tr key={item.wallet}><td className="mono">{walletLabel(item.wallet)}</td><td>{number(item.score)}</td><td>{item.allocation_policy}</td><td>{money(item.open_pnl)}</td><td>{money(item.total_pnl)}</td><td>{percent(item.drawdown)}</td><td><span className="badge neutral">{item.research_state || "—"}</span></td><td><span className="badge state">ACTIVE · PAPER</span></td><td><button className="link-button" onClick={() => remove(item.wallet)}>Remove</button></td></tr>)}{!cohort?.members?.length && <tr><td className="empty" colSpan={9}>No active PAPER traders. Activate a qualified/shadow finalist from the Shadow page.</td></tr>}</tbody></table></div></section><section className="panel span-6"><PanelTitle title="Cohort guardrails" /><MetricList values={[["Paper only", "Yes"], ["Automatic promotion", "Disabled"], ["Entry eligibility", "Active state + global control"], ["Exit handling", "Continues while entries paused/muted"]]} /></section><section className="panel span-6"><PanelTitle title="Portfolio overlap" /><p className="muted">Current trader/symbol overlap is shown through the portfolio’s attribution and positions views. The canonical Phase B finalist selection includes persisted diversification evidence before this manual activation step.</p></section></div>;
+}
+
+function PortfolioPage({ portfolio }: { portfolio: Portfolio | null }) {
+  return <div className="page-grid"><section className="stat-grid span-12">{[["Paper equity", money(portfolio?.equity)], ["Free cash", money(portfolio?.cash)], ["Committed", money(portfolio?.committed_capital)], ["Open P&L", money(portfolio?.open_pnl)], ["Realized today", money(portfolio?.realized_pnl_today)], ["Realized total", money(portfolio?.realized_pnl_total)], ["Fees", money(portfolio?.fees)], ["Max DD", percent(portfolio?.max_drawdown)]].map(([label, value]) => <article className="panel stat" key={String(label)}><span>{label}</span><strong>{value}</strong></article>)}</section><section className="panel span-8"><PanelTitle title="Paper equity curve" subtitle="Persisted portfolio snapshots" /><MiniChart points={(portfolio?.equity_curve || []).map((point: any) => Number(point.equity || 0))} color="#46c995" /></section><section className="panel span-4"><PanelTitle title="Drawdown curve" /><MiniChart points={(portfolio?.drawdown_curve || []).map((point: any) => Number(point.value || 0))} color="#e7a950" /></section><Attribution title="P&L by trader" rows={portfolio?.pnl_by_trader || []} keys={["target_wallet", "open_pnl", "realized_pnl", "total_pnl", "fees", "capital_usage"]} /><Attribution title="P&L by symbol" rows={portfolio?.pnl_by_symbol || []} keys={["symbol", "open_pnl", "realized_pnl", "total_pnl", "exposure", "position_count"]} /><Attribution title="P&L by sizing bucket" rows={portfolio?.pnl_by_bucket || []} keys={["bucket", "open_pnl", "realized_pnl", "total_pnl", "capital_usage", "position_count"]} /></div>;
+}
+
+function PositionsPage() {
+  const [data, setData] = useState<any[]>([]); const [wallet, setWallet] = useState(""); const [symbol, setSymbol] = useState(""); const [direction, setDirection] = useState("");
+  const load = useCallback(async () => { try { const params = new URLSearchParams({ wallet, symbol, direction }); setData((await api<{ items: any[] }>(`/api/positions?${params}`)).items); } catch { setData([]); } }, [wallet, symbol, direction]);
+  useEffect(() => { void load(); }, [load]);
+  return <section className="panel table-panel"><div className="toolbar"><div><input placeholder="Filter wallet" value={wallet} onChange={(e) => setWallet(e.target.value)} /><input placeholder="Symbol" value={symbol} onChange={(e) => setSymbol(e.target.value)} /><select value={direction} onChange={(e) => setDirection(e.target.value)}><option value="">All directions</option><option>long</option><option>short</option></select></div><span className="paper-label">PAPER POSITIONS ONLY</span></div><div className="table-scroll"><table><thead><tr><th>PAPER</th><th>Target wallet</th><th>Symbol</th><th>Direction</th><th>Quantity</th><th>Entry</th><th>Mark</th><th>Allocated</th><th>Remaining</th><th>Bucket</th><th>Unrealized P&L</th><th>Realized P&L</th><th>Fees</th><th>Opened</th><th>Mark freshness</th></tr></thead><tbody>{data.map((item) => <tr key={item.sleeve_id}><td><span className="badge paper">PAPER</span></td><td className="mono">{walletLabel(item.target_wallet)}</td><td>{item.symbol}</td><td>{item.direction}</td><td>{number(item.quantity, 4)}</td><td>{number(item.entry_price, 2)}</td><td>{number(item.current_mark, 2)}</td><td>{money(item.allocated_capital)}</td><td>{money(item.remaining_capital)}</td><td>{item.allocation_bucket}</td><td className={Number(item.unrealized_pnl) >= 0 ? "positive-text" : "negative-text"}>{money(item.unrealized_pnl)}</td><td>{money(item.realized_pnl)}</td><td>{money(item.fees)}</td><td>{timeLabel(item.opened_at)}</td><td><span className={`badge ${item.mark_fresh ? "good" : "warning"}`}>{item.mark_fresh ? "FRESH" : `STALE ${Math.round(item.mark_age_ms)}ms`}</span></td></tr>)}{!data.length && <tr><td colSpan={15} className="empty">No open PAPER positions match these filters.</td></tr>}</tbody></table></div></section>;
+}
+
+function ActivityPage() {
+  const [items, setItems] = useState<any[]>([]); const [wallet, setWallet] = useState("");
+  const load = useCallback(async () => { try { setItems((await api<{ items: any[] }>(`/api/activity?${new URLSearchParams({ wallet })}`)).items); } catch { setItems([]); } }, [wallet]);
+  useEffect(() => { void load(); }, [load]);
+  return <section className="panel activity-panel"><div className="toolbar"><PanelTitle title="Paper system activity" subtitle="Operator actions, simulated execution, and notable operational state." /><input placeholder="Filter wallet" value={wallet} onChange={(e) => setWallet(e.target.value)} /></div><ActivityList items={items} full /></section>;
+}
+
+function SystemPage({ control }: { control: ControlState | null }) {
+  const [data, setData] = useState<any>(null);
+  useEffect(() => { void api("/api/system").then(setData).catch(() => setData(null)); }, []);
+  const health = data?.health || {}; const risk = data?.risk || {};
+  return <div className="page-grid"><section className="panel span-6"><PanelTitle title="System health" /><MetricList values={[["Mode", health.mode || "—"], ["Paper-only", health.paper_only ? "Yes" : "—"], ["Database", health.database?.connected ? "Connected" : "Degraded"], ["Watcher", health.watcher?.state || "NOT_ATTACHED"], ["Market data", health.market_data?.fresh ? "Fresh" : "Stale / unavailable"], ["Kill switch", health.kill_switch?.active ? "ACTIVE" : "Off"]]} /></section><section className="panel span-6"><PanelTitle title="Paper control state" /><MetricList values={[["State", control?.state || "—"], ["New OPEN entries", control?.entries_allowed ? "Allowed" : "Paused"], ["Existing exits", "Enabled"], ["WebSocket", health.websocket?.available ? "Available" : "Unavailable"], ["Last discovery", health.last_discovery_run?.started_at || "—"], ["Last Phase B", health.last_phase_b_run?.started_at || "—"]]} /></section><section className="panel span-12"><PanelTitle title="Risk controls · current / limit" /><div className="risk-grid">{(risk.limits || []).map((item: any) => <div key={item.label}><div><span>{item.label}</span><strong>{percent(item.current)} / {percent(item.limit)}</strong></div><div className="progress"><i style={{ width: `${Math.min(100, Number(item.current) / Math.max(Number(item.limit), 0.00001) * 100)}%` }} /></div></div>)}</div><p className="muted">These values reflect the existing paper risk gates. This GUI cannot override risk controls or bypass paper-mode validation.</p></section></div>;
+}
+
+function CandidateDossier({ detail, close, action }: { detail: Record<string, any>; close: () => void; action: (wallet: string, state: string) => Promise<void> }) {
+  const identity = detail.identity || {}; const score = detail.score || {}; const wallet = identity.wallet;
+  return <aside className="dossier"><header><div><span className="eyebrow">RESEARCH DOSSIER</span><h2 className="mono">{walletLabel(wallet)}</h2></div><button className="icon-button" onClick={close} aria-label="Close dossier">×</button></header><div className="dossier-actions"><button onClick={() => void action(wallet, "shadow")}>Add to Shadow</button><button onClick={() => void action(wallet, "active")}>Activate PAPER</button><button onClick={() => void action(wallet, "muted")}>Mute</button><button onClick={() => void action(wallet, "rejected")}>Reject</button></div><section><h3>Identity & state</h3><MetricList values={[["Operator", identity.operator_state], ["Research", identity.research_state], ["Last activity", timeLabel(identity.last_activity)], ["Analysis", timeLabel(identity.analysis_timestamp)], ["Coverage", identity.coverage?.coverage_state || identity.coverage?.status || "UNPROVEN"]]} /></section><section><h3>Score {number(score.total)}</h3><p className="muted">Eligibility: {score.eligible ? "qualified" : "not qualified"}</p><ScoreBars values={score.component_scores || {}} penalties={score.penalties || {}} /><ReasonList label="Reason codes" values={score.reason_codes || []} /><ReasonList label="Hard-gate failures" values={score.hard_gate_failures || []} /></section><section><h3>Target performance</h3><Performance values={detail.target_performance || {}} /></section><section><h3>Follower performance</h3><Performance values={detail.follower_performance || {}} /></section><section><h3>Copyability & slippage</h3><pre>{JSON.stringify({ copyability: detail.copyability, slippage: detail.slippage }, null, 2)}</pre></section><section><h3>Latency</h3>{detail.latency?.status === "unavailable" ? <p className="empty-note">Historical latency evidence unavailable</p> : <pre>{JSON.stringify(detail.latency, null, 2)}</pre>}</section><section><h3>Walk-forward</h3><pre>{JSON.stringify(detail.walk_forward, null, 2)}</pre></section><section><h3>Immutable Phase B analysis window</h3><pre>{JSON.stringify(detail.analysis_window, null, 2)}</pre></section></aside>;
+}
+
+function ConfirmationDialog({ item, close }: { item: NonNullable<Confirmation>; close: () => void }) {
+  const [busy, setBusy] = useState(false); const confirm = async () => { setBusy(true); await item.action(); setBusy(false); close(); };
+  return <div className="modal-backdrop" role="presentation"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><span className="eyebrow">CONSEQUENTIAL PAPER ACTION</span><h2 id="confirm-title">{item.title}</h2><p>{item.body}</p><div><button className="button minor" onClick={close} disabled={busy}>Cancel</button><button className="button critical" onClick={() => void confirm()} disabled={busy}>{busy ? "Working…" : item.confirm}</button></div></section></div>;
+}
+
+function PanelTitle({ title, subtitle, action, onAction }: { title: string; subtitle?: string; action?: string; onAction?: () => void }) { return <div className="panel-title"><div><h2>{title}</h2>{subtitle && <p>{subtitle}</p>}</div>{action && <button className="link-button" onClick={onAction}>{action} →</button>}</div>; }
+function MetricList({ values }: { values: [string, unknown][] }) { return <dl className="metric-list">{values.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{String(value ?? "—")}</dd></div>)}</dl>; }
+function SortHead({ label, active, onClick }: { label: string; active?: boolean; onClick?: () => void }) { return <th><button className={active ? "sort active" : "sort"} onClick={onClick}>{label}{active ? " ↕" : ""}</button></th>; }
+function DualStatus({ candidate }: { candidate: Candidate }) { return <span className="status-stack"><span className="badge state">{candidate.operator_state}</span><span className="badge neutral">{candidate.research_state}</span></span>; }
+function CandidateRows({ candidates }: { candidates: Candidate[] }) { return <div className="candidate-rows">{candidates.map((item) => <div key={item.wallet}><span className="mono">{walletLabel(item.wallet)}</span><DualStatus candidate={item} /><strong>{number(item.score)}</strong><span>{money(item.follower_net_pnl)}</span></div>)}{!candidates.length && <p className="empty-note">No persisted candidate summaries yet.</p>}</div>; }
+function ActivityList({ items, full = false }: { items: any[]; full?: boolean }) { return <ol className={full ? "activity-list full" : "activity-list"}>{items.map((item) => <li key={item.event_id}><time>{new Date(item.occurred_at).toLocaleTimeString()}</time><span className={`event-dot ${item.severity || "info"}`} /><div><strong>{item.category}</strong><p>{item.message}</p>{item.wallet && <small className="mono">{walletLabel(item.wallet)} {item.symbol || ""}</small>}</div></li>)}{!items.length && <li className="empty-note">No recorded activity yet.</li>}</ol>; }
+function ScoreBars({ values, penalties }: { values: Record<string, number>; penalties: Record<string, number> }) { return <div className="score-bars">{Object.entries(values).map(([key, value]) => <div key={key}><span>{key.replaceAll("_", " ")}</span><i><b style={{ width: `${Math.min(100, Math.max(0, Number(value)))}%` }} /></i><strong>{number(value)}</strong></div>)}{Object.entries(penalties).map(([key, value]) => <div className="penalty" key={key}><span>{key.replaceAll("_", " ")} penalty</span><i><b style={{ width: `${Math.min(100, Math.max(0, Number(value)))}%` }} /></i><strong>-{number(value)}</strong></div>)}</div>; }
+function ReasonList({ label, values }: { label: string; values: string[] }) { return <div className="reason-list"><span>{label}</span>{values.length ? values.map((item) => <em key={item}>{item}</em>) : <small>None recorded</small>}</div>; }
+function Performance({ values }: { values: Record<string, any> }) { const keys = ["net_pnl", "gross_pnl", "fees", "win_rate", "profit_factor", "expectancy", "campaign_count", "max_drawdown", "liquidation_count"]; return <MetricList values={keys.filter((key) => values[key] !== undefined).map((key) => [key.replaceAll("_", " "), key.includes("rate") || key.includes("drawdown") ? percent(values[key]) : key.includes("pnl") || key === "fees" || key === "expectancy" ? money(values[key]) : values[key]]) as [string, unknown][]} />; }
+function MiniChart({ points, color }: { points: number[]; color: string }) { const path = useMemo(() => { if (points.length < 2) return ""; const min = Math.min(...points), max = Math.max(...points), range = max - min || 1; return points.map((value, index) => `${index ? "L" : "M"}${(index / (points.length - 1)) * 100} ${92 - ((value - min) / range) * 80}`).join(" "); }, [points]); return <div className="chart">{points.length > 1 ? <svg viewBox="0 0 100 100" preserveAspectRatio="none"><path d={path} fill="none" stroke={color} strokeWidth="1.5" vectorEffect="non-scaling-stroke" /></svg> : <p className="empty-note">Awaiting persisted portfolio snapshots.</p>}</div>; }
+function Attribution({ title, rows, keys }: { title: string; rows: any[]; keys: string[] }) { return <section className="panel span-4"><PanelTitle title={title} /><div className="table-scroll small-table"><table><thead><tr>{keys.map((key) => <th key={key}>{key.replaceAll("_", " ")}</th>)}</tr></thead><tbody>{rows.map((row) => <tr key={String(row[keys[0]])}>{keys.map((key) => <td key={key} className={key.includes("pnl") && Number(row[key]) < 0 ? "negative-text" : ""}>{key.includes("pnl") || key === "fees" || key.includes("capital") || key === "exposure" ? money(row[key]) : row[key]}</td>)}</tr>)}{!rows.length && <tr><td colSpan={keys.length} className="empty">No paper attribution available.</td></tr>}</tbody></table></div></section>; }
