@@ -8,6 +8,7 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Any, Iterable
 
 from .config import CopyTradeConfig, RiskConfig, SizingConfig
+from .equity import is_equity_observation_usable
 from .models import CopySignal, ExecutionAttempt, ExecutionFill, PositionEvent, PositionEventType, VirtualTargetPosition, as_utc, stable_id
 from .storage import CopyTradeStore
 
@@ -31,10 +32,8 @@ class TargetSizeClassifier:
         self, target_wallet: str, initial_notional: float, target_equity: float | None,
         equity_source: str = "exact", equity_age_seconds: float | None = None,
     ) -> SizingDecision:
-        valid = (
-            target_equity is not None and target_equity > 0 and initial_notional > 0
-            and equity_source in self.config.accepted_equity_sources
-            and (equity_age_seconds is None or equity_age_seconds <= self.config.max_equity_age_seconds)
+        valid = initial_notional > 0 and is_equity_observation_usable(
+            self.config, target_equity, equity_source, equity_age_seconds
         )
         if not valid:
             return SizingDecision(self.config.fallback_fraction, None, None, "fallback")
@@ -271,21 +270,38 @@ class PaperExecutionEngine:
             self.portfolio.mark(symbol, market_price, timestamp)
             self.equity_history.append(self.portfolio.equity)
 
+    def persist_mark(self, timestamp: object) -> None:
+        """Persist a mark-only state update without creating an execution attempt."""
+        if self.store:
+            self.store.persist_portfolio_mark(  # type: ignore[attr-defined]
+                self.portfolio.sleeves.values(), self._snapshot(), timestamp=timestamp,
+            )
+
     def process_signal(
         self, signal: CopySignal, *, received_at: object | None = None, market_price: float | None = None,
-        market_metadata: dict[str, object] | None = None, fault_hook: Any = None,
+        market_metadata: dict[str, object] | None = None, forced_reason: str | None = None, fault_hook: Any = None,
     ) -> ExecutionAttempt:
         existing = getattr(self.store, "get_execution_attempt", lambda _id: None)(signal.signal_id) if self.store else None
         if existing:
             return existing
         original = copy.deepcopy(self.portfolio)
         self._pending_fills = []
-        self._market_metadata = dict(market_metadata or {})
         received = as_utc(received_at or signal.source_event_timestamp + timedelta(milliseconds=self.config.paper_execution.detection_latency_ms))
         order_time = received + timedelta(milliseconds=self.config.paper_execution.order_latency_ms)
+        self._market_metadata = {
+            **dict(market_metadata or {}),
+            "decision_timestamp": received.isoformat(),
+            "simulated_execution_timestamp": order_time.isoformat(),
+            "decision_to_execution_latency_ms": max(0.0, (order_time - received).total_seconds() * 1000),
+        }
         price = market_price if market_price and market_price > 0 else signal.target_price
-        self.mark_to_market(signal.symbol, price, received)
-        attempt = self._exit(signal, price, received, order_time) if signal.action in {"reduce", "close"} else self._entry(signal, price, received, order_time)
+        if market_price and market_price > 0:
+            self.mark_to_market(signal.symbol, price, received)
+        if forced_reason:
+            attempt_id = stable_id("attempt", signal.signal_id, received, "forced")
+            attempt = self._attempt(attempt_id, signal, forced_reason, "skipped", received)
+        else:
+            attempt = self._exit(signal, price, received, order_time) if signal.action in {"reduce", "close"} else self._entry(signal, price, received, order_time)
         snapshot = self._snapshot() if attempt.status == "filled" else None
         if self.store:
             try:
@@ -316,11 +332,15 @@ class PaperExecutionEngine:
             updated_at=as_utc(order_time), target_entry_price=signal.target_price, current_mark=price)
         self.portfolio.cash = (self.portfolio.cash or 0.0) - decision.capital - fee
         self.portfolio.sleeves[sleeve_id] = sleeve
+        # Entry fees leave cash immediately and are economically realized costs
+        # for target/daily loss stops even while the sleeve remains open.
+        self.portfolio.realized_results.append((sleeve.target_wallet, -fee, as_utc(order_time)))
         self.portfolio.update_peak(order_time)
         entry_deterioration = (execution_price - signal.target_price) / max(signal.target_price, 1e-12) * 10_000 * (1 if signal.direction == "long" else -1)
         self._pending_fills.append(ExecutionFill(stable_id("execfill", attempt_id), attempt_id, sleeve_id, execution_price, quantity, notional, fee,
             self.config.paper_execution.slippage_bps, as_utc(order_time), {"target_price": signal.target_price, "allocation_reason": decision.reason,
-            "market_price": price, "entry_deterioration_bps": entry_deterioration, **getattr(self, "_market_metadata", {})}))
+            "market_price": price, "simulated_execution_price": execution_price, "entry_deterioration_bps": entry_deterioration,
+            "risk_realized_pnl": -fee, "target_wallet": sleeve.target_wallet, **getattr(self, "_market_metadata", {})}))
         return self._attempt(attempt_id, signal, decision.reason, "filled", received, order_time)
 
     def _exit(self, signal: CopySignal, price: float, received: object, order_time: object) -> ExecutionAttempt:
@@ -351,7 +371,8 @@ class PaperExecutionEngine:
             self._pending_fills.append(ExecutionFill(stable_id("execfill", attempt_id, sleeve.sleeve_id), attempt_id, sleeve.sleeve_id,
                 exit_price, closing_quantity, closing_quantity * exit_price, fee, self.config.paper_execution.slippage_bps,
                 as_utc(order_time), {"target_price": signal.target_price, "fraction": actual_fraction, "market_price": price,
-                                     "realized_pnl": net, "target_wallet": sleeve.target_wallet,
+                                     "simulated_execution_price": exit_price, "realized_pnl": net,
+                                     "risk_realized_pnl": net, "target_wallet": sleeve.target_wallet,
                                      "exit_deterioration_bps": exit_deterioration, **getattr(self, "_market_metadata", {})}))
         if not self._pending_fills: return self._attempt(attempt_id, signal, "quantity_rounds_to_zero", "skipped", received)
         self.portfolio.update_peak(order_time)

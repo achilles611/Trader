@@ -12,6 +12,7 @@ source:
   stale_after_seconds: 60
   subscribe_order_updates: false
   subscribe_position_state: true
+  subscribe_market_data: true
 
 # Optionally list manually researched wallets.  Importing a CSV is usually
 # preferable so this example remains non-prescriptive.
@@ -59,6 +60,9 @@ paper_execution:
   quantity_precision: 6
   missed_trade_rate: 0
   random_seed: 7
+  market_data_max_age_ms: 3000
+  mark_persist_interval_ms: 1000
+  stale_exit_market_policy: target_fill_fallback
 
 fees:
   paper_fee_rate: 0.00045
@@ -88,6 +92,7 @@ candidates:
   require_positive_expectancy: true
   require_positive_follower_expectancy: true
   activity_max_age_days: 30
+  require_proven_history: false
 
 artifacts: {}
 

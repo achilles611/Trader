@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from dataclasses import replace
@@ -9,13 +10,13 @@ from pathlib import Path
 
 from src.copytrade.analytics import calculate_trader_metrics
 from src.copytrade.backtest import CopyTradeBacktester
-from src.copytrade.config import ArtifactConfig, CopyTradeConfig, PaperExecutionConfig, RiskConfig, SizingConfig
+from src.copytrade.config import ArtifactConfig, CandidateConfig, CopyTradeConfig, PaperExecutionConfig, RiskConfig, SizingConfig
 from src.copytrade.hyperliquid import HyperliquidPublicAdapter, HyperliquidWatcher
 from src.copytrade.market import HyperliquidMarketData, MarketPrice
-from src.copytrade.models import RawFill, TraderSnapshot, as_utc, stable_id
+from src.copytrade.models import RawFill, TraderSnapshot, as_utc, stable_id, utc_now
 from src.copytrade.paper import PaperExecutionEngine, TargetSizeClassifier
 from src.copytrade.reconstruction import PositionReconstructor
-from src.copytrade.scoring import FollowerMetrics, pairwise_correlation_details, score_candidate
+from src.copytrade.scoring import FollowerMetrics, pairwise_correlation_details, score_candidate, select_diverse_targets
 from src.copytrade.service import CopyTradeService
 from src.copytrade.storage import CopyTradeDatabase
 
@@ -79,6 +80,134 @@ class CandleAdapter:
 
 
 class CopytradeCorrectnessTests(unittest.TestCase):
+    def test_enriched_events_drive_backtest_five_ten_twenty_and_ignore_future(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = config(Path(temp))
+            service = CopyTradeService(cfg)
+            times = [T0 + offset for offset in (1_000, 2_000, 3_000, 4_000, 5_000)]
+            notionals = [100, 100, 30, 100, 200]
+            for index, (when, notional) in enumerate(zip(times, notionals), 1):
+                service.database.insert_snapshot(TraderSnapshot(f"equity{index}", WALLET, as_utc(when - 1), 1_000, None, None, {}, "live", {}))
+                service.database.insert_raw_fill(raw(index, "B", notional / 100, 0, price=100, time_ms=when))
+            events = service.reconstruct(WALLET)["events"]
+            run = CopyTradeBacktester(cfg).run(events=events)
+            self.assertEqual([item["allocation_fraction"] for item in run.summary["sizing_decisions"]], [.10, .10, .05, .10, .20])
+            self.assertEqual(run.summary["equity_enrichment"]["usable_entry_count"], 5)
+
+            future_wallet = "0x2222222222222222222222222222222222222222"
+            service.database.insert_snapshot(TraderSnapshot("future", future_wallet, as_utc(T0 + 10_000), 1_000, None, None, {}, "live", {}))
+            future = RawFill.from_hyperliquid({"coin": "BTC", "px": "100", "sz": "1", "side": "B", "time": T0,
+                                                "startPosition": "0", "oid": 88, "tid": 88, "fee": "0"}, future_wallet)
+            service.database.insert_raw_fill(future)
+            self.assertEqual(service.reconstruct(future_wallet)["events"][0].equity_source, "missing")
+
+    def test_historical_seed_rejects_stale_and_disallowed_equity(self) -> None:
+        from dataclasses import replace as replace_dataclass
+        from src.copytrade.models import PositionEvent, PositionEventType
+        cfg = config(Path(tempfile.gettempdir()), sizing=SizingConfig(min_history=0, max_equity_age_seconds=10, accepted_equity_sources=("exact",)))
+        base = PositionEvent("one", WALLET, "BTC", PositionEventType.OPEN, "long", 1, 0, 1, 100, 100,
+                             as_utc(T0), "campaign", (), 1_000, 100, "exact", 0)
+        stale = replace_dataclass(base, event_id="two", equity_age_seconds=11)
+        disallowed = replace_dataclass(base, event_id="three", equity_source="recent_live_snapshot")
+        classifier = TargetSizeClassifier(cfg.sizing)
+        CopyTradeBacktester._seed_prior_size_history(classifier, [base, stale, disallowed])
+        self.assertEqual(classifier._history[WALLET], [.1])
+
+    def test_official_live_state_parses_and_enriches_following_open(self) -> None:
+        from src.copytrade.service import _live_state_equity
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            payload = {"user": WALLET, "clearinghouseStates": {"": {"marginSummary": {"accountValue": "1234"}}}}
+            asyncio.run(service.ingest_watched_state(WALLET, payload))
+            observation = service.database.latest_prior_equity_observation(WALLET, utc_now() + timedelta(seconds=1))
+            self.assertEqual(observation["account_value"], 1234)
+            self.assertEqual(observation["positions"]["equity_parse_status"], "ok")
+            current_ms = int((utc_now() + timedelta(milliseconds=20)).timestamp() * 1000)
+            service.database.insert_raw_fill(raw(1, "B", 1, 0, time_ms=current_ms))
+            event = service.reconstruct(WALLET)["events"][0]
+            self.assertEqual((event.target_equity, event.equity_source), (1234, "recent_live_snapshot"))
+            decision = TargetSizeClassifier(service.config.sizing).classify(
+                WALLET, event.initial_delta_notional, event.target_equity, event.equity_source, event.equity_age_seconds,
+            )
+            self.assertAlmostEqual(decision.target_size_fraction or 0, 100 / 1234)
+
+            self.assertEqual(_live_state_equity({"clearinghouseStates": {"": {"marginSummary": {"accountValue": "10"}}, "dex2": {"marginSummary": {"accountValue": "20"}}}})[0], 10)
+            self.assertEqual(_live_state_equity({"clearinghouseStates": {"dex1": {"marginSummary": {"accountValue": "10"}}, "dex2": {"marginSummary": {"accountValue": "20"}}}})[2], "ambiguous_multiple_states")
+            self.assertEqual(_live_state_equity({"clearinghouseStates": {"": {}}})[2], "missing_margin_account_value")
+            asyncio.run(service.ingest_watched_state(WALLET, {"user": WALLET, "clearinghouseStates": {"a": {}, "b": {}}}))
+            asyncio.run(service.ingest_watched_state(WALLET, {"user": WALLET, "clearinghouseStates": []}))
+            asyncio.run(service.ingest_watched_state("0x3333333333333333333333333333333333333333", payload))
+            latest = service.database.latest_prior_equity_observation(WALLET, utc_now() + timedelta(seconds=1))
+            self.assertEqual(latest["account_value"], 1234)
+
+    def test_unproven_coverage_warns_but_known_incomplete_blocks(self) -> None:
+        candidate = CandidateConfig(history_days_min=0, closed_campaigns_min=0, require_positive_expectancy=False,
+                                    require_positive_follower_expectancy=False, activity_max_age_days=99_999)
+        metrics = calculate_trader_metrics(WALLET, [])
+        metrics.raw["coverage_state"] = "PROVEN_COMPLETE"
+        self.assertTrue(score_candidate(metrics, candidate, FollowerMetrics(expectancy=1)).eligible)
+        metrics.raw["coverage_state"] = "UNPROVEN"
+        unproven = score_candidate(metrics, candidate, FollowerMetrics(expectancy=1))
+        self.assertTrue(unproven.eligible)
+        self.assertIn("coverage_unproven", unproven.reasons)
+        self.assertEqual(select_diverse_targets([unproven], {WALLET: {}}, target_count=1)[0].target_wallet, WALLET)
+        metrics.raw["coverage_state"] = "KNOWN_INCOMPLETE"
+        self.assertFalse(score_candidate(metrics, candidate, FollowerMetrics(expectancy=1)).eligible)
+
+    def test_live_market_reference_mark_persistence_and_stale_skip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = config(Path(temp), risk=replace(config(Path(temp)).risk, max_price_deviation_bps=200))
+            service = CopyTradeService(cfg)
+            asyncio.run(service.ingest_market_update({"mids": {"BTC": "101"}}))
+            current_ms = int(utc_now().timestamp() * 1000)
+            asyncio.run(service.ingest_watched_fills(WALLET, [raw(1, "B", 1, 0, price=100, time_ms=current_ms)], False))
+            execution = service.database.dashboard_snapshot()["execution_fills"][0]
+            details = json.loads(execution["raw_json"])
+            self.assertEqual(execution["price"], 101)
+            self.assertEqual(details["market_reference_price"], 101)
+            self.assertAlmostEqual(details["entry_deterioration_bps"], 100)
+            attempts_before = len(service.database.dashboard_snapshot()["execution_attempts"])
+            asyncio.run(service.ingest_market_update({"mids": {"BTC": "90"}}))
+            sleeve = service.database.list_virtual_positions(open_only=True)[0]
+            self.assertEqual(sleeve.current_mark, 90)
+            self.assertLess(sleeve.unrealized_pnl, 0)
+            self.assertGreater(service.database.latest_portfolio_snapshot()["max_drawdown_fraction"], 0)
+            self.assertEqual(len(service.database.dashboard_snapshot()["execution_attempts"]), attempts_before)
+            restarted = PaperExecutionEngine(cfg, service.database)
+            restarted.restore(service.database.list_virtual_positions(), service.database.latest_portfolio_snapshot(), service.database.list_realized_results())
+            self.assertEqual(next(iter(restarted.portfolio.sleeves.values())).current_mark, 90)
+
+            short_service = CopyTradeService(config(Path(temp) / "short"))
+            asyncio.run(short_service.ingest_market_update({"mids": {"BTC": "100"}}))
+            asyncio.run(short_service.ingest_watched_fills(WALLET, [raw(7, "A", 1, 0, price=100, time_ms=int(utc_now().timestamp() * 1000))], False))
+            asyncio.run(short_service.ingest_market_update({"mids": {"BTC": "90"}}))
+            self.assertGreater(short_service.database.list_virtual_positions(open_only=True)[0].unrealized_pnl, 0)
+
+            stale = CopyTradeService(config(Path(temp) / "stale", paper_execution=replace(cfg.paper_execution, market_data_max_age_ms=0)))
+            later = int(utc_now().timestamp() * 1000)
+            asyncio.run(stale.ingest_watched_fills(WALLET, [raw(2, "B", 1, 0, price=100, time_ms=later)], False))
+            self.assertEqual(stale.database.dashboard_snapshot()["execution_attempts"][0]["reason"], "stale_market_data")
+
+    def test_entry_fee_is_in_risk_ledger_and_restores_without_double_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cfg = config(root, paper_execution=replace(config(root).paper_execution, fee_rate=.01),
+                         risk=replace(config(root).risk, target_loss_stop_fraction=.005))
+            database = CopyTradeDatabase(cfg.artifacts.database_path)
+            database.initialize()
+            engine = PaperExecutionEngine(cfg, database)
+            self.assertEqual(engine.process_signal(signal("fee-open", capital=100)).status, "filled")
+            self.assertAlmostEqual(engine.portfolio.target_realized(WALLET), -1)
+            self.assertAlmostEqual(engine.portfolio.daily_realized(T0), -1)
+            self.assertEqual(engine.process_signal(signal("fee-stop", capital=10, at=T0 + 1)).reason, "target_loss_stop")
+            engine.process_signal(signal("fee-reduce", action="reduce", price=50, qty=50, before=100, at=T0 + 2))
+            engine.process_signal(signal("fee-close", action="close", price=50, qty=50, before=50, at=T0 + 3))
+            sleeve = database.list_virtual_positions()[0]
+            self.assertAlmostEqual(sleeve.realized_pnl - sleeve.entry_fee, -51.5)
+            restarted = PaperExecutionEngine(cfg, database)
+            ledger = database.list_realized_results()
+            restarted.restore(database.list_virtual_positions(), database.latest_portfolio_snapshot(), ledger)
+            self.assertAlmostEqual(restarted.portfolio.target_realized(WALLET), -51.5)
     def test_long_to_short_flip_splits_fee_notional_and_pnl(self) -> None:
         result = PositionReconstructor().reconstruct([raw(1, "B", 1, 0, price=90, fee=.3), raw(2, "A", 3, 1, price=100, fee=.9, closed_pnl=10)])
         old, new = result.campaigns

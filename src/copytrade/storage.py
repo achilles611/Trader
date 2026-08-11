@@ -166,7 +166,8 @@ class CopyTradeDatabase:
                 CREATE TABLE IF NOT EXISTS copy_backfill_coverage (
                     coverage_id TEXT PRIMARY KEY, target_wallet TEXT NOT NULL, requested_start TEXT NOT NULL,
                     requested_end TEXT NOT NULL, earliest_observed_fill TEXT, latest_observed_fill TEXT,
-                    source_limit_detected INTEGER NOT NULL, coverage_complete INTEGER NOT NULL, coverage_quality TEXT NOT NULL
+                    source_limit_detected INTEGER NOT NULL, coverage_complete INTEGER NOT NULL, coverage_quality TEXT NOT NULL,
+                    coverage_state TEXT NOT NULL DEFAULT 'UNPROVEN'
                 );
                 CREATE INDEX IF NOT EXISTS idx_copy_portfolio_snapshot_time ON copy_portfolio_snapshots(timestamp);
                 """
@@ -197,6 +198,7 @@ class CopyTradeDatabase:
             self._ensure_column(connection, "copy_virtual_positions", "unrealized_pnl", "REAL NOT NULL DEFAULT 0")
             self._ensure_column(connection, "copy_portfolio_snapshots", "peak_equity", "REAL")
             self._ensure_column(connection, "copy_portfolio_snapshots", "max_drawdown_fraction", "REAL NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "copy_backfill_coverage", "coverage_state", "TEXT NOT NULL DEFAULT 'UNPROVEN'")
             duplicate_attempt = connection.execute(
                 "SELECT 1 FROM copy_execution_attempts GROUP BY signal_id HAVING COUNT(*) > 1 LIMIT 1"
             ).fetchone()
@@ -550,8 +552,9 @@ class CopyTradeDatabase:
         results: list[tuple[str, float, object]] = []
         for row in rows:
             raw = _load(row["raw_json"], {})
-            if "realized_pnl" in raw and "target_wallet" in raw:
-                results.append((str(raw["target_wallet"]), float(raw["realized_pnl"]), as_utc(row["timestamp"])))
+            if "target_wallet" in raw and ("risk_realized_pnl" in raw or "realized_pnl" in raw):
+                value = raw["risk_realized_pnl"] if "risk_realized_pnl" in raw else raw["realized_pnl"]
+                results.append((str(raw["target_wallet"]), float(value), as_utc(row["timestamp"])))
         return results
 
     def insert_execution_attempt(self, attempt: ExecutionAttempt) -> None:
@@ -622,6 +625,41 @@ class CopyTradeDatabase:
                 (snapshot_id, iso(timestamp), cash, equity, committed_capital, drawdown_fraction, peak_equity, max_drawdown_fraction),
             )
 
+    def persist_portfolio_mark(
+        self, sleeves: Iterable[VirtualTargetPosition], snapshot: dict[str, float], *, timestamp: object,
+    ) -> None:
+        """Durably checkpoint marks; unlike execution, this creates no attempt."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                for sleeve in sleeves:
+                    connection.execute(
+                        """INSERT INTO copy_virtual_positions(sleeve_id, target_wallet, campaign_id, symbol, direction,
+                        quantity, entry_price, allocated_capital, remaining_capital, entry_fee, realized_pnl, exit_fee,
+                        opened_at, updated_at, closed_at, target_entry_price, max_drawdown, current_mark, unrealized_pnl)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(sleeve_id) DO UPDATE SET quantity=excluded.quantity, remaining_capital=excluded.remaining_capital,
+                        realized_pnl=excluded.realized_pnl, exit_fee=excluded.exit_fee, updated_at=excluded.updated_at,
+                        closed_at=excluded.closed_at, max_drawdown=excluded.max_drawdown, current_mark=excluded.current_mark,
+                        unrealized_pnl=excluded.unrealized_pnl""",
+                        (sleeve.sleeve_id, sleeve.target_wallet, sleeve.campaign_id, sleeve.symbol, sleeve.direction,
+                         sleeve.quantity, sleeve.entry_price, sleeve.allocated_capital, sleeve.remaining_capital,
+                         sleeve.entry_fee, sleeve.realized_pnl, sleeve.exit_fee, iso(sleeve.opened_at), iso(sleeve.updated_at),
+                         iso(sleeve.closed_at) if sleeve.closed_at else None, sleeve.target_entry_price, sleeve.max_drawdown,
+                         sleeve.current_mark, sleeve.unrealized_pnl),
+                    )
+                snapshot_id = stable_id("portfolio_mark", iso(timestamp), snapshot["cash"], snapshot["equity"], snapshot["committed_capital"], snapshot["drawdown_fraction"])
+                connection.execute(
+                    """INSERT OR IGNORE INTO copy_portfolio_snapshots(snapshot_id, timestamp, cash, equity, committed_capital,
+                    drawdown_fraction, peak_equity, max_drawdown_fraction) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (snapshot_id, iso(timestamp), snapshot["cash"], snapshot["equity"], snapshot["committed_capital"],
+                     snapshot["drawdown_fraction"], snapshot.get("peak_equity"), snapshot.get("max_drawdown_fraction", 0.0)),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+
     def latest_portfolio_snapshot(self) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM copy_portfolio_snapshots ORDER BY timestamp DESC LIMIT 1").fetchone()
@@ -632,12 +670,12 @@ class CopyTradeDatabase:
         with self._connect() as connection:
             connection.execute(
                 """INSERT OR IGNORE INTO copy_backfill_coverage(coverage_id, target_wallet, requested_start, requested_end,
-                earliest_observed_fill, latest_observed_fill, source_limit_detected, coverage_complete, coverage_quality)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                earliest_observed_fill, latest_observed_fill, source_limit_detected, coverage_complete, coverage_quality, coverage_state)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (coverage_id, wallet.lower(), iso(coverage.requested_start), iso(coverage.requested_end),
                  iso(coverage.earliest_observed_fill) if coverage.earliest_observed_fill else None,
                  iso(coverage.latest_observed_fill) if coverage.latest_observed_fill else None,
-                 int(coverage.source_limit_detected), int(coverage.coverage_complete), coverage.coverage_quality),
+                 int(coverage.source_limit_detected), int(coverage.coverage_complete), coverage.coverage_quality, coverage.coverage_state),
             )
 
     def latest_backfill_coverage(self, wallet: str) -> dict[str, Any] | None:

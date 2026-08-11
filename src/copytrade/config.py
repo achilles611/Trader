@@ -40,6 +40,7 @@ class SourceConfig:
     # orderUpdates feeds do not provide a safe uniform attribution contract.
     subscribe_order_updates: bool = False
     subscribe_position_state: bool = True
+    subscribe_market_data: bool = True
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,9 @@ class PaperExecutionConfig:
     order_latency_ms: int = 100
     missed_trade_rate: float = 0.0
     random_seed: int = 7
+    market_data_max_age_ms: int = 3_000
+    mark_persist_interval_ms: int = 1_000
+    stale_exit_market_policy: str = "target_fill_fallback"
 
 
 @dataclass(frozen=True)
@@ -118,6 +122,7 @@ class CandidateConfig:
     require_positive_expectancy: bool = True
     require_positive_follower_expectancy: bool = True
     activity_max_age_days: int = 30
+    require_proven_history: bool = False
     score_weights: dict[str, float] = field(
         default_factory=lambda: {
             "risk_adjusted_expectancy": 20.0,
@@ -271,6 +276,10 @@ class CopyTradeConfig:
             raise ValueError("paper_execution.missed_trade_rate must be between zero and one.")
         if self.paper_execution.quantity_precision < 0:
             raise ValueError("paper_execution.quantity_precision must be >= 0.")
+        if self.paper_execution.market_data_max_age_ms < 0 or self.paper_execution.mark_persist_interval_ms < 0:
+            raise ValueError("paper market-data ages and persistence intervals must be >= 0.")
+        if self.paper_execution.stale_exit_market_policy not in {"target_fill_fallback", "skip"}:
+            raise ValueError("paper_execution.stale_exit_market_policy must be target_fill_fallback or skip.")
         if not 0 < self.risk.max_total_committed_fraction <= 1:
             raise ValueError("risk.max_total_committed_fraction must be in (0, 1].")
         if self.risk.insufficient_capital_action not in {"scale", "skip"}:

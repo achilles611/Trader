@@ -7,6 +7,8 @@ from datetime import timezone
 from typing import Iterable
 
 from .models import PositionCampaign, PositionEvent, PositionEventType, TraderMetrics, utc_now
+from .config import SizingConfig
+from .equity import is_equity_observation_usable
 
 
 def _percentile(values: list[float], fraction: float) -> float:
@@ -54,6 +56,7 @@ def calculate_trader_metrics(
     target_wallet: str,
     campaigns: Iterable[PositionCampaign],
     events: Iterable[PositionEvent] = (),
+    sizing: SizingConfig | None = None,
 ) -> TraderMetrics:
     all_campaigns = sorted(campaigns, key=lambda item: item.opened_at)
     event_list = list(events)
@@ -97,6 +100,7 @@ def calculate_trader_metrics(
         abs(event.initial_delta_notional) / event.target_equity
         for event in event_list
         if event.event_type in {PositionEventType.OPEN, PositionEventType.FLIP}
+        and (sizing is None or is_equity_observation_usable(sizing, event.target_equity, event.equity_source, event.equity_age_seconds))
         and event.target_equity is not None and event.target_equity > 0
     ]
     equity_observations = [

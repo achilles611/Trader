@@ -42,10 +42,14 @@ def score_candidate(
         reasons.append("truncated_campaign_history")
     if int(metrics.raw.get("reconciliation_mismatch_count", 0)):
         reasons.append("pnl_reconciliation_mismatch")
-    if "coverage_complete" not in metrics.raw:
-        reasons.append("historical_coverage_unknown")
-    elif metrics.raw.get("coverage_complete") is False:
-        reasons.append("incomplete_historical_coverage")
+    coverage_state = str(metrics.raw.get("coverage_state") or ("PROVEN_COMPLETE" if metrics.raw.get("coverage_complete") else "UNPROVEN"))
+    if coverage_state == "KNOWN_INCOMPLETE":
+        reasons.append("known_incomplete_historical_coverage")
+    elif coverage_state == "UNPROVEN":
+        reasons.append("coverage_unproven")
+        source_quality *= 0.90
+    elif coverage_state != "PROVEN_COMPLETE":
+        reasons.append("coverage_state_unknown")
 
     latency_survival = _latency_survival(follower)
     latency_available = latency_survival is not None
@@ -88,7 +92,9 @@ def score_candidate(
     return CandidateScore(
         target_wallet=metrics.target_wallet, calculated_at=utc_now(), total_score=total,
         component_scores=weighted, penalties=penalties,
-        eligible=not [reason for reason in reasons if reason != "latency_unavailable"], reasons=tuple(reasons),
+        eligible=not [reason for reason in reasons if reason not in {
+            "latency_unavailable", "coverage_unproven",
+        } or (reason == "coverage_unproven" and config.require_proven_history)], reasons=tuple(reasons),
         source_quality=source_quality,
     )
 

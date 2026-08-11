@@ -28,8 +28,8 @@ flowchart TD
 The first source adapter is Hyperliquid. `HyperliquidPublicAdapter` uses the
 public `/info` endpoint for `userFillsByTime`, `portfolio`, and
 `clearinghouseState`, and the public websocket's safely attributable
-`userFills` and clearinghouse-state subscriptions. Shared `userEvents` and
-`orderUpdates` are intentionally disabled for Alpha. No page scraper is on
+`userFills`, `allDexsClearinghouseState`, and `allMids` subscriptions. Shared
+`userEvents` and `orderUpdates` are intentionally disabled for Alpha. No page scraper is on
 the real-time path. Adapters for dYdX, GMX, Drift, Nansen, Birdeye, Dune, and
 centralized-exchange research sources can implement the same normalized input
 models later.
@@ -70,6 +70,11 @@ initial entries only. Fills normally have no `accountValue`: entries are
 enriched from the latest prior account-value snapshot, record source and age,
 and reject stale observations from classifier history.
 
+The same enriched `PositionEvent` objects are used by `copy-score`,
+`copy-backtest`, and event-based walk-forward replay. The single equity-quality
+rule accepts only prior, configured source-quality observations; missing, stale,
+future, or disallowed observations fall back and never train the sizing median.
+
 The process never promotes itself to live mode. A future implementation must
 require both `COPYTRADE_MODE=live` and `COPYTRADE_LIVE_ENABLED=true`; this alpha
 rejects live startup even when both are set because it includes no live order
@@ -87,6 +92,14 @@ with a one-millisecond overlap before subscribing. The subsequent Hyperliquid
 websocket snapshot is also accepted. Both paths pass through the same
 deterministic raw-event ID and execution-attempt boundary, so reconnect data is
 replayed safely rather than silently skipped or copied twice.
+
+For live paper research, `allMids` is cached as a websocket midpoint reference.
+It is not described as an executable quote. New entries require a fresh cached
+reference and record its source, age, timestamps, and deterioration from the
+target fill before configured slippage. Stale entries are skipped; exits use the
+explicit `target_fill_fallback` policy unless configured to skip. Market updates
+mark open sleeves and periodically persist their equity/drawdown state without
+creating an execution attempt.
 
 ## Typical workflow
 
@@ -129,6 +142,12 @@ then applies martingale, adverse-averaging, concentration, inactivity,
 small-sample, and latency-decay penalties. Ranking uses return correlations so
 the target set is not merely the top individual scores.
 
+Backfill coverage has three states: `PROVEN_COMPLETE`, `UNPROVEN`, and
+`KNOWN_INCOMPLETE`. Ordinary public Hyperliquid history is `UNPROVEN`: it is a
+visible warning and source-quality penalty, but remains research-eligible by
+default. `KNOWN_INCOMPLETE` is a hard gate. Set
+`candidates.require_proven_history` only when archive-quality proof is required.
+
 ## Research outputs and dashboard
 
 Obsidian output defaults to `artifacts/obsidian/`:
@@ -157,14 +176,19 @@ fee rebates, source-PnL reconciliation, truncated history, prior-only equity
 enrichment, 5/10/20 sizing, unavailable and time-sensitive latency, candle
 no-lookahead, marked long/short sleeves, partial loss risk, atomic fault replay,
 restart drawdown, walk-forward boundaries, time-aligned correlation, websocket
-payload shapes, coverage metadata, and the earlier baseline behaviors.
+payload shapes, official plural clearinghouse-state parsing, enriched-event
+backtests, contemporaneous live-paper price deterioration, fee-risk ledgers,
+coverage eligibility, and the earlier baseline behaviors.
 
 ## Hyperliquid limitations
 
 - `userFillsByTime` is limited by the public API (2,000 fills per response and
   only the most recent 10,000 fills). The adapter records coverage metadata and
-  leaves coverage `unproven_public_10000_fill_retention`, never "complete",
-  until an archive/indexer source can prove it.
+  leaves coverage `UNPROVEN`, never "complete", until an archive/indexer source
+  can prove it. A saturated smallest interval is `KNOWN_INCOMPLETE`.
+- The plural websocket clearinghouse record is only used when one state is
+  present or when its explicit empty/default key is present. Multiple nondefault
+  states are kept as ambiguous rather than silently summed.
 - Websocket snapshot messages can overlap backfilled data. IDs and source-first
   persistence make the overlap safe.
 - Public target fills do not recreate historical order-book depth. Backtests

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Protocol
+from datetime import datetime
+from typing import Any, Protocol
 
 from .hyperliquid import HyperliquidPublicAdapter
 from .models import as_utc
@@ -15,6 +16,49 @@ class MarketPrice:
     timestamp: object
     source: str
     quality: str
+
+
+@dataclass(frozen=True)
+class MarketObservation:
+    symbol: str
+    price: float
+    timestamp: datetime
+    received_at: datetime
+    source: str
+    quality: str
+    bid: float | None = None
+    ask: float | None = None
+
+
+class LiveMarketCache:
+    """In-memory websocket reference cache; no REST work in the fill hot path."""
+
+    def __init__(self) -> None:
+        self._latest: dict[str, MarketObservation] = {}
+
+    def update_mid(self, symbol: str, price: float, *, timestamp: object | None = None, received_at: object | None = None) -> MarketObservation:
+        received = as_utc(received_at)
+        observed = as_utc(timestamp) if timestamp is not None else received
+        # An exchange timestamp later than local receipt cannot have been known
+        # at receipt; use receipt time as the availability bound.
+        if observed > received:
+            observed = received
+        item = MarketObservation(symbol.upper(), float(price), observed, received, "hyperliquid_allMids", "websocket_midpoint")
+        self._latest[item.symbol] = item
+        return item
+
+    def latest_available(self, symbol: str, decision_at: object, max_age_ms: int) -> tuple[MarketObservation | None, float | None]:
+        item = self._latest.get(symbol.upper())
+        decision = as_utc(decision_at)
+        if item is None or item.received_at > decision:
+            return None, None
+        age = max(0.0, (decision - item.received_at).total_seconds() * 1000)
+        if age > max_age_ms:
+            return None, age
+        return item, age
+
+    def symbols(self) -> set[str]:
+        return set(self._latest)
 
 
 @dataclass(frozen=True)

@@ -152,6 +152,7 @@ class ObsidianExporter:
             "\n\n## Target performance\n\n"
             f"- Net P&L after target fees: {metrics.net_pnl:.2f}\n- Campaigns: {metrics.closed_campaign_count} closed / {metrics.campaign_count} total\n"
             f"- Excluded truncated campaigns: {metrics.raw.get('truncated_campaign_count', 0)}; P&L reconciliation mismatches: {metrics.raw.get('reconciliation_mismatch_count', 0)}\n"
+            f"- Historical coverage: {metrics.raw.get('coverage_state', 'UNPROVEN')} ({metrics.raw.get('coverage_quality', 'not recorded')})\n"
             f"- Win rate: {metrics.win_rate:.2%}; profit factor: {metrics.profit_factor:.2f}; expectancy: {metrics.expectancy:.2f}\n"
             f"- Martingale indicator: {metrics.martingale_indicator}; adverse averaging: {metrics.adverse_averaging_indicator}\n\n"
             "## Simulated follower performance\n\nLatency and follower-equity charts below are deterministic paper simulations using the report configuration. These are deliberately not inferred from target fills alone.\n\n" + embeds + "\n"

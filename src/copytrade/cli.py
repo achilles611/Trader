@@ -94,9 +94,10 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
         for wallet in wallets:
             reconstructed = service.reconstruct(wallet)
             metrics = reconstructed["metrics"]
-            fills = service.database.list_raw_fills(wallet)
-            baseline = CopyTradeBacktester(config).run(fills)
-            latency = () if args.no_latency_grid else tuple(CopyTradeBacktester(config).latency_decay_curve(fills))
+            events = reconstructed["events"]
+            coverage = service.database.latest_backfill_coverage(wallet) or {}
+            baseline = CopyTradeBacktester(config).run(events=events, coverage_metadata=coverage)  # type: ignore[arg-type]
+            latency = () if args.no_latency_grid else tuple(CopyTradeBacktester(config).latency_decay_curve(events=events))  # type: ignore[arg-type]
             target_net = float(metrics.net_pnl)  # type: ignore[union-attr]
             follower_net = float(baseline.summary["net_pnl"])
             follower = FollowerMetrics(
@@ -125,7 +126,8 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
         watcher = HyperliquidWatcher(service.adapter)
         async def watch() -> dict[str, int]:
             reconciled = await service.reconcile_approved_wallets()
-            await watcher.run(service.approved_wallets(), service.ingest_watched_fills, service.ingest_watched_state, duration_seconds=args.duration)
+            await watcher.run(service.approved_wallets(), service.ingest_watched_fills, service.ingest_watched_state,
+                              service.ingest_market_update, duration_seconds=args.duration)
             return reconciled
         reconciled = asyncio.run(watch())
         _print({"health": watcher.health.as_dict(), "mode": config.mode, "reconciled_fills": reconciled})
@@ -133,17 +135,28 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
     if command == "copy-backtest":
         wallets = args.wallet or None
         fills = []
+        events = []
+        coverages = []
         if wallets:
             for wallet in wallets:
                 fills.extend(service.database.list_raw_fills(wallet))
+                events.extend(service.reconstruct(wallet)["events"])
+                coverage = service.database.latest_backfill_coverage(wallet)
+                if coverage:
+                    coverages.append(coverage)
         else:
             fills = service.database.list_raw_fills()
+            for wallet in sorted({fill.target_wallet for fill in fills}):
+                events.extend(service.reconstruct(wallet)["events"])
+                coverage = service.database.latest_backfill_coverage(wallet)
+                if coverage:
+                    coverages.append(coverage)
         market_data = HyperliquidMarketData(service.adapter) if args.market_price_proxy else None
         backtester = CopyTradeBacktester(config, service.database, market_data)
         if args.walk_forward:
-            _print({"walk_forward": backtester.walk_forward(fills)})
+            _print({"walk_forward": backtester.walk_forward(events=events)})
         else:
-            run = backtester.run(fills)
+            run = backtester.run(events=events, coverage_metadata={"wallet_coverages": coverages})
             payload: dict[str, Any] = {"run_id": run.run_id, "summary": run.summary}
             if args.export:
                 payload["obsidian_note"] = str(ObsidianExporter(config, service.database).export_backtest(run))

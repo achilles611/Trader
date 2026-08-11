@@ -10,7 +10,8 @@ from .analytics import calculate_trader_metrics
 from .config import CopyTradeConfig
 from .discovery import CandidateDiscoveryAdapter
 from .hyperliquid import HyperliquidPublicAdapter
-from .models import PositionEventType, RawFill, Target, TargetStatus, TraderSnapshot, utc_now
+from .models import PositionEvent, PositionEventType, RawFill, Target, TargetStatus, TraderSnapshot, as_utc, utc_now
+from .market import LiveMarketCache
 from .paper import PaperExecutionEngine, SignalFactory, TargetSizeClassifier
 from .reconstruction import PositionReconstructor
 from .storage import CopyTradeDatabase
@@ -24,6 +25,9 @@ class CopyTradeService:
         self.database = database or CopyTradeDatabase(config.artifacts.database_path)
         self.database.initialize()
         self.adapter = HyperliquidPublicAdapter(config.source)
+        self.market_cache = LiveMarketCache()
+        self._live_engine: PaperExecutionEngine | None = None
+        self._last_mark_persist_at: dict[str, object] = {}
         for target in config.targets:
             wallet = str(target.get("wallet", "")).strip()
             if wallet:
@@ -93,6 +97,7 @@ class CopyTradeService:
             "coverage": {
                 "coverage_complete": coverage.coverage_complete,
                 "coverage_quality": coverage.coverage_quality,
+                "coverage_state": coverage.coverage_state,
                 "source_limit_detected": coverage.source_limit_detected,
             } if coverage else None,
         }
@@ -105,11 +110,12 @@ class CopyTradeService:
             self.database.upsert_position_event(event)
         for campaign in result.campaigns:
             self.database.upsert_campaign(campaign)
-        metrics = calculate_trader_metrics(wallet, result.campaigns, enriched_events)
+        metrics = calculate_trader_metrics(wallet, result.campaigns, enriched_events, self.config.sizing)
         coverage = self.database.latest_backfill_coverage(wallet)
         if coverage:
             metrics.raw["coverage_complete"] = bool(coverage["coverage_complete"])
             metrics.raw["coverage_quality"] = coverage["coverage_quality"]
+            metrics.raw["coverage_state"] = coverage.get("coverage_state", "UNPROVEN")
         self.database.upsert_metrics(metrics)
         return {"events": enriched_events, "campaigns": result.campaigns, "metrics": metrics, "reconciliation": result.reconciliation}
 
@@ -121,8 +127,11 @@ class CopyTradeService:
         reconstructed = self.reconstruct(wallet)
         events = reconstructed["events"]
         assert isinstance(events, tuple)
-        engine = PaperExecutionEngine(self.config, self.database)
-        engine.restore(self.database.list_virtual_positions(), self.database.latest_portfolio_snapshot(), self.database.list_realized_results())
+        engine = self._live_engine
+        if engine is None:
+            engine = PaperExecutionEngine(self.config, self.database)
+            engine.restore(self.database.list_virtual_positions(), self.database.latest_portfolio_snapshot(), self.database.list_realized_results())
+            self._live_engine = engine
         classifier = TargetSizeClassifier(self.config.sizing)
         factory = SignalFactory(classifier, self.config)
         for event in events:
@@ -134,17 +143,77 @@ class CopyTradeService:
                 if not self.database.has_signal(signal.signal_id):
                     self.database.insert_signal(signal)
                 received_at = utc_now()
-                engine.process_signal(signal, received_at=received_at, market_price=event.price)
+                observation, age_ms = self.market_cache.latest_available(
+                    event.symbol, received_at, self.config.paper_execution.market_data_max_age_ms,
+                )
+                metadata: dict[str, object] = {
+                    "target_fill_price": event.price,
+                    "source_fill_timestamp": event.event_timestamp.isoformat(),
+                    "local_receive_timestamp": received_at.isoformat(),
+                    "market_reference_age_ms": age_ms,
+                }
+                if observation:
+                    metadata.update({
+                        "market_reference_price": observation.price,
+                        "market_reference_timestamp": observation.timestamp.isoformat(),
+                        "market_reference_source": observation.source,
+                        "market_reference_quality": observation.quality,
+                        "source_to_receive_latency_ms": max(0.0, (received_at - event.event_timestamp).total_seconds() * 1000),
+                    })
+                    engine.process_signal(signal, received_at=received_at, market_price=observation.price, market_metadata=metadata)
+                elif signal.action in {"open", "add"}:
+                    metadata.update({"market_reference_source": "unavailable", "market_reference_quality": "stale_or_missing"})
+                    engine.process_signal(signal, received_at=received_at, market_metadata=metadata, forced_reason="stale_market_data")
+                elif self.config.paper_execution.stale_exit_market_policy == "skip":
+                    metadata.update({"market_reference_source": "unavailable", "market_reference_quality": "stale_or_missing"})
+                    engine.process_signal(signal, received_at=received_at, market_metadata=metadata, forced_reason="stale_market_data_exit")
+                else:
+                    # Explicit emergency paper fallback for exits only; it is
+                    # recorded as such rather than passing for a live quote.
+                    metadata.update({"market_reference_price": event.price, "market_reference_source": "target_fill_fallback",
+                                     "market_reference_quality": "exit_only_not_contemporaneous"})
+                    engine.process_signal(signal, received_at=received_at, market_price=event.price, market_metadata=metadata)
 
     async def ingest_watched_state(self, wallet: str, payload: dict[str, object]) -> None:
-        state = payload.get("clearinghouseState") if isinstance(payload.get("clearinghouseState"), dict) else payload
-        margin = state.get("marginSummary") if isinstance(state, dict) and isinstance(state.get("marginSummary"), dict) else {}
+        attributed = str(payload.get("user") or "").lower()
+        if attributed and attributed != wallet.lower():
+            return
+        account_value, state_key, parse_status = _live_state_equity(payload)
         snapshot = TraderSnapshot(
             snapshot_id=f"wsstate_{wallet.lower()}_{int(utc_now().timestamp() * 1000)}",
-            target_wallet=wallet.lower(), snapshot_timestamp=utc_now(), account_value=_float_or_none(margin.get("accountValue")), withdrawable=None,
-            total_notional_position=None, positions={"websocket": payload}, source="hyperliquid", raw_payload=payload,
+            target_wallet=wallet.lower(), snapshot_timestamp=utc_now(), account_value=account_value, withdrawable=None,
+            total_notional_position=None, positions={"websocket": payload, "equity_state_key": state_key,
+                                                      "equity_parse_status": parse_status}, source="hyperliquid", raw_payload=payload,
         )
         self.database.insert_snapshot(snapshot)
+
+    async def ingest_market_update(self, payload: dict[str, object]) -> None:
+        mids = payload.get("mids") if isinstance(payload.get("mids"), dict) else payload
+        if not isinstance(mids, dict):
+            return
+        received = utc_now()
+        observed_at = payload.get("time") or received
+        for symbol, value in mids.items():
+            price = _float_or_none(value)
+            if price is not None and price > 0:
+                self.market_cache.update_mid(str(symbol), price, timestamp=observed_at, received_at=received)
+        engine = self._live_engine
+        if engine is None and self.database.list_virtual_positions(open_only=True):
+            engine = PaperExecutionEngine(self.config, self.database)
+            engine.restore(self.database.list_virtual_positions(), self.database.latest_portfolio_snapshot(), self.database.list_realized_results())
+            self._live_engine = engine
+        if engine is None:
+            return
+        open_symbols = {sleeve.symbol for sleeve in engine.portfolio.sleeves.values() if sleeve.is_open}
+        for symbol in open_symbols:
+            observation, _ = self.market_cache.latest_available(symbol, received, self.config.paper_execution.market_data_max_age_ms)
+            if not observation:
+                continue
+            engine.mark_to_market(symbol, observation.price, received)
+            previous = self._last_mark_persist_at.get(symbol)
+            if previous is None or (received - as_utc(previous)).total_seconds() * 1000 >= self.config.paper_execution.mark_persist_interval_ms:
+                engine.persist_mark(received)
+                self._last_mark_persist_at[symbol] = received
 
     async def reconcile_wallet(self, wallet: str) -> int:
         """Fetch the gap from durable local time before websocket subscription.
@@ -210,4 +279,37 @@ def _is_wallet(value: str) -> bool:
 
 
 def _float_or_none(value: object) -> float | None:
-    return float(value) if value not in (None, "") else None
+    try:
+        return float(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _live_state_equity(payload: dict[str, object]) -> tuple[float | None, str | None, str]:
+    """Select only an unambiguous canonical perp state from official payloads.
+
+    The official `clearinghouseStates` is a record keyed by dex.  A single
+    state is safe.  With several, only the empty/default key (the same implicit
+    first-perp choice used by the public adapter) is accepted; otherwise the
+    snapshot remains deliberately unpriced instead of summing unrelated dexes.
+    """
+    states = payload.get("clearinghouseStates")
+    if isinstance(states, dict):
+        usable = {str(key): value for key, value in states.items() if isinstance(value, dict)}
+        if len(usable) == 1:
+            key, state = next(iter(usable.items()))
+        elif "" in usable:
+            key, state = "", usable[""]
+        elif len(usable) > 1:
+            return None, None, "ambiguous_multiple_states"
+        else:
+            return None, None, "missing_clearinghouse_state"
+        margin = state.get("marginSummary") if isinstance(state.get("marginSummary"), dict) else {}
+        value = _float_or_none(margin.get("accountValue"))
+        return value, key, "ok" if value is not None else "missing_margin_account_value"
+    # A direct clearinghouseState/top-level marginSummary is retained for
+    # compatibility with older fixtures and explicit single-dex subscriptions.
+    state = payload.get("clearinghouseState") if isinstance(payload.get("clearinghouseState"), dict) else payload
+    margin = state.get("marginSummary") if isinstance(state, dict) and isinstance(state.get("marginSummary"), dict) else {}
+    value = _float_or_none(margin.get("accountValue"))
+    return value, None, "legacy_ok" if value is not None else "missing_clearinghouse_states"

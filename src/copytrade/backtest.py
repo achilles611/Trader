@@ -3,10 +3,12 @@ from __future__ import annotations
 import subprocess
 from dataclasses import replace
 from datetime import timedelta
+from statistics import median
 from typing import Iterable
 
 from .analytics import calculate_trader_metrics
 from .config import CopyTradeConfig
+from .equity import is_equity_observation_usable
 from .models import BacktestRun, PositionEvent, PositionEventType, RawFill, as_utc, new_run_id, utc_now
 from .market import MarketDataProvider
 from .paper import PaperExecutionEngine, SignalFactory, TargetSizeClassifier
@@ -26,7 +28,7 @@ class CopyTradeBacktester:
 
     def run(
         self, fills: Iterable[RawFill] | None = None, *, events: Iterable[PositionEvent] | None = None,
-        prior_events: Iterable[PositionEvent] = (), run_id: str | None = None,
+        prior_events: Iterable[PositionEvent] = (), run_id: str | None = None, coverage_metadata: dict[str, object] | None = None,
     ) -> BacktestRun:
         started = utc_now()
         if events is None:
@@ -41,7 +43,9 @@ class CopyTradeBacktester:
         engine = PaperExecutionEngine(self.config, self.store)
         attempts = []
         market_observations: list[dict[str, object]] = []
+        execution_details: list[dict[str, object]] = []
         signals_created = 0
+        sizing_decisions: list[dict[str, object]] = []
         for event in replay_events:
             signals = factory.from_position_event(event, engine.portfolio.cash or 0.0)
             for signal in signals:
@@ -53,6 +57,11 @@ class CopyTradeBacktester:
                         requested_capital=(engine.portfolio.cash or 0.0) * signal.allocation_fraction,
                     )
                 signals_created += 1
+                if signal.action in {"open", "add"}:
+                    sizing_decisions.append({
+                        "event_id": event.event_id, "allocation_fraction": signal.allocation_fraction,
+                        "bucket": signal.reason.removeprefix("size_"), "equity_source": signal.equity_source,
+                    })
                 if self.store:
                     self.store.insert_signal(signal)  # type: ignore[attr-defined]
                 received = event.event_timestamp + timedelta(milliseconds=self.config.paper_execution.detection_latency_ms)
@@ -71,6 +80,7 @@ class CopyTradeBacktester:
                         market_metadata = {"source": "unavailable", "quality": "missing_historical_price", "market_timestamp": None}
                 market_observations.append({"event_id": event.event_id, "target_fill_price": event.price, "execution_price": market_price, **market_metadata})
                 attempts.append(engine.process_signal(signal, received_at=received, market_price=market_price, market_metadata=market_metadata))
+                execution_details.extend(fill.raw for fill in engine._pending_fills)
         ending = engine.portfolio.equity
         summary = {
             "events_replayed": len(replay_events), "signals_created": signals_created,
@@ -90,6 +100,17 @@ class CopyTradeBacktester:
             "skip_reasons": _count([item.reason for item in attempts if item.status != "filled"]),
             "market_observations": market_observations,
             "market_data_complete": bool(self.market_data) and all(item.get("quality") != "missing_historical_price" for item in market_observations),
+            "equity_enrichment": self._equity_enrichment_summary(replay_events),
+            "sizing_decisions": sizing_decisions,
+            "coverage": dict(coverage_metadata or {}),
+            "live_paper_metrics": {
+                "median_detection_latency_ms": median([item.detection_latency_ms for item in attempts]) if attempts else None,
+                "median_market_reference_age_ms": _median_field(execution_details, "market_reference_age_ms"),
+                "median_entry_deterioration_bps": _median_field(execution_details, "entry_deterioration_bps"),
+                "median_exit_deterioration_bps": _median_field(execution_details, "exit_deterioration_bps"),
+                "market_data_stale_skip_count": sum(item.reason == "stale_market_data" for item in attempts),
+                "follower_capture_ratio": None,
+            },
         }
         run = BacktestRun(
             run_id=run_id or new_run_id(), started_at=started, finished_at=utc_now(),
@@ -104,17 +125,20 @@ class CopyTradeBacktester:
             self.store.insert_backtest_run(run)  # type: ignore[attr-defined]
         return run
 
-    def latency_decay_curve(self, fills: Iterable[RawFill]) -> list[dict[str, float]]:
+    def latency_decay_curve(
+        self, fills: Iterable[RawFill] | None = None, *, events: Iterable[PositionEvent] | None = None,
+    ) -> list[dict[str, float]]:
         values: list[dict[str, float]] = []
         if self.market_data is None:
             return values
-        fills = list(fills)
+        fill_list = list(fills or ())
+        event_list = list(events) if events is not None else None
         for latency_ms in self.config.backtest.detection_delays_ms:
             config = replace(
                 self.config,
                 paper_execution=replace(self.config.paper_execution, detection_latency_ms=latency_ms),
             )
-            run = CopyTradeBacktester(config, market_data=self.market_data).run(fills)
+            run = CopyTradeBacktester(config, market_data=self.market_data).run(fill_list, events=event_list)
             if not run.summary.get("market_data_complete"):
                 return []
             values.append({"latency_ms": float(latency_ms), "net_pnl": float(run.summary["net_pnl"]),
@@ -131,7 +155,13 @@ class CopyTradeBacktester:
                            "return_fraction": float(run.summary["return_fraction"])})
         return values
 
-    def walk_forward(self, fills: Iterable[RawFill], *, training_days: int | None = None, forward_days: int | None = None) -> list[dict[str, object]]:
+    def walk_forward(
+        self, fills: Iterable[RawFill] | None = None, *, events: Iterable[PositionEvent] | None = None,
+        training_days: int | None = None, forward_days: int | None = None,
+    ) -> list[dict[str, object]]:
+        if events is not None:
+            return self._walk_forward_events(events, training_days=training_days, forward_days=forward_days)
+        fills = fills or ()
         ordered = sorted(fills, key=lambda fill: (fill.event_timestamp, fill.event_id))
         if not ordered:
             return []
@@ -147,7 +177,7 @@ class CopyTradeBacktester:
             forward = [fill for fill in ordered if training_end <= fill.event_timestamp < forward_end]
             training_reconstruction = PositionReconstructor().reconstruct(training)
             training_metrics = calculate_trader_metrics(
-                training[0].target_wallet if training else "unknown", training_reconstruction.campaigns, training_reconstruction.events
+                training[0].target_wallet if training else "unknown", training_reconstruction.campaigns, training_reconstruction.events, self.config.sizing
             )
             # Boundary policy: exclude campaigns already open at forward start.
             # Reconstructing all data up to the boundary identifies them without
@@ -174,10 +204,57 @@ class CopyTradeBacktester:
         for event in sorted(events, key=lambda item: (item.event_timestamp, item.event_id)):
             if event.event_type not in {PositionEventType.OPEN, PositionEventType.FLIP}:
                 continue
-            if event.target_equity and event.target_equity > 0 and event.initial_delta_notional > 0:
+            if event.initial_delta_notional > 0 and is_equity_observation_usable(
+                classifier.config, event.target_equity, event.equity_source, event.equity_age_seconds,
+            ):
                 groups.setdefault(event.target_wallet, []).append(event.initial_delta_notional / event.target_equity)
         for wallet, fractions in groups.items():
             classifier.seed(wallet, fractions)
+
+    def _equity_enrichment_summary(self, events: Iterable[PositionEvent]) -> dict[str, object]:
+        entries = [event for event in events if event.event_type in {PositionEventType.OPEN, PositionEventType.ADD, PositionEventType.FLIP}]
+        usable = [event for event in entries if event.initial_delta_notional > 0 and is_equity_observation_usable(
+            self.config.sizing, event.target_equity, event.equity_source, event.equity_age_seconds,
+        )]
+        return {
+            "usable_entry_count": len(usable), "fallback_entry_count": len(entries) - len(usable),
+            "enrichment_coverage_fraction": len(usable) / len(entries) if entries else 0.0,
+            "equity_source_counts": _count(event.equity_source for event in entries),
+        }
+
+    def _walk_forward_events(
+        self, events: Iterable[PositionEvent], *, training_days: int | None, forward_days: int | None,
+    ) -> list[dict[str, object]]:
+        ordered = sorted(events, key=lambda event: (event.event_timestamp, event.event_id))
+        if not ordered:
+            return []
+        train_days = training_days or self.config.backtest.default_training_days
+        test_days = forward_days or self.config.backtest.default_forward_days
+        cursor, final = ordered[0].event_timestamp, ordered[-1].event_timestamp
+        windows: list[dict[str, object]] = []
+        while cursor + timedelta(days=train_days + test_days) <= final + timedelta(milliseconds=1):
+            training_end, forward_end = cursor + timedelta(days=train_days), cursor + timedelta(days=train_days + test_days)
+            training = [event for event in ordered if cursor <= event.event_timestamp < training_end]
+            active: set[str] = set()
+            for event in ordered:
+                if event.event_timestamp >= training_end:
+                    break
+                if event.campaign_id is None:
+                    continue
+                if event.event_type is PositionEventType.OPEN:
+                    active.add(event.campaign_id)
+                elif event.event_type is PositionEventType.CLOSE:
+                    active.discard(event.campaign_id)
+            forward = [event for event in ordered if training_end <= event.event_timestamp < forward_end and event.campaign_id not in active]
+            run = self.run(events=forward, prior_events=training)
+            windows.append({
+                "training_start": cursor.isoformat(), "training_end": training_end.isoformat(), "forward_end": forward_end.isoformat(),
+                "training_campaigns": 0, "forward_run_id": run.run_id, "forward_net_pnl": run.summary["net_pnl"],
+                "boundary_policy": "exclude_campaigns_open_at_forward_start", "boundary_campaigns_excluded": len(active),
+                "equity_enrichment": run.summary["equity_enrichment"],
+            })
+            cursor += timedelta(days=test_days)
+        return windows
 
 
 def _count(values: Iterable[str]) -> dict[str, int]:
@@ -185,6 +262,11 @@ def _count(values: Iterable[str]) -> dict[str, int]:
     for value in values:
         counts[value] = counts.get(value, 0) + 1
     return counts
+
+
+def _median_field(items: Iterable[dict[str, object]], field: str) -> float | None:
+    values = [float(item[field]) for item in items if item.get(field) is not None]
+    return median(values) if values else None
 
 
 def _git_commit() -> str | None:

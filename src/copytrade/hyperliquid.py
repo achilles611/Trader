@@ -25,6 +25,7 @@ class BackfillCoverage:
     source_limit_detected: bool
     coverage_complete: bool
     coverage_quality: str
+    coverage_state: str = "UNPROVEN"
 
 
 class HyperliquidPublicAdapter:
@@ -95,7 +96,7 @@ class HyperliquidPublicAdapter:
                     self.last_backfill_coverage = BackfillCoverage(
                         requested_start=start_at, requested_end=end_at, earliest_observed_fill=None,
                         latest_observed_fill=None, source_limit_detected=True, coverage_complete=False,
-                        coverage_quality="incomplete_dense_interval_public_cap",
+                        coverage_quality="incomplete_dense_interval_public_cap", coverage_state="KNOWN_INCOMPLETE",
                     )
                     raise HyperliquidAPIError(
                         "A one-minute interval reached the public API's 2,000-fill cap; complete backfill is unavailable."
@@ -121,6 +122,7 @@ class HyperliquidPublicAdapter:
             source_limit_detected=source_limit_detected,
             coverage_complete=False,
             coverage_quality="unproven_public_10000_fill_retention",
+            coverage_state="UNPROVEN",
         )
         return result
 
@@ -161,6 +163,7 @@ def _optional_float(value: Any) -> float | None:
 
 FillHandler = Callable[[str, list[RawFill], bool], Awaitable[None] | None]
 StateHandler = Callable[[str, dict[str, Any]], Awaitable[None] | None]
+MarketHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
 @dataclass
@@ -204,6 +207,7 @@ class HyperliquidWatcher:
 
     async def run(
         self, wallets: Iterable[str], on_fills: FillHandler, on_state: StateHandler | None = None,
+        on_market: MarketHandler | None = None,
         *, duration_seconds: float | None = None,
     ) -> None:
         target_wallets = [wallet.lower() for wallet in wallets]
@@ -224,6 +228,10 @@ class HyperliquidWatcher:
         while not self._stopped.is_set() and (deadline is None or asyncio.get_running_loop().time() < deadline):
             try:
                 async with websockets.connect(self.adapter.config.websocket_url, ping_interval=20, ping_timeout=20) as socket:
+                    if on_market and self.adapter.config.subscribe_market_data:
+                        # allMids is a single public stream.  The service filters
+                        # it to active/open symbols and labels it a midpoint.
+                        await socket.send(json.dumps({"method": "subscribe", "subscription": {"type": "allMids"}}))
                     for wallet in target_wallets:
                         await socket.send(json.dumps({"method": "subscribe", "subscription": {"type": "userFills", "user": wallet}}))
                         # Shared userFills carries its `user` field.  Do not
@@ -246,7 +254,7 @@ class HyperliquidWatcher:
                         self.health.last_message_at = utc_now()
                         self.health.state = ConnectionState.CONNECTED
                         self.health.per_target = {wallet: ConnectionState.CONNECTED for wallet in target_wallets}
-                        await self._handle_message(json.loads(message), on_fills, on_state)
+                        await self._handle_message(json.loads(message), on_fills, on_state, on_market)
             except Exception as exc:
                 self.health.state = ConnectionState.RECONNECTING
                 self.health.per_target = {wallet: ConnectionState.RECONNECTING for wallet in target_wallets}
@@ -257,7 +265,10 @@ class HyperliquidWatcher:
                 await self.reconcile(target_wallets, on_fills)
         self.health.state = ConnectionState.STOPPED
 
-    async def _handle_message(self, message: dict[str, Any], on_fills: FillHandler, on_state: StateHandler | None) -> None:
+    async def _handle_message(
+        self, message: dict[str, Any], on_fills: FillHandler, on_state: StateHandler | None,
+        on_market: MarketHandler | None = None,
+    ) -> None:
         if not isinstance(message, dict):
             return
         channel = message.get("channel")
@@ -276,5 +287,10 @@ class HyperliquidWatcher:
             if not wallet:
                 return
             result = on_state(wallet, data)
+            if asyncio.iscoroutine(result):
+                await result
+            return
+        if on_market and channel == "allMids" and isinstance(data, dict):
+            result = on_market(data)
             if asyncio.iscoroutine(result):
                 await result
