@@ -443,6 +443,10 @@ class CopySignal:
     target_equity: float | None = None
     equity_source: str = "missing"
     equity_age_seconds: float | None = None
+    # Persist the classifier's actual decision.  Historical rows pre-dating
+    # this field are intentionally represented as unknown rather than guessed
+    # from the amount of capital allocated.
+    sizing_bucket: str = "unknown_legacy"
 
 
 @dataclass
@@ -466,6 +470,8 @@ class VirtualTargetPosition:
     max_drawdown: float = 0.0
     current_mark: float | None = None
     unrealized_pnl: float = 0.0
+    sizing_bucket: str = "unknown_legacy"
+    sizing_allocation_fraction: float | None = None
 
     @property
     def is_open(self) -> bool:

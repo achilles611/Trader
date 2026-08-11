@@ -75,7 +75,7 @@ def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
     reject = command("copy-reject", "Reject a target from paper-mode websocket monitoring.")
     reject.add_argument("--wallet", required=True)
 
-    watch = command("copy-watch", "Watch approved Hyperliquid wallets and paper-copy new public fills.")
+    watch = command("copy-watch", "Watch active Hyperliquid paper targets and open-sleeve exit wallets.")
     watch.add_argument("--duration", type=float, help="Optional bounded duration in seconds for smoke tests.")
 
     backtest = command("copy-backtest", "Replay stored public fills through deterministic paper-copy simulation.")
@@ -96,6 +96,7 @@ def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
     control_center = command("copy-control-center", "Start the Phase C local PAPER copy-trading control center.")
     control_center.add_argument("--host", help="Override control-center host.")
     control_center.add_argument("--port", type=int, help="Override control-center port.")
+    control_center.add_argument("--with-watcher", action="store_true", help="Run the single paper watcher in the control-center lifecycle.")
 
     sizing = command("copy-size-demo", "Show the configured 5/10/20 percent sizing classification.")
     sizing.add_argument("--fractions", default="0.03,0.10,0.20", help="Comma-separated target entry fractions to classify against a 10% prior-median demo history.")
@@ -251,7 +252,8 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
         serve_dashboard(config, service.database)
         return 0
     if command == "copy-control-center":
-        serve_control_center(config, service.database, host=args.host, port=args.port)
+        serve_control_center(config, service.database, host=args.host, port=args.port,
+                             with_watcher=args.with_watcher, service=service)
         return 0
     if command == "copy-size-demo":
         fractions = [float(item.strip()) for item in args.fractions.split(",") if item.strip()]

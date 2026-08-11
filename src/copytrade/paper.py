@@ -104,6 +104,7 @@ class SignalFactory:
             created_at=event.event_timestamp, source_event_timestamp=event.event_timestamp, size_ratio=decision.size_ratio,
             reason=f"size_{decision.bucket}", target_position_before=event.before_quantity,
             target_equity=event.target_equity, equity_source=event.equity_source, equity_age_seconds=event.equity_age_seconds,
+            sizing_bucket=decision.bucket,
         )]
 
     @staticmethod
@@ -329,7 +330,8 @@ class PaperExecutionEngine:
         sleeve = VirtualTargetPosition(sleeve_id=sleeve_id, target_wallet=signal.target_wallet.lower(), campaign_id=signal.campaign_id,
             symbol=signal.symbol, direction=signal.direction, quantity=quantity, entry_price=execution_price,
             allocated_capital=decision.capital, remaining_capital=decision.capital, entry_fee=fee, opened_at=as_utc(order_time),
-            updated_at=as_utc(order_time), target_entry_price=signal.target_price, current_mark=price)
+            updated_at=as_utc(order_time), target_entry_price=signal.target_price, current_mark=price,
+            sizing_bucket=signal.sizing_bucket, sizing_allocation_fraction=signal.allocation_fraction)
         self.portfolio.cash = (self.portfolio.cash or 0.0) - decision.capital - fee
         self.portfolio.sleeves[sleeve_id] = sleeve
         # Entry fees leave cash immediately and are economically realized costs

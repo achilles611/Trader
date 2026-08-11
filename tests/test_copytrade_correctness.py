@@ -18,7 +18,7 @@ from src.copytrade.config import ArtifactConfig, CandidateConfig, CopyTradeConfi
 from src.copytrade.cli import run_copytrade_command
 from src.copytrade.hyperliquid import HyperliquidPublicAdapter, HyperliquidWatcher
 from src.copytrade.market import HyperliquidMarketData, MarketPrice
-from src.copytrade.models import RawFill, TraderSnapshot, as_utc, stable_id, utc_now
+from src.copytrade.models import RawFill, Target, TraderSnapshot, as_utc, stable_id, utc_now
 from src.copytrade.paper import PaperExecutionEngine, TargetSizeClassifier
 from src.copytrade.reconstruction import PositionReconstructor
 from src.copytrade.scoring import FollowerMetrics, pairwise_correlation_details, score_candidate, select_diverse_targets
@@ -232,6 +232,7 @@ class CopytradeCorrectnessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             cfg = config(Path(temp), risk=replace(config(Path(temp)).risk, max_price_deviation_bps=200))
             service = CopyTradeService(cfg)
+            service.database.upsert_target(Target(wallet=WALLET, status="active"))
             asyncio.run(service.ingest_market_update({"mids": {"BTC": "101"}}))
             current_ms = int(utc_now().timestamp() * 1000)
             asyncio.run(service.ingest_watched_fills(WALLET, [raw(1, "B", 1, 0, price=100, time_ms=current_ms)], False))
@@ -252,12 +253,14 @@ class CopytradeCorrectnessTests(unittest.TestCase):
             self.assertEqual(next(iter(restarted.portfolio.sleeves.values())).current_mark, 90)
 
             short_service = CopyTradeService(config(Path(temp) / "short"))
+            short_service.database.upsert_target(Target(wallet=WALLET, status="active"))
             asyncio.run(short_service.ingest_market_update({"mids": {"BTC": "100"}}))
             asyncio.run(short_service.ingest_watched_fills(WALLET, [raw(7, "A", 1, 0, price=100, time_ms=int(utc_now().timestamp() * 1000))], False))
             asyncio.run(short_service.ingest_market_update({"mids": {"BTC": "90"}}))
             self.assertGreater(short_service.database.list_virtual_positions(open_only=True)[0].unrealized_pnl, 0)
 
             stale = CopyTradeService(config(Path(temp) / "stale", paper_execution=replace(cfg.paper_execution, market_data_max_age_ms=0)))
+            stale.database.upsert_target(Target(wallet=WALLET, status="active"))
             later = int(utc_now().timestamp() * 1000)
             asyncio.run(stale.ingest_watched_fills(WALLET, [raw(2, "B", 1, 0, price=100, time_ms=later)], False))
             self.assertEqual(stale.database.dashboard_snapshot()["execution_attempts"][0]["reason"], "stale_market_data")

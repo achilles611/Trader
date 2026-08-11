@@ -36,7 +36,12 @@ class CopyTradeService:
         for target in config.targets:
             wallet = str(target.get("wallet", "")).strip()
             if wallet:
-                self.database.upsert_target(Target(wallet=wallet, label=str(target.get("label", "")), status=str(target.get("status", "pending"))))
+                # Config remains bootstrap metadata, never an instruction to
+                # overwrite a durable operator decision after restart.
+                self.database.upsert_target(
+                    Target(wallet=wallet, label=str(target.get("label", "")), status=str(target.get("status", "pending"))),
+                    preserve_existing_status=True,
+                )
 
     def import_wallets(self, wallets: Iterable[str], *, label_prefix: str = "") -> list[Target]:
         imported: list[Target] = []
@@ -277,19 +282,26 @@ class CopyTradeService:
         await self.ingest_watched_fills(wallet, fills, True)
         return len(fills)
 
-    async def reconcile_approved_wallets(self) -> dict[str, int]:
+    async def reconcile_monitored_wallets(self) -> dict[str, int]:
         result: dict[str, int] = {}
-        for wallet in self.approved_wallets():
+        for wallet in self.monitored_execution_wallets():
             result[wallet] = await self.reconcile_wallet(wallet)
         return result
 
+    def monitored_execution_wallets(self) -> list[str]:
+        """Only active entry targets plus wallets that need exit monitoring."""
+        active = {target.wallet for target in self.database.list_targets(TargetStatus.ACTIVE.value)}
+        open_sleeve_wallets = {position.target_wallet for position in self.database.list_virtual_positions(open_only=True)}
+        return sorted(active | open_sleeve_wallets)
+
+    # Compatibility name used by the standalone copy-watch command.  It now
+    # obeys the Phase C execution subscription policy rather than treating
+    # shadow/approved research candidates as live watcher targets.
     def approved_wallets(self) -> list[str]:
-        # Shadow and muted traders remain monitored for research and safe exit
-        # handling; the persisted Phase C entry gate decides whether an OPEN
-        # may be copied.  This avoids unsubscribing a wallet merely because
-        # the operator paused entries or muted it.
-        monitored = {TargetStatus.APPROVED.value, TargetStatus.SHADOW.value, TargetStatus.ACTIVE.value, TargetStatus.MUTED.value}
-        return [target.wallet for target in self.database.list_targets() if str(target.status) in monitored]
+        return self.monitored_execution_wallets()
+
+    async def reconcile_approved_wallets(self) -> dict[str, int]:
+        return await self.reconcile_monitored_wallets()
 
     def _store_portfolio_snapshot(self, wallet: str, portfolio: object) -> None:
         if not isinstance(portfolio, list):

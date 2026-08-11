@@ -181,7 +181,8 @@ class CopyTradeDatabase:
                     target_notional REAL NOT NULL, allocation_fraction REAL NOT NULL,
                     requested_capital REAL NOT NULL, created_at TEXT NOT NULL,
                     source_event_timestamp TEXT NOT NULL, size_ratio REAL, reason TEXT NOT NULL,
-                    target_position_before REAL NOT NULL DEFAULT 0, target_leverage REAL
+                    target_position_before REAL NOT NULL DEFAULT 0, target_leverage REAL,
+                    sizing_bucket TEXT NOT NULL DEFAULT 'unknown_legacy'
                 );
                 CREATE TABLE IF NOT EXISTS copy_virtual_positions (
                     sleeve_id TEXT PRIMARY KEY, target_wallet TEXT NOT NULL, campaign_id TEXT,
@@ -190,7 +191,8 @@ class CopyTradeDatabase:
                     remaining_capital REAL NOT NULL, entry_fee REAL NOT NULL,
                     realized_pnl REAL NOT NULL, exit_fee REAL NOT NULL, opened_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL, closed_at TEXT, target_entry_price REAL,
-                    max_drawdown REAL NOT NULL DEFAULT 0
+                    max_drawdown REAL NOT NULL DEFAULT 0,
+                    sizing_bucket TEXT NOT NULL DEFAULT 'unknown_legacy', sizing_allocation_fraction REAL
                 );
                 CREATE INDEX IF NOT EXISTS idx_copy_sleeves_wallet_open ON copy_virtual_positions(target_wallet, closed_at);
                 CREATE TABLE IF NOT EXISTS copy_execution_attempts (
@@ -290,6 +292,7 @@ class CopyTradeDatabase:
             )
             self._ensure_column(connection, "copy_signals", "target_position_before", "REAL NOT NULL DEFAULT 0")
             self._ensure_column(connection, "copy_signals", "target_leverage", "REAL")
+            self._ensure_column(connection, "copy_signals", "sizing_bucket", "TEXT NOT NULL DEFAULT 'unknown_legacy'")
             self._ensure_column(connection, "copy_raw_fills", "source_closed_pnl", "REAL")
             self._ensure_column(connection, "copy_raw_fills", "is_liquidation", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "copy_position_events", "equity_source", "TEXT NOT NULL DEFAULT 'missing'")
@@ -312,6 +315,8 @@ class CopyTradeDatabase:
             self._ensure_column(connection, "copy_signals", "equity_age_seconds", "REAL")
             self._ensure_column(connection, "copy_virtual_positions", "current_mark", "REAL")
             self._ensure_column(connection, "copy_virtual_positions", "unrealized_pnl", "REAL NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "copy_virtual_positions", "sizing_bucket", "TEXT NOT NULL DEFAULT 'unknown_legacy'")
+            self._ensure_column(connection, "copy_virtual_positions", "sizing_allocation_fraction", "REAL")
             self._ensure_column(connection, "copy_portfolio_snapshots", "peak_equity", "REAL")
             self._ensure_column(connection, "copy_portfolio_snapshots", "max_drawdown_fraction", "REAL NOT NULL DEFAULT 0")
             self._ensure_column(connection, "copy_backfill_coverage", "coverage_state", "TEXT NOT NULL DEFAULT 'UNPROVEN'")
@@ -360,16 +365,17 @@ class CopyTradeDatabase:
         if column not in present:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
-    def upsert_target(self, target: Target) -> None:
+    def upsert_target(self, target: Target, *, preserve_existing_status: bool = False) -> None:
         with self._connect() as connection:
             connection.execute(
                 """INSERT INTO copy_targets(wallet, source, venue, status, label, created_at, updated_at, metadata_json)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(wallet) DO UPDATE SET source=excluded.source, venue=excluded.venue,
-                   status=excluded.status, label=excluded.label, updated_at=excluded.updated_at,
+                   status=CASE WHEN ? THEN copy_targets.status ELSE excluded.status END,
+                   label=excluded.label, updated_at=excluded.updated_at,
                    metadata_json=excluded.metadata_json""",
                 (target.normalized_wallet(), target.source, target.venue, getattr(target.status, "value", str(target.status)), target.label,
-                 iso(target.created_at), iso(target.updated_at), _dump(target.metadata)),
+                 iso(target.created_at), iso(target.updated_at), _dump(target.metadata), int(preserve_existing_status)),
             )
 
     def list_targets(self, status: str | None = None) -> list[Target]:
@@ -1135,13 +1141,13 @@ class CopyTradeDatabase:
                 """INSERT OR IGNORE INTO copy_signals(signal_id, target_wallet, campaign_id, source_event_id,
                 symbol, action, direction, target_price, target_quantity, target_notional, allocation_fraction,
                 requested_capital, created_at, source_event_timestamp, size_ratio, reason, target_position_before, target_leverage,
-                target_equity, equity_source, equity_age_seconds)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                target_equity, equity_source, equity_age_seconds, sizing_bucket)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (signal.signal_id, signal.target_wallet, signal.campaign_id, signal.source_event_id, signal.symbol,
                  signal.action, signal.direction, signal.target_price, signal.target_quantity, signal.target_notional,
                  signal.allocation_fraction, signal.requested_capital, iso(signal.created_at),
                  iso(signal.source_event_timestamp), signal.size_ratio, signal.reason, signal.target_position_before, signal.target_leverage,
-                 signal.target_equity, signal.equity_source, signal.equity_age_seconds),
+                 signal.target_equity, signal.equity_source, signal.equity_age_seconds, signal.sizing_bucket),
             )
         return cursor.rowcount == 1
 
@@ -1155,17 +1161,19 @@ class CopyTradeDatabase:
             connection.execute(
                 """INSERT INTO copy_virtual_positions(sleeve_id, target_wallet, campaign_id, symbol, direction,
                 quantity, entry_price, allocated_capital, remaining_capital, entry_fee, realized_pnl, exit_fee,
-                opened_at, updated_at, closed_at, target_entry_price, max_drawdown, current_mark, unrealized_pnl)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                opened_at, updated_at, closed_at, target_entry_price, max_drawdown, current_mark, unrealized_pnl,
+                sizing_bucket, sizing_allocation_fraction)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(sleeve_id) DO UPDATE SET quantity=excluded.quantity, remaining_capital=excluded.remaining_capital,
                 realized_pnl=excluded.realized_pnl, exit_fee=excluded.exit_fee, updated_at=excluded.updated_at,
                 closed_at=excluded.closed_at, max_drawdown=excluded.max_drawdown, current_mark=excluded.current_mark,
-                unrealized_pnl=excluded.unrealized_pnl""",
+                unrealized_pnl=excluded.unrealized_pnl, sizing_bucket=excluded.sizing_bucket,
+                sizing_allocation_fraction=excluded.sizing_allocation_fraction""",
                 (sleeve.sleeve_id, sleeve.target_wallet, sleeve.campaign_id, sleeve.symbol, sleeve.direction,
                  sleeve.quantity, sleeve.entry_price, sleeve.allocated_capital, sleeve.remaining_capital, sleeve.entry_fee,
                  sleeve.realized_pnl, sleeve.exit_fee, iso(sleeve.opened_at), iso(sleeve.updated_at),
                  iso(sleeve.closed_at) if sleeve.closed_at else None, sleeve.target_entry_price, sleeve.max_drawdown,
-                 sleeve.current_mark, sleeve.unrealized_pnl),
+                 sleeve.current_mark, sleeve.unrealized_pnl, sleeve.sizing_bucket, sleeve.sizing_allocation_fraction),
             )
 
     def list_virtual_positions(self, *, open_only: bool = False) -> list[VirtualTargetPosition]:
@@ -1184,7 +1192,9 @@ class CopyTradeDatabase:
                                   opened_at=as_utc(row["opened_at"]), updated_at=as_utc(row["updated_at"]),
                                   closed_at=as_utc(row["closed_at"]) if row["closed_at"] else None,
                                   target_entry_price=row["target_entry_price"], max_drawdown=float(row["max_drawdown"]),
-                                  current_mark=row["current_mark"], unrealized_pnl=float(row["unrealized_pnl"]))
+                                  current_mark=row["current_mark"], unrealized_pnl=float(row["unrealized_pnl"]),
+                                  sizing_bucket=str(row["sizing_bucket"] or "unknown_legacy"),
+                                  sizing_allocation_fraction=row["sizing_allocation_fraction"])
             for row in rows
         ]
 
@@ -1280,17 +1290,19 @@ class CopyTradeDatabase:
                     connection.execute(
                         """INSERT INTO copy_virtual_positions(sleeve_id, target_wallet, campaign_id, symbol, direction,
                         quantity, entry_price, allocated_capital, remaining_capital, entry_fee, realized_pnl, exit_fee,
-                        opened_at, updated_at, closed_at, target_entry_price, max_drawdown, current_mark, unrealized_pnl)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        opened_at, updated_at, closed_at, target_entry_price, max_drawdown, current_mark, unrealized_pnl,
+                        sizing_bucket, sizing_allocation_fraction)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(sleeve_id) DO UPDATE SET quantity=excluded.quantity, remaining_capital=excluded.remaining_capital,
                         realized_pnl=excluded.realized_pnl, exit_fee=excluded.exit_fee, updated_at=excluded.updated_at,
                         closed_at=excluded.closed_at, max_drawdown=excluded.max_drawdown, current_mark=excluded.current_mark,
-                        unrealized_pnl=excluded.unrealized_pnl""",
+                        unrealized_pnl=excluded.unrealized_pnl, sizing_bucket=excluded.sizing_bucket,
+                        sizing_allocation_fraction=excluded.sizing_allocation_fraction""",
                         (sleeve.sleeve_id, sleeve.target_wallet, sleeve.campaign_id, sleeve.symbol, sleeve.direction,
                          sleeve.quantity, sleeve.entry_price, sleeve.allocated_capital, sleeve.remaining_capital,
                          sleeve.entry_fee, sleeve.realized_pnl, sleeve.exit_fee, iso(sleeve.opened_at), iso(sleeve.updated_at),
                          iso(sleeve.closed_at) if sleeve.closed_at else None, sleeve.target_entry_price, sleeve.max_drawdown,
-                         sleeve.current_mark, sleeve.unrealized_pnl),
+                         sleeve.current_mark, sleeve.unrealized_pnl, sleeve.sizing_bucket, sleeve.sizing_allocation_fraction),
                     )
                 snapshot_id = stable_id("portfolio_mark", iso(timestamp), snapshot["cash"], snapshot["equity"], snapshot["committed_capital"], snapshot["drawdown_fraction"])
                 connection.execute(
@@ -1398,13 +1410,13 @@ class CopyTradeDatabase:
                     """INSERT OR IGNORE INTO copy_signals(signal_id, target_wallet, campaign_id, source_event_id,
                     symbol, action, direction, target_price, target_quantity, target_notional, allocation_fraction,
                     requested_capital, created_at, source_event_timestamp, size_ratio, reason, target_position_before,
-                    target_leverage, target_equity, equity_source, equity_age_seconds)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    target_leverage, target_equity, equity_source, equity_age_seconds, sizing_bucket)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (signal.signal_id, signal.target_wallet, signal.campaign_id, signal.source_event_id, signal.symbol,
                      signal.action, signal.direction, signal.target_price, signal.target_quantity, signal.target_notional,
                      signal.allocation_fraction, signal.requested_capital, iso(signal.created_at), iso(signal.source_event_timestamp),
                      signal.size_ratio, signal.reason, signal.target_position_before, signal.target_leverage, signal.target_equity,
-                     signal.equity_source, signal.equity_age_seconds),
+                     signal.equity_source, signal.equity_age_seconds, signal.sizing_bucket),
                 )
                 connection.execute(
                     "INSERT INTO copy_execution_claims(signal_id, status, claimed_at, attempt_id) VALUES (?, 'committed', ?, ?)",
@@ -1429,17 +1441,19 @@ class CopyTradeDatabase:
                     connection.execute(
                         """INSERT INTO copy_virtual_positions(sleeve_id, target_wallet, campaign_id, symbol, direction,
                         quantity, entry_price, allocated_capital, remaining_capital, entry_fee, realized_pnl, exit_fee,
-                        opened_at, updated_at, closed_at, target_entry_price, max_drawdown, current_mark, unrealized_pnl)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        opened_at, updated_at, closed_at, target_entry_price, max_drawdown, current_mark, unrealized_pnl,
+                        sizing_bucket, sizing_allocation_fraction)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(sleeve_id) DO UPDATE SET quantity=excluded.quantity, remaining_capital=excluded.remaining_capital,
                         realized_pnl=excluded.realized_pnl, exit_fee=excluded.exit_fee, updated_at=excluded.updated_at,
                         closed_at=excluded.closed_at, max_drawdown=excluded.max_drawdown, current_mark=excluded.current_mark,
-                        unrealized_pnl=excluded.unrealized_pnl""",
+                        unrealized_pnl=excluded.unrealized_pnl, sizing_bucket=excluded.sizing_bucket,
+                        sizing_allocation_fraction=excluded.sizing_allocation_fraction""",
                         (sleeve.sleeve_id, sleeve.target_wallet, sleeve.campaign_id, sleeve.symbol, sleeve.direction,
                          sleeve.quantity, sleeve.entry_price, sleeve.allocated_capital, sleeve.remaining_capital,
                          sleeve.entry_fee, sleeve.realized_pnl, sleeve.exit_fee, iso(sleeve.opened_at), iso(sleeve.updated_at),
                          iso(sleeve.closed_at) if sleeve.closed_at else None, sleeve.target_entry_price, sleeve.max_drawdown,
-                         sleeve.current_mark, sleeve.unrealized_pnl),
+                         sleeve.current_mark, sleeve.unrealized_pnl, sleeve.sizing_bucket, sleeve.sizing_allocation_fraction),
                     )
                 if fault_hook:
                     fault_hook("after_sleeves")

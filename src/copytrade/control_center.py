@@ -11,14 +11,16 @@ import asyncio
 import hashlib
 import json
 import sqlite3
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
 from .config import CopyTradeConfig
-from .models import CopySignal, TargetStatus, as_utc, iso, jsonable, stable_id, utc_now
+from .control_center_read_model import phase_b_candidate_view
+from .models import CopySignal, as_utc, iso, jsonable, stable_id, utc_now
 from .paper import PaperExecutionEngine
+from .scoring import select_diverse_targets_with_metadata
 from .storage import CopyTradeDatabase
 
 
@@ -152,15 +154,11 @@ class ControlCenterStore:
             return "paper_entries_paused"
         with self._connect() as connection:
             target = connection.execute("SELECT status FROM copy_targets WHERE wallet=?", (wallet.lower(),)).fetchone()
-            active_count = int(connection.execute("SELECT COUNT(*) FROM copy_targets WHERE status='active'").fetchone()[0])
         status = str(target["status"]) if target else None
         if status == "muted":
             return "wallet_muted"
-        # Retain compatibility for established paper users until an operator
-        # deliberately builds an active cohort.  Once one exists, it is the
-        # authoritative paper entry allow-list.
-        if active_count and status != "active":
-            return "not_active_paper_cohort"
+        if status != "active":
+            return "wallet_not_active"
         return None
 
 
@@ -179,7 +177,7 @@ class CopyControlCenter:
         with self.store._connect() as connection:
             yield connection
 
-    def health(self, watcher_health: dict[str, Any] | None = None) -> dict[str, Any]:
+    def health(self, watcher_health: dict[str, Any] | Any | None = None) -> dict[str, Any]:
         now = utc_now()
         with self._connect() as connection:
             db_ok = bool(connection.execute("SELECT 1").fetchone())
@@ -189,11 +187,19 @@ class CopyControlCenter:
             fill = connection.execute("SELECT MAX(event_timestamp) AS event_timestamp FROM copy_raw_fills").fetchone()
         last_mark = mark["updated_at"] if mark and mark["updated_at"] else None
         mark_age_ms = (now - as_utc(last_mark)).total_seconds() * 1000 if last_mark else None
+        supplied_watcher = watcher_health() if callable(watcher_health) else watcher_health
+        watcher = dict(supplied_watcher or {"state": "NOT_ATTACHED", "detail": "Control center is not running a watcher."})
+        active_wallets = {target.wallet for target in self.database.list_targets("active")}
+        monitored_wallets = active_wallets | {position.target_wallet for position in self.database.list_virtual_positions(open_only=True)}
+        watcher["active_entry_target_count"] = len(active_wallets)
+        watcher["monitored_target_count"] = len(monitored_wallets)
+        watcher["open_sleeve_wallet_count"] = len(monitored_wallets - active_wallets)
+        watcher["subscribed_target_count"] = len(watcher.get("per_target", {}))
         return {
             "mode": self.config.mode,
             "paper_only": True,
             "database": {"connected": db_ok, "path": str(self.config.artifacts.database_path)},
-            "watcher": watcher_health or {"state": "NOT_ATTACHED", "detail": "Control center is not running a watcher."},
+            "watcher": watcher,
             "market_data": {"last_mark_at": last_mark, "age_ms": mark_age_ms,
                             "fresh": bool(mark_age_ms is not None and mark_age_ms <= self.config.paper_execution.market_data_max_age_ms)},
             "source": {"last_public_fill_at": fill["event_timestamp"] if fill else None},
@@ -280,13 +286,13 @@ class CopyControlCenter:
         page = max(1, int(page))
         page_size = max(1, min(int(page_size), 200))
         sortable = {
-            "score": "score.total_score", "wallet": "candidate.wallet", "last_active": "candidate.recent_activity_at",
-            "campaigns": "json_extract(analysis.summary_json, '$.target_metrics.campaign_count')",
-            "win_rate": "json_extract(analysis.summary_json, '$.target_metrics.win_rate')",
-            "profit_factor": "json_extract(analysis.summary_json, '$.target_metrics.profit_factor')",
-            "target_pnl": "json_extract(analysis.summary_json, '$.target_metrics.net_pnl')",
+            "score": "phase_score.total_score", "wallet": "candidate.wallet", "last_active": "candidate.recent_activity_at",
+            "campaigns": "json_extract(analysis.summary_json, '$.target_metrics.activity.campaigns')",
+            "win_rate": "json_extract(analysis.summary_json, '$.target_metrics.profitability.win_rate')",
+            "profit_factor": "json_extract(analysis.summary_json, '$.target_metrics.profitability.profit_factor')",
+            "target_pnl": "json_extract(analysis.summary_json, '$.target_metrics.profitability.net_pnl')",
             "follower_pnl": "json_extract(analysis.summary_json, '$.follower.net_pnl')",
-            "target_drawdown": "json_extract(analysis.summary_json, '$.target_metrics.max_drawdown')",
+            "target_drawdown": "json_extract(analysis.summary_json, '$.target_metrics.risk.max_drawdown_fraction')",
             "follower_drawdown": "json_extract(analysis.summary_json, '$.follower.max_drawdown')",
         }
         order = sortable.get(sort, sortable["score"])
@@ -303,25 +309,25 @@ class CopyControlCenter:
             clauses.append("COALESCE(analysis.lifecycle_status, 'new')=?")
             values.append(lifecycle)
         if min_score is not None:
-            clauses.append("COALESCE(score.total_score, -999999)>=?")
+            clauses.append("COALESCE(phase_score.total_score, -999999)>=?")
             values.append(float(min_score))
         if max_score is not None:
-            clauses.append("COALESCE(score.total_score, 999999)<=?")
+            clauses.append("COALESCE(phase_score.total_score, 999999)<=?")
             values.append(float(max_score))
         if min_win_rate is not None:
-            clauses.append("COALESCE(json_extract(analysis.summary_json, '$.target_metrics.win_rate'), -1)>=?")
+            clauses.append("COALESCE(json_extract(analysis.summary_json, '$.target_metrics.profitability.win_rate'), -1)>=?")
             values.append(float(min_win_rate))
         if max_win_rate is not None:
-            clauses.append("COALESCE(json_extract(analysis.summary_json, '$.target_metrics.win_rate'), 999999)<=?")
+            clauses.append("COALESCE(json_extract(analysis.summary_json, '$.target_metrics.profitability.win_rate'), 999999)<=?")
             values.append(float(max_win_rate))
         if min_profit_factor is not None:
-            clauses.append("COALESCE(json_extract(analysis.summary_json, '$.target_metrics.profit_factor'), -1)>=?")
+            clauses.append("COALESCE(json_extract(analysis.summary_json, '$.target_metrics.profitability.profit_factor'), -1)>=?")
             values.append(float(min_profit_factor))
         if max_profit_factor is not None:
-            clauses.append("COALESCE(json_extract(analysis.summary_json, '$.target_metrics.profit_factor'), 999999)<=?")
+            clauses.append("COALESCE(json_extract(analysis.summary_json, '$.target_metrics.profitability.profit_factor'), 999999)<=?")
             values.append(float(max_profit_factor))
         if max_drawdown is not None:
-            clauses.append("COALESCE(json_extract(analysis.summary_json, '$.target_metrics.max_drawdown'), 999999)<=?")
+            clauses.append("COALESCE(json_extract(analysis.summary_json, '$.target_metrics.risk.max_drawdown_fraction'), 999999)<=?")
             values.append(float(max_drawdown))
         if max_follower_drawdown is not None:
             clauses.append("COALESCE(json_extract(analysis.summary_json, '$.follower.max_drawdown'), 999999)<=?")
@@ -346,13 +352,12 @@ class CopyControlCenter:
             FROM copy_discovery_candidates candidate
             JOIN copy_targets target ON target.wallet=candidate.wallet
             LEFT JOIN copy_candidate_analyses analysis ON analysis.wallet=candidate.wallet
-            LEFT JOIN copy_candidate_scores score ON score.target_wallet=candidate.wallet
-              AND score.calculated_at=(SELECT MAX(calculated_at) FROM copy_candidate_scores WHERE target_wallet=candidate.wallet)
             LEFT JOIN copy_candidate_scores phase_score ON phase_score.target_wallet=candidate.wallet
               AND phase_score.analysis_run_id=analysis.last_run_id AND phase_score.provenance='phase_b'
-              AND phase_score.rowid=(SELECT MAX(current_score.rowid) FROM copy_candidate_scores current_score
-                WHERE current_score.target_wallet=candidate.wallet AND current_score.analysis_run_id=analysis.last_run_id
-                AND current_score.provenance='phase_b')
+            LEFT JOIN copy_candidate_scores legacy_score ON legacy_score.target_wallet=candidate.wallet
+              AND legacy_score.provenance!='phase_b' AND legacy_score.calculated_at=(SELECT MAX(current_score.calculated_at)
+                FROM copy_candidate_scores current_score WHERE current_score.target_wallet=candidate.wallet
+                  AND current_score.provenance!='phase_b')
         """
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self._connect() as connection:
@@ -361,8 +366,12 @@ class CopyControlCenter:
                 """SELECT candidate.wallet, candidate.discovered_at, candidate.last_seen_at, candidate.recent_activity_at,
                    candidate.source_count, target.label, target.status AS operator_state,
                    COALESCE(analysis.lifecycle_status, 'new') AS lifecycle_status, analysis.completed_at AS analysis_timestamp,
-                   analysis.summary_json, analysis.prefilter_reasons_json, score.total_score, score.eligible,
-                   score.component_scores_json, score.penalties_json, score.reasons_json, phase_score.config_fingerprint
+                   analysis.summary_json, analysis.prefilter_reasons_json,
+                   phase_score.total_score AS phase_score_total, phase_score.eligible AS phase_score_eligible,
+                   phase_score.component_scores_json AS phase_score_components, phase_score.penalties_json AS phase_score_penalties,
+                   phase_score.reasons_json AS phase_score_reasons, phase_score.provenance AS phase_score_provenance,
+                   phase_score.analysis_run_id AS phase_score_run_id, phase_score.config_fingerprint AS phase_score_fingerprint,
+                   legacy_score.total_score AS legacy_score_total, legacy_score.eligible AS legacy_score_eligible
                 """ + base + where + f" ORDER BY {order} {descending} NULLS LAST, candidate.wallet ASC LIMIT ? OFFSET ?",
                 [*values, page_size, (page - 1) * page_size],
             ).fetchall()
@@ -372,29 +381,42 @@ class CopyControlCenter:
 
     def _candidate_row(self, row: dict[str, Any], fingerprint: str) -> dict[str, Any]:
         summary = _load(row.pop("summary_json", None), {})
-        target = summary.get("target_metrics", {}) if isinstance(summary, dict) else {}
-        follower = summary.get("follower", {}) if isinstance(summary, dict) else {}
-        coverage = summary.get("coverage", {}) if isinstance(summary, dict) else {}
-        copyability = summary.get("copyability", {}) if isinstance(summary, dict) else {}
-        walk_forward = summary.get("walk_forward", {}) if isinstance(summary, dict) else {}
-        score_fingerprint = row.pop("config_fingerprint", None)
+        phase_score = self._score_mapping(row, "phase_score")
+        legacy_score = self._score_mapping(row, "legacy_score")
+        view = phase_b_candidate_view(summary, phase_score, current_config_fingerprint=fingerprint, legacy_score=legacy_score)
+        target, follower, coverage = view["target"], view["follower"], view["coverage"]
+        canonical = view["score"]
         return {
             "wallet": row["wallet"], "label": row.get("label", ""), "operator_state": row["operator_state"],
-            "research_state": row["lifecycle_status"], "score": row.get("total_score"), "qualified": bool(row.get("eligible")),
-            "analysis_timestamp": row.get("analysis_timestamp"), "stale_analysis": bool(score_fingerprint and score_fingerprint != fingerprint),
-            "last_active": row.get("recent_activity_at"), "history_days": target.get("history_days"),
-            "campaigns": target.get("campaign_count"), "win_rate": target.get("win_rate"),
+            "research_state": row["lifecycle_status"], "score": canonical["total"], "qualified": canonical["eligible"],
+            "analysis_timestamp": row.get("analysis_timestamp"), "stale_analysis": bool(phase_score and not canonical["current"]),
+            "last_active": row.get("recent_activity_at"), "history_days": view["history_days"],
+            "campaigns": view["campaigns"], "win_rate": target.get("win_rate"),
             "profit_factor": target.get("profit_factor"), "expectancy": target.get("expectancy"),
             "target_net_pnl": target.get("net_pnl"), "target_max_drawdown": target.get("max_drawdown"),
             "follower_net_pnl": follower.get("net_pnl"), "follower_max_drawdown": follower.get("max_drawdown"),
             "follower_expectancy": follower.get("expectancy"), "follower_profit_factor": follower.get("profit_factor"),
-            "copyability": copyability.get("score", copyability.get("status")),
-            "missed_trade_rate": follower.get("missed_trade_rate"), "slippage_robustness": summary.get("slippage", {}).get("robustness") if isinstance(summary.get("slippage"), dict) else None,
-            "walk_forward": walk_forward.get("status"), "coverage": coverage.get("coverage_state", coverage.get("status", "UNPROVEN")),
-            "concentration": target.get("pnl_concentration_best_five"), "liquidation_frequency": target.get("liquidation_frequency"),
-            "recency_days": target.get("activity_recency_days"), "source_count": row.get("source_count", 0),
-            "score_reasons": _load(row.get("reasons_json"), []),
+            "copyability": view["copyability"].get("score", view["copyability"].get("status")),
+            "missed_trade_rate": follower.get("missed_trade_rate"), "slippage_robustness": follower.get("slippage_robustness"),
+            "walk_forward": view["walk_forward"]["status"], "walk_forward_score": view["walk_forward"]["score"],
+            "coverage": coverage.get("coverage_state", coverage.get("status", "UNPROVEN")),
+            "concentration": target.get("concentration"), "liquidation_frequency": target.get("liquidation_frequency"),
+            "recency_days": view["last_active_recency_days"], "source_count": row.get("source_count", 0),
+            "score_reasons": canonical["reasons"], "legacy_compatibility_score": view["legacy_compatibility_score"],
             "prefilter_reasons": _load(row.get("prefilter_reasons_json"), []),
+        }
+
+    @staticmethod
+    def _score_mapping(row: dict[str, Any], prefix: str) -> dict[str, Any] | None:
+        total = row.get(f"{prefix}_total")
+        if total is None:
+            return None
+        return {
+            "total_score": total, "eligible": bool(row.get(f"{prefix}_eligible")),
+            "component_scores": _load(row.get(f"{prefix}_components"), {}),
+            "penalties": _load(row.get(f"{prefix}_penalties"), {}), "reasons": _load(row.get(f"{prefix}_reasons"), []),
+            "provenance": row.get(f"{prefix}_provenance"), "analysis_run_id": row.get(f"{prefix}_run_id"),
+            "config_fingerprint": row.get(f"{prefix}_fingerprint"),
         }
 
     def candidate_detail(self, wallet: str) -> dict[str, Any] | None:
@@ -404,31 +426,46 @@ class CopyControlCenter:
             return None
         target = self.database.get_target(wallet)
         analysis = self.database.get_candidate_analysis(wallet)
-        latest_metrics = self.database.latest_metrics(wallet)
-        latest_score = next((score for score in self.database.latest_scores() if score.target_wallet == wallet.lower()), None)
         summary = analysis.summary if analysis else {}
+        canonical_score = self._authoritative_score(wallet, analysis.last_run_id if analysis else None)
+        legacy_score = self._latest_legacy_score(wallet)
+        view = phase_b_candidate_view(summary, canonical_score, current_config_fingerprint=_config_fingerprint(self.config.snapshot()), legacy_score=legacy_score)
         return {
             "identity": {"wallet": wallet.lower(), "label": target.label if target else "", "operator_state": target.status if target else "new",
                          "research_state": analysis.lifecycle_status if analysis else "new", "first_discovered": row.get("discovered_at"),
                          "last_activity": row.get("last_active"), "analysis_timestamp": row.get("analysis_timestamp"),
-                         "coverage": summary.get("coverage", {}), "source_count": row.get("source_count", 0)},
-            "score": {"total": row.get("score"), "eligible": row.get("qualified"),
-                      "reason_codes": list(latest_score.reasons) if latest_score else row.get("score_reasons", []),
-                      "component_scores": latest_score.component_scores if latest_score else {},
-                      "penalties": latest_score.penalties if latest_score else {}, "hard_gate_failures": row.get("prefilter_reasons", [])},
-            "target_performance": summary.get("target_metrics", jsonable(latest_metrics) if latest_metrics else {}),
-            "follower_performance": summary.get("follower", {}), "copyability": summary.get("copyability", {}),
-            "slippage": summary.get("slippage", {}), "latency": summary.get("latency", {"status": "unavailable", "message": "Historical latency evidence unavailable"}),
-            "walk_forward": summary.get("walk_forward", {}), "concentration": summary.get("concentration", {}),
-            "analysis_window": summary.get("analysis_window", {}), "diversification": summary.get("diversification_input", {}),
+                         "coverage": view["coverage"], "source_count": row.get("source_count", 0)},
+            "score": {**view["score"], "hard_gate_failures": row.get("prefilter_reasons", [])},
+            "legacy_compatibility_score": view["legacy_compatibility_score"],
+            "target_performance": view["target"], "follower_performance": view["follower"], "copyability": view["copyability"],
+            "slippage": view["slippage_scenarios"], "latency": view["latency"],
+            "walk_forward": view["walk_forward"], "concentration": view["target"]["concentration"],
+            "analysis_window": view["analysis_window"], "diversification": view["diversification"],
             "table_row": row, "open_paper_positions": self.positions(wallet=wallet), "activity": self.activity(wallet=wallet, limit=50),
         }
 
     def shadow_finalists(self) -> list[dict[str, Any]]:
-        # Deferred to avoid coupling the service's watcher path to Phase B's
-        # orchestration module during import.
-        from .analysis import CandidateAnalysisPipeline
-        finalists = CandidateAnalysisPipeline(type("Service", (), {"config": self.config, "database": self.database})()).shadow_finalists()
+        fingerprint = _config_fingerprint(self.config.snapshot())
+        scores = self.database.phase_b_qualified_scores(config_fingerprint=fingerprint)
+        candidates = {str(item["wallet"]): item for item in self.database.list_analysis_candidates(limit=10_000)}
+        series, exposures = {}, {}
+        for score in scores:
+            summary = candidates.get(score.target_wallet, {}).get("analysis_summary", {})
+            view = phase_b_candidate_view(summary, score, current_config_fingerprint=fingerprint)
+            diversification = view["diversification"]
+            series[score.target_wallet] = diversification.get("daily_return_series", {}) if isinstance(diversification.get("daily_return_series"), dict) else {}
+            exposures[score.target_wallet] = {"symbols": diversification.get("symbols", []), "directions": diversification.get("directions", [])}
+        selected = select_diverse_targets_with_metadata(scores, series, target_count=self.config.analysis.shadow_finalist_count, exposures=exposures)
+        finalists = []
+        for rank, (score, diversification) in enumerate(selected, 1):
+            summary = candidates.get(score.target_wallet, {}).get("analysis_summary", {})
+            view = phase_b_candidate_view(summary, score, current_config_fingerprint=fingerprint)
+            finalists.append({"rank": rank, "wallet": score.target_wallet, "score": score.total_score,
+                              "target": view["target"], "follower": view["follower"], "copyability": view["copyability"],
+                              "data_quality": view["coverage"], "principal_risks": list(score.reasons), "diversification": diversification,
+                              "walk_forward": view["walk_forward"], "current_config_fingerprint": fingerprint,
+                              "candidate_config_fingerprint": score.config_fingerprint, "stale_for_current_config": False,
+                              "selection_reason": "current qualified Phase B score with persisted return-correlation and exposure-overlap diversification penalties"})
         positions = {item["wallet"]: item for item in self._pnl_by_trader()}
         for item in finalists:
             target = self.database.get_target(str(item["wallet"]))
@@ -436,21 +473,55 @@ class CopyControlCenter:
             item["paper_pnl"] = positions.get(str(item["wallet"]), {})
         return finalists
 
-    def set_operator_state(self, wallet: str, state: str, *, by: str = "operator") -> dict[str, Any]:
+    def set_operator_state(self, wallet: str, state: str, *, by: str = "operator", allow_overflow: bool = False) -> dict[str, Any]:
         if state not in OPERATOR_STATES:
             raise ValueError("Operator state must be one of: " + ", ".join(sorted(OPERATOR_STATES)))
         target = self.database.get_target(wallet)
         if not target:
             raise KeyError("Wallet was not found in the candidate universe.")
         analysis = self.database.get_candidate_analysis(wallet)
-        if state == "active" and target.status != "shadow" and (not analysis or analysis.lifecycle_status != "qualified"):
-            raise ValueError("Only a qualified or shadow trader can enter the active PAPER cohort.")
+        if state == "active":
+            if not analysis or analysis.lifecycle_status != "qualified":
+                raise ValueError("Wallet cannot be activated because its Phase B analysis is not currently qualified. No state change was made.")
+            score = self._authoritative_score(wallet, analysis.last_run_id)
+            if not score or not bool(score["eligible"]):
+                raise ValueError("Wallet cannot be activated because it lacks an eligible canonical Phase B score. No state change was made.")
+            if score.get("config_fingerprint") != _config_fingerprint(self.config.snapshot()):
+                raise ValueError("Wallet cannot be activated because its Phase B analysis is stale. No state change was made.")
         before = target.status
         if not self.database.set_target_status(wallet, state):
             raise KeyError("Wallet was not found in the candidate universe.")
         self.store.record_activity(category="operator", severity="info", wallet=wallet,
             message=f"Trader state changed from {before} to {state}", payload={"from": before, "to": state, "by": by})
-        return {"wallet": wallet.lower(), "operator_state": state, "previous_state": before, "paper_only": True}
+        active_count = len(self.database.list_targets("active"))
+        return {"wallet": wallet.lower(), "operator_state": state, "previous_state": before, "paper_only": True,
+                "active_count_after": active_count, "recommended_max": 7,
+                "cohort_over_recommended_size": active_count > 7, "allow_overflow": allow_overflow}
+
+    def _authoritative_score(self, wallet: str, run_id: str | None) -> dict[str, Any] | None:
+        if not run_id:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT total_score, eligible, component_scores_json, penalties_json, reasons_json, provenance, analysis_run_id, config_fingerprint
+                   FROM copy_candidate_scores WHERE target_wallet=? AND analysis_run_id=? AND provenance='phase_b' LIMIT 1""",
+                (wallet.lower(), run_id),
+            ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        return {"total_score": item["total_score"], "eligible": bool(item["eligible"]),
+                "component_scores": _load(item["component_scores_json"], {}), "penalties": _load(item["penalties_json"], {}),
+                "reasons": _load(item["reasons_json"], []), "provenance": item["provenance"],
+                "analysis_run_id": item["analysis_run_id"], "config_fingerprint": item["config_fingerprint"]}
+
+    def _latest_legacy_score(self, wallet: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT total_score, eligible FROM copy_candidate_scores WHERE target_wallet=? AND provenance!='phase_b'
+                   ORDER BY calculated_at DESC LIMIT 1""", (wallet.lower(),)
+            ).fetchone()
+        return {"total_score": row["total_score"], "eligible": bool(row["eligible"])} if row else None
 
     def active_cohort(self) -> dict[str, Any]:
         active = [target for target in self.database.list_targets("active")]
@@ -481,19 +552,14 @@ class CopyControlCenter:
                 "paper": True, "sleeve_id": position.sleeve_id, "target_wallet": position.target_wallet, "symbol": position.symbol,
                 "direction": position.direction, "quantity": position.quantity, "entry_price": position.entry_price, "current_mark": position.current_mark,
                 "target_entry_price": position.target_entry_price, "allocated_capital": position.allocated_capital,
-                "remaining_capital": position.remaining_capital, "allocation_bucket": self._bucket(position.allocated_capital),
+                "remaining_capital": position.remaining_capital, "allocation_bucket": position.sizing_bucket,
+                "allocation_fraction": position.sizing_allocation_fraction,
                 "unrealized_pnl": position.unrealized_pnl, "realized_pnl": position.realized_pnl, "fees": position.entry_fee + position.exit_fee,
                 "opened_at": iso(position.opened_at), "age_seconds": age, "campaign_id": position.campaign_id,
                 "mark_fresh": mark_age <= self.config.paper_execution.market_data_max_age_ms, "mark_age_ms": mark_age,
                 "max_drawdown": position.max_drawdown,
             })
         return result
-
-    def _bucket(self, capital: float) -> str:
-        base = self.config.capital.initial_capital
-        ratio = capital / max(base, 1e-9)
-        candidates = [(0.05, "5%"), (0.10, "10%"), (0.20, "20%")]
-        return min(candidates, key=lambda item: abs(item[0] - ratio))[1] if any(abs(ratio - x[0]) < 0.025 for x in candidates) else "fallback"
 
     def portfolio_summary(self) -> dict[str, Any]:
         snapshot = self.database.latest_portfolio_snapshot()
@@ -545,7 +611,7 @@ class CopyControlCenter:
     def _pnl_by_bucket(self) -> list[dict[str, Any]]:
         values: dict[str, dict[str, float]] = {}
         for position in self.database.list_virtual_positions():
-            bucket = self._bucket(position.allocated_capital)
+            bucket = position.sizing_bucket
             row = values.setdefault(bucket, {"bucket": bucket, "open_pnl": 0.0, "realized_pnl": 0.0, "capital_usage": 0.0, "position_count": 0.0})
             row["position_count"] += 1
             row["realized_pnl"] += position.realized_pnl - position.entry_fee
@@ -623,27 +689,79 @@ class CopyControlCenter:
             closed.append({"wallet": wallet, "symbol": symbol, "status": attempt.status, "reason": attempt.reason})
             self.store.record_activity(category="control", severity="warning", wallet=wallet, symbol=symbol,
                 message=f"Close-all PAPER action {attempt.status} for {symbol}", payload={"reason": attempt.reason, "paper": True})
-        final = CONTROL_PAUSED if pause_after else str(prior_state)
-        note = "Exit + pause completed." if pause_after else "Close-all PAPER positions completed; entry state retained." if not skipped else "Close-all finished with stale-reference skips."
-        # A close-all must not silently change entry semantics. Restore its prior
-        # state unless the action explicitly requested a pause.
-        return {"closed": closed, "skipped": skipped, "control": self.store.set_control_state(final, note=note), "paper_only": True}
+        partial = bool(skipped)
+        final = CONTROL_PAUSED if pause_after or partial else str(prior_state)
+        note = "Exit + pause completed." if pause_after else "Close-all partially completed; new PAPER entries remain paused until explicitly resumed." if partial else "Close-all PAPER positions completed; entry state retained."
+        return {"status": "partial" if partial else "completed", "closed": closed, "skipped": skipped,
+                "control": self.store.set_control_state(final, note=note), "paper_only": True}
 
     def exit_and_pause(self) -> dict[str, Any]:
         return self.close_all_paper_positions(pause_after=True)
 
 
-def create_control_center_app(config: CopyTradeConfig, database: CopyTradeDatabase | None = None, watcher_health: dict[str, Any] | None = None) -> Any:
+def create_control_center_app(
+    config: CopyTradeConfig, database: CopyTradeDatabase | None = None, watcher_health: dict[str, Any] | Any | None = None,
+    *, watcher_service: Any | None = None, watcher_factory: Any | None = None,
+) -> Any:
     """Create the local FastAPI Phase C application; no live-trading routes exist."""
     try:
-        from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-        from fastapi.responses import FileResponse, HTMLResponse
+        from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
         from fastapi.staticfiles import StaticFiles
     except ImportError as exc:  # pragma: no cover - dependency guidance
         raise RuntimeError("copy-control-center requires fastapi and uvicorn; install requirements.txt.") from exc
 
     center = CopyControlCenter(config, database)
-    app = FastAPI(title="Trader Copy Control Center", version="1.0", docs_url=None, redoc_url=None)
+    watcher_runtime: dict[str, Any] = {}
+
+    def live_watcher_health() -> dict[str, Any] | None:
+        watcher = watcher_runtime.get("watcher")
+        if watcher is not None:
+            payload = watcher.health.as_dict()
+            if watcher_runtime.get("detail"):
+                payload["detail"] = watcher_runtime["detail"]
+            return payload
+        if callable(watcher_health):
+            return watcher_health()
+        return watcher_health
+
+    @asynccontextmanager
+    async def lifespan(_: Any) -> Any:
+        if watcher_service is not None:
+            if watcher_factory is None:
+                from .hyperliquid import HyperliquidWatcher
+                factory = HyperliquidWatcher
+            else:
+                factory = watcher_factory
+            watcher = factory(watcher_service.adapter)
+            watcher_runtime["watcher"] = watcher
+            wallets = watcher_service.monitored_execution_wallets()
+            if wallets:
+                watcher_runtime["task"] = asyncio.create_task(
+                    watcher.run(
+                        wallets, watcher_service.ingest_watched_fills, watcher_service.ingest_watched_state,
+                        watcher_service.ingest_market_update, watcher_service.reconcile_monitored_wallets,
+                    )
+                )
+            else:
+                watcher_runtime["detail"] = "No active targets or open paper sleeves to subscribe."
+        try:
+            yield
+        finally:
+            watcher = watcher_runtime.get("watcher")
+            task = watcher_runtime.get("task")
+            if watcher is not None:
+                watcher.stop()
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    app = FastAPI(title="Trader Copy Control Center", version="1.0", docs_url=None, redoc_url=None,
+                  lifespan=lifespan if watcher_service is not None else None)
+
+    @app.exception_handler(sqlite3.Error)
+    async def database_unavailable(_: Any, __: sqlite3.Error) -> Any:
+        return JSONResponse(status_code=503, content={"detail": "Control-center database is temporarily unavailable."})
 
     def required_wallet(wallet: str) -> str:
         if not wallet.startswith("0x") or len(wallet) != 42:
@@ -652,7 +770,7 @@ def create_control_center_app(config: CopyTradeConfig, database: CopyTradeDataba
 
     @app.get("/api/health")
     async def api_health() -> dict[str, Any]:
-        return center.health(watcher_health)
+        return center.health(live_watcher_health)
 
     @app.get("/api/overview")
     async def api_overview() -> dict[str, Any]:
@@ -680,9 +798,14 @@ def create_control_center_app(config: CopyTradeConfig, database: CopyTradeDataba
         return detail
 
     @app.post("/api/candidates/{wallet}/operator-state")
-    async def api_operator_state(wallet: str, body: dict[str, Any]) -> dict[str, Any]:
+    async def api_operator_state(wallet: str, body: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        if not isinstance(body, dict) or not isinstance(body.get("state"), str) or not body["state"].strip():
+            raise HTTPException(status_code=400, detail="Request body requires a non-empty operator state.")
+        state = body["state"].strip()
+        if state not in OPERATOR_STATES:
+            raise HTTPException(status_code=400, detail="Unsupported operator state.")
         try:
-            return center.set_operator_state(required_wallet(wallet), str(body.get("state", "")))
+            return center.set_operator_state(required_wallet(wallet), state, allow_overflow=bool(body.get("allow_overflow", False)))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -710,7 +833,7 @@ def create_control_center_app(config: CopyTradeConfig, database: CopyTradeDataba
 
     @app.get("/api/system")
     async def api_system() -> dict[str, Any]:
-        return {"health": center.health(watcher_health), "risk": center.risk_panel(), "paper_only": True}
+        return {"health": center.health(live_watcher_health), "risk": center.risk_panel(), "paper_only": True}
 
     @app.get("/api/controls")
     async def api_controls() -> dict[str, Any]:
@@ -742,7 +865,8 @@ def create_control_center_app(config: CopyTradeConfig, database: CopyTradeDataba
                     "control_state": center.store.control_state(),
                     "portfolio_update": center.portfolio_summary(),
                     "position_update": {"items": center.positions(), "paper_only": True},
-                    "watcher_health": center.health(watcher_health)["watcher"],
+                    "watcher_health": center.health(live_watcher_health)["watcher"],
+                    "activity": {"items": center.activity(limit=20)},
                 }
                 for name, payload in events.items():
                     signature = _dump(payload)
@@ -761,7 +885,12 @@ def create_control_center_app(config: CopyTradeConfig, database: CopyTradeDataba
 
         @app.get("/{path:path}", response_class=FileResponse)
         async def frontend(path: str) -> Any:
-            requested = frontend_dist / path if path and (frontend_dist / path).is_file() else frontend_dist / "index.html"
+            root = frontend_dist.resolve()
+            requested = (root / path).resolve() if path else root / "index.html"
+            # Only explicitly built files under dist may be served.  Every SPA
+            # route falls back to index.html, including traversal-like paths.
+            if root not in requested.parents or not requested.is_file():
+                requested = root / "index.html"
             return FileResponse(requested)
     else:
         @app.get("/", response_class=HTMLResponse)
@@ -771,9 +900,16 @@ def create_control_center_app(config: CopyTradeConfig, database: CopyTradeDataba
     return app
 
 
-def serve_control_center(config: CopyTradeConfig, database: CopyTradeDatabase | None = None, *, host: str | None = None, port: int | None = None) -> None:
+def serve_control_center(
+    config: CopyTradeConfig, database: CopyTradeDatabase | None = None, *, host: str | None = None, port: int | None = None,
+    with_watcher: bool = False, service: Any | None = None,
+) -> None:
     try:
         import uvicorn
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("copy-control-center requires uvicorn; install requirements.txt.") from exc
-    uvicorn.run(create_control_center_app(config, database), host=host or config.artifacts.dashboard_host, port=port or config.artifacts.dashboard_port)
+    if with_watcher and service is None:
+        from .service import CopyTradeService
+        service = CopyTradeService(config, database)
+    uvicorn.run(create_control_center_app(config, database, watcher_service=service if with_watcher else None),
+                host=host or config.artifacts.dashboard_host, port=port or config.artifacts.dashboard_port)
