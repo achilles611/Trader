@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .config import BotConfig, StrategyProfile
-from .indicators import ema, rsi
+from .indicators import directional_consistency, ema, normalized_slope_pct, rsi
 from .models import Candle, NetworkScores, Position, StrategyDecision
 from .network import NeuralNetwork
 
@@ -112,20 +112,33 @@ class MomentumStrategy:
         recent_low = min(candle.low for candle in recent_window)
         recent_range = max(0.0, recent_high - recent_low)
 
-        market_state, efficiency_ratio, ema_gap_pct = self._market_state(closes, current_fast, current_slow)
+        trend_context = self._trend_context(closes, fast_ema_values, slow_ema_values)
+        market_state = trend_context["market_state"]
+        efficiency_ratio = trend_context["efficiency_ratio"]
+        ema_gap_pct = trend_context["ema_gap_pct"]
+        fast_slope_pct = trend_context["fast_slope_pct"]
+        slow_slope_pct = trend_context["slow_slope_pct"]
+        price_slope_pct = trend_context["price_slope_pct"]
+        consistency_ratio = trend_context["consistency_ratio"]
+        trend_strength = trend_context["trend_strength"]
+        trend_bias = trend_context["trend_bias"]
         bullish_cross = previous_fast <= previous_slow and current_fast > current_slow
         bearish_cross = previous_fast >= previous_slow and current_fast < current_slow
-        trend_up = current_fast > current_slow and current_close > current_slow
-        trend_down = current_fast < current_slow and current_close < current_slow
+        trend_up = trend_context["trend_up"]
+        trend_down = trend_context["trend_down"]
         momentum_resume_up = current_close > previous_close and current_close > current_fast
         momentum_resume_down = current_close < previous_close and current_close < current_fast
         strong_push = momentum_resume_up and current_close > previous_close * 1.001
+        strong_trend_up = trend_up and trend_strength >= 1.05 and (momentum_resume_up or strong_push)
+        strong_trend_down = trend_down and trend_strength >= 1.05 and momentum_resume_down
         long_pullback_pct = (recent_high - current_close) / recent_high if recent_high > 0 else 0.0
         short_pullback_pct = (current_close - recent_low) / recent_low if recent_low > 0 else 0.0
         pullback_detected_long = trend_up and long_pullback_pct >= self.config.pullback_min_pct
         pullback_detected_short = trend_down and short_pullback_pct >= self.config.pullback_min_pct
         near_recent_high = current_close > recent_high * self.config.long_top_guard_pct
         near_recent_low = current_close < recent_low * self.config.short_bottom_guard_pct
+        trend_continuation_up = strong_trend_up and near_recent_high
+        trend_continuation_down = strong_trend_down and near_recent_low
         long_rsi_ok = self.config.rsi_entry_floor <= current_rsi <= self.config.rsi_entry_ceiling
         short_rsi_ok = self.config.short_rsi_entry_floor <= current_rsi <= self.config.short_rsi_entry_ceiling
         cross_required = (market_state == "CHOPPY") or (not profile.aggressive_entries)
@@ -149,6 +162,7 @@ class MomentumStrategy:
             near_recent_low=near_recent_low,
             efficiency_ratio=efficiency_ratio,
             ema_gap_pct=ema_gap_pct,
+            market_state=market_state,
         )
         network_scores = (
             self.network.forward(feature_vector)
@@ -159,7 +173,7 @@ class MomentumStrategy:
         long_confirmation_count = sum(
             [
                 trend_up,
-                pullback_detected_long,
+                pullback_detected_long or trend_continuation_up,
                 momentum_resume_up,
                 bullish_cross,
                 long_rsi_ok,
@@ -168,7 +182,7 @@ class MomentumStrategy:
         short_confirmation_count = sum(
             [
                 trend_down,
-                pullback_detected_short,
+                pullback_detected_short or trend_continuation_down,
                 momentum_resume_down,
                 bearish_cross,
                 short_rsi_ok,
@@ -177,7 +191,7 @@ class MomentumStrategy:
 
         long_rule_score = self._normalized_rule_score(
             trend_component=profile.weight_trend * _bool_score(trend_up),
-            pullback_component=profile.weight_pullback * _bool_score(pullback_detected_long),
+            pullback_component=profile.weight_pullback * _bool_score(pullback_detected_long or trend_continuation_up),
             momentum_component=profile.weight_momentum * _bool_score(momentum_resume_up or strong_push),
             cross_component=profile.weight_cross * _bool_score(bullish_cross),
             rsi_component=profile.weight_rsi * _bool_score(long_rsi_ok),
@@ -192,7 +206,7 @@ class MomentumStrategy:
         )
         short_rule_score = self._normalized_rule_score(
             trend_component=profile.weight_trend * _bool_score(trend_down),
-            pullback_component=profile.weight_pullback * _bool_score(pullback_detected_short),
+            pullback_component=profile.weight_pullback * _bool_score(pullback_detected_short or trend_continuation_down),
             momentum_component=profile.weight_momentum * _bool_score(momentum_resume_down),
             cross_component=profile.weight_cross * _bool_score(bearish_cross),
             rsi_component=profile.weight_rsi * _bool_score(short_rsi_ok),
@@ -239,11 +253,21 @@ class MomentumStrategy:
             "short_rsi_ok": short_rsi_ok,
             "pullback_detected_long": pullback_detected_long,
             "pullback_detected_short": pullback_detected_short,
+            "trend_continuation_up": trend_continuation_up,
+            "trend_continuation_down": trend_continuation_down,
             "near_recent_high": near_recent_high,
             "near_recent_low": near_recent_low,
             "market_state": market_state,
             "efficiency_ratio": efficiency_ratio,
             "ema_gap_pct": ema_gap_pct * 100,
+            "fast_ema_slope_pct": fast_slope_pct * 100,
+            "slow_ema_slope_pct": slow_slope_pct * 100,
+            "price_slope_pct": price_slope_pct * 100,
+            "consistency_ratio": consistency_ratio,
+            "trend_strength": trend_strength,
+            "trend_bias": trend_bias,
+            "strong_trend_up": strong_trend_up,
+            "strong_trend_down": strong_trend_down,
             "cross_required": cross_required,
             "long_score": long_confirmation_count,
             "short_score": short_confirmation_count,
@@ -285,7 +309,7 @@ class MomentumStrategy:
                     network_scores=network_scores,
                 )
 
-            if near_recent_high and trend_up and not profile.allow_near_recent_high_long and not strong_push:
+            if near_recent_high and trend_up and not profile.allow_near_recent_high_long and not strong_push and not strong_trend_up:
                 return StrategyDecision(
                     action="hold",
                     reason="blocked_near_recent_high_weak",
@@ -293,7 +317,7 @@ class MomentumStrategy:
                     indicators=indicators,
                     network_scores=network_scores,
                 )
-            if near_recent_low and trend_down and not profile.allow_near_recent_low_short:
+            if near_recent_low and trend_down and not profile.allow_near_recent_low_short and not strong_trend_down:
                 return StrategyDecision(
                     action="hold",
                     reason="blocked_near_recent_low",
@@ -305,7 +329,7 @@ class MomentumStrategy:
             long_structural_ready = (
                 long_confirmation_count >= profile.min_confirmation_signals
                 and (
-                    (trend_up and (pullback_detected_long or bullish_cross or profile.aggressive_entries))
+                    (trend_up and (pullback_detected_long or trend_continuation_up or bullish_cross or profile.aggressive_entries))
                     or (profile.allow_countertrend and near_recent_low and long_rsi_ok)
                 )
                 and (momentum_resume_up or bullish_cross or profile.allow_countertrend)
@@ -314,7 +338,7 @@ class MomentumStrategy:
                 self.config.enable_shorts
                 and short_confirmation_count >= profile.min_confirmation_signals
                 and (
-                    (trend_down and (pullback_detected_short or bearish_cross or profile.aggressive_entries))
+                    (trend_down and (pullback_detected_short or trend_continuation_down or bearish_cross or profile.aggressive_entries))
                     or (profile.allow_countertrend and near_recent_high and short_rsi_ok)
                 )
                 and (momentum_resume_down or bearish_cross or profile.allow_countertrend)
@@ -343,7 +367,13 @@ class MomentumStrategy:
                 and long_market_state_ok
                 and (bullish_cross if cross_required else True)
             ):
-                reason = "pullback_resume_long" if pullback_detected_long else "profile_weighted_long"
+                reason = (
+                    "pullback_resume_long"
+                    if pullback_detected_long
+                    else "trend_continuation_long"
+                    if trend_continuation_up
+                    else "profile_weighted_long"
+                )
                 return StrategyDecision(
                     action="buy",
                     reason=reason,
@@ -362,7 +392,13 @@ class MomentumStrategy:
                 and short_market_state_ok
                 and (bearish_cross if cross_required else True)
             ):
-                reason = "pullback_resume_short" if pullback_detected_short else "profile_weighted_short"
+                reason = (
+                    "pullback_resume_short"
+                    if pullback_detected_short
+                    else "trend_continuation_short"
+                    if trend_continuation_down
+                    else "profile_weighted_short"
+                )
                 return StrategyDecision(
                     action="short",
                     reason=reason,
@@ -498,6 +534,7 @@ class MomentumStrategy:
         near_recent_low: bool,
         efficiency_ratio: float,
         ema_gap_pct: float,
+        market_state: str,
     ) -> list[float]:
         current_volume = candles[-1].volume
         recent_volumes = [candle.volume for candle in candles[-20:]]
@@ -537,30 +574,129 @@ class MomentumStrategy:
             _bool_score(near_recent_high),
             _bool_score(near_recent_low),
             efficiency_ratio,
-            1.0 if self._market_state_label(efficiency_ratio, ema_gap_pct) == "TRENDING" else 0.0,
+            1.0 if market_state == "TRENDING" else 0.0,
         ]
 
-    def _market_state(
+    def _trend_context(
         self,
         closes: list[float],
-        current_fast: float,
-        current_slow: float,
-    ) -> tuple[str, float, float]:
-        lookback = min(self.config.market_state_lookback_candles, len(closes) - 1)
+        fast_ema_values: list[float],
+        slow_ema_values: list[float],
+    ) -> dict[str, float | str | bool]:
+        lookback = min(
+            self.config.market_state_lookback_candles,
+            len(closes) - 1,
+            len(fast_ema_values) - 1,
+            len(slow_ema_values) - 1,
+        )
         if lookback <= 1:
-            return "UNKNOWN", 0.0, 0.0
+            return {
+                "market_state": "UNKNOWN",
+                "efficiency_ratio": 0.0,
+                "ema_gap_pct": 0.0,
+                "fast_slope_pct": 0.0,
+                "slow_slope_pct": 0.0,
+                "price_slope_pct": 0.0,
+                "consistency_ratio": 0.0,
+                "trend_strength": 0.0,
+                "trend_bias": "FLAT",
+                "trend_up": False,
+                "trend_down": False,
+            }
 
         recent_closes = closes[-lookback - 1 :]
+        recent_fast = fast_ema_values[-lookback - 1 :]
+        recent_slow = slow_ema_values[-lookback - 1 :]
         net_move = recent_closes[-1] - recent_closes[0]
         gross_move = sum(abs(recent_closes[index] - recent_closes[index - 1]) for index in range(1, len(recent_closes)))
         efficiency_ratio = abs(net_move) / gross_move if gross_move > 0 else 0.0
-        ema_gap_pct = abs(current_fast - current_slow) / recent_closes[-1] if recent_closes[-1] > 0 else 0.0
-        return self._market_state_label(efficiency_ratio, ema_gap_pct), efficiency_ratio, ema_gap_pct
+        ema_gap_pct = abs(recent_fast[-1] - recent_slow[-1]) / recent_closes[-1] if recent_closes[-1] > 0 else 0.0
+        fast_slope_pct = normalized_slope_pct(recent_fast)
+        slow_slope_pct = normalized_slope_pct(recent_slow)
+        price_slope_pct = normalized_slope_pct(recent_closes)
+        consistency_ratio = directional_consistency(recent_closes)
 
-    def _market_state_label(self, efficiency_ratio: float, ema_gap_pct: float) -> str:
+        slope_floor = max(self.config.market_trend_ema_gap_pct * 0.5, 0.00008)
+        consistency_floor = max(0.55, min(0.8, self.config.market_trend_efficiency_threshold + 0.25))
+        price_floor = slope_floor * 0.5
+
+        directional_trend_up = (
+            recent_fast[-1] > recent_slow[-1]
+            and recent_closes[-1] > recent_slow[-1]
+            and fast_slope_pct > slope_floor
+            and slow_slope_pct >= 0.0
+            and price_slope_pct > price_floor
+        )
+        directional_trend_down = (
+            recent_fast[-1] < recent_slow[-1]
+            and recent_closes[-1] < recent_slow[-1]
+            and fast_slope_pct < -slope_floor
+            and slow_slope_pct <= 0.0
+            and price_slope_pct < -price_floor
+        )
+
+        directional_ok = (
+            efficiency_ratio >= self.config.market_trend_efficiency_threshold * 0.85
+            or consistency_ratio >= consistency_floor
+        )
+        trend_up = directional_trend_up and directional_ok
+        trend_down = directional_trend_down and directional_ok
+
+        gap_floor = max(self.config.market_trend_ema_gap_pct, slope_floor)
+        trend_strength = (
+            min(1.5, efficiency_ratio / max(self.config.market_trend_efficiency_threshold, 1e-6))
+            + min(1.5, consistency_ratio / consistency_floor)
+            + min(1.5, ema_gap_pct / gap_floor)
+            + min(1.5, abs(fast_slope_pct) / slope_floor)
+        ) / 4
+
+        market_state = self._market_state_label(
+            efficiency_ratio=efficiency_ratio,
+            ema_gap_pct=ema_gap_pct,
+            consistency_ratio=consistency_ratio,
+            trend_up=trend_up,
+            trend_down=trend_down,
+            consistency_floor=consistency_floor,
+            gap_floor=gap_floor,
+        )
+        trend_bias = "UP" if trend_up else "DOWN" if trend_down else "FLAT"
+        return {
+            "market_state": market_state,
+            "efficiency_ratio": efficiency_ratio,
+            "ema_gap_pct": ema_gap_pct,
+            "fast_slope_pct": fast_slope_pct,
+            "slow_slope_pct": slow_slope_pct,
+            "price_slope_pct": price_slope_pct,
+            "consistency_ratio": consistency_ratio,
+            "trend_strength": trend_strength,
+            "trend_bias": trend_bias,
+            "trend_up": trend_up,
+            "trend_down": trend_down,
+        }
+
+    def _market_state_label(
+        self,
+        *,
+        efficiency_ratio: float,
+        ema_gap_pct: float,
+        consistency_ratio: float,
+        trend_up: bool,
+        trend_down: bool,
+        consistency_floor: float,
+        gap_floor: float,
+    ) -> str:
         return (
             "TRENDING"
-            if efficiency_ratio >= self.config.market_trend_efficiency_threshold
-            and ema_gap_pct >= self.config.market_trend_ema_gap_pct
+            if (trend_up or trend_down)
+            and (
+                (
+                    efficiency_ratio >= self.config.market_trend_efficiency_threshold
+                    and ema_gap_pct >= self.config.market_trend_ema_gap_pct
+                )
+                or (
+                    consistency_ratio >= consistency_floor
+                    and ema_gap_pct >= gap_floor * 0.75
+                )
+            )
             else "CHOPPY"
         )

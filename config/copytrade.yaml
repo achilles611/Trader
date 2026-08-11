@@ -1,0 +1,108 @@
+# Public-wallet copy-trading research alpha.  It is intentionally paper-only.
+mode: paper
+
+source:
+  venue: hyperliquid
+  network: mainnet
+  info_url: https://api.hyperliquid.xyz/info
+  websocket_url: wss://api.hyperliquid.xyz/ws
+  request_timeout_seconds: 20
+  reconnect_initial_seconds: 1
+  reconnect_max_seconds: 30
+  stale_after_seconds: 60
+  subscribe_order_updates: false
+  subscribe_position_state: true
+
+# Optionally list manually researched wallets.  Importing a CSV is usually
+# preferable so this example remains non-prescriptive.
+targets: []
+
+capital:
+  initial_capital: 200.00
+  currency: USD
+
+sizing:
+  mode: ratio
+  small_fraction: 0.05
+  medium_fraction: 0.10
+  large_fraction: 0.20
+  small_ratio_max: 0.67
+  large_ratio_min: 1.50
+  min_history: 10
+  fallback_fraction: 0.10
+  quantiles: [0.33, 0.67]
+  copy_initial_entries: true
+  copy_target_adds: false
+  max_equity_age_seconds: 300
+  accepted_equity_sources: [exact, recent_live_snapshot, sampled_prior_proxy]
+
+risk:
+  max_total_committed_fraction: 0.80
+  max_capital_per_target_fraction: 0.30
+  max_capital_per_symbol_fraction: 0.40
+  max_simultaneous_virtual_campaigns: 7
+  daily_loss_stop_fraction: 0.10
+  target_loss_stop_fraction: 0.15
+  max_copy_drawdown_fraction: 0.20
+  max_consecutive_losses: 5
+  kill_switch_path: state/copytrade_kill_switch.txt
+  max_signal_age_seconds: 30
+  max_price_deviation_bps: 50
+  insufficient_capital_action: scale
+  symbol_allowlist: []
+  symbol_blocklist: []
+  max_leverage: null
+  risk_cap_base: current_equity
+
+paper_execution:
+  min_order_notional: 10
+  quantity_precision: 6
+  missed_trade_rate: 0
+  random_seed: 7
+
+fees:
+  paper_fee_rate: 0.00045
+
+slippage:
+  paper_bps: 5
+
+latency:
+  detection_ms: 250
+  order_ms: 100
+
+backtest:
+  detection_delays_ms: [100, 250, 500, 1000, 2000, 5000, 15000]
+  slippage_scenarios_bps: [1, 2, 5, 10, 25]
+  training_windows_days: [30, 60, 90, 180]
+  forward_windows_days: [7, 14, 30]
+  default_training_days: 90
+  default_forward_days: 30
+
+candidates:
+  history_days_min: 90
+  history_days_preferred: 180
+  closed_campaigns_min: 100
+  max_drawdown_preferred: 0.15
+  max_drawdown_hard: 0.25
+  profit_factor_preferred: 1.40
+  require_positive_expectancy: true
+  require_positive_follower_expectancy: true
+  activity_max_age_days: 30
+
+artifacts: {}
+
+database:
+  path: artifacts/copytrade.sqlite3
+
+obsidian:
+  root: artifacts/obsidian
+
+dashboard:
+  host: 127.0.0.1
+  port: 8090
+
+# Merely setting these fields does not enable live operation.  The process
+# rejects live startup unless both COPYTRADE_MODE=live and
+# COPYTRADE_LIVE_ENABLED=true are supplied, and this alpha has no live adapter.
+future_live_execution:
+  enabled: false

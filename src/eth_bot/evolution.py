@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import random
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +13,56 @@ def _safe_divide(numerator: float, denominator: float) -> float:
     if denominator == 0:
         return 0.0
     return numerator / denominator
+
+
+def apply_strategy_profile_payload(profile: StrategyProfile, payload: dict[str, Any]) -> StrategyProfile:
+    allowed = {field.name for field in fields(StrategyProfile)}
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        raise ValueError(f"Unknown StrategyProfile fields in proposal payload: {unknown}")
+    updated = replace(profile, **payload)
+    updated.validate()
+    return updated
+
+
+def load_generation_proposal_payloads(root_dir: Path, generation: int) -> dict[str, dict[str, Any]]:
+    if generation <= 1:
+        return {}
+
+    proposal_path = root_dir / "reports" / f"generation_{generation - 1:03d}" / "next_generation_proposals.json"
+    if not proposal_path.exists():
+        return {}
+
+    payload = json.loads(proposal_path.read_text(encoding="utf-8"))
+    if int(payload.get("to_generation", -1)) != generation:
+        raise ValueError(
+            f"Proposal file {proposal_path} targets generation {payload.get('to_generation')}, "
+            f"not generation {generation}."
+        )
+
+    raw_proposals = payload.get("proposals", [])
+    if not isinstance(raw_proposals, list):
+        raise ValueError(f"Proposal file {proposal_path} has a non-list 'proposals' payload.")
+
+    proposal_payloads: dict[str, dict[str, Any]] = {}
+    for item in raw_proposals:
+        if not isinstance(item, dict):
+            raise ValueError(f"Proposal file {proposal_path} contains a non-object proposal entry.")
+
+        instance_id = str(item.get("instance_id") or "").strip()
+        profile_payload = item.get("profile")
+        if not instance_id:
+            raise ValueError(f"Proposal file {proposal_path} contains a proposal without an instance_id.")
+        if not isinstance(profile_payload, dict):
+            raise ValueError(
+                f"Proposal file {proposal_path} contains a non-object profile payload for instance {instance_id}."
+            )
+        if instance_id in proposal_payloads:
+            raise ValueError(f"Proposal file {proposal_path} contains duplicate proposals for instance {instance_id}.")
+
+        proposal_payloads[instance_id] = profile_payload
+
+    return proposal_payloads
 
 
 def compute_tr_fitness(report: dict[str, Any]) -> float:

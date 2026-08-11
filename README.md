@@ -21,6 +21,7 @@ Use this as a paper-trading and research bot first.
 - Runs in `paper` mode by default.
 - Can place Coinbase live market orders only if you explicitly switch to `BOT_MODE=live` and provide API keys.
 - Live shorting is not enabled in this starter because the current adapter is built around Coinbase spot orders.
+- Includes an isolated Hyperliquid public-wallet copy-trading research alpha with raw-event preservation, position campaigns, deterministic paper sleeves, scoring, event-driven backtests, Obsidian reports, and a local dashboard. It is paper-only and does not use exchange credentials.
 
 ## Setup
 
@@ -88,6 +89,18 @@ Dump the current swarm profiles:
 ```powershell
 python main.py profile-dump --generation 1
 ```
+
+Copy-trading research commands (all default to paper mode):
+
+```powershell
+python main.py copy-import --wallet 0xYOUR_PUBLIC_WALLET
+python main.py copy-backfill --wallet 0xYOUR_PUBLIC_WALLET
+python main.py copy-score --wallet 0xYOUR_PUBLIC_WALLET
+python main.py copy-backtest --wallet 0xYOUR_PUBLIC_WALLET
+python main.py copy-report --wallet 0xYOUR_PUBLIC_WALLET
+```
+
+See [docs/COPYTRADING.md](docs/COPYTRADING.md) for the full architecture, configuration, safeguards, workflow, limitations, and tests.
 
 Run the production orchestration cycle wrapper:
 

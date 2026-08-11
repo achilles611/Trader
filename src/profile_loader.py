@@ -18,6 +18,7 @@ from .eth_bot.config import (
     StrategyProfile,
     apply_instance_overrides,
 )
+from .eth_bot.evolution import apply_strategy_profile_payload, load_generation_proposal_payloads
 from .eth_bot.profiles import SWARM_INSTANCE_IDS, default_strategy_profile
 
 
@@ -302,6 +303,7 @@ def load_runtime_settings(root_dir: Path, config_path: Path | None = None) -> Ru
 def load_bot_definitions(settings: RuntimeSettings) -> list[BotDefinition]:
     base_config = BotConfig.from_env()
     baseline_profile = default_strategy_profile(base_config)
+    proposal_payloads = load_generation_proposal_payloads(settings.root_dir, settings.generation)
     bot_files = sorted(settings.bots_dir.glob("*.yaml"))
     definitions: list[BotDefinition] = []
 
@@ -311,6 +313,9 @@ def load_bot_definitions(settings: RuntimeSettings) -> list[BotDefinition]:
         family = str(payload["family"])
         profile_name = str(payload["profile_name"])
         strategy_profile = _replace_dataclass(baseline_profile, payload.get("strategy_profile", {}))
+        proposal_payload = proposal_payloads.get(bot_id)
+        if proposal_payload:
+            strategy_profile = apply_strategy_profile_payload(strategy_profile, proposal_payload)
         strategy_profile.validate()
 
         effective_base = _replace_dataclass(base_config, payload.get("bot_config_overrides", {}))

@@ -41,3 +41,36 @@ def rsi(values: list[float], period: int) -> list[float | None]:
         rs = avg_gain / avg_loss
         output[index] = 100.0 - (100.0 / (1.0 + rs))
     return output
+
+
+def normalized_slope_pct(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+
+    x_mean = (len(values) - 1) / 2
+    y_mean = sum(values) / len(values)
+    denominator = sum((index - x_mean) ** 2 for index in range(len(values)))
+    if denominator <= 0:
+        return 0.0
+
+    numerator = sum((index - x_mean) * (value - y_mean) for index, value in enumerate(values))
+    baseline = abs(y_mean) if y_mean != 0 else 1.0
+    return (numerator / denominator) / baseline
+
+
+def directional_consistency(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+
+    deltas = [values[index] - values[index - 1] for index in range(1, len(values))]
+    gross_move = sum(abs(delta) for delta in deltas)
+    if gross_move <= 0:
+        return 0.0
+
+    net_move = values[-1] - values[0]
+    if net_move == 0:
+        return 0.0
+
+    direction = 1 if net_move > 0 else -1
+    aligned_move = sum(abs(delta) for delta in deltas if (delta * direction) > 0)
+    return aligned_move / gross_move

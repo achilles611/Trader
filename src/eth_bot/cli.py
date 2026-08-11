@@ -11,6 +11,7 @@ from .config import BotConfig
 from .dashboard import serve_dashboard, write_swarm_dashboard
 from .orchestrator import SwarmOrchestrator, evolve_generation, profile_dump, render_instance_visual, train_baseline_network
 from .profiles import SWARM_INSTANCE_IDS
+from src.copytrade.cli import add_copytrade_parsers, run_copytrade_command
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -70,6 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dashboard_serve_parser.add_argument("--generation", type=int, default=1, help="Generation number to render.")
     dashboard_serve_parser.add_argument("--port", type=int, default=8000, help="Local HTTP port.")
+    add_copytrade_parsers(subparsers)
     return parser
 
 
@@ -83,6 +85,8 @@ def configure_logging() -> None:
 def main(argv: list[str] | None = None) -> int:
     configure_logging()
     args = build_parser().parse_args(argv)
+    if args.command.startswith("copy-"):
+        return run_copytrade_command(args)
     config = BotConfig.from_env()
 
     if args.command == "run":

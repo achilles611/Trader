@@ -11,6 +11,7 @@ from .config import (
     apply_instance_overrides,
     build_instance_paths,
 )
+from .evolution import apply_strategy_profile_payload, load_generation_proposal_payloads
 
 
 SWARM_INSTANCE_IDS = ("zerk1", "zerk2", "tr1", "tr2", "tr3", "tr4", "tr5", "tr6", "tr7", "tr8")
@@ -82,6 +83,7 @@ def build_swarm_instance_configs(
     root = root_dir or Path(".")
     baseline_profile = default_strategy_profile(base_config)
     shared_network_version = f"baseline-v1-g{generation:03d}"
+    proposal_payloads = load_generation_proposal_payloads(root, generation)
 
     definitions: list[tuple[str, str, str, StrategyProfile, dict[str, object]]] = [
         (
@@ -300,6 +302,9 @@ def build_swarm_instance_configs(
 
     instances: list[BotInstanceConfig] = []
     for index, (instance_id, family, profile_name, profile, overrides) in enumerate(definitions, start=1):
+        proposal_payload = proposal_payloads.get(instance_id)
+        if proposal_payload:
+            profile = apply_strategy_profile_payload(profile, proposal_payload)
         paths = build_instance_paths(root, instance_id, generation)
         effective_base = replace(base_config, **overrides)
         effective_config = apply_instance_overrides(effective_base, profile, paths)
