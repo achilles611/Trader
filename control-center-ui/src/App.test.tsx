@@ -16,17 +16,22 @@ const candidate = {
   win_rate: 0.62, profit_factor: 1.8, target_max_drawdown: 0.08, follower_max_drawdown: 0.1, coverage: "PROVEN_COMPLETE", source_count: 2,
 };
 
+let closeAllResponse: Record<string, unknown> | null = null;
+
 function payload(path: string) {
   if (path.startsWith("/api/overview")) return { counts: { total_discovered: 20, qualified: 2, shadow: 1, active: 0 }, funnel: [], top_candidates: [candidate], recent_activity: [] };
   if (path.startsWith("/api/portfolio")) return { equity: 210, cash: 190, committed_capital: 10, open_pnl: 1, realized_pnl_total: 9, max_drawdown: 0.02, open_positions: 1 };
+  if (path.startsWith("/api/controls/close-all-paper-positions")) return closeAllResponse || { status: "completed", control: { state: "RUNNING", entries_allowed: true, paper_only: true } };
   if (path.startsWith("/api/controls")) return { state: "RUNNING", entries_allowed: true, paper_only: true };
+  if (path.startsWith("/api/system")) return { health: { mode: "paper", paper_only: true, database: { connected: true }, websocket: { available: true }, watcher: { state: "NOT_ATTACHED", desired_target_count: 0, subscribed_target_count: 0, membership_in_sync: true } }, risk: { limits: [] } };
   if (path.startsWith("/api/candidates?")) return { items: [candidate], page: path.includes("page=2") ? 2 : 1, page_size: 50, total: 51, pages: 2 };
-  if (path.startsWith(`/api/candidates/${candidate.wallet}`)) return { identity: { wallet: candidate.wallet, operator_state: "shadow", research_state: "qualified" }, score: { total: 87.3, eligible: true, component_scores: { consistency: 9 }, penalties: {}, reason_codes: [] }, target_performance: {}, follower_performance: {}, latency: { status: "unavailable" }, analysis_window: {} };
+  if (path.startsWith(`/api/candidates/${candidate.wallet}`)) return { identity: { wallet: candidate.wallet, operator_state: "shadow", research_state: "qualified" }, score: { total: 87.3, eligible: true, components: { consistency: 9 }, penalties: { drawdown: 1 }, reasons: ["fixture_reason"] }, target_performance: {}, follower_performance: {}, latency: { status: "unavailable" }, analysis_window: {} };
   return { items: [] };
 }
 
 beforeEach(() => {
   WebSocketStub.instances = [];
+  closeAllResponse = null;
   vi.stubGlobal("WebSocket", WebSocketStub);
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => new Response(JSON.stringify(payload(String(input))), { status: 200, headers: { "Content-Type": "application/json" } })));
 });
@@ -50,6 +55,40 @@ describe("copy control center", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close All Paper Positions" }));
     expect(screen.getByRole("dialog")).toHaveTextContent("flatten every current paper sleeve");
     expect(within(screen.getByRole("dialog")).getByRole("button", { name: "Close All Paper Positions" })).toBeInTheDocument();
+  });
+
+  it("renders canonical dossier score fields without legacy aliases", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Candidates" }));
+    fireEvent.click(await screen.findByText("0x111111…111111"));
+    expect(await screen.findByText("RESEARCH DOSSIER")).toBeInTheDocument();
+    expect(screen.getByText("consistency")).toBeInTheDocument();
+    expect(screen.getByText("drawdown penalty")).toBeInTheDocument();
+    expect(screen.getByText("fixture_reason")).toBeInTheDocument();
+  });
+
+  it("shows the actual number of PAPER positions left open after a partial close-all", async () => {
+    closeAllResponse = {
+      status: "partial", closed: [{ wallet: candidate.wallet, symbol: "BTC" }], failed: [{ wallet: candidate.wallet, symbol: "ETH" }],
+      remaining_open_positions: [{ sleeve_id: "sleeve-2", wallet: candidate.wallet, symbol: "ETH" }],
+      control: { state: "PAUSED", entries_allowed: false, paper_only: true },
+    };
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Close All Paper Positions" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close All Paper Positions" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("1 PAPER position remains open");
+  });
+
+  it("renders watcher membership health received over the websocket", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "System" }));
+    await act(async () => {
+      WebSocketStub.instances[0].onmessage?.({ data: JSON.stringify({ type: "watcher_health", data: { state: "CONNECTED", supervisor_state: "CONNECTED", desired_target_count: 2, subscribed_target_count: 2, membership_in_sync: true, active_entry_target_count: 1, open_sleeve_wallet_count: 1 } }) } as MessageEvent);
+    });
+    const panel = (await screen.findByText("System health")).closest("section");
+    expect(panel).toHaveTextContent("Desired targets");
+    expect(panel).toHaveTextContent("IN SYNC");
+    expect(panel).toHaveTextContent("Open sleeve wallets");
   });
 
   it("uses server pagination and applies live position websocket updates", async () => {

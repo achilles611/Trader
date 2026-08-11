@@ -6,6 +6,8 @@ import asyncio
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from src.copytrade.config import ArtifactConfig, CopyTradeConfig, PaperExecutionConfig, RiskConfig
 from src.copytrade.control_center import (
@@ -84,7 +86,9 @@ def phase_b_summary(now: object, score: float) -> dict[str, object]:
     }
 
 
-def seed_candidate(service: CopyTradeService, wallet: str, *, score: float, status: str = "new") -> None:
+def seed_candidate(
+    service: CopyTradeService, wallet: str, *, score: float, status: str = "new", run_status: str = "completed",
+) -> None:
     now = utc_now()
     run = DiscoveryRun(run_id=f"discover_{wallet[-2:]}", started_at=now, sources=("fixture",), configuration={})
     service.database.start_discovery_run(run)
@@ -93,7 +97,7 @@ def seed_candidate(service: CopyTradeService, wallet: str, *, score: float, stat
     service.database.set_target_status(wallet, status)
     summary = phase_b_summary(now, score)
     run_id = f"phase_b_fixture_{wallet[-2:]}"
-    service.database.start_analysis_run(AnalysisRun(run_id=run_id, started_at=now, finished_at=now, status="completed", configuration={}))
+    service.database.start_analysis_run(AnalysisRun(run_id=run_id, started_at=now, finished_at=now, status=run_status, configuration={}))
     service.database.upsert_candidate_analysis(CandidateAnalysis(wallet=wallet, lifecycle_status="qualified", last_run_id=run_id, completed_at=now, summary=summary))
     from src.copytrade.control_center import _config_fingerprint
     service.database.upsert_candidate_score(CandidateScore(wallet, now, score, {"consistency": 9.0}, {}, True, ("fixture",), provenance="phase_b", analysis_run_id=run_id, config_fingerprint=_config_fingerprint(service.config.snapshot())))
@@ -195,6 +199,25 @@ class CopyControlCenterTests(unittest.TestCase):
                 center.set_operator_state(WALLET_A, "active")
             self.assertEqual(service.database.get_target(WALLET_A).status, "shadow")  # type: ignore[union-attr]
 
+    def test_activation_requires_a_completed_parent_phase_b_run(self) -> None:
+        accepted = {"completed", "completed_with_errors"}
+        rejected = {"running", "failed"}
+        for index, status in enumerate(sorted(accepted | rejected), 1):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as temp:
+                service = CopyTradeService(config(Path(temp)))
+                wallet = f"0x{index:040x}"
+                seed_candidate(service, wallet, score=88.0, status="shadow", run_status=status)
+                center = CopyControlCenter(service.config, service.database)
+                if status in accepted:
+                    self.assertEqual(center.set_operator_state(wallet, "active")["operator_state"], "active")
+                else:
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "Wallet cannot be activated because its canonical Phase B analysis run did not complete successfully. No state change was made.",
+                    ):
+                        center.set_operator_state(wallet, "active")
+                    self.assertEqual(service.database.get_target(wallet).status, "shadow")  # type: ignore[union-attr]
+
     def test_entry_gate_allows_only_active_entries_and_always_allows_exits(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             service = CopyTradeService(config(Path(temp)))
@@ -269,6 +292,27 @@ class CopyControlCenterTests(unittest.TestCase):
             self.assertEqual(result["status"], "partial")
             self.assertEqual(result["control"]["state"], "PAUSED")
             self.assertTrue(result["skipped"])
+            self.assertTrue(result["remaining_open_positions"])
+
+    def test_close_all_uses_persisted_positions_as_the_completion_condition(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            engine = PaperExecutionEngine(service.config, service.database)
+            self.assertEqual(engine.process_signal(open_signal(WALLET_A), market_price=100.0).status, "filled")
+            engine.mark_to_market("BTC", 101.0, utc_now())
+            engine.persist_mark(utc_now())
+            center = CopyControlCenter(service.config, service.database)
+            with patch.object(
+                PaperExecutionEngine, "process_signal", return_value=SimpleNamespace(status="skipped", reason="fixture_rejection"),
+            ):
+                result = center.close_all_paper_positions()
+            self.assertEqual(result["status"], "partial")
+            self.assertEqual(result["control"]["state"], "PAUSED")
+            self.assertEqual(len(result["attempted"]), 1)
+            self.assertEqual(len(result["failed"]), 1)
+            self.assertEqual(len(result["remaining_open_positions"]), 1)
+            self.assertTrue(service.database.list_virtual_positions(open_only=True))
+            self.assertTrue(any("incomplete" in item["message"] for item in center.activity()))
 
     def test_sizing_bucket_is_persisted_and_legacy_sleeves_are_not_inferred(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -336,49 +380,185 @@ class CopyControlCenterTests(unittest.TestCase):
                 asyncio.run(endpoint(WALLET_A, {"state": "active"}))
             self.assertEqual(stale.exception.status_code, 409)
 
-    def test_control_center_watcher_lifecycle_uses_one_fake_watcher(self) -> None:
+    def test_watcher_supervisor_replaces_membership_serially_and_idles_cleanly(self) -> None:
         class FakeHealth:
+            def __init__(self, watcher: "FakeWatcher") -> None:
+                self.watcher = watcher
+
             def as_dict(self) -> dict[str, object]:
-                return {"state": "CONNECTED", "per_target": {WALLET_A: "CONNECTED"}}
+                return {"state": "CONNECTED", "per_target": {wallet: "CONNECTED" for wallet in self.watcher.wallets}}
 
         class FakeWatcher:
+            instances: list["FakeWatcher"] = []
+            active_count = 0
+            max_active_count = 0
+
             def __init__(self, _: object) -> None:
-                self.health = FakeHealth()
-                self.calls: list[list[str]] = []
+                self.wallets: list[str] = []
+                self.stop_event = asyncio.Event()
                 self.stopped = False
+                self.health = FakeHealth(self)
+                FakeWatcher.instances.append(self)
 
             async def run(self, wallets: list[str], *_: object) -> dict[str, int]:
-                self.calls.append(wallets)
-                await asyncio.Event().wait()
+                self.wallets = wallets
+                reconcile = _[-1]
+                await reconcile()
+                FakeWatcher.active_count += 1
+                FakeWatcher.max_active_count = max(FakeWatcher.max_active_count, FakeWatcher.active_count)
+                try:
+                    await self.stop_event.wait()
+                finally:
+                    FakeWatcher.active_count -= 1
                 return {}
 
             def stop(self) -> None:
                 self.stopped = True
+                self.stop_event.set()
 
         class FakeService:
             adapter = object()
 
-            def monitored_execution_wallets(self) -> list[str]:
-                return [WALLET_A]
+            def __init__(self) -> None:
+                self.wallets: list[str] = []
+                self.reconciled: list[str] = []
 
+            def monitored_execution_wallets(self) -> list[str]:
+                return self.wallets
+
+            async def ingest_watched_fills(self, *_: object) -> None: pass
+            async def ingest_watched_state(self, *_: object) -> None: pass
+            async def ingest_market_update(self, *_: object) -> None: pass
+            async def reconcile_wallet(self, wallet: str) -> int:
+                self.reconciled.append(wallet)
+                return 0
+
+        async def wait_until(predicate: object) -> None:
+            for _ in range(100):
+                value = predicate() if callable(predicate) else False
+                if asyncio.iscoroutine(value):
+                    value = await value
+                if value:
+                    return
+                await asyncio.sleep(0.01)
+            self.fail("timed out waiting for watcher supervisor")
+
+        with tempfile.TemporaryDirectory() as temp:
+            database_service = CopyTradeService(config(Path(temp)))
+            service = FakeService()
+            app = create_control_center_app(
+                database_service.config, database_service.database, watcher_service=service, watcher_factory=FakeWatcher,
+                watcher_poll_interval_seconds=0.01, watcher_stop_timeout_seconds=0.1,
+            )
+
+            async def exercise_lifecycle() -> None:
+                health_endpoint = next(route.endpoint for route in app.routes if route.path == "/api/health")
+
+                async def watcher_state_is(state: str) -> bool:
+                    return (await health_endpoint())["watcher"]["state"] == state
+
+                async with app.router.lifespan_context(app):
+                    await wait_until(lambda: len(FakeWatcher.instances) == 0)
+                    await wait_until(lambda: watcher_state_is("IDLE"))
+                    self.assertEqual((await health_endpoint())["watcher"]["state"], "IDLE")
+
+                    service.wallets = [WALLET_A]
+                    await wait_until(lambda: len(FakeWatcher.instances) == 1 and FakeWatcher.instances[0].wallets == [WALLET_A])
+                    self.assertEqual((await health_endpoint())["watcher"]["desired_wallets"], [WALLET_A])
+
+                    service.wallets = [WALLET_A, WALLET_B]
+                    await wait_until(lambda: len(FakeWatcher.instances) == 2 and FakeWatcher.instances[-1].wallets == [WALLET_A, WALLET_B])
+                    self.assertTrue(FakeWatcher.instances[0].stopped)
+                    self.assertEqual(FakeWatcher.max_active_count, 1)
+
+                    service.wallets = [WALLET_B]
+                    await wait_until(lambda: len(FakeWatcher.instances) == 3 and FakeWatcher.instances[-1].wallets == [WALLET_B])
+                    health = await health_endpoint()
+                    self.assertTrue(health["watcher"]["membership_in_sync"])
+                    self.assertEqual(health["watcher"]["subscribed_wallets"], [WALLET_B])
+
+                    service.wallets = []
+                    await wait_until(lambda: watcher_state_is("IDLE"))
+
+            asyncio.run(exercise_lifecycle())
+            self.assertTrue(all(watcher.stopped for watcher in FakeWatcher.instances))
+            self.assertEqual(FakeWatcher.max_active_count, 1)
+            self.assertIn(WALLET_A, service.reconciled)
+            self.assertIn(WALLET_B, service.reconciled)
+
+    def test_watcher_supervisor_recovers_without_breaking_fastapi_and_pauses_on_capacity_overflow(self) -> None:
+        class FakeHealth:
+            def as_dict(self) -> dict[str, object]:
+                return {"state": "CONNECTED", "per_target": {}}
+
+        class FailingThenHealthyWatcher:
+            starts = 0
+
+            def __init__(self, _: object) -> None:
+                self.health = FakeHealth()
+                self.stop_event = asyncio.Event()
+
+            async def run(self, *_: object) -> dict[str, int]:
+                FailingThenHealthyWatcher.starts += 1
+                if FailingThenHealthyWatcher.starts == 1:
+                    raise RuntimeError("fixture watcher failure")
+                await self.stop_event.wait()
+                return {}
+
+            def stop(self) -> None:
+                self.stop_event.set()
+
+        class FakeService:
+            adapter = object()
+
+            def __init__(self, wallets: list[str]) -> None:
+                self.wallets = wallets
+
+            def monitored_execution_wallets(self) -> list[str]: return self.wallets
             async def ingest_watched_fills(self, *_: object) -> None: pass
             async def ingest_watched_state(self, *_: object) -> None: pass
             async def ingest_market_update(self, *_: object) -> None: pass
             async def reconcile_monitored_wallets(self) -> dict[str, int]: return {}
 
+        async def wait_until(predicate: object) -> None:
+            for _ in range(100):
+                value = predicate() if callable(predicate) else False
+                if asyncio.iscoroutine(value):
+                    value = await value
+                if value:
+                    return
+                await asyncio.sleep(0.01)
+            self.fail("timed out waiting for watcher supervisor")
+
         with tempfile.TemporaryDirectory() as temp:
-            service = CopyTradeService(config(Path(temp)))
-            watcher = FakeWatcher(object())
-            app = create_control_center_app(service.config, service.database, watcher_service=FakeService(), watcher_factory=lambda _: watcher)
+            database_service = CopyTradeService(config(Path(temp)))
+            service = FakeService([WALLET_A])
+            app = create_control_center_app(
+                database_service.config, database_service.database, watcher_service=service, watcher_factory=FailingThenHealthyWatcher,
+                watcher_poll_interval_seconds=0.01, watcher_retry_delay_seconds=0.15, watcher_stop_timeout_seconds=0.1,
+            )
 
-            async def exercise_lifecycle() -> None:
+            async def exercise_retry_and_overflow() -> None:
+                health_endpoint = next(route.endpoint for route in app.routes if route.path == "/api/health")
+
+                async def watcher_state_is(state: str) -> bool:
+                    return (await health_endpoint())["watcher"]["state"] == state
+
+                async def recovered() -> bool:
+                    return FailingThenHealthyWatcher.starts >= 2 and await watcher_state_is("CONNECTED")
+
                 async with app.router.lifespan_context(app):
-                    await asyncio.sleep(0)
-                    health_endpoint = next(route.endpoint for route in app.routes if route.path == "/api/health")
+                    await wait_until(lambda: FailingThenHealthyWatcher.starts == 1)
                     health = await health_endpoint()
-                    self.assertEqual(health["watcher"]["state"], "CONNECTED")
-                    self.assertEqual(health["watcher"]["subscribed_target_count"], 1)
-                self.assertTrue(watcher.stopped)
+                    self.assertEqual(health["watcher"]["state"], "DEGRADED")
+                    self.assertIn("fixture watcher failure", health["watcher"]["supervisor_error"])
+                    self.assertTrue((await health_endpoint())["paper_only"])
+                    await wait_until(recovered)
 
-            asyncio.run(exercise_lifecycle())
-            self.assertEqual(watcher.calls, [[WALLET_A]])
+                    service.wallets = [f"0x{index:040x}" for index in range(11)]
+                    await wait_until(lambda: watcher_state_is("DEGRADED"))
+                    overflow = await health_endpoint()
+                    self.assertIn("maximum of 10", overflow["watcher"]["supervisor_error"])
+                    self.assertFalse(overflow["control"]["entries_allowed"])
+
+            asyncio.run(exercise_retry_and_overflow())

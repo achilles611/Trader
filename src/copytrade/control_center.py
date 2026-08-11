@@ -30,6 +30,7 @@ CONTROL_EXITING = "EXITING"
 CONTROL_PAUSED = "PAUSED"
 CONTROL_STATES = {CONTROL_RUNNING, CONTROL_ENTRIES_PAUSED, CONTROL_EXITING, CONTROL_PAUSED}
 OPERATOR_STATES = {"new", "approved", "shadow", "active", "muted", "rejected"}
+WATCHER_MAX_SUBSCRIPTIONS = 10
 
 
 def _load(value: str | None, default: Any) -> Any:
@@ -44,6 +45,197 @@ def _config_fingerprint(snapshot: dict[str, Any]) -> str:
     """Match Phase B's immutable configuration fingerprint without importing its pipeline at module load."""
     payload = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+class WatcherMembershipSupervisor:
+    """Own the one optional execution watcher used by the Control Center.
+
+    Membership is intentionally derived from the service on a short local poll:
+    active entry targets plus wallets that still need exit monitoring.  A
+    replacement waits for the previous watcher task to stop before it starts a
+    successor, so public fills are never processed by overlapping watchers.
+    """
+
+    def __init__(
+        self, watcher_service: Any, watcher_factory: Any, store: "ControlCenterStore", *,
+        poll_interval_seconds: float = 1.0, retry_delay_seconds: float = 3.0, stop_timeout_seconds: float = 3.0,
+    ) -> None:
+        self.watcher_service = watcher_service
+        self.watcher_factory = watcher_factory
+        self.store = store
+        self.poll_interval_seconds = max(0.05, poll_interval_seconds)
+        self.retry_delay_seconds = max(0.05, retry_delay_seconds)
+        self.stop_timeout_seconds = max(0.05, stop_timeout_seconds)
+        self._watcher: Any | None = None
+        self._watcher_task: asyncio.Task[Any] | None = None
+        self._desired_wallets: tuple[str, ...] = ()
+        self._subscribed_wallets: tuple[str, ...] = ()
+        self._state = "STARTING"
+        self._error = ""
+        self._last_membership_change: str | None = None
+        self._next_retry_at = 0.0
+        self._stopping = False
+        self._wake = asyncio.Event()
+        self._transition_lock = asyncio.Lock()
+
+    def wake(self) -> None:
+        """Request a prompt membership check after an operator/position change."""
+        self._wake.set()
+
+    def health(self) -> dict[str, Any]:
+        watcher_payload = self._watcher.health.as_dict() if self._watcher is not None else {}
+        watcher_state = str(watcher_payload.get("state") or "")
+        if self._state in {"IDLE", "STARTING", "DEGRADED", "STOPPED"}:
+            state = self._state
+        else:
+            state = watcher_state or "CONNECTED"
+        return {
+            **watcher_payload,
+            "state": state,
+            "supervisor_state": self._state,
+            "desired_wallets": list(self._desired_wallets),
+            "subscribed_wallets": list(self._subscribed_wallets),
+            "desired_target_count": len(self._desired_wallets),
+            "subscribed_target_count": len(self._subscribed_wallets),
+            "membership_in_sync": self._desired_wallets == self._subscribed_wallets and self._state in {"IDLE", "CONNECTED"},
+            "last_membership_change": self._last_membership_change,
+            "supervisor_error": self._error,
+            "per_target": watcher_payload.get("per_target", {}),
+        }
+
+    async def run(self) -> None:
+        try:
+            while not self._stopping:
+                try:
+                    desired = tuple(sorted({str(wallet).lower() for wallet in self.watcher_service.monitored_execution_wallets()}))
+                    await self._reconcile(desired)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # A watcher or transient local-service failure must never
+                    # end the FastAPI lifespan task.  Expose it and retry.
+                    self._state, self._error = "DEGRADED", str(exc)
+                    self._next_retry_at = asyncio.get_running_loop().time() + self.retry_delay_seconds
+                    await self._stop_current()
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=self.poll_interval_seconds)
+                except asyncio.TimeoutError:
+                    pass
+                self._wake.clear()
+        finally:
+            await self._stop_current()
+            self._state = "STOPPED"
+
+    async def stop(self) -> None:
+        self._stopping = True
+        self.wake()
+        await self._stop_current()
+        self._state = "STOPPED"
+
+    async def _reconcile(self, desired: tuple[str, ...]) -> None:
+        async with self._transition_lock:
+            if desired != self._desired_wallets:
+                self._desired_wallets = desired
+                self._last_membership_change = iso(utc_now())
+            await self._clear_finished_watcher()
+            if len(desired) > WATCHER_MAX_SUBSCRIPTIONS:
+                detail = (
+                    f"Execution watcher requires {len(desired)} subscriptions but supports a maximum of "
+                    f"{WATCHER_MAX_SUBSCRIPTIONS}. Reduce the Active cohort or close exit-only sleeves."
+                )
+                # A stale subset is not a valid subscription set.  Stop it
+                # before reporting the fail-safe degraded state.
+                await self._stop_current_locked()
+                self._state, self._error = "DEGRADED", detail
+                if self.store.control_state()["entries_allowed"]:
+                    self.store.set_control_state(CONTROL_ENTRIES_PAUSED, by="watcher_supervisor", note=detail)
+                return
+            if desired == self._subscribed_wallets and self._watcher_task is not None and not self._watcher_task.done():
+                self._state, self._error = "CONNECTED", ""
+                return
+            if not desired:
+                await self._stop_current_locked()
+                self._state, self._error = "IDLE", ""
+                return
+            loop = asyncio.get_running_loop()
+            if loop.time() < self._next_retry_at and self._watcher_task is None:
+                self._state = "DEGRADED"
+                return
+            await self._stop_current_locked()
+            self._state, self._error = "STARTING", ""
+            try:
+                watcher = self.watcher_factory(self.watcher_service.adapter)
+                self._watcher = watcher
+                self._watcher_task = asyncio.create_task(
+                    watcher.run(
+                        list(desired), self.watcher_service.ingest_watched_fills, self.watcher_service.ingest_watched_state,
+                        self.watcher_service.ingest_market_update, self._reconcile_snapshot(desired),
+                    )
+                )
+                self._subscribed_wallets = desired
+                self._last_membership_change = iso(utc_now())
+                await asyncio.sleep(0)
+                await self._clear_finished_watcher()
+                if self._watcher_task is not None:
+                    self._state = "CONNECTED"
+            except Exception as exc:
+                self._watcher = None
+                self._watcher_task = None
+                self._subscribed_wallets = ()
+                self._state, self._error = "DEGRADED", str(exc)
+                self._next_retry_at = loop.time() + self.retry_delay_seconds
+
+    def _reconcile_snapshot(self, wallets: tuple[str, ...]) -> Any:
+        async def reconcile() -> dict[str, int]:
+            per_wallet = getattr(self.watcher_service, "reconcile_wallet", None)
+            if callable(per_wallet):
+                result: dict[str, int] = {}
+                for wallet in wallets:
+                    result[wallet] = await per_wallet(wallet)
+                return result
+            fallback = self.watcher_service.reconcile_monitored_wallets()
+            return await fallback if asyncio.iscoroutine(fallback) else fallback
+        return reconcile
+
+    async def _clear_finished_watcher(self) -> None:
+        task = self._watcher_task
+        if task is None or not task.done():
+            return
+        try:
+            task.result()
+            error = "Execution watcher exited unexpectedly."
+        except asyncio.CancelledError:
+            error = ""
+        except Exception as exc:  # watcher failures must leave FastAPI alive
+            error = str(exc)
+        self._watcher, self._watcher_task, self._subscribed_wallets = None, None, ()
+        if not self._stopping:
+            self._state = "DEGRADED"
+            self._error = error or "Execution watcher stopped unexpectedly."
+            self._next_retry_at = asyncio.get_running_loop().time() + self.retry_delay_seconds
+
+    async def _stop_current(self) -> None:
+        async with self._transition_lock:
+            await self._stop_current_locked()
+
+    async def _stop_current_locked(self) -> None:
+        watcher, task = self._watcher, self._watcher_task
+        if watcher is not None:
+            try:
+                watcher.stop()
+            except Exception as exc:
+                self._error = self._error or f"Execution watcher stop failed: {exc}"
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=self.stop_timeout_seconds)
+            except asyncio.TimeoutError:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        elif task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        if self._subscribed_wallets:
+            self._last_membership_change = iso(utc_now())
+        self._watcher, self._watcher_task, self._subscribed_wallets = None, None, ()
 
 
 class ControlCenterStore:
@@ -194,7 +386,13 @@ class CopyControlCenter:
         watcher["active_entry_target_count"] = len(active_wallets)
         watcher["monitored_target_count"] = len(monitored_wallets)
         watcher["open_sleeve_wallet_count"] = len(monitored_wallets - active_wallets)
-        watcher["subscribed_target_count"] = len(watcher.get("per_target", {}))
+        watcher.setdefault("desired_wallets", [])
+        watcher.setdefault("subscribed_wallets", list(watcher.get("per_target", {})))
+        watcher.setdefault("desired_target_count", len(watcher["desired_wallets"]))
+        watcher.setdefault("subscribed_target_count", len(watcher["subscribed_wallets"]))
+        watcher.setdefault("membership_in_sync", watcher["desired_wallets"] == watcher["subscribed_wallets"])
+        watcher.setdefault("last_membership_change", None)
+        watcher.setdefault("supervisor_state", watcher.get("state", "NOT_ATTACHED"))
         return {
             "mode": self.config.mode,
             "paper_only": True,
@@ -488,6 +686,9 @@ class CopyControlCenter:
                 raise ValueError("Wallet cannot be activated because it lacks an eligible canonical Phase B score. No state change was made.")
             if score.get("config_fingerprint") != _config_fingerprint(self.config.snapshot()):
                 raise ValueError("Wallet cannot be activated because its Phase B analysis is stale. No state change was made.")
+            run = self.database.get_analysis_run(str(score.get("analysis_run_id") or ""))
+            if not run or run.get("status") not in {"completed", "completed_with_errors"}:
+                raise ValueError("Wallet cannot be activated because its canonical Phase B analysis run did not complete successfully. No state change was made.")
         before = target.status
         if not self.database.set_target_status(wallet, state):
             raise KeyError("Wallet was not found in the candidate universe.")
@@ -670,13 +871,16 @@ class CopyControlCenter:
         for sleeve in engine.portfolio.sleeves.values():
             if sleeve.is_open:
                 groups.setdefault((sleeve.target_wallet, sleeve.symbol), []).append(sleeve)
-        closed, skipped = [], []
+        attempted, closed, failed, skipped = [], [], [], []
         for (wallet, symbol), sleeves in groups.items():
             mark = next((item.current_mark for item in sleeves if item.current_mark and (now - item.updated_at).total_seconds() * 1000 <= self.config.paper_execution.market_data_max_age_ms), None)
             if not mark:
-                skipped.append({"wallet": wallet, "symbol": symbol, "reason": "no_fresh_market_reference"})
+                result = {"wallet": wallet, "symbol": symbol, "status": "skipped", "reason": "no_fresh_market_reference"}
+                attempted.append(result)
+                skipped.append(result)
                 self.store.record_activity(category="control", severity="warning", wallet=wallet, symbol=symbol,
-                    message="Could not close PAPER position: no fresh market reference", payload={"paper": True})
+                    message="Could not close PAPER position: no fresh market reference",
+                    payload={"paper": True, "attempt_status": "skipped", "remaining_open": True})
                 continue
             signal = CopySignal(
                 signal_id=stable_id("manual_paper_close", wallet, symbol, now), target_wallet=wallet, campaign_id=None,
@@ -686,13 +890,36 @@ class CopyControlCenter:
                 created_at=now, source_event_timestamp=now, reason="manual_close_all_paper_positions",
             )
             attempt = engine.process_signal(signal, received_at=now, market_price=float(mark), market_metadata={"market_reference_source": "persisted_live_mark", "paper_control": "close_all"})
-            closed.append({"wallet": wallet, "symbol": symbol, "status": attempt.status, "reason": attempt.reason})
-            self.store.record_activity(category="control", severity="warning", wallet=wallet, symbol=symbol,
-                message=f"Close-all PAPER action {attempt.status} for {symbol}", payload={"reason": attempt.reason, "paper": True})
-        partial = bool(skipped)
+            group_remaining = any(
+                position.target_wallet == wallet and position.symbol == symbol
+                for position in self.database.list_virtual_positions(open_only=True)
+            )
+            result = {"wallet": wallet, "symbol": symbol, "status": attempt.status, "reason": attempt.reason}
+            attempted.append(result)
+            if attempt.status == "filled" and not group_remaining:
+                closed.append(result)
+            else:
+                if attempt.status == "skipped":
+                    skipped.append(result)
+                failed.append({**result, "reason": attempt.reason if attempt.status != "filled" else "position_remains_open"})
+            self.store.record_activity(category="control", severity="info" if attempt.status == "filled" and not group_remaining else "warning", wallet=wallet, symbol=symbol,
+                message=f"Close-all PAPER action {attempt.status} for {symbol}",
+                payload={"reason": attempt.reason, "paper": True, "attempt_status": attempt.status, "remaining_open": group_remaining})
+        remaining_positions = self.database.list_virtual_positions(open_only=True)
+        remaining_open_positions = [
+            {"sleeve_id": position.sleeve_id, "wallet": position.target_wallet, "symbol": position.symbol,
+             "direction": position.direction, "quantity": position.quantity}
+            for position in remaining_positions
+        ]
+        partial = bool(remaining_open_positions)
         final = CONTROL_PAUSED if pause_after or partial else str(prior_state)
         note = "Exit + pause completed." if pause_after else "Close-all partially completed; new PAPER entries remain paused until explicitly resumed." if partial else "Close-all PAPER positions completed; entry state retained."
-        return {"status": "partial" if partial else "completed", "closed": closed, "skipped": skipped,
+        if partial:
+            self.store.record_activity(category="control", severity="warning", wallet=None, symbol=None,
+                message="Close-all PAPER positions incomplete; new PAPER entries remain paused.",
+                payload={"paper": True, "remaining_open_positions": remaining_open_positions, "failed": failed})
+        return {"status": "partial" if partial else "completed", "attempted": attempted, "closed": closed,
+                "failed": failed, "skipped": skipped, "remaining_open_positions": remaining_open_positions,
                 "control": self.store.set_control_state(final, note=note), "paper_only": True}
 
     def exit_and_pause(self) -> dict[str, Any]:
@@ -702,6 +929,8 @@ class CopyControlCenter:
 def create_control_center_app(
     config: CopyTradeConfig, database: CopyTradeDatabase | None = None, watcher_health: dict[str, Any] | Any | None = None,
     *, watcher_service: Any | None = None, watcher_factory: Any | None = None,
+    watcher_poll_interval_seconds: float = 1.0, watcher_retry_delay_seconds: float = 3.0,
+    watcher_stop_timeout_seconds: float = 3.0,
 ) -> Any:
     """Create the local FastAPI Phase C application; no live-trading routes exist."""
     try:
@@ -715,15 +944,17 @@ def create_control_center_app(
     watcher_runtime: dict[str, Any] = {}
 
     def live_watcher_health() -> dict[str, Any] | None:
-        watcher = watcher_runtime.get("watcher")
-        if watcher is not None:
-            payload = watcher.health.as_dict()
-            if watcher_runtime.get("detail"):
-                payload["detail"] = watcher_runtime["detail"]
-            return payload
+        supervisor = watcher_runtime.get("supervisor")
+        if supervisor is not None:
+            return supervisor.health()
         if callable(watcher_health):
             return watcher_health()
         return watcher_health
+
+    def refresh_watcher_membership() -> None:
+        supervisor = watcher_runtime.get("supervisor")
+        if supervisor is not None:
+            supervisor.wake()
 
     @asynccontextmanager
     async def lifespan(_: Any) -> Any:
@@ -733,27 +964,22 @@ def create_control_center_app(
                 factory = HyperliquidWatcher
             else:
                 factory = watcher_factory
-            watcher = factory(watcher_service.adapter)
-            watcher_runtime["watcher"] = watcher
-            wallets = watcher_service.monitored_execution_wallets()
-            if wallets:
-                watcher_runtime["task"] = asyncio.create_task(
-                    watcher.run(
-                        wallets, watcher_service.ingest_watched_fills, watcher_service.ingest_watched_state,
-                        watcher_service.ingest_market_update, watcher_service.reconcile_monitored_wallets,
-                    )
-                )
-            else:
-                watcher_runtime["detail"] = "No active targets or open paper sleeves to subscribe."
+            supervisor = WatcherMembershipSupervisor(
+                watcher_service, factory, center.store,
+                poll_interval_seconds=watcher_poll_interval_seconds,
+                retry_delay_seconds=watcher_retry_delay_seconds,
+                stop_timeout_seconds=watcher_stop_timeout_seconds,
+            )
+            watcher_runtime["supervisor"] = supervisor
+            watcher_runtime["task"] = asyncio.create_task(supervisor.run())
         try:
             yield
         finally:
-            watcher = watcher_runtime.get("watcher")
+            supervisor = watcher_runtime.get("supervisor")
             task = watcher_runtime.get("task")
-            if watcher is not None:
-                watcher.stop()
+            if supervisor is not None:
+                await supervisor.stop()
             if task is not None:
-                task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
 
     app = FastAPI(title="Trader Copy Control Center", version="1.0", docs_url=None, redoc_url=None,
@@ -805,7 +1031,9 @@ def create_control_center_app(
         if state not in OPERATOR_STATES:
             raise HTTPException(status_code=400, detail="Unsupported operator state.")
         try:
-            return center.set_operator_state(required_wallet(wallet), state, allow_overflow=bool(body.get("allow_overflow", False)))
+            result = center.set_operator_state(required_wallet(wallet), state, allow_overflow=bool(body.get("allow_overflow", False)))
+            refresh_watcher_membership()
+            return result
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -849,11 +1077,15 @@ def create_control_center_app(
 
     @app.post("/api/controls/close-all-paper-positions")
     async def api_close_all() -> dict[str, Any]:
-        return center.close_all_paper_positions()
+        result = center.close_all_paper_positions()
+        refresh_watcher_membership()
+        return result
 
     @app.post("/api/controls/exit-and-pause")
     async def api_exit_pause() -> dict[str, Any]:
-        return center.exit_and_pause()
+        result = center.exit_and_pause()
+        refresh_watcher_membership()
+        return result
 
     @app.websocket("/ws")
     async def ws_updates(websocket: WebSocket) -> None:
