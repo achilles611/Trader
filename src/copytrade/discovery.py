@@ -6,7 +6,8 @@ import re
 from datetime import datetime, timedelta
 from itertools import chain
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Protocol, TextIO
+from dataclasses import dataclass
+from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, TextIO
 from urllib.parse import urlparse
 
 from .models import DiscoveryObservation, DiscoveryRun, DiscoverySummary, as_utc, new_run_id, stable_id, utc_now
@@ -15,6 +16,28 @@ from .storage import CopyTradeDatabase
 
 class DiscoveryProviderError(RuntimeError):
     """Raised when a source cannot be acquired safely or interpreted reliably."""
+
+
+class DiscoveryRecordError(DiscoveryProviderError):
+    """A single recognized event is malformed and can be quarantined safely."""
+
+    category = "malformed_event"
+
+
+class DiscoveryUnsupportedRecordError(DiscoveryRecordError):
+    """A record nested in a supported envelope has no supported event shape."""
+
+    category = "unsupported_record"
+
+
+@dataclass(frozen=True)
+class DiscoveryIssue:
+    category: str
+    message: str
+    source: str
+    record_index: int
+    event_index: int | None
+    raw_record: object
 
 
 class CandidateDiscoveryAdapter(Protocol):
@@ -58,7 +81,7 @@ class LocalNodeTradeFileTransport:
                 try:
                     import lz4.frame
                 except ImportError as exc:
-                    raise DiscoveryProviderError(f"Reading LZ4 HyperCore data ({path}) requires optional lz4.") from exc
+                    raise DiscoveryProviderError(f"Reading LZ4 HyperCore data ({path}) requires the lz4 dependency.") from exc
                 with lz4.frame.open(path, mode="rt", encoding="utf-8") as stream:
                     yield from _iter_json_records(stream, str(path))
             else:
@@ -81,7 +104,7 @@ class RequesterPaysS3NodeTradeTransport:
             import boto3
         except ImportError as exc:
             raise DiscoveryProviderError(
-                "Direct Hyperliquid S3 discovery requires optional boto3 plus configured AWS requester-pays credentials; "
+                "Direct Hyperliquid S3 discovery requires the boto3 dependency plus configured AWS requester-pays credentials; "
                 "download the node data first and use --source hypercore-file instead."
             ) from exc
         client = boto3.client("s3")
@@ -100,7 +123,7 @@ class RequesterPaysS3NodeTradeTransport:
                     try:
                         import lz4.frame
                     except ImportError as exc:
-                        raise DiscoveryProviderError(f"Reading LZ4 HyperCore data ({uri}) requires optional lz4.") from exc
+                        raise DiscoveryProviderError(f"Reading LZ4 HyperCore data ({uri}) requires the lz4 dependency.") from exc
                     with lz4.frame.open(body, mode="rt", encoding="utf-8") as stream:
                         yield from _iter_json_records(stream, uri)
                 else:
@@ -120,15 +143,52 @@ class HyperCoreNodeTradeDiscoveryProvider:
 
     def __init__(self, transport: HyperCoreNodeTradeTransport) -> None:
         self.transport = transport
+        self._issues: list[DiscoveryIssue] = []
+        self._valid_events = 0
+
+    @property
+    def discovery_issues(self) -> tuple[DiscoveryIssue, ...]:
+        return tuple(self._issues)
+
+    @property
+    def discovery_stats(self) -> dict[str, int]:
+        return {
+            "valid_events": self._valid_events,
+            "malformed_events": sum(issue.category == "malformed_event" for issue in self._issues),
+            "unsupported_records": sum(issue.category == "unsupported_record" for issue in self._issues),
+        }
 
     def discover(self, *, refresh: bool = False) -> Iterable[DiscoveryObservation]:
         observed_at = utc_now()
         saw_record = False
-        for record in self.transport.iter_trades(refresh=refresh):
+        self._issues = []
+        self._valid_events = 0
+        for record_index, record in enumerate(self.transport.iter_trades(refresh=refresh), 1):
             saw_record = True
-            yield from _normalize_hypercore_record(record, observed_at, type(self.transport).__name__)
+            try:
+                yield from _normalize_hypercore_record(
+                    record, observed_at, type(self.transport).__name__,
+                    on_valid_event=self._mark_valid_event,
+                    on_issue=lambda exc, event_index, event: self._record_issue(
+                        exc, record_index=record_index, event_index=event_index, raw_record=event,
+                    ),
+                )
+            except DiscoveryRecordError as exc:
+                self._record_issue(exc, record_index=record_index, event_index=None, raw_record=record)
+                continue
         if not saw_record:
             raise DiscoveryProviderError("HyperCore discovery input contained no JSON records.")
+
+    def _mark_valid_event(self) -> None:
+        self._valid_events += 1
+
+    def _record_issue(
+        self, exc: DiscoveryRecordError, *, record_index: int, event_index: int | None, raw_record: object,
+    ) -> None:
+        self._issues.append(DiscoveryIssue(
+            category=exc.category, message=str(exc), source=type(self.transport).__name__,
+            record_index=record_index, event_index=event_index, raw_record=raw_record,
+        ))
 
 
 class DiscoveryPipeline:
@@ -158,19 +218,42 @@ class DiscoveryPipeline:
         )
         self.database.start_discovery_run(run)
         try:
-            invalid_wallets = self.database.stage_discovery_observations(
-                run.run_id, provider.discover(refresh=refresh), batch_size=self.batch_size,
+            stage = self.database.new_discovery_stage_stats()
+            self.database.stage_discovery_observations(
+                run.run_id, provider.discover(refresh=refresh), batch_size=self.batch_size, statistics=stage,
             )
+            source_stats = getattr(provider, "discovery_stats", {})
+            source_issues = getattr(provider, "discovery_issues", ())
+            self.database.record_discovery_rejections(run.run_id, tuple(source_issues) + tuple(stage.rejections))
             return self.database.complete_discovery_run(
                 run, limit=limit, min_activity=min_activity, max_activity_age_seconds=age_seconds,
-                invalid_wallets=invalid_wallets,
+                valid_events=int(source_stats.get("valid_events", stage.normalized_observations)),
+                normalized_observations=stage.normalized_observations, duplicate_events=stage.duplicate_events,
+                invalid_wallets=stage.invalid_wallets, malformed_events=int(source_stats.get("malformed_events", 0)),
+                unsupported_records=int(source_stats.get("unsupported_records", 0)),
             )
         except Exception as exc:
             # Candidate state is only changed during completion. Remove staged
             # partial evidence so a malformed/provider-failed run stays auditable
             # as failed without looking like a completed source observation.
+            stage = locals().get("stage") or self.database.new_discovery_stage_stats()
+            source_stats = getattr(provider, "discovery_stats", {})
+            source_issues = getattr(provider, "discovery_issues", ())
+            self.database.record_discovery_rejections(
+                run.run_id,
+                tuple(source_issues) + tuple(stage.rejections) + ({
+                    "category": "fatal_source_error", "message": str(exc), "source": provider.source_name,
+                    "record_index": None, "event_index": None, "raw_record": {},
+                },),
+            )
             self.database.discard_discovery_observations(run.run_id)
-            self.database.finish_discovery_run(run.run_id, status="failed", errors=(str(exc),))
+            self.database.finish_discovery_run(
+                run.run_id, status="failed", errors=(str(exc),),
+                valid_events=int(source_stats.get("valid_events", stage.normalized_observations)),
+                normalized_observations=stage.normalized_observations, duplicate_events=stage.duplicate_events,
+                invalid_wallets=stage.invalid_wallets, malformed_events=int(source_stats.get("malformed_events", 0)),
+                unsupported_records=int(source_stats.get("unsupported_records", 0)), fatal_source_errors=1,
+            )
             if isinstance(exc, DiscoveryProviderError):
                 raise
             raise DiscoveryProviderError(f"Discovery provider {provider.source_name} failed: {exc}") from exc
@@ -199,25 +282,35 @@ def parse_activity_age(value: str | None) -> timedelta | None:
 
 
 def _normalize_hypercore_record(
-    record: Mapping[str, Any], observed_at: datetime, transport_name: str,
+    record: Mapping[str, Any], observed_at: datetime, transport_name: str, *,
+    on_valid_event: Callable[[], None] | None = None,
+    on_issue: Callable[[DiscoveryRecordError, int, object], None] | None = None,
 ) -> Iterator[DiscoveryObservation]:
     if not isinstance(record, Mapping):
         raise DiscoveryProviderError("HyperCore input record must be a JSON object.")
     if "side_info" in record:
-        yield from _normalize_node_trade(record, observed_at, transport_name)
+        yield from _normalize_node_trade(record, observed_at, transport_name, on_valid_event=on_valid_event)
         return
     if "events" in record:
         events = record.get("events")
         if not isinstance(events, list) or not any(key in record for key in ("block_number", "block_time", "local_time")):
             raise DiscoveryProviderError("Unsupported HyperCore block record: expected node_fills_by_block {block_number, events:[fill...] }.")
         block_meta = {key: record.get(key) for key in ("local_time", "block_time", "block_number") if record.get(key) is not None}
-        for event in events:
-            if not isinstance(event, Mapping):
-                raise DiscoveryProviderError("Unsupported node_fills_by_block event: expected a fill object.")
-            yield from _normalize_node_fill(event, observed_at, transport_name, "node_fills_by_block", block_meta)
+        for event_index, event in enumerate(events):
+            event_meta = {**block_meta, "block_event_index": event_index}
+            try:
+                fill, user_override = _block_event_fill(event)
+                yield from _normalize_node_fill(
+                    fill, observed_at, transport_name, "node_fills_by_block", event_meta,
+                    user_override=user_override, on_valid_event=on_valid_event,
+                )
+            except DiscoveryRecordError as exc:
+                if on_issue is None:
+                    raise
+                on_issue(exc, event_index, event)
         return
     if _looks_like_fill(record):
-        yield from _normalize_node_fill(record, observed_at, transport_name, "node_fills", {})
+        yield from _normalize_node_fill(record, observed_at, transport_name, "node_fills", {}, on_valid_event=on_valid_event)
         return
     raise DiscoveryProviderError(
         "Unsupported HyperCore discovery schema. Supported formats are node_trades (side_info), "
@@ -225,20 +318,42 @@ def _normalize_hypercore_record(
     )
 
 
-def _normalize_node_trade(record: Mapping[str, Any], observed_at: datetime, transport_name: str) -> Iterator[DiscoveryObservation]:
+def _block_event_fill(event: object) -> tuple[Mapping[str, Any], str | None]:
+    """Accept a bare fill or HyperCore's production ``[wallet, fill]`` pair."""
+    if isinstance(event, Mapping):
+        return event, None
+    if isinstance(event, (list, tuple)):
+        if len(event) != 2 or not isinstance(event[1], Mapping):
+            raise DiscoveryUnsupportedRecordError(
+                "Unsupported node_fills_by_block event: expected a fill object or [wallet, fill] pair."
+            )
+        outer_wallet = event[0]
+        return event[1], str(outer_wallet) if outer_wallet not in (None, "") else None
+    raise DiscoveryUnsupportedRecordError(
+        "Unsupported node_fills_by_block event: expected a fill object or [wallet, fill] pair."
+    )
+
+
+def _normalize_node_trade(
+    record: Mapping[str, Any], observed_at: datetime, transport_name: str, *, on_valid_event: Callable[[], None] | None = None,
+) -> Iterator[DiscoveryObservation]:
     sides = record.get("side_info")
     if not isinstance(sides, list) or len(sides) != 2 or record.get("time") in (None, ""):
-        raise DiscoveryProviderError("Unsupported node_trades record: expected two side_info users plus time, coin, px, and sz.")
+        raise DiscoveryRecordError("Unsupported node_trades record: expected two side_info users plus time, coin, px, and sz.")
     try:
         activity_at = as_utc(record["time"])
         price, size = float(record.get("px") or 0), abs(float(record.get("sz") or 0))
     except (TypeError, ValueError) as exc:
-        raise DiscoveryProviderError("Malformed node_trades price, size, or time.") from exc
+        raise DiscoveryRecordError("Malformed node_trades price, size, or time.") from exc
     if not str(record.get("coin") or record.get("symbol") or ""):
-        raise DiscoveryProviderError("Malformed node_trades record: missing coin/symbol.")
+        raise DiscoveryRecordError("Malformed node_trades record: missing coin/symbol.")
     for index, side in enumerate(sides):
         if not isinstance(side, Mapping):
-            raise DiscoveryProviderError("Malformed node_trades side_info entry.")
+            raise DiscoveryRecordError("Malformed node_trades side_info entry.")
+    if on_valid_event is not None:
+        on_valid_event()
+    for index, side in enumerate(sides):
+        assert isinstance(side, Mapping)
         wallet = str(side.get("user") or "").lower()
         evidence_id = _hypercore_event_id(record, wallet)
         yield DiscoveryObservation(
@@ -252,32 +367,36 @@ def _normalize_node_trade(record: Mapping[str, Any], observed_at: datetime, tran
 
 def _normalize_node_fill(
     record: Mapping[str, Any], observed_at: datetime, transport_name: str, format_name: str,
-    block_meta: Mapping[str, Any], user_override: str | None = None,
+    block_meta: Mapping[str, Any], user_override: str | None = None, *, on_valid_event: Callable[[], None] | None = None,
 ) -> Iterator[DiscoveryObservation]:
     # Some node writers wrap API-format fills as {user, fill} or {user, fills}.
     if isinstance(record.get("fills"), list):
         outer_user = str(record.get("user") or user_override or "")
         for item in record["fills"]:
             if not isinstance(item, Mapping):
-                raise DiscoveryProviderError(f"Malformed {format_name} fills wrapper.")
-            yield from _normalize_node_fill(item, observed_at, transport_name, format_name, block_meta, outer_user)
+                raise DiscoveryRecordError(f"Malformed {format_name} fills wrapper.")
+            yield from _normalize_node_fill(
+                item, observed_at, transport_name, format_name, block_meta, outer_user, on_valid_event=on_valid_event,
+            )
         return
     fill = record.get("fill") if isinstance(record.get("fill"), Mapping) else record
     if not isinstance(fill, Mapping):
-        raise DiscoveryProviderError(f"Malformed {format_name} fill record.")
+        raise DiscoveryRecordError(f"Malformed {format_name} fill record.")
     wallet = str(fill.get("user") or record.get("user") or user_override or "").lower()
     timestamp = fill.get("time") or fill.get("timestamp") or block_meta.get("block_time") or block_meta.get("local_time")
     symbol = str(fill.get("coin") or fill.get("symbol") or "")
     if not wallet or timestamp in (None, "") or not symbol or (fill.get("px") is None and fill.get("price") is None) or (fill.get("sz") is None and fill.get("size") is None):
-        raise DiscoveryProviderError(
+        raise DiscoveryRecordError(
             f"Unsupported {format_name} fill: expected user, time, coin/symbol, px/price, and sz/size fields."
         )
     try:
         activity_at = as_utc(timestamp)
         price, size = float(fill.get("px") or fill.get("price")), abs(float(fill.get("sz") or fill.get("size")))
     except (TypeError, ValueError) as exc:
-        raise DiscoveryProviderError(f"Malformed {format_name} price, size, or time.") from exc
+        raise DiscoveryRecordError(f"Malformed {format_name} price, size, or time.") from exc
     evidence_id = _hypercore_event_id(fill, wallet, block_meta)
+    if on_valid_event is not None:
+        on_valid_event()
     yield DiscoveryObservation(
         wallet=wallet, source=HyperCoreNodeTradeDiscoveryProvider.source_name, observed_at=as_utc(observed_at),
         recent_activity_at=activity_at, source_score=price * size if price > 0 and size > 0 else None,
@@ -287,7 +406,10 @@ def _normalize_node_fill(
 
 
 def _looks_like_fill(record: Mapping[str, Any]) -> bool:
-    return "user" in record and any(key in record for key in ("coin", "symbol", "px", "price", "sz", "size"))
+    return "user" in record and (
+        any(key in record for key in ("coin", "symbol", "px", "price", "sz", "size"))
+        or isinstance(record.get("fill"), Mapping) or isinstance(record.get("fills"), list)
+    )
 
 
 def _hypercore_event_id(payload: Mapping[str, Any], wallet: str, block_meta: Mapping[str, Any] | None = None) -> str:
@@ -301,6 +423,7 @@ def _hypercore_event_id(payload: Mapping[str, Any], wallet: str, block_meta: Map
         str(payload.get("time") or payload.get("timestamp") or (block_meta or {}).get("block_time") or ""),
         str(payload.get("px") or payload.get("price") or ""), str(payload.get("sz") or payload.get("size") or ""),
         str((block_meta or {}).get("block_number") or ""),
+        str((block_meta or {}).get("block_event_index") or ""),
     ]
     return stable_id("hypercore_discovery_event", *parts)
 

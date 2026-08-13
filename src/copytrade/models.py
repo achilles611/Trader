@@ -144,6 +144,13 @@ class DiscoveryRun:
     filtered_wallets: int = 0
     queued_for_analysis: int = 0
     errors: tuple[str, ...] = ()
+    valid_events: int = 0
+    normalized_observations: int = 0
+    duplicate_events: int = 0
+    invalid_wallets: int = 0
+    malformed_events: int = 0
+    unsupported_records: int = 0
+    fatal_source_errors: int = 0
 
 
 @dataclass(frozen=True)
@@ -159,6 +166,13 @@ class DiscoverySummary:
     filtered_wallets: int
     queued_for_analysis: int
     errors: tuple[str, ...] = ()
+    valid_events: int = 0
+    normalized_observations: int = 0
+    duplicate_events: int = 0
+    invalid_wallets: int = 0
+    malformed_events: int = 0
+    unsupported_records: int = 0
+    fatal_source_errors: int = 0
 
 
 @dataclass(frozen=True)
@@ -536,6 +550,9 @@ class CandidateScore:
     provenance: str = "legacy"
     analysis_run_id: str | None = None
     config_fingerprint: str | None = None
+    confidence_score: float = 0.0
+    hard_gates: tuple[str, ...] = ()
+    score_version: str = "phase_b_suitability_v3"
 
 
 def new_run_id(prefix: str = "copyrun") -> str:

@@ -171,13 +171,22 @@ class ObsidianExporter:
             copyability = summary.get("copyability", {}) if isinstance(summary, dict) else {}
             coverage = summary.get("coverage", {}) if isinstance(summary, dict) else {}
             walk_forward = summary.get("walk_forward_evaluation", {}) if isinstance(summary, dict) else {}
+            suitability = summary.get("score", {}) if isinstance(summary, dict) else {}
+            confidence = summary.get("confidence", {}) if isinstance(summary, dict) else {}
+            regime = summary.get("regime", {}) if isinstance(summary, dict) else {}
+            pathology = summary.get("pathology", {}) if isinstance(summary, dict) else {}
+            stress = summary.get("stress_tests", {}) if isinstance(summary, dict) else {}
             phase_b = (
                 "\n## Phase B research analysis\n\n"
                 f"- Lifecycle: {analysis.lifecycle_status}; reasons: {', '.join(analysis.prefilter_reasons) or 'none'}\n"
+                f"- Suitability: {suitability.get('total', 'n/a')}; confidence: {confidence.get('score', suitability.get('confidence', 'n/a'))}; hard gates: {', '.join(suitability.get('hard_gates', [])) or 'none'}\n"
                 f"- Follower net P&L: {float(follower.get('net_pnl', 0.0)):.2f}; follower drawdown: {float(follower.get('max_drawdown', 0.0)):.2%}\n"
                 f"- Copyability: {copyability.get('status', 'unavailable')} ({copyability.get('score', 'n/a')}); denominator: {copyability.get('denominator', 'n/a')} from {copyability.get('denominator_source', 'unavailable')}\n"
                 f"- Analysis-window coverage: {coverage.get('coverage_state', 'UNPROVEN')} ({coverage.get('required_start', 'not recorded')} to {coverage.get('required_end', 'not recorded')})\n"
                 f"- Walk-forward evidence: {walk_forward.get('status', 'unavailable')}; windows: {walk_forward.get('window_count', 0)}; score: {walk_forward.get('score', 'n/a')}\n"
+                f"- Regime evidence: {regime.get('status', 'unavailable')}; represented: {regime.get('represented_regime_count', 0)}; method: {regime.get('method', 'n/a')}\n"
+                f"- Friction: slippage break-even {stress.get('slippage', {}).get('break_even_slippage_bps', 'n/a')}; latency break-even {stress.get('latency', {}).get('break_even_latency_ms', 'n/a')}\n"
+                f"- Pathology indicators: {', '.join(pathology.get('reason_codes', [])) or 'none'}\n"
                 f"- Analysis errors: {', '.join(analysis.errors) or 'none'}\n"
             )
         return (
