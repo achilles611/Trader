@@ -80,9 +80,14 @@ class CopyTradeBacktester:
                     if historical is not None:
                         market_price = historical.price
                         market_metadata = {"source": historical.source, "quality": historical.quality,
-                                           "market_timestamp": as_utc(historical.timestamp).isoformat(), "reference_price": historical.price}
+                                           "market_timestamp": as_utc(historical.timestamp).isoformat(), "reference_price": historical.price,
+                                           "requested_for_timestamp": as_utc(historical.requested_for_timestamp or execution_at).isoformat(),
+                                           "resolution": historical.resolution or "unspecified"}
                     else:
-                        market_metadata = {"source": "unavailable", "quality": "missing_historical_price", "market_timestamp": None}
+                        market_metadata = {
+                            "source": "unavailable", "quality": "missing_historical_price", "market_timestamp": None,
+                            "requested_for_timestamp": execution_at.isoformat(), "resolution": "unspecified",
+                        }
                 market_observations.append({"event_id": event.event_id, "target_fill_price": event.price, "execution_price": market_price, **market_metadata})
                 attempts.append(engine.process_signal(signal, received_at=received, market_price=market_price, market_metadata=market_metadata))
                 if signal.action in {"open", "add"}:
@@ -128,7 +133,9 @@ class CopyTradeBacktester:
             ),
             "skip_reasons": _count([item.reason for item in attempts if item.status != "filled"]),
             "market_observations": market_observations,
-            "market_data_complete": bool(self.market_data) and all(item.get("quality") != "missing_historical_price" for item in market_observations),
+            "market_data_complete": bool(self.market_data) and bool(market_observations) and all(
+                item.get("quality") != "missing_historical_price" for item in market_observations
+            ),
             "equity_enrichment": self._equity_enrichment_summary(replay_events),
             "sizing_decisions": sizing_decisions,
             "coverage": dict(coverage_metadata or {}),
