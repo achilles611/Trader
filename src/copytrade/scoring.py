@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
-from .config import CandidateConfig
+from .config import CandidateConfig, ConfidenceConfig
 from .models import CandidateScore, TraderMetrics, utc_now
 
 
@@ -24,13 +24,19 @@ class FollowerMetrics:
     walk_forward_score: float | None = None
     walk_forward_status: str = "unavailable"
     walk_forward_window_count: int = 0
+    friction_robustness: float | None = None
+    regime_robustness: float | None = None
 
 
 def score_candidate(
     metrics: TraderMetrics, config: CandidateConfig, follower: FollowerMetrics | None = None,
-    *, source_quality: float = 1.0, diversification: float = 0.5,
+    *, source_quality: float = 1.0, diversification: float = 0.5, confidence_score: float = 0.0,
 ) -> CandidateScore:
     follower = follower or FollowerMetrics()
+    # Portfolio diversification is a selection-stage concern.  Keep this
+    # legacy argument harmless for callers while never blending it into the
+    # stored single-wallet suitability score.
+    del diversification
     reasons: list[str] = []
     if metrics.history_days < config.history_days_min:
         reasons.append("insufficient_history")
@@ -65,6 +71,8 @@ def score_candidate(
         reasons.append("latency_unavailable")
     if follower.copyability_score is None:
         reasons.append("copyability_unavailable")
+    elif follower.copyability_score < config.minimum_copyability_hard:
+        reasons.append("copyability_hard_limit")
     if follower.walk_forward_score is None or follower.walk_forward_status != "available":
         reasons.append("walk_forward_unavailable")
     components = {
@@ -74,7 +82,6 @@ def score_candidate(
         "consistency": _clamp01((metrics.shrunk_win_rate + min(metrics.profit_factor, 2.0) / 2) / 2),
         "history_quality": _clamp01(min(metrics.history_days / max(config.history_days_preferred, 1), metrics.closed_campaign_count / max(config.closed_campaigns_min, 1))),
         "position_size_stability": _clamp01(1 - metrics.entry_size_variance / max(metrics.median_entry_size_fraction ** 2, 0.01)),
-        "diversification": _clamp01(diversification),
         "source_quality": _clamp01(source_quality),
     }
     if follower.return_fraction is not None:
@@ -84,6 +91,10 @@ def score_candidate(
         components["copyability"] = _clamp01((follower.copyability_score + friction) / 2)
     if follower.walk_forward_score is not None and follower.walk_forward_status == "available":
         components["walk_forward"] = _clamp01(follower.walk_forward_score)
+    if follower.friction_robustness is not None:
+        components["friction_robustness"] = _clamp01(follower.friction_robustness)
+    if follower.regime_robustness is not None:
+        components["regime_robustness"] = _clamp01(follower.regime_robustness)
     active_weights = {name: weight for name, weight in config.score_weights.items() if name in components}
     if latency_available:
         components["latency_survivability"] = latency_survival
@@ -110,25 +121,61 @@ def score_candidate(
         )
     if liquidation_frequency >= config.liquidation_frequency_hard:
         reasons.append("liquidation_frequency_hard_limit")
-    if metrics.pnl_concentration_best > 0.5:
-        penalties["concentration"] = config.penalty_weights.get("concentration", 0.0) * metrics.pnl_concentration_best
+    if metrics.pnl_concentration_best > config.pnl_concentration_preferred:
+        excess = (metrics.pnl_concentration_best - config.pnl_concentration_preferred) / max(
+            1 - config.pnl_concentration_preferred, 1e-12,
+        )
+        penalties["jackpot_concentration"] = config.penalty_weights.get("jackpot_concentration", config.penalty_weights.get("concentration", 0.0)) * _clamp01(excess)
+        reasons.append("jackpot_concentration")
+    if config.pnl_concentration_hard < 1.0 and metrics.pnl_concentration_best >= config.pnl_concentration_hard:
+        reasons.append("pnl_concentration_hard_limit")
     if metrics.closed_campaign_count < config.closed_campaigns_min:
         penalties["small_sample"] = config.penalty_weights.get("small_sample", 0.0)
     if metrics.activity_recency_days is not None and metrics.activity_recency_days > config.activity_max_age_days:
         penalties["inactivity"] = config.penalty_weights.get("inactivity", 0.0)
     if latency_survival is not None and latency_survival < 0.4:
         penalties["latency_decay"] = config.penalty_weights.get("latency_decay", 0.0) * (1 - latency_survival)
+    if follower.friction_robustness is not None and follower.friction_robustness < 0.4:
+        penalties["friction_sensitivity"] = config.penalty_weights.get("friction_sensitivity", 0.0) * (1 - follower.friction_robustness)
+    if follower.regime_robustness is not None and follower.regime_robustness < 0.4:
+        penalties["regime_dependency"] = config.penalty_weights.get("regime_dependency", 0.0) * (1 - follower.regime_robustness)
     if metrics.fifth_percentile < -abs(metrics.average_winner) * 3:
         penalties["negative_skew"] = config.penalty_weights.get("negative_skew", 0.0)
     total = max(0.0, min(100.0, sum(weighted.values()) - sum(penalties.values())))
+    soft_reasons = {
+        "latency_unavailable", "copyability_unavailable", "coverage_unproven", "walk_forward_unavailable",
+        "jackpot_concentration",
+    }
+    hard_gates = tuple(sorted(
+        reason for reason in reasons
+        if reason not in soft_reasons or (reason == "coverage_unproven" and config.require_proven_history)
+    ))
     return CandidateScore(
         target_wallet=metrics.target_wallet, calculated_at=utc_now(), total_score=total,
         component_scores=weighted, penalties=penalties,
-        eligible=not [reason for reason in reasons if reason not in {
-            "latency_unavailable", "copyability_unavailable", "coverage_unproven", "walk_forward_unavailable",
-        } or (reason == "coverage_unproven" and config.require_proven_history)], reasons=tuple(reasons),
+        eligible=not hard_gates, reasons=tuple(sorted(set(reasons))), hard_gates=hard_gates,
+        confidence_score=max(0.0, min(100.0, confidence_score)),
         source_quality=source_quality,
     )
+
+
+def suitability_confidence(
+    metrics: TraderMetrics, config: ConfidenceConfig, *, coverage_state: str,
+    walk_forward_windows: int, represented_regimes: int,
+) -> dict[str, object]:
+    """Deterministic evidence strength, deliberately independent of return quality."""
+    active_days = int(metrics.raw.get("active_days", 0) or 0)
+    factors = {
+        "closed_campaign_sample": _clamp01(metrics.closed_campaign_count / max(config.closed_campaigns_reference, 1)),
+        "active_days": _clamp01(active_days / max(config.active_days_reference, 1)),
+        "history_span": _clamp01(metrics.history_days / max(config.history_days_reference, 1)),
+        "walk_forward_windows": _clamp01(walk_forward_windows / max(config.walk_forward_windows_reference, 1)),
+        "regime_representation": _clamp01(represented_regimes / max(config.regimes_reference, 1)),
+        "coverage": 1.0 if coverage_state == "PROVEN_COMPLETE" else (0.65 if coverage_state == "UNPROVEN" else 0.0),
+        "source_quality": _clamp01(float(metrics.raw.get("source_quality", 1.0) or 0.0)),
+    }
+    return {"score": 100.0 * sum(factors.values()) / len(factors), "factors": factors,
+            "coverage_state": coverage_state}
 
 
 def select_diverse_targets(

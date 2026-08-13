@@ -13,7 +13,7 @@ from .analytics import calculate_trader_metrics, campaign_return_series
 from .backtest import CopyTradeBacktester
 from .config import CopyTradeConfig
 from .models import AnalysisRun, CandidateAnalysis, CandidateAnalysisState, PositionCampaign, PositionEvent, as_utc, new_run_id, utc_now
-from .scoring import FollowerMetrics, score_candidate, select_diverse_targets_with_metadata
+from .scoring import FollowerMetrics, score_candidate, select_diverse_targets_with_metadata, suitability_confidence
 from .service import CopyTradeService
 
 
@@ -198,6 +198,12 @@ class CandidateAnalysisPipeline:
             "total_candidates": sum(state_counts.values()), "candidates": rows,
             "current_config_fingerprint": fingerprint,
             "stale_qualified_candidates": self.database.count_stale_qualified_candidates(fingerprint),
+            "run_funnels": {
+                str(run["run_id"]): self.database.analysis_funnel(
+                    str(run["run_id"]), high_suitability_score=self.config.analysis.high_suitability_score,
+                )
+                for run in self.database.list_analysis_runs(limit=20)
+            },
         }
 
     def shadow_finalists(self, *, count: int | None = None) -> list[dict[str, object]]:
@@ -231,8 +237,13 @@ class CandidateAnalysisPipeline:
             follower = analysis.get("follower", {}) if isinstance(analysis, dict) else {}
             finalists.append({
                 "rank": rank, "wallet": score.target_wallet, "score": score.total_score,
+                "base_suitability_score": score.total_score, "confidence_score": score.confidence_score,
+                "diversification_penalty": diversification["penalty"],
+                "final_selection_score": score.total_score - float(diversification["penalty"]),
                 "target": target, "follower": follower, "copyability": analysis.get("copyability", {}),
                 "data_quality": analysis.get("coverage", {}), "principal_risks": score.reasons,
+                "hard_gates": score.hard_gates, "pathology": analysis.get("pathology", {}),
+                "regime": analysis.get("regime", {}), "stress_tests": analysis.get("stress_tests", {}),
                 "diversification": diversification,
                 "current_config_fingerprint": current_fingerprint,
                 "candidate_config_fingerprint": score.config_fingerprint,
@@ -240,6 +251,31 @@ class CandidateAnalysisPipeline:
                 "selection_reason": "current qualified Phase B score with return-correlation and exposure-overlap diversification penalties",
             })
         return finalists
+
+    def suitability_report(self, wallet: str) -> dict[str, object]:
+        """Deterministic operator report from the immutable completed analysis summary."""
+        candidate = next(iter(self.database.list_analysis_candidates(wallets=[wallet], limit=1)), None)
+        if not candidate:
+            raise KeyError(f"Candidate not found: {wallet}")
+        summary = _json_object(candidate.get("analysis_summary", {}))
+        score = {
+            "suitability_score": candidate.get("total_score"), "confidence_score": candidate.get("confidence_score"),
+            "eligibility": bool(candidate.get("score_eligible")), "hard_gates": candidate.get("score_hard_gates", []),
+            "principal_risks": candidate.get("score_reasons", []), "score_version": candidate.get("score_version"),
+            "analysis_run_id": candidate.get("score_analysis_run_id"),
+            "config_fingerprint": candidate.get("candidate_config_fingerprint"),
+        }
+        return {
+            "wallet": str(candidate["wallet"]), "operator_status": candidate.get("current_status"),
+            "lifecycle_status": candidate.get("lifecycle_status"), "score": score,
+            "target_performance": summary.get("target_metrics", {}), "follower_performance": summary.get("follower", {}),
+            "copyability": summary.get("copyability", {}), "data_quality": summary.get("coverage", {}),
+            "walk_forward": summary.get("walk_forward_evaluation", {}), "regime_robustness": summary.get("regime", {}),
+            "friction_robustness": summary.get("stress_tests", {}), "pathology": summary.get("pathology", {}),
+            "analysis_window": summary.get("analysis_window", {}),
+            "why_it_might_fail": candidate.get("score_reasons", []),
+            "operator_action": "recommendation_only; no target status was changed",
+        }
 
     def _default_backfill(self, wallet: str, start: object) -> dict[str, object]:
         earliest = self.database.earliest_fill_time(wallet)
@@ -307,15 +343,27 @@ class CandidateAnalysisPipeline:
         if not _is_wallet(wallet):
             reasons.append("invalid_wallet")
         status = str(candidate.get("current_status") or "")
-        if status in _OPERATOR_CONTROLLED_TARGET_STATES:
+        if self.config.prefilter.exclude_operator_managed and status in _OPERATOR_CONTROLLED_TARGET_STATES:
             reasons.append("operator_managed_status")
         activity = candidate.get("recent_activity_at")
         if not activity or (as_utc(required_end) - as_utc(activity)).total_seconds() > self.config.candidates.activity_max_age_days * 86_400:
             reasons.append("inactive")
         metadata = _json_object(candidate.get("metadata_json"))
-        observed = int(metadata.get("latest_activity_observations", 0) or 0)
-        if observed < self.config.analysis.min_discovery_activity:
+        cheap_stats = _json_object(metadata.get("cheap_stats"))
+        observed = int(cheap_stats.get("distinct_observed_events", metadata.get("latest_activity_observations", 0)) or 0)
+        minimum_activity = self.config.prefilter.min_activity_observations or self.config.analysis.min_discovery_activity
+        if observed < minimum_activity:
             reasons.append("insufficient_activity")
+        if int(cheap_stats.get("distinct_active_days", 0) or 0) < self.config.prefilter.min_distinct_active_days:
+            reasons.append("insufficient_temporal_diversity")
+        if int(cheap_stats.get("distinct_active_hours", 0) or 0) < self.config.prefilter.min_distinct_active_hours:
+            reasons.append("insufficient_temporal_diversity")
+        if float(cheap_stats.get("observation_span_hours", 0) or 0) < self.config.prefilter.min_observation_span_hours:
+            reasons.append("insufficient_temporal_span")
+        if float(cheap_stats.get("approximate_observed_notional", 0) or 0) < self.config.prefilter.min_observed_notional:
+            reasons.append("insufficient_observed_notional")
+        if int(cheap_stats.get("distinct_symbols", 0) or 0) < self.config.prefilter.min_distinct_symbols:
+            reasons.append("insufficient_symbol_diversity")
         coverage = self.database.analysis_window_coverage(wallet, required_start, required_end) if wallet else None
         if coverage and str(coverage.get("coverage_state")) == "KNOWN_INCOMPLETE":
             reasons.append("known_incomplete")
@@ -399,6 +447,19 @@ class CandidateAnalysisPipeline:
         walk_forward_evaluation = _walk_forward_evidence(walk_forward, self.config.analysis.walk_forward_min_windows)
         follower = _follower_summary(baseline.summary, slippage, latency)
         copyability = _copyability(metrics.net_pnl, metrics.raw, baseline.summary, coverage)
+        friction = _friction_evidence(slippage)
+        latency_evidence = _latency_evidence(latency)
+        regime = _regime_evidence(campaigns, self.config)
+        pathology = _pathology_evidence(metrics, campaigns, self.config)
+        metrics.raw["pathology"] = pathology
+        metrics.raw["regime"] = regime
+        metrics.raw["source_quality"] = 1.0
+        confidence = suitability_confidence(
+            metrics, self.config.confidence, coverage_state=str(coverage.get("coverage_state", "UNPROVEN")),
+            walk_forward_windows=int(walk_forward_evaluation["window_count"]),
+            represented_regimes=int(regime.get("represented_regime_count", 0)),
+        )
+        self.database.upsert_metrics(metrics)
         follower_metrics = FollowerMetrics(
             net_pnl=float(baseline.summary["net_pnl"]),
             expectancy=float(follower["expectancy"]),
@@ -408,13 +469,14 @@ class CandidateAnalysisPipeline:
             latency_curve=tuple(latency), latency_status="available" if latency else "unavailable",
             return_fraction=float(follower["return_fraction"]),
             copyability_score=copyability["score"] if copyability["status"] == "available" else None,
-            slippage_robustness=follower.get("slippage_robustness_score"),
+            slippage_robustness=friction.get("retention_score"), friction_robustness=friction.get("score"),
             walk_forward_score=walk_forward_evaluation["score"],
             walk_forward_status=str(walk_forward_evaluation["status"]),
             walk_forward_window_count=int(walk_forward_evaluation["window_count"]),
+            regime_robustness=regime.get("score") if regime.get("status") == "available" else None,
         )
         score = replace(
-            score_candidate(metrics, self.config.candidates, follower_metrics), provenance="phase_b",
+            score_candidate(metrics, self.config.candidates, follower_metrics, confidence_score=float(confidence["score"])), provenance="phase_b",
             analysis_run_id=run_id, config_fingerprint=config_fingerprint,
         )
         self.database.upsert_candidate_score(score)
@@ -447,12 +509,17 @@ class CandidateAnalysisPipeline:
             **boundary_metadata,
             "diversification_input": diversification_input,
             "slippage_scenarios": slippage,
-            "latency": {"status": "available" if latency else "unavailable", "curve": latency},
+            "stress_tests": {"slippage": friction, "latency": latency_evidence},
+            "latency": {"status": "available" if latency else "unavailable", "curve": latency, **latency_evidence},
             "walk_forward": walk_forward,
             "walk_forward_evaluation": walk_forward_evaluation,
+            "regime": regime,
+            "pathology": pathology,
+            "confidence": confidence,
             "score": {
                 "total": score.total_score, "eligible": score.eligible, "components": score.component_scores,
-                "penalties": score.penalties, "reasons": list(score.reasons), "source_quality": score.source_quality,
+                "penalties": score.penalties, "reasons": list(score.reasons), "hard_gates": list(score.hard_gates),
+                "confidence": score.confidence_score, "score_version": score.score_version, "source_quality": score.source_quality,
             },
             "eligible": score.eligible,
         }
@@ -472,7 +539,12 @@ class CandidateAnalysisPipeline:
     def _finish(self, run_id: str, errors: list[str], *, status: str) -> dict[str, object]:
         counters = self.database.analysis_run_counters(run_id)
         self.database.finish_analysis_run(run_id, status=status, errors=tuple(sorted(errors)), **counters)
-        return {"run_id": run_id, "status": status, **counters, "errors": sorted(errors), "shadow_finalists": self.shadow_finalists()}
+        finalists = self.shadow_finalists()
+        return {
+            "run_id": run_id, "status": status, **counters, "errors": sorted(errors),
+            "funnel": self.database.analysis_funnel(run_id, high_suitability_score=self.config.analysis.high_suitability_score),
+            "diversification_selected": len(finalists), "shadow_finalists": finalists,
+        }
 
 
 def _follower_summary(
@@ -513,6 +585,97 @@ def _follower_summary(
         "latency_status": "available" if latency else "unavailable",
         "price_assumption": baseline.get("price_assumption"),
     }
+
+
+def _friction_evidence(scenarios: Iterable[dict[str, object]]) -> dict[str, object]:
+    """Summarize deterministic slippage scenarios without inferring liquidity."""
+    values = sorted((dict(item) for item in scenarios), key=lambda item: float(item.get("slippage_bps", 0)))
+    if not values:
+        return {"status": "unavailable", "score": None, "retention_score": None, "break_even_slippage_bps": None}
+    baseline = next((item for item in values if float(item.get("slippage_bps", 0)) == 0), values[0])
+    baseline_return = float(baseline.get("return_fraction", 0.0))
+    returns = [float(item.get("return_fraction", 0.0)) for item in values]
+    retained = max(0.0, min(1.0, min(returns) / baseline_return)) if baseline_return > 1e-12 else 0.0
+    positive_fraction = sum(value > 0 for value in returns) / len(returns)
+    break_even = next((float(item.get("slippage_bps", 0)) for item in values if float(item.get("return_fraction", 0)) <= 0), None)
+    return {
+        "status": "available", "baseline_return_fraction": baseline_return,
+        "worst_return_fraction": min(returns), "retention_score": retained,
+        "positive_scenario_fraction": positive_fraction, "score": (retained + positive_fraction) / 2,
+        "break_even_slippage_bps": break_even, "scenarios": values,
+    }
+
+
+def _latency_evidence(curve: Iterable[dict[str, object]]) -> dict[str, object]:
+    values = sorted((dict(item) for item in curve), key=lambda item: float(item.get("latency_ms", 0)))
+    if not values:
+        return {"status": "unavailable", "retention_score": None, "break_even_latency_ms": None}
+    baseline = float(values[0].get("return_fraction", 0.0))
+    returns = [float(item.get("return_fraction", 0.0)) for item in values]
+    retention = max(0.0, min(1.0, returns[-1] / baseline)) if baseline > 1e-12 else 0.0
+    break_even = next((float(item.get("latency_ms", 0)) for item in values if float(item.get("return_fraction", 0)) <= 0), None)
+    return {"status": "available", "baseline_return_fraction": baseline, "worst_return_fraction": min(returns),
+            "retention_score": retention, "break_even_latency_ms": break_even, "curve": values}
+
+
+def _regime_evidence(campaigns: Iterable[PositionCampaign], config: CopyTradeConfig) -> dict[str, object]:
+    """A transparent asset-move proxy, never presented as a market-wide ML regime model."""
+    if not config.regimes.enabled:
+        return {"status": "disabled", "represented_regime_count": 0, "score": None, "method": "disabled"}
+    groups: dict[str, list[float]] = {}
+    threshold = config.regimes.volatility_move_threshold
+    for campaign in campaigns:
+        if not campaign.closed_at or campaign.entry_quantity <= 0 or campaign.average_entry_price <= 0:
+            continue
+        exit_price = campaign.exit_notional / campaign.entry_quantity if campaign.exit_notional else 0.0
+        if exit_price <= 0:
+            continue
+        move = exit_price / campaign.average_entry_price - 1
+        pnl = campaign.realized_pnl - campaign.target_fees
+        groups.setdefault("high_volatility" if abs(move) >= threshold else "low_volatility", []).append(pnl)
+        groups.setdefault("rising" if move > threshold else ("falling" if move < -threshold else "sideways"), []).append(pnl)
+    summaries = {
+        name: {"campaign_count": len(values), "net_pnl": sum(values), "profitable_fraction": sum(value > 0 for value in values) / len(values)}
+        for name, values in sorted(groups.items())
+    }
+    represented = {name: value for name, value in summaries.items() if int(value["campaign_count"]) >= config.regimes.minimum_campaigns_per_regime}
+    if not represented:
+        return {"status": "insufficient_sample", "represented_regime_count": 0, "score": None,
+                "method": "campaign entry-to-exit observed-price proxy", "regimes": summaries}
+    positive = [max(float(item["net_pnl"]), 0.0) for item in represented.values()]
+    total_positive = sum(positive)
+    strongest_share = max(positive, default=0.0) / total_positive if total_positive else 1.0
+    profitable_fraction = sum(float(item["net_pnl"]) > 0 for item in represented.values()) / len(represented)
+    score = max(0.0, min(1.0, (profitable_fraction + (1 - strongest_share)) / 2))
+    return {"status": "available", "represented_regime_count": len(represented), "score": score,
+            "strongest_regime_pnl_share": strongest_share, "method": "campaign entry-to-exit observed-price proxy",
+            "regimes": summaries}
+
+
+def _pathology_evidence(
+    metrics: object, campaigns: Iterable[PositionCampaign], config: CopyTradeConfig,
+) -> dict[str, object]:
+    values = [campaign.realized_pnl - campaign.target_fees for campaign in campaigns if campaign.closed_at]
+    winners = [value for value in values if value > 0]
+    worst_to_average_win = abs(min(values, default=0.0)) / max(fmean(winners) if winners else 0.0, 1e-12)
+    reasons: list[str] = []
+    if getattr(metrics, "martingale_indicator"):
+        reasons.append("martingale_like")
+    if getattr(metrics, "adverse_averaging_indicator"):
+        reasons.append("adverse_averaging")
+    concentration = float(getattr(metrics, "pnl_concentration_best"))
+    if concentration > config.candidates.pnl_concentration_preferred:
+        reasons.append("jackpot_concentration")
+    liquidation_frequency = float(getattr(metrics, "raw").get("liquidation_frequency", 0.0) or 0.0)
+    if liquidation_frequency > 0:
+        reasons.append("liquidation_observed")
+    if worst_to_average_win >= 3:
+        reasons.append("tail_loss_asymmetry")
+    if len(getattr(metrics, "by_symbol")) == 1 and values:
+        reasons.append("one_symbol_concentration")
+    return {"reason_codes": sorted(set(reasons)), "top_campaign_pnl_fraction": concentration,
+            "worst_to_average_win_ratio": worst_to_average_win, "liquidation_frequency": liquidation_frequency,
+            "campaign_count": len(values)}
 
 
 def _copyability(target_net_pnl: float, raw: dict[str, Any], follower: dict[str, Any], coverage: dict[str, Any]) -> dict[str, object]:

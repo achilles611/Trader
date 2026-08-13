@@ -127,6 +127,10 @@ def calculate_trader_metrics(
     concentration_base = max(abs(sum(pnl)), 1e-12)
     best_sorted = sorted(pnl, reverse=True)
     total_fees = sum(campaign.target_fees for campaign in closed)
+    active_days = {event.event_timestamp.date().isoformat() for event in event_list}
+    active_hours = {event.event_timestamp.strftime("%Y-%m-%dT%H") for event in event_list}
+    gross_profit = sum(value for value in pnl if value > 0)
+    gross_loss = abs(sum(value for value in pnl if value < 0))
     return TraderMetrics(
         target_wallet=target_wallet.lower(), calculated_at=utc_now(), history_days=history_days,
         campaign_count=len(all_campaigns), closed_campaign_count=len(closed), realized_pnl=sum(campaign.realized_pnl for campaign in closed),
@@ -152,6 +156,10 @@ def calculate_trader_metrics(
             "equity_curve": curve, "drawdown_curve": drawdowns, "long_campaign_count": long_count,
             "short_campaign_count": short_count, "target_fees": total_fees,
             "trade_frequency_per_day": len(all_campaigns) / max(history_days, 1.0),
+            "active_days": len(active_days), "active_hours": len(active_hours),
+            "gross_profit": gross_profit, "gross_loss": gross_loss,
+            "average_campaign_pnl": fmean(pnl) if pnl else 0.0,
+            "loss_rate": losses / len(pnl) if pnl else 0.0,
             "rolling_drawdowns": drawdowns, "max_drawdown_dollars": max_drawdown_dollars,
             "drawdown_denominator": drawdown_denominator,
             "drawdown_denominator_source": "target_equity" if equity_observations else "campaign_entry_notional_proxy",

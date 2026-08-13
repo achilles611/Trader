@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .env
+aws secret key.txt
 .venv/
 artifacts/
 logs/

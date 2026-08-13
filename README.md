@@ -94,13 +94,20 @@ Copy-trading research commands (all default to paper mode):
 
 ```powershell
 python main.py copy-import --wallet 0xYOUR_PUBLIC_WALLET
+python main.py copy-discover --source hypercore-file --input path\to\node_fills_by_block.jsonl
 python main.py copy-backfill --wallet 0xYOUR_PUBLIC_WALLET
 python main.py copy-score --wallet 0xYOUR_PUBLIC_WALLET
+python main.py copy-analyze-candidates --limit 500
+python main.py copy-analysis-status
+python main.py copy-rank --count 20 --output artifacts\finalists.json
+python main.py copy-suitability-report --wallet 0xYOUR_PUBLIC_WALLET
 python main.py copy-backtest --wallet 0xYOUR_PUBLIC_WALLET
 python main.py copy-report --wallet 0xYOUR_PUBLIC_WALLET
 ```
 
-See [docs/COPYTRADING.md](docs/COPYTRADING.md) for the full architecture, configuration, safeguards, workflow, limitations, and tests.
+See [docs/COPYTRADING.md](docs/COPYTRADING.md) for the full architecture, tested
+HyperCore discovery shapes, requester-pays/LZ4 prerequisites, safeguards,
+workflow, limitations, and tests.
 
 Run the production orchestration cycle wrapper:
 

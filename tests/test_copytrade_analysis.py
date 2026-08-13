@@ -431,6 +431,17 @@ class PhaseBAnalysisTests(unittest.TestCase):
             self.assertEqual(count, 1)
             current = service.database.phase_b_qualified_scores(config_fingerprint=fingerprint)
             self.assertEqual([(score.target_wallet, score.total_score) for score in current], [(GOOD, 60.0)])
+            # A later legacy/research score is visible separately but cannot
+            # create a hybrid candidate row with Phase B provenance/config.
+            service.database.upsert_candidate_score(CandidateScore(
+                GOOD, utc_now() + timedelta(seconds=1), 999, {"legacy": 1}, {}, True,
+            ))
+            candidate = service.database.list_analysis_candidates(wallets=[GOOD], limit=1)[0]
+            self.assertEqual((candidate["total_score"], candidate["score_provenance"], candidate["score_analysis_run_id"]),
+                             (60.0, "phase_b", "analysis_authoritative"))
+            self.assertEqual(candidate["candidate_config_fingerprint"], fingerprint)
+            self.assertEqual((candidate["legacy_total_score"], candidate["legacy_score_reasons"]), (999.0, []))
+            self.assertEqual([(score.target_wallet, score.total_score) for score in service.database.latest_legacy_scores()], [(GOOD, 999.0)])
             pipeline = CandidateAnalysisPipeline(service)
             finalist_wallets = [item["wallet"] for item in pipeline.shadow_finalists()]
             self.assertEqual(finalist_wallets, [GOOD])

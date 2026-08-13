@@ -93,24 +93,33 @@ reduce the matching virtual sleeve; they cannot become reverse entries.
 `copy-discover` builds a cheap research queue; it does not backfill, score,
 approve, watch, or paper-copy a wallet. The initial native source is documented
 HyperCore node data: older `node_trades` (both counterparties from
-`side_info[].user`), API-shaped `node_fills`, and the current block-batched
-`node_fills_by_block` (`block_*` metadata plus `events`). It detects those shapes
-explicitly and fails a valid-but-unsupported JSON/LZ4 input instead of reporting
-a misleading zero-wallet run. No leaderboard endpoint is assumed or scraped.
+`side_info[].user`), API-shaped bare `node_fills`, and block-batched
+`node_fills_by_block` (`block_*` metadata plus `events`). Block events may be a
+bare fill object or the production `[wallet_address, fill_object]` pair. The
+outer wallet is used only when the fill omits `user`; a fill must still provide
+time (or a block timestamp), symbol, price, and size. It detects those tested
+shapes explicitly and fails a valid-but-unsupported source envelope instead of
+reporting a misleading zero-wallet run. No leaderboard endpoint is assumed or
+scraped.
 
 ```powershell
-# A locally downloaded node-data JSON/JSONL (or .lz4 with optional lz4 installed)
+# A locally downloaded node-data JSON/JSONL (or .lz4; lz4 is installed by requirements.txt)
 python main.py copy-discover --source hypercore-file --input path\to\node_fills_by_block.jsonl --limit 1000 --min-activity 2 --max-activity-age 30d --output artifacts\discovery.json
 
-# An exact requester-pays historical-node object; requires optional boto3 plus AWS billing/credentials
+# An exact requester-pays historical-node object; boto3 is installed by requirements.txt.
+# It still requires AWS requester-pays billing authorization and configured credentials.
 python main.py copy-discover --source hypercore-s3 --input s3://hl-mainnet-node-data/node_fills_by_block/DATE/HOUR --refresh
 
 # Archive research explicitly disables the default 30-day Phase A recency gate
 python main.py copy-discover --source hypercore-file --input path\to\node_trades.jsonl --max-activity-age none
 ```
 
-The S3 transport sends `RequestPayer=requester` and fails clearly if `boto3`,
-AWS requester-pays billing, credentials, or the exact object are unavailable.
+The S3 transport sends `RequestPayer=requester` and fails clearly if AWS
+requester-pays billing authorization, credentials, or the exact object are
+unavailable. `boto3` and `lz4` are runtime dependencies in `requirements.txt`,
+so a fresh supported install can use the documented S3 plus `.lz4` path. Error
+messages identify the object and requester-pays requirement without printing
+credential values.
 It never falls back to a scraped or undocumented HTTP endpoint. The transport
 interface also accepts local fixtures, downloaded data, local-node streams, or
 a future indexer while keeping their normalized observations identical.
@@ -120,10 +129,28 @@ bounded SQLite batches; requester-pays S3 objects are likewise read as streams.
 Within a run, a deterministic identity based on source, wallet, fill/trade ID,
 hash, order ID, time, symbol, price, and size deduplicates overlapping files
 before `--min-activity` or ranking. Separate runs remain append-only audit
-history. Each run persists valid observed, eligible, registered/refreshed,
-limit-deferred, filtered, and invalid-wallet counts, so a `--limit` never makes
-eligible wallets disappear from accounting. The default `--max-activity-age
-30d` filters stale activity before Phase B; `none` disables that gate.
+history. Each run persists valid events, normalized observations, duplicate
+events, invalid wallets, malformed events, unsupported nested records, valid
+wallets, eligible wallets, registered/refreshed candidates, limit-deferred
+wallets, filtered wallets, and fatal-source errors, so a `--limit` never makes
+eligible wallets disappear from accounting. A malformed event inside a
+recognized block is quarantined in `copy_discovery_rejections` and the remaining
+events proceed; a malformed block envelope, unsupported top-level schema,
+corrupt/truncated stream, or I/O failure fails the source/run explicitly and
+does not register staged candidates. Successful runs with quarantined records
+are marked `completed_with_warnings`; source failures are `failed`. The default
+`--max-activity-age 30d` filters stale activity before Phase B; `none` disables
+that gate.
+
+For every de-duplicated wallet/run, Stage A.1 persists cheap evidence in the
+candidate metadata: distinct observed events, active hours/days, observed span,
+symbols, approximate observed notional, source count, and first/last observed
+activity. Stage A.2 uses the configurable `prefilter` section before any
+expensive public backfill. Its explainable reason codes include
+`invalid_wallet`, `inactive`, `insufficient_activity`,
+`insufficient_temporal_diversity`, `insufficient_temporal_span`,
+`insufficient_observed_notional`, `insufficient_symbol_diversity`,
+`known_incomplete`, and `operator_managed_status`.
 
 Candidates are merged by normalized address, retain independent-source count,
 and refresh activity/last-seen values. A new wallet is added to `copy_targets`
@@ -238,13 +265,18 @@ python main.py copy-analyze-candidates --status new --force --limit 50
 
 # Future-dashboard-friendly persisted rows and current run state
 python main.py copy-analysis-status --limit 1000
-python main.py copy-rank --count 20
+python main.py copy-rank --count 20 --output artifacts\finalists.json
+python main.py copy-suitability-report --wallet 0xYOUR_PUBLIC_WALLET --output artifacts\wallet-suitability.json
 ```
 
 Phase B persists target metrics, follower metrics, sizing/equity-quality
 coverage, slippage scenarios (including 0 bps), latency availability,
-walk-forward evidence, transparent score components/penalties, and reason
-codes in the candidate-analysis summary. Coverage is evaluated over the full
+walk-forward evidence, transparent score components/penalties, hard gates,
+confidence, deterministic pathology flags, and observed-price-proxy regime
+evidence in the candidate-analysis summary. Confidence is a separate 0–100
+measure of evidence depth (campaigns, active days, history span, coverage,
+walk-forward windows, regime representation, and source quality); it is never
+silently folded into suitability. Coverage is evaluated over the full
 immutable analysis window: only continuous `PROVEN_COMPLETE` request segments
 prove it; any intersecting `KNOWN_INCOMPLETE` segment quarantines it; a small
 recent request can never certify old stored fills. The Follower Capture Ratio
@@ -284,7 +316,12 @@ directional exposure-overlap penalties. It returns the diversification
 breakdown but never changes a target state to `shadow` or `approved`.
 
 There is exactly one authoritative `phase_b` score for each wallet/run. A
-resume after a score-write crash updates that same record. Finalist selection
+resume after a score-write crash updates that same record. During an upgrade,
+pre-existing duplicate Phase B rows are copied to `copy_candidate_score_archive`
+before the active uniqueness constraint is applied. Phase B-facing candidate
+rows always read score, eligibility, reasons, provenance, run ID, and config
+fingerprint from that one authoritative Phase B record; a later legacy/research
+score is displayed separately and cannot replace it. Finalist selection
 also requires the score fingerprint to equal the current configuration
 fingerprint; prior qualified analyses remain auditable but are reported as
 stale and are not compared with current settings. Coverage prefiltering and
@@ -293,8 +330,21 @@ backfill retry decisions use the run window, so an unrelated historical
 
 `copy-rank` now makes `ranked_phase_b`, `selected`, and `shadow_finalists`
 canonical Phase B recommendations using that same current fingerprint and
-bounded evidence. It retains `legacy_scores` only with the explicit
-`research_compatibility_only` label.
+bounded evidence. Each selection preserves base suitability, confidence,
+diversification penalty, final selection score, and deterministic rationale.
+`copy-analysis-status` includes per-run funnel counts/percentages from observed
+through cheap eligibility, backfill, quarantine, scoring, eligibility, and high
+suitability. `copy-suitability-report` reads only the stored immutable evidence
+and is recommendation-only: it never promotes a target status. Legacy scores
+remain only under the explicit `research_compatibility_only` label.
+
+The `regimes` section uses a deterministic campaign entry-to-exit observed-price
+proxy (high/low move and rising/falling/sideways), not a market-wide ML regime
+classifier. It is marked `insufficient_sample` when the configured population
+is not represented. The `stress_tests` summary reports slippage retention and
+break-even slippage plus latency retention/break-even latency when a historical
+market-price path is available. These are suitability risk indicators, not
+claims of future liquidity or intent.
 
 ## Research outputs and dashboard
 
@@ -326,9 +376,12 @@ no-lookahead, marked long/short sleeves, partial loss risk, atomic fault replay,
 restart drawdown, walk-forward boundaries, time-aligned correlation, websocket
 payload shapes, official plural clearinghouse-state parsing, enriched-event
 backtests, contemporaneous live-paper price deterioration, fee-risk ledgers,
-coverage eligibility, all documented HyperCore-node discovery formats,
-duplicate-evidence rejection, limit/recency accounting, streaming discovery,
-and the earlier baseline behaviors.
+coverage eligibility, all documented HyperCore-node discovery formats including
+production `[wallet, fill]` blocks, deterministic fallback identities,
+malformed-event quarantine, corrupt/empty/unsupported source failures,
+duplicate-evidence rejection, LZ4 dependency behavior, score-migration audit
+preservation, limit/recency accounting, streaming discovery, and the earlier
+baseline behaviors.
 
 ## Hyperliquid limitations
 
