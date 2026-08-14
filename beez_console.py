@@ -31,7 +31,10 @@ def project_root(*, frozen: bool | None = None, executable: str | None = None, s
     """Return the executable directory once packaged, otherwise this source directory."""
     packaged = getattr(sys, "frozen", False) if frozen is None else frozen
     if packaged:
-        return Path(executable or sys.executable).resolve().parent
+        # Keep a packaged Windows executable path lexical when this behavior is
+        # tested from a non-Windows CI runner; resolving it there incorrectly
+        # prefixes the Linux workspace.  Native Windows paths need no resolve.
+        return Path(executable or sys.executable).parent
     return Path(source_file or __file__).resolve().parent
 
 
