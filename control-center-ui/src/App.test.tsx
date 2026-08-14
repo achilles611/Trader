@@ -31,7 +31,7 @@ function payload(path: string) {
   if (path.startsWith("/api/discovery/source/test")) return { source: "Official HyperCore node data", connection_state: "READY", aws_credentials_detected: true, requester_pays_access: "ready", cache: { object_count: 1, size_bytes: 42 } };
   if (path.startsWith("/api/discovery/jobs/")) return discoveryJobDetailResponse || { job_id: "discovery-1", status: "queued", stage: "queued", configuration: { preset: "standard", candidate_limit: 2500 } };
   if (path.startsWith("/api/discovery/jobs")) return discoveryJobResponse || { job_id: "discovery-1", status: "queued", stage: "queued", configuration: { preset: "standard", candidate_limit: 2500 } };
-  if (path.startsWith("/api/system")) return { health: { mode: "paper", paper_only: true, database: { connected: true }, websocket: { available: true }, watcher: { state: "NOT_ATTACHED", desired_target_count: 0, subscribed_target_count: 0, membership_in_sync: true } }, risk: { limits: [] } };
+  if (path.startsWith("/api/system")) return { health: { mode: "paper", paper_only: true, database: { connected: true }, websocket: { available: true }, watcher: { state: "NOT_ATTACHED", desired_target_count: 0, subscribed_target_count: 0, membership_in_sync: true }, recovery: { wallets: [{ wallet: candidate.wallet, state: "RECOVERY_INCOMPLETE" }] } }, risk: { limits: [] } };
   if (path.startsWith("/api/candidates?")) return { items: emptyUniverse || filteredEmpty ? [] : [candidate], page: path.includes("page=2") ? 2 : 1, page_size: 50, total: emptyUniverse ? 0 : filteredEmpty ? 1 : 51, pages: 2 };
   if (path.startsWith(`/api/candidates/${candidate.wallet}`)) return { identity: { wallet: candidate.wallet, operator_state: "shadow", research_state: "qualified" }, score: { total: 87.3, eligible: true, components: { consistency: 9 }, penalties: { drawdown: 1 }, reasons: ["fixture_reason"] }, phase_a_prefilter_reasons: ["phase_a_fixture"], phase_b_hard_gates: ["phase_b_fixture"], target_performance: {}, follower_performance: {}, latency: { status: "unavailable" }, analysis_window: {} };
   return { items: [] };
@@ -185,6 +185,7 @@ describe("copy control center", () => {
     expect(await screen.findByText("Hyperliquid API")).toBeInTheDocument();
     expect(screen.getByText("REST budget")).toBeInTheDocument();
     expect(screen.getByText("429 retry signals")).toBeInTheDocument();
+    expect(screen.getByText("Recovery gaps")).toBeInTheDocument();
   });
 
   it("shows discovery websocket progress and completion navigation", async () => {

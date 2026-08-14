@@ -29,6 +29,7 @@ _TWENTY_ITEM_RESPONSE_TYPES = {
     "nonUserFundingUpdates", "twapHistory", "userTwapSliceFills", "userTwapSliceFillsByTime",
     "delegatorHistory", "delegatorRewards", "validatorStats",
 }
+_coordinator_initialization_lock = Lock()
 
 
 @dataclass
@@ -57,9 +58,13 @@ class _SQLiteRateLimitCoordinator:
         self.documented_limit = documented_limit
         self._wall_clock = wall_clock
         self._sleep = sleeper
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
-            connection.executescript("""
+        # SQLite schema initialization itself obtains a write lock.  Serialize
+        # same-process constructors so concurrent startup cannot turn a safe
+        # conservative merge into a transient "database is locked" failure.
+        with _coordinator_initialization_lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self._connect() as connection:
+                connection.executescript("""
                 CREATE TABLE IF NOT EXISTS copy_hyperliquid_rate_limit_reservations (
                     reservation_id TEXT PRIMARY KEY, endpoint TEXT NOT NULL, request_type TEXT NOT NULL,
                     created_at_epoch REAL NOT NULL, reservation_weight INTEGER NOT NULL, actual_weight INTEGER
@@ -71,7 +76,12 @@ class _SQLiteRateLimitCoordinator:
                     consecutive_429 INTEGER NOT NULL DEFAULT 0, rate_limit_count INTEGER NOT NULL DEFAULT 0,
                     retry_count INTEGER NOT NULL DEFAULT 0
                 );
-            """)
+                CREATE TABLE IF NOT EXISTS copy_hyperliquid_rate_limit_budgets (
+                    endpoint TEXT PRIMARY KEY, operating_budget INTEGER NOT NULL,
+                    updated_at_epoch REAL NOT NULL
+                );
+                """)
+            self.operating_budget = self.set_operating_budget(operating_budget)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -108,12 +118,19 @@ class _SQLiteRateLimitCoordinator:
                         "SELECT throttle_until_epoch FROM copy_hyperliquid_rate_limit_cooldowns WHERE endpoint=?",
                         (self.endpoint,),
                     ).fetchone()
+                    budget = int(connection.execute(
+                        "SELECT operating_budget FROM copy_hyperliquid_rate_limit_budgets WHERE endpoint=?", (self.endpoint,),
+                    ).fetchone()["operating_budget"])
+                    # Another local process may have initialized more
+                    # conservatively after this object was created.  Never
+                    # retain a larger in-memory allowance.
+                    self.operating_budget = min(self.operating_budget, budget)
                     used = int(connection.execute(
                         """SELECT COALESCE(SUM(COALESCE(actual_weight, reservation_weight)), 0)
                            FROM copy_hyperliquid_rate_limit_reservations WHERE endpoint=?""", (self.endpoint,),
                     ).fetchone()[0])
                     throttle_until = float(cooldown["throttle_until_epoch"])
-                    if now >= throttle_until and used + reservation_weight <= self.operating_budget:
+                    if now >= throttle_until and used + reservation_weight <= budget:
                         reservation_id = uuid4().hex
                         connection.execute(
                             """INSERT INTO copy_hyperliquid_rate_limit_reservations(
@@ -125,7 +142,7 @@ class _SQLiteRateLimitCoordinator:
                         waits: list[float] = []
                         if now < throttle_until:
                             waits.append(throttle_until - now)
-                        if used + reservation_weight > self.operating_budget:
+                        if used + reservation_weight > budget:
                             oldest = connection.execute(
                                 """SELECT MIN(created_at_epoch) FROM copy_hyperliquid_rate_limit_reservations
                                    WHERE endpoint=?""", (self.endpoint,),
@@ -140,6 +157,46 @@ class _SQLiteRateLimitCoordinator:
             if reservation_id is not None:
                 return _Reservation(request_type, now, reservation_weight, reservation_weight, reservation_id)
             self._sleep(wait_seconds)
+
+    def set_operating_budget(self, requested_budget: int) -> int:
+        """Atomically adopt the minimum host-local configured allowance.
+
+        There is deliberately no automatic increase: relaxing a conservative
+        budget requires an explicit coordinator reset/reconfiguration rather
+        than process-start order.
+        """
+        if not 1 <= requested_budget <= self.documented_limit:
+            raise ValueError("Hyperliquid operating budget must be between 1 and the documented IP limit.")
+        now = self._wall_clock()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    """INSERT INTO copy_hyperliquid_rate_limit_budgets(endpoint, operating_budget, updated_at_epoch)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(endpoint) DO UPDATE SET
+                         operating_budget=MIN(copy_hyperliquid_rate_limit_budgets.operating_budget, excluded.operating_budget),
+                         updated_at_epoch=excluded.updated_at_epoch""",
+                    (self.endpoint, requested_budget, now),
+                )
+                effective = int(connection.execute(
+                    "SELECT operating_budget FROM copy_hyperliquid_rate_limit_budgets WHERE endpoint=?", (self.endpoint,),
+                ).fetchone()["operating_budget"])
+                connection.commit()
+                self.operating_budget = effective
+                return effective
+            except Exception:
+                connection.rollback()
+                raise
+
+    def current_budget(self) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT operating_budget FROM copy_hyperliquid_rate_limit_budgets WHERE endpoint=?", (self.endpoint,),
+            ).fetchone()
+        if row is not None:
+            self.operating_budget = min(self.operating_budget, int(row["operating_budget"]))
+        return self.operating_budget
 
     def settle(self, reservation: _Reservation, response_payload: object | None) -> None:
         if not reservation.coordination_id or response_payload is None:
@@ -206,6 +263,10 @@ class _SQLiteRateLimitCoordinator:
                 """SELECT COUNT(*) AS requests, COALESCE(SUM(COALESCE(actual_weight, reservation_weight)), 0) AS weight
                    FROM copy_hyperliquid_rate_limit_reservations WHERE endpoint=?""", (self.endpoint,),
             ).fetchone()
+            budget = int(connection.execute(
+                "SELECT operating_budget FROM copy_hyperliquid_rate_limit_budgets WHERE endpoint=?", (self.endpoint,),
+            ).fetchone()["operating_budget"])
+        self.operating_budget = min(self.operating_budget, budget)
         throttle_until = float(state["throttle_until_epoch"])
         throttled = now < throttle_until
         estimated_weight = int(rows["weight"])
@@ -268,6 +329,8 @@ class HyperliquidInfoRateLimiter:
     def acquire(self, payload: Mapping[str, Any]) -> _Reservation:
         request_type = str(payload.get("type") or "")
         reservation_weight = self.reserved_weight(request_type)
+        if self._coordinator is not None:
+            self.operating_budget = self._coordinator.current_budget()
         if reservation_weight > self.operating_budget:
             raise ValueError(
                 f"Hyperliquid operating budget {self.operating_budget} is below the required reservation "
@@ -289,7 +352,19 @@ class HyperliquidInfoRateLimiter:
                     waits.append(self._throttle_until - now)
                 if used_weight + reservation_weight > self.operating_budget and self._reservations:
                     waits.append(max(0.01, self._reservations[0].created_at + _WINDOW_SECONDS - now))
-                self._condition.wait(timeout=max(0.01, min(waits) if waits else 0.01))
+            self._condition.wait(timeout=max(0.01, min(waits) if waits else 0.01))
+
+    def set_operating_budget(self, operating_budget: int) -> int:
+        """Monotonically lower the local and coordinated operating budget."""
+        if not 1 <= operating_budget <= self.documented_limit:
+            raise ValueError("Hyperliquid operating budget must be between 1 and the documented IP limit.")
+        if self._coordinator is not None:
+            self.operating_budget = self._coordinator.set_operating_budget(operating_budget)
+            return self.operating_budget
+        with self._condition:
+            self.operating_budget = min(self.operating_budget, operating_budget)
+            self._condition.notify_all()
+            return self.operating_budget
 
     def settle(self, reservation: _Reservation, response_payload: object | None) -> None:
         """Replace a conservative reservation with the documented actual weight."""
@@ -333,7 +408,9 @@ class HyperliquidInfoRateLimiter:
 
     def telemetry(self) -> dict[str, object]:
         if self._coordinator is not None:
-            return self._coordinator.telemetry()
+            telemetry = self._coordinator.telemetry()
+            self.operating_budget = int(telemetry["operating_budget"])
+            return telemetry
         with self._condition:
             now = self._clock()
             self._expire(now)
@@ -427,5 +504,5 @@ def shared_hyperliquid_info_limiter(
             )
             _shared_limiters[key] = limiter
         elif operating_budget < limiter.operating_budget:
-            limiter.operating_budget = operating_budget
+            limiter.set_operating_budget(operating_budget)
         return limiter

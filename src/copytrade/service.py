@@ -12,12 +12,13 @@ from .config import CopyTradeConfig
 from .control_center import ControlCenterStore
 from .discovery import CandidateDiscoveryAdapter, DiscoveryPipeline
 from .hyperliquid import HyperliquidPublicAdapter
-from .models import CopySignal, PositionEvent, PositionEventType, RawFill, Target, TargetStatus, TraderSnapshot, as_utc, stable_id, utc_now
+from .equity import is_equity_observation_usable
+from .models import CopySignal, PositionCampaign, PositionEvent, PositionEventType, RawFill, Target, TargetStatus, TraderSnapshot, as_utc, stable_id, utc_now
 from .market import LiveMarketCache
 from .paper import PaperExecutionEngine, SignalFactory, TargetSizeClassifier
 from .rate_limit import shared_hyperliquid_info_limiter
-from .reconstruction import PositionReconstructor
-from .storage import CopyTradeDatabase
+from .reconstruction import FillAggregate, PositionReconstructor, ReconstructionResult, aggregate_partial_fills
+from .storage import CopyTradeDatabase, RECONSTRUCTION_SCHEMA_VERSION, ReconstructionCursor
 
 
 class _PaperExecutionAuthority:
@@ -25,8 +26,12 @@ class _PaperExecutionAuthority:
 
     def __init__(self) -> None:
         self.lock = RLock()
+        self.reconstruction_lock = RLock()
         self.engine: PaperExecutionEngine | None = None
         self.last_mark_persist_at: dict[str, object] = {}
+        self.classifiers: dict[str, tuple[object, TargetSizeClassifier]] = {}
+        self.classifier_signal_ids: dict[str, set[str]] = {}
+        self.incremental_work: dict[str, dict[str, int | str]] = {}
 
 
 _paper_execution_authorities: dict[str, _PaperExecutionAuthority] = {}
@@ -222,13 +227,32 @@ class CopyTradeService:
         return payload
 
     def reconstruct(self, wallet: str) -> dict[str, object]:
+        with self._execution_authority.reconstruction_lock:
+            return self._reconstruct_full(wallet)
+
+    def _reconstruct_full(self, wallet: str) -> dict[str, object]:
+        """Explicit full-history rebuild for Phase B, repair, and validation.
+
+        It is intentionally separate from the Phase C watcher hot path.  The
+        cursor is reset to the complete durable evidence only after the rebuilt
+        events and campaigns have committed in the same transaction.
+        """
         fills = self.database.list_raw_fills(wallet)
         result = PositionReconstructor().reconstruct(fills)
         enriched_events = tuple(self._enrich_equity(event) for event in result.events)
-        for event in enriched_events:
-            self.database.upsert_position_event(event)
-        for campaign in result.campaigns:
-            self.database.upsert_campaign(campaign)
+        current = self.database.reconstruction_cursor(wallet)
+        last = fills[-1] if fills else None
+        cursor = ReconstructionCursor(
+            target_wallet=wallet.lower(), schema_version=RECONSTRUCTION_SCHEMA_VERSION, revision=current.revision,
+            last_seen_timestamp=last.event_timestamp if last else None, last_seen_event_id=last.event_id if last else None,
+            last_processed_timestamp=last.event_timestamp if last else None, last_processed_event_id=last.event_id if last else None,
+            recovery_state=current.recovery_state, recovery_anchor_event_id=current.recovery_anchor_event_id,
+            recovery_anchor_timestamp=current.recovery_anchor_timestamp, recovery_detail=current.recovery_detail,
+            updated_at=utc_now(),
+        )
+        self.database.persist_reconstruction_batch(wallet, enriched_events, result.campaigns, cursor, replace_wallet_history=True)
+        self._execution_authority.classifiers.pop(wallet.lower(), None)
+        self._execution_authority.classifier_signal_ids.pop(wallet.lower(), None)
         metrics = calculate_trader_metrics(wallet, result.campaigns, enriched_events, self.config.sizing)
         coverage = self.database.latest_backfill_coverage(wallet)
         if coverage:
@@ -239,63 +263,339 @@ class CopyTradeService:
         return {"events": enriched_events, "campaigns": result.campaigns, "metrics": metrics, "reconciliation": result.reconciliation}
 
     async def ingest_watched_fills(self, wallet: str, fills: list[RawFill], is_snapshot: bool) -> None:
-        with self._execution_lock:
-            self._ingest_watched_fills(wallet, fills, is_snapshot)
+        # SQLite reconstruction can be substantial during startup/recovery.
+        # Keep it out of both the asyncio event loop and the mutable PAPER
+        # authority lock; execution itself remains strictly serialized below.
+        await asyncio.to_thread(self._stage_and_incrementally_reconstruct, wallet, fills, is_snapshot)
+        await asyncio.to_thread(self._drain_pending_reconstruction_events, wallet)
 
     def _ingest_watched_fills(self, wallet: str, fills: list[RawFill], is_snapshot: bool) -> None:
-        # This happens before reconstruction/signal generation, preserving source
-        # evidence even if a later process crashes.
-        self.database.insert_raw_fills(fills)
-        reconstructed = self.reconstruct(wallet)
-        events = reconstructed["events"]
-        assert isinstance(events, tuple)
-        engine = self._execution_engine()
-        classifier = TargetSizeClassifier(self.config.sizing)
-        factory = SignalFactory(classifier, self.config)
-        for event in events:
-            signals = factory.from_position_event(event, engine.portfolio.cash or 0.0)
-            for signal in signals:
-                # A persisted attempt is the idempotency boundary.  If a crash
-                # happened after raw/signal persistence but before an attempt,
-                # the same deterministic signal is recovered on the next pass.
-                if not self.database.has_signal(signal.signal_id):
-                    self.database.insert_signal(signal)
-                received_at = utc_now()
-                observation, age_ms = self.market_cache.latest_available(
-                    event.symbol, received_at, self.config.paper_execution.market_data_max_age_ms,
+        self._stage_and_incrementally_reconstruct(wallet, fills, is_snapshot)
+        self._drain_pending_reconstruction_events(wallet)
+
+    @staticmethod
+    def _fill_key(fill: RawFill) -> tuple[object, str]:
+        return fill.event_timestamp, fill.event_id
+
+    @staticmethod
+    def _same_partial_order(first: RawFill, second: RawFill) -> bool:
+        return (
+            first.target_order_id is not None and first.target_order_id == second.target_order_id
+            and first.target_wallet.lower() == second.target_wallet.lower() and first.symbol == second.symbol
+            and (first.signed_quantity >= 0) == (second.signed_quantity >= 0)
+        )
+
+    def _full_rebuild_cursor(
+        self, wallet: str, cursor: ReconstructionCursor, *, pending_event_ids: tuple[str, ...] = (),
+        recovery_state: str | None = None, recovery_detail: dict[str, object] | None = None,
+        fills: list[RawFill] | None = None, reconstruction: ReconstructionResult | None = None,
+    ) -> tuple[tuple[PositionEvent, ...], dict[str, int | str]]:
+        fills = fills if fills is not None else self.database.list_raw_fills(wallet)
+        result = reconstruction if reconstruction is not None else PositionReconstructor().reconstruct(fills)
+        events = tuple(self._enrich_equity(event) for event in result.events)
+        last = fills[-1] if fills else None
+        replacement = ReconstructionCursor(
+            target_wallet=wallet.lower(), schema_version=RECONSTRUCTION_SCHEMA_VERSION, revision=cursor.revision,
+            last_seen_timestamp=last.event_timestamp if last else None, last_seen_event_id=last.event_id if last else None,
+            last_processed_timestamp=last.event_timestamp if last else None, last_processed_event_id=last.event_id if last else None,
+            pending_event_ids=pending_event_ids,
+            recovery_state=recovery_state or cursor.recovery_state,
+            recovery_anchor_event_id=cursor.recovery_anchor_event_id,
+            recovery_anchor_timestamp=cursor.recovery_anchor_timestamp,
+            recovery_detail=recovery_detail if recovery_detail is not None else cursor.recovery_detail,
+            updated_at=utc_now(),
+        )
+        self.database.persist_reconstruction_batch(wallet, events, result.campaigns, replacement, replace_wallet_history=True)
+        self._execution_authority.classifiers.pop(wallet.lower(), None)
+        self._execution_authority.classifier_signal_ids.pop(wallet.lower(), None)
+        return events, {
+            "mode": "full_rebuild", "fills_loaded": len(fills), "new_raw_fills": 0,
+            "events_produced": len(events), "campaign_rows_written": len(result.campaigns),
+        }
+
+    def _stage_and_incrementally_reconstruct(self, wallet: str, fills: list[RawFill], is_snapshot: bool) -> None:
+        """Persist source evidence then advance only finalized new aggregates.
+
+        Cursor movement is in the same transaction as event/campaign writes.
+        An interrupted source insert is harmless (no evidence committed); an
+        interrupted reconstruction leaves evidence but an older cursor, which
+        safely replays through deterministic IDs on the next call.
+        """
+        normalized = wallet.lower()
+        with self._execution_authority.reconstruction_lock:
+            fresh = self.database.insert_raw_fills_returning_new(fills)
+            cursor_exists = self.database.has_reconstruction_cursor(normalized)
+            cursor = self.database.reconstruction_cursor(normalized)
+            cursor_initialized = cursor_exists and (
+                cursor.last_seen_event_id is not None or self.database.latest_raw_fill(normalized) is None
+            )
+            if not cursor_initialized:
+                # Pre-hotfix databases -- or a recovery-status row written
+                # before its first reconstruction -- have durable raw evidence
+                # and possibly persisted historical campaigns, but no cursor
+                # provenance.
+                # Continuing from those campaigns would reapply the whole
+                # ledger against its final source position.  One explicit safe
+                # rebuild establishes the first cursor transaction boundary.
+                historical = self.database.list_raw_fills(normalized)
+                rebuilt = PositionReconstructor().reconstruct(historical)
+                fresh_ids = {item.event_id for item in fresh}
+                pending = () if is_snapshot else tuple(
+                    event.event_id for event in rebuilt.events if set(event.raw_fill_ids) & fresh_ids
                 )
-                metadata: dict[str, object] = {
-                    "target_fill_price": event.price,
-                    "source_fill_timestamp": event.event_timestamp.isoformat(),
-                    "local_receive_timestamp": received_at.isoformat(),
-                    "market_reference_age_ms": age_ms,
+                events, work = self._full_rebuild_cursor(
+                    normalized, cursor, pending_event_ids=pending, fills=historical, reconstruction=rebuilt,
+                )
+                work["new_raw_fills"] = len(fresh)
+                self._execution_authority.incremental_work[normalized] = work
+                return
+            late = [fill for fill in fresh if cursor.last_seen_timestamp is not None and cursor.last_seen_event_id is not None
+                    and self._fill_key(fill) <= (cursor.last_seen_timestamp, cursor.last_seen_event_id)]
+            if cursor.schema_version != RECONSTRUCTION_SCHEMA_VERSION or late:
+                # New evidence preceding the durable cursor changes causal
+                # historical transitions.  Rebuild accounting, fail closed for
+                # entries, and only queue direct new exits for PAPER handling.
+                selected = ()
+                if late:
+                    late_ids = {fill.event_id for fill in late}
+                    all_fills = self.database.list_raw_fills(normalized)
+                    rebuilt = PositionReconstructor().reconstruct(all_fills)
+                    selected = tuple(
+                        event.event_id for event in rebuilt.events
+                        if set(event.raw_fill_ids) & late_ids and event.event_type in {PositionEventType.REDUCE, PositionEventType.CLOSE}
+                    )
+                events, work = self._full_rebuild_cursor(
+                    normalized, cursor, pending_event_ids=selected,
+                    recovery_state="RECOVERY_INCOMPLETE" if late else cursor.recovery_state,
+                    recovery_detail={"reason": "out_of_order_source_evidence", "late_fill_ids": [item.event_id for item in late]}
+                    if late else None, fills=all_fills if late else None, reconstruction=rebuilt if late else None,
+                )
+                if late:
+                    self.control_store.record_activity(
+                        category="recovery", severity="warning", wallet=normalized,
+                        message="Out-of-order source evidence forced a fail-closed reconstruction rebuild.",
+                        payload={"recovery_state": "RECOVERY_INCOMPLETE", "late_fill_ids": [item.event_id for item in late]},
+                    )
+                work["new_raw_fills"] = len(fresh)
+                self._execution_authority.incremental_work[normalized] = work
+                return
+
+            new_fills = self.database.list_raw_fills_after(normalized, cursor.last_seen_timestamp, cursor.last_seen_event_id)
+            pending = self.database.list_raw_fills_by_ids(normalized, cursor.pending_fill_ids)
+            ordered = sorted({item.event_id: item for item in [*pending, *new_fills]}.values(), key=self._fill_key)
+            if not ordered:
+                # The subscription snapshot establishes accounting and sizing
+                # history without replaying a potentially large backlog into
+                # PAPER.  If the source later delivers one of those exact
+                # fills as a *live* frame, it is an explicit real-time event:
+                # queue only the fully represented event(s), via indexed JSON
+                # attribution, rather than scanning historic position events.
+                replay_ids: tuple[str, ...] = ()
+                if not is_snapshot and fills:
+                    delivered_ids = {item.event_id for item in fills}
+                    replay_ids = tuple(
+                        event.event_id for event in self.database.list_position_events_for_raw_fills(normalized, delivered_ids)
+                        if set(event.raw_fill_ids).issubset(delivered_ids) and event.event_id not in cursor.pending_event_ids
+                    )
+                if replay_ids:
+                    replacement = ReconstructionCursor(
+                        target_wallet=normalized, schema_version=RECONSTRUCTION_SCHEMA_VERSION, revision=cursor.revision,
+                        last_seen_timestamp=cursor.last_seen_timestamp, last_seen_event_id=cursor.last_seen_event_id,
+                        last_processed_timestamp=cursor.last_processed_timestamp,
+                        last_processed_event_id=cursor.last_processed_event_id,
+                        pending_fill_ids=cursor.pending_fill_ids,
+                        pending_event_ids=tuple([*cursor.pending_event_ids, *replay_ids]),
+                        recovery_state=cursor.recovery_state, recovery_anchor_event_id=cursor.recovery_anchor_event_id,
+                        recovery_anchor_timestamp=cursor.recovery_anchor_timestamp, recovery_detail=cursor.recovery_detail,
+                        updated_at=utc_now(),
+                    )
+                    self.database.persist_reconstruction_batch(normalized, (), (), replacement)
+                self._execution_authority.incremental_work[normalized] = {
+                    "mode": "replay", "fills_loaded": 0, "new_raw_fills": len(fresh),
+                    "events_produced": 0, "campaign_rows_written": 0, "events_requeued": len(replay_ids),
                 }
-                entry_block = self.control_store.entry_block_reason(signal.target_wallet, signal.action)
-                if entry_block:
-                    metadata.update({"entry_gate": entry_block, "market_reference_source": "not_used"})
-                    engine.process_signal(signal, received_at=received_at, market_metadata=metadata, forced_reason=entry_block)
-                    continue
-                if observation:
-                    metadata.update({
-                        "market_reference_price": observation.price,
-                        "market_reference_timestamp": observation.timestamp.isoformat(),
-                        "market_reference_source": observation.source,
-                        "market_reference_quality": observation.quality,
-                        "source_to_receive_latency_ms": max(0.0, (received_at - event.event_timestamp).total_seconds() * 1000),
-                    })
-                    engine.process_signal(signal, received_at=received_at, market_price=observation.price, market_metadata=metadata)
-                elif signal.action in {"open", "add"}:
-                    metadata.update({"market_reference_source": "unavailable", "market_reference_quality": "stale_or_missing"})
-                    engine.process_signal(signal, received_at=received_at, market_metadata=metadata, forced_reason="stale_market_data")
-                elif self.config.paper_execution.stale_exit_market_policy == "skip":
-                    metadata.update({"market_reference_source": "unavailable", "market_reference_quality": "stale_or_missing"})
-                    engine.process_signal(signal, received_at=received_at, market_metadata=metadata, forced_reason="stale_market_data_exit")
+                return
+
+            groups: list[list[RawFill]] = []
+            for fill in ordered:
+                if groups and self._same_partial_order(groups[-1][-1], fill):
+                    groups[-1].append(fill)
                 else:
-                    # Explicit emergency paper fallback for exits only; it is
-                    # recorded as such rather than passing for a live quote.
-                    metadata.update({"market_reference_price": event.price, "market_reference_source": "target_fill_fallback",
-                                     "market_reference_quality": "exit_only_not_contemporaneous"})
-                    engine.process_signal(signal, received_at=received_at, market_price=event.price, market_metadata=metadata)
+                    groups.append([fill])
+            # Hyperliquid delivers a complete userFills frame as the smallest
+            # public execution unit.  Finalize its tail immediately so a lone
+            # realtime fill is not held indefinitely; partials within the
+            # frame still aggregate exactly.  Durable overlap/recovery frames
+            # are likewise finalized as a snapshot.
+            pending_group: list[RawFill] = []
+            aggregates: list[FillAggregate] = []
+            for group in groups:
+                aggregates.extend(aggregate_partial_fills(group))
+
+            open_campaigns = self.database.list_open_campaigns(normalized)
+            rebaseline_after = cursor.recovery_detail.get("safe_rebaseline_after")
+            if rebaseline_after:
+                baseline = as_utc(rebaseline_after)
+                # Preserve incomplete historical campaigns for audit, but they
+                # cannot become the source state for a deliberately verified
+                # zero-position baseline.
+                open_campaigns = [campaign for campaign in open_campaigns if campaign.opened_at > baseline]
+            state = PositionReconstructor.incremental_state(open_campaigns)
+            reconstructor = PositionReconstructor()
+            generated: list[PositionEvent] = []
+            changed_campaigns: dict[str, PositionCampaign] = {}
+            last_processed: RawFill | None = None
+            for aggregate in aggregates:
+                events, changed = reconstructor.apply_aggregate(state, aggregate)
+                generated.extend(self._enrich_equity(event) for event in events)
+                changed_campaigns.update({campaign.campaign_id: campaign for campaign in changed})
+                last_processed = aggregate.fills[-1]
+            last_seen = ordered[-1]
+            replacement = ReconstructionCursor(
+                target_wallet=normalized, schema_version=RECONSTRUCTION_SCHEMA_VERSION, revision=cursor.revision,
+                last_seen_timestamp=last_seen.event_timestamp, last_seen_event_id=last_seen.event_id,
+                last_processed_timestamp=last_processed.event_timestamp if last_processed else cursor.last_processed_timestamp,
+                last_processed_event_id=last_processed.event_id if last_processed else cursor.last_processed_event_id,
+                pending_fill_ids=tuple(item.event_id for item in pending_group),
+                pending_event_ids=tuple([*cursor.pending_event_ids, *(event.event_id for event in generated)]),
+                recovery_state=cursor.recovery_state, recovery_anchor_event_id=cursor.recovery_anchor_event_id,
+                recovery_anchor_timestamp=cursor.recovery_anchor_timestamp, recovery_detail=cursor.recovery_detail,
+                updated_at=utc_now(),
+            )
+            self.database.persist_reconstruction_batch(normalized, generated, changed_campaigns.values(), replacement)
+            self._execution_authority.incremental_work[normalized] = {
+                "mode": "incremental", "fills_loaded": len(ordered), "new_raw_fills": len(fresh),
+                "events_produced": len(generated), "campaign_rows_written": len(changed_campaigns),
+            }
+
+    def incremental_work(self, wallet: str) -> dict[str, int | str]:
+        return dict(self._execution_authority.incremental_work.get(wallet.lower(), {}))
+
+    def _classifier_for_wallet(self, wallet: str, *, exclude_event_ids: Iterable[str] = ()) -> TargetSizeClassifier:
+        key = wallet.lower()
+        cached = self._execution_authority.classifiers.get(key)
+        if cached is not None and cached[0] == self.config.sizing:
+            return cached[1]
+        classifier = TargetSizeClassifier(self.config.sizing)
+        fractions: list[float] = []
+        seeded_signal_ids: set[str] = set()
+        excluded = set(exclude_event_ids)
+        for item in self.database.sizing_history(key):
+            if item.get("event_id") in excluded:
+                continue
+            event_type = item.get("event_type")
+            if event_type == PositionEventType.OPEN.value and not self.config.sizing.copy_initial_entries:
+                continue
+            if event_type == PositionEventType.ADD.value and not self.config.sizing.copy_target_adds:
+                continue
+            equity = item.get("target_equity")
+            if equity is None or float(equity) <= 0:
+                continue
+            if is_equity_observation_usable(
+                self.config.sizing, float(equity), str(item.get("equity_source") or "missing"), item.get("equity_age_seconds"),
+            ):
+                fractions.append(float(item["target_notional"]) / float(equity))
+                action = "open" if event_type == PositionEventType.OPEN.value else "add"
+                seeded_signal_ids.add(stable_id("signal", str(item["event_id"]), action))
+        classifier.seed(key, fractions)
+        self._execution_authority.classifiers[key] = (self.config.sizing, classifier)
+        self._execution_authority.classifier_signal_ids[key] = seeded_signal_ids
+        return classifier
+
+    def _signals_for_event(self, event: PositionEvent, engine: PaperExecutionEngine) -> list[CopySignal]:
+        action = {
+            PositionEventType.OPEN: "open", PositionEventType.ADD: "add",
+            PositionEventType.REDUCE: "reduce", PositionEventType.CLOSE: "close",
+        }.get(event.event_type)
+        if action is not None:
+            identifier = (stable_id("signal", event.event_id, action) if action in {"open", "add"}
+                          else stable_id("signal", event.event_id, action, event.direction))
+            existing = self.database.get_signal(identifier)
+            if existing:
+                if action in {"open", "add"}:
+                    known = self._execution_authority.classifier_signal_ids.setdefault(event.target_wallet.lower(), set())
+                    if existing.signal_id not in known:
+                        equity = existing.target_equity
+                        if equity and is_equity_observation_usable(
+                            self.config.sizing, equity, existing.equity_source, existing.equity_age_seconds,
+                        ):
+                            self._classifier_for_wallet(event.target_wallet).record(
+                                event.target_wallet, existing.target_notional / equity,
+                            )
+                        known.add(existing.signal_id)
+                return [existing]
+        factory = SignalFactory(self._classifier_for_wallet(event.target_wallet), self.config)
+        signals = factory.from_position_event(event, engine.portfolio.cash or 0.0)
+        for signal in signals:
+            self.database.insert_signal(signal)
+            if signal.action in {"open", "add"}:
+                self._execution_authority.classifier_signal_ids.setdefault(event.target_wallet.lower(), set()).add(signal.signal_id)
+        return signals
+
+    def _execute_reconstructed_signal(
+        self, engine: PaperExecutionEngine, event: PositionEvent, signal: CopySignal, recovery_state: str,
+    ) -> None:
+        received_at = utc_now()
+        observation, age_ms = self.market_cache.latest_available(
+            event.symbol, received_at, self.config.paper_execution.market_data_max_age_ms,
+        )
+        metadata: dict[str, object] = {
+            "target_fill_price": event.price, "source_fill_timestamp": event.event_timestamp.isoformat(),
+            "local_receive_timestamp": received_at.isoformat(), "market_reference_age_ms": age_ms,
+        }
+        entry_block = (
+            "source_recovery_not_continuous" if recovery_state != "CONTINUOUS" and signal.action in {"open", "add"}
+            else self.control_store.entry_block_reason(signal.target_wallet, signal.action)
+        )
+        if entry_block:
+            metadata.update({"entry_gate": entry_block, "market_reference_source": "not_used"})
+            engine.process_signal(signal, received_at=received_at, market_metadata=metadata, forced_reason=entry_block)
+            return
+        if observation:
+            metadata.update({
+                "market_reference_price": observation.price,
+                "market_reference_timestamp": observation.timestamp.isoformat(),
+                "market_reference_source": observation.source, "market_reference_quality": observation.quality,
+                "source_to_receive_latency_ms": max(0.0, (received_at - event.event_timestamp).total_seconds() * 1000),
+            })
+            engine.process_signal(signal, received_at=received_at, market_price=observation.price, market_metadata=metadata)
+        elif signal.action in {"open", "add"}:
+            metadata.update({"market_reference_source": "unavailable", "market_reference_quality": "stale_or_missing"})
+            engine.process_signal(signal, received_at=received_at, market_metadata=metadata, forced_reason="stale_market_data")
+        elif self.config.paper_execution.stale_exit_market_policy == "skip":
+            metadata.update({"market_reference_source": "unavailable", "market_reference_quality": "stale_or_missing"})
+            engine.process_signal(signal, received_at=received_at, market_metadata=metadata, forced_reason="stale_market_data_exit")
+        else:
+            metadata.update({"market_reference_price": event.price, "market_reference_source": "target_fill_fallback",
+                             "market_reference_quality": "exit_only_not_contemporaneous"})
+            engine.process_signal(signal, received_at=received_at, market_price=event.price, market_metadata=metadata)
+
+    def _drain_pending_reconstruction_events(self, wallet: str) -> None:
+        """Execute only the cursor's durable pending economic events.
+
+        Signal rows are inserted before the PAPER attempt.  Therefore a crash
+        after reconstruction or signal persistence can restart from the same
+        deterministic signal, and a crash after execution is absorbed by the
+        transaction-backed execution claim before the queue entry is cleared.
+        """
+        normalized = wallet.lower()
+        with self._execution_lock:
+            cursor = self.database.reconstruction_cursor(normalized)
+            events = self.database.list_position_events_by_ids(normalized, cursor.pending_event_ids)
+            if not events:
+                return
+            engine = self._execution_engine()
+            # On a restart, the event transaction has already committed but
+            # their signals may not have.  Seed only from prior events so the
+            # first pending OPEN/ADD still sees prior-only sizing history.
+            self._classifier_for_wallet(normalized, exclude_event_ids=cursor.pending_event_ids)
+            completed: list[str] = []
+            for event in events:
+                for signal in self._signals_for_event(event, engine):
+                    self._execute_reconstructed_signal(engine, event, signal, cursor.recovery_state)
+                completed.append(event.event_id)
+            if completed:
+                self.database.clear_pending_reconstruction_events(normalized, completed)
 
     async def ingest_watched_state(self, wallet: str, payload: dict[str, object]) -> None:
         attributed = str(payload.get("user") or "").lower()
@@ -432,19 +732,138 @@ class CopyTradeService:
             }
 
     async def reconcile_wallet(self, wallet: str) -> int:
-        """Fetch the gap from durable local time before websocket subscription.
+        """Reconcile retained public history while proving the local overlap.
 
-        An overlap protects endpoint-boundary ambiguity; raw event IDs make it
-        harmless.  This is stronger than relying on a websocket snapshot alone
-        after a restart.
+        Receiving a nonempty response is not proof that the public retention
+        window still joins the durable local ledger.  A durable source fill ID
+        must appear in the returned range; otherwise entry copying fails closed
+        until an operator performs a verified flat-source rebaseline.
         """
-        latest = self.database.latest_fill_time(wallet)
-        if latest:
-            fills = await asyncio.to_thread(self.adapter.backfill_fills, wallet, latest - timedelta(milliseconds=1), utc_now())
+        normalized = wallet.lower()
+        anchor = self.database.latest_raw_fill(normalized)
+        prior = self.database.reconstruction_cursor(normalized)
+        baseline_detail = {
+            "safe_rebaseline_after": prior.recovery_detail["safe_rebaseline_after"],
+        } if "safe_rebaseline_after" in prior.recovery_detail else {}
+        self.database.set_recovery_state(
+            normalized, "RECOVERING", anchor=anchor,
+            detail={"reason": "watcher_reconcile", "prior_state": prior.recovery_state, **baseline_detail},
+        )
+        fills = await asyncio.to_thread(self.adapter.fetch_user_fills, normalized)
+        returned = {fill.event_id for fill in fills}
+        continuous = anchor is None or anchor.event_id in returned
+        if not continuous:
+            snapshot = await asyncio.to_thread(self.adapter.fetch_clearinghouse_state, normalized)
+            self.database.insert_snapshot(snapshot)
+            self.database.set_recovery_state(
+                normalized, "RECOVERY_INCOMPLETE", anchor=anchor,
+                detail={
+                    "reason": "recovery_anchor_missing", "anchor_event_id": anchor.event_id,
+                    "anchor_timestamp": anchor.event_timestamp.isoformat(), "returned_fill_count": len(fills),
+                    "clearinghouse_snapshot_id": snapshot.snapshot_id,
+                },
+            )
+            self.control_store.record_activity(
+                category="recovery", severity="warning", wallet=normalized,
+                message="Source continuity could not be proven; PAPER entries are fail-closed.",
+                payload={"recovery_state": "RECOVERY_INCOMPLETE", "anchor_event_id": anchor.event_id,
+                         "returned_fill_count": len(fills), "paper_entries_blocked": True, "exits_allowed": True},
+            )
+        elif prior.recovery_state == "RECOVERY_INCOMPLETE":
+            # A later overlap cannot prove the unobserved historical gap did
+            # not contain an economic transition.  Only safe rebaseline below
+            # can leave the incomplete state.
+            self.database.set_recovery_state(
+                normalized, "RECOVERY_INCOMPLETE", anchor=anchor,
+                detail={"reason": "prior_recovery_gap_requires_safe_rebaseline", "anchor_event_id": anchor.event_id if anchor else None},
+            )
         else:
-            fills = await asyncio.to_thread(self.adapter.fetch_user_fills, wallet)
-        await self.ingest_watched_fills(wallet, fills, True)
+            self.database.set_recovery_state(
+                normalized, "CONTINUOUS", anchor=anchor,
+                detail={"reason": "recovery_anchor_verified" if anchor else "initial_source_baseline",
+                        "anchor_event_id": anchor.event_id if anchor else None, **baseline_detail},
+            )
+            self.control_store.record_activity(
+                category="recovery", severity="info", wallet=normalized,
+                message="Source continuity verified for watcher reconciliation.",
+                payload={"recovery_state": "CONTINUOUS", "anchor_event_id": anchor.event_id if anchor else None},
+            )
+        await self.ingest_watched_fills(normalized, fills, True)
         return len(fills)
+
+    async def safe_rebaseline_recovery(self, wallet: str) -> dict[str, object]:
+        """Explicitly permit a new source baseline only after a verified flat state.
+
+        Existing raw evidence and incomplete campaigns are retained unchanged.
+        The cursor records a zero-source baseline for future incremental
+        transitions; it never fabricates the missing close, price, or P&L, and
+        it never mutates PAPER sleeves.
+        """
+        normalized = wallet.lower()
+        cursor = self.database.reconstruction_cursor(normalized)
+        if cursor.recovery_state != "RECOVERY_INCOMPLETE":
+            return {"wallet": normalized, "accepted": False, "reason": "recovery_not_incomplete"}
+        snapshot = await asyncio.to_thread(self.adapter.fetch_clearinghouse_state, normalized)
+        self.database.insert_snapshot(snapshot)
+        if not _clearinghouse_snapshot_is_flat(snapshot):
+            self.control_store.record_activity(
+                category="recovery", severity="warning", wallet=normalized,
+                message="Safe rebaseline rejected because source clearinghouse exposure is not provably flat.",
+                payload={"recovery_state": "RECOVERY_INCOMPLETE", "snapshot_id": snapshot.snapshot_id},
+            )
+            return {"wallet": normalized, "accepted": False, "reason": "source_not_provably_flat", "snapshot_id": snapshot.snapshot_id}
+        rebased_at = snapshot.snapshot_timestamp
+        updated = self.database.set_recovery_state(
+            normalized, "CONTINUOUS", anchor=None,
+            detail={
+                "reason": "operator_acknowledged_flat_rebaseline", "snapshot_id": snapshot.snapshot_id,
+                "safe_rebaseline_after": rebased_at.isoformat(), "prior_recovery_anchor": cursor.recovery_anchor_event_id,
+            },
+        )
+        self.control_store.record_activity(
+            category="recovery", severity="warning", wallet=normalized,
+            message="Operator acknowledged a verified flat source state; future campaigns use a new zero baseline.",
+            payload={"recovery_state": updated.recovery_state, "snapshot_id": snapshot.snapshot_id,
+                     "safe_rebaseline_after": rebased_at.isoformat(), "paper_only": True},
+        )
+        return {"wallet": normalized, "accepted": True, "snapshot_id": snapshot.snapshot_id,
+                "recovery_state": updated.recovery_state, "safe_rebaseline_after": rebased_at.isoformat()}
+
+    def recovery_status(self, wallet: str | None = None) -> dict[str, object]:
+        cursors = self.database.reconstruction_cursors([wallet] if wallet else None)
+        cursor_by_wallet = {item.target_wallet: item for item in cursors}
+        expected = [wallet.lower()] if wallet else self.monitored_execution_wallets()
+        rows: list[dict[str, object]] = []
+        for expected_wallet in expected:
+            item = cursor_by_wallet.pop(expected_wallet, None)
+            if item is None:
+                rows.append({
+                    "wallet": expected_wallet, "state": "NOT_STARTED", "anchor_event_id": None,
+                    "anchor_timestamp": None, "detail": {"reason": "no_durable_recovery_checkpoint"},
+                    "updated_at": None, "entries_blocked": True, "exits_allowed": True,
+                })
+                continue
+            rows.append({
+                "wallet": item.target_wallet, "state": item.recovery_state,
+                "anchor_event_id": item.recovery_anchor_event_id,
+                "anchor_timestamp": item.recovery_anchor_timestamp.isoformat() if item.recovery_anchor_timestamp else None,
+                "detail": item.recovery_detail,
+                "updated_at": item.updated_at.isoformat() if hasattr(item.updated_at, "isoformat") else item.updated_at,
+                "entries_blocked": item.recovery_state != "CONTINUOUS", "exits_allowed": True,
+            })
+        for item in cursor_by_wallet.values():
+            rows.append({
+                "wallet": item.target_wallet, "state": item.recovery_state,
+                "anchor_event_id": item.recovery_anchor_event_id,
+                "anchor_timestamp": item.recovery_anchor_timestamp.isoformat() if item.recovery_anchor_timestamp else None,
+                "detail": item.recovery_detail,
+                "updated_at": item.updated_at.isoformat() if hasattr(item.updated_at, "isoformat") else item.updated_at,
+                "entries_blocked": item.recovery_state != "CONTINUOUS", "exits_allowed": True,
+            })
+        return {
+            "wallets": sorted(rows, key=lambda item: str(item["wallet"])),
+            "paper_only": True,
+        }
 
     async def reconcile_approved_wallets(self) -> dict[str, int]:
         """Compatibility alias for the former approved-target watcher API."""
@@ -510,6 +929,24 @@ def _float_or_none(value: object) -> float | None:
         return float(value) if value not in (None, "") else None
     except (TypeError, ValueError):
         return None
+
+
+def _clearinghouse_snapshot_is_flat(snapshot: TraderSnapshot) -> bool:
+    """Accept only an explicitly parseable zero-position public state."""
+    positions = snapshot.positions.get("asset_positions") if isinstance(snapshot.positions, dict) else None
+    if not isinstance(positions, list):
+        return False
+    for item in positions:
+        position = item.get("position") if isinstance(item, dict) and isinstance(item.get("position"), dict) else item
+        if not isinstance(position, dict):
+            return False
+        value = position.get("szi", position.get("size", position.get("position")))
+        try:
+            if value is None or abs(float(value)) > 1e-12:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
 
 
 def _live_state_equity(payload: dict[str, object]) -> tuple[float | None, str | None, str]:

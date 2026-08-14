@@ -298,9 +298,15 @@ class PhaseCAuthorityTests(unittest.TestCase):
 
             def assert_write_lock(wallet: str, *, connection: sqlite3.Connection | None = None) -> dict[str, object]:
                 self.assertIsNotNone(connection)
-                with sqlite3.connect(service.config.artifacts.database_path, timeout=0) as contender:
+                contender = sqlite3.connect(service.config.artifacts.database_path, timeout=0)
+                try:
                     with self.assertRaises(sqlite3.OperationalError):
                         contender.execute("UPDATE copy_candidate_analyses SET last_run_id='concurrent-run' WHERE wallet=?", (wallet,))
+                finally:
+                    # sqlite3's transaction context commits/rolls back but
+                    # does not close the connection.  Close it explicitly so
+                    # Windows can remove this test's temporary database.
+                    contender.close()
                 return validate(wallet, connection=connection)
 
             with patch.object(center, "_validate_activation_authority", side_effect=assert_write_lock):

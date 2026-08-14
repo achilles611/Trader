@@ -519,6 +519,7 @@ class CopyControlCenter:
             "market_data": {"last_mark_at": last_mark, "age_ms": mark_age_ms,
                             "fresh": bool(mark_age_ms is not None and mark_age_ms <= self.config.paper_execution.market_data_max_age_ms)},
             "source": {"last_public_fill_at": fill["event_timestamp"] if fill else None},
+            "recovery": self._paper_service().recovery_status(),
             "hyperliquid_api": api_limiter.telemetry(),
             "last_discovery_run": self._run_payload(latest_discovery),
             "last_phase_b_run": self._run_payload(latest_analysis),
@@ -549,6 +550,7 @@ class CopyControlCenter:
             "control": self.store.control_state(),
             "top_candidates": self.candidates(page_size=8, status="")['items'],
             "active_cohort": self.active_cohort(),
+            "recovery": self._paper_service().recovery_status(),
             "recent_activity": self.activity(limit=8),
         }
 
@@ -1468,6 +1470,14 @@ def create_control_center_app(
     @app.get("/api/system")
     async def api_system() -> dict[str, Any]:
         return {"health": center.health(live_watcher_health), "risk": center.risk_panel(), "source": source.source_status(), "paper_only": True}
+
+    @app.get("/api/recovery")
+    async def api_recovery(wallet: str | None = None) -> dict[str, Any]:
+        return center._paper_service().recovery_status(wallet)
+
+    @app.post("/api/recovery/{wallet}/safe-rebaseline")
+    async def api_safe_rebaseline(wallet: str) -> dict[str, Any]:
+        return await center._paper_service().safe_rebaseline_recovery(wallet)
 
     @app.get("/api/controls")
     async def api_controls() -> dict[str, Any]:

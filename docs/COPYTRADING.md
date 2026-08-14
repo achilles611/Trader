@@ -49,6 +49,7 @@ SQLite tables are deliberately isolated in `artifacts/copytrade.sqlite3`:
 - `copy_trader_snapshots`, `copy_daily_metrics`, and `copy_candidate_scores`
 - `copy_signals`, `copy_virtual_positions`, `copy_execution_attempts`, `copy_execution_claims`, and `copy_execution_fills`
 - `copy_backtest_runs`, `copy_portfolio_snapshots`, and `copy_backfill_coverage`
+- `copy_reconstruction_cursors` for versioned per-wallet incremental source reconstruction and recovery continuity state
 - `copy_analysis_runs`, `copy_analysis_run_wallets`, append-only `copy_analysis_run_wallet_events`, and `copy_candidate_analyses`
 - `copy_analysis_market_evidence` and `copy_analysis_finalist_recommendations` for immutable replay evidence and recommendation-only selection audit
 
@@ -176,12 +177,24 @@ and refresh activity/last-seen values. A new wallet is added to `copy_targets`
 with status `new`; rediscovery never overwrites a manually set status.
 
 On watcher startup (and after each reconnect), it first receives an `allMids`
-frame to warm the market cache, then reconciles from the durable latest-fill
-timestamp with a one-millisecond overlap, and finally processes the subscribed
-user-fill stream. There is one initial reconciliation, not a duplicate startup
-pass. The websocket snapshot is also accepted. Both paths pass through the
-same deterministic raw-event ID and execution-attempt boundary, so overlap is
-replayed safely rather than silently skipped or copied twice.
+frame to warm the market cache, then asks for the retained public fill range.
+If a local anchor exists, an exact durable raw-fill ID must appear in that
+response before continuity is accepted. A nonempty response alone is not
+proof. An absent anchor persists `RECOVERY_INCOMPLETE`, records activity and a
+clearinghouse-state observation, blocks `OPEN`/`ADD`, and preserves exits.
+It remains fail-closed across restart; a verified flat clearinghouse state plus
+an explicit safe-rebaseline command is the only route to a new zero source
+baseline. Clearinghouse state is evidence only and never overwrites PAPER
+sleeves or invents missing source P&L.
+
+The live watcher does not reconstruct a wallet's full raw-fill history for
+each source message. New fills are committed first, then the versioned cursor
+advances in the same SQLite transaction as only the generated PositionEvents
+and changed campaigns. A crash can leave durable raw evidence behind the
+cursor, which safely replays; it cannot advance a cursor beyond uncommitted
+reconstruction. Full reconstruction remains the explicit startup/migration,
+repair, research, and validation path. Historical snapshot rebuilding seeds
+prior-only target-size context but does not replay historical PAPER entries.
 
 For live paper research, `allMids` is cached as a websocket midpoint reference.
 It is not described as an executable quote. New entries require a fresh cached
@@ -382,6 +395,9 @@ The public Hyperliquid `/info` allowance is coordinated through a tiny
 SQLite-backed host-local reservation window beside the application artifacts.
 Separate Control Center and Phase B processes using the same artifacts
 database therefore share conservative weighted reservations and 429 cooldowns.
+The durable coordinator adopts the minimum configured operating budget for its
+entire lifetime; a later process requesting a larger budget cannot relax an
+earlier conservative setting without an explicit reset/reconfiguration.
 This is local-machine coordination, not a claim to coordinate unrelated hosts
 behind the same external NAT.
 

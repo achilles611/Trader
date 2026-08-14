@@ -46,6 +46,27 @@ class DiscoveryStageStats:
     rejections: list[dict[str, Any]] = field(default_factory=list)
 
 
+RECONSTRUCTION_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class ReconstructionCursor:
+    target_wallet: str
+    schema_version: int
+    revision: int
+    last_seen_timestamp: object | None = None
+    last_seen_event_id: str | None = None
+    last_processed_timestamp: object | None = None
+    last_processed_event_id: str | None = None
+    pending_fill_ids: tuple[str, ...] = ()
+    pending_event_ids: tuple[str, ...] = ()
+    recovery_state: str = "CONTINUOUS"
+    recovery_anchor_event_id: str | None = None
+    recovery_anchor_timestamp: object | None = None
+    recovery_detail: dict[str, Any] = field(default_factory=dict)
+    updated_at: object | None = None
+
+
 class CopyTradeStore(Protocol):
     """Small storage contract; a PostgreSQL implementation can replace SQLite later."""
 
@@ -149,6 +170,24 @@ class CopyTradeDatabase:
                     ON copy_raw_fills(target_wallet, event_timestamp);
                 CREATE INDEX IF NOT EXISTS idx_copy_raw_fills_order
                     ON copy_raw_fills(target_wallet, target_order_id);
+                CREATE TABLE IF NOT EXISTS copy_reconstruction_cursors (
+                    target_wallet TEXT PRIMARY KEY,
+                    schema_version INTEGER NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    last_seen_timestamp TEXT,
+                    last_seen_event_id TEXT,
+                    last_processed_timestamp TEXT,
+                    last_processed_event_id TEXT,
+                    pending_fill_ids_json TEXT NOT NULL DEFAULT '[]',
+                    pending_event_ids_json TEXT NOT NULL DEFAULT '[]',
+                    recovery_state TEXT NOT NULL DEFAULT 'CONTINUOUS',
+                    recovery_anchor_event_id TEXT,
+                    recovery_anchor_timestamp TEXT,
+                    recovery_detail_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_copy_reconstruction_cursors_recovery
+                    ON copy_reconstruction_cursors(recovery_state, updated_at);
                 CREATE TABLE IF NOT EXISTS copy_position_events (
                     event_id TEXT PRIMARY KEY, target_wallet TEXT NOT NULL, symbol TEXT NOT NULL,
                     event_type TEXT NOT NULL, direction TEXT NOT NULL, delta_quantity REAL NOT NULL,
@@ -333,6 +372,18 @@ class CopyTradeDatabase:
             self._ensure_column(connection, "copy_signals", "target_leverage", "REAL")
             self._ensure_column(connection, "copy_raw_fills", "source_closed_pnl", "REAL")
             self._ensure_column(connection, "copy_raw_fills", "is_liquidation", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "copy_reconstruction_cursors", "schema_version", "INTEGER NOT NULL DEFAULT 1")
+            self._ensure_column(connection, "copy_reconstruction_cursors", "revision", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "copy_reconstruction_cursors", "last_seen_timestamp", "TEXT")
+            self._ensure_column(connection, "copy_reconstruction_cursors", "last_seen_event_id", "TEXT")
+            self._ensure_column(connection, "copy_reconstruction_cursors", "last_processed_timestamp", "TEXT")
+            self._ensure_column(connection, "copy_reconstruction_cursors", "last_processed_event_id", "TEXT")
+            self._ensure_column(connection, "copy_reconstruction_cursors", "pending_fill_ids_json", "TEXT NOT NULL DEFAULT '[]'")
+            self._ensure_column(connection, "copy_reconstruction_cursors", "pending_event_ids_json", "TEXT NOT NULL DEFAULT '[]'")
+            self._ensure_column(connection, "copy_reconstruction_cursors", "recovery_state", "TEXT NOT NULL DEFAULT 'CONTINUOUS'")
+            self._ensure_column(connection, "copy_reconstruction_cursors", "recovery_anchor_event_id", "TEXT")
+            self._ensure_column(connection, "copy_reconstruction_cursors", "recovery_anchor_timestamp", "TEXT")
+            self._ensure_column(connection, "copy_reconstruction_cursors", "recovery_detail_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(connection, "copy_analysis_finalist_recommendations", "recommendation_schema_version", "INTEGER NOT NULL DEFAULT 1")
             self._ensure_column(connection, "copy_position_events", "equity_source", "TEXT NOT NULL DEFAULT 'missing'")
             self._ensure_column(connection, "copy_position_events", "equity_age_seconds", "REAL")
@@ -1196,21 +1247,38 @@ class CopyTradeDatabase:
             _dump(fill.raw_payload), fill.source_closed_pnl, int(fill.is_liquidation),
         )
 
-    def insert_raw_fills(self, fills: Iterable[RawFill], *, batch_size: int = 1_000) -> int:
+    def insert_raw_fills_returning_new(self, fills: Iterable[RawFill], *, batch_size: int = 1_000) -> tuple[RawFill, ...]:
         """Insert de-duplicated source fills in one bounded SQLite transaction.
 
         Network acquisition can stay parallel while persistence is a single
-        WAL-friendly write transaction.  Duplicate event IDs retain the former
-        INSERT OR IGNORE semantics both within and across batches.
+        WAL-friendly write transaction.  Returning the exact newly inserted
+        evidence lets the watcher distinguish an old replay from a genuinely
+        late arrival without relying on timestamps alone.
         """
         if batch_size < 1:
             raise ValueError("Raw-fill batch size must be positive.")
-        inserted = 0
+        inserted: list[RawFill] = []
         iterator = iter(fills)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             while batch := list(islice(iterator, batch_size)):
-                before = connection.total_changes
+                # De-duplicate within a frame first.  The IMMEDIATE writer
+                # transaction then makes the read/insert decision atomic with
+                # respect to other local SQLite writers.
+                unique = list({fill.event_id: fill for fill in batch}.values())
+                if not unique:
+                    continue
+                known: set[str] = set()
+                for offset in range(0, len(unique), 900):
+                    identifiers = [fill.event_id for fill in unique[offset:offset + 900]]
+                    placeholders = ",".join("?" for _ in identifiers)
+                    rows = connection.execute(
+                        f"SELECT event_id FROM copy_raw_fills WHERE event_id IN ({placeholders})", identifiers,
+                    ).fetchall()
+                    known.update(str(row["event_id"]) for row in rows)
+                fresh = [fill for fill in unique if fill.event_id not in known]
+                if not fresh:
+                    continue
                 connection.executemany(
                     """INSERT OR IGNORE INTO copy_raw_fills(
                         event_id, source, venue, chain_network, target_wallet, target_order_id, target_trade_id,
@@ -1218,10 +1286,13 @@ class CopyTradeDatabase:
                         target_account_equity, target_position_before, event_timestamp, ingestion_timestamp,
                         confirmation, raw_payload_json, source_closed_pnl, is_liquidation)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    [self._raw_fill_values(fill) for fill in batch],
+                    [self._raw_fill_values(fill) for fill in fresh],
                 )
-                inserted += connection.total_changes - before
-        return inserted
+                inserted.extend(fresh)
+        return tuple(inserted)
+
+    def insert_raw_fills(self, fills: Iterable[RawFill], *, batch_size: int = 1_000) -> int:
+        return len(self.insert_raw_fills_returning_new(fills, batch_size=batch_size))
 
     def list_raw_fills(
         self, wallet: str | None = None, *, start: object | None = None, end: object | None = None
@@ -1245,6 +1316,42 @@ class CopyTradeDatabase:
             rows = connection.execute(query, values).fetchall()
         return [self._raw_fill_from_row(row) for row in rows]
 
+    def list_raw_fills_after(self, wallet: str, timestamp: object | None, event_id: str | None) -> list[RawFill]:
+        """Return only source evidence strictly beyond a durable composite cursor."""
+        if timestamp is None or event_id is None:
+            return self.list_raw_fills(wallet)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM copy_raw_fills WHERE target_wallet=?
+                   AND (event_timestamp>? OR (event_timestamp=? AND event_id>?))
+                   ORDER BY event_timestamp, event_id""",
+                (wallet.lower(), iso(timestamp), iso(timestamp), event_id),
+            ).fetchall()
+        return [self._raw_fill_from_row(row) for row in rows]
+
+    def list_raw_fills_by_ids(self, wallet: str, event_ids: Iterable[str]) -> list[RawFill]:
+        identifiers = list(dict.fromkeys(event_ids))
+        if not identifiers:
+            return []
+        rows: list[sqlite3.Row] = []
+        with self._connect() as connection:
+            for offset in range(0, len(identifiers), 900):
+                batch = identifiers[offset:offset + 900]
+                placeholders = ",".join("?" for _ in batch)
+                rows.extend(connection.execute(
+                    f"SELECT * FROM copy_raw_fills WHERE target_wallet=? AND event_id IN ({placeholders})",
+                    [wallet.lower(), *batch],
+                ).fetchall())
+        return [self._raw_fill_from_row(row) for row in sorted(rows, key=lambda row: (row["event_timestamp"], row["event_id"]))]
+
+    def latest_raw_fill(self, wallet: str) -> RawFill | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT * FROM copy_raw_fills WHERE target_wallet=?
+                   ORDER BY event_timestamp DESC, event_id DESC LIMIT 1""", (wallet.lower(),),
+            ).fetchone()
+        return self._raw_fill_from_row(row) if row else None
+
     def latest_fill_time(self, wallet: str) -> object | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -1258,6 +1365,145 @@ class CopyTradeDatabase:
                 "SELECT MIN(event_timestamp) AS event_timestamp FROM copy_raw_fills WHERE target_wallet=?", (wallet.lower(),)
             ).fetchone()
         return as_utc(row["event_timestamp"]) if row and row["event_timestamp"] else None
+
+    @staticmethod
+    def _cursor_from_row(row: sqlite3.Row | None, wallet: str) -> ReconstructionCursor:
+        if row is None:
+            return ReconstructionCursor(target_wallet=wallet.lower(), schema_version=RECONSTRUCTION_SCHEMA_VERSION, revision=0)
+        return ReconstructionCursor(
+            target_wallet=row["target_wallet"], schema_version=int(row["schema_version"]), revision=int(row["revision"]),
+            last_seen_timestamp=as_utc(row["last_seen_timestamp"]) if row["last_seen_timestamp"] else None,
+            last_seen_event_id=row["last_seen_event_id"],
+            last_processed_timestamp=as_utc(row["last_processed_timestamp"]) if row["last_processed_timestamp"] else None,
+            last_processed_event_id=row["last_processed_event_id"],
+            pending_fill_ids=tuple(_load(row["pending_fill_ids_json"], [])),
+            pending_event_ids=tuple(_load(row["pending_event_ids_json"], [])),
+            recovery_state=row["recovery_state"], recovery_anchor_event_id=row["recovery_anchor_event_id"],
+            recovery_anchor_timestamp=as_utc(row["recovery_anchor_timestamp"]) if row["recovery_anchor_timestamp"] else None,
+            recovery_detail=_load(row["recovery_detail_json"], {}),
+            updated_at=as_utc(row["updated_at"]) if row["updated_at"] else None,
+        )
+
+    def reconstruction_cursor(self, wallet: str) -> ReconstructionCursor:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM copy_reconstruction_cursors WHERE target_wallet=?", (wallet.lower(),),
+            ).fetchone()
+        return self._cursor_from_row(row, wallet)
+
+    def has_reconstruction_cursor(self, wallet: str) -> bool:
+        with self._connect() as connection:
+            return connection.execute(
+                "SELECT 1 FROM copy_reconstruction_cursors WHERE target_wallet=?", (wallet.lower(),),
+            ).fetchone() is not None
+
+    def reconstruction_cursors(self, wallets: Iterable[str] | None = None) -> list[ReconstructionCursor]:
+        requested = [wallet.lower() for wallet in wallets] if wallets is not None else None
+        with self._connect() as connection:
+            if requested:
+                placeholders = ",".join("?" for _ in requested)
+                rows = connection.execute(
+                    f"SELECT * FROM copy_reconstruction_cursors WHERE target_wallet IN ({placeholders}) ORDER BY target_wallet",
+                    requested,
+                ).fetchall()
+            else:
+                rows = connection.execute("SELECT * FROM copy_reconstruction_cursors ORDER BY target_wallet").fetchall()
+        return [self._cursor_from_row(row, row["target_wallet"]) for row in rows]
+
+    @staticmethod
+    def _cursor_values(cursor: ReconstructionCursor, *, revision: int) -> tuple[Any, ...]:
+        return (
+            cursor.target_wallet.lower(), cursor.schema_version, revision,
+            iso(cursor.last_seen_timestamp) if cursor.last_seen_timestamp else None, cursor.last_seen_event_id,
+            iso(cursor.last_processed_timestamp) if cursor.last_processed_timestamp else None, cursor.last_processed_event_id,
+            _dump(cursor.pending_fill_ids), _dump(cursor.pending_event_ids), cursor.recovery_state,
+            cursor.recovery_anchor_event_id,
+            iso(cursor.recovery_anchor_timestamp) if cursor.recovery_anchor_timestamp else None,
+            _dump(cursor.recovery_detail), iso(cursor.updated_at),
+        )
+
+    def set_recovery_state(
+        self, wallet: str, state: str, *, anchor: RawFill | None = None, detail: Mapping[str, Any] | None = None,
+    ) -> ReconstructionCursor:
+        """Persist continuity state without manufacturing source history."""
+        if state not in {"CONTINUOUS", "RECOVERING", "RECOVERY_INCOMPLETE"}:
+            raise ValueError(f"Unsupported recovery state: {state}")
+        normalized = wallet.lower()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT * FROM copy_reconstruction_cursors WHERE target_wallet=?", (normalized,),
+                ).fetchone()
+                cursor = self._cursor_from_row(row, normalized)
+                replacement = ReconstructionCursor(
+                    target_wallet=normalized, schema_version=cursor.schema_version, revision=cursor.revision,
+                    last_seen_timestamp=cursor.last_seen_timestamp, last_seen_event_id=cursor.last_seen_event_id,
+                    last_processed_timestamp=cursor.last_processed_timestamp, last_processed_event_id=cursor.last_processed_event_id,
+                    pending_fill_ids=cursor.pending_fill_ids, pending_event_ids=cursor.pending_event_ids,
+                    recovery_state=state,
+                    recovery_anchor_event_id=anchor.event_id if anchor else cursor.recovery_anchor_event_id,
+                    recovery_anchor_timestamp=anchor.event_timestamp if anchor else cursor.recovery_anchor_timestamp,
+                    recovery_detail=dict(detail or {}), updated_at=iso(None),
+                )
+                if row is None:
+                    connection.execute(
+                        """INSERT INTO copy_reconstruction_cursors(target_wallet, schema_version, revision,
+                        last_seen_timestamp, last_seen_event_id, last_processed_timestamp, last_processed_event_id,
+                        pending_fill_ids_json, pending_event_ids_json, recovery_state, recovery_anchor_event_id,
+                        recovery_anchor_timestamp, recovery_detail_json, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        self._cursor_values(replacement, revision=1),
+                    )
+                    return ReconstructionCursor(**{**replacement.__dict__, "revision": 1})
+                changed = connection.execute(
+                    """UPDATE copy_reconstruction_cursors SET schema_version=?, revision=?, last_seen_timestamp=?,
+                       last_seen_event_id=?, last_processed_timestamp=?, last_processed_event_id=?, pending_fill_ids_json=?,
+                       pending_event_ids_json=?, recovery_state=?, recovery_anchor_event_id=?, recovery_anchor_timestamp=?,
+                       recovery_detail_json=?, updated_at=? WHERE target_wallet=? AND revision=?""",
+                    (*self._cursor_values(replacement, revision=cursor.revision + 1)[1:], normalized, cursor.revision),
+                ).rowcount
+                if changed != 1:
+                    raise RuntimeError("Concurrent reconstruction cursor update detected.")
+                return ReconstructionCursor(**{**replacement.__dict__, "revision": cursor.revision + 1})
+            except Exception:
+                connection.rollback()
+                raise
+
+    def clear_pending_reconstruction_events(self, wallet: str, event_ids: Iterable[str]) -> ReconstructionCursor:
+        consumed = set(event_ids)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT * FROM copy_reconstruction_cursors WHERE target_wallet=?", (wallet.lower(),),
+                ).fetchone()
+                cursor = self._cursor_from_row(row, wallet)
+                if row is None:
+                    return cursor
+                replacement = ReconstructionCursor(
+                    target_wallet=cursor.target_wallet, schema_version=cursor.schema_version, revision=cursor.revision,
+                    last_seen_timestamp=cursor.last_seen_timestamp, last_seen_event_id=cursor.last_seen_event_id,
+                    last_processed_timestamp=cursor.last_processed_timestamp, last_processed_event_id=cursor.last_processed_event_id,
+                    pending_fill_ids=cursor.pending_fill_ids,
+                    pending_event_ids=tuple(item for item in cursor.pending_event_ids if item not in consumed),
+                    recovery_state=cursor.recovery_state, recovery_anchor_event_id=cursor.recovery_anchor_event_id,
+                    recovery_anchor_timestamp=cursor.recovery_anchor_timestamp, recovery_detail=cursor.recovery_detail,
+                    updated_at=iso(None),
+                )
+                changed = connection.execute(
+                    """UPDATE copy_reconstruction_cursors SET schema_version=?, revision=?, last_seen_timestamp=?,
+                       last_seen_event_id=?, last_processed_timestamp=?, last_processed_event_id=?, pending_fill_ids_json=?,
+                       pending_event_ids_json=?, recovery_state=?, recovery_anchor_event_id=?, recovery_anchor_timestamp=?,
+                       recovery_detail_json=?, updated_at=? WHERE target_wallet=? AND revision=?""",
+                    (*self._cursor_values(replacement, revision=cursor.revision + 1)[1:], wallet.lower(), cursor.revision),
+                ).rowcount
+                if changed != 1:
+                    raise RuntimeError("Concurrent reconstruction cursor update detected.")
+                return ReconstructionCursor(**{**replacement.__dict__, "revision": cursor.revision + 1})
+            except Exception:
+                connection.rollback()
+                raise
 
     def latest_prior_equity_observation(self, wallet: str, timestamp: object) -> dict[str, Any] | None:
         """Return the latest non-future account-value sample for enrichment."""
@@ -1352,6 +1598,205 @@ class CopyTradeDatabase:
                  int(campaign.history_complete), campaign.entry_basis_quality, campaign.source_closed_pnl,
                  int(campaign.source_closed_pnl_observed), campaign.reconciliation_gross_difference, campaign.liquidation_count),
             )
+
+    @staticmethod
+    def _position_event_values(event: PositionEvent) -> tuple[Any, ...]:
+        return (
+            event.event_id, event.target_wallet, event.symbol, event.event_type.value, event.direction,
+            event.delta_quantity, event.before_quantity, event.after_quantity, event.price, event.notional,
+            iso(event.event_timestamp), event.campaign_id, _dump(event.raw_fill_ids), event.target_equity,
+            event.initial_delta_notional, event.equity_source, event.equity_age_seconds, event.source_event_type,
+            event.split_role, event.split_quantity, event.split_notional, event.split_fee, event.source_closed_pnl,
+        )
+
+    @staticmethod
+    def _campaign_values(campaign: PositionCampaign) -> tuple[Any, ...]:
+        return (
+            campaign.campaign_id, campaign.target_wallet, campaign.symbol, campaign.direction, iso(campaign.opened_at),
+            iso(campaign.closed_at) if campaign.closed_at else None, campaign.entry_quantity, campaign.open_quantity,
+            campaign.entry_notional, campaign.remaining_entry_notional, campaign.exit_notional, campaign.realized_pnl,
+            campaign.target_fees, campaign.event_count, _dump(campaign.raw_fill_ids), campaign.max_open_quantity,
+            campaign.adverse_add_count, int(campaign.history_complete), campaign.entry_basis_quality,
+            campaign.source_closed_pnl, int(campaign.source_closed_pnl_observed), campaign.reconciliation_gross_difference,
+            campaign.liquidation_count,
+        )
+
+    def persist_reconstruction_batch(
+        self, wallet: str, events: Iterable[PositionEvent], campaigns: Iterable[PositionCampaign], cursor: ReconstructionCursor,
+        *, replace_wallet_history: bool = False,
+    ) -> ReconstructionCursor:
+        """Commit reconstructed rows and the cursor as one recovery boundary.
+
+        Raw evidence is committed first.  This second transaction is all or
+        nothing: the cursor can never point beyond events/campaign accounting
+        that reached SQLite.  A crash before it commits leaves the cursor behind
+        durable evidence, which is intentionally safe to replay.
+        """
+        event_rows = [self._position_event_values(item) for item in events]
+        campaign_rows = [self._campaign_values(item) for item in campaigns]
+        normalized = wallet.lower()
+        if cursor.target_wallet.lower() != normalized:
+            raise ValueError("Reconstruction cursor wallet does not match persisted rows.")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                current = connection.execute(
+                    "SELECT revision FROM copy_reconstruction_cursors WHERE target_wallet=?", (normalized,),
+                ).fetchone()
+                current_revision = int(current["revision"]) if current else 0
+                if current_revision != cursor.revision:
+                    raise RuntimeError("Concurrent reconstruction cursor update detected.")
+                if replace_wallet_history:
+                    connection.execute("DELETE FROM copy_position_events WHERE target_wallet=?", (normalized,))
+                    connection.execute("DELETE FROM copy_campaigns WHERE target_wallet=?", (normalized,))
+                if event_rows:
+                    connection.executemany(
+                        """INSERT INTO copy_position_events(event_id, target_wallet, symbol, event_type, direction,
+                           delta_quantity, before_quantity, after_quantity, price, notional, event_timestamp,
+                           campaign_id, raw_fill_ids_json, target_equity, initial_delta_notional, equity_source,
+                           equity_age_seconds, source_event_type, split_role, split_quantity, split_notional, split_fee, source_closed_pnl)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(event_id) DO UPDATE SET campaign_id=excluded.campaign_id,
+                           target_equity=excluded.target_equity, equity_source=excluded.equity_source,
+                           equity_age_seconds=excluded.equity_age_seconds""", event_rows,
+                    )
+                if campaign_rows:
+                    connection.executemany(
+                        """INSERT INTO copy_campaigns(campaign_id, target_wallet, symbol, direction, opened_at, closed_at,
+                           entry_quantity, open_quantity, entry_notional, remaining_entry_notional, exit_notional, realized_pnl, target_fees,
+                           event_count, raw_fill_ids_json, max_open_quantity, adverse_add_count, history_complete,
+                           entry_basis_quality, source_closed_pnl, source_closed_pnl_observed, reconciliation_gross_difference, liquidation_count)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(campaign_id) DO UPDATE SET closed_at=excluded.closed_at,
+                           entry_quantity=excluded.entry_quantity, open_quantity=excluded.open_quantity,
+                           entry_notional=excluded.entry_notional, remaining_entry_notional=excluded.remaining_entry_notional,
+                           exit_notional=excluded.exit_notional, realized_pnl=excluded.realized_pnl,
+                           target_fees=excluded.target_fees, event_count=excluded.event_count,
+                           raw_fill_ids_json=excluded.raw_fill_ids_json, max_open_quantity=excluded.max_open_quantity,
+                           adverse_add_count=excluded.adverse_add_count, history_complete=excluded.history_complete,
+                           entry_basis_quality=excluded.entry_basis_quality, source_closed_pnl=excluded.source_closed_pnl,
+                           source_closed_pnl_observed=excluded.source_closed_pnl_observed,
+                           reconciliation_gross_difference=excluded.reconciliation_gross_difference,
+                           liquidation_count=excluded.liquidation_count""", campaign_rows,
+                    )
+                replacement = ReconstructionCursor(
+                    target_wallet=normalized, schema_version=cursor.schema_version, revision=current_revision + 1,
+                    last_seen_timestamp=cursor.last_seen_timestamp, last_seen_event_id=cursor.last_seen_event_id,
+                    last_processed_timestamp=cursor.last_processed_timestamp,
+                    last_processed_event_id=cursor.last_processed_event_id,
+                    pending_fill_ids=cursor.pending_fill_ids, pending_event_ids=cursor.pending_event_ids,
+                    recovery_state=cursor.recovery_state, recovery_anchor_event_id=cursor.recovery_anchor_event_id,
+                    recovery_anchor_timestamp=cursor.recovery_anchor_timestamp, recovery_detail=cursor.recovery_detail,
+                    updated_at=iso(None),
+                )
+                if current is None:
+                    connection.execute(
+                        """INSERT INTO copy_reconstruction_cursors(target_wallet, schema_version, revision,
+                        last_seen_timestamp, last_seen_event_id, last_processed_timestamp, last_processed_event_id,
+                        pending_fill_ids_json, pending_event_ids_json, recovery_state, recovery_anchor_event_id,
+                        recovery_anchor_timestamp, recovery_detail_json, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        self._cursor_values(replacement, revision=replacement.revision),
+                    )
+                else:
+                    connection.execute(
+                        """UPDATE copy_reconstruction_cursors SET schema_version=?, revision=?, last_seen_timestamp=?,
+                           last_seen_event_id=?, last_processed_timestamp=?, last_processed_event_id=?, pending_fill_ids_json=?,
+                           pending_event_ids_json=?, recovery_state=?, recovery_anchor_event_id=?, recovery_anchor_timestamp=?,
+                           recovery_detail_json=?, updated_at=? WHERE target_wallet=? AND revision=?""",
+                        (*self._cursor_values(replacement, revision=replacement.revision)[1:], normalized, current_revision),
+                    )
+                connection.commit()
+                return replacement
+            except Exception:
+                connection.rollback()
+                raise
+
+    def list_open_campaigns(self, wallet: str) -> list[PositionCampaign]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM copy_campaigns WHERE target_wallet=? AND closed_at IS NULL
+                   ORDER BY opened_at, campaign_id""", (wallet.lower(),),
+            ).fetchall()
+        return [
+            PositionCampaign(campaign_id=row["campaign_id"], target_wallet=row["target_wallet"], symbol=row["symbol"],
+                             direction=row["direction"], opened_at=as_utc(row["opened_at"]),
+                             closed_at=None, entry_quantity=float(row["entry_quantity"]), open_quantity=float(row["open_quantity"]),
+                             entry_notional=float(row["entry_notional"]), remaining_entry_notional=float(row["remaining_entry_notional"]),
+                             exit_notional=float(row["exit_notional"]), realized_pnl=float(row["realized_pnl"]),
+                             target_fees=float(row["target_fees"]), event_count=int(row["event_count"]),
+                             raw_fill_ids=list(_load(row["raw_fill_ids_json"], [])), max_open_quantity=float(row["max_open_quantity"]),
+                             adverse_add_count=int(row["adverse_add_count"]), history_complete=bool(row["history_complete"]),
+                             entry_basis_quality=row["entry_basis_quality"], source_closed_pnl=float(row["source_closed_pnl"]),
+                             source_closed_pnl_observed=bool(row["source_closed_pnl_observed"]),
+                             reconciliation_gross_difference=row["reconciliation_gross_difference"], liquidation_count=int(row["liquidation_count"]))
+            for row in rows
+        ]
+
+    def list_position_events_by_ids(self, wallet: str, event_ids: Iterable[str]) -> list[PositionEvent]:
+        identifiers = list(dict.fromkeys(event_ids))
+        if not identifiers:
+            return []
+        rows: list[sqlite3.Row] = []
+        with self._connect() as connection:
+            for offset in range(0, len(identifiers), 900):
+                batch = identifiers[offset:offset + 900]
+                placeholders = ",".join("?" for _ in batch)
+                rows.extend(connection.execute(
+                    f"SELECT * FROM copy_position_events WHERE target_wallet=? AND event_id IN ({placeholders})",
+                    [wallet.lower(), *batch],
+                ).fetchall())
+        return [
+            PositionEvent(event_id=row["event_id"], target_wallet=row["target_wallet"], symbol=row["symbol"],
+                          event_type=PositionEventType(row["event_type"]), direction=row["direction"],
+                          delta_quantity=float(row["delta_quantity"]), before_quantity=float(row["before_quantity"]),
+                          after_quantity=float(row["after_quantity"]), price=float(row["price"]),
+                          notional=float(row["notional"]), event_timestamp=as_utc(row["event_timestamp"]),
+                          campaign_id=row["campaign_id"], raw_fill_ids=tuple(_load(row["raw_fill_ids_json"], [])),
+                          target_equity=row["target_equity"], initial_delta_notional=float(row["initial_delta_notional"]),
+                          equity_source=row["equity_source"], equity_age_seconds=row["equity_age_seconds"],
+                          source_event_type=row["source_event_type"], split_role=row["split_role"],
+                          split_quantity=row["split_quantity"], split_notional=row["split_notional"], split_fee=row["split_fee"],
+                          source_closed_pnl=row["source_closed_pnl"])
+            for row in sorted(rows, key=lambda row: (row["event_timestamp"], row["event_id"]))
+        ]
+
+    def list_position_events_for_raw_fills(self, wallet: str, raw_fill_ids: Iterable[str]) -> list[PositionEvent]:
+        """Find only events attributable to a delivered source-frame overlap.
+
+        This supports a real-time callback that repeats evidence first seen in
+        a startup snapshot without scanning a wallet's historical event table.
+        SQLite's built-in JSON table function expands the immutable raw-fill
+        attribution stored on each reconstructed event.
+        """
+        identifiers = list(dict.fromkeys(raw_fill_ids))
+        if not identifiers:
+            return []
+        rows: list[sqlite3.Row] = []
+        with self._connect() as connection:
+            for offset in range(0, len(identifiers), 900):
+                batch = identifiers[offset:offset + 900]
+                placeholders = ",".join("?" for _ in batch)
+                rows.extend(connection.execute(
+                    f"""SELECT DISTINCT event.* FROM copy_position_events AS event
+                        JOIN json_each(event.raw_fill_ids_json) AS raw
+                        WHERE event.target_wallet=? AND raw.value IN ({placeholders})""",
+                    [wallet.lower(), *batch],
+                ).fetchall())
+        return [
+            PositionEvent(event_id=row["event_id"], target_wallet=row["target_wallet"], symbol=row["symbol"],
+                          event_type=PositionEventType(row["event_type"]), direction=row["direction"],
+                          delta_quantity=float(row["delta_quantity"]), before_quantity=float(row["before_quantity"]),
+                          after_quantity=float(row["after_quantity"]), price=float(row["price"]),
+                          notional=float(row["notional"]), event_timestamp=as_utc(row["event_timestamp"]),
+                          campaign_id=row["campaign_id"], raw_fill_ids=tuple(_load(row["raw_fill_ids_json"], [])),
+                          target_equity=row["target_equity"], initial_delta_notional=float(row["initial_delta_notional"]),
+                          equity_source=row["equity_source"], equity_age_seconds=row["equity_age_seconds"],
+                          source_event_type=row["source_event_type"], split_role=row["split_role"],
+                          split_quantity=row["split_quantity"], split_notional=row["split_notional"], split_fee=row["split_fee"],
+                          source_closed_pnl=row["source_closed_pnl"])
+            for row in sorted(rows, key=lambda row: (row["event_timestamp"], row["event_id"]))
+        ]
 
     def list_campaigns(self, wallet: str | None = None, *, closed_only: bool = False) -> list[PositionCampaign]:
         clauses: list[str] = []
@@ -1556,6 +2001,41 @@ class CopyTradeDatabase:
         with self._connect() as connection:
             row = connection.execute("SELECT 1 FROM copy_signals WHERE signal_id=?", (signal_id,)).fetchone()
         return row is not None
+
+    @staticmethod
+    def _signal_from_row(row: sqlite3.Row) -> CopySignal:
+        return CopySignal(
+            signal_id=row["signal_id"], target_wallet=row["target_wallet"], campaign_id=row["campaign_id"],
+            source_event_id=row["source_event_id"], symbol=row["symbol"], action=row["action"], direction=row["direction"],
+            target_price=float(row["target_price"]), target_quantity=float(row["target_quantity"]),
+            target_notional=float(row["target_notional"]), allocation_fraction=float(row["allocation_fraction"]),
+            requested_capital=float(row["requested_capital"]), created_at=as_utc(row["created_at"]),
+            source_event_timestamp=as_utc(row["source_event_timestamp"]), size_ratio=row["size_ratio"], reason=row["reason"],
+            target_position_before=float(row["target_position_before"]), target_leverage=row["target_leverage"],
+            target_equity=row["target_equity"], equity_source=row["equity_source"], equity_age_seconds=row["equity_age_seconds"],
+        )
+
+    def get_signal(self, signal_id: str) -> CopySignal | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM copy_signals WHERE signal_id=?", (signal_id,)).fetchone()
+        return self._signal_from_row(row) if row else None
+
+    def sizing_history(self, wallet: str) -> list[dict[str, Any]]:
+        """Prior reconstructed entry evidence for one-time classifier restore.
+
+        This is intentionally sourced from PositionEvents rather than PAPER
+        signals: a paused or recovery-blocked entry must still preserve the
+        target's prior-only sizing context for later live source events.
+        """
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT event_id, event_type,
+                          CASE WHEN initial_delta_notional>0 THEN initial_delta_notional ELSE notional END AS target_notional,
+                          target_equity, equity_source, equity_age_seconds
+                   FROM copy_position_events WHERE target_wallet=? AND event_type IN ('OPEN', 'ADD')
+                   ORDER BY event_timestamp, event_id""", (wallet.lower(),),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def upsert_virtual_position(self, sleeve: VirtualTargetPosition) -> None:
         with self._connect() as connection:

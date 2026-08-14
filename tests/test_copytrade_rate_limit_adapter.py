@@ -9,7 +9,7 @@ import requests
 
 from src.copytrade.config import SourceConfig
 from src.copytrade.hyperliquid import HyperliquidAPIError, HyperliquidPublicAdapter
-from src.copytrade.rate_limit import HyperliquidInfoRateLimiter
+from src.copytrade.rate_limit import HyperliquidInfoRateLimiter, shared_hyperliquid_info_limiter
 
 
 class FakeResponse:
@@ -105,6 +105,54 @@ class HyperliquidInfoAdapterRateLimitTests(unittest.TestCase):
             self.assertEqual(failures, [])
             telemetry = limiters[0].telemetry()
             self.assertEqual((telemetry["requests_last_minute"], telemetry["estimated_weight_last_minute"]), (4, 8))
+
+    def test_smaller_budget_propagates_to_existing_host_coordinator(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "shared-rate-limit.sqlite3"
+            first = HyperliquidInfoRateLimiter(operating_budget=900, jitter_seconds=0, coordination_path=path)
+            second = HyperliquidInfoRateLimiter(operating_budget=600, jitter_seconds=0, coordination_path=path)
+            self.assertEqual(second.telemetry()["operating_budget"], 600)
+            # An older object must refresh its larger local value before it
+            # reserves against the shared SQLite coordinator.
+            self.assertEqual(first.telemetry()["operating_budget"], 600)
+            self.assertEqual(first.operating_budget, 600)
+
+    def test_larger_later_budget_cannot_relax_host_coordinator(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "shared-rate-limit.sqlite3"
+            first = HyperliquidInfoRateLimiter(operating_budget=600, jitter_seconds=0, coordination_path=path)
+            second = HyperliquidInfoRateLimiter(operating_budget=900, jitter_seconds=0, coordination_path=path)
+            self.assertEqual((first.telemetry()["operating_budget"], second.telemetry()["operating_budget"]), (600, 600))
+
+    def test_shared_limiter_lowering_updates_its_sqlite_coordinator(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "shared-rate-limit.sqlite3"
+            url = "https://shared-budget-lowering.example/info"
+            first = shared_hyperliquid_info_limiter(url, operating_budget=900, coordination_path=path, jitter_seconds=0)
+            second = shared_hyperliquid_info_limiter(url, operating_budget=600, coordination_path=path, jitter_seconds=0)
+            self.assertIs(first, second)
+            self.assertEqual((first.operating_budget, first.telemetry()["operating_budget"]), (600, 600))
+
+    def test_concurrent_coordinator_initialization_keeps_smallest_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "shared-rate-limit.sqlite3"
+            budgets = [900, 700, 600, 800]
+            barrier = threading.Barrier(len(budgets))
+            limiters: list[HyperliquidInfoRateLimiter] = []
+            failures: list[BaseException] = []
+
+            def worker(budget: int) -> None:
+                try:
+                    barrier.wait()
+                    limiters.append(HyperliquidInfoRateLimiter(operating_budget=budget, jitter_seconds=0, coordination_path=path))
+                except BaseException as exc:
+                    failures.append(exc)
+
+            workers = [threading.Thread(target=worker, args=(budget,)) for budget in budgets]
+            for worker in workers: worker.start()
+            for worker in workers: worker.join()
+            self.assertEqual(failures, [])
+            self.assertEqual(HyperliquidInfoRateLimiter(operating_budget=900, jitter_seconds=0, coordination_path=path).telemetry()["operating_budget"], 600)
 
 
 if __name__ == "__main__":

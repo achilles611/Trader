@@ -68,6 +68,14 @@ unrealized P&L, drawdown, and timestamp, but cannot create a sleeve, change
 economic quantity/capital/fees/realized P&L, or clear `closed_at`. Therefore a
 stale mark or a post-restart watcher path cannot resurrect a committed close.
 
+Source recovery is independently visible in System health and `/api/recovery`.
+Each wallet reports `CONTINUOUS`, `RECOVERING`, or `RECOVERY_INCOMPLETE` with
+its exact durable overlap anchor. `RECOVERY_INCOMPLETE` blocks only new PAPER
+`OPEN`/`ADD` signals; `REDUCE`/`CLOSE` remain available. `/api/recovery/{wallet}/safe-rebaseline`
+requires a fresh, parseable flat public clearinghouse state and preserves the
+incomplete source ledger for audit; it never changes a PAPER sleeve or creates
+missing source economics.
+
 The interface deliberately contains no private-key fields, exchange API-secret fields, order submission routes, live-mode enablement, signing, or live execution adapters.
 
 ## API and WebSocket
