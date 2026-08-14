@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import ctypes
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import shutil
 import socket
 import subprocess
@@ -33,8 +33,12 @@ def project_root(*, frozen: bool | None = None, executable: str | None = None, s
     if packaged:
         # Keep a packaged Windows executable path lexical when this behavior is
         # tested from a non-Windows CI runner; resolving it there incorrectly
-        # prefixes the Linux workspace.  Native Windows paths need no resolve.
-        return Path(executable or sys.executable).parent
+        # prefixes the Linux workspace, and POSIX ``Path`` does not parse its
+        # backslashes as separators. Native Windows paths need no resolve.
+        executable_path = executable or sys.executable
+        if "\\" in executable_path:
+            return Path(str(PureWindowsPath(executable_path).parent))
+        return Path(executable_path).parent
     return Path(source_file or __file__).resolve().parent
 
 
