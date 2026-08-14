@@ -37,7 +37,7 @@ def project_root(*, frozen: bool | None = None, executable: str | None = None, s
         # backslashes as separators. Native Windows paths need no resolve.
         executable_path = executable or sys.executable
         if "\\" in executable_path:
-            return Path(executable_path.rsplit("\\", 1)[0])
+            return Path(executable_path.rsplit("\\", 1)[0].rstrip("\\"))
         return Path(executable_path).parent
     return Path(source_file or __file__).resolve().parent
 
