@@ -11,6 +11,7 @@ from .analytics import campaign_return_series
 from .analysis import CandidateAnalysisPipeline, _config_fingerprint
 from .backtest import CopyTradeBacktester
 from .config import CopyTradeConfig
+from .control_center import serve_control_center
 from .dashboard import serve_dashboard
 from .discovery import build_discovery_provider, parse_activity_age
 from .hyperliquid import HyperliquidWatcher
@@ -96,6 +97,11 @@ def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
     dashboard = command("copy-dashboard", "Start the local paper-copy FastAPI dashboard.")
     dashboard.add_argument("--host", help="Override dashboard host.")
     dashboard.add_argument("--port", type=int, help="Override dashboard port.")
+
+    control_center = command("copy-control-center", "Start the local paper-only copy-trading control center.")
+    control_center.add_argument("--host", help="Override control-center host.")
+    control_center.add_argument("--port", type=int, help="Override control-center port.")
+    control_center.add_argument("--with-watcher", action="store_true", help="Run the paper watcher in the control-center lifecycle.")
 
     sizing = command("copy-size-demo", "Show the configured 5/10/20 percent sizing classification.")
     sizing.add_argument("--fractions", default="0.03,0.10,0.20", help="Comma-separated target entry fractions to classify against a 10% prior-median demo history.")
@@ -223,8 +229,8 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
     if command == "copy-watch":
         watcher = HyperliquidWatcher(service.adapter)
         async def watch() -> dict[str, int]:
-            return await watcher.run(service.approved_wallets(), service.ingest_watched_fills, service.ingest_watched_state,
-                                     service.ingest_market_update, service.reconcile_approved_wallets,
+            return await watcher.run(service.monitored_execution_wallets(), service.ingest_watched_fills, service.ingest_watched_state,
+                                     service.ingest_market_update, service.reconcile_monitored_wallets,
                                      duration_seconds=args.duration)
         reconciled = asyncio.run(watch())
         _print({"health": watcher.health.as_dict(), "mode": config.mode, "reconciled_fills": reconciled})
@@ -268,6 +274,10 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
         if args.host or args.port:
             config = replace(config, artifacts=replace(config.artifacts, dashboard_host=args.host or config.artifacts.dashboard_host, dashboard_port=args.port or config.artifacts.dashboard_port))
         serve_dashboard(config, service.database)
+        return 0
+    if command == "copy-control-center":
+        serve_control_center(config, service.database, host=args.host, port=args.port,
+                             with_watcher=args.with_watcher, service=service)
         return 0
     if command == "copy-size-demo":
         fractions = [float(item.strip()) for item in args.fractions.split(",") if item.strip()]

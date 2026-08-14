@@ -356,7 +356,9 @@ class CopytradeDiscoveryTests(unittest.TestCase):
             )
             self.assertEqual(summary.eligible_wallets, 1)
             candidate = database.list_discovery_candidates()[0]
-            stats = json.loads(candidate["metadata_json"])["cheap_stats"]
+            metadata = json.loads(candidate["metadata_json"])
+            self.assertEqual(metadata["evidence_schema_version"], 2)
+            stats = metadata["cheap_stats"]
             self.assertEqual((stats["distinct_observed_events"], stats["distinct_active_days"], stats["distinct_active_hours"]), (2, 2, 2))
             self.assertEqual((stats["distinct_symbols"], stats["symbols"], stats["independent_source_count"]), (2, ["BTC", "ETH"], 1))
             self.assertGreater(stats["approximate_observed_notional"], 0)

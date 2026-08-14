@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Protocol
 
+from .contracts import PHASE_A_EVIDENCE_SCHEMA_VERSION, PHASE_B_RECOMMENDATION_SCHEMA_VERSION
 from .models import (
     BacktestRun,
     AnalysisRun,
@@ -309,6 +310,7 @@ class CopyTradeDatabase:
                 );
                 CREATE TABLE IF NOT EXISTS copy_analysis_finalist_recommendations (
                     analysis_run_id TEXT NOT NULL, config_fingerprint TEXT NOT NULL, wallet TEXT NOT NULL,
+                    recommendation_schema_version INTEGER NOT NULL DEFAULT 1,
                     finalist_eligible INTEGER NOT NULL, finalist_rejection_reasons_json TEXT NOT NULL DEFAULT '[]',
                     diversification_penalty REAL, final_selection_score REAL, selection_rank INTEGER,
                     evaluated_at TEXT NOT NULL,
@@ -329,6 +331,7 @@ class CopyTradeDatabase:
             self._ensure_column(connection, "copy_signals", "target_leverage", "REAL")
             self._ensure_column(connection, "copy_raw_fills", "source_closed_pnl", "REAL")
             self._ensure_column(connection, "copy_raw_fills", "is_liquidation", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "copy_analysis_finalist_recommendations", "recommendation_schema_version", "INTEGER NOT NULL DEFAULT 1")
             self._ensure_column(connection, "copy_position_events", "equity_source", "TEXT NOT NULL DEFAULT 'missing'")
             self._ensure_column(connection, "copy_position_events", "equity_age_seconds", "REAL")
             self._ensure_column(connection, "copy_position_events", "source_event_type", "TEXT")
@@ -693,6 +696,7 @@ class CopyTradeDatabase:
                     "SELECT COUNT(DISTINCT source) FROM copy_discovery_observations WHERE wallet=?", (wallet,)
                 ).fetchone()[0])
                 metadata = {
+                    "evidence_schema_version": PHASE_A_EVIDENCE_SCHEMA_VERSION,
                     "latest_sources": sorted(row["source"] for row in connection.execute(
                         "SELECT DISTINCT source FROM copy_discovery_observations WHERE run_id=? AND wallet=?", (run.run_id, wallet)
                     ).fetchall()),
@@ -997,11 +1001,12 @@ class CopyTradeDatabase:
             for item in recommendations:
                 connection.execute(
                     """INSERT INTO copy_analysis_finalist_recommendations(
-                        analysis_run_id, config_fingerprint, wallet, finalist_eligible,
+                        analysis_run_id, config_fingerprint, wallet, recommendation_schema_version, finalist_eligible,
                         finalist_rejection_reasons_json, diversification_penalty, final_selection_score,
                         selection_rank, evaluated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(analysis_run_id, config_fingerprint, wallet) DO UPDATE SET
+                         recommendation_schema_version=excluded.recommendation_schema_version,
                          finalist_eligible=excluded.finalist_eligible,
                          finalist_rejection_reasons_json=excluded.finalist_rejection_reasons_json,
                          diversification_penalty=excluded.diversification_penalty,
@@ -1009,7 +1014,7 @@ class CopyTradeDatabase:
                          selection_rank=excluded.selection_rank,
                          evaluated_at=excluded.evaluated_at""",
                     (str(item["analysis_run_id"]), config_fingerprint, str(item["wallet"]).lower(),
-                     int(bool(item.get("finalist_eligible"))), _dump(item.get("finalist_rejection_reasons", ())),
+                     PHASE_B_RECOMMENDATION_SCHEMA_VERSION, int(bool(item.get("finalist_eligible"))), _dump(item.get("finalist_rejection_reasons", ())),
                      item.get("diversification_penalty"), item.get("final_selection_score"), item.get("selection_rank"), iso(None)),
                 )
 
@@ -1030,6 +1035,34 @@ class CopyTradeDatabase:
         value["finalist_eligible"] = bool(value["finalist_eligible"])
         value["finalist_rejection_reasons"] = _load(value.pop("finalist_rejection_reasons_json"), [])
         return value
+
+    def list_finalist_recommendations(
+        self, config_fingerprint: str, *, selected_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Read Phase B's persisted authority without recomputing a cohort.
+
+        ``selected_only`` returns the diversified final selection in Phase-B
+        rank order.  Phase C deliberately uses this API rather than scores so
+        the two phases cannot disagree about eligibility or diversification.
+        """
+        where = "config_fingerprint=?"
+        if selected_only:
+            where += " AND finalist_eligible=1 AND selection_rank IS NOT NULL"
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""SELECT * FROM copy_analysis_finalist_recommendations
+                    WHERE {where}
+                    ORDER BY CASE WHEN selection_rank IS NULL THEN 1 ELSE 0 END,
+                             selection_rank ASC, wallet ASC""",
+                (config_fingerprint,),
+            ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            value = dict(row)
+            value["finalist_eligible"] = bool(value["finalist_eligible"])
+            value["finalist_rejection_reasons"] = _load(value.pop("finalist_rejection_reasons_json"), [])
+            results.append(value)
+        return results
 
     def get_analysis_wallet(self, run_id: str, wallet: str) -> dict[str, Any] | None:
         with self._connect() as connection:

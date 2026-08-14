@@ -13,6 +13,7 @@ from typing import Any, Callable, Iterable
 from .analytics import calculate_trader_metrics, campaign_return_series
 from .backtest import CopyTradeBacktester
 from .config import CopyTradeConfig
+from .contracts import PHASE_A_CHEAP_STATS_FIELDS, PHASE_A_EVIDENCE_SCHEMA_VERSION
 from .hyperliquid import HyperliquidPublicAdapter
 from .market import CachedHistoricalMarketData, HyperliquidMarketData, MarketDataProvider
 from .models import AnalysisRun, CandidateAnalysis, CandidateAnalysisState, CandidateScore, PositionCampaign, PositionEvent, as_utc, new_run_id, utc_now
@@ -70,9 +71,16 @@ class CandidateAnalysisPipeline:
             candidate_wallets = [str(wallet).lower() for wallet in configuration.get("candidate_wallets", [])]
             if not candidate_wallets:
                 raise ValueError("Cannot resume analysis run without its immutable candidate manifest.")
-            candidate_rows = self.database.list_analysis_candidates(wallets=candidate_wallets, limit=len(candidate_wallets))
-            rows_by_wallet = {str(row["wallet"]).lower(): row for row in candidate_rows}
-            candidates = [rows_by_wallet[wallet] for wallet in candidate_wallets if wallet in rows_by_wallet]
+            manifest = _json_list(configuration.get("candidate_manifest"))
+            if manifest:
+                candidates = [_candidate_from_manifest(item) for item in manifest]
+            else:
+                # Runs created before the evidence-manifest contract retain
+                # their old compatibility behavior, but cannot claim the
+                # stronger immutable Phase-A snapshot guarantee.
+                candidate_rows = self.database.list_analysis_candidates(wallets=candidate_wallets, limit=len(candidate_wallets))
+                rows_by_wallet = {str(row["wallet"]).lower(): row for row in candidate_rows}
+                candidates = [rows_by_wallet[wallet] for wallet in candidate_wallets if wallet in rows_by_wallet]
             worker_count = int(invocation["workers"])
             force = bool(invocation["force"])
             cheap_only = bool(invocation["cheap_only"])
@@ -96,6 +104,11 @@ class CandidateAnalysisPipeline:
                 "min_discovery_activity": self.config.analysis.min_discovery_activity,
                 "copytrade_config": self.config.snapshot(), "config_fingerprint": _config_fingerprint(self.config.snapshot()),
                 "candidate_wallets": [str(row["wallet"]).lower() for row in candidates],
+                # Phase A completes candidate-universe updates atomically. A
+                # run records the exact completed evidence snapshot selected
+                # here, so a later Quick Scan cannot rewrite an in-flight or
+                # resumed Phase-B prefilter decision.
+                "candidate_manifest": [_candidate_manifest_entry(row) for row in candidates],
             }
             run, _ = self._start_or_resume(resume=False, configuration=configuration)
         errors: list[str] = list(_json_list(run.get("errors_json")))
@@ -127,19 +140,27 @@ class CandidateAnalysisPipeline:
                     continue
                 if run_wallet and run_wallet["stage"] == "prefilter" and run_wallet["status"] == "rejected":
                     continue
-                reasons = self._cheap_prefilter(candidate, required_start, required_end)
+                phase_a_evidence = _phase_a_evidence_snapshot(candidate)
+                reasons = self._cheap_prefilter(candidate, required_start, required_end, phase_a_evidence=phase_a_evidence)
                 if reasons:
                     self._save_candidate(
                         wallet, CandidateAnalysisState.PREFILTER_REJECTED.value, run["run_id"],
-                        reasons=reasons, summary={"prefilter": {"accepted": False, "reasons": reasons}}, completed=True,
+                        reasons=reasons, summary={"prefilter": {"accepted": False, "reasons": reasons,
+                                                     "phase_a_evidence": phase_a_evidence}}, completed=True,
                     )
-                    self.database.record_analysis_wallet(run["run_id"], wallet, stage="prefilter", status="rejected", payload={"reasons": reasons})
+                    self.database.record_analysis_wallet(
+                        run["run_id"], wallet, stage="prefilter", status="rejected",
+                        payload={"reasons": reasons, "phase_a_evidence": phase_a_evidence},
+                    )
                     continue
                 self._save_candidate(
                     wallet, CandidateAnalysisState.BACKFILL_PENDING.value, run["run_id"],
-                    summary={"prefilter": {"accepted": True, "reasons": []}}, completed=False,
+                    summary={"prefilter": {"accepted": True, "reasons": [], "phase_a_evidence": phase_a_evidence}}, completed=False,
                 )
-                self.database.record_analysis_wallet(run["run_id"], wallet, stage="prefilter", status="accepted")
+                self.database.record_analysis_wallet(
+                    run["run_id"], wallet, stage="prefilter", status="accepted",
+                    payload={"phase_a_evidence": phase_a_evidence},
+                )
                 pending.append(candidate)
 
             if cheap_only:
@@ -435,7 +456,10 @@ class CandidateAnalysisPipeline:
             return self._backfill_wallet(wallet, start)
         return self._backfill_wallet(wallet, start, end)
 
-    def _cheap_prefilter(self, candidate: dict[str, Any], required_start: object, required_end: object) -> tuple[str, ...]:
+    def _cheap_prefilter(
+        self, candidate: dict[str, Any], required_start: object, required_end: object, *,
+        phase_a_evidence: dict[str, Any] | None = None,
+    ) -> tuple[str, ...]:
         reasons: list[str] = []
         wallet = str(candidate.get("wallet") or "").lower()
         if not _is_wallet(wallet):
@@ -446,22 +470,33 @@ class CandidateAnalysisPipeline:
         activity = candidate.get("recent_activity_at")
         if not activity or (as_utc(required_end) - as_utc(activity)).total_seconds() > self.config.candidates.activity_max_age_days * 86_400:
             reasons.append("inactive")
+        evidence = phase_a_evidence or _phase_a_evidence_snapshot(candidate)
         metadata = _json_object(candidate.get("metadata_json"))
-        cheap_stats = _json_object(metadata.get("cheap_stats"))
-        observed = int(cheap_stats.get("distinct_observed_events", metadata.get("latest_activity_observations", 0)) or 0)
         minimum_activity = self.config.prefilter.min_activity_observations or self.config.analysis.min_discovery_activity
-        if observed < minimum_activity:
-            reasons.append("insufficient_activity")
-        if int(cheap_stats.get("distinct_active_days", 0) or 0) < self.config.prefilter.min_distinct_active_days:
-            reasons.append("insufficient_temporal_diversity")
-        if int(cheap_stats.get("distinct_active_hours", 0) or 0) < self.config.prefilter.min_distinct_active_hours:
-            reasons.append("insufficient_temporal_diversity")
-        if float(cheap_stats.get("observation_span_hours", 0) or 0) < self.config.prefilter.min_observation_span_hours:
-            reasons.append("insufficient_temporal_span")
-        if float(cheap_stats.get("approximate_observed_notional", 0) or 0) < self.config.prefilter.min_observed_notional:
-            reasons.append("insufficient_observed_notional")
-        if int(cheap_stats.get("distinct_symbols", 0) or 0) < self.config.prefilter.min_distinct_symbols:
-            reasons.append("insufficient_symbol_diversity")
+        # Version 2 has a complete, measured cheap-stat payload.  Only that
+        # payload may drive the multi-dimension gates below.  Older discovery
+        # rows predate those measurements, so interpreting absent fields as
+        # zero would fabricate a negative finding.
+        if evidence["contract_status"] != "current":
+            observed = _as_int(metadata.get("latest_activity_observations"))
+            if observed < minimum_activity:
+                reasons.append("insufficient_activity")
+            reasons.append("phase_a_refresh_required")
+        else:
+            cheap_stats = _json_object(evidence.get("cheap_stats"))
+            observed = _as_int(cheap_stats.get("distinct_observed_events"))
+            if observed < minimum_activity:
+                reasons.append("insufficient_activity")
+            if _as_int(cheap_stats.get("distinct_active_days")) < self.config.prefilter.min_distinct_active_days:
+                reasons.append("insufficient_temporal_diversity")
+            if _as_int(cheap_stats.get("distinct_active_hours")) < self.config.prefilter.min_distinct_active_hours:
+                reasons.append("insufficient_temporal_diversity")
+            if _as_float(cheap_stats.get("observation_span_hours")) < self.config.prefilter.min_observation_span_hours:
+                reasons.append("insufficient_temporal_span")
+            if _as_float(cheap_stats.get("approximate_observed_notional")) < self.config.prefilter.min_observed_notional:
+                reasons.append("insufficient_observed_notional")
+            if _as_int(cheap_stats.get("distinct_symbols")) < self.config.prefilter.min_distinct_symbols:
+                reasons.append("insufficient_symbol_diversity")
         coverage = self.database.analysis_window_coverage(wallet, required_start, required_end) if wallet else None
         if coverage and str(coverage.get("coverage_state")) == "KNOWN_INCOMPLETE":
             reasons.append("known_incomplete")
@@ -940,6 +975,60 @@ def _target_summary(metrics: Any, campaigns: Iterable[PositionCampaign], events:
     }
 
 
+def _candidate_manifest_entry(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Freeze the Phase-A evidence used to decide this Phase-B run.
+
+    The discovery transaction has already published a coherent candidate
+    universe.  Copying the small candidate record into the run configuration
+    prevents a later discovery refresh from changing a resumed run's evidence.
+    """
+    metadata = _json_object(candidate.get("metadata_json"))
+    return {
+        "wallet": str(candidate.get("wallet") or "").lower(),
+        "recent_activity_at": candidate.get("recent_activity_at"),
+        "current_status": candidate.get("current_status"),
+        "last_discovery_run_id": candidate.get("last_discovery_run_id"),
+        "metadata": metadata,
+        "phase_a_evidence": _phase_a_evidence_snapshot(candidate),
+    }
+
+
+def _candidate_from_manifest(item: object) -> dict[str, Any]:
+    """Restore the minimal candidate shape consumed by the Phase-B pipeline."""
+    manifest = _json_object(item)
+    return {
+        "wallet": str(manifest.get("wallet") or "").lower(),
+        "recent_activity_at": manifest.get("recent_activity_at"),
+        "current_status": manifest.get("current_status"),
+        "last_discovery_run_id": manifest.get("last_discovery_run_id"),
+        "metadata_json": _json_object(manifest.get("metadata")),
+    }
+
+
+def _phase_a_evidence_snapshot(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Return a versioned, conservative view of Phase-A cheap evidence."""
+    metadata = _json_object(candidate.get("metadata_json"))
+    version = _as_int_or_none(metadata.get("evidence_schema_version"))
+    cheap_stats = _json_object(metadata.get("cheap_stats"))
+    has_complete_stats = PHASE_A_CHEAP_STATS_FIELDS.issubset(cheap_stats)
+    current = version == PHASE_A_EVIDENCE_SCHEMA_VERSION and has_complete_stats
+    if current:
+        contract_status = "current"
+    elif version is not None and version > PHASE_A_EVIDENCE_SCHEMA_VERSION:
+        contract_status = "unsupported_future_version"
+    else:
+        contract_status = "legacy_or_incomplete"
+    return {
+        "discovery_run_id": candidate.get("last_discovery_run_id"),
+        "evidence_schema_version": version,
+        "contract_status": contract_status,
+        "latest_activity_observations": metadata.get("latest_activity_observations"),
+        # Do not make an incomplete payload look measured to downstream
+        # consumers.  It is retained in discovery metadata for diagnostics.
+        "cheap_stats": dict(cheap_stats) if current else {},
+    }
+
+
 def _json_object(value: object) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -952,14 +1041,39 @@ def _json_object(value: object) -> dict[str, Any]:
     return {}
 
 
-def _json_list(value: object) -> list[str]:
+def _json_list(value: object) -> list[Any]:
+    if isinstance(value, list):
+        return list(value)
     if not isinstance(value, str):
         return []
     try:
         parsed = json.loads(value)
     except json.JSONDecodeError:
         return []
-    return [str(item) for item in parsed] if isinstance(parsed, list) else []
+    return list(parsed) if isinstance(parsed, list) else []
+
+
+def _as_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _as_int_or_none(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_float(value: object) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _variance(values: list[float]) -> float:

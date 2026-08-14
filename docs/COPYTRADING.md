@@ -144,14 +144,22 @@ are marked `completed_with_warnings`; source failures are `failed`. The default
 that gate.
 
 For every de-duplicated wallet/run, Stage A.1 persists cheap evidence in the
-candidate metadata: distinct observed events, active hours/days, observed span,
-symbols, approximate observed notional, source count, and first/last observed
-activity. Stage A.2 uses the configurable `prefilter` section before any
-expensive public backfill. Its explainable reason codes include
+candidate metadata using `evidence_schema_version: 2`. Version 2 requires the
+complete `cheap_stats` contract: distinct observed events, active hours/days,
+observed span, symbols and distinct-symbol count, approximate observed
+notional, independent-source count, and first/last observed activity. Zero is
+a finding only in a complete version-2 record. Phase B recognizes older,
+incomplete, and future-version rows; it can use the legacy
+`latest_activity_observations` count for the safe activity check, but never
+turns absent dimensions into zero. Those rows receive the explicit
+`phase_a_refresh_required` prefilter reason and require a fresh Phase-A scan
+before expensive Phase-B analysis. Stage A.2 uses the configurable `prefilter`
+section before any expensive public backfill. Its explainable reason codes include
 `invalid_wallet`, `inactive`, `insufficient_activity`,
 `insufficient_temporal_diversity`, `insufficient_temporal_span`,
 `insufficient_observed_notional`, `insufficient_symbol_diversity`,
-`known_incomplete`, and `operator_managed_status`.
+`known_incomplete`, `operator_managed_status`, and
+`phase_a_refresh_required`.
 
 Candidates are merged by normalized address, retain independent-source count,
 and refresh activity/last-seen values. A new wallet is added to `copy_targets`
@@ -245,12 +253,16 @@ own public adapter so coverage bookkeeping cannot cross wallets. Network
 ingestion persists raw data and coverage first; a wallet is reconstructed once
 afterward for Phase B scoring. A failure is stored per wallet and does not
 abort the remaining candidate set. Each run records an immutable candidate
-manifest, analysis window, and configuration fingerprint. `--resume` restores
+manifest containing the selected candidate metadata and its versioned Phase-A
+evidence snapshot, plus the analysis window and configuration fingerprint.
+`--resume` restores
 that manifest and invocation policy (its new CLI limit/status/worker options
 are ignored), and refuses a changed copy-trading configuration rather than
 mixing assumptions inside one run. Wallet stage events are append-only, while
 the current wallet table is only a convenient projection; final counters are
-reconstructed from that event history.
+reconstructed from that event history. Runs created before the manifest
+contract keep their compatibility fallback of re-reading the current candidate
+row, and are explicitly weaker than new immutable-evidence runs.
 
 ```powershell
 # Cheap local sieve only; no public API calls
@@ -345,6 +357,18 @@ through cheap eligibility, backfill, quarantine, scoring, eligibility, and high
 suitability. `copy-suitability-report` reads only the stored immutable evidence
 and is recommendation-only: it never promotes a target status. Legacy scores
 remain only under the explicit `research_compatibility_only` label.
+
+The Phase-B-to-Phase-C recommendation contract is
+`recommendation_schema_version: 1` in
+`copy_analysis_finalist_recommendations`. A record is keyed by analysis run,
+configuration fingerprint, and wallet, and persists Phase B's
+`finalist_eligible` decision, rejection reasons, diversification penalty,
+final selection score, and rank. Existing rows migrate additively with version
+1. Phase C is a consumer only: it never re-scores or re-diversifies candidates.
+An Active transition requires the candidate's current completed Phase-B run,
+its eligible authoritative Phase-B score with the current fingerprint, and a
+current version-1 recommendation with `finalist_eligible=true`; a failed check
+does not change manual target state.
 
 The `regimes` section uses a deterministic campaign entry-to-exit observed-price
 proxy, not a market-wide ML regime classifier. It reports independent

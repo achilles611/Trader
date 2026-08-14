@@ -16,5 +16,21 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements.txt
-      - run: python -m compileall -q src main.py
+      - run: python -m compileall -q src main.py beez_console.py
       - run: python -m unittest discover -s tests
+
+  control-center-ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: control-center-ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: control-center-ui/package-lock.json
+      - run: npm ci
+      - run: npm test -- --run
+      - run: npm run build

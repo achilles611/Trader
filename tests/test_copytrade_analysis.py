@@ -9,7 +9,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.copytrade.analysis import CandidateAnalysisPipeline, _config_fingerprint, _copyability, _walk_forward_evidence
-from src.copytrade.config import AnalysisConfig, ArtifactConfig, CandidateConfig, CopyTradeConfig, FinalistRequirementsConfig, PaperExecutionConfig, RiskConfig, SizingConfig
+from src.copytrade.config import AnalysisConfig, ArtifactConfig, CandidateConfig, CopyTradeConfig, FinalistRequirementsConfig, PaperExecutionConfig, PrefilterConfig, RiskConfig, SizingConfig
+from src.copytrade.contracts import PHASE_A_EVIDENCE_SCHEMA_VERSION
 from src.copytrade.discovery import DiscoveryPipeline
 from src.copytrade.hyperliquid import BackfillCoverage
 from src.copytrade.models import AnalysisRun, CandidateAnalysis, CandidateScore, DiscoveryObservation, RawFill, as_utc, utc_now
@@ -107,6 +108,55 @@ class PhaseBAnalysisTests(unittest.TestCase):
             self.assertEqual(analysis.lifecycle_status, "prefilter_rejected")  # type: ignore[union-attr]
             self.assertIn("inactive", analysis.prefilter_reasons)  # type: ignore[union-attr]
 
+    def test_prefilter_distinguishes_legacy_absence_from_measured_zero_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cfg = replace(config(root), prefilter=PrefilterConfig(
+                min_activity_observations=1, min_distinct_active_days=1, min_distinct_symbols=1,
+            ))
+            service = CopyTradeService(cfg)
+            seed_candidates(service, [GOOD])
+            # This is a pre-v2 discovery row: it has a safe activity count,
+            # but no measured temporal/symbol dimensions.  Missing dimensions
+            # must not be fabricated as factual zeros.
+            with service.database._connect() as connection:  # type: ignore[attr-defined]
+                connection.execute(
+                    "UPDATE copy_discovery_candidates SET metadata_json=? WHERE wallet=?",
+                    (json.dumps({"latest_activity_observations": 680, "latest_sources": ["legacy"]}), GOOD),
+                )
+            legacy = CandidateAnalysisPipeline(service).run(limit=10, cheap_only=True)
+            legacy_analysis = service.database.get_candidate_analysis(GOOD)
+            self.assertEqual(legacy["cheap_rejected"], 1)
+            self.assertIn("phase_a_refresh_required", legacy_analysis.prefilter_reasons)  # type: ignore[union-attr]
+            self.assertNotIn("insufficient_activity", legacy_analysis.prefilter_reasons)  # type: ignore[union-attr]
+            self.assertNotIn("insufficient_temporal_diversity", legacy_analysis.prefilter_reasons)  # type: ignore[union-attr]
+            self.assertNotIn("insufficient_symbol_diversity", legacy_analysis.prefilter_reasons)  # type: ignore[union-attr]
+            configuration = json.loads(service.database.get_analysis_run(str(legacy["run_id"]))["configuration_json"])
+            manifest = configuration["candidate_manifest"][0]
+            self.assertEqual(manifest["phase_a_evidence"]["contract_status"], "legacy_or_incomplete")
+
+            # A complete v2 payload with zeros is different: those are actual
+            # measurements and should trigger the corresponding cheap gates.
+            current_metadata = {
+                "evidence_schema_version": PHASE_A_EVIDENCE_SCHEMA_VERSION,
+                "latest_activity_observations": 10,
+                "cheap_stats": {
+                    "distinct_observed_events": 10, "distinct_active_days": 0, "distinct_active_hours": 1,
+                    "observation_span_hours": 0.0, "distinct_symbols": 0, "symbols": [],
+                    "approximate_observed_notional": 0.0, "independent_source_count": 1,
+                    "first_observed_activity": None, "last_observed_activity": None,
+                },
+            }
+            with service.database._connect() as connection:  # type: ignore[attr-defined]
+                connection.execute("UPDATE copy_discovery_candidates SET metadata_json=? WHERE wallet=?", (json.dumps(current_metadata), GOOD))
+                connection.execute("DELETE FROM copy_candidate_analyses WHERE wallet=?", (GOOD,))
+            current = CandidateAnalysisPipeline(service).run(limit=10, cheap_only=True)
+            current_analysis = service.database.get_candidate_analysis(GOOD)
+            self.assertEqual(current["cheap_rejected"], 1)
+            self.assertIn("insufficient_temporal_diversity", current_analysis.prefilter_reasons)  # type: ignore[union-attr]
+            self.assertIn("insufficient_symbol_diversity", current_analysis.prefilter_reasons)  # type: ignore[union-attr]
+            self.assertNotIn("phase_a_refresh_required", current_analysis.prefilter_reasons)  # type: ignore[union-attr]
+
     def test_analysis_is_resumable_forceable_and_isolated_from_execution_tables(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             service = CopyTradeService(config(Path(temp)))
@@ -202,8 +252,18 @@ class PhaseBAnalysisTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 pipeline.run(limit=10)
             run_id = service.database.latest_resumable_analysis_run()["run_id"]  # type: ignore[index]
+            # A subsequent Quick Scan must not alter an in-flight Phase-B
+            # decision.  If resume re-read this mutable row, it would reject
+            # the candidate for missing v2 evidence instead of using the saved
+            # manifest snapshot.
+            with service.database._connect() as connection:  # type: ignore[attr-defined]
+                connection.execute(
+                    "UPDATE copy_discovery_candidates SET metadata_json=? WHERE wallet=?",
+                    (json.dumps({"latest_activity_observations": 680}), GOOD),
+                )
             result = pipeline.run(limit=999, status="all", workers=1, resume=True)
             self.assertEqual(result["run_id"], run_id)
+            self.assertEqual(result["eligible"], 1)
             with patch("src.copytrade.cli.CopyTradeConfig.from_yaml", return_value=cfg), patch("src.copytrade.cli._print") as printed:
                 from src.copytrade.cli import run_copytrade_command
                 import argparse

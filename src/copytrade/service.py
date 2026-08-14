@@ -8,6 +8,7 @@ from typing import Iterable
 
 from .analytics import calculate_trader_metrics
 from .config import CopyTradeConfig
+from .control_center import ControlCenterStore
 from .discovery import CandidateDiscoveryAdapter, DiscoveryPipeline
 from .hyperliquid import HyperliquidPublicAdapter
 from .models import PositionEvent, PositionEventType, RawFill, Target, TargetStatus, TraderSnapshot, as_utc, utc_now
@@ -24,6 +25,12 @@ class CopyTradeService:
         self.config = config
         self.database = database or CopyTradeDatabase(config.artifacts.database_path)
         self.database.initialize()
+        # Phase C owns the durable operator/control state.  Keeping its gate
+        # beside signal processing means a watcher cannot bypass the UI's
+        # paper-entry controls, while raw evidence and exit handling remain
+        # available regardless of entry eligibility.
+        self.control_store = ControlCenterStore(config.artifacts.database_path)
+        self.control_store.initialize()
         self.adapter = HyperliquidPublicAdapter(config.source)
         self.market_cache = LiveMarketCache()
         self._live_engine: PaperExecutionEngine | None = None
@@ -182,6 +189,11 @@ class CopyTradeService:
                     "local_receive_timestamp": received_at.isoformat(),
                     "market_reference_age_ms": age_ms,
                 }
+                entry_block = self.control_store.entry_block_reason(signal.target_wallet, signal.action)
+                if entry_block:
+                    metadata.update({"entry_gate": entry_block, "market_reference_source": "not_used"})
+                    engine.process_signal(signal, received_at=received_at, market_metadata=metadata, forced_reason=entry_block)
+                    continue
                 if observation:
                     metadata.update({
                         "market_reference_price": observation.price,
@@ -261,13 +273,24 @@ class CopyTradeService:
         return len(fills)
 
     async def reconcile_approved_wallets(self) -> dict[str, int]:
-        result: dict[str, int] = {}
-        for wallet in self.approved_wallets():
-            result[wallet] = await self.reconcile_wallet(wallet)
-        return result
+        """Compatibility alias for the former approved-target watcher API."""
+        return await self.reconcile_monitored_wallets()
 
     def approved_wallets(self) -> list[str]:
-        return [target.wallet for target in self.database.list_targets(TargetStatus.APPROVED.value)]
+        """Compatibility alias; new entry monitoring is Active-only."""
+        return self.monitored_execution_wallets()
+
+    def monitored_execution_wallets(self) -> list[str]:
+        """Watch active entry targets and any wallet with an open paper sleeve for exits."""
+        active = {target.wallet for target in self.database.list_targets(TargetStatus.ACTIVE.value)}
+        exits = {position.target_wallet for position in self.database.list_virtual_positions(open_only=True)}
+        return sorted(active | exits)
+
+    async def reconcile_monitored_wallets(self) -> dict[str, int]:
+        result: dict[str, int] = {}
+        for wallet in self.monitored_execution_wallets():
+            result[wallet] = await self.reconcile_wallet(wallet)
+        return result
 
     def _store_portfolio_snapshot(self, wallet: str, portfolio: object) -> None:
         if not isinstance(portfolio, list):
