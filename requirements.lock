@@ -1,0 +1,44 @@
+# Generated from requirements.txt for the supported Python 3.12 runtime.
+# Regenerate in an isolated Python 3.12 environment with pip-tools:
+#   python -m pip install pip-tools
+#   pip-compile --strip-extras --output-file requirements.lock requirements.txt
+# Do not hand-edit transitive pins.
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.14.2
+attrs==26.1.0
+backoff==2.2.1
+boto3==1.43.68
+botocore==1.43.68
+certifi==2026.2.25
+cffi==2.0.0
+charset-normalizer==3.4.6
+click==8.4.2
+colorama==0.4.6
+coinbase-advanced-py==1.8.2
+cryptography==46.0.6
+fastapi==0.141.1
+h11==0.16.0
+idna==3.11
+jmespath==1.1.0
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+lz4==4.4.5
+pycparser==3.0
+pydantic==2.13.4
+pydantic_core==2.46.4
+PyJWT==2.12.1
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.2
+PyYAML==6.0.3
+referencing==0.37.0
+requests==2.33.1
+rpds-py==0.30.0
+s3transfer==0.19.2
+six==1.17.0
+starlette==1.6.0
+typing-inspection==0.4.3
+typing_extensions==4.15.0
+urllib3==2.6.3
+uvicorn==0.52.1
+websockets==13.1

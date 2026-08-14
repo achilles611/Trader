@@ -60,7 +60,17 @@ is safe and replay after a committed attempt is a no-op.
 
 `ExecutionAggregator` can net independent virtual sleeves into future
 venue-facing execution intents while preserving every contributing sleeve. It
-does not submit orders.
+does not submit orders. It is an inert Phase D boundary: any future live
+implementation must first add exchange-versus-desired-position reconciliation,
+idempotent client order IDs, durable order state and partial-fill attribution,
+reduce-only/precision/minimum-notional controls, signing-key isolation,
+restart reconciliation, emergency flattening, and explicit control-plane
+authorization. None of those capabilities exists in this repository today.
+
+Raw-fill batches are committed through bounded SQLite `executemany` chunks in
+one transaction. Phase A completion also computes evidence counts, source and
+symbol diversity, activity span, and notional proxies with SQL aggregation, so
+Deep scans do not materialize every staged observation in Python memory.
 
 ## Configuration and safeguards
 
@@ -359,6 +369,21 @@ through cheap eligibility, backfill, quarantine, scoring, eligibility, and high
 suitability. `copy-suitability-report` reads only the stored immutable evidence
 and is recommendation-only: it never promotes a target status. Legacy scores
 remain only under the explicit `research_compatibility_only` label.
+
+Finalist persistence is an authority action, not a read side effect: Phase B
+run completion and the explicit `copy-rank` command persist recommendations.
+`copy-analysis-status` may calculate a transient display projection but never
+rewrites finalist rank, timestamp, fingerprint, or recommendation schema. In
+the Control Center dossier, Phase A `phase_a_prefilter_reasons` and Phase B
+`phase_b_hard_gates` are deliberately separate fields; soft score reasons and
+diversification policy remain distinct as well.
+
+The public Hyperliquid `/info` allowance is coordinated through a tiny
+SQLite-backed host-local reservation window beside the application artifacts.
+Separate Control Center and Phase B processes using the same artifacts
+database therefore share conservative weighted reservations and 429 cooldowns.
+This is local-machine coordination, not a claim to coordinate unrelated hosts
+behind the same external NAT.
 
 The Phase-B-to-Phase-C recommendation contract is
 `recommendation_schema_version: 1` in

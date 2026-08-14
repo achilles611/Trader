@@ -366,16 +366,20 @@ class HyperCoreSourceAcquisition:
             raise HyperCoreSourceError("Insufficient free disk space to cache the requested official HyperCore source object.")
         partial = data_path.with_suffix(data_path.suffix + ".partial")
         partial.unlink(missing_ok=True)
+        digest = hashlib.sha256()
         try:
             response = self._client().get_object(Bucket=source.bucket, Key=source.key, RequestPayer="requester")
             body = response["Body"]
-            with partial.open("wb") as stream:
-                while True:
-                    chunk = body.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    stream.write(chunk)
-            body.close()
+            try:
+                with partial.open("wb") as stream:
+                    while True:
+                        chunk = body.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        stream.write(chunk)
+                        digest.update(chunk)
+            finally:
+                body.close()
             actual_size = partial.stat().st_size if partial.exists() else 0
             expected_size = int(response.get("ContentLength") or source.size or 0)
             if actual_size <= 0 or (expected_size and actual_size != expected_size):
@@ -391,6 +395,9 @@ class HyperCoreSourceAcquisition:
             **asdict(source), "identifier": source.identifier, "local_cache_path": str(data_path),
             "acquired_at": iso(self.now()), "source_transport": "aws_s3_requester_pays",
             "official_source_identifier": source.identifier, "object_checksum": source.etag,
+            # ETags are provenance only: multipart S3 ETags are not an MD5
+            # contract.  This digest covers the exact bytes accepted locally.
+            "sha256": digest.hexdigest(),
         }
         self._write_metadata(metadata_path, metadata)
         return data_path, metadata
@@ -443,7 +450,22 @@ class HyperCoreSourceAcquisition:
             return None
         if source.data_hour_start and metadata.get("data_hour_start") != source.data_hour_start:
             return None
+        expected_digest = metadata.get("sha256")
+        # A cache entry written before digest hardening is deliberately
+        # re-fetched.  Size and ETag cannot prove same-size local tampering.
+        if not isinstance(expected_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+            return None
+        if self._file_sha256(data_path) != expected_digest:
+            return None
         return metadata
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def _metadata_entries(self) -> list[dict[str, Any]]:
         if not self.cache_root.exists():

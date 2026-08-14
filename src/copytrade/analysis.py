@@ -237,7 +237,14 @@ class CandidateAnalysisPipeline:
             "shadow_finalists": finalists,
         }
 
-    def shadow_finalists(self, *, count: int | None = None) -> list[dict[str, object]]:
+    def shadow_finalists(self, *, count: int | None = None, persist: bool = False) -> list[dict[str, object]]:
+        """Calculate the current cohort; persist only on an explicit authority action.
+
+        A status request is an observational operation.  It may calculate a
+        transient projection for the UI, but it must not refresh authoritative
+        recommendation timestamps or ranks.  Run finalization and the explicit
+        ``copy-rank`` command pass ``persist=True`` deliberately.
+        """
         target_count = count or self.config.analysis.shadow_finalist_count
         current_fingerprint = _config_fingerprint(self.config.research_snapshot())
         scores = self.database.phase_b_qualified_scores(config_fingerprint=current_fingerprint)
@@ -269,24 +276,25 @@ class CandidateAnalysisPipeline:
             score.target_wallet: (rank, diversification)
             for rank, (score, diversification) in enumerate(selected, 1)
         }
-        self.database.upsert_finalist_recommendations(
-            current_fingerprint,
-            (
-                {
-                    "analysis_run_id": score.analysis_run_id,
-                    "wallet": score.target_wallet,
-                    "finalist_eligible": assessments[score.target_wallet][0],
-                    "finalist_rejection_reasons": assessments[score.target_wallet][1],
-                    "diversification_penalty": selected_by_wallet.get(score.target_wallet, (None, {}))[1].get("penalty"),
-                    "final_selection_score": (
-                        score.total_score - float(selected_by_wallet[score.target_wallet][1]["penalty"])
-                        if score.target_wallet in selected_by_wallet else None
-                    ),
-                    "selection_rank": selected_by_wallet.get(score.target_wallet, (None, {}))[0],
-                }
-                for score in scores if score.analysis_run_id
-            ),
-        )
+        if persist:
+            self.database.upsert_finalist_recommendations(
+                current_fingerprint,
+                (
+                    {
+                        "analysis_run_id": score.analysis_run_id,
+                        "wallet": score.target_wallet,
+                        "finalist_eligible": assessments[score.target_wallet][0],
+                        "finalist_rejection_reasons": assessments[score.target_wallet][1],
+                        "diversification_penalty": selected_by_wallet.get(score.target_wallet, (None, {}))[1].get("penalty"),
+                        "final_selection_score": (
+                            score.total_score - float(selected_by_wallet[score.target_wallet][1]["penalty"])
+                            if score.target_wallet in selected_by_wallet else None
+                        ),
+                        "selection_rank": selected_by_wallet.get(score.target_wallet, (None, {}))[0],
+                    }
+                    for score in scores if score.analysis_run_id
+                ),
+            )
         finalists = []
         for rank, (score, diversification) in enumerate(selected, 1):
             candidate = candidates.get(score.target_wallet, {})
@@ -703,7 +711,7 @@ class CandidateAnalysisPipeline:
     def _finish(self, run_id: str, errors: list[str], *, status: str) -> dict[str, object]:
         counters = self.database.analysis_run_counters(run_id)
         self.database.finish_analysis_run(run_id, status=status, errors=tuple(sorted(errors)), **counters)
-        finalists = self.shadow_finalists()
+        finalists = self.shadow_finalists(persist=True)
         return {
             "run_id": run_id, "status": status, **counters, "errors": sorted(errors),
             "funnel": self.database.analysis_funnel(

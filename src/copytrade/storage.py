@@ -4,6 +4,7 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Protocol
 
@@ -114,6 +115,7 @@ class CopyTradeDatabase:
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA busy_timeout=5000")
         try:
             yield connection
             connection.commit()
@@ -627,42 +629,38 @@ class CopyTradeDatabase:
         """Aggregate staged evidence without retaining the raw input in process memory."""
         cutoff = run.started_at.timestamp() - max_activity_age_seconds if max_activity_age_seconds is not None else None
         with self._connect() as connection:
+            # Keep raw Phase A evidence in SQLite.  Completion scales with the
+            # candidate-wallet result set rather than constructing a Python
+            # list for every staged observation in a Deep scan.  JSON1 is part
+            # of the supported SQLite runtime used by this application.
             rows = connection.execute(
                 """SELECT wallet, COUNT(*) AS activity_count, MIN(observed_at) AS first_seen, MAX(observed_at) AS last_seen,
                 MAX(recent_activity_at) AS recent_activity_at, MIN(discovery_rank) AS discovery_rank,
-                MAX(source_score) AS source_score FROM copy_discovery_observations WHERE run_id=? GROUP BY wallet""",
+                MAX(source_score) AS source_score, COUNT(DISTINCT source) AS independent_source_count,
+                COUNT(DISTINCT strftime('%Y-%m-%dT%H', recent_activity_at)) AS distinct_active_hours,
+                COUNT(DISTINCT date(recent_activity_at)) AS distinct_active_days,
+                COALESCE((julianday(MAX(recent_activity_at)) - julianday(MIN(recent_activity_at))) * 24.0, 0.0) AS observation_span_hours,
+                COUNT(DISTINCT CASE WHEN json_valid(metadata_json)
+                                    THEN NULLIF(UPPER(json_extract(metadata_json, '$.coin')), '') END) AS distinct_symbols,
+                GROUP_CONCAT(DISTINCT CASE WHEN json_valid(metadata_json)
+                                           THEN NULLIF(UPPER(json_extract(metadata_json, '$.coin')), '') END) AS symbols_csv,
+                SUM(CASE WHEN source_score > 0 THEN source_score ELSE 0 END) AS approximate_observed_notional,
+                MIN(recent_activity_at) AS first_observed_activity,
+                MAX(recent_activity_at) AS last_observed_activity,
+                GROUP_CONCAT(DISTINCT source) AS latest_sources_csv
+                FROM copy_discovery_observations WHERE run_id=? GROUP BY wallet""",
                 (run.run_id,),
             ).fetchall()
             aggregates = [dict(row) for row in rows]
-            # Stage A.1 statistics are intentionally computed from the staged,
-            # de-duplicated evidence rather than from mutable candidate state.
-            # This single run-scoped read avoids one query per candidate.
-            evidence_rows = connection.execute(
-                """SELECT wallet, source, recent_activity_at, source_score, metadata_json
-                   FROM copy_discovery_observations WHERE run_id=?""",
-                (run.run_id,),
-            ).fetchall()
-            evidence_by_wallet: dict[str, list[sqlite3.Row]] = {}
-            for evidence in evidence_rows:
-                evidence_by_wallet.setdefault(str(evidence["wallet"]), []).append(evidence)
-            cheap_stats_by_wallet: dict[str, dict[str, Any]] = {}
-            for wallet, evidence in evidence_by_wallet.items():
-                activity_times = [as_utc(item["recent_activity_at"]) for item in evidence if item["recent_activity_at"]]
-                metadata_values = [_load(item["metadata_json"], {}) for item in evidence]
-                symbols = {str(value.get("coin") or "").upper() for value in metadata_values if value.get("coin")}
-                cheap_stats_by_wallet[wallet] = {
-                    "distinct_observed_events": len(evidence),
-                    "distinct_active_hours": len({value.strftime("%Y-%m-%dT%H") for value in activity_times}),
-                    "distinct_active_days": len({value.date().isoformat() for value in activity_times}),
-                    "observation_span_hours": max(
-                        0.0, (max(activity_times) - min(activity_times)).total_seconds() / 3600,
-                    ) if len(activity_times) > 1 else 0.0,
-                    "distinct_symbols": len(symbols), "symbols": sorted(symbols),
-                    "approximate_observed_notional": sum(max(float(item["source_score"] or 0), 0.0) for item in evidence),
-                    "independent_source_count": len({str(item["source"]) for item in evidence}),
-                    "first_observed_activity": min(activity_times).isoformat() if activity_times else None,
-                    "last_observed_activity": max(activity_times).isoformat() if activity_times else None,
-                }
+            # `source_count` is lifetime evidence, unlike the `latest_*`
+            # metadata above.  Aggregate it once instead of executing a full
+            # observation-table query for every selected candidate.
+            source_counts = {
+                str(row["wallet"]): int(row["source_count"])
+                for row in connection.execute(
+                    "SELECT wallet, COUNT(DISTINCT source) AS source_count FROM copy_discovery_observations GROUP BY wallet"
+                ).fetchall()
+            }
             eligible = [
                 row for row in aggregates
                 if int(row["activity_count"]) >= min_activity
@@ -699,16 +697,24 @@ class CopyTradeDatabase:
                 first_seen = as_utc(aggregate["first_seen"])
                 last_seen = as_utc(aggregate["last_seen"])
                 activity = as_utc(aggregate["recent_activity_at"]) if aggregate["recent_activity_at"] else None
-                source_count = int(connection.execute(
-                    "SELECT COUNT(DISTINCT source) FROM copy_discovery_observations WHERE wallet=?", (wallet,)
-                ).fetchone()[0])
+                source_count = source_counts.get(wallet, 0)
+                symbols = sorted(filter(None, str(aggregate["symbols_csv"] or "").split(",")))
                 metadata = {
                     "evidence_schema_version": PHASE_A_EVIDENCE_SCHEMA_VERSION,
-                    "latest_sources": sorted(row["source"] for row in connection.execute(
-                        "SELECT DISTINCT source FROM copy_discovery_observations WHERE run_id=? AND wallet=?", (run.run_id, wallet)
-                    ).fetchall()),
+                    "latest_sources": sorted(filter(None, str(aggregate["latest_sources_csv"] or "").split(","))),
                     "latest_activity_observations": int(aggregate["activity_count"]),
-                    "cheap_stats": cheap_stats_by_wallet.get(wallet, {}),
+                    "cheap_stats": {
+                        "distinct_observed_events": int(aggregate["activity_count"]),
+                        "distinct_active_hours": int(aggregate["distinct_active_hours"]),
+                        "distinct_active_days": int(aggregate["distinct_active_days"]),
+                        "observation_span_hours": max(0.0, float(aggregate["observation_span_hours"] or 0.0)),
+                        "distinct_symbols": int(aggregate["distinct_symbols"]),
+                        "symbols": symbols,
+                        "approximate_observed_notional": float(aggregate["approximate_observed_notional"] or 0.0),
+                        "independent_source_count": int(aggregate["independent_source_count"]),
+                        "first_observed_activity": aggregate["first_observed_activity"],
+                        "last_observed_activity": aggregate["last_observed_activity"],
+                    },
                 }
                 if target is None:
                     connection.execute(
@@ -1178,23 +1184,44 @@ class CopyTradeDatabase:
         return {str(row["lifecycle_status"]): int(row["count"]) for row in rows}
 
     def insert_raw_fill(self, fill: RawFill) -> bool:
-        with self._connect() as connection:
-            cursor = connection.execute(
-                """INSERT OR IGNORE INTO copy_raw_fills(
-                    event_id, source, venue, chain_network, target_wallet, target_order_id, target_trade_id,
-                    transaction_hash, symbol, side, direction, price, base_quantity, notional, fee, fee_token,
-                    target_account_equity, target_position_before, event_timestamp, ingestion_timestamp,
-                    confirmation, raw_payload_json, source_closed_pnl, is_liquidation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (fill.event_id, fill.source, fill.venue, fill.chain_network, fill.target_wallet.lower(), fill.target_order_id,
-                 fill.target_trade_id, fill.transaction_hash, fill.symbol, fill.side, fill.direction, fill.price,
-                 fill.base_quantity, fill.notional, fill.fee, fill.fee_token, fill.target_account_equity,
-                 fill.target_position_before, iso(fill.event_timestamp), iso(fill.ingestion_timestamp), fill.confirmation,
-                 _dump(fill.raw_payload), fill.source_closed_pnl, int(fill.is_liquidation)),
-            )
-        return cursor.rowcount == 1
+        return self.insert_raw_fills((fill,)) == 1
 
-    def insert_raw_fills(self, fills: Iterable[RawFill]) -> int:
-        return sum(1 for fill in fills if self.insert_raw_fill(fill))
+    @staticmethod
+    def _raw_fill_values(fill: RawFill) -> tuple[Any, ...]:
+        return (
+            fill.event_id, fill.source, fill.venue, fill.chain_network, fill.target_wallet.lower(), fill.target_order_id,
+            fill.target_trade_id, fill.transaction_hash, fill.symbol, fill.side, fill.direction, fill.price,
+            fill.base_quantity, fill.notional, fill.fee, fill.fee_token, fill.target_account_equity,
+            fill.target_position_before, iso(fill.event_timestamp), iso(fill.ingestion_timestamp), fill.confirmation,
+            _dump(fill.raw_payload), fill.source_closed_pnl, int(fill.is_liquidation),
+        )
+
+    def insert_raw_fills(self, fills: Iterable[RawFill], *, batch_size: int = 1_000) -> int:
+        """Insert de-duplicated source fills in one bounded SQLite transaction.
+
+        Network acquisition can stay parallel while persistence is a single
+        WAL-friendly write transaction.  Duplicate event IDs retain the former
+        INSERT OR IGNORE semantics both within and across batches.
+        """
+        if batch_size < 1:
+            raise ValueError("Raw-fill batch size must be positive.")
+        inserted = 0
+        iterator = iter(fills)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            while batch := list(islice(iterator, batch_size)):
+                before = connection.total_changes
+                connection.executemany(
+                    """INSERT OR IGNORE INTO copy_raw_fills(
+                        event_id, source, venue, chain_network, target_wallet, target_order_id, target_trade_id,
+                        transaction_hash, symbol, side, direction, price, base_quantity, notional, fee, fee_token,
+                        target_account_equity, target_position_before, event_timestamp, ingestion_timestamp,
+                        confirmation, raw_payload_json, source_closed_pnl, is_liquidation)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [self._raw_fill_values(fill) for fill in batch],
+                )
+                inserted += connection.total_changes - before
+        return inserted
 
     def list_raw_fills(
         self, wallet: str | None = None, *, start: object | None = None, end: object | None = None
@@ -1651,35 +1678,55 @@ class CopyTradeDatabase:
 
     def persist_portfolio_mark(
         self, sleeves: Iterable[VirtualTargetPosition], snapshot: dict[str, float], *, timestamp: object,
-    ) -> None:
-        """Durably checkpoint marks; unlike execution, this creates no attempt."""
+    ) -> int:
+        """Persist observational marks for sleeves that are still open.
+
+        Marking has deliberately weaker authority than execution.  It can
+        never create a sleeve or rewrite economic state (quantity, capital,
+        realized P&L, fees, or closure).  This makes a stale in-memory engine
+        harmless after another execution path has committed a close.
+        """
+        persisted = 0
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 for sleeve in sleeves:
-                    connection.execute(
-                        """INSERT INTO copy_virtual_positions(sleeve_id, target_wallet, campaign_id, symbol, direction,
-                        quantity, entry_price, allocated_capital, remaining_capital, entry_fee, realized_pnl, exit_fee,
-                        opened_at, updated_at, closed_at, target_entry_price, max_drawdown, current_mark, unrealized_pnl)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(sleeve_id) DO UPDATE SET quantity=excluded.quantity, remaining_capital=excluded.remaining_capital,
-                        realized_pnl=excluded.realized_pnl, exit_fee=excluded.exit_fee, updated_at=excluded.updated_at,
-                        closed_at=excluded.closed_at, max_drawdown=excluded.max_drawdown, current_mark=excluded.current_mark,
-                        unrealized_pnl=excluded.unrealized_pnl""",
-                        (sleeve.sleeve_id, sleeve.target_wallet, sleeve.campaign_id, sleeve.symbol, sleeve.direction,
-                         sleeve.quantity, sleeve.entry_price, sleeve.allocated_capital, sleeve.remaining_capital,
-                         sleeve.entry_fee, sleeve.realized_pnl, sleeve.exit_fee, iso(sleeve.opened_at), iso(sleeve.updated_at),
-                         iso(sleeve.closed_at) if sleeve.closed_at else None, sleeve.target_entry_price, sleeve.max_drawdown,
-                         sleeve.current_mark, sleeve.unrealized_pnl),
+                    cursor = connection.execute(
+                        """UPDATE copy_virtual_positions
+                           SET updated_at=?, max_drawdown=?, current_mark=?, unrealized_pnl=?
+                           WHERE sleeve_id=? AND closed_at IS NULL""",
+                        (iso(sleeve.updated_at), sleeve.max_drawdown, sleeve.current_mark, sleeve.unrealized_pnl,
+                         sleeve.sleeve_id),
                     )
-                snapshot_id = stable_id("portfolio_mark", iso(timestamp), snapshot["cash"], snapshot["equity"], snapshot["committed_capital"], snapshot["drawdown_fraction"])
-                connection.execute(
-                    """INSERT OR IGNORE INTO copy_portfolio_snapshots(snapshot_id, timestamp, cash, equity, committed_capital,
-                    drawdown_fraction, peak_equity, max_drawdown_fraction) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (snapshot_id, iso(timestamp), snapshot["cash"], snapshot["equity"], snapshot["committed_capital"],
-                     snapshot["drawdown_fraction"], snapshot.get("peak_equity"), snapshot.get("max_drawdown_fraction", 0.0)),
-                )
+                    persisted += cursor.rowcount
+                # Never checkpoint the caller's portfolio total: it may be a
+                # stale engine that just lost a race to a committed close.
+                # Derive every economic aggregate from database truth instead.
+                if persisted:
+                    latest = connection.execute(
+                        """SELECT cash, peak_equity, max_drawdown_fraction
+                           FROM copy_portfolio_snapshots ORDER BY timestamp DESC LIMIT 1"""
+                    ).fetchone()
+                    if latest:
+                        aggregates = connection.execute(
+                            """SELECT COALESCE(SUM(remaining_capital), 0) AS committed_capital,
+                                      COALESCE(SUM(unrealized_pnl), 0) AS unrealized_pnl
+                               FROM copy_virtual_positions WHERE closed_at IS NULL"""
+                        ).fetchone()
+                        cash = float(latest["cash"])
+                        committed = float(aggregates["committed_capital"])
+                        equity = cash + committed + float(aggregates["unrealized_pnl"])
+                        peak = max(float(latest["peak_equity"] or latest["cash"]), equity)
+                        drawdown = max(0.0, peak - equity) / max(peak, 1e-12)
+                        maximum = max(float(latest["max_drawdown_fraction"] or 0.0), drawdown)
+                        snapshot_id = stable_id("portfolio_mark", iso(timestamp), cash, equity, committed, drawdown)
+                        connection.execute(
+                            """INSERT OR IGNORE INTO copy_portfolio_snapshots(snapshot_id, timestamp, cash, equity, committed_capital,
+                            drawdown_fraction, peak_equity, max_drawdown_fraction) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (snapshot_id, iso(timestamp), cash, equity, committed, drawdown, peak, maximum),
+                        )
                 connection.commit()
+                return persisted
             except Exception:
                 connection.rollback()
                 raise

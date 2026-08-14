@@ -434,14 +434,14 @@ class CopytradeDiscoveryTests(unittest.TestCase):
             database.initialize()
 
             def records():
-                for index in range(1_200):
+                for index in range(5_000):
                     yield fill(T0, f"0x{index + 1000:040x}", fill_id=f"large-{index}")
 
             provider = HyperCoreNodeTradeDiscoveryProvider(IterableNodeTradeTransport(records()))
-            summary = DiscoveryPipeline(database, batch_size=61).run(provider, limit=2_000, min_activity=1, max_activity_age=None)
-            self.assertEqual((summary.wallets_seen, summary.eligible_wallets, summary.new_wallets), (1_200, 1_200, 1_200))
+            summary = DiscoveryPipeline(database, batch_size=61).run(provider, limit=5_000, min_activity=1, max_activity_age=None)
+            self.assertEqual((summary.wallets_seen, summary.eligible_wallets, summary.new_wallets), (5_000, 5_000, 5_000))
             with database._connect() as connection:  # type: ignore[attr-defined]
-                self.assertEqual(connection.execute("SELECT COUNT(*) FROM copy_discovery_observations").fetchone()[0], 1_200)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM copy_discovery_observations").fetchone()[0], 5_000)
 
     def test_copy_discover_cli_file_source_is_repeatable_and_writes_complete_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

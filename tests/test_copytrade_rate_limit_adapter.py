@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
+import threading
+from pathlib import Path
 
 import requests
 
@@ -66,6 +69,42 @@ class HyperliquidInfoAdapterRateLimitTests(unittest.TestCase):
     def test_default_adapters_share_one_process_limiter_per_info_url(self) -> None:
         source = SourceConfig(info_url="https://adapter-sharing-test.example/info")
         self.assertIs(HyperliquidPublicAdapter(source).limiter, HyperliquidPublicAdapter(source).limiter)
+
+    def test_independent_limiters_share_one_host_sqlite_budget_and_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "shared-rate-limit.sqlite3"
+            first = HyperliquidInfoRateLimiter(operating_budget=200, jitter_seconds=0, coordination_path=path)
+            second = HyperliquidInfoRateLimiter(operating_budget=200, jitter_seconds=0, coordination_path=path)
+            first.settle(first.acquire({"type": "userFills"}), [{}] * 20)
+            second.settle(second.acquire({"type": "userFills"}), [{}] * 20)
+            telemetry = second.telemetry()
+            self.assertEqual((telemetry["coordination_scope"], telemetry["requests_last_minute"], telemetry["estimated_weight_last_minute"]),
+                             ("host_sqlite", 2, 42))
+            first.register_429("5")
+            first.record_retry()
+            throttled = second.telemetry()
+            self.assertEqual((throttled["state"], throttled["429_count"], throttled["retry_count"]), ("THROTTLED", 1, 1))
+
+    def test_independent_limiter_instances_coordinate_concurrent_threads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "shared-rate-limit.sqlite3"
+            limiters = [HyperliquidInfoRateLimiter(operating_budget=100, jitter_seconds=0, coordination_path=path) for _ in range(4)]
+            barrier = threading.Barrier(len(limiters))
+            failures: list[BaseException] = []
+
+            def worker(limiter: HyperliquidInfoRateLimiter) -> None:
+                try:
+                    barrier.wait()
+                    limiter.settle(limiter.acquire({"type": "allMids"}), {})
+                except BaseException as exc:
+                    failures.append(exc)
+
+            workers = [threading.Thread(target=worker, args=(limiter,)) for limiter in limiters]
+            for worker in workers: worker.start()
+            for worker in workers: worker.join()
+            self.assertEqual(failures, [])
+            telemetry = limiters[0].telemetry()
+            self.assertEqual((telemetry["requests_last_minute"], telemetry["estimated_weight_last_minute"]), (4, 8))
 
 
 if __name__ == "__main__":

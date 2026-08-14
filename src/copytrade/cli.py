@@ -196,7 +196,8 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
         pipeline = CandidateAnalysisPipeline(service)
         fingerprint = _config_fingerprint(config.research_snapshot())
         phase_b_scores = service.database.phase_b_qualified_scores(config_fingerprint=fingerprint)
-        finalists = pipeline.shadow_finalists(count=args.count)
+        # Ranking is an explicit operator command, unlike analysis status.
+        finalists = pipeline.shadow_finalists(count=args.count, persist=True)
         payload = {
             "ranked_phase_b": [_score_payload(score) for score in phase_b_scores],
             "selected": finalists,

@@ -20,8 +20,7 @@ from .config import CopyTradeConfig
 from .contracts import PHASE_B_RECOMMENDATION_SCHEMA_VERSION
 from .control_center_read_model import phase_b_candidate_view
 from .discovery import build_discovery_provider, parse_activity_age
-from .models import CopySignal, as_utc, iso, jsonable, stable_id, utc_now
-from .paper import PaperExecutionEngine
+from .models import as_utc, iso, jsonable, stable_id, utc_now
 from .rate_limit import shared_hyperliquid_info_limiter
 from .source_acquisition import HyperCoreSourceAcquisition, HyperCoreSourceError, cache_directory, discovery_preset
 from .storage import CopyTradeDatabase
@@ -455,12 +454,25 @@ class ControlCenterStore:
 class CopyControlCenter:
     """Read-model and command service for the Phase C control surface."""
 
-    def __init__(self, config: CopyTradeConfig, database: CopyTradeDatabase | None = None) -> None:
+    def __init__(
+        self, config: CopyTradeConfig, database: CopyTradeDatabase | None = None, *, execution_service: Any | None = None,
+    ) -> None:
         self.config = config
         self.database = database or CopyTradeDatabase(config.artifacts.database_path)
         self.database.initialize()
         self.store = ControlCenterStore(config.artifacts.database_path)
         self.store.initialize()
+        self._execution_service = execution_service
+
+    def _paper_service(self) -> Any:
+        """Return the single service that owns mutable PAPER engine state."""
+        if self._execution_service is None:
+            # Laziness avoids the module-level service/control-store import
+            # cycle while still preventing Control Center fallback commands
+            # from creating an independent ad-hoc execution engine.
+            from .service import CopyTradeService
+            self._execution_service = CopyTradeService(self.config, self.database)
+        return self._execution_service
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -497,6 +509,7 @@ class CopyControlCenter:
             backoff_initial_seconds=getattr(analysis, "rate_limit_backoff_initial_seconds", 2.0),
             backoff_max_seconds=getattr(analysis, "rate_limit_backoff_max_seconds", 30.0),
             jitter_seconds=getattr(analysis, "rate_limit_jitter_seconds", 0.5),
+            coordination_path=self.config.artifacts.database_path,
         )
         return {
             "mode": self.config.mode,
@@ -743,7 +756,12 @@ class CopyControlCenter:
                          "research_state": analysis.lifecycle_status if analysis else "new", "first_discovered": row.get("discovered_at"),
                          "last_activity": row.get("last_active"), "analysis_timestamp": row.get("analysis_timestamp"),
                          "coverage": view["coverage"], "source_count": row.get("source_count", 0)},
-            "score": {**view["score"], "hard_gate_failures": row.get("prefilter_reasons", [])},
+            # Phase A cheap filtering and Phase B evidence-backed gates answer
+            # different questions.  Never present a Phase-A reason as though
+            # it were a failed Phase-B hard gate.
+            "phase_a_prefilter_reasons": row.get("prefilter_reasons", []),
+            "phase_b_hard_gates": list((canonical_score or {}).get("hard_gates", [])),
+            "score": view["score"],
             "legacy_compatibility_score": view["legacy_compatibility_score"],
             "target_performance": view["target"], "follower_performance": view["follower"], "copyability": view["copyability"],
             "slippage": view["slippage_scenarios"], "latency": view["latency"],
@@ -936,14 +954,16 @@ class CopyControlCenter:
         if connection is None:
             with self._connect() as query_connection:
                 row = query_connection.execute(
-                    """SELECT total_score, eligible, component_scores_json, penalties_json, reasons_json, provenance, analysis_run_id, config_fingerprint
+                    """SELECT total_score, eligible, component_scores_json, penalties_json, reasons_json, source_quality,
+                       provenance, analysis_run_id, config_fingerprint, confidence_score, hard_gates_json, score_version
                        FROM copy_candidate_scores WHERE target_wallet=? AND analysis_run_id=? AND provenance='phase_b'
                        LIMIT 1""",
                     (wallet.lower(), run_id),
                 ).fetchone()
         else:
             row = connection.execute(
-                """SELECT total_score, eligible, component_scores_json, penalties_json, reasons_json, provenance, analysis_run_id, config_fingerprint
+                """SELECT total_score, eligible, component_scores_json, penalties_json, reasons_json, source_quality,
+                   provenance, analysis_run_id, config_fingerprint, confidence_score, hard_gates_json, score_version
                    FROM copy_candidate_scores WHERE target_wallet=? AND analysis_run_id=? AND provenance='phase_b' LIMIT 1""",
                 (wallet.lower(), run_id),
             ).fetchone()
@@ -952,8 +972,11 @@ class CopyControlCenter:
         item = dict(row)
         return {"total_score": item["total_score"], "eligible": bool(item["eligible"]),
                 "component_scores": _load(item["component_scores_json"], {}), "penalties": _load(item["penalties_json"], {}),
-                "reasons": _load(item["reasons_json"], []), "provenance": item["provenance"],
-                "analysis_run_id": item["analysis_run_id"], "config_fingerprint": item["config_fingerprint"]}
+                "reasons": _load(item["reasons_json"], []), "source_quality": float(item["source_quality"]),
+                "provenance": item["provenance"], "analysis_run_id": item["analysis_run_id"],
+                "config_fingerprint": item["config_fingerprint"], "confidence_score": float(item["confidence_score"] or 0),
+                "hard_gates": _load(item["hard_gates_json"], []),
+                "score_version": item["score_version"]}
 
     def _latest_legacy_score(self, wallet: str) -> dict[str, Any] | None:
         with self._connect() as connection:
@@ -1101,66 +1124,8 @@ class CopyControlCenter:
         return self.store.set_control_state(CONTROL_RUNNING, note="New PAPER entries resumed.")
 
     def close_all_paper_positions(self, *, pause_after: bool = False) -> dict[str, Any]:
-        """Flatten only fresh-mark paper sleeves through the existing paper engine."""
-        prior_state = self.store.control_state()["state"]
-        self.store.set_control_state(CONTROL_EXITING, note="Flattening open PAPER positions.")
-        engine = PaperExecutionEngine(self.config, self.database)
-        engine.restore(self.database.list_virtual_positions(), self.database.latest_portfolio_snapshot(), self.database.list_realized_results())
-        now = utc_now()
-        groups: dict[tuple[str, str], list[Any]] = {}
-        for sleeve in engine.portfolio.sleeves.values():
-            if sleeve.is_open:
-                groups.setdefault((sleeve.target_wallet, sleeve.symbol), []).append(sleeve)
-        attempted, closed, failed, skipped = [], [], [], []
-        for (wallet, symbol), sleeves in groups.items():
-            mark = next((item.current_mark for item in sleeves if item.current_mark and (now - item.updated_at).total_seconds() * 1000 <= self.config.paper_execution.market_data_max_age_ms), None)
-            if not mark:
-                result = {"wallet": wallet, "symbol": symbol, "status": "skipped", "reason": "no_fresh_market_reference"}
-                attempted.append(result)
-                skipped.append(result)
-                self.store.record_activity(category="control", severity="warning", wallet=wallet, symbol=symbol,
-                    message="Could not close PAPER position: no fresh market reference",
-                    payload={"paper": True, "attempt_status": "skipped", "remaining_open": True})
-                continue
-            signal = CopySignal(
-                signal_id=stable_id("manual_paper_close", wallet, symbol, now), target_wallet=wallet, campaign_id=None,
-                source_event_id=stable_id("manual_close_source", wallet, symbol, now), symbol=symbol, action="close",
-                direction=sleeves[0].direction, target_price=float(mark), target_quantity=sum(item.quantity for item in sleeves),
-                target_notional=sum(item.quantity for item in sleeves) * float(mark), allocation_fraction=0.0, requested_capital=0.0,
-                created_at=now, source_event_timestamp=now, reason="manual_close_all_paper_positions",
-            )
-            attempt = engine.process_signal(signal, received_at=now, market_price=float(mark), market_metadata={"market_reference_source": "persisted_live_mark", "paper_control": "close_all"})
-            group_remaining = any(
-                position.target_wallet == wallet and position.symbol == symbol
-                for position in self.database.list_virtual_positions(open_only=True)
-            )
-            result = {"wallet": wallet, "symbol": symbol, "status": attempt.status, "reason": attempt.reason}
-            attempted.append(result)
-            if attempt.status == "filled" and not group_remaining:
-                closed.append(result)
-            else:
-                if attempt.status == "skipped":
-                    skipped.append(result)
-                failed.append({**result, "reason": attempt.reason if attempt.status != "filled" else "position_remains_open"})
-            self.store.record_activity(category="control", severity="info" if attempt.status == "filled" and not group_remaining else "warning", wallet=wallet, symbol=symbol,
-                message=f"Close-all PAPER action {attempt.status} for {symbol}",
-                payload={"reason": attempt.reason, "paper": True, "attempt_status": attempt.status, "remaining_open": group_remaining})
-        remaining_positions = self.database.list_virtual_positions(open_only=True)
-        remaining_open_positions = [
-            {"sleeve_id": position.sleeve_id, "wallet": position.target_wallet, "symbol": position.symbol,
-             "direction": position.direction, "quantity": position.quantity}
-            for position in remaining_positions
-        ]
-        partial = bool(remaining_open_positions)
-        final = CONTROL_PAUSED if pause_after or partial else str(prior_state)
-        note = "Exit + pause completed." if pause_after else "Close-all partially completed; new PAPER entries remain paused until explicitly resumed." if partial else "Close-all PAPER positions completed; entry state retained."
-        if partial:
-            self.store.record_activity(category="control", severity="warning", wallet=None, symbol=None,
-                message="Close-all PAPER positions incomplete; new PAPER entries remain paused.",
-                payload={"paper": True, "remaining_open_positions": remaining_open_positions, "failed": failed})
-        return {"status": "partial" if partial else "completed", "attempted": attempted, "closed": closed,
-                "failed": failed, "skipped": skipped, "remaining_open_positions": remaining_open_positions,
-                "control": self.store.set_control_state(final, note=note), "paper_only": True}
+        """Delegate control closing to the service-owned serialized engine."""
+        return self._paper_service().close_all_paper_positions(pause_after=pause_after)
 
     def exit_and_pause(self) -> dict[str, Any]:
         return self.close_all_paper_positions(pause_after=True)
@@ -1303,13 +1268,14 @@ def create_control_center_app(
     # WebSocket instead of being interpreted as an HTTP query parameter.
     globals()["WebSocket"] = WebSocket
 
-    center = CopyControlCenter(config, database)
+    # Import lazily: CopyTradeService itself owns Phase C control-state setup.
+    from .service import CopyTradeService
+    execution_service = watcher_service or CopyTradeService(config, database)
+    center = CopyControlCenter(config, execution_service.database, execution_service=execution_service)
     watcher_runtime: dict[str, Any] = {}
     job_runtime: dict[str, asyncio.Task[Any]] = {}
     source = discovery_source or HyperCoreSourceAcquisition(cache_directory(config.artifacts.database_path))
-    # Import lazily: CopyTradeService itself owns Phase C control-state setup.
-    from .service import CopyTradeService
-    discovery_orchestrator = CandidateDiscoveryOrchestrator(CopyTradeService(config, center.database), center.store, source)
+    discovery_orchestrator = CandidateDiscoveryOrchestrator(execution_service, center.store, source)
 
     def live_watcher_health() -> dict[str, Any] | None:
         supervisor = watcher_runtime.get("supervisor")

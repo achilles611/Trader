@@ -108,6 +108,28 @@ class PhaseCAuthorityTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cannot enter Active"):
                 CopyTradeService(configured)
 
+    def test_candidate_dossier_separates_phase_a_prefilter_from_phase_b_hard_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            center, fingerprint = seed_phase_b_authority(service)
+            analysis = service.database.get_candidate_analysis(WALLET)
+            self.assertIsNotNone(analysis)
+            service.database.upsert_candidate_analysis(CandidateAnalysis(
+                WALLET, "qualified", analysis.last_run_id, analysis.started_at, analysis.completed_at,
+                prefilter_reasons=("phase_a_observation_span",), summary=analysis.summary,
+            ))
+            service.database.upsert_candidate_score(CandidateScore(
+                WALLET, utc_now(), 99.0, {"quality": 99.0}, {}, False, source_quality=0.8,
+                provenance="phase_b", analysis_run_id=analysis.last_run_id, config_fingerprint=fingerprint,
+                confidence_score=77.0, hard_gates=("phase_b_copyability_limit",), score_version="fixture-v1",
+            ))
+            detail = center.candidate_detail(WALLET)
+            self.assertEqual(detail["phase_a_prefilter_reasons"], ["phase_a_observation_span"])  # type: ignore[index]
+            self.assertEqual(detail["phase_b_hard_gates"], ["phase_b_copyability_limit"])  # type: ignore[index]
+            score = detail["score"]  # type: ignore[index]
+            self.assertEqual((score["confidence_score"], score["source_quality"], score["score_version"]), (77.0, 0.8, "fixture-v1"))
+            self.assertEqual((score["analysis_run_id"], score["config_fingerprint"]), (analysis.last_run_id, fingerprint))
+
     def test_deterministic_phase_a_to_b_to_c_flow_uses_versioned_evidence_and_persisted_finalists(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             service = CopyTradeService(config(Path(temp)))

@@ -300,6 +300,36 @@ class PhaseBAnalysisTests(unittest.TestCase):
             service.set_status(GOOD, "muted")
             self.assertEqual(pipeline.shadow_finalists(), [])
 
+    def test_status_does_not_rewrite_persisted_finalist_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            seed_candidates(service, [GOOD])
+
+            def backfill(wallet: str, _start: object) -> dict[str, object]:
+                service.database.insert_raw_fills(fills(wallet))
+                return {"new_raw_fills": 2}
+
+            pipeline = CandidateAnalysisPipeline(service, backfill_wallet=backfill)
+            pipeline.run(limit=10)
+            with service.database._connect() as connection:  # type: ignore[attr-defined]
+                before = [tuple(row) for row in connection.execute(
+                    """SELECT analysis_run_id, config_fingerprint, wallet, recommendation_schema_version,
+                       finalist_eligible, finalist_rejection_reasons_json, diversification_penalty,
+                       final_selection_score, selection_rank, evaluated_at
+                       FROM copy_analysis_finalist_recommendations ORDER BY wallet"""
+                ).fetchall()]
+            self.assertTrue(before)
+            pipeline.status()
+            pipeline.status()
+            with service.database._connect() as connection:  # type: ignore[attr-defined]
+                after = [tuple(row) for row in connection.execute(
+                    """SELECT analysis_run_id, config_fingerprint, wallet, recommendation_schema_version,
+                       finalist_eligible, finalist_rejection_reasons_json, diversification_penalty,
+                       final_selection_score, selection_rank, evaluated_at
+                       FROM copy_analysis_finalist_recommendations ORDER BY wallet"""
+                ).fetchall()]
+            self.assertEqual(after, before)
+
     def test_window_coverage_requires_contiguous_proven_segments(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             service = CopyTradeService(config(Path(temp)))

@@ -73,6 +73,10 @@ def phase_b_candidate_view(
         "provenance": _score_value(score, "provenance") if score else None,
         "analysis_run_id": _score_value(score, "analysis_run_id") if score else None,
         "config_fingerprint": score_fingerprint,
+        "confidence_score": _score_value(score, "confidence_score") if score else None,
+        "source_quality": _score_value(score, "source_quality") if score else None,
+        "hard_gates": list(_score_value(score, "hard_gates", ()) or ()) if score else [],
+        "score_version": _score_value(score, "score_version") if score else None,
         "current": bool(score and (current_config_fingerprint is None or score_fingerprint == current_config_fingerprint)),
     }
     legacy = None

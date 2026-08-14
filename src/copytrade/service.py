@@ -1,22 +1,42 @@
 from __future__ import annotations
 
 import asyncio
+from threading import Lock, RLock
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 from .analytics import calculate_trader_metrics
 from .config import CopyTradeConfig
 from .control_center import ControlCenterStore
 from .discovery import CandidateDiscoveryAdapter, DiscoveryPipeline
 from .hyperliquid import HyperliquidPublicAdapter
-from .models import PositionEvent, PositionEventType, RawFill, Target, TargetStatus, TraderSnapshot, as_utc, utc_now
+from .models import CopySignal, PositionEvent, PositionEventType, RawFill, Target, TargetStatus, TraderSnapshot, as_utc, stable_id, utc_now
 from .market import LiveMarketCache
 from .paper import PaperExecutionEngine, SignalFactory, TargetSizeClassifier
 from .rate_limit import shared_hyperliquid_info_limiter
 from .reconstruction import PositionReconstructor
 from .storage import CopyTradeDatabase
+
+
+class _PaperExecutionAuthority:
+    """One in-process mutable PAPER portfolio per durable database."""
+
+    def __init__(self) -> None:
+        self.lock = RLock()
+        self.engine: PaperExecutionEngine | None = None
+        self.last_mark_persist_at: dict[str, object] = {}
+
+
+_paper_execution_authorities: dict[str, _PaperExecutionAuthority] = {}
+_paper_execution_authorities_lock = Lock()
+
+
+def _paper_execution_authority(database_path: Path) -> _PaperExecutionAuthority:
+    key = str(database_path.resolve())
+    with _paper_execution_authorities_lock:
+        return _paper_execution_authorities.setdefault(key, _PaperExecutionAuthority())
 
 
 class CopyTradeService:
@@ -37,11 +57,16 @@ class CopyTradeService:
             backoff_initial_seconds=config.analysis.rate_limit_backoff_initial_seconds,
             backoff_max_seconds=config.analysis.rate_limit_backoff_max_seconds,
             jitter_seconds=config.analysis.rate_limit_jitter_seconds,
+            coordination_path=config.artifacts.database_path,
         )
         self.adapter = HyperliquidPublicAdapter(config.source, limiter=self.api_limiter)
         self.market_cache = LiveMarketCache()
-        self._live_engine: PaperExecutionEngine | None = None
-        self._last_mark_persist_at: dict[str, object] = {}
+        # All services against one SQLite portfolio share this mutable engine
+        # and lock.  The application passes one service to the Control Center;
+        # this registry additionally makes an in-process fallback unable to
+        # create a competing stale authority.
+        self._execution_authority = _paper_execution_authority(self.database.path)
+        self._execution_lock = self._execution_authority.lock
         for target in config.targets:
             wallet = str(target.get("wallet", "")).strip()
             if wallet:
@@ -52,6 +77,37 @@ class CopyTradeService:
                         "so current Phase-B finalist authority can be validated."
                     )
                 self.database.upsert_target(Target(wallet=wallet, label=str(target.get("label", "")), status=status))
+
+    @property
+    def _live_engine(self) -> PaperExecutionEngine | None:
+        return self._execution_authority.engine
+
+    @_live_engine.setter
+    def _live_engine(self, engine: PaperExecutionEngine | None) -> None:
+        self._execution_authority.engine = engine
+
+    @property
+    def _last_mark_persist_at(self) -> dict[str, object]:
+        return self._execution_authority.last_mark_persist_at
+
+    def reload_execution_state(self) -> PaperExecutionEngine:
+        """Replace the live PAPER engine with the current durable state.
+
+        Callers must hold no external database transaction.  The service lock
+        makes the replacement atomic with respect to watcher mutations.
+        """
+        with self._execution_lock:
+            engine = PaperExecutionEngine(self.config, self.database)
+            engine.restore(
+                self.database.list_virtual_positions(), self.database.latest_portfolio_snapshot(),
+                self.database.list_realized_results(),
+            )
+            self._live_engine = engine
+            self._last_mark_persist_at.clear()
+            return engine
+
+    def _execution_engine(self) -> PaperExecutionEngine:
+        return self._live_engine or self.reload_execution_state()
 
     def import_wallets(self, wallets: Iterable[str], *, label_prefix: str = "") -> list[Target]:
         imported: list[Target] = []
@@ -183,18 +239,17 @@ class CopyTradeService:
         return {"events": enriched_events, "campaigns": result.campaigns, "metrics": metrics, "reconciliation": result.reconciliation}
 
     async def ingest_watched_fills(self, wallet: str, fills: list[RawFill], is_snapshot: bool) -> None:
+        with self._execution_lock:
+            self._ingest_watched_fills(wallet, fills, is_snapshot)
+
+    def _ingest_watched_fills(self, wallet: str, fills: list[RawFill], is_snapshot: bool) -> None:
         # This happens before reconstruction/signal generation, preserving source
         # evidence even if a later process crashes.
-        for fill in fills:
-            self.database.insert_raw_fill(fill)
+        self.database.insert_raw_fills(fills)
         reconstructed = self.reconstruct(wallet)
         events = reconstructed["events"]
         assert isinstance(events, tuple)
-        engine = self._live_engine
-        if engine is None:
-            engine = PaperExecutionEngine(self.config, self.database)
-            engine.restore(self.database.list_virtual_positions(), self.database.latest_portfolio_snapshot(), self.database.list_realized_results())
-            self._live_engine = engine
+        engine = self._execution_engine()
         classifier = TargetSizeClassifier(self.config.sizing)
         factory = SignalFactory(classifier, self.config)
         for event in events:
@@ -256,6 +311,10 @@ class CopyTradeService:
         self.database.insert_snapshot(snapshot)
 
     async def ingest_market_update(self, payload: dict[str, object]) -> None:
+        with self._execution_lock:
+            self._ingest_market_update(payload)
+
+    def _ingest_market_update(self, payload: dict[str, object]) -> None:
         mids = payload.get("mids") if isinstance(payload.get("mids"), dict) else payload
         if not isinstance(mids, dict):
             return
@@ -267,9 +326,7 @@ class CopyTradeService:
                 self.market_cache.update_mid(str(symbol), price, timestamp=observed_at, received_at=received)
         engine = self._live_engine
         if engine is None and self.database.list_virtual_positions(open_only=True):
-            engine = PaperExecutionEngine(self.config, self.database)
-            engine.restore(self.database.list_virtual_positions(), self.database.latest_portfolio_snapshot(), self.database.list_realized_results())
-            self._live_engine = engine
+            engine = self._execution_engine()
         if engine is None:
             return
         open_symbols = {sleeve.symbol for sleeve in engine.portfolio.sleeves.values() if sleeve.is_open}
@@ -282,6 +339,97 @@ class CopyTradeService:
             if previous is None or (received - as_utc(previous)).total_seconds() * 1000 >= self.config.paper_execution.mark_persist_interval_ms:
                 engine.persist_mark(received)
                 self._last_mark_persist_at[symbol] = received
+
+    def close_all_paper_positions(self, *, pause_after: bool = False) -> dict[str, Any]:
+        """Close fresh-mark sleeves through the one serialized PAPER engine.
+
+        The engine is first reconstructed from database truth, then retained as
+        the service's live instance after the committed closes.  A later mark
+        therefore sees closed sleeves in memory as well as in persistence.
+        """
+        with self._execution_lock:
+            prior_state = self.control_store.control_state()["state"]
+            self.control_store.set_control_state("EXITING", note="Flattening open PAPER positions.")
+            engine = self.reload_execution_state()
+            now = utc_now()
+            groups: dict[tuple[str, str], list[Any]] = {}
+            for sleeve in engine.portfolio.sleeves.values():
+                if sleeve.is_open:
+                    groups.setdefault((sleeve.target_wallet, sleeve.symbol), []).append(sleeve)
+            attempted: list[dict[str, Any]] = []
+            closed: list[dict[str, Any]] = []
+            failed: list[dict[str, Any]] = []
+            skipped: list[dict[str, Any]] = []
+            for (wallet, symbol), sleeves in groups.items():
+                mark = next((
+                    item.current_mark for item in sleeves
+                    if item.current_mark and (now - item.updated_at).total_seconds() * 1000
+                    <= self.config.paper_execution.market_data_max_age_ms
+                ), None)
+                if not mark:
+                    result = {"wallet": wallet, "symbol": symbol, "status": "skipped", "reason": "no_fresh_market_reference"}
+                    attempted.append(result)
+                    skipped.append(result)
+                    self.control_store.record_activity(
+                        category="control", severity="warning", wallet=wallet, symbol=symbol,
+                        message="Could not close PAPER position: no fresh market reference",
+                        payload={"paper": True, "attempt_status": "skipped", "remaining_open": True},
+                    )
+                    continue
+                signal = CopySignal(
+                    signal_id=stable_id("manual_paper_close", wallet, symbol, now), target_wallet=wallet, campaign_id=None,
+                    source_event_id=stable_id("manual_close_source", wallet, symbol, now), symbol=symbol, action="close",
+                    direction=sleeves[0].direction, target_price=float(mark), target_quantity=sum(item.quantity for item in sleeves),
+                    target_notional=sum(item.quantity for item in sleeves) * float(mark), allocation_fraction=0.0,
+                    requested_capital=0.0, created_at=now, source_event_timestamp=now,
+                    reason="manual_close_all_paper_positions",
+                )
+                attempt = engine.process_signal(
+                    signal, received_at=now, market_price=float(mark),
+                    market_metadata={"market_reference_source": "persisted_live_mark", "paper_control": "close_all"},
+                )
+                group_remaining = any(
+                    position.target_wallet == wallet and position.symbol == symbol
+                    for position in self.database.list_virtual_positions(open_only=True)
+                )
+                result = {"wallet": wallet, "symbol": symbol, "status": attempt.status, "reason": attempt.reason}
+                attempted.append(result)
+                if attempt.status == "filled" and not group_remaining:
+                    closed.append(result)
+                else:
+                    if attempt.status == "skipped":
+                        skipped.append(result)
+                    failed.append({**result, "reason": attempt.reason if attempt.status != "filled" else "position_remains_open"})
+                self.control_store.record_activity(
+                    category="control", severity="info" if attempt.status == "filled" and not group_remaining else "warning",
+                    wallet=wallet, symbol=symbol, message=f"Close-all PAPER action {attempt.status} for {symbol}",
+                    payload={"reason": attempt.reason, "paper": True, "attempt_status": attempt.status,
+                             "remaining_open": group_remaining},
+                )
+            remaining_positions = self.database.list_virtual_positions(open_only=True)
+            remaining_open_positions = [
+                {"sleeve_id": position.sleeve_id, "wallet": position.target_wallet, "symbol": position.symbol,
+                 "direction": position.direction, "quantity": position.quantity}
+                for position in remaining_positions
+            ]
+            partial = bool(remaining_open_positions)
+            final = "PAUSED" if pause_after or partial else str(prior_state)
+            note = (
+                "Exit + pause completed." if pause_after else
+                "Close-all partially completed; new PAPER entries remain paused until explicitly resumed."
+                if partial else "Close-all PAPER positions completed; entry state retained."
+            )
+            if partial:
+                self.control_store.record_activity(
+                    category="control", severity="warning", wallet=None, symbol=None,
+                    message="Close-all PAPER positions incomplete; new PAPER entries remain paused.",
+                    payload={"paper": True, "remaining_open_positions": remaining_open_positions, "failed": failed},
+                )
+            return {
+                "status": "partial" if partial else "completed", "attempted": attempted, "closed": closed,
+                "failed": failed, "skipped": skipped, "remaining_open_positions": remaining_open_positions,
+                "control": self.control_store.set_control_state(final, note=note), "paper_only": True,
+            }
 
     async def reconcile_wallet(self, wallet: str) -> int:
         """Fetch the gap from durable local time before websocket subscription.

@@ -33,7 +33,7 @@ function payload(path: string) {
   if (path.startsWith("/api/discovery/jobs")) return discoveryJobResponse || { job_id: "discovery-1", status: "queued", stage: "queued", configuration: { preset: "standard", candidate_limit: 2500 } };
   if (path.startsWith("/api/system")) return { health: { mode: "paper", paper_only: true, database: { connected: true }, websocket: { available: true }, watcher: { state: "NOT_ATTACHED", desired_target_count: 0, subscribed_target_count: 0, membership_in_sync: true } }, risk: { limits: [] } };
   if (path.startsWith("/api/candidates?")) return { items: emptyUniverse || filteredEmpty ? [] : [candidate], page: path.includes("page=2") ? 2 : 1, page_size: 50, total: emptyUniverse ? 0 : filteredEmpty ? 1 : 51, pages: 2 };
-  if (path.startsWith(`/api/candidates/${candidate.wallet}`)) return { identity: { wallet: candidate.wallet, operator_state: "shadow", research_state: "qualified" }, score: { total: 87.3, eligible: true, components: { consistency: 9 }, penalties: { drawdown: 1 }, reasons: ["fixture_reason"] }, target_performance: {}, follower_performance: {}, latency: { status: "unavailable" }, analysis_window: {} };
+  if (path.startsWith(`/api/candidates/${candidate.wallet}`)) return { identity: { wallet: candidate.wallet, operator_state: "shadow", research_state: "qualified" }, score: { total: 87.3, eligible: true, components: { consistency: 9 }, penalties: { drawdown: 1 }, reasons: ["fixture_reason"] }, phase_a_prefilter_reasons: ["phase_a_fixture"], phase_b_hard_gates: ["phase_b_fixture"], target_performance: {}, follower_performance: {}, latency: { status: "unavailable" }, analysis_window: {} };
   return { items: [] };
 }
 
@@ -77,6 +77,10 @@ describe("copy control center", () => {
     expect(screen.getByText("consistency")).toBeInTheDocument();
     expect(screen.getByText("drawdown penalty")).toBeInTheDocument();
     expect(screen.getByText("fixture_reason")).toBeInTheDocument();
+    expect(screen.getByText("Phase A prefilter reasons")).toBeInTheDocument();
+    expect(screen.getByText("phase_a_fixture")).toBeInTheDocument();
+    expect(screen.getByText("Phase B hard-gate failures")).toBeInTheDocument();
+    expect(screen.getByText("phase_b_fixture")).toBeInTheDocument();
   });
 
   it("does not offer Active for a dossier without a selected Phase B finalist recommendation", async () => {
