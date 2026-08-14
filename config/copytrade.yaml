@@ -138,6 +138,11 @@ analysis:
   default_workers: 4
   retry_attempts: 3
   retry_initial_seconds: 0.25
+  # Shared process-wide operating budget for the public /info endpoint.
+  api_weight_budget_per_minute: 900
+  rate_limit_backoff_initial_seconds: 2.0
+  rate_limit_backoff_max_seconds: 30.0
+  rate_limit_jitter_seconds: 0.5
   history_days: 180
   min_discovery_activity: 2
   shadow_finalist_count: 20

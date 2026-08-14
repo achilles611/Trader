@@ -14,6 +14,7 @@ from .hyperliquid import HyperliquidPublicAdapter
 from .models import PositionEvent, PositionEventType, RawFill, Target, TargetStatus, TraderSnapshot, as_utc, utc_now
 from .market import LiveMarketCache
 from .paper import PaperExecutionEngine, SignalFactory, TargetSizeClassifier
+from .rate_limit import shared_hyperliquid_info_limiter
 from .reconstruction import PositionReconstructor
 from .storage import CopyTradeDatabase
 
@@ -31,14 +32,26 @@ class CopyTradeService:
         # available regardless of entry eligibility.
         self.control_store = ControlCenterStore(config.artifacts.database_path)
         self.control_store.initialize()
-        self.adapter = HyperliquidPublicAdapter(config.source)
+        self.api_limiter = shared_hyperliquid_info_limiter(
+            config.source.info_url, operating_budget=config.analysis.api_weight_budget_per_minute,
+            backoff_initial_seconds=config.analysis.rate_limit_backoff_initial_seconds,
+            backoff_max_seconds=config.analysis.rate_limit_backoff_max_seconds,
+            jitter_seconds=config.analysis.rate_limit_jitter_seconds,
+        )
+        self.adapter = HyperliquidPublicAdapter(config.source, limiter=self.api_limiter)
         self.market_cache = LiveMarketCache()
         self._live_engine: PaperExecutionEngine | None = None
         self._last_mark_persist_at: dict[str, object] = {}
         for target in config.targets:
             wallet = str(target.get("wallet", "")).strip()
             if wallet:
-                self.database.upsert_target(Target(wallet=wallet, label=str(target.get("label", "")), status=str(target.get("status", "pending"))))
+                status = str(target.get("status", "pending"))
+                if status == TargetStatus.ACTIVE.value:
+                    raise ValueError(
+                        "Configured targets cannot enter Active directly. Use the canonical Phase C activation path "
+                        "so current Phase-B finalist authority can be validated."
+                    )
+                self.database.upsert_target(Target(wallet=wallet, label=str(target.get("label", "")), status=status))
 
     def import_wallets(self, wallets: Iterable[str], *, label_prefix: str = "") -> list[Target]:
         imported: list[Target] = []
@@ -77,8 +90,20 @@ class CopyTradeService:
         return self.import_wallets(tokens)
 
     def set_status(self, wallet: str, status: str) -> None:
+        """Apply a generic non-Active target status transition.
+
+        Active is a privileged paper-execution state.  Only Phase C's
+        canonical activation path may enter it after validating current Phase-B
+        finalist authority; callers must never be able to bypass that policy
+        through this general-purpose helper.
+        """
         if status not in {item.value for item in TargetStatus}:
             raise ValueError(f"Unsupported target status: {status}")
+        if status == TargetStatus.ACTIVE.value:
+            raise ValueError(
+                "Direct Active transition is prohibited. Use the canonical Phase C activation path so "
+                "current Phase-B finalist authority can be validated."
+            )
         if not self.database.set_target_status(wallet, status):
             raise KeyError(f"Target not found: {wallet}")
 
@@ -93,7 +118,8 @@ class CopyTradeService:
         that bookkeeping.  This remains source ingestion only.
         """
         return self._backfill_with_adapter(
-            wallet, HyperliquidPublicAdapter(self.config.source), start=start, end=end, reconstruct_after_ingestion=False,
+            wallet, HyperliquidPublicAdapter(self.config.source, limiter=self.api_limiter), start=start, end=end,
+            reconstruct_after_ingestion=False,
         )
 
     def _backfill_with_adapter(

@@ -186,19 +186,21 @@ creating an execution attempt.
 ```powershell
 python main.py copy-import --wallet 0xYOUR_PUBLIC_WALLET
 python main.py copy-discover --source hypercore-file --input path\to\node_fills_by_block.jsonl --limit 1000 --max-activity-age 30d
-python main.py copy-backfill --wallet 0xYOUR_PUBLIC_WALLET --start 2026-01-01T00:00:00Z
-python main.py copy-score --wallet 0xYOUR_PUBLIC_WALLET
-python main.py copy-rank --count 7
-python main.py copy-approve --wallet 0xYOUR_PUBLIC_WALLET
+python main.py copy-analyze-candidates --limit 500 --workers 4
+python main.py copy-analysis-status
 python main.py copy-backtest --wallet 0xYOUR_PUBLIC_WALLET --walk-forward
 python main.py copy-backtest --wallet 0xYOUR_PUBLIC_WALLET --market-price-proxy
 python main.py copy-report --wallet 0xYOUR_PUBLIC_WALLET
-python main.py copy-watch --duration 60
-python main.py copy-dashboard
+python main.py copy-control-center --with-watcher
 ```
 
 All commands have `--help`. `copy-size-demo` makes the configured 5/10/20
-classification visible using a warm historical median. `copy-watch` has an
+classification visible using a warm historical median. Phase B writes its
+versioned finalist recommendation and diversified selection rank to SQLite.
+An operator must then use the local Control Center to activate a current
+selected finalist; only that canonical Phase-C transition makes a wallet an
+Active paper-entry target. `copy-approve` is research triage only and
+`copy-watch` never promotes approved or Shadow wallets. `copy-watch` has an
 optional bounded duration so it can be smoke-tested without leaving a process
 running.
 
@@ -286,7 +288,7 @@ Phase B persists target metrics, follower metrics, sizing/equity-quality
 coverage, slippage scenarios (including 0 bps), latency availability,
 walk-forward evidence, transparent score components/penalties, hard gates,
 confidence, deterministic pathology flags, and observed-price-proxy regime
-evidence in the candidate-analysis summary. Confidence is a separate 0?100
+evidence in the candidate-analysis summary. Confidence is a separate 0-100
 measure of evidence depth (campaigns, active days, history span, coverage,
 walk-forward windows, regime representation, and source quality); it is never
 silently folded into suitability. Coverage is evaluated over the full
@@ -365,10 +367,12 @@ configuration fingerprint, and wallet, and persists Phase B's
 `finalist_eligible` decision, rejection reasons, diversification penalty,
 final selection score, and rank. Existing rows migrate additively with version
 1. Phase C is a consumer only: it never re-scores or re-diversifies candidates.
-An Active transition requires the candidate's current completed Phase-B run,
-its eligible authoritative Phase-B score with the current fingerprint, and a
-current version-1 recommendation with `finalist_eligible=true`; a failed check
-does not change manual target state.
+An Active transition requires the candidate's current completed (or
+`completed_with_errors`) Phase-B run, its eligible authoritative Phase-B score
+with the current fingerprint, and a current version-1 recommendation with
+`finalist_eligible=true` and a non-null diversified selection rank. Only the
+Control Center's canonical Phase-C activation path may enter Active; a failed
+check does not change manual target state or write an operator audit event.
 
 The `regimes` section uses a deterministic campaign entry-to-exit observed-price
 proxy, not a market-wide ML regime classifier. It reports independent

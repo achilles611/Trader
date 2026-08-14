@@ -102,7 +102,7 @@ class CandidateAnalysisPipeline:
                 "analysis_window": {"required_start": required_start.isoformat(), "required_end": required_end.isoformat()},
                 "history_days": self.config.analysis.history_days,
                 "min_discovery_activity": self.config.analysis.min_discovery_activity,
-                "copytrade_config": self.config.snapshot(), "config_fingerprint": _config_fingerprint(self.config.snapshot()),
+                "copytrade_config": self.config.snapshot(), "config_fingerprint": _config_fingerprint(self.config.research_snapshot()),
                 "candidate_wallets": [str(row["wallet"]).lower() for row in candidates],
                 # Phase A completes candidate-universe updates atomically. A
                 # run records the exact completed evidence snapshot selected
@@ -217,7 +217,7 @@ class CandidateAnalysisPipeline:
     def status(self, *, limit: int = 1000) -> dict[str, object]:
         rows = self.database.list_analysis_candidates(limit=limit)
         state_counts = self.database.count_analysis_candidates_by_state()
-        fingerprint = _config_fingerprint(self.config.snapshot())
+        fingerprint = _config_fingerprint(self.config.research_snapshot())
         finalists = self.shadow_finalists()
         for row in rows:
             candidate_fingerprint = row.get("candidate_config_fingerprint")
@@ -239,7 +239,7 @@ class CandidateAnalysisPipeline:
 
     def shadow_finalists(self, *, count: int | None = None) -> list[dict[str, object]]:
         target_count = count or self.config.analysis.shadow_finalist_count
-        current_fingerprint = _config_fingerprint(self.config.snapshot())
+        current_fingerprint = _config_fingerprint(self.config.research_snapshot())
         scores = self.database.phase_b_qualified_scores(config_fingerprint=current_fingerprint)
         candidates = {row["wallet"]: row for row in self.database.list_analysis_candidates(limit=10_000)}
         analysis_by_wallet = {
@@ -345,7 +345,7 @@ class CandidateAnalysisPipeline:
         if not candidate:
             raise KeyError(f"Candidate not found: {wallet}")
         summary = _json_object(candidate.get("analysis_summary", {}))
-        current_fingerprint = _config_fingerprint(self.config.snapshot())
+        current_fingerprint = _config_fingerprint(self.config.research_snapshot())
         recommendation = self.database.get_finalist_recommendation(
             candidate.get("score_analysis_run_id"), current_fingerprint, str(candidate["wallet"]),
         )
@@ -415,7 +415,7 @@ class CandidateAnalysisPipeline:
         stored_fingerprint = str(configuration.get("config_fingerprint") or "")
         if not stored_fingerprint:
             raise ValueError("Cannot resume analysis run without a Phase B.1 configuration fingerprint.")
-        current_fingerprint = _config_fingerprint(self.config.snapshot())
+        current_fingerprint = _config_fingerprint(self.config.research_snapshot())
         if stored_fingerprint != current_fingerprint:
             raise ValueError(
                 "Refusing to resume with a changed copy-trading configuration; restore the original configuration or start a new run."
@@ -708,7 +708,7 @@ class CandidateAnalysisPipeline:
             "run_id": run_id, "status": status, **counters, "errors": sorted(errors),
             "funnel": self.database.analysis_funnel(
                 run_id, high_suitability_score=self.config.analysis.high_suitability_score,
-                config_fingerprint=_config_fingerprint(self.config.snapshot()),
+                config_fingerprint=_config_fingerprint(self.config.research_snapshot()),
             ),
             "diversification_selected": len(finalists), "shadow_finalists": finalists,
         }

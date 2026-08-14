@@ -554,7 +554,7 @@ class CopyControlCenter:
                 """SELECT COUNT(*) FROM copy_candidate_analyses analysis JOIN copy_candidate_scores score
                    ON score.target_wallet=analysis.wallet AND score.analysis_run_id=analysis.last_run_id AND score.provenance='phase_b'
                    WHERE analysis.lifecycle_status='qualified' AND score.config_fingerprint<>?""",
-                (_config_fingerprint(self.config.snapshot()),),
+                (_config_fingerprint(self.config.research_snapshot()),),
             ).fetchone()[0])
             open_positions = int(connection.execute("SELECT COUNT(*) FROM copy_virtual_positions WHERE closed_at IS NULL").fetchone()[0])
         return {
@@ -648,7 +648,7 @@ class CopyControlCenter:
             cutoff = iso(utc_now() - timedelta(days=max(0, int(recent_days))))
             clauses.append("candidate.recent_activity_at>=?")
             values.append(cutoff)
-        fingerprint = _config_fingerprint(self.config.snapshot())
+        fingerprint = _config_fingerprint(self.config.research_snapshot())
         if current_only:
             clauses.append("phase_score.config_fingerprint=?")
             values.append(fingerprint)
@@ -732,7 +732,7 @@ class CopyControlCenter:
         analysis = self.database.get_candidate_analysis(wallet)
         summary = analysis.summary if analysis else {}
         canonical_score = self._authoritative_score(wallet, analysis.last_run_id if analysis else None)
-        fingerprint = _config_fingerprint(self.config.snapshot())
+        fingerprint = _config_fingerprint(self.config.research_snapshot())
         recommendation = self.database.get_finalist_recommendation(
             analysis.last_run_id if analysis else None, fingerprint, wallet,
         )
@@ -759,7 +759,7 @@ class CopyControlCenter:
         This is a read model: Phase C never recalculates scores, gates,
         correlation, or exposure penalties when deciding its finalist cohort.
         """
-        fingerprint = _config_fingerprint(self.config.snapshot())
+        fingerprint = _config_fingerprint(self.config.research_snapshot())
         candidates = {str(item["wallet"]).lower(): item for item in self.database.list_analysis_candidates(limit=10_000)}
         recommendations = self.database.list_finalist_recommendations(fingerprint, selected_only=True)
         finalists = []
@@ -798,31 +798,126 @@ class CopyControlCenter:
     def set_operator_state(self, wallet: str, state: str, *, by: str = "operator", allow_overflow: bool = False) -> dict[str, Any]:
         if state not in OPERATOR_STATES:
             raise ValueError("Operator state must be one of: " + ", ".join(sorted(OPERATOR_STATES)))
+        if state == "active":
+            return self.activate_wallet(wallet, by=by, allow_overflow=allow_overflow)
         target = self.database.get_target(wallet)
         if not target:
             raise KeyError("Wallet was not found in the candidate universe.")
-        analysis = self.database.get_candidate_analysis(wallet)
-        if state == "active":
-            if not analysis or analysis.lifecycle_status != "qualified":
-                raise ValueError("Wallet cannot be activated because its Phase B analysis is not currently qualified. No state change was made.")
-            score = self._authoritative_score(wallet, analysis.last_run_id)
-            if not score or not bool(score["eligible"]):
-                raise ValueError("Wallet cannot be activated because it lacks an eligible canonical Phase B score. No state change was made.")
-            if score.get("config_fingerprint") != _config_fingerprint(self.config.snapshot()):
-                raise ValueError("Wallet cannot be activated because its Phase B analysis is stale. No state change was made.")
-            run = self.database.get_analysis_run(str(score.get("analysis_run_id") or ""))
-            if not run or run.get("status") not in {"completed", "completed_with_errors"}:
-                raise ValueError("Wallet cannot be activated because its canonical Phase B analysis run did not complete successfully. No state change was made.")
-            recommendation = self.database.get_finalist_recommendation(
-                analysis.last_run_id, _config_fingerprint(self.config.snapshot()), wallet,
+        return self._apply_operator_state(target.wallet, state, by=by, allow_overflow=allow_overflow)
+
+    def activate_wallet(self, wallet: str, *, by: str = "operator", allow_overflow: bool = False) -> dict[str, Any]:
+        """Enter Active only after validating the complete current Phase-B chain.
+
+        This is the single application-level Active transition.  Generic
+        status helpers intentionally reject Active so a future CLI, plugin, or
+        automation cannot accidentally grant paper-entry eligibility.
+        """
+        # Keep the authorization reads, status write, and success audit in one
+        # short SQLite write transaction.  A separate validation connection
+        # would allow a concurrent Phase-B run to replace the candidate's
+        # authoritative run after validation and before the Active write.
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            target = connection.execute(
+                "SELECT wallet, status FROM copy_targets WHERE wallet=?", (wallet.lower(),)
+            ).fetchone()
+            if not target:
+                raise KeyError("Wallet was not found in the candidate universe.")
+            self._validate_activation_authority(str(target["wallet"]), connection=connection)
+            before = str(target["status"])
+            now = iso(None)
+            cursor = connection.execute(
+                "UPDATE copy_targets SET status=?, updated_at=? WHERE wallet=?",
+                ("active", now, target["wallet"]),
             )
-            if not recommendation:
-                raise ValueError("Wallet cannot be activated because it lacks a current persisted Phase B finalist recommendation. No state change was made.")
-            if recommendation.get("recommendation_schema_version") != PHASE_B_RECOMMENDATION_SCHEMA_VERSION:
-                raise ValueError("Wallet cannot be activated because its persisted Phase B finalist recommendation uses an unsupported contract version. No state change was made.")
-            if not recommendation["finalist_eligible"]:
-                reasons = ", ".join(str(reason) for reason in recommendation["finalist_rejection_reasons"]) or "not finalist eligible"
-                raise ValueError(f"Wallet cannot be activated because Phase B rejected it as a finalist ({reasons}). No state change was made.")
+            if not cursor.rowcount:
+                raise KeyError("Wallet was not found in the candidate universe.")
+            connection.execute(
+                "UPDATE copy_discovery_candidates SET discovery_status=? WHERE wallet=?",
+                ("active", target["wallet"]),
+            )
+            message = f"Trader state changed from {before} to active"
+            payload = {"from": before, "to": "active", "by": by}
+            connection.execute(
+                """INSERT OR IGNORE INTO copy_control_center_activity(
+                    event_id, occurred_at, category, severity, wallet, symbol, message, payload_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (stable_id("control_activity", now, "operator", "info", target["wallet"], "", message, payload),
+                 now, "operator", "info", target["wallet"], None, message, _dump(payload)),
+            )
+            active_count = int(connection.execute(
+                "SELECT COUNT(*) FROM copy_targets WHERE status='active'"
+            ).fetchone()[0])
+        return {"wallet": str(target["wallet"]).lower(), "operator_state": "active", "previous_state": before,
+                "paper_only": True, "active_count_after": active_count, "recommended_max": 7,
+                "cohort_over_recommended_size": active_count > 7, "allow_overflow": allow_overflow}
+
+    def _validate_activation_authority(
+        self, wallet: str, *, connection: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
+        """Validate Phase B's immutable authority before any target mutation."""
+        if connection is None:
+            analysis = self.database.get_candidate_analysis(wallet)
+            lifecycle_status = analysis.lifecycle_status if analysis else None
+            run_id = analysis.last_run_id if analysis else None
+        else:
+            analysis = connection.execute(
+                "SELECT lifecycle_status, last_run_id FROM copy_candidate_analyses WHERE wallet=?", (wallet.lower(),)
+            ).fetchone()
+            lifecycle_status = str(analysis["lifecycle_status"]) if analysis else None
+            run_id = str(analysis["last_run_id"]) if analysis and analysis["last_run_id"] else None
+        if lifecycle_status != "qualified" or not run_id:
+            raise ValueError("Wallet cannot be activated because its Phase B analysis is not currently qualified. No state change was made.")
+        fingerprint = _config_fingerprint(self.config.research_snapshot())
+        score = self._authoritative_score(wallet, run_id, connection=connection)
+        if not score or score.get("provenance") != "phase_b" or score.get("analysis_run_id") != run_id:
+            raise ValueError("Wallet cannot be activated because it lacks an authoritative Phase B score for its current analysis run. No state change was made.")
+        if not bool(score["eligible"]):
+            raise ValueError("Wallet cannot be activated because its canonical Phase B score is not eligible. No state change was made.")
+        if score.get("config_fingerprint") != fingerprint:
+            raise ValueError("Wallet cannot be activated because its Phase B analysis is stale. No state change was made.")
+        if connection is None:
+            run = self.database.get_analysis_run(run_id)
+        else:
+            row = connection.execute("SELECT status FROM copy_analysis_runs WHERE run_id=?", (run_id,)).fetchone()
+            run = dict(row) if row else None
+        if not run or run.get("status") not in {"completed", "completed_with_errors"}:
+            raise ValueError("Wallet cannot be activated because its canonical Phase B analysis run did not complete successfully. No state change was made.")
+        if connection is None:
+            recommendation = self.database.get_finalist_recommendation(run_id, fingerprint, wallet)
+        else:
+            row = connection.execute(
+                """SELECT * FROM copy_analysis_finalist_recommendations
+                   WHERE analysis_run_id=? AND config_fingerprint=? AND wallet=?""",
+                (run_id, fingerprint, wallet.lower()),
+            ).fetchone()
+            recommendation = dict(row) if row else None
+            if recommendation:
+                recommendation["finalist_eligible"] = bool(recommendation["finalist_eligible"])
+                recommendation["finalist_rejection_reasons"] = _load(
+                    recommendation.pop("finalist_rejection_reasons_json"), []
+                )
+        if not recommendation or recommendation.get("analysis_run_id") != run_id:
+            raise ValueError("Wallet cannot be activated because it lacks a current persisted Phase B finalist recommendation. No state change was made.")
+        if recommendation.get("recommendation_schema_version") != PHASE_B_RECOMMENDATION_SCHEMA_VERSION:
+            raise ValueError("Wallet cannot be activated because its persisted Phase B finalist recommendation uses an unsupported contract version. No state change was made.")
+        if not recommendation["finalist_eligible"]:
+            reasons = ", ".join(str(reason) for reason in recommendation["finalist_rejection_reasons"]) or "not finalist eligible"
+            raise ValueError(f"Wallet cannot be activated because Phase B rejected it as a finalist ({reasons}). No state change was made.")
+        # ``finalist_eligible`` is the policy gate; rank is the independent
+        # diversification decision.  Active is the paper execution cohort, so
+        # it must be selected into the persisted diversified finalist set too.
+        if recommendation.get("selection_rank") is None:
+            raise ValueError("Wallet cannot be activated because Phase B did not select it into the current diversified finalist cohort. No state change was made.")
+        return recommendation
+
+    def _apply_operator_state(self, wallet: str, state: str, *, by: str, allow_overflow: bool) -> dict[str, Any]:
+        """Persist a validated non-Active operator transition and its audit event."""
+        if state == "active":
+            raise ValueError("Direct Active transition is prohibited; use activate_wallet so Phase-B authority is validated.")
+        target = self.database.get_target(wallet)
+        if not target:
+            raise KeyError("Wallet was not found in the candidate universe.")
         before = target.status
         if not self.database.set_target_status(wallet, state):
             raise KeyError("Wallet was not found in the candidate universe.")
@@ -833,10 +928,20 @@ class CopyControlCenter:
                 "active_count_after": active_count, "recommended_max": 7,
                 "cohort_over_recommended_size": active_count > 7, "allow_overflow": allow_overflow}
 
-    def _authoritative_score(self, wallet: str, run_id: str | None) -> dict[str, Any] | None:
+    def _authoritative_score(
+        self, wallet: str, run_id: str | None, *, connection: sqlite3.Connection | None = None,
+    ) -> dict[str, Any] | None:
         if not run_id:
             return None
-        with self._connect() as connection:
+        if connection is None:
+            with self._connect() as query_connection:
+                row = query_connection.execute(
+                    """SELECT total_score, eligible, component_scores_json, penalties_json, reasons_json, provenance, analysis_run_id, config_fingerprint
+                       FROM copy_candidate_scores WHERE target_wallet=? AND analysis_run_id=? AND provenance='phase_b'
+                       LIMIT 1""",
+                    (wallet.lower(), run_id),
+                ).fetchone()
+        else:
             row = connection.execute(
                 """SELECT total_score, eligible, component_scores_json, penalties_json, reasons_json, provenance, analysis_run_id, config_fingerprint
                    FROM copy_candidate_scores WHERE target_wallet=? AND analysis_run_id=? AND provenance='phase_b' LIMIT 1""",
@@ -868,7 +973,7 @@ class CopyControlCenter:
             members.append({"wallet": target.wallet, "label": target.label, "score": row.get("score"), "open_pnl": pnl.get(target.wallet, {}).get("open_pnl", 0.0),
                             "total_pnl": pnl.get(target.wallet, {}).get("total_pnl", 0.0), "drawdown": pnl.get(target.wallet, {}).get("max_drawdown", 0.0),
                             "allocation_policy": "Dynamic 5/10/20", "operator_state": "active", "research_state": row.get("research_state")})
-        return {"target_size": "5?7", "count": len(members), "members": members, "paper_only": True}
+        return {"target_size": "5–7", "count": len(members), "members": members, "paper_only": True}
 
     def positions(self, *, wallet: str | None = None, symbol: str | None = None, direction: str | None = None) -> list[dict[str, Any]]:
         positions = self.database.list_virtual_positions(open_only=True)

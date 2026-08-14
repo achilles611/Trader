@@ -55,7 +55,7 @@ describe("copy control center", () => {
     render(<App />);
     expect(await screen.findByText("PAPER POSITIONS ONLY")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Candidates" }));
-    expect(await screen.findByText("0x111111?111111")).toBeInTheDocument();
+    expect(await screen.findByText("0x111111…111111")).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Search wallet"), { target: { value: "0x111" } });
     fireEvent.click(screen.getByRole("button", { name: /Score/ }));
     await waitFor(() => expect(fetch).toHaveBeenCalledWith(expect.stringContaining("sort=score"), expect.anything()));
@@ -72,11 +72,19 @@ describe("copy control center", () => {
   it("renders canonical dossier score fields without legacy aliases", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Candidates" }));
-    fireEvent.click(await screen.findByText("0x111111?111111"));
+    fireEvent.click(await screen.findByText("0x111111…111111"));
     expect(await screen.findByText("RESEARCH DOSSIER")).toBeInTheDocument();
     expect(screen.getByText("consistency")).toBeInTheDocument();
     expect(screen.getByText("drawdown penalty")).toBeInTheDocument();
     expect(screen.getByText("fixture_reason")).toBeInTheDocument();
+  });
+
+  it("does not offer Active for a dossier without a selected Phase B finalist recommendation", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Candidates" }));
+    fireEvent.click(await screen.findByText("0x111111…111111"));
+    expect(await screen.findByText("Activation is available only for a current Phase B selected finalist.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Activate PAPER" })).not.toBeInTheDocument();
   });
 
   it("shows the actual number of PAPER positions left open after a partial close-all", async () => {
@@ -172,7 +180,7 @@ describe("copy control center", () => {
     fireEvent.click(screen.getByRole("button", { name: "System" }));
     expect(await screen.findByText("Hyperliquid API")).toBeInTheDocument();
     expect(screen.getByText("REST budget")).toBeInTheDocument();
-    expect(screen.getByText("Rate-limit retries")).toBeInTheDocument();
+    expect(screen.getByText("429 retry signals")).toBeInTheDocument();
   });
 
   it("shows discovery websocket progress and completion navigation", async () => {

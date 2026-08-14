@@ -483,6 +483,13 @@ class CopyTradeDatabase:
         return next((target for target in targets if target.wallet.lower() == normalized), None)
 
     def set_target_status(self, wallet: str, status: str) -> bool:
+        """Low-level persistence primitive for internal migrations and fixtures.
+
+        Application-level callers must use ``CopyTradeService.set_status`` for
+        ordinary non-Active transitions or ``CopyControlCenter.activate_wallet``
+        for the privileged Active transition. This storage layer deliberately
+        does not duplicate Phase-C authority policy.
+        """
         with self._connect() as connection:
             cursor = connection.execute(
                 "UPDATE copy_targets SET status=?, updated_at=? WHERE wallet=?",

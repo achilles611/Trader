@@ -115,7 +115,7 @@ class SuitabilityEvidenceTests(unittest.TestCase):
                 StaticProvider([DiscoveryObservation(STEADY, "suitability_fixture", utc_now(), utc_now(), evidence_id="policy")]),
                 limit=10, min_activity=1, max_activity_age=None,
             )
-            fingerprint = CandidateAnalysisPipeline(service).config.snapshot()
+            fingerprint = CandidateAnalysisPipeline(service).config.research_snapshot()
             from src.copytrade.analysis import _config_fingerprint
             config_fingerprint = _config_fingerprint(fingerprint)
             run = AnalysisRun("analysis_policy", utc_now(), {"fixture": True})

@@ -453,7 +453,7 @@ class PhaseBAnalysisTests(unittest.TestCase):
             with patch("src.copytrade.analytics.utc_now", return_value=end + timedelta(days=120)):
                 repeated = pipeline._analyze_wallet(
                     GOOD, summary["coverage"], run_id=result["run_id"],
-                    config_fingerprint=_config_fingerprint(service.config.snapshot()), required_start=start, required_end=end,
+                    config_fingerprint=_config_fingerprint(service.config.research_snapshot()), required_start=start, required_end=end,
                 )
             self.assertEqual(repeated["score"]["total"], summary["score"]["total"])
             self.assertEqual(repeated["diversification_input"], summary["diversification_input"])
@@ -465,7 +465,7 @@ class PhaseBAnalysisTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             service = CopyTradeService(config(Path(temp)))
             seed_candidates(service, [GOOD, FAILED])
-            fingerprint = _config_fingerprint(service.config.snapshot())
+            fingerprint = _config_fingerprint(service.config.research_snapshot())
             old_fingerprint = "old-config"
             def qualified(wallet: str, run_id: str, score_value: float, score_fingerprint: str) -> None:
                 service.database.start_analysis_run(AnalysisRun(run_id, utc_now(), {"fixture": True}))

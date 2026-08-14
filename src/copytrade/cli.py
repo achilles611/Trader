@@ -31,7 +31,7 @@ def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
     importer = command("copy-import", "Import manually researched Hyperliquid wallets from arguments or a text/CSV file.")
     importer.add_argument("--wallet", action="append", default=[], help="0x wallet address; may be specified repeatedly.")
     importer.add_argument("--file", help="Text/CSV list whose first column contains wallet addresses.")
-    importer.add_argument("--approve", action="store_true", help="Mark newly imported targets approved after import.")
+    importer.add_argument("--approve", action="store_true", help="Mark newly imported targets approved for research triage; this does not activate paper monitoring.")
 
     backfill = command("copy-backfill", "Backfill public Hyperliquid fills, account state, and portfolio history.")
     backfill.add_argument("--wallet", required=True, help="Previously imported wallet address.")
@@ -75,12 +75,12 @@ def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
     suitability.add_argument("--wallet", required=True, help="Discovered public wallet to inspect; this never changes status.")
     suitability.add_argument("--output", help="Optional path for the report JSON.")
 
-    approve = command("copy-approve", "Approve a target for paper-mode websocket monitoring.")
+    approve = command("copy-approve", "Approve a target for research triage; approval does not activate paper monitoring.")
     approve.add_argument("--wallet", required=True)
-    reject = command("copy-reject", "Reject a target from paper-mode websocket monitoring.")
+    reject = command("copy-reject", "Reject a target from research triage; it cannot open new paper sleeves.")
     reject.add_argument("--wallet", required=True)
 
-    watch = command("copy-watch", "Watch approved Hyperliquid wallets and paper-copy new public fills.")
+    watch = command("copy-watch", "Watch Active entry wallets and exit-only wallets with open paper sleeves.")
     watch.add_argument("--duration", type=float, help="Optional bounded duration in seconds for smoke tests.")
 
     backtest = command("copy-backtest", "Replay stored public fills through deterministic paper-copy simulation.")
@@ -194,7 +194,7 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
         return 0
     if command == "copy-rank":
         pipeline = CandidateAnalysisPipeline(service)
-        fingerprint = _config_fingerprint(config.snapshot())
+        fingerprint = _config_fingerprint(config.research_snapshot())
         phase_b_scores = service.database.phase_b_qualified_scores(config_fingerprint=fingerprint)
         finalists = pipeline.shadow_finalists(count=args.count)
         payload = {

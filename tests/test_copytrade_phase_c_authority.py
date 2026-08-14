@@ -5,8 +5,10 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from src.copytrade.analysis import CandidateAnalysisPipeline, _config_fingerprint
 from src.copytrade.config import AnalysisConfig, ArtifactConfig, CandidateConfig, CopyTradeConfig, FinalistRequirementsConfig, PaperExecutionConfig, RiskConfig, SizingConfig
@@ -54,7 +56,7 @@ def seed_phase_b_authority(
 ) -> tuple[CopyControlCenter, str]:
     database = service.database
     DiscoveryPipeline(database).run(StaticProvider(), limit=10, min_activity=1, max_activity_age=None)
-    fingerprint = _config_fingerprint(service.config.snapshot())
+    fingerprint = _config_fingerprint(service.config.research_snapshot())
     run_id = f"phase_b_{run_status}_{'eligible' if finalist_eligible else 'rejected'}"
     database.start_analysis_run(AnalysisRun(run_id=run_id, started_at=utc_now(), configuration={"config_fingerprint": fingerprint}))
     database.finish_analysis_run(
@@ -87,6 +89,25 @@ def raw_fill(tid: int, side: str, position_before: float, *, wallet: str = WALLE
 
 
 class PhaseCAuthorityTests(unittest.TestCase):
+    def test_generic_status_paths_cannot_activate_and_configuration_cannot_bootstrap_active(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            service = CopyTradeService(config(root))
+            service.import_wallets([WALLET])
+            with self.assertRaisesRegex(ValueError, "Direct Active transition"):
+                service.set_status(WALLET, "active")
+            self.assertEqual(service.database.get_target(WALLET).status, "pending")  # type: ignore[union-attr]
+            center = CopyControlCenter(service.config, service.database)
+            with self.assertRaisesRegex(ValueError, "Direct Active transition"):
+                center._apply_operator_state(WALLET, "active", by="test", allow_overflow=False)
+            self.assertEqual(service.database.get_target(WALLET).status, "pending")  # type: ignore[union-attr]
+            for state in ("new", "queued", "approved", "shadow", "muted", "rejected", "pending"):
+                service.set_status(WALLET, state)
+                self.assertEqual(service.database.get_target(WALLET).status, state)  # type: ignore[union-attr]
+            configured = replace(config(root / "configured"), targets=({"wallet": WALLET, "status": "active"},))
+            with self.assertRaisesRegex(ValueError, "cannot enter Active"):
+                CopyTradeService(configured)
+
     def test_deterministic_phase_a_to_b_to_c_flow_uses_versioned_evidence_and_persisted_finalists(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             service = CopyTradeService(config(Path(temp)))
@@ -129,7 +150,7 @@ class PhaseCAuthorityTests(unittest.TestCase):
             self.assertEqual((result["cheap_rejected"], result["eligible"]), (1, 1))
             legacy_analysis = service.database.get_candidate_analysis(LEGACY)
             self.assertEqual(legacy_analysis.prefilter_reasons, ("phase_a_refresh_required",))  # type: ignore[union-attr]
-            persisted = service.database.list_finalist_recommendations(_config_fingerprint(service.config.snapshot()))
+            persisted = service.database.list_finalist_recommendations(_config_fingerprint(service.config.research_snapshot()))
             self.assertEqual([item["wallet"] for item in persisted if item["finalist_eligible"]], [WALLET])
 
             center = CopyControlCenter(service.config, service.database)
@@ -168,6 +189,7 @@ class PhaseCAuthorityTests(unittest.TestCase):
             ("stale recommendation", True, (), "completed", "stale-fingerprint", False),
             ("failed parent run", True, (), "failed", None, False),
             ("current persisted finalist", True, (), "completed", None, True),
+            ("completed with errors finalist", True, (), "completed_with_errors", None, True),
         )
         for name, eligible, reasons, run_status, recommendation_fingerprint, succeeds in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
@@ -187,9 +209,120 @@ class PhaseCAuthorityTests(unittest.TestCase):
                         center.set_operator_state(WALLET, "active")
                     self.assertEqual(service.database.get_target(WALLET).status, "new")  # type: ignore[union-attr]
 
+    def test_activation_rejection_cases_leave_target_and_activity_unchanged(self) -> None:
+        def mutate(name: str, service: CopyTradeService, fingerprint: str) -> None:
+            with service.database._connect() as connection:  # type: ignore[attr-defined]
+                if name == "non-qualified lifecycle":
+                    connection.execute("UPDATE copy_candidate_analyses SET lifecycle_status='analyzed' WHERE wallet=?", (WALLET,))
+                elif name == "missing score":
+                    connection.execute("DELETE FROM copy_candidate_scores WHERE target_wallet=?", (WALLET,))
+                elif name == "wrong score run":
+                    connection.execute("UPDATE copy_candidate_scores SET analysis_run_id='other-run' WHERE target_wallet=?", (WALLET,))
+                elif name == "legacy score provenance":
+                    connection.execute("UPDATE copy_candidate_scores SET provenance='legacy' WHERE target_wallet=?", (WALLET,))
+                elif name == "ineligible score":
+                    connection.execute("UPDATE copy_candidate_scores SET eligible=0 WHERE target_wallet=?", (WALLET,))
+                elif name == "stale score fingerprint":
+                    connection.execute("UPDATE copy_candidate_scores SET config_fingerprint='stale' WHERE target_wallet=?", (WALLET,))
+                elif name == "rejected parent run":
+                    connection.execute("UPDATE copy_analysis_runs SET status='failed'")
+                elif name == "missing recommendation":
+                    connection.execute("DELETE FROM copy_analysis_finalist_recommendations WHERE wallet=?", (WALLET,))
+                elif name == "unsupported recommendation schema":
+                    connection.execute(
+                        "UPDATE copy_analysis_finalist_recommendations SET recommendation_schema_version=999 WHERE wallet=?", (WALLET,)
+                    )
+                elif name == "not diversified selection":
+                    connection.execute(
+                        "UPDATE copy_analysis_finalist_recommendations SET selection_rank=NULL WHERE wallet=?", (WALLET,)
+                    )
+                else:
+                    raise AssertionError(name)
+
+        cases = (
+            "non-qualified lifecycle", "missing score", "wrong score run", "legacy score provenance", "ineligible score",
+            "stale score fingerprint", "rejected parent run", "missing recommendation", "unsupported recommendation schema",
+            "not diversified selection",
+        )
+        for name in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                service = CopyTradeService(config(Path(temp)))
+                center, fingerprint = seed_phase_b_authority(service)
+                mutate(name, service, fingerprint)
+                before = center.activity(limit=100, wallet=WALLET)
+                with self.assertRaises(ValueError):
+                    center.activate_wallet(WALLET)
+                self.assertEqual(service.database.get_target(WALLET).status, "new")  # type: ignore[union-attr]
+                self.assertEqual(center.activity(limit=100, wallet=WALLET), before)
+                self.assertEqual(service.monitored_execution_wallets(), [])
+                self.assertEqual(service.database.list_virtual_positions(open_only=True), [])
+
+    def test_canonical_activation_audits_only_after_authority_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            center, _ = seed_phase_b_authority(service)
+            result = center.activate_wallet(WALLET, by="test-operator")
+            self.assertEqual((result["operator_state"], result["previous_state"]), ("active", "new"))
+            events = center.activity(limit=10, wallet=WALLET)
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["category"], "operator")
+            self.assertEqual(events[0]["payload"], {"from": "new", "to": "active", "by": "test-operator"})
+
+    def test_activation_serializes_phase_b_authority_and_status_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            center, _ = seed_phase_b_authority(service)
+            validate = center._validate_activation_authority
+
+            def assert_write_lock(wallet: str, *, connection: sqlite3.Connection | None = None) -> dict[str, object]:
+                self.assertIsNotNone(connection)
+                with sqlite3.connect(service.config.artifacts.database_path, timeout=0) as contender:
+                    with self.assertRaises(sqlite3.OperationalError):
+                        contender.execute("UPDATE copy_candidate_analyses SET last_run_id='concurrent-run' WHERE wallet=?", (wallet,))
+                return validate(wallet, connection=connection)
+
+            with patch.object(center, "_validate_activation_authority", side_effect=assert_write_lock):
+                self.assertEqual(center.activate_wallet(WALLET)["operator_state"], "active")
+
+    def test_operational_rate_limit_settings_do_not_stale_phase_b_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            _, fingerprint = seed_phase_b_authority(service)
+            historical_snapshot = service.config.snapshot()
+            for field_name in (
+                "api_weight_budget_per_minute",
+                "rate_limit_backoff_initial_seconds",
+                "rate_limit_backoff_max_seconds",
+                "rate_limit_jitter_seconds",
+            ):
+                historical_snapshot["analysis"].pop(field_name)
+            self.assertEqual(_config_fingerprint(historical_snapshot), fingerprint)
+            changed_config = replace(
+                service.config,
+                analysis=replace(service.config.analysis, api_weight_budget_per_minute=700, rate_limit_jitter_seconds=0),
+            )
+            self.assertNotEqual(
+                _config_fingerprint(service.config.snapshot()), _config_fingerprint(changed_config.snapshot()),
+            )
+            self.assertEqual(
+                _config_fingerprint(service.config.research_snapshot()), _config_fingerprint(changed_config.research_snapshot()),
+            )
+            self.assertEqual(_config_fingerprint(changed_config.research_snapshot()), fingerprint)
+            self.assertEqual(CopyControlCenter(changed_config, service.database).activate_wallet(WALLET)["operator_state"], "active")
+
+    def test_activation_requires_an_existing_target_without_creating_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            center = CopyControlCenter(service.config, service.database)
+            with self.assertRaises(KeyError):
+                center.activate_wallet(WALLET)
+            self.assertEqual(center.activity(limit=10, wallet=WALLET), [])
+
     def test_execution_entry_gates_preserve_raw_evidence_and_never_gate_exits(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             service = CopyTradeService(config(Path(temp)))
+            # Fixture-only raw state: production entry uses the canonical
+            # Phase-C activation test path above.
             service.database.upsert_target(Target(wallet=WALLET, status="active"))
             service.control_store.set_control_state(CONTROL_ENTRIES_PAUSED, by="test")
             asyncio.run(service.ingest_market_update({"mids": {"BTC": "100"}}))
@@ -208,6 +341,7 @@ class PhaseCAuthorityTests(unittest.TestCase):
             asyncio.run(fresh.ingest_watched_fills(WALLET, [raw_fill(2, "B", 0)], False))
             self.assertEqual(len(fresh.database.list_virtual_positions(open_only=True)), 1)
             fresh.set_status(WALLET, "muted")
+            self.assertIn(WALLET, fresh.monitored_execution_wallets())
             asyncio.run(fresh.ingest_watched_fills(WALLET, [raw_fill(3, "A", 1)], False))
             self.assertEqual(fresh.database.list_virtual_positions(open_only=True), [])
 

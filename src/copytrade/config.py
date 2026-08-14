@@ -215,6 +215,12 @@ class AnalysisConfig:
     default_workers: int = 4
     retry_attempts: int = 3
     retry_initial_seconds: float = 0.25
+    # One shared operating allowance for all public /info consumers in this
+    # process.  It stays below Hyperliquid's documented IP ceiling.
+    api_weight_budget_per_minute: int = 900
+    rate_limit_backoff_initial_seconds: float = 2.0
+    rate_limit_backoff_max_seconds: float = 30.0
+    rate_limit_jitter_seconds: float = 0.5
     history_days: int = 180
     min_discovery_activity: int = 2
     shadow_finalist_count: int = 20
@@ -380,6 +386,12 @@ class CopyTradeConfig:
             raise ValueError("analysis.default_workers and analysis.retry_attempts must be positive.")
         if self.analysis.retry_initial_seconds < 0 or self.analysis.history_days <= 0 or self.analysis.min_discovery_activity <= 0:
             raise ValueError("analysis retry delay, history days, and minimum discovery activity must be positive.")
+        if not 1 <= self.analysis.api_weight_budget_per_minute <= 1_200:
+            raise ValueError("analysis.api_weight_budget_per_minute must be between 1 and Hyperliquid's 1200 weight/minute limit.")
+        if (self.analysis.rate_limit_backoff_initial_seconds <= 0
+                or self.analysis.rate_limit_backoff_max_seconds < self.analysis.rate_limit_backoff_initial_seconds
+                or self.analysis.rate_limit_jitter_seconds < 0):
+            raise ValueError("analysis rate-limit backoff configuration is invalid.")
         if self.analysis.walk_forward_min_windows <= 0:
             raise ValueError("analysis.walk_forward_min_windows must be positive.")
         if not 0 <= self.analysis.high_suitability_score <= 100:
@@ -410,3 +422,23 @@ class CopyTradeConfig:
 
     def snapshot(self) -> dict[str, Any]:
         return jsonable(asdict(self))
+
+    def research_snapshot(self) -> dict[str, Any]:
+        """Return the Phase-B semantic configuration projection.
+
+        The full snapshot remains durable run provenance. Public-request
+        scheduling is operational rather than a research/scoring assumption,
+        so changing its limiter settings must not stale otherwise identical
+        Phase-B scores or finalist recommendations.
+        """
+        snapshot = self.snapshot()
+        analysis = dict(snapshot.get("analysis") or {})
+        for field_name in (
+            "api_weight_budget_per_minute",
+            "rate_limit_backoff_initial_seconds",
+            "rate_limit_backoff_max_seconds",
+            "rate_limit_jitter_seconds",
+        ):
+            analysis.pop(field_name, None)
+        snapshot["analysis"] = analysis
+        return snapshot
