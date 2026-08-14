@@ -17,7 +17,14 @@ class NetExecutionIntent:
 
 
 class ExecutionAggregator:
-    """Converts independent paper sleeves into nettable venue intents; sends no orders."""
+    """Converts sleeves into inert planning data; this module sends no orders.
+
+    Phase D must remain an aggregation seam until it has durable exchange
+    reconciliation, idempotent order state, partial-fill attribution,
+    reduce-only/precision/minimum-notional controls, signing isolation, and a
+    separately authorized control plane.  Do not add transport or credentials
+    here as a shortcut around those requirements.
+    """
 
     @staticmethod
     def net_open_sleeves(sleeves: Iterable[VirtualTargetPosition]) -> list[NetExecutionIntent]:

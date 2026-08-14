@@ -1,0 +1,59 @@
+name: CI
+
+"on":
+  push: {}
+  pull_request: {}
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - name: Install locked runtime dependencies
+        run: python -m pip install -r requirements.lock
+      - name: Compile Python source
+        run: python -m compileall -q src main.py beez_console.py
+      - name: Run complete backend suite
+        run: python -m unittest discover -s tests -v
+
+  windows-backend:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - name: Install locked runtime dependencies
+        run: python -m pip install -r requirements.lock
+      - name: Compile Python source
+        run: python -m compileall -q src main.py beez_console.py
+      - name: Run complete Windows backend and launcher suite
+        run: python -m unittest discover -s tests -v
+
+  control-center-ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: control-center-ui
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: control-center-ui/package-lock.json
+      - name: Install locked frontend dependencies
+        run: npm ci
+      - name: Run complete frontend suite
+        run: npm test -- --run
+      - name: Build production frontend
+        run: npm run build
+      - name: Audit production dependency tree
+        run: npm audit --omit=dev --audit-level=high
+      - name: Audit development tooling for High/Critical advisories
+        run: npm audit --audit-level=high

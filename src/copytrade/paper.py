@@ -67,6 +67,11 @@ class TargetSizeClassifier:
     def seed(self, target_wallet: str, fractions: Iterable[float]) -> None:
         self._history[target_wallet.lower()] = [float(value) for value in fractions if value > 0]
 
+    def record(self, target_wallet: str, fraction: float) -> None:
+        """Restore one already-decided valid entry without reclassifying it."""
+        if fraction > 0:
+            self._history.setdefault(target_wallet.lower(), []).append(float(fraction))
+
 
 def _quantile(values: list[float], fraction: float) -> float:
     point = (len(values) - 1) * fraction

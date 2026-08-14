@@ -121,6 +121,9 @@ class CandidateConfig:
     max_follower_drawdown_preferred: float = 0.15
     max_follower_drawdown_hard: float = 0.30
     liquidation_frequency_hard: float = 0.10
+    minimum_copyability_hard: float = 0.05
+    pnl_concentration_preferred: float = 0.50
+    pnl_concentration_hard: float = 1.0  # 1.0 disables the optional hard gate
     profit_factor_preferred: float = 1.40
     require_positive_expectancy: bool = True
     require_positive_follower_expectancy: bool = True
@@ -138,8 +141,9 @@ class CandidateConfig:
             "latency_survivability": 5.0,
             "history_quality": 5.0,
             "position_size_stability": 5.0,
-            "diversification": 3.0,
             "source_quality": 2.0,
+            "friction_robustness": 5.0,
+            "regime_robustness": 4.0,
         }
     )
     penalty_weights: dict[str, float] = field(
@@ -153,8 +157,55 @@ class CandidateConfig:
             "inactivity": 10.0,
             "latency_decay": 15.0,
             "follower_drawdown": 8.0,
+            "jackpot_concentration": 12.0,
+            "regime_dependency": 6.0,
+            "friction_sensitivity": 8.0,
         }
     )
+
+
+@dataclass(frozen=True)
+class PrefilterConfig:
+    """Cheap Stage A.2 gates applied before public backfill/simulation."""
+
+    min_activity_observations: int = 0  # zero inherits analysis.min_discovery_activity
+    min_distinct_active_days: int = 0
+    min_distinct_active_hours: int = 0
+    min_observation_span_hours: float = 0.0
+    min_observed_notional: float = 0.0
+    min_distinct_symbols: int = 0
+    exclude_operator_managed: bool = True
+
+
+@dataclass(frozen=True)
+class ConfidenceConfig:
+    """Evidence confidence is intentionally separate from suitability (0-100)."""
+
+    closed_campaigns_reference: int = 100
+    active_days_reference: int = 30
+    history_days_reference: int = 180
+    walk_forward_windows_reference: int = 4
+    regimes_reference: int = 2
+
+
+@dataclass(frozen=True)
+class RegimeConfig:
+    """Deterministic observed-price proxy segmentation; no ML classifier."""
+
+    enabled: bool = True
+    volatility_move_threshold: float = 0.03
+    minimum_campaigns_per_regime: int = 3
+
+
+@dataclass(frozen=True)
+class FinalistRequirementsConfig:
+    """Evidence policy for shadow-finalist recommendations, not raw scores."""
+
+    minimum_confidence_score: float = 60.0
+    require_copyability_evidence: bool = True
+    require_walk_forward_evidence: bool = False
+    require_latency_evidence: bool = False
+    require_regime_evidence: bool = False
 
 
 @dataclass(frozen=True)
@@ -164,10 +215,19 @@ class AnalysisConfig:
     default_workers: int = 4
     retry_attempts: int = 3
     retry_initial_seconds: float = 0.25
+    # One shared operating allowance for all public /info consumers in this
+    # process.  It stays below Hyperliquid's documented IP ceiling.
+    api_weight_budget_per_minute: int = 900
+    rate_limit_backoff_initial_seconds: float = 2.0
+    rate_limit_backoff_max_seconds: float = 30.0
+    rate_limit_jitter_seconds: float = 0.5
     history_days: int = 180
     min_discovery_activity: int = 2
     shadow_finalist_count: int = 20
     walk_forward_min_windows: int = 2
+    high_suitability_score: float = 70.0
+    market_evidence_enabled: bool = True
+    market_evidence_bucket_seconds: int = 60
 
 
 @dataclass(frozen=True)
@@ -189,6 +249,10 @@ class CopyTradeConfig:
     paper_execution: PaperExecutionConfig = field(default_factory=PaperExecutionConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     candidates: CandidateConfig = field(default_factory=CandidateConfig)
+    prefilter: PrefilterConfig = field(default_factory=PrefilterConfig)
+    confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
+    regimes: RegimeConfig = field(default_factory=RegimeConfig)
+    finalist_requirements: FinalistRequirementsConfig = field(default_factory=FinalistRequirementsConfig)
     analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
     artifacts: ArtifactConfig = field(default_factory=ArtifactConfig)
     targets: tuple[dict[str, Any], ...] = ()
@@ -214,6 +278,10 @@ class CopyTradeConfig:
         latency = _section(document, "latency")
         backtest = _section(document, "backtest")
         candidates = _section(document, "candidates")
+        prefilter = _section(document, "prefilter")
+        confidence = _section(document, "confidence")
+        regimes = _section(document, "regimes")
+        finalist_requirements = _section(document, "finalist_requirements")
         analysis = _section(document, "analysis")
         artifacts = _section(document, "artifacts")
         database = _section(document, "database")
@@ -263,6 +331,10 @@ class CopyTradeConfig:
                 }
             ),
             candidates=CandidateConfig(**candidates),
+            prefilter=PrefilterConfig(**prefilter),
+            confidence=ConfidenceConfig(**confidence),
+            regimes=RegimeConfig(**regimes),
+            finalist_requirements=FinalistRequirementsConfig(**finalist_requirements),
             analysis=AnalysisConfig(**analysis),
             artifacts=ArtifactConfig(
                 **{
@@ -314,12 +386,59 @@ class CopyTradeConfig:
             raise ValueError("analysis.default_workers and analysis.retry_attempts must be positive.")
         if self.analysis.retry_initial_seconds < 0 or self.analysis.history_days <= 0 or self.analysis.min_discovery_activity <= 0:
             raise ValueError("analysis retry delay, history days, and minimum discovery activity must be positive.")
+        if not 1 <= self.analysis.api_weight_budget_per_minute <= 1_200:
+            raise ValueError("analysis.api_weight_budget_per_minute must be between 1 and Hyperliquid's 1200 weight/minute limit.")
+        if (self.analysis.rate_limit_backoff_initial_seconds <= 0
+                or self.analysis.rate_limit_backoff_max_seconds < self.analysis.rate_limit_backoff_initial_seconds
+                or self.analysis.rate_limit_jitter_seconds < 0):
+            raise ValueError("analysis rate-limit backoff configuration is invalid.")
         if self.analysis.walk_forward_min_windows <= 0:
             raise ValueError("analysis.walk_forward_min_windows must be positive.")
+        if not 0 <= self.analysis.high_suitability_score <= 100:
+            raise ValueError("analysis.high_suitability_score must be in [0, 100].")
+        if self.analysis.market_evidence_bucket_seconds <= 0:
+            raise ValueError("analysis.market_evidence_bucket_seconds must be positive.")
         if not 0 <= self.candidates.max_follower_drawdown_preferred <= self.candidates.max_follower_drawdown_hard <= 1:
             raise ValueError("Follower drawdown thresholds must be ordered fractions in [0, 1].")
         if not 0 < self.candidates.liquidation_frequency_hard <= 1:
             raise ValueError("candidates.liquidation_frequency_hard must be in (0, 1].")
+        if not 0 <= self.candidates.minimum_copyability_hard <= 1:
+            raise ValueError("candidates.minimum_copyability_hard must be in [0, 1].")
+        if not 0 <= self.candidates.pnl_concentration_preferred <= self.candidates.pnl_concentration_hard <= 1:
+            raise ValueError("candidate P&L concentration thresholds must be ordered fractions in [0, 1].")
+        if min(self.prefilter.min_activity_observations, self.prefilter.min_distinct_active_days,
+               self.prefilter.min_distinct_active_hours, self.prefilter.min_distinct_symbols) < 0:
+            raise ValueError("prefilter count thresholds must be >= 0.")
+        if self.prefilter.min_observation_span_hours < 0 or self.prefilter.min_observed_notional < 0:
+            raise ValueError("prefilter span/notional thresholds must be >= 0.")
+        if min(self.confidence.closed_campaigns_reference, self.confidence.active_days_reference,
+               self.confidence.history_days_reference, self.confidence.walk_forward_windows_reference,
+               self.confidence.regimes_reference) <= 0:
+            raise ValueError("confidence reference thresholds must be positive.")
+        if self.regimes.volatility_move_threshold < 0 or self.regimes.minimum_campaigns_per_regime <= 0:
+            raise ValueError("regime thresholds are invalid.")
+        if not 0 <= self.finalist_requirements.minimum_confidence_score <= 100:
+            raise ValueError("finalist_requirements.minimum_confidence_score must be in [0, 100].")
 
     def snapshot(self) -> dict[str, Any]:
         return jsonable(asdict(self))
+
+    def research_snapshot(self) -> dict[str, Any]:
+        """Return the Phase-B semantic configuration projection.
+
+        The full snapshot remains durable run provenance. Public-request
+        scheduling is operational rather than a research/scoring assumption,
+        so changing its limiter settings must not stale otherwise identical
+        Phase-B scores or finalist recommendations.
+        """
+        snapshot = self.snapshot()
+        analysis = dict(snapshot.get("analysis") or {})
+        for field_name in (
+            "api_weight_budget_per_minute",
+            "rate_limit_backoff_initial_seconds",
+            "rate_limit_backoff_max_seconds",
+            "rate_limit_jitter_seconds",
+        ):
+            analysis.pop(field_name, None)
+        snapshot["analysis"] = analysis
+        return snapshot

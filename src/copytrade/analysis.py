@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -12,8 +13,11 @@ from typing import Any, Callable, Iterable
 from .analytics import calculate_trader_metrics, campaign_return_series
 from .backtest import CopyTradeBacktester
 from .config import CopyTradeConfig
-from .models import AnalysisRun, CandidateAnalysis, CandidateAnalysisState, PositionCampaign, PositionEvent, as_utc, new_run_id, utc_now
-from .scoring import FollowerMetrics, score_candidate, select_diverse_targets_with_metadata
+from .contracts import PHASE_A_CHEAP_STATS_FIELDS, PHASE_A_EVIDENCE_SCHEMA_VERSION
+from .hyperliquid import HyperliquidPublicAdapter
+from .market import CachedHistoricalMarketData, HyperliquidMarketData, MarketDataProvider
+from .models import AnalysisRun, CandidateAnalysis, CandidateAnalysisState, CandidateScore, PositionCampaign, PositionEvent, as_utc, new_run_id, utc_now
+from .scoring import FollowerMetrics, score_candidate, select_diverse_targets_with_metadata, suitability_confidence
 from .service import CopyTradeService
 
 
@@ -37,8 +41,9 @@ class CandidateAnalysisPipeline:
 
     def __init__(
         self, service: CopyTradeService, *,
-        backfill_wallet: Callable[[str, object], dict[str, object]] | None = None,
+        backfill_wallet: Callable[..., dict[str, object]] | None = None,
         reconstruct_wallet: Callable[[str], dict[str, object]] | None = None,
+        market_data_factory: Callable[[], MarketDataProvider] | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.service = service
@@ -46,6 +51,9 @@ class CandidateAnalysisPipeline:
         self.database = service.database
         self._backfill_wallet = backfill_wallet or self._default_backfill
         self._reconstruct_wallet = reconstruct_wallet or service.reconstruct
+        self._market_data_factory = market_data_factory or (
+            lambda: HyperliquidMarketData(HyperliquidPublicAdapter(self.config.source))
+        )
         self._sleep = sleep
 
     def run(
@@ -63,9 +71,16 @@ class CandidateAnalysisPipeline:
             candidate_wallets = [str(wallet).lower() for wallet in configuration.get("candidate_wallets", [])]
             if not candidate_wallets:
                 raise ValueError("Cannot resume analysis run without its immutable candidate manifest.")
-            candidate_rows = self.database.list_analysis_candidates(wallets=candidate_wallets, limit=len(candidate_wallets))
-            rows_by_wallet = {str(row["wallet"]).lower(): row for row in candidate_rows}
-            candidates = [rows_by_wallet[wallet] for wallet in candidate_wallets if wallet in rows_by_wallet]
+            manifest = _json_list(configuration.get("candidate_manifest"))
+            if manifest:
+                candidates = [_candidate_from_manifest(item) for item in manifest]
+            else:
+                # Runs created before the evidence-manifest contract retain
+                # their old compatibility behavior, but cannot claim the
+                # stronger immutable Phase-A snapshot guarantee.
+                candidate_rows = self.database.list_analysis_candidates(wallets=candidate_wallets, limit=len(candidate_wallets))
+                rows_by_wallet = {str(row["wallet"]).lower(): row for row in candidate_rows}
+                candidates = [rows_by_wallet[wallet] for wallet in candidate_wallets if wallet in rows_by_wallet]
             worker_count = int(invocation["workers"])
             force = bool(invocation["force"])
             cheap_only = bool(invocation["cheap_only"])
@@ -87,8 +102,13 @@ class CandidateAnalysisPipeline:
                 "analysis_window": {"required_start": required_start.isoformat(), "required_end": required_end.isoformat()},
                 "history_days": self.config.analysis.history_days,
                 "min_discovery_activity": self.config.analysis.min_discovery_activity,
-                "copytrade_config": self.config.snapshot(), "config_fingerprint": _config_fingerprint(self.config.snapshot()),
+                "copytrade_config": self.config.snapshot(), "config_fingerprint": _config_fingerprint(self.config.research_snapshot()),
                 "candidate_wallets": [str(row["wallet"]).lower() for row in candidates],
+                # Phase A completes candidate-universe updates atomically. A
+                # run records the exact completed evidence snapshot selected
+                # here, so a later Quick Scan cannot rewrite an in-flight or
+                # resumed Phase-B prefilter decision.
+                "candidate_manifest": [_candidate_manifest_entry(row) for row in candidates],
             }
             run, _ = self._start_or_resume(resume=False, configuration=configuration)
         errors: list[str] = list(_json_list(run.get("errors_json")))
@@ -120,19 +140,27 @@ class CandidateAnalysisPipeline:
                     continue
                 if run_wallet and run_wallet["stage"] == "prefilter" and run_wallet["status"] == "rejected":
                     continue
-                reasons = self._cheap_prefilter(candidate, required_start, required_end)
+                phase_a_evidence = _phase_a_evidence_snapshot(candidate)
+                reasons = self._cheap_prefilter(candidate, required_start, required_end, phase_a_evidence=phase_a_evidence)
                 if reasons:
                     self._save_candidate(
                         wallet, CandidateAnalysisState.PREFILTER_REJECTED.value, run["run_id"],
-                        reasons=reasons, summary={"prefilter": {"accepted": False, "reasons": reasons}}, completed=True,
+                        reasons=reasons, summary={"prefilter": {"accepted": False, "reasons": reasons,
+                                                     "phase_a_evidence": phase_a_evidence}}, completed=True,
                     )
-                    self.database.record_analysis_wallet(run["run_id"], wallet, stage="prefilter", status="rejected", payload={"reasons": reasons})
+                    self.database.record_analysis_wallet(
+                        run["run_id"], wallet, stage="prefilter", status="rejected",
+                        payload={"reasons": reasons, "phase_a_evidence": phase_a_evidence},
+                    )
                     continue
                 self._save_candidate(
                     wallet, CandidateAnalysisState.BACKFILL_PENDING.value, run["run_id"],
-                    summary={"prefilter": {"accepted": True, "reasons": []}}, completed=False,
+                    summary={"prefilter": {"accepted": True, "reasons": [], "phase_a_evidence": phase_a_evidence}}, completed=False,
                 )
-                self.database.record_analysis_wallet(run["run_id"], wallet, stage="prefilter", status="accepted")
+                self.database.record_analysis_wallet(
+                    run["run_id"], wallet, stage="prefilter", status="accepted",
+                    payload={"phase_a_evidence": phase_a_evidence},
+                )
                 pending.append(candidate)
 
             if cheap_only:
@@ -189,7 +217,8 @@ class CandidateAnalysisPipeline:
     def status(self, *, limit: int = 1000) -> dict[str, object]:
         rows = self.database.list_analysis_candidates(limit=limit)
         state_counts = self.database.count_analysis_candidates_by_state()
-        fingerprint = _config_fingerprint(self.config.snapshot())
+        fingerprint = _config_fingerprint(self.config.research_snapshot())
+        finalists = self.shadow_finalists()
         for row in rows:
             candidate_fingerprint = row.get("candidate_config_fingerprint")
             row["stale_for_current_config"] = bool(candidate_fingerprint and candidate_fingerprint != fingerprint)
@@ -198,11 +227,26 @@ class CandidateAnalysisPipeline:
             "total_candidates": sum(state_counts.values()), "candidates": rows,
             "current_config_fingerprint": fingerprint,
             "stale_qualified_candidates": self.database.count_stale_qualified_candidates(fingerprint),
+            "run_funnels": {
+                str(run["run_id"]): self.database.analysis_funnel(
+                    str(run["run_id"]), high_suitability_score=self.config.analysis.high_suitability_score,
+                    config_fingerprint=fingerprint,
+                )
+                for run in self.database.list_analysis_runs(limit=20)
+            },
+            "shadow_finalists": finalists,
         }
 
-    def shadow_finalists(self, *, count: int | None = None) -> list[dict[str, object]]:
+    def shadow_finalists(self, *, count: int | None = None, persist: bool = False) -> list[dict[str, object]]:
+        """Calculate the current cohort; persist only on an explicit authority action.
+
+        A status request is an observational operation.  It may calculate a
+        transient projection for the UI, but it must not refresh authoritative
+        recommendation timestamps or ranks.  Run finalization and the explicit
+        ``copy-rank`` command pass ``persist=True`` deliberately.
+        """
         target_count = count or self.config.analysis.shadow_finalist_count
-        current_fingerprint = _config_fingerprint(self.config.snapshot())
+        current_fingerprint = _config_fingerprint(self.config.research_snapshot())
         scores = self.database.phase_b_qualified_scores(config_fingerprint=current_fingerprint)
         candidates = {row["wallet"]: row for row in self.database.list_analysis_candidates(limit=10_000)}
         analysis_by_wallet = {
@@ -222,7 +266,35 @@ class CandidateAnalysisPipeline:
             }
             for score in scores
         }
-        selected = select_diverse_targets_with_metadata(scores, series, target_count=target_count, exposures=exposures)
+        assessments: dict[str, tuple[bool, tuple[str, ...]]] = {
+            score.target_wallet: self._finalist_policy(score, analysis_by_wallet[score.target_wallet], current_fingerprint)
+            for score in scores
+        }
+        eligible_scores = [score for score in scores if assessments[score.target_wallet][0]]
+        selected = select_diverse_targets_with_metadata(eligible_scores, series, target_count=target_count, exposures=exposures)
+        selected_by_wallet = {
+            score.target_wallet: (rank, diversification)
+            for rank, (score, diversification) in enumerate(selected, 1)
+        }
+        if persist:
+            self.database.upsert_finalist_recommendations(
+                current_fingerprint,
+                (
+                    {
+                        "analysis_run_id": score.analysis_run_id,
+                        "wallet": score.target_wallet,
+                        "finalist_eligible": assessments[score.target_wallet][0],
+                        "finalist_rejection_reasons": assessments[score.target_wallet][1],
+                        "diversification_penalty": selected_by_wallet.get(score.target_wallet, (None, {}))[1].get("penalty"),
+                        "final_selection_score": (
+                            score.total_score - float(selected_by_wallet[score.target_wallet][1]["penalty"])
+                            if score.target_wallet in selected_by_wallet else None
+                        ),
+                        "selection_rank": selected_by_wallet.get(score.target_wallet, (None, {}))[0],
+                    }
+                    for score in scores if score.analysis_run_id
+                ),
+            )
         finalists = []
         for rank, (score, diversification) in enumerate(selected, 1):
             candidate = candidates.get(score.target_wallet, {})
@@ -231,8 +303,14 @@ class CandidateAnalysisPipeline:
             follower = analysis.get("follower", {}) if isinstance(analysis, dict) else {}
             finalists.append({
                 "rank": rank, "wallet": score.target_wallet, "score": score.total_score,
+                "base_suitability_score": score.total_score, "confidence_score": score.confidence_score,
+                "finalist_eligible": True, "finalist_rejection_reasons": [],
+                "diversification_penalty": diversification["penalty"],
+                "final_selection_score": score.total_score - float(diversification["penalty"]),
                 "target": target, "follower": follower, "copyability": analysis.get("copyability", {}),
                 "data_quality": analysis.get("coverage", {}), "principal_risks": score.reasons,
+                "hard_gates": score.hard_gates, "pathology": analysis.get("pathology", {}),
+                "regime": analysis.get("regime", {}), "stress_tests": analysis.get("stress_tests", {}),
                 "diversification": diversification,
                 "current_config_fingerprint": current_fingerprint,
                 "candidate_config_fingerprint": score.config_fingerprint,
@@ -241,17 +319,94 @@ class CandidateAnalysisPipeline:
             })
         return finalists
 
-    def _default_backfill(self, wallet: str, start: object) -> dict[str, object]:
+    def _finalist_policy(
+        self, score: object, analysis: dict[str, object], current_fingerprint: str,
+    ) -> tuple[bool, tuple[str, ...]]:
+        """Apply configurable evidence policy without mutating Phase-B score evidence."""
+        reasons: list[str] = []
+        requirements = self.config.finalist_requirements
+        if getattr(score, "provenance", None) != "phase_b" or not getattr(score, "analysis_run_id", None):
+            reasons.append("not_current_phase_b_finalist_candidate")
+        if not getattr(score, "eligible"):
+            reasons.append("base_suitability_ineligible")
+        if getattr(score, "config_fingerprint") != current_fingerprint:
+            reasons.append("stale_config_fingerprint")
+        if float(getattr(score, "confidence_score")) < requirements.minimum_confidence_score:
+            reasons.append("confidence_below_minimum")
+        copyability = _json_object(analysis.get("copyability", {}))
+        if requirements.require_copyability_evidence and copyability.get("status") != "available":
+            reasons.append("copyability_evidence_required")
+        walk_forward = _json_object(analysis.get("walk_forward_evaluation", {}))
+        if requirements.require_walk_forward_evidence and walk_forward.get("status") != "available":
+            reasons.append("walk_forward_evidence_required")
+        latency = _json_object(analysis.get("latency", {}))
+        if requirements.require_latency_evidence and latency.get("status") != "available":
+            reasons.append("latency_evidence_required")
+        regime = _json_object(analysis.get("regime", {}))
+        if requirements.require_regime_evidence and regime.get("status") != "available":
+            reasons.append("regime_evidence_required")
+        return not reasons, tuple(sorted(set(reasons)))
+
+    def suitability_report(self, wallet: str) -> dict[str, object]:
+        """Deterministic operator report from the immutable completed analysis summary."""
+        candidate = next(iter(self.database.list_analysis_candidates(wallets=[wallet], limit=1)), None)
+        if not candidate:
+            raise KeyError(f"Candidate not found: {wallet}")
+        summary = _json_object(candidate.get("analysis_summary", {}))
+        current_fingerprint = _config_fingerprint(self.config.research_snapshot())
+        recommendation = self.database.get_finalist_recommendation(
+            candidate.get("score_analysis_run_id"), current_fingerprint, str(candidate["wallet"]),
+        )
+        if recommendation is None:
+            transient_score = CandidateScore(
+                target_wallet=str(candidate["wallet"]), calculated_at=utc_now(),
+                total_score=float(candidate.get("total_score") or 0), component_scores={}, penalties={},
+                eligible=bool(candidate.get("score_eligible")), provenance=str(candidate.get("score_provenance") or "legacy"),
+                analysis_run_id=candidate.get("score_analysis_run_id"), config_fingerprint=candidate.get("candidate_config_fingerprint"),
+                confidence_score=float(candidate.get("confidence_score") or 0),
+                hard_gates=tuple(candidate.get("score_hard_gates") or ()), score_version=str(candidate.get("score_version") or "phase_b_suitability_v3"),
+            )
+            finalist_eligible, policy_reasons = self._finalist_policy(transient_score, summary, current_fingerprint)
+            finalist_reasons = list(policy_reasons)
+        else:
+            finalist_reasons = recommendation["finalist_rejection_reasons"]
+            finalist_eligible = bool(recommendation["finalist_eligible"])
+        score = {
+            "suitability_score": candidate.get("total_score"), "confidence_score": candidate.get("confidence_score"),
+            "base_suitability_score": candidate.get("total_score"),
+            "eligibility": bool(candidate.get("score_eligible")), "hard_gates": candidate.get("score_hard_gates", []),
+            "principal_risks": candidate.get("score_reasons", []), "score_version": candidate.get("score_version"),
+            "analysis_run_id": candidate.get("score_analysis_run_id"),
+            "config_fingerprint": candidate.get("candidate_config_fingerprint"),
+            "finalist_eligible": finalist_eligible, "finalist_rejection_reasons": finalist_reasons,
+            "diversification_penalty": recommendation.get("diversification_penalty") if recommendation else None,
+            "final_selection_score": recommendation.get("final_selection_score") if recommendation else None,
+        }
+        return {
+            "wallet": str(candidate["wallet"]), "operator_status": candidate.get("current_status"),
+            "lifecycle_status": candidate.get("lifecycle_status"), "score": score,
+            "target_performance": summary.get("target_metrics", {}), "follower_performance": summary.get("follower", {}),
+            "copyability": summary.get("copyability", {}), "data_quality": summary.get("coverage", {}),
+            "walk_forward": summary.get("walk_forward_evaluation", {}), "regime_robustness": summary.get("regime", {}),
+            "friction_robustness": summary.get("stress_tests", {}), "pathology": summary.get("pathology", {}),
+            "analysis_window": summary.get("analysis_window", {}),
+            "why_it_might_fail": candidate.get("score_reasons", []),
+            "operator_action": "recommendation_only; no target status was changed",
+        }
+
+    def _default_backfill(self, wallet: str, start: object, end: object) -> dict[str, object]:
         earliest = self.database.earliest_fill_time(wallet)
         if earliest and as_utc(earliest) <= as_utc(start):
             latest = self.database.latest_fill_time(wallet)
             # Existing history satisfies the requested left boundary.  Fetch
-            # only the forward gap when it is materially stale; fill IDs make
-            # the one-millisecond overlap harmless at the boundary.
-            if latest and as_utc(latest) < utc_now() - timedelta(minutes=1):
-                return self.service.backfill_for_analysis(wallet, start=as_utc(latest) - timedelta(milliseconds=1))
+            # only the forward gap.  The immutable end is always forwarded;
+            # fill IDs make the one-millisecond overlap harmless at the gap.
+            if latest and as_utc(latest) < as_utc(end):
+                return self.service.backfill_for_analysis(
+                    wallet, start=max(as_utc(start), as_utc(latest) - timedelta(milliseconds=1)), end=end,
+                )
             return {"skipped_existing_history": True, "earliest_fill": as_utc(earliest).isoformat()}
-        return self.service.backfill_for_analysis(wallet, start=start)
+        return self.service.backfill_for_analysis(wallet, start=start, end=end)
 
     def _start_or_resume(self, *, resume: bool, configuration: dict[str, object]) -> tuple[dict[str, Any], bool]:
         if resume:
@@ -268,7 +423,7 @@ class CandidateAnalysisPipeline:
         stored_fingerprint = str(configuration.get("config_fingerprint") or "")
         if not stored_fingerprint:
             raise ValueError("Cannot resume analysis run without a Phase B.1 configuration fingerprint.")
-        current_fingerprint = _config_fingerprint(self.config.snapshot())
+        current_fingerprint = _config_fingerprint(self.config.research_snapshot())
         if stored_fingerprint != current_fingerprint:
             raise ValueError(
                 "Refusing to resume with a changed copy-trading configuration; restore the original configuration or start a new run."
@@ -291,7 +446,7 @@ class CandidateAnalysisPipeline:
         attempts = self.config.analysis.retry_attempts
         for attempt in range(1, attempts + 1):
             try:
-                return wallet, attempt, self._backfill_wallet(wallet, start), None
+                return wallet, attempt, self._invoke_backfill(wallet, start, end), None
             except Exception as exc:
                 coverage = self.database.analysis_window_coverage(wallet, start, end)
                 if str(coverage.get("coverage_state")) == "KNOWN_INCOMPLETE":
@@ -301,21 +456,55 @@ class CandidateAnalysisPipeline:
                 self._sleep(self.config.analysis.retry_initial_seconds * (2 ** (attempt - 1)))
         raise AssertionError("retry loop must return")  # pragma: no cover
 
-    def _cheap_prefilter(self, candidate: dict[str, Any], required_start: object, required_end: object) -> tuple[str, ...]:
+    def _invoke_backfill(self, wallet: str, start: object, end: object) -> dict[str, object]:
+        """Pass immutable bounds to modern callbacks while retaining test/plugin compatibility."""
+        try:
+            inspect.signature(self._backfill_wallet).bind(wallet, start, end)
+        except TypeError:
+            return self._backfill_wallet(wallet, start)
+        return self._backfill_wallet(wallet, start, end)
+
+    def _cheap_prefilter(
+        self, candidate: dict[str, Any], required_start: object, required_end: object, *,
+        phase_a_evidence: dict[str, Any] | None = None,
+    ) -> tuple[str, ...]:
         reasons: list[str] = []
         wallet = str(candidate.get("wallet") or "").lower()
         if not _is_wallet(wallet):
             reasons.append("invalid_wallet")
         status = str(candidate.get("current_status") or "")
-        if status in _OPERATOR_CONTROLLED_TARGET_STATES:
+        if self.config.prefilter.exclude_operator_managed and status in _OPERATOR_CONTROLLED_TARGET_STATES:
             reasons.append("operator_managed_status")
         activity = candidate.get("recent_activity_at")
         if not activity or (as_utc(required_end) - as_utc(activity)).total_seconds() > self.config.candidates.activity_max_age_days * 86_400:
             reasons.append("inactive")
+        evidence = phase_a_evidence or _phase_a_evidence_snapshot(candidate)
         metadata = _json_object(candidate.get("metadata_json"))
-        observed = int(metadata.get("latest_activity_observations", 0) or 0)
-        if observed < self.config.analysis.min_discovery_activity:
-            reasons.append("insufficient_activity")
+        minimum_activity = self.config.prefilter.min_activity_observations or self.config.analysis.min_discovery_activity
+        # Version 2 has a complete, measured cheap-stat payload.  Only that
+        # payload may drive the multi-dimension gates below.  Older discovery
+        # rows predate those measurements, so interpreting absent fields as
+        # zero would fabricate a negative finding.
+        if evidence["contract_status"] != "current":
+            observed = _as_int(metadata.get("latest_activity_observations"))
+            if observed < minimum_activity:
+                reasons.append("insufficient_activity")
+            reasons.append("phase_a_refresh_required")
+        else:
+            cheap_stats = _json_object(evidence.get("cheap_stats"))
+            observed = _as_int(cheap_stats.get("distinct_observed_events"))
+            if observed < minimum_activity:
+                reasons.append("insufficient_activity")
+            if _as_int(cheap_stats.get("distinct_active_days")) < self.config.prefilter.min_distinct_active_days:
+                reasons.append("insufficient_temporal_diversity")
+            if _as_int(cheap_stats.get("distinct_active_hours")) < self.config.prefilter.min_distinct_active_hours:
+                reasons.append("insufficient_temporal_diversity")
+            if _as_float(cheap_stats.get("observation_span_hours")) < self.config.prefilter.min_observation_span_hours:
+                reasons.append("insufficient_temporal_span")
+            if _as_float(cheap_stats.get("approximate_observed_notional")) < self.config.prefilter.min_observed_notional:
+                reasons.append("insufficient_observed_notional")
+            if _as_int(cheap_stats.get("distinct_symbols")) < self.config.prefilter.min_distinct_symbols:
+                reasons.append("insufficient_symbol_diversity")
         coverage = self.database.analysis_window_coverage(wallet, required_start, required_end) if wallet else None
         if coverage and str(coverage.get("coverage_state")) == "KNOWN_INCOMPLETE":
             reasons.append("known_incomplete")
@@ -388,7 +577,8 @@ class CandidateAnalysisPipeline:
         metrics.raw["coverage_quality"] = coverage.get("coverage_quality", "analysis_window")
         metrics.raw["analysis_window_coverage"] = coverage
         self.database.upsert_metrics(metrics)
-        backtester = CopyTradeBacktester(self.config)
+        market_evidence = self._historical_market_evidence(run_id, events)
+        backtester = CopyTradeBacktester(self.config, market_data=market_evidence)
         baseline = backtester.run(events=events, coverage_metadata=coverage)
         slippage = backtester.slippage_scenarios(events=events)
         latency = backtester.latency_decay_curve(events=events)
@@ -399,6 +589,19 @@ class CandidateAnalysisPipeline:
         walk_forward_evaluation = _walk_forward_evidence(walk_forward, self.config.analysis.walk_forward_min_windows)
         follower = _follower_summary(baseline.summary, slippage, latency)
         copyability = _copyability(metrics.net_pnl, metrics.raw, baseline.summary, coverage)
+        friction = _friction_evidence(slippage)
+        latency_evidence = _latency_evidence(latency)
+        regime = _regime_evidence(campaigns, self.config)
+        pathology = _pathology_evidence(metrics, campaigns, self.config)
+        metrics.raw["pathology"] = pathology
+        metrics.raw["regime"] = regime
+        metrics.raw["source_quality"] = 1.0
+        confidence = suitability_confidence(
+            metrics, self.config.confidence, coverage_state=str(coverage.get("coverage_state", "UNPROVEN")),
+            walk_forward_windows=int(walk_forward_evaluation["window_count"]),
+            represented_regimes=int(regime.get("represented_dimensions", 0)),
+        )
+        self.database.upsert_metrics(metrics)
         follower_metrics = FollowerMetrics(
             net_pnl=float(baseline.summary["net_pnl"]),
             expectancy=float(follower["expectancy"]),
@@ -408,13 +611,14 @@ class CandidateAnalysisPipeline:
             latency_curve=tuple(latency), latency_status="available" if latency else "unavailable",
             return_fraction=float(follower["return_fraction"]),
             copyability_score=copyability["score"] if copyability["status"] == "available" else None,
-            slippage_robustness=follower.get("slippage_robustness_score"),
+            slippage_robustness=friction.get("retention_score"), friction_robustness=friction.get("score"),
             walk_forward_score=walk_forward_evaluation["score"],
             walk_forward_status=str(walk_forward_evaluation["status"]),
             walk_forward_window_count=int(walk_forward_evaluation["window_count"]),
+            regime_robustness=regime.get("combined_score") if regime.get("status") == "available" else None,
         )
         score = replace(
-            score_candidate(metrics, self.config.candidates, follower_metrics), provenance="phase_b",
+            score_candidate(metrics, self.config.candidates, follower_metrics, confidence_score=float(confidence["score"])), provenance="phase_b",
             analysis_run_id=run_id, config_fingerprint=config_fingerprint,
         )
         self.database.upsert_candidate_score(score)
@@ -426,7 +630,7 @@ class CandidateAnalysisPipeline:
         }
         boundary_metadata = {
             "required_start": start.isoformat(), "required_end": end.isoformat(),
-            "boundary_policy": "reconstruct_prior_state_then_exclude_campaigns_open_at_required_start; score_only_campaigns_opened_and_closed_within_window",
+            "boundary_policy": "reconstruct_prior_state_then_exclude_campaigns_opened_before_required_start; score_only_campaigns_opened_and_closed_within_window",
             "campaigns_excluded_at_left_boundary": len(boundary_campaigns),
             "events_excluded_before_window": sum(as_utc(event.event_timestamp) < start for event in all_events),
             "events_excluded_after_window": sum(as_utc(event.event_timestamp) > end for event in all_events),
@@ -447,15 +651,50 @@ class CandidateAnalysisPipeline:
             **boundary_metadata,
             "diversification_input": diversification_input,
             "slippage_scenarios": slippage,
-            "latency": {"status": "available" if latency else "unavailable", "curve": latency},
+            "stress_tests": {"slippage": friction, "latency": latency_evidence},
+            "latency": {"status": "available" if latency else "unavailable", "curve": latency, **latency_evidence},
+            "market_evidence": {
+                "status": "available" if market_evidence and any(item.get("price") is not None for item in market_evidence.evidence_metadata()) else "unavailable",
+                "resolution": f"{self.config.analysis.market_evidence_bucket_seconds}s" if market_evidence else None,
+                "observations": market_evidence.evidence_metadata() if market_evidence else [],
+                "quality_note": "Public candle-close proxy only; this is not historical L2/order-book execution evidence.",
+            },
             "walk_forward": walk_forward,
             "walk_forward_evaluation": walk_forward_evaluation,
+            "regime": regime,
+            "pathology": pathology,
+            "confidence": confidence,
             "score": {
                 "total": score.total_score, "eligible": score.eligible, "components": score.component_scores,
-                "penalties": score.penalties, "reasons": list(score.reasons), "source_quality": score.source_quality,
+                "penalties": score.penalties, "reasons": list(score.reasons), "hard_gates": list(score.hard_gates),
+                "confidence": score.confidence_score, "score_version": score.score_version, "source_quality": score.source_quality,
             },
             "eligible": score.eligible,
         }
+
+    def _historical_market_evidence(
+        self, run_id: str, events: Iterable[PositionEvent],
+    ) -> CachedHistoricalMarketData | None:
+        """Prime bounded, immutable candle evidence before any replay scenarios run."""
+        event_list = tuple(events)
+        if not self.config.analysis.market_evidence_enabled or not event_list:
+            return None
+        evidence = CachedHistoricalMarketData(
+            self._market_data_factory(), bucket_seconds=self.config.analysis.market_evidence_bucket_seconds,
+            load=lambda symbol, bucket: self.database.get_analysis_market_evidence(run_id, symbol, bucket),
+            store=lambda item: self.database.insert_analysis_market_evidence(run_id, item),
+        )
+        delays = set(self.config.backtest.detection_delays_ms)
+        delays.add(self.config.paper_execution.detection_latency_ms)
+        requests = [
+            (
+                event.symbol,
+                event.event_timestamp + timedelta(milliseconds=delay + self.config.paper_execution.order_latency_ms),
+            )
+            for event in event_list for delay in delays
+        ]
+        evidence.prime(requests)
+        return evidence
 
     def _save_candidate(
         self, wallet: str, lifecycle: str, run_id: str, *, reasons: tuple[str, ...] = (),
@@ -472,7 +711,15 @@ class CandidateAnalysisPipeline:
     def _finish(self, run_id: str, errors: list[str], *, status: str) -> dict[str, object]:
         counters = self.database.analysis_run_counters(run_id)
         self.database.finish_analysis_run(run_id, status=status, errors=tuple(sorted(errors)), **counters)
-        return {"run_id": run_id, "status": status, **counters, "errors": sorted(errors), "shadow_finalists": self.shadow_finalists()}
+        finalists = self.shadow_finalists(persist=True)
+        return {
+            "run_id": run_id, "status": status, **counters, "errors": sorted(errors),
+            "funnel": self.database.analysis_funnel(
+                run_id, high_suitability_score=self.config.analysis.high_suitability_score,
+                config_fingerprint=_config_fingerprint(self.config.research_snapshot()),
+            ),
+            "diversification_selected": len(finalists), "shadow_finalists": finalists,
+        }
 
 
 def _follower_summary(
@@ -513,6 +760,142 @@ def _follower_summary(
         "latency_status": "available" if latency else "unavailable",
         "price_assumption": baseline.get("price_assumption"),
     }
+
+
+def _friction_evidence(scenarios: Iterable[dict[str, object]]) -> dict[str, object]:
+    """Summarize deterministic slippage scenarios without inferring liquidity."""
+    values = sorted((dict(item) for item in scenarios), key=lambda item: float(item.get("slippage_bps", 0)))
+    if not values:
+        return {"status": "unavailable", "score": None, "retention_score": None, "break_even_slippage_bps": None}
+    baseline = next((item for item in values if float(item.get("slippage_bps", 0)) == 0), values[0])
+    baseline_return = float(baseline.get("return_fraction", 0.0))
+    returns = [float(item.get("return_fraction", 0.0)) for item in values]
+    retained = max(0.0, min(1.0, min(returns) / baseline_return)) if baseline_return > 1e-12 else 0.0
+    positive_fraction = sum(value > 0 for value in returns) / len(returns)
+    break_even = next((float(item.get("slippage_bps", 0)) for item in values if float(item.get("return_fraction", 0)) <= 0), None)
+    return {
+        "status": "available", "baseline_return_fraction": baseline_return,
+        "worst_return_fraction": min(returns), "retention_score": retained,
+        "positive_scenario_fraction": positive_fraction, "score": (retained + positive_fraction) / 2,
+        "break_even_slippage_bps": break_even, "scenarios": values,
+    }
+
+
+def _latency_evidence(curve: Iterable[dict[str, object]]) -> dict[str, object]:
+    values = sorted((dict(item) for item in curve), key=lambda item: float(item.get("latency_ms", 0)))
+    if not values:
+        return {
+            "status": "unavailable", "reason": "missing_or_insufficient_historical_price_evidence",
+            "retention_score": None, "break_even_latency_ms": None,
+        }
+    baseline = float(values[0].get("return_fraction", 0.0))
+    returns = [float(item.get("return_fraction", 0.0)) for item in values]
+    retention = max(0.0, min(1.0, returns[-1] / baseline)) if baseline > 1e-12 else 0.0
+    break_even = next((float(item.get("latency_ms", 0)) for item in values if float(item.get("return_fraction", 0)) <= 0), None)
+    return {"status": "available", "baseline_return_fraction": baseline, "worst_return_fraction": min(returns),
+            "retention_score": retention, "break_even_latency_ms": break_even, "curve": values}
+
+
+def _regime_evidence(campaigns: Iterable[PositionCampaign], config: CopyTradeConfig) -> dict[str, object]:
+    """Independent directional and volatility evidence using a transparent price proxy."""
+    method = "campaign entry-to-exit observed-price proxy"
+    if not config.regimes.enabled:
+        disabled = {"status": "disabled", "represented_regime_count": 0, "score": None, "regimes": {}}
+        return {
+            "status": "disabled", "directional": disabled, "volatility": disabled,
+            "combined_score": None, "score": None, "represented_dimensions": 0,
+            "represented_regime_count": 0, "method": "disabled",
+        }
+    directional_groups: dict[str, list[float]] = {}
+    volatility_groups: dict[str, list[float]] = {}
+    threshold = config.regimes.volatility_move_threshold
+    campaign_count = 0
+    for campaign in campaigns:
+        if not campaign.closed_at or campaign.entry_quantity <= 0 or campaign.average_entry_price <= 0:
+            continue
+        exit_price = campaign.exit_notional / campaign.entry_quantity if campaign.exit_notional else 0.0
+        if exit_price <= 0:
+            continue
+        campaign_count += 1
+        move = exit_price / campaign.average_entry_price - 1
+        pnl = campaign.realized_pnl - campaign.target_fees
+        directional_groups.setdefault(
+            "rising" if move > threshold else ("falling" if move < -threshold else "sideways"), []
+        ).append(pnl)
+        volatility_groups.setdefault("high_volatility" if abs(move) >= threshold else "low_volatility", []).append(pnl)
+
+    directional = _regime_dimension(directional_groups, config.regimes.minimum_campaigns_per_regime)
+    volatility = _regime_dimension(volatility_groups, config.regimes.minimum_campaigns_per_regime)
+    available_scores = [
+        float(dimension["score"]) for dimension in (directional, volatility)
+        if dimension["status"] == "available" and dimension["score"] is not None
+    ]
+    combined = fmean(available_scores) if available_scores else None
+    represented_dimensions = len(available_scores)
+    return {
+        "status": "available" if available_scores else "insufficient_sample",
+        "directional": directional,
+        "volatility": volatility,
+        "combined_score": combined,
+        # ``score`` and ``represented_regime_count`` retain a stable public
+        # surface while counting independent dimensions, never overlapping bins.
+        "score": combined,
+        "represented_dimensions": represented_dimensions,
+        "represented_regime_count": represented_dimensions,
+        "campaign_count": campaign_count,
+        "method": method,
+    }
+
+
+def _regime_dimension(groups: dict[str, list[float]], minimum_campaigns: int) -> dict[str, object]:
+    summaries = {
+        name: {
+            "campaign_count": len(values), "net_pnl": sum(values),
+            "profitable_fraction": sum(value > 0 for value in values) / len(values),
+        }
+        for name, values in sorted(groups.items())
+    }
+    represented = {
+        name: value for name, value in summaries.items()
+        if int(value["campaign_count"]) >= minimum_campaigns
+    }
+    if not represented:
+        return {"status": "insufficient_sample", "represented_regime_count": 0, "score": None, "regimes": summaries}
+    positive = [max(float(item["net_pnl"]), 0.0) for item in represented.values()]
+    total_positive = sum(positive)
+    strongest_share = max(positive, default=0.0) / total_positive if total_positive else 1.0
+    profitable_fraction = sum(float(item["net_pnl"]) > 0 for item in represented.values()) / len(represented)
+    return {
+        "status": "available", "represented_regime_count": len(represented),
+        "score": max(0.0, min(1.0, (profitable_fraction + (1 - strongest_share)) / 2)),
+        "strongest_regime_pnl_share": strongest_share, "regimes": summaries,
+    }
+
+
+def _pathology_evidence(
+    metrics: object, campaigns: Iterable[PositionCampaign], config: CopyTradeConfig,
+) -> dict[str, object]:
+    values = [campaign.realized_pnl - campaign.target_fees for campaign in campaigns if campaign.closed_at]
+    winners = [value for value in values if value > 0]
+    worst_to_average_win = abs(min(values, default=0.0)) / max(fmean(winners) if winners else 0.0, 1e-12)
+    reasons: list[str] = []
+    if getattr(metrics, "martingale_indicator"):
+        reasons.append("martingale_like")
+    if getattr(metrics, "adverse_averaging_indicator"):
+        reasons.append("adverse_averaging")
+    concentration = float(getattr(metrics, "pnl_concentration_best"))
+    if concentration > config.candidates.pnl_concentration_preferred:
+        reasons.append("jackpot_concentration")
+    liquidation_frequency = float(getattr(metrics, "raw").get("liquidation_frequency", 0.0) or 0.0)
+    if liquidation_frequency > 0:
+        reasons.append("liquidation_observed")
+    if worst_to_average_win >= 3:
+        reasons.append("tail_loss_asymmetry")
+    if len(getattr(metrics, "by_symbol")) == 1 and values:
+        reasons.append("one_symbol_concentration")
+    return {"reason_codes": sorted(set(reasons)), "top_campaign_pnl_fraction": concentration,
+            "worst_to_average_win_ratio": worst_to_average_win, "liquidation_frequency": liquidation_frequency,
+            "campaign_count": len(values)}
 
 
 def _copyability(target_net_pnl: float, raw: dict[str, Any], follower: dict[str, Any], coverage: dict[str, Any]) -> dict[str, object]:
@@ -600,6 +983,60 @@ def _target_summary(metrics: Any, campaigns: Iterable[PositionCampaign], events:
     }
 
 
+def _candidate_manifest_entry(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Freeze the Phase-A evidence used to decide this Phase-B run.
+
+    The discovery transaction has already published a coherent candidate
+    universe.  Copying the small candidate record into the run configuration
+    prevents a later discovery refresh from changing a resumed run's evidence.
+    """
+    metadata = _json_object(candidate.get("metadata_json"))
+    return {
+        "wallet": str(candidate.get("wallet") or "").lower(),
+        "recent_activity_at": candidate.get("recent_activity_at"),
+        "current_status": candidate.get("current_status"),
+        "last_discovery_run_id": candidate.get("last_discovery_run_id"),
+        "metadata": metadata,
+        "phase_a_evidence": _phase_a_evidence_snapshot(candidate),
+    }
+
+
+def _candidate_from_manifest(item: object) -> dict[str, Any]:
+    """Restore the minimal candidate shape consumed by the Phase-B pipeline."""
+    manifest = _json_object(item)
+    return {
+        "wallet": str(manifest.get("wallet") or "").lower(),
+        "recent_activity_at": manifest.get("recent_activity_at"),
+        "current_status": manifest.get("current_status"),
+        "last_discovery_run_id": manifest.get("last_discovery_run_id"),
+        "metadata_json": _json_object(manifest.get("metadata")),
+    }
+
+
+def _phase_a_evidence_snapshot(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Return a versioned, conservative view of Phase-A cheap evidence."""
+    metadata = _json_object(candidate.get("metadata_json"))
+    version = _as_int_or_none(metadata.get("evidence_schema_version"))
+    cheap_stats = _json_object(metadata.get("cheap_stats"))
+    has_complete_stats = PHASE_A_CHEAP_STATS_FIELDS.issubset(cheap_stats)
+    current = version == PHASE_A_EVIDENCE_SCHEMA_VERSION and has_complete_stats
+    if current:
+        contract_status = "current"
+    elif version is not None and version > PHASE_A_EVIDENCE_SCHEMA_VERSION:
+        contract_status = "unsupported_future_version"
+    else:
+        contract_status = "legacy_or_incomplete"
+    return {
+        "discovery_run_id": candidate.get("last_discovery_run_id"),
+        "evidence_schema_version": version,
+        "contract_status": contract_status,
+        "latest_activity_observations": metadata.get("latest_activity_observations"),
+        # Do not make an incomplete payload look measured to downstream
+        # consumers.  It is retained in discovery metadata for diagnostics.
+        "cheap_stats": dict(cheap_stats) if current else {},
+    }
+
+
 def _json_object(value: object) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -612,14 +1049,39 @@ def _json_object(value: object) -> dict[str, Any]:
     return {}
 
 
-def _json_list(value: object) -> list[str]:
+def _json_list(value: object) -> list[Any]:
+    if isinstance(value, list):
+        return list(value)
     if not isinstance(value, str):
         return []
     try:
         parsed = json.loads(value)
     except json.JSONDecodeError:
         return []
-    return [str(item) for item in parsed] if isinstance(parsed, list) else []
+    return list(parsed) if isinstance(parsed, list) else []
+
+
+def _as_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _as_int_or_none(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_float(value: object) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _variance(values: list[float]) -> float:

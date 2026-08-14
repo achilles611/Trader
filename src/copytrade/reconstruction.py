@@ -59,6 +59,20 @@ class ReconstructionResult:
         }
 
 
+@dataclass
+class IncrementalReconstructionState:
+    """Minimal durable state needed to continue a wallet without rereading fills.
+
+    Closed campaigns deliberately are not retained here.  The only historical
+    accounting needed by the next source aggregate is the current source
+    position and its active campaign; the complete campaign ledger remains in
+    SQLite for reporting and explicit rebuilds.
+    """
+
+    positions: dict[tuple[str, str], float]
+    active_campaigns: dict[tuple[str, str], PositionCampaign]
+
+
 def aggregate_partial_fills(fills: Iterable[RawFill]) -> list[FillAggregate]:
     """Combine only contiguous partials while preserving source-fill evidence."""
     ordered = sorted(fills, key=lambda fill: (fill.event_timestamp, fill.event_id))
@@ -102,77 +116,116 @@ class PositionReconstructor:
     """Rebuild campaigns causally; an unknown historical entry is never priced in."""
 
     def reconstruct(self, fills: Iterable[RawFill]) -> ReconstructionResult:
-        positions: dict[tuple[str, str], float] = {}
-        active_campaigns: dict[tuple[str, str], PositionCampaign] = {}
+        state = IncrementalReconstructionState({}, {})
         campaigns: dict[str, PositionCampaign] = {}
         events: list[PositionEvent] = []
 
         for aggregate in aggregate_partial_fills(fills):
-            key = (aggregate.target_wallet.lower(), aggregate.symbol)
-            previous = positions.get(key, 0.0)
-            before = aggregate.position_before if aggregate.position_before is not None else previous
-            after = before + aggregate.signed_quantity
-            if abs(after) < EPSILON:
-                after = 0.0
-            kind = self._event_type(before, after)
-            active = active_campaigns.get(key)
-
-            if kind is PositionEventType.OPEN:
-                active = self._new_campaign(aggregate, self._direction(after))
-                campaigns[active.campaign_id] = active
-                active_campaigns[key] = active
-                self._entry(active, aggregate, abs(after), 1.0)
-                events.append(self._event(aggregate, active, PositionEventType.OPEN, before, after,
-                                          aggregate.signed_quantity, 1.0, "opening"))
-            elif kind is PositionEventType.ADD:
-                if active is None or active.direction != self._direction(after):
-                    # State proves there was already exposure, but not what it cost.
-                    active = self._unknown_campaign(aggregate, self._direction(before), abs(before))
-                    campaigns[active.campaign_id] = active
-                    active_campaigns[key] = active
-                self._entry(active, aggregate, abs(aggregate.signed_quantity), 1.0)
-                events.append(self._event(aggregate, active, PositionEventType.ADD, before, after,
-                                          aggregate.signed_quantity, 1.0, None))
-            elif kind in {PositionEventType.REDUCE, PositionEventType.CLOSE}:
-                if active is None:
-                    active = self._unknown_campaign(aggregate, self._direction(before), abs(before))
-                    campaigns[active.campaign_id] = active
-                    active_campaigns[key] = active
-                closing_quantity = min(abs(aggregate.signed_quantity), abs(before))
-                self._exit(active, aggregate, closing_quantity, 1.0)
-                events.append(self._event(aggregate, active, kind, before, after,
-                                          aggregate.signed_quantity, 1.0, None))
-                if kind is PositionEventType.CLOSE:
-                    self._close(active, aggregate)
-                    active_campaigns.pop(key, None)
-            else:
-                # A flip is one immutable source fill, but two independent
-                # economic actions.  Allocate notional, fees, source closedPnl,
-                # event attribution and event counts proportionally.
-                close_quantity, open_quantity = abs(before), abs(after)
-                total_quantity = close_quantity + open_quantity
-                close_fraction = close_quantity / max(total_quantity, EPSILON)
-                open_fraction = open_quantity / max(total_quantity, EPSILON)
-                if active is None:
-                    active = self._unknown_campaign(aggregate, self._direction(before), close_quantity)
-                    campaigns[active.campaign_id] = active
-                self._exit(active, aggregate, close_quantity, close_fraction)
-                events.append(self._event(aggregate, active, PositionEventType.CLOSE, before, 0.0,
-                                          -before, close_fraction, "closing", source_event_type="FLIP"))
-                self._close(active, aggregate)
-                new = self._new_campaign(aggregate, self._direction(after))
-                campaigns[new.campaign_id] = new
-                active_campaigns[key] = new
-                self._entry(new, aggregate, open_quantity, open_fraction)
-                events.append(self._event(aggregate, new, PositionEventType.OPEN, 0.0, after,
-                                          after, open_fraction, "opening", source_event_type="FLIP"))
-
-            positions[key] = after
+            generated, changed = self.apply_aggregate(state, aggregate)
+            events.extend(generated)
+            for campaign in changed:
+                campaigns[campaign.campaign_id] = campaign
 
         for campaign in campaigns.values():
-            if campaign.source_closed_pnl_observed and campaign.history_complete:
-                campaign.reconciliation_gross_difference = campaign.realized_pnl - campaign.source_closed_pnl
+            self._refresh_reconciliation(campaign)
         return ReconstructionResult(tuple(events), tuple(campaigns.values()))
+
+    @staticmethod
+    def incremental_state(campaigns: Iterable[PositionCampaign]) -> IncrementalReconstructionState:
+        """Restore only active source campaigns for cursor-driven processing."""
+        positions: dict[tuple[str, str], float] = {}
+        active: dict[tuple[str, str], PositionCampaign] = {}
+        for campaign in campaigns:
+            if campaign.is_closed:
+                continue
+            key = (campaign.target_wallet.lower(), campaign.symbol)
+            # An invariant violation should not silently pick an arbitrary
+            # campaign.  A full rebuild is the caller's safe repair path.
+            if key in active:
+                raise ValueError(f"Multiple active campaigns for {campaign.target_wallet}/{campaign.symbol}")
+            active[key] = campaign
+            positions[key] = campaign.open_quantity if campaign.direction == "long" else -campaign.open_quantity
+        return IncrementalReconstructionState(positions, active)
+
+    def apply_aggregate(
+        self, state: IncrementalReconstructionState, aggregate: FillAggregate,
+    ) -> tuple[tuple[PositionEvent, ...], tuple[PositionCampaign, ...]]:
+        """Apply one finalized aggregate without rereading older raw evidence.
+
+        The transition logic is shared with full reconstruction so a complete
+        history and a clean cursor plus incremental chunks have identical
+        events and campaign economics.
+        """
+        key = (aggregate.target_wallet.lower(), aggregate.symbol)
+        previous = state.positions.get(key, 0.0)
+        before = aggregate.position_before if aggregate.position_before is not None else previous
+        after = before + aggregate.signed_quantity
+        if abs(after) < EPSILON:
+            after = 0.0
+        kind = self._event_type(before, after)
+        active = state.active_campaigns.get(key)
+        events: list[PositionEvent] = []
+        changed: dict[str, PositionCampaign] = {}
+
+        if kind is PositionEventType.OPEN:
+            active = self._new_campaign(aggregate, self._direction(after))
+            state.active_campaigns[key] = active
+            self._entry(active, aggregate, abs(after), 1.0)
+            events.append(self._event(aggregate, active, PositionEventType.OPEN, before, after,
+                                      aggregate.signed_quantity, 1.0, "opening"))
+            changed[active.campaign_id] = active
+        elif kind is PositionEventType.ADD:
+            if active is None or active.direction != self._direction(after):
+                # State proves there was already exposure, but not what it cost.
+                active = self._unknown_campaign(aggregate, self._direction(before), abs(before))
+                state.active_campaigns[key] = active
+            self._entry(active, aggregate, abs(aggregate.signed_quantity), 1.0)
+            events.append(self._event(aggregate, active, PositionEventType.ADD, before, after,
+                                      aggregate.signed_quantity, 1.0, None))
+            changed[active.campaign_id] = active
+        elif kind in {PositionEventType.REDUCE, PositionEventType.CLOSE}:
+            if active is None:
+                active = self._unknown_campaign(aggregate, self._direction(before), abs(before))
+                state.active_campaigns[key] = active
+            closing_quantity = min(abs(aggregate.signed_quantity), abs(before))
+            self._exit(active, aggregate, closing_quantity, 1.0)
+            events.append(self._event(aggregate, active, kind, before, after,
+                                      aggregate.signed_quantity, 1.0, None))
+            if kind is PositionEventType.CLOSE:
+                self._close(active, aggregate)
+                state.active_campaigns.pop(key, None)
+            changed[active.campaign_id] = active
+        else:
+            # A flip is one immutable source fill, but two independent
+            # economic actions.  Allocate notional, fees, source closedPnl,
+            # event attribution and event counts proportionally.
+            close_quantity, open_quantity = abs(before), abs(after)
+            total_quantity = close_quantity + open_quantity
+            close_fraction = close_quantity / max(total_quantity, EPSILON)
+            open_fraction = open_quantity / max(total_quantity, EPSILON)
+            if active is None:
+                active = self._unknown_campaign(aggregate, self._direction(before), close_quantity)
+            self._exit(active, aggregate, close_quantity, close_fraction)
+            events.append(self._event(aggregate, active, PositionEventType.CLOSE, before, 0.0,
+                                      -before, close_fraction, "closing", source_event_type="FLIP"))
+            self._close(active, aggregate)
+            changed[active.campaign_id] = active
+            new = self._new_campaign(aggregate, self._direction(after))
+            state.active_campaigns[key] = new
+            self._entry(new, aggregate, open_quantity, open_fraction)
+            events.append(self._event(aggregate, new, PositionEventType.OPEN, 0.0, after,
+                                      after, open_fraction, "opening", source_event_type="FLIP"))
+            changed[new.campaign_id] = new
+
+        state.positions[key] = after
+        for campaign in changed.values():
+            self._refresh_reconciliation(campaign)
+        return tuple(events), tuple(changed.values())
+
+    @staticmethod
+    def _refresh_reconciliation(campaign: PositionCampaign) -> None:
+        if campaign.source_closed_pnl_observed and campaign.history_complete:
+            campaign.reconciliation_gross_difference = campaign.realized_pnl - campaign.source_closed_pnl
 
     @staticmethod
     def _event_type(before: float, after: float) -> PositionEventType:
