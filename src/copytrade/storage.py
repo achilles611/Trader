@@ -8,7 +8,21 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Protocol
 
-from .contracts import PHASE_A_EVIDENCE_SCHEMA_VERSION, PHASE_B_RECOMMENDATION_SCHEMA_VERSION
+from .contracts import (
+    PHASE_A_EVIDENCE_SCHEMA_VERSION,
+    PHASE_B_RECOMMENDATION_SCHEMA_VERSION,
+    PHASE_D_EXECUTION_CONTRACT_VERSION,
+)
+from .execution_contracts import (
+    ExecutionIntent,
+    ExecutionRiskDecision,
+    ExecutionState,
+    ExecutionSubmission,
+    ExposureEffect,
+    TERMINAL_EXECUTION_STATES,
+    VenueFill,
+    validate_execution_transition,
+)
 from .models import (
     BacktestRun,
     AnalysisRun,
@@ -366,6 +380,84 @@ class CopyTradeDatabase:
                 );
                 CREATE INDEX IF NOT EXISTS idx_copy_candidate_analyses_state ON copy_candidate_analyses(lifecycle_status, completed_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_copy_candidate_analyses_run ON copy_candidate_analyses(last_run_id);
+
+                -- Phase D owns a separate execution ledger.  The historical
+                -- copy_execution_* tables above remain PAPER research records.
+                CREATE TABLE IF NOT EXISTS phase_d_execution_intents (
+                    intent_id TEXT PRIMARY KEY, contract_version INTEGER NOT NULL,
+                    signal_id TEXT NOT NULL UNIQUE, source_event_id TEXT NOT NULL,
+                    target_wallet TEXT NOT NULL, campaign_id TEXT, symbol TEXT NOT NULL,
+                    action TEXT NOT NULL, direction TEXT NOT NULL,
+                    requested_quantity REAL NOT NULL, requested_capital REAL NOT NULL,
+                    source_event_timestamp TEXT NOT NULL, accepted_at TEXT NOT NULL,
+                    provenance_json TEXT NOT NULL, exposure_effect TEXT NOT NULL,
+                    supersedes_intent_id TEXT, state TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_phase_d_execution_intents_state
+                    ON phase_d_execution_intents(state, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_phase_d_execution_intents_symbol
+                    ON phase_d_execution_intents(symbol, target_wallet);
+                CREATE TABLE IF NOT EXISTS phase_d_execution_state_events (
+                    event_id TEXT PRIMARY KEY, intent_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+                    previous_state TEXT, next_state TEXT NOT NULL, reason TEXT NOT NULL,
+                    source TEXT NOT NULL, occurred_at TEXT NOT NULL, raw_evidence_json TEXT NOT NULL DEFAULT '{}',
+                    UNIQUE(intent_id, sequence),
+                    FOREIGN KEY(intent_id) REFERENCES phase_d_execution_intents(intent_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_phase_d_execution_state_events_intent
+                    ON phase_d_execution_state_events(intent_id, sequence);
+                CREATE TABLE IF NOT EXISTS phase_d_execution_risk_decisions (
+                    decision_id TEXT PRIMARY KEY, intent_id TEXT NOT NULL, allowed INTEGER NOT NULL,
+                    reason TEXT NOT NULL, evaluated_at TEXT NOT NULL, evidence_json TEXT NOT NULL DEFAULT '{}',
+                    FOREIGN KEY(intent_id) REFERENCES phase_d_execution_intents(intent_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_phase_d_execution_risk_decisions_intent
+                    ON phase_d_execution_risk_decisions(intent_id, evaluated_at);
+                CREATE TABLE IF NOT EXISTS phase_d_execution_submissions (
+                    submission_id TEXT PRIMARY KEY, intent_id TEXT NOT NULL UNIQUE,
+                    client_order_id TEXT NOT NULL UNIQUE, requested_quantity REAL NOT NULL,
+                    side TEXT NOT NULL, state TEXT NOT NULL, venue_order_id TEXT,
+                    filled_quantity REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL, raw_evidence_json TEXT NOT NULL DEFAULT '{}',
+                    FOREIGN KEY(intent_id) REFERENCES phase_d_execution_intents(intent_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_phase_d_execution_submissions_state
+                    ON phase_d_execution_submissions(state, updated_at);
+                CREATE TABLE IF NOT EXISTS phase_d_execution_fills (
+                    execution_fill_id TEXT PRIMARY KEY, intent_id TEXT NOT NULL,
+                    submission_id TEXT NOT NULL, venue_fill_id TEXT NOT NULL,
+                    quantity REAL NOT NULL, price REAL NOT NULL, fee REAL NOT NULL,
+                    venue_timestamp TEXT NOT NULL, received_at TEXT NOT NULL,
+                    raw_evidence_json TEXT NOT NULL DEFAULT '{}',
+                    UNIQUE(submission_id, venue_fill_id),
+                    FOREIGN KEY(intent_id) REFERENCES phase_d_execution_intents(intent_id),
+                    FOREIGN KEY(submission_id) REFERENCES phase_d_execution_submissions(submission_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_phase_d_execution_fills_intent
+                    ON phase_d_execution_fills(intent_id, venue_timestamp);
+                CREATE TABLE IF NOT EXISTS phase_d_execution_reconciliation_runs (
+                    reconciliation_run_id TEXT PRIMARY KEY, scope TEXT NOT NULL,
+                    state TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT,
+                    evidence_json TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE TABLE IF NOT EXISTS phase_d_execution_reconciliation_items (
+                    item_id TEXT PRIMARY KEY, reconciliation_run_id TEXT NOT NULL,
+                    intent_id TEXT, submission_id TEXT, item_type TEXT NOT NULL,
+                    state TEXT NOT NULL, reason TEXT NOT NULL, local_json TEXT NOT NULL DEFAULT '{}',
+                    venue_json TEXT NOT NULL DEFAULT '{}', recorded_at TEXT NOT NULL,
+                    FOREIGN KEY(reconciliation_run_id) REFERENCES phase_d_execution_reconciliation_runs(reconciliation_run_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_phase_d_execution_reconciliation_items_run
+                    ON phase_d_execution_reconciliation_items(reconciliation_run_id, state);
+                CREATE TABLE IF NOT EXISTS phase_d_execution_position_observations (
+                    observation_id TEXT PRIMARY KEY, reconciliation_run_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL, local_signed_quantity REAL NOT NULL,
+                    venue_signed_quantity REAL, state TEXT NOT NULL, observed_at TEXT NOT NULL,
+                    raw_evidence_json TEXT NOT NULL DEFAULT '{}',
+                    FOREIGN KEY(reconciliation_run_id) REFERENCES phase_d_execution_reconciliation_runs(reconciliation_run_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_phase_d_execution_position_observations_symbol
+                    ON phase_d_execution_position_observations(symbol, observed_at);
                 """
             )
             self._ensure_column(connection, "copy_signals", "target_position_before", "REAL NOT NULL DEFAULT 0")
@@ -2372,6 +2464,435 @@ class CopyTradeDatabase:
             except Exception:
                 connection.rollback()
                 raise
+
+    # ------------------------------------------------------------------
+    # Phase D execution ledger.  This is deliberately separate from the
+    # historical paper tables and is not called by PaperExecutionEngine.
+
+    @staticmethod
+    def _phase_d_intent_from_row(row: sqlite3.Row) -> ExecutionIntent:
+        version = int(row["contract_version"])
+        if version != PHASE_D_EXECUTION_CONTRACT_VERSION:
+            raise ValueError(
+                f"Unsupported Phase-D execution contract version {version}; "
+                f"reader supports {PHASE_D_EXECUTION_CONTRACT_VERSION}."
+            )
+        return ExecutionIntent(
+            intent_id=row["intent_id"], signal_id=row["signal_id"], source_event_id=row["source_event_id"],
+            target_wallet=row["target_wallet"], campaign_id=row["campaign_id"], symbol=row["symbol"],
+            action=row["action"], direction=row["direction"], requested_quantity=float(row["requested_quantity"]),
+            requested_capital=float(row["requested_capital"]), source_event_timestamp=as_utc(row["source_event_timestamp"]),
+            accepted_at=as_utc(row["accepted_at"]), contract_version=version,
+            provenance=_load(row["provenance_json"], {}), exposure_effect=ExposureEffect(row["exposure_effect"]),
+            supersedes_intent_id=row["supersedes_intent_id"], state=ExecutionState(row["state"]),
+            updated_at=as_utc(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _phase_d_submission_from_row(row: sqlite3.Row) -> ExecutionSubmission:
+        return ExecutionSubmission(
+            submission_id=row["submission_id"], intent_id=row["intent_id"], client_order_id=row["client_order_id"],
+            requested_quantity=float(row["requested_quantity"]), side=row["side"], state=row["state"],
+            venue_order_id=row["venue_order_id"], filled_quantity=float(row["filled_quantity"]),
+            created_at=as_utc(row["created_at"]), updated_at=as_utc(row["updated_at"]),
+            raw_evidence=_load(row["raw_evidence_json"], {}),
+        )
+
+    @staticmethod
+    def _same_phase_d_intent(existing: ExecutionIntent, requested: ExecutionIntent) -> bool:
+        """Do not use an upsert to turn an existing intent into revised history."""
+        return (
+            existing.intent_id == requested.intent_id and existing.contract_version == requested.contract_version
+            and existing.signal_id == requested.signal_id and existing.source_event_id == requested.source_event_id
+            and existing.target_wallet == requested.target_wallet and existing.campaign_id == requested.campaign_id
+            and existing.symbol == requested.symbol and existing.action == requested.action
+            and existing.direction == requested.direction and existing.requested_quantity == requested.requested_quantity
+            and existing.requested_capital == requested.requested_capital
+            and iso(existing.source_event_timestamp) == iso(requested.source_event_timestamp)
+            and existing.exposure_effect == requested.exposure_effect
+            and existing.supersedes_intent_id == requested.supersedes_intent_id
+            and _dump(existing.provenance) == _dump(requested.provenance)
+        )
+
+    def create_or_get_execution_intent(self, intent: ExecutionIntent) -> ExecutionIntent:
+        """Atomically claim a Phase-C signal and write immutable D provenance."""
+        if intent.contract_version != PHASE_D_EXECUTION_CONTRACT_VERSION:
+            raise ValueError(f"Unsupported Phase-D execution contract version {intent.contract_version}.")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing_row = connection.execute(
+                "SELECT * FROM phase_d_execution_intents WHERE signal_id=?", (intent.signal_id,)
+            ).fetchone()
+            if existing_row:
+                existing = self._phase_d_intent_from_row(existing_row)
+                if not self._same_phase_d_intent(existing, intent):
+                    raise ValueError("Phase-C signal already has an immutable, non-equivalent Phase-D intent.")
+                return existing
+            connection.execute(
+                """INSERT INTO phase_d_execution_intents(
+                    intent_id, contract_version, signal_id, source_event_id, target_wallet, campaign_id, symbol,
+                    action, direction, requested_quantity, requested_capital, source_event_timestamp, accepted_at,
+                    provenance_json, exposure_effect, supersedes_intent_id, state, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (intent.intent_id, intent.contract_version, intent.signal_id, intent.source_event_id, intent.target_wallet,
+                 intent.campaign_id, intent.symbol, intent.action, intent.direction, intent.requested_quantity,
+                 intent.requested_capital, iso(intent.source_event_timestamp), iso(intent.accepted_at),
+                 _dump(intent.provenance), intent.exposure_effect.value, intent.supersedes_intent_id,
+                 intent.state.value, iso(intent.updated_at or intent.accepted_at)),
+            )
+            self._append_phase_d_state_event(
+                connection, intent.intent_id, None, intent.state, "intent_accepted", "phase_c", intent.accepted_at, {},
+            )
+        return intent
+
+    def get_execution_intent(self, intent_id: str) -> ExecutionIntent | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM phase_d_execution_intents WHERE intent_id=?", (intent_id,)).fetchone()
+        return self._phase_d_intent_from_row(row) if row else None
+
+    def get_execution_intent_for_signal(self, signal_id: str) -> ExecutionIntent | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM phase_d_execution_intents WHERE signal_id=?", (signal_id,)).fetchone()
+        return self._phase_d_intent_from_row(row) if row else None
+
+    def list_execution_intents(self, *, states: Iterable[ExecutionState] | None = None) -> list[ExecutionIntent]:
+        values = [state.value for state in states] if states else []
+        query = "SELECT * FROM phase_d_execution_intents"
+        if values:
+            query += " WHERE state IN (" + ",".join("?" for _ in values) + ")"
+        query += " ORDER BY accepted_at, intent_id"
+        with self._connect() as connection:
+            rows = connection.execute(query, values).fetchall()
+        return [self._phase_d_intent_from_row(row) for row in rows]
+
+    @staticmethod
+    def _append_phase_d_state_event(
+        connection: sqlite3.Connection, intent_id: str, previous: ExecutionState | None, next_state: ExecutionState,
+        reason: str, source: str, occurred_at: object, raw_evidence: Mapping[str, Any],
+    ) -> None:
+        sequence = int(connection.execute(
+            "SELECT COUNT(*) FROM phase_d_execution_state_events WHERE intent_id=?", (intent_id,)
+        ).fetchone()[0]) + 1
+        event_id = stable_id(
+            "phase_d_execution_state", intent_id, sequence, previous.value if previous else None,
+            next_state.value, reason, source,
+        )
+        connection.execute(
+            """INSERT INTO phase_d_execution_state_events(
+                event_id, intent_id, sequence, previous_state, next_state, reason, source, occurred_at, raw_evidence_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (event_id, intent_id, sequence, previous.value if previous else None, next_state.value,
+             reason, source, iso(occurred_at), _dump(dict(raw_evidence))),
+        )
+
+    def transition_execution_intent(
+        self, intent_id: str, next_state: ExecutionState, *, reason: str, source: str,
+        occurred_at: object | None = None, raw_evidence: Mapping[str, Any] | None = None,
+    ) -> ExecutionIntent:
+        """Append a legal transition, ignoring stale observations after terminal truth."""
+        at = as_utc(occurred_at)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM phase_d_execution_intents WHERE intent_id=?", (intent_id,)).fetchone()
+            if not row:
+                raise KeyError(f"Unknown Phase-D execution intent: {intent_id}")
+            current = self._phase_d_intent_from_row(row)
+            if current.state == next_state:
+                return current
+            try:
+                validate_execution_transition(current.state, next_state)
+            except ValueError:
+                # A stale acknowledgement/cancel notification must not undo a
+                # terminal state.  Actual fill truth is explicitly modeled by
+                # the one legal CANCELLED -> FILLED transition above.
+                if current.state in TERMINAL_EXECUTION_STATES:
+                    return current
+                raise
+            connection.execute(
+                "UPDATE phase_d_execution_intents SET state=?, updated_at=? WHERE intent_id=?",
+                (next_state.value, iso(at), intent_id),
+            )
+            self._append_phase_d_state_event(
+                connection, intent_id, current.state, next_state, reason, source, at, raw_evidence or {},
+            )
+            row = connection.execute("SELECT * FROM phase_d_execution_intents WHERE intent_id=?", (intent_id,)).fetchone()
+        return self._phase_d_intent_from_row(row)
+
+    def list_execution_state_events(self, intent_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM phase_d_execution_state_events WHERE intent_id=? ORDER BY sequence", (intent_id,)
+            ).fetchall()
+        return [
+            {**dict(row), "raw_evidence": _load(row["raw_evidence_json"], {})}
+            for row in rows
+        ]
+
+    def record_execution_risk_decision(self, decision: ExecutionRiskDecision) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO phase_d_execution_risk_decisions(
+                    decision_id, intent_id, allowed, reason, evaluated_at, evidence_json)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (decision.decision_id, decision.intent_id, int(decision.allowed), decision.reason,
+                 iso(decision.evaluated_at), _dump(decision.evidence)),
+            )
+
+    def latest_execution_risk_decision(self, intent_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM phase_d_execution_risk_decisions WHERE intent_id=? ORDER BY evaluated_at DESC, decision_id DESC LIMIT 1",
+                (intent_id,),
+            ).fetchone()
+        return ({**dict(row), "allowed": bool(row["allowed"]), "evidence": _load(row["evidence_json"], {})} if row else None)
+
+    def prepare_execution_submission(
+        self, intent_id: str, *, submission_id: str, client_order_id: str, side: str, requested_quantity: float,
+        created_at: object | None = None,
+    ) -> tuple[ExecutionSubmission, bool]:
+        """Persist the idempotent submission identity before adapter invocation."""
+        at = as_utc(created_at)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM phase_d_execution_submissions WHERE intent_id=?", (intent_id,)
+            ).fetchone()
+            if existing:
+                return self._phase_d_submission_from_row(existing), False
+            intent_row = connection.execute(
+                "SELECT * FROM phase_d_execution_intents WHERE intent_id=?", (intent_id,)
+            ).fetchone()
+            if not intent_row:
+                raise KeyError(f"Unknown Phase-D execution intent: {intent_id}")
+            intent = self._phase_d_intent_from_row(intent_row)
+            if intent.state is not ExecutionState.READY:
+                raise ValueError(f"Cannot prepare submission from {intent.state.value}.")
+            connection.execute(
+                """INSERT INTO phase_d_execution_submissions(
+                    submission_id, intent_id, client_order_id, requested_quantity, side, state, venue_order_id,
+                    filled_quantity, created_at, updated_at, raw_evidence_json)
+                   VALUES (?, ?, ?, ?, ?, 'PREPARED', NULL, 0, ?, ?, '{}')""",
+                (submission_id, intent_id, client_order_id, requested_quantity, side, iso(at), iso(at)),
+            )
+            connection.execute(
+                "UPDATE phase_d_execution_intents SET state=?, updated_at=? WHERE intent_id=?",
+                (ExecutionState.SUBMITTING.value, iso(at), intent_id),
+            )
+            self._append_phase_d_state_event(
+                connection, intent_id, intent.state, ExecutionState.SUBMITTING,
+                "submission_identity_persisted", "execution_engine", at,
+                {"submission_id": submission_id, "client_order_id": client_order_id},
+            )
+            row = connection.execute(
+                "SELECT * FROM phase_d_execution_submissions WHERE intent_id=?", (intent_id,)
+            ).fetchone()
+        return self._phase_d_submission_from_row(row), True
+
+    def get_execution_submission(self, intent_id: str) -> ExecutionSubmission | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM phase_d_execution_submissions WHERE intent_id=?", (intent_id,)
+            ).fetchone()
+        return self._phase_d_submission_from_row(row) if row else None
+
+    def update_execution_submission(
+        self, intent_id: str, *, state: str, venue_order_id: str | None, filled_quantity: float,
+        raw_evidence: Mapping[str, Any], updated_at: object | None = None,
+    ) -> ExecutionSubmission:
+        at = as_utc(updated_at)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM phase_d_execution_submissions WHERE intent_id=?", (intent_id,)
+            ).fetchone()
+            if not row:
+                raise KeyError(f"No Phase-D submission for intent {intent_id}")
+            current = self._phase_d_submission_from_row(row)
+            connection.execute(
+                """UPDATE phase_d_execution_submissions
+                   SET state=?, venue_order_id=COALESCE(?, venue_order_id), filled_quantity=?, updated_at=?, raw_evidence_json=?
+                   WHERE intent_id=?""",
+                (state, venue_order_id, max(current.filled_quantity, filled_quantity), iso(at),
+                 _dump(dict(raw_evidence)), intent_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM phase_d_execution_submissions WHERE intent_id=?", (intent_id,)
+            ).fetchone()
+        return self._phase_d_submission_from_row(row)
+
+    def record_execution_venue_fill(
+        self, intent_id: str, submission_id: str, fill: VenueFill, *, received_at: object | None = None,
+    ) -> bool:
+        """Deduplicate venue fills before they can affect any local accounting read model."""
+        execution_fill_id = stable_id("phase_d_execution_fill_v1", submission_id, fill.venue_fill_id)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO phase_d_execution_fills(
+                    execution_fill_id, intent_id, submission_id, venue_fill_id, quantity, price, fee,
+                    venue_timestamp, received_at, raw_evidence_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (execution_fill_id, intent_id, submission_id, fill.venue_fill_id, fill.quantity, fill.price,
+                 fill.fee, iso(fill.venue_timestamp), iso(received_at), _dump(fill.raw_payload)),
+            )
+        return cursor.rowcount == 1
+
+    def list_execution_fills(self, intent_id: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM phase_d_execution_fills"
+        values: list[Any] = []
+        if intent_id:
+            query += " WHERE intent_id=?"
+            values.append(intent_id)
+        query += " ORDER BY venue_timestamp, execution_fill_id"
+        with self._connect() as connection:
+            rows = connection.execute(query, values).fetchall()
+        return [{**dict(row), "raw_evidence": _load(row["raw_evidence_json"], {})} for row in rows]
+
+    def start_execution_reconciliation(
+        self, reconciliation_run_id: str, *, scope: str, started_at: object, evidence: Mapping[str, Any] | None = None,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO phase_d_execution_reconciliation_runs(
+                    reconciliation_run_id, scope, state, started_at, completed_at, evidence_json)
+                   VALUES (?, ?, 'RECONCILING', ?, NULL, ?)""",
+                (reconciliation_run_id, scope, iso(started_at), _dump(dict(evidence or {}))),
+            )
+
+    def record_execution_reconciliation_item(
+        self, *, reconciliation_run_id: str, item_id: str, item_type: str, state: str, reason: str,
+        intent_id: str | None = None, submission_id: str | None = None, local: Mapping[str, Any] | None = None,
+        venue: Mapping[str, Any] | None = None, recorded_at: object | None = None,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO phase_d_execution_reconciliation_items(
+                    item_id, reconciliation_run_id, intent_id, submission_id, item_type, state, reason,
+                    local_json, venue_json, recorded_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (item_id, reconciliation_run_id, intent_id, submission_id, item_type, state, reason,
+                 _dump(dict(local or {})), _dump(dict(venue or {})), iso(recorded_at)),
+            )
+
+    def record_execution_position_observation(
+        self, *, observation_id: str, reconciliation_run_id: str, symbol: str, local_signed_quantity: float,
+        venue_signed_quantity: float | None, state: str, observed_at: object, raw_evidence: Mapping[str, Any] | None = None,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO phase_d_execution_position_observations(
+                    observation_id, reconciliation_run_id, symbol, local_signed_quantity, venue_signed_quantity,
+                    state, observed_at, raw_evidence_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (observation_id, reconciliation_run_id, symbol, local_signed_quantity, venue_signed_quantity,
+                 state, iso(observed_at), _dump(dict(raw_evidence or {}))),
+            )
+
+    def complete_execution_reconciliation(
+        self, reconciliation_run_id: str, *, state: str, completed_at: object, evidence: Mapping[str, Any] | None = None,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE phase_d_execution_reconciliation_runs
+                   SET state=?, completed_at=?, evidence_json=? WHERE reconciliation_run_id=?""",
+                (state, iso(completed_at), _dump(dict(evidence or {})), reconciliation_run_id),
+            )
+
+    def latest_execution_reconciliation(self) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM phase_d_execution_reconciliation_runs ORDER BY started_at DESC, reconciliation_run_id DESC LIMIT 1"
+            ).fetchone()
+        return {**dict(row), "evidence": _load(row["evidence_json"], {})} if row else None
+
+    def phase_d_local_positions(self) -> dict[str, float]:
+        """Reconstruct local exposure from deduplicated fills; never from intent wishes."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT intent.symbol, intent.action, intent.direction, fill.quantity
+                   FROM phase_d_execution_fills AS fill
+                   JOIN phase_d_execution_intents AS intent ON intent.intent_id=fill.intent_id
+                   ORDER BY fill.venue_timestamp, fill.execution_fill_id"""
+            ).fetchall()
+        positions: dict[str, float] = {}
+        for row in rows:
+            signed = float(row["quantity"])
+            if row["direction"] == "short":
+                signed *= -1
+            if row["action"] in {"reduce", "close"}:
+                signed *= -1
+            positions[row["symbol"]] = positions.get(row["symbol"], 0.0) + signed
+        return {symbol: quantity for symbol, quantity in positions.items() if abs(quantity) > 1e-12}
+
+    def execution_has_unresolved_entry_risk(self) -> bool:
+        """Return only *current* D evidence that must fail closed for entries."""
+        with self._connect() as connection:
+            unresolved = connection.execute(
+                """SELECT 1 FROM phase_d_execution_intents
+                   WHERE exposure_effect='INCREASE' AND state IN ('SUBMISSION_UNKNOWN', 'RECONCILIATION_REQUIRED')
+                   LIMIT 1"""
+            ).fetchone()
+            if unresolved:
+                return True
+            mismatch = connection.execute(
+                """SELECT 1 FROM phase_d_execution_position_observations AS observation
+                   WHERE observation.observed_at=(
+                       SELECT MAX(newer.observed_at) FROM phase_d_execution_position_observations AS newer
+                       WHERE newer.symbol=observation.symbol
+                   ) AND observation.state NOT IN ('MATCHED', 'VERIFIED_FLAT') LIMIT 1"""
+            ).fetchone()
+        return mismatch is not None
+
+    def execution_read_model(self, *, limit: int = 50) -> dict[str, Any]:
+        """Stable read model for the future control center; no mutable engine access."""
+        with self._connect() as connection:
+            state_rows = connection.execute(
+                "SELECT state, COUNT(*) AS count FROM phase_d_execution_intents GROUP BY state"
+            ).fetchall()
+            intents = connection.execute(
+                """SELECT intent_id, signal_id, target_wallet, campaign_id, symbol, action, direction,
+                          requested_quantity, requested_capital, exposure_effect, state, accepted_at, updated_at
+                   FROM phase_d_execution_intents ORDER BY updated_at DESC, intent_id DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            submissions = connection.execute(
+                """SELECT submission_id, intent_id, client_order_id, state, venue_order_id, requested_quantity,
+                          filled_quantity, updated_at FROM phase_d_execution_submissions
+                   ORDER BY updated_at DESC, submission_id DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            fills = connection.execute(
+                """SELECT execution_fill_id, intent_id, submission_id, venue_fill_id, quantity, price, fee,
+                          venue_timestamp, received_at FROM phase_d_execution_fills
+                   ORDER BY venue_timestamp DESC, execution_fill_id DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            discrepancies = connection.execute(
+                """SELECT * FROM phase_d_execution_reconciliation_items
+                   WHERE state NOT IN ('MATCHED', 'VERIFIED_FLAT') ORDER BY recorded_at DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        current_states = {str(row["state"]): int(row["count"]) for row in state_rows}
+        return {
+            "execution_mode": "SIMULATOR_ONLY",
+            "live_order_transmission": False,
+            "entry_enabled": False,
+            "entry_inhibit": {"active": True, "reason": "phase_d_d0_simulator_only"},
+            "hard_transport_stop": {"active": False, "reason": "no_live_transport_exists"},
+            "adapter_state": "SIMULATOR_ONLY",
+            "reconciliation": self.latest_execution_reconciliation(),
+            "entry_blocked_by_unresolved_execution": self.execution_has_unresolved_entry_risk(),
+            "state_counts": current_states,
+            "unknown_submissions": current_states.get(ExecutionState.SUBMISSION_UNKNOWN.value, 0),
+            "outstanding_orders": [dict(row) for row in submissions if row["state"] not in {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}],
+            "partial_orders": [dict(row) for row in submissions if 0 < float(row["filled_quantity"]) < float(row["requested_quantity"])],
+            "position_mismatches": [
+                {**dict(row), "local": _load(row["local_json"], {}), "venue": _load(row["venue_json"], {})}
+                for row in discrepancies
+            ],
+            "local_positions": self.phase_d_local_positions(),
+            "recent_intents": [dict(row) for row in intents],
+            "recent_fills": [dict(row) for row in fills],
+        }
 
     def dashboard_snapshot(self) -> dict[str, Any]:
         targets = self.list_targets()

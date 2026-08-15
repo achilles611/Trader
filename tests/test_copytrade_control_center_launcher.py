@@ -18,13 +18,13 @@ class ControlCenterLauncherTests(unittest.TestCase):
         route = next(item for item in app.routes if item.path == "/ws")
         self.assertEqual(route.dependant.websocket_param_name, "websocket")
 
-    def test_recovery_status_and_safe_rebaseline_routes_are_registered(self) -> None:
+    def test_recovery_status_safe_rebaseline_and_phase_d_read_routes_are_registered(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = CopyTradeConfig()
             config = replace(base, artifacts=replace(base.artifacts, database_path=Path(directory) / "copytrade.sqlite3"))
             app = create_control_center_app(config)
         paths = {item.path for item in app.routes}
-        self.assertTrue({"/api/recovery", "/api/recovery/{wallet}/safe-rebaseline"} <= paths)
+        self.assertTrue({"/api/recovery", "/api/recovery/{wallet}/safe-rebaseline", "/api/execution"} <= paths)
 
 
 if __name__ == "__main__":  # pragma: no cover

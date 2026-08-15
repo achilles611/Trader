@@ -526,6 +526,9 @@ class CopyControlCenter:
             "websocket": {"available": True, "endpoint": "/ws"},
             "kill_switch": {"active": self.config.risk.kill_switch_path.exists(), "path": str(self.config.risk.kill_switch_path)},
             "control": self.store.control_state(),
+            # Phase D.0 is a persisted simulator-only read model.  It is
+            # intentionally not wired to the mutable Phase-C paper engine.
+            "execution": self.execution_health(),
             "timestamp": iso(now),
         }
 
@@ -1099,6 +1102,10 @@ class CopyControlCenter:
                     {"label": "Daily realized loss", "current": max(0.0, -portfolio["realized_pnl_today"]) / capital, "limit": self.config.risk.daily_loss_stop_fraction},
                 ]}
 
+    def execution_health(self) -> dict[str, Any]:
+        """Versioned Phase-D visibility from ledger state, never live transport."""
+        return self.database.execution_read_model()
+
     def activity(self, *, limit: int = 100, wallet: str | None = None) -> list[dict[str, Any]]:
         manual = self.store.activities(limit=limit, wallet=wallet)
         with self._connect() as connection:
@@ -1470,6 +1477,10 @@ def create_control_center_app(
     @app.get("/api/system")
     async def api_system() -> dict[str, Any]:
         return {"health": center.health(live_watcher_health), "risk": center.risk_panel(), "source": source.source_status(), "paper_only": True}
+
+    @app.get("/api/execution")
+    async def api_execution() -> dict[str, Any]:
+        return center.execution_health()
 
     @app.get("/api/recovery")
     async def api_recovery(wallet: str | None = None) -> dict[str, Any]:

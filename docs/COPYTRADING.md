@@ -52,6 +52,8 @@ SQLite tables are deliberately isolated in `artifacts/copytrade.sqlite3`:
 - `copy_reconstruction_cursors` for versioned per-wallet incremental source reconstruction and recovery continuity state
 - `copy_analysis_runs`, `copy_analysis_run_wallets`, append-only `copy_analysis_run_wallet_events`, and `copy_candidate_analyses`
 - `copy_analysis_market_evidence` and `copy_analysis_finalist_recommendations` for immutable replay evidence and recommendation-only selection audit
+- `phase_d_execution_intents`, `phase_d_execution_submissions`, append-only `phase_d_execution_state_events`, and `phase_d_execution_risk_decisions` for the versioned D.0 simulator execution ledger
+- `phase_d_execution_fills`, `phase_d_execution_reconciliation_runs`, `phase_d_execution_reconciliation_items`, and `phase_d_execution_position_observations` for normalized venue evidence and discrepancies
 
 The small `CopyTradeStore` contract means a PostgreSQL backend can replace the
 SQLite implementation without changing the research, risk, or paper-execution
@@ -59,14 +61,12 @@ logic. A signal claim, attempt, sleeve mutation, simulated fills, and portfolio
 snapshot commit in one SQLite transaction; replay after an uncommitted failure
 is safe and replay after a committed attempt is a no-op.
 
-`ExecutionAggregator` can net independent virtual sleeves into future
-venue-facing execution intents while preserving every contributing sleeve. It
-does not submit orders. It is an inert Phase D boundary: any future live
-implementation must first add exchange-versus-desired-position reconciliation,
-idempotent client order IDs, durable order state and partial-fill attribution,
-reduce-only/precision/minimum-notional controls, signing-key isolation,
-restart reconciliation, emergency flattening, and explicit control-plane
-authorization. None of those capabilities exists in this repository today.
+`ExecutionAggregator` remains an inert paper-sleeve planning seam.  Alongside
+it, Phase D.0 adds an independent, simulator-only execution ledger for
+immutable `CopySignal → ExecutionIntent` provenance, deterministic submission
+identity, explicit ambiguous-submission handling, fills, and reconciliation
+evidence. It does not alter paper sleeves or reinterpret the historical
+`copy_execution_*` rows. See [Phase D execution foundation](PHASE_D_EXECUTION.md).
 
 Raw-fill batches are committed through bounded SQLite `executemany` chunks in
 one transaction. Phase A completion also computes evidence counts, source and

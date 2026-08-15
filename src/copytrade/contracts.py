@@ -15,6 +15,13 @@ PHASE_B_RECOMMENDATION_SCHEMA_VERSION = 1
 """Current persisted finalist-recommendation contract consumed by Phase C."""
 
 
+# Phase D records are deliberately versioned independently of the SQLite
+# schema.  A database migration only makes columns available; it must never
+# cause newer code to silently assign a new economic meaning to old rows.
+PHASE_D_EXECUTION_CONTRACT_VERSION = 1
+"""Current immutable Phase-C-to-Phase-D execution-intent contract."""
+
+
 # A current Phase-A record must carry every dimension that configurable Phase-B
 # prefilter gates may inspect.  Zero is meaningful only when this whole
 # contract is present and versioned.
