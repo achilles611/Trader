@@ -77,7 +77,11 @@ LEGAL_EXECUTION_TRANSITIONS: dict[ExecutionState, frozenset[ExecutionState]] = {
     ExecutionState.CREATED: frozenset({ExecutionState.VALIDATING, ExecutionState.BLOCKED, ExecutionState.TERMINAL_ERROR}),
     ExecutionState.VALIDATING: frozenset({ExecutionState.READY, ExecutionState.BLOCKED, ExecutionState.TERMINAL_ERROR}),
     ExecutionState.BLOCKED: frozenset(),
-    ExecutionState.READY: frozenset({ExecutionState.SUBMITTING, ExecutionState.CANCELLED, ExecutionState.TERMINAL_ERROR}),
+    # A readiness decision can become unsafe before the adapter boundary when
+    # newer account authority or immutable integrity evidence arrives.
+    ExecutionState.READY: frozenset({
+        ExecutionState.BLOCKED, ExecutionState.SUBMITTING, ExecutionState.CANCELLED, ExecutionState.TERMINAL_ERROR,
+    }),
     ExecutionState.SUBMITTING: frozenset({
         ExecutionState.SUBMISSION_UNKNOWN, ExecutionState.ACKNOWLEDGED, ExecutionState.PARTIALLY_FILLED,
         ExecutionState.FILLED, ExecutionState.REJECTED_BY_VENUE, ExecutionState.RECONCILIATION_REQUIRED,

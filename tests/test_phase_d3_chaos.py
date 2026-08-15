@@ -136,6 +136,31 @@ class PhaseDChaosRecoveryTests(unittest.TestCase):
             self.assertEqual(rejected["state"], "INCOMPLETE")
             self.assertIn("unresolved_submission_present", rejected["reason"])
 
+    def test_open_order_authority_remains_latched_after_positions_only_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database, engine, adapter = self.engine(Path(temp))
+            adapter.inject_external_order("BTC", 1.0)
+            failed_flat = engine.verify_flat()
+            self.assertEqual(failed_flat["state"], "INCOMPLETE")
+            self.assertIn("open_order_present", failed_flat["reason"])
+            self.assertTrue(database.execution_open_order_reconciliation_unhealthy())
+
+            # This is fresh, authoritative position evidence, but it says
+            # nothing about an outstanding venue order and must not clear it.
+            self.assertEqual(engine.reconcile_positions()["state"], "VERIFIED_FLAT")
+            self.assertTrue(database.execution_open_order_reconciliation_unhealthy())
+            health = database.execution_read_model()["execution_health"]
+            self.assertEqual(health["state"], "OPEN_ORDER_RECONCILIATION_INCOMPLETE")
+            self.assertTrue(health["safety"]["unhealthy"])
+            self.assertEqual(engine.process_signal(signal("open-order-latched")).state, ExecutionState.BLOCKED)
+
+            # Only a later open-order authority observation may clear the
+            # latch.  Position reconciliation is intentionally irrelevant.
+            adapter.clear_external_orders()
+            self.assertEqual(engine.reconcile_open_orders()["state"], "MATCHED")
+            self.assertFalse(database.execution_open_order_reconciliation_unhealthy())
+            self.assertTrue(database.execution_safety_health()["healthy"])
+
     def test_cancellation_and_reconciliation_crashes_remain_ambiguous_until_repaired(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             database, engine, adapter = self.engine(Path(temp), SimulatorPlan("partial", fill_quantities=(0.25,)))

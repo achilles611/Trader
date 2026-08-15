@@ -48,7 +48,7 @@ All tables are additive and use the `phase_d_` namespace. Existing
 | `phase_d_execution_risk_decisions` | Admission decision and structured evidence before submission |
 | `phase_d_execution_submissions` | One deterministic client-order identity per intent, with monotonic venue evidence |
 | `phase_d_execution_fills` | Deduplicated normalized venue fills, executed side, and raw evidence |
-| `phase_d_execution_reconciliation_runs/items` | Order/account reconciliation evidence and discrepancies |
+| `phase_d_execution_reconciliation_runs/items` | Independently-scoped intent-order, position, open-order, and verified-flat evidence and discrepancies |
 | `phase_d_execution_position_observations` | Local-fill-derived exposure compared with venue observations |
 | `phase_d_execution_integrity_issues` | Immutable contradictions such as conflicting IDs, side conflicts, and overfills |
 
@@ -111,15 +111,24 @@ fill just to make local accounting match a venue position.
 
 Local positions are calculated from deduplicated Phase-D fills using each
 fill's executed `BUY`/`SELL` side, never desired intent direction or quantity.
-A fill-side conflict, conflicting fill identity, or overfill is retained as
-evidence, makes the intent `RECONCILIATION_REQUIRED` where transitionable,
-and inhibits future increases for that account. `reconcile_positions()` stores
-the venue observation and the discrepancy. Account-position health is a
-latched authority: only a successful `account_positions`/`verified_flat` run
-for the same domain/account clears an incomplete or mismatch state. Per-intent
-order reconciliation cannot clear it. D.0 deliberately has no automatic
-rebaseline: any future verified-flat recovery must be an explicit, audited
-operator action.
+A fill-side conflict, conflicting fill identity/order ID, or overfill is
+retained as immutable integrity evidence, makes the intent
+`RECONCILIATION_REQUIRED` where transitionable, and makes combined execution
+safety unhealthy for that domain/account. This is not merely an entry warning:
+opens and adds fail closed, and a reduce/close requires fresh, authoritative,
+direction-and-size-bounded position evidence. The same combined check is
+repeated at the adapter boundary so a previously `READY` intent cannot submit
+after newer safety evidence arrives.
+
+Position and open-order observations are independent latched authorities.
+`reconcile_positions()` can clear only position authority. `verify_flat()`
+also records an `open_orders` observation; an external open order remains an
+entry risk until a newer authoritative `open_orders` observation reports it
+clear. A positions-only match and per-intent order reconciliation cannot clear
+that latch. The read model combines position authority, open-order authority,
+and unresolved integrity evidence and never reports `CONTINUOUS` while any is
+unhealthy. D.0 deliberately has no automatic rebaseline: any future
+verified-flat recovery must be an explicit, audited operator action.
 
 ## Risk and exit semantics
 
@@ -131,8 +140,9 @@ operator action.
   exposure but do not casually remove a safe reduction.
 
 `REDUCE` and `FLATTEN` intents use `reduce_only=True` in the normalized
-submission request. During degraded reconciliation, an exit requires a
-current authoritative verified position snapshot; otherwise it is blocked as
+submission request. During degraded combined safety — reconciliation authority
+or unresolved integrity evidence — an exit requires a current authoritative
+verified position snapshot; otherwise it is blocked as
 `reduce_only_verified_position_required`. Once that snapshot is present, D.0
 still rejects an exit that would exceed it or reverse its direction using
 `reduce_only_size_exceeds_position` or `reduce_only_direction_mismatch`.
@@ -211,10 +221,11 @@ Position reconciliation now records `INCOMPLETE` for adapter failure, stale
 or freshness-unknown observations, and an interrupted observation pass.
 Manual simulator positions are labelled `UNKNOWN_POSITION`, and quantity,
 direction, and missing-local/missing-venue cases carry distinct reasons.
-The latest incomplete/mismatch account run blocks new exposure; an order-only
-run cannot clear that authority. It does not rewrite local fill provenance.
-The read model exposes account and intent-order reconciliation separately as
-execution health.
+D.3.2 gives position, open-order, and integrity evidence independent authority:
+a matched positions-only run cannot clear an external open-order failure, and
+every unresolved integrity failure makes combined execution safety unhealthy.
+The read model exposes each authority and never calls health `CONTINUOUS`
+while one remains degraded. It does not rewrite local fill provenance.
 
 `verify_flat()` is evidence-only. It succeeds only when the adapter reports
 a fresh position observation, no local or venue position, no open order able
@@ -225,6 +236,8 @@ history. An explicit operator rebaseline remains future work.
 | Degraded condition | OPEN / ADD | REDUCE / CLOSE | CANCEL |
 | --- | --- | --- | --- |
 | Position mismatch or stale/unavailable reconciliation | Blocked | Only when caller supplies a direction-and-size-bounded verified position | Existing cancellation may reconcile; no blind retry |
+| External open order or unavailable open-order observation | Blocked until a newer open-order observation is clear | Only when caller supplies a direction-and-size-bounded verified position | Existing cancellation may reconcile; no blind retry |
+| Unresolved integrity failure (overfill, side/ID conflict) | Blocked | Only when caller supplies a direction-and-size-bounded verified position | Existing cancellation may reconcile; no blind retry |
 | Unknown/in-flight increasing submission | Blocked | Available if independently bounded | Reconcile first |
 | Direction mismatch | Blocked | Blocked when it would increase the observed opposite exposure | Reconcile first |
 | Hard transport stop | Blocked | Blocked because no safe adapter action can be transmitted | Blocked |

@@ -141,6 +141,8 @@ class PhaseDClosureHardeningTests(unittest.TestCase):
                 "FILL_SIDE_CONFLICT",
                 {issue["category"] for issue in database.list_execution_integrity_issues(intent_id=intent.intent_id)},
             )
+            self.assertTrue(database.execution_safety_health(**SIMULATION_SCOPE)["integrity_unhealthy"])
+            self.assertEqual(database.execution_read_model()["execution_health"]["state"], "INTEGRITY_FAILURE")
             self.assertTrue(database.execution_has_unresolved_entry_risk(**SIMULATION_SCOPE))
 
     def test_conflicting_duplicate_fill_payload_is_retained_once_and_escalated(self) -> None:
@@ -158,11 +160,20 @@ class PhaseDClosureHardeningTests(unittest.TestCase):
                 "CONFLICTING_VENUE_FILL_ID",
                 {issue["category"] for issue in database.list_execution_integrity_issues(intent_id=intent.intent_id)},
             )
+            self.assertTrue(database.execution_safety_health(**SIMULATION_SCOPE)["integrity_unhealthy"])
+            self.assertEqual(database.execution_read_model()["execution_health"]["state"], "INTEGRITY_FAILURE")
             self.assertEqual(engine.reconcile_intent(intent.intent_id).state, ExecutionState.RECONCILIATION_REQUIRED)
 
-    def test_overfill_is_retained_as_evidence_and_blocks_new_entry(self) -> None:
+    def test_integrity_failure_degrades_combined_safety_and_preserves_only_verified_exits(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            database, engine, adapter = self.setup_engine(Path(temp), SimulatorPlan("acknowledged"))
+            database, engine, adapter = self.setup_engine(
+                Path(temp), SimulatorPlan("acknowledged"), SimulatorPlan("immediate_fill"),
+            )
+            ready_before_failure = engine.accept_signal(signal("overfill-ready-before-failure"))
+            self.assertEqual(
+                engine.validate_intent(ready_before_failure.intent_id, context=ExecutionSafetyContext()).state,
+                ExecutionState.READY,
+            )
             intent = engine.process_signal(signal("overfill"))
             submission = database.get_execution_submission(intent.intent_id)
             self.assertIsNotNone(submission)
@@ -174,7 +185,33 @@ class PhaseDClosureHardeningTests(unittest.TestCase):
                 "OVERFILL_DETECTED",
                 {issue["category"] for issue in database.list_execution_integrity_issues(intent_id=intent.intent_id)},
             )
-            self.assertEqual(engine.process_signal(signal("overfill-followup")).state, ExecutionState.BLOCKED)
+            safety = database.execution_safety_health(**SIMULATION_SCOPE)
+            self.assertTrue(safety["integrity_unhealthy"])
+            self.assertTrue(safety["unhealthy"])
+            health = database.execution_read_model()["execution_health"]
+            self.assertEqual(health["state"], "INTEGRITY_FAILURE")
+            self.assertNotEqual(health["state"], "CONTINUOUS")
+            self.assertEqual(
+                engine.submit_ready_intent(ready_before_failure.intent_id, context=ExecutionSafetyContext()).state,
+                ExecutionState.BLOCKED,
+            )
+            self.assertEqual(engine.process_signal(signal("overfill-open")).state, ExecutionState.BLOCKED)
+            self.assertEqual(engine.process_signal(signal("overfill-add", action="add")).state, ExecutionState.BLOCKED)
+
+            missing_evidence = engine.process_signal(signal("overfill-close-missing", action="close"))
+            self.assertEqual(missing_evidence.state, ExecutionState.BLOCKED)
+            self.assertEqual(
+                database.latest_execution_risk_decision(missing_evidence.intent_id)["reason"],
+                "reduce_only_verified_position_required",
+            )
+            bounded_exit = engine.process_signal(
+                signal("overfill-close-verified", action="close", quantity=1.0),
+                context=ExecutionSafetyContext(
+                    verified_positions={"BTC": 1.2}, verified_positions_current=True,
+                    verified_positions_authoritative=True,
+                ),
+            )
+            self.assertEqual(bounded_exit.state, ExecutionState.FILLED)
 
     def test_submission_evidence_is_monotonic_and_conflicting_order_id_escalates(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -197,6 +234,8 @@ class PhaseDClosureHardeningTests(unittest.TestCase):
                 "CONFLICTING_VENUE_ORDER_ID",
                 {issue["category"] for issue in database.list_execution_integrity_issues(intent_id=intent.intent_id)},
             )
+            self.assertTrue(database.execution_safety_health(**SIMULATION_SCOPE)["integrity_unhealthy"])
+            self.assertEqual(database.execution_read_model()["execution_health"]["state"], "INTEGRITY_FAILURE")
             self.assertEqual(engine.reconcile_intent(intent.intent_id).state, ExecutionState.RECONCILIATION_REQUIRED)
 
     def test_cancelled_submission_does_not_regress_to_stale_ack(self) -> None:

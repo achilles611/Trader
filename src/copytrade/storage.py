@@ -3197,16 +3197,90 @@ class CopyTradeDatabase:
             positions[row["symbol"]] = positions.get(row["symbol"], 0.0) + signed
         return {symbol: quantity for symbol, quantity in positions.items() if abs(quantity) > 1e-12}
 
-    def execution_account_reconciliation_unhealthy(
+    def execution_position_reconciliation_unhealthy(
         self, *, execution_domain: str = "SIMULATOR", execution_account_id: str = "SIMULATOR:default",
     ) -> bool:
-        account_run = self.latest_execution_reconciliation(
+        """Whether the latest authoritative position observation is degraded.
+
+        ``verified_flat`` contains a fresh position observation as well as the
+        aggregate recovery result, so it may clear a prior position failure.
+        It deliberately cannot clear the independent open-order authority.
+        """
+        position_run = self.latest_execution_reconciliation(
             scopes=("account_positions", "positions", "verified_flat"), execution_domain=execution_domain,
             execution_account_id=execution_account_id,
         )
-        return bool(account_run and account_run["state"] not in {
+        return bool(position_run and position_run["state"] not in {
             ReconciliationState.MATCHED.value, ReconciliationState.VERIFIED_FLAT.value,
         })
+
+    def execution_open_order_reconciliation_unhealthy(
+        self, *, execution_domain: str = "SIMULATOR", execution_account_id: str = "SIMULATOR:default",
+    ) -> bool:
+        """Whether the latest authoritative open-order observation is degraded.
+
+        This selector intentionally excludes position runs.  An external open
+        order remains an entry risk until a later ``open_orders`` observation,
+        rather than a positions-only reconciliation, reports it absent.
+        """
+        order_run = self.latest_execution_reconciliation(
+            scopes=("open_orders",), execution_domain=execution_domain,
+            execution_account_id=execution_account_id,
+        )
+        return bool(order_run and order_run["state"] != ReconciliationState.MATCHED.value)
+
+    def execution_account_reconciliation_unhealthy(
+        self, *, execution_domain: str = "SIMULATOR", execution_account_id: str = "SIMULATOR:default",
+    ) -> bool:
+        """Compatibility name for the position-authority health check."""
+        return self.execution_position_reconciliation_unhealthy(
+            execution_domain=execution_domain, execution_account_id=execution_account_id,
+        )
+
+    def execution_safety_health(
+        self, *, execution_domain: str = "SIMULATOR", execution_account_id: str = "SIMULATOR:default",
+    ) -> dict[str, Any]:
+        """Return the combined, independently-authoritative execution safety state.
+
+        Integrity records are immutable contradictory evidence in D.3.2 and
+        remain unresolved until a future explicitly-authorized remediation
+        workflow exists.  They therefore fail closed alongside reconciliation
+        authority rather than being treated as an entry-only warning.
+        """
+        position_authority = self.latest_execution_reconciliation(
+            scopes=("account_positions", "positions", "verified_flat"), execution_domain=execution_domain,
+            execution_account_id=execution_account_id,
+        )
+        open_order_authority = self.latest_execution_reconciliation(
+            scopes=("open_orders",), execution_domain=execution_domain,
+            execution_account_id=execution_account_id,
+        )
+        integrity_issues = self.list_execution_integrity_issues(
+            execution_domain=execution_domain, execution_account_id=execution_account_id,
+        )
+        position_unhealthy = bool(position_authority and position_authority["state"] not in {
+            ReconciliationState.MATCHED.value, ReconciliationState.VERIFIED_FLAT.value,
+        })
+        open_order_unhealthy = bool(
+            open_order_authority and open_order_authority["state"] != ReconciliationState.MATCHED.value
+        )
+        integrity_unhealthy = bool(integrity_issues)
+        reasons = [
+            *(["position_reconciliation_unhealthy"] if position_unhealthy else []),
+            *(["open_order_reconciliation_unhealthy"] if open_order_unhealthy else []),
+            *(["execution_integrity_failure"] if integrity_unhealthy else []),
+        ]
+        return {
+            "healthy": not reasons,
+            "unhealthy": bool(reasons),
+            "reasons": reasons,
+            "position_authority": position_authority,
+            "open_order_authority": open_order_authority,
+            "position_unhealthy": position_unhealthy,
+            "open_order_unhealthy": open_order_unhealthy,
+            "integrity_unhealthy": integrity_unhealthy,
+            "integrity_issue_count": len(integrity_issues),
+        }
 
     def execution_has_unresolved_entry_risk(
         self, *, execution_domain: str = "SIMULATOR", execution_account_id: str = "SIMULATOR:default",
@@ -3224,14 +3298,9 @@ class CopyTradeDatabase:
             ).fetchone()
             if unresolved:
                 return True
-            integrity = connection.execute(
-                """SELECT 1 FROM phase_d_execution_integrity_issues
-                   WHERE execution_domain=? AND execution_account_id=? LIMIT 1""",
-                (execution_domain, execution_account_id),
-            ).fetchone()
-        return integrity is not None or self.execution_account_reconciliation_unhealthy(
+        return self.execution_safety_health(
             execution_domain=execution_domain, execution_account_id=execution_account_id,
-        )
+        )["unhealthy"]
 
     def execution_unresolved_submissions(
         self, *, execution_domain: str = "SIMULATOR", execution_account_id: str = "SIMULATOR:default",
@@ -3295,16 +3364,28 @@ class CopyTradeDatabase:
                    WHERE execution_domain='PAPER_COMPAT' AND execution_account_id='PAPER_COMPAT:legacy_paper'"""
             ).fetchone()
         current_states = {str(row["state"]): int(row["count"]) for row in state_rows}
-        reconciliation = self.latest_execution_reconciliation(
+        position_reconciliation = self.latest_execution_reconciliation(
             scopes=("account_positions", "positions", "verified_flat"), execution_domain=execution_domain,
+            execution_account_id=execution_account_id,
+        )
+        open_order_reconciliation = self.latest_execution_reconciliation(
+            scopes=("open_orders",), execution_domain=execution_domain,
             execution_account_id=execution_account_id,
         )
         intent_reconciliation = self.latest_execution_reconciliation(
             scopes=("intent_order", "order"), execution_domain=execution_domain,
             execution_account_id=execution_account_id,
         )
-        reconciliation_state = reconciliation["state"] if reconciliation else "NOT_YET_RUN"
-        if reconciliation_state in {ReconciliationState.INCOMPLETE.value, ReconciliationState.RECONCILING.value}:
+        safety = self.execution_safety_health(
+            execution_domain=execution_domain, execution_account_id=execution_account_id,
+        )
+        reconciliation_state = position_reconciliation["state"] if position_reconciliation else "NOT_YET_RUN"
+        open_order_state = open_order_reconciliation["state"] if open_order_reconciliation else "NOT_YET_RUN"
+        if safety["integrity_unhealthy"]:
+            health_state = "INTEGRITY_FAILURE"
+        elif safety["open_order_unhealthy"]:
+            health_state = "OPEN_ORDER_RECONCILIATION_INCOMPLETE"
+        elif reconciliation_state in {ReconciliationState.INCOMPLETE.value, ReconciliationState.RECONCILING.value}:
             health_state = "RECONCILIATION_INCOMPLETE"
         elif reconciliation_state == ReconciliationState.MISMATCH.value:
             health_state = "POSITION_MISMATCH"
@@ -3322,15 +3403,18 @@ class CopyTradeDatabase:
             "entry_inhibit": {"active": True, "reason": "phase_d_d0_simulator_only"},
             "hard_transport_stop": {"active": False, "reason": "no_live_transport_exists"},
             "adapter_state": "SIMULATOR_ONLY",
-            "reconciliation": reconciliation,
+            "reconciliation": position_reconciliation,
             "reconciliation_authorities": {
-                "account_positions": reconciliation,
+                "account_positions": position_reconciliation,
+                "position": position_reconciliation,
+                "open_orders": open_order_reconciliation,
                 "intent_order": intent_reconciliation,
             },
             "execution_health": {
                 "state": health_state,
                 "entry_inhibited": entry_blocked,
-                "reason": reconciliation_state,
+                "reason": safety["reasons"] or [reconciliation_state, open_order_state],
+                "safety": safety,
             },
             "entry_blocked_by_unresolved_execution": entry_blocked,
             "state_counts": current_states,

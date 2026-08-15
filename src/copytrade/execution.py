@@ -331,6 +331,10 @@ class DeterministicExecutionSimulator:
         self._external_orders[identifier] = order
         return order
 
+    def clear_external_orders(self) -> None:
+        """Remove injected manual orders so a later observation can clear risk."""
+        self._external_orders.clear()
+
     def list_open_orders(self) -> list[VenueOrder]:
         self._require_available()
         local = [order for order in self._orders.values() if order.status in {
@@ -562,16 +566,20 @@ class ExecutionEngine:
             self._checkpoint(fault_hook, "after_state_transition_persistence")
         if intent.state is not ExecutionState.VALIDATING:
             return intent
-        account_unhealthy = self.store.execution_account_reconciliation_unhealthy(
+        safety_health = self.store.execution_safety_health(
             execution_domain=intent.execution_domain, execution_account_id=intent.execution_account_id,
         )
-        safety = replace(context, reconciliation_healthy=context.reconciliation_healthy and not account_unhealthy)
+        safety = replace(context, reconciliation_healthy=context.reconciliation_healthy and not safety_health["unhealthy"])
         allowed, reason, evidence = self.risk_gate.evaluate(intent, safety)
         if intent.exposure_effect is ExposureEffect.INCREASE and self.store.execution_has_unresolved_entry_risk(
             execution_domain=intent.execution_domain, execution_account_id=intent.execution_account_id,
         ):
             allowed, reason = False, "entry_blocked_reconciliation_required"
-            evidence = {**evidence, "unresolved_phase_d_execution": True, "account_reconciliation_unhealthy": account_unhealthy}
+            evidence = {
+                **evidence,
+                "unresolved_phase_d_execution": True,
+                "execution_safety_health": safety_health,
+            }
         decision = ExecutionRiskDecision(
             decision_id=stable_id("phase_d_risk_decision", intent_id, allowed, reason, evidence),
             intent_id=intent_id, allowed=allowed, reason=reason, evaluated_at=utc_now(), evidence=evidence,
@@ -598,6 +606,25 @@ class ExecutionEngine:
             return self.resume_intent(intent_id, context=context, fault_hook=fault_hook)
         if context.hard_transport_stop:
             return intent
+        # Re-check volatile account safety at the adapter boundary.  An intent
+        # can be READY from an earlier admission while new reconciliation or
+        # integrity evidence arrives; that earlier approval must never authorize
+        # an increase, or an unbounded exit, after the safety change.
+        safety_health = self.store.execution_safety_health(
+            execution_domain=intent.execution_domain, execution_account_id=intent.execution_account_id,
+        )
+        if safety_health["unhealthy"]:
+            safety = replace(context, reconciliation_healthy=context.reconciliation_healthy and not safety_health["unhealthy"])
+            allowed, reason, evidence = self.risk_gate.evaluate(intent, safety)
+            if not allowed:
+                evidence = {**evidence, "execution_safety_health": safety_health, "checked_at_submit_boundary": True}
+                self.store.record_execution_risk_decision(ExecutionRiskDecision(
+                    decision_id=stable_id("phase_d_submit_safety_decision", intent_id, allowed, reason, evidence),
+                    intent_id=intent_id, allowed=allowed, reason=reason, evaluated_at=utc_now(), evidence=evidence,
+                ))
+                return self.store.transition_execution_intent(
+                    intent_id, ExecutionState.BLOCKED, reason=reason, source="submit_safety_gate", raw_evidence=evidence,
+                )
         submission, should_submit = self.store.prepare_execution_submission(
             intent_id,
             submission_id=stable_id("phase_d_submission_v1", intent_id),
@@ -802,6 +829,69 @@ class ExecutionEngine:
         self.store.complete_execution_reconciliation(run_id, state=result_state, completed_at=now, evidence={"mismatches": mismatches})
         return {"reconciliation_run_id": run_id, "state": result_state, "mismatches": mismatches, "local_positions": local}
 
+    def reconcile_open_orders(self) -> dict[str, Any]:
+        """Record the independent authority for orders able to create exposure.
+
+        Position reconciliation is not evidence that no venue order remains.
+        This narrow observation therefore has its own scope and only a newer
+        successful observation of that scope can clear an open-order latch.
+        """
+        now = utc_now()
+        run_id = stable_id("phase_d_reconcile_open_orders", now)
+        self.store.start_execution_reconciliation(
+            run_id, scope="open_orders", started_at=now, execution_domain="SIMULATOR",
+            execution_account_id="SIMULATOR:default",
+        )
+        try:
+            list_open_orders = getattr(self.adapter, "list_open_orders", None)
+            if not callable(list_open_orders):
+                raise _StaleVenueObservation("open_order_observation_unavailable")
+            open_orders = list_open_orders()
+        except Exception as exc:
+            reason = str(exc) if isinstance(exc, _StaleVenueObservation) else "open_order_reconciliation_adapter_error"
+            self.store.record_execution_reconciliation_item(
+                reconciliation_run_id=run_id, item_id=stable_id("phase_d_reconcile_item", run_id, "observation_error"),
+                item_type="open_order", state=ReconciliationState.INCOMPLETE.value, reason=reason,
+                venue={"error": str(exc)}, recorded_at=now,
+            )
+            self.store.complete_execution_reconciliation(
+                run_id, state=ReconciliationState.INCOMPLETE.value, completed_at=now, evidence={"reason": reason},
+            )
+            return {
+                "reconciliation_run_id": run_id,
+                "state": ReconciliationState.INCOMPLETE.value,
+                "reason": reason,
+                "active_orders": [],
+            }
+        active_orders = [
+            order for order in open_orders
+            if order.status in {VenueOrderStatus.ACKNOWLEDGED, VenueOrderStatus.PARTIALLY_FILLED}
+        ]
+        state = ReconciliationState.MATCHED.value if not active_orders else ReconciliationState.INCOMPLETE.value
+        reason = "open_orders_clear" if not active_orders else "open_order_present"
+        for order in active_orders:
+            self.store.record_execution_reconciliation_item(
+                reconciliation_run_id=run_id,
+                item_id=stable_id("phase_d_reconcile_item", run_id, "open_order", order.client_order_id),
+                item_type="open_order", state=ReconciliationState.INCOMPLETE.value, reason="open_order_present",
+                venue=self._venue_order_evidence(order), recorded_at=now,
+            )
+        self.store.record_execution_reconciliation_item(
+            reconciliation_run_id=run_id, item_id=stable_id("phase_d_reconcile_item", run_id, "summary"),
+            item_type="open_order_authority", state=state, reason=reason,
+            venue={"open_order_ids": [item.client_order_id for item in active_orders]}, recorded_at=now,
+        )
+        self.store.complete_execution_reconciliation(
+            run_id, state=state, completed_at=now,
+            evidence={"reason": reason, "open_orders": len(active_orders)},
+        )
+        return {
+            "reconciliation_run_id": run_id,
+            "state": state,
+            "reason": reason,
+            "active_orders": active_orders,
+        }
+
     def verify_flat(self, *, fault_hook: Any = None) -> dict[str, Any]:
         """Fail closed before declaring a recovery baseline safely flat.
 
@@ -816,13 +906,10 @@ class ExecutionEngine:
             execution_account_id="SIMULATOR:default",
         )
         local = self.store.phase_d_local_positions(execution_domain="SIMULATOR", execution_account_id="SIMULATOR:default")
+        open_order_observation = self.reconcile_open_orders()
         try:
             self._checkpoint(fault_hook, "before_reconciliation")
             venue_rows = self.adapter.get_positions()
-            list_open_orders = getattr(self.adapter, "list_open_orders", None)
-            if not callable(list_open_orders):
-                raise _StaleVenueObservation("open_order_observation_unavailable")
-            open_orders = list_open_orders()
             freshness = getattr(self.adapter, "positions_observation_is_fresh", None)
             if not callable(freshness) or not freshness():
                 raise _StaleVenueObservation("position_observation_stale_or_freshness_unavailable")
@@ -841,17 +928,14 @@ class ExecutionEngine:
         unresolved = self.store.execution_unresolved_submissions(
             execution_domain="SIMULATOR", execution_account_id="SIMULATOR:default",
         )
-        active_orders = [
-            order for order in open_orders
-            if order.status in {VenueOrderStatus.ACKNOWLEDGED, VenueOrderStatus.PARTIALLY_FILLED}
-        ]
+        active_orders = open_order_observation["active_orders"]
         failures: list[str] = []
         if local:
             failures.append("local_position_not_flat")
         if venue_positions:
             failures.append("venue_position_not_flat")
-        if active_orders:
-            failures.append("open_order_present")
+        if open_order_observation["state"] != ReconciliationState.MATCHED.value:
+            failures.append(str(open_order_observation["reason"]))
         if unresolved:
             failures.append("unresolved_submission_present")
         state = ReconciliationState.VERIFIED_FLAT.value if not failures else ReconciliationState.INCOMPLETE.value
@@ -876,7 +960,8 @@ class ExecutionEngine:
         )
         return {"reconciliation_run_id": run_id, "state": state, "reason": reason,
                 "local_positions": local, "venue_positions": venue_positions,
-                "open_orders": len(active_orders), "unresolved_submissions": len(unresolved)}
+                "open_orders": len(active_orders), "unresolved_submissions": len(unresolved),
+                "open_order_reconciliation_run_id": open_order_observation["reconciliation_run_id"]}
 
     def _apply_venue_order(
         self, intent: ExecutionIntent, submission: ExecutionSubmission, order: VenueOrder, *, source: str,
