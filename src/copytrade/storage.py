@@ -19,6 +19,7 @@ from .execution_contracts import (
     ExecutionState,
     ExecutionSubmission,
     ExposureEffect,
+    ReconciliationState,
     TERMINAL_EXECUTION_STATES,
     VenueFill,
     validate_execution_transition,
@@ -435,6 +436,8 @@ class CopyTradeDatabase:
                 );
                 CREATE INDEX IF NOT EXISTS idx_phase_d_execution_fills_intent
                     ON phase_d_execution_fills(intent_id, venue_timestamp);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_phase_d_execution_fills_venue_fill_id
+                    ON phase_d_execution_fills(venue_fill_id);
                 CREATE TABLE IF NOT EXISTS phase_d_execution_reconciliation_runs (
                     reconciliation_run_id TEXT PRIMARY KEY, scope TEXT NOT NULL,
                     state TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT,
@@ -2474,6 +2477,8 @@ class CopyTradeDatabase:
                     )
                 if phase_d_projection:
                     self._commit_phase_d_paper_projection(connection, signal, attempt, fill_rows)
+                    if fault_hook:
+                        fault_hook("after_phase_d_projection")
                 if fault_hook:
                     fault_hook("before_commit")
                 connection.commit()
@@ -2928,10 +2933,22 @@ class CopyTradeDatabase:
         with self._connect() as connection:
             unresolved = connection.execute(
                 """SELECT 1 FROM phase_d_execution_intents
-                   WHERE exposure_effect='INCREASE' AND state IN ('SUBMISSION_UNKNOWN', 'RECONCILIATION_REQUIRED')
+                   WHERE exposure_effect='INCREASE' AND state IN (
+                       'SUBMITTING', 'SUBMISSION_UNKNOWN', 'ACKNOWLEDGED', 'PARTIALLY_FILLED',
+                       'CANCEL_PENDING', 'RECONCILIATION_REQUIRED'
+                   )
                    LIMIT 1"""
             ).fetchone()
             if unresolved:
+                return True
+            incomplete_run = connection.execute(
+                """SELECT 1 FROM phase_d_execution_reconciliation_runs
+                   WHERE reconciliation_run_id=(
+                       SELECT reconciliation_run_id FROM phase_d_execution_reconciliation_runs
+                       ORDER BY started_at DESC, reconciliation_run_id DESC LIMIT 1
+                   ) AND state IN ('RECONCILING', 'MISMATCH', 'INCOMPLETE')"""
+            ).fetchone()
+            if incomplete_run:
                 return True
             mismatch = connection.execute(
                 """SELECT 1 FROM phase_d_execution_position_observations AS observation
@@ -2941,6 +2958,16 @@ class CopyTradeDatabase:
                    ) AND observation.state NOT IN ('MATCHED', 'VERIFIED_FLAT') LIMIT 1"""
             ).fetchone()
         return mismatch is not None
+
+    def execution_unresolved_submissions(self) -> list[dict[str, Any]]:
+        """Durable ambiguity that prevents a verified-flat declaration."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT intent_id, state, updated_at FROM phase_d_execution_intents
+                   WHERE state IN ('SUBMITTING', 'SUBMISSION_UNKNOWN', 'RECONCILIATION_REQUIRED', 'CANCEL_PENDING')
+                   ORDER BY updated_at, intent_id"""
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def execution_read_model(self, *, limit: int = 50) -> dict[str, Any]:
         """Stable read model for the future control center; no mutable engine access."""
@@ -2972,6 +2999,17 @@ class CopyTradeDatabase:
                 (limit,),
             ).fetchall()
         current_states = {str(row["state"]): int(row["count"]) for row in state_rows}
+        reconciliation = self.latest_execution_reconciliation()
+        reconciliation_state = reconciliation["state"] if reconciliation else "NOT_YET_RUN"
+        if reconciliation_state in {ReconciliationState.INCOMPLETE.value, ReconciliationState.RECONCILING.value}:
+            health_state = "RECONCILIATION_INCOMPLETE"
+        elif reconciliation_state == ReconciliationState.MISMATCH.value:
+            health_state = "POSITION_MISMATCH"
+        elif reconciliation_state == ReconciliationState.VERIFIED_FLAT.value:
+            health_state = "VERIFIED_FLAT"
+        else:
+            health_state = "CONTINUOUS"
+        entry_blocked = self.execution_has_unresolved_entry_risk()
         return {
             "execution_mode": "SIMULATOR_ONLY",
             "live_order_transmission": False,
@@ -2979,8 +3017,13 @@ class CopyTradeDatabase:
             "entry_inhibit": {"active": True, "reason": "phase_d_d0_simulator_only"},
             "hard_transport_stop": {"active": False, "reason": "no_live_transport_exists"},
             "adapter_state": "SIMULATOR_ONLY",
-            "reconciliation": self.latest_execution_reconciliation(),
-            "entry_blocked_by_unresolved_execution": self.execution_has_unresolved_entry_risk(),
+            "reconciliation": reconciliation,
+            "execution_health": {
+                "state": health_state,
+                "entry_inhibited": entry_blocked,
+                "reason": reconciliation_state,
+            },
+            "entry_blocked_by_unresolved_execution": entry_blocked,
             "state_counts": current_states,
             "unknown_submissions": current_states.get(ExecutionState.SUBMISSION_UNKNOWN.value, 0),
             "outstanding_orders": [dict(row) for row in submissions if row["state"] not in {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}],

@@ -37,6 +37,36 @@ class AmbiguousSubmissionError(RuntimeError):
     """The adapter may have transmitted; the engine must reconcile, not retry."""
 
 
+class InjectedExecutionFault(RuntimeError):
+    """Deliberate deterministic process-loss analogue used only by D.3 tests."""
+
+
+class _StaleVenueObservation(RuntimeError):
+    """Internal signal that an observation is not strong enough to clear risk."""
+
+
+@dataclass
+class DeterministicFaultInjector:
+    """Raise once at named durable/external checkpoints without sleeping.
+
+    This is intentionally a small callable so the same object can drive the
+    paper transaction and the D execution engine.  It records every observed
+    checkpoint, which makes a crash test's placement auditable.
+    """
+
+    checkpoints: Iterable[str]
+    observed: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self._remaining = set(self.checkpoints)
+
+    def __call__(self, checkpoint: str) -> None:
+        self.observed.append(checkpoint)
+        if checkpoint in self._remaining:
+            self._remaining.remove(checkpoint)
+            raise InjectedExecutionFault(f"injected_execution_fault:{checkpoint}")
+
+
 class ExecutionAdapter(Protocol):
     """Normalized boundary future venue adapters must satisfy.
 
@@ -52,6 +82,7 @@ class ExecutionAdapter(Protocol):
     def cancel(self, client_order_id: str) -> VenueOrder: ...
     def get_order(self, client_order_id: str) -> VenueOrder | None: ...
     def list_fills(self, client_order_id: str) -> list[VenueFill]: ...
+    def list_open_orders(self) -> list[VenueOrder]: ...
     def get_positions(self) -> list[VenuePosition]: ...
     def get_balances(self) -> dict[str, Any]: ...
     def get_instrument_metadata(self, symbol: str) -> dict[str, Any]: ...
@@ -123,6 +154,7 @@ class DeterministicExecutionSimulator:
         self._requests: dict[str, SubmissionRequest] = {}
         self._hidden_reads: set[str] = set()
         self._reported_positions: dict[str, float] | None = None
+        self._external_position_symbols: set[str] = set()
         self._external_orders: dict[str, VenueOrder] = {}
         self._unavailable = False
         self._stale_positions: list[VenuePosition] | None = None
@@ -214,7 +246,11 @@ class DeterministicExecutionSimulator:
         observed = self.clock.now()
         positions = self._reported_positions if self._reported_positions is not None else self._calculated_positions()
         return [
-            VenuePosition(symbol=symbol, signed_quantity=quantity, observed_at=observed, raw_payload={"simulator": True})
+            VenuePosition(
+                symbol=symbol, signed_quantity=quantity, observed_at=observed,
+                raw_payload={"simulator": True, "stale": self._stale_positions is not None,
+                             "external_manual_activity": symbol in self._external_position_symbols},
+            )
             for symbol, quantity in sorted(positions.items()) if abs(quantity) > EPSILON
         ]
 
@@ -264,6 +300,8 @@ class DeterministicExecutionSimulator:
     def set_reported_positions(self, positions: dict[str, float] | None) -> None:
         """Inject stale/mismatched venue account truth for reconciliation tests."""
         self._reported_positions = dict(positions) if positions is not None else None
+        if positions is None:
+            self._external_position_symbols.clear()
 
     def set_temporary_unavailable(self, unavailable: bool = True) -> None:
         self._unavailable = unavailable
@@ -271,11 +309,16 @@ class DeterministicExecutionSimulator:
     def set_stale_positions(self, positions: list[VenuePosition] | None) -> None:
         self._stale_positions = list(positions) if positions is not None else None
 
+    def positions_observation_is_fresh(self) -> bool:
+        """Optional adapter freshness signal used by fail-closed reconciliation."""
+        return self._stale_positions is None
+
     def inject_external_position(self, symbol: str, signed_quantity: float) -> None:
         """Venue-side manual activity: deliberately has no local intent provenance."""
         positions = dict(self._reported_positions or self._calculated_positions())
         positions[symbol] = signed_quantity
         self._reported_positions = positions
+        self._external_position_symbols.add(symbol)
 
     def inject_external_order(self, symbol: str, signed_quantity: float) -> VenueOrder:
         identifier = stable_id("sim_external_order", symbol, signed_quantity, len(self._external_orders))
@@ -464,6 +507,7 @@ class ExecutionEngine:
         self, signal: CopySignal, *, context: ExecutionSafetyContext | None = None, fault_hook: Any = None,
     ) -> ExecutionIntent:
         intent = self.accept_signal(signal)
+        self._checkpoint(fault_hook, "after_intent_persistence")
         return self.resume_intent(intent.intent_id, context=context, fault_hook=fault_hook)
 
     def resume_intent(
@@ -472,21 +516,25 @@ class ExecutionEngine:
         safety = context or ExecutionSafetyContext()
         intent = self._required_intent(intent_id)
         if intent.state in {ExecutionState.CREATED, ExecutionState.VALIDATING}:
-            intent = self.validate_intent(intent.intent_id, context=safety)
+            intent = self.validate_intent(intent.intent_id, context=safety, fault_hook=fault_hook)
         if intent.state is ExecutionState.READY:
             if safety.hard_transport_stop:
                 return intent
             return self.submit_ready_intent(intent.intent_id, context=safety, fault_hook=fault_hook)
-        if intent.state in {ExecutionState.SUBMITTING, ExecutionState.SUBMISSION_UNKNOWN, ExecutionState.RECONCILIATION_REQUIRED}:
-            return self.reconcile_intent(intent.intent_id)
+        if intent.state in {
+            ExecutionState.SUBMITTING, ExecutionState.SUBMISSION_UNKNOWN, ExecutionState.RECONCILIATION_REQUIRED,
+            ExecutionState.CANCEL_PENDING,
+        }:
+            return self.reconcile_intent(intent.intent_id, fault_hook=fault_hook)
         return intent
 
-    def validate_intent(self, intent_id: str, *, context: ExecutionSafetyContext) -> ExecutionIntent:
+    def validate_intent(self, intent_id: str, *, context: ExecutionSafetyContext, fault_hook: Any = None) -> ExecutionIntent:
         intent = self._required_intent(intent_id)
         if intent.state is ExecutionState.CREATED:
             intent = self.store.transition_execution_intent(
                 intent_id, ExecutionState.VALIDATING, reason="risk_validation_started", source="execution_engine",
             )
+            self._checkpoint(fault_hook, "after_state_transition_persistence")
         if intent.state is not ExecutionState.VALIDATING:
             return intent
         allowed, reason, evidence = self.risk_gate.evaluate(intent, context)
@@ -504,10 +552,12 @@ class ExecutionEngine:
         current = self._required_intent(intent_id)
         if current.state is not ExecutionState.VALIDATING:
             return current
-        return self.store.transition_execution_intent(
+        result = self.store.transition_execution_intent(
             intent_id, ExecutionState.READY if allowed else ExecutionState.BLOCKED,
             reason=reason, source="risk_gate", raw_evidence=evidence,
         )
+        self._checkpoint(fault_hook, "after_state_transition_persistence")
+        return result
 
     def submit_ready_intent(
         self, intent_id: str, *, context: ExecutionSafetyContext, fault_hook: Any = None,
@@ -534,9 +584,9 @@ class ExecutionEngine:
             exposure_effect=intent.exposure_effect, reduce_only=intent.exposure_effect in {ExposureEffect.REDUCE, ExposureEffect.FLATTEN},
         )
         try:
+            self._checkpoint(fault_hook, "before_submit")
             order = self.adapter.submit(request)
-            if fault_hook:
-                fault_hook("after_external_submit")
+            self._checkpoint(fault_hook, "after_external_submit")
         except AmbiguousSubmissionError as exc:
             return self.store.transition_execution_intent(
                 intent_id, ExecutionState.SUBMISSION_UNKNOWN, reason="submission_unknown_timeout",
@@ -549,9 +599,10 @@ class ExecutionEngine:
                 intent_id, ExecutionState.SUBMISSION_UNKNOWN, reason="submission_unknown_adapter_error",
                 source="adapter", raw_evidence={"error": str(exc), "client_order_id": submission.client_order_id},
             )
-        return self._apply_venue_order(intent, submission, order, source="submit_ack")
+        self._checkpoint(fault_hook, "before_local_ack_persistence")
+        return self._apply_venue_order(intent, submission, order, source="submit_ack", fault_hook=fault_hook)
 
-    def request_cancel(self, intent_id: str) -> ExecutionIntent:
+    def request_cancel(self, intent_id: str, *, fault_hook: Any = None) -> ExecutionIntent:
         intent = self._required_intent(intent_id)
         if intent.state not in {ExecutionState.ACKNOWLEDGED, ExecutionState.PARTIALLY_FILLED}:
             return intent
@@ -560,15 +611,17 @@ class ExecutionEngine:
         )
         submission = self._required_submission(intent_id)
         try:
+            self._checkpoint(fault_hook, "before_cancel")
             order = self.adapter.cancel(submission.client_order_id)
+            self._checkpoint(fault_hook, "after_cancel_acceptance")
         except Exception as exc:
             return self.store.transition_execution_intent(
                 intent_id, ExecutionState.RECONCILIATION_REQUIRED, reason="cancel_outcome_unknown", source="adapter",
                 raw_evidence={"error": str(exc)},
             )
-        return self._apply_venue_order(intent, submission, order, source="cancel_ack")
+        return self._apply_venue_order(intent, submission, order, source="cancel_ack", fault_hook=fault_hook)
 
-    def reconcile_intent(self, intent_id: str) -> ExecutionIntent:
+    def reconcile_intent(self, intent_id: str, *, fault_hook: Any = None) -> ExecutionIntent:
         intent = self._required_intent(intent_id)
         submission = self.store.get_execution_submission(intent_id)
         if submission is None:
@@ -576,6 +629,7 @@ class ExecutionEngine:
         now = utc_now()
         run_id = stable_id("phase_d_reconcile_order", intent_id, now)
         self.store.start_execution_reconciliation(run_id, scope="order", started_at=now, evidence={"intent_id": intent_id})
+        self._checkpoint(fault_hook, "before_reconciliation")
         try:
             fills = self.adapter.list_fills(submission.client_order_id)
             for fill in fills:
@@ -613,41 +667,96 @@ class ExecutionEngine:
             intent_id=intent_id, submission_id=submission.submission_id,
             local={"client_order_id": submission.client_order_id}, venue=self._venue_order_evidence(order), recorded_at=now,
         )
-        self.store.complete_execution_reconciliation(run_id, state=ReconciliationState.MATCHED.value, completed_at=now)
-        return self._apply_venue_order(intent, submission, order, source="reconciliation")
+        result = self._apply_venue_order(intent, submission, order, source="reconciliation", fault_hook=fault_hook)
+        reconciliation_state = (
+            ReconciliationState.INCOMPLETE.value
+            if result.state in {ExecutionState.SUBMISSION_UNKNOWN, ExecutionState.RECONCILIATION_REQUIRED}
+            else ReconciliationState.MATCHED.value
+        )
+        self.store.complete_execution_reconciliation(run_id, state=reconciliation_state, completed_at=now)
+        return result
 
-    def reconcile_positions(self) -> dict[str, Any]:
-        """Record venue account evidence without rewriting local provenance."""
+    def reconcile_positions(self, *, fault_hook: Any = None) -> dict[str, Any]:
+        """Record account evidence; unavailable or stale reads never clear risk."""
         now = utc_now()
         run_id = stable_id("phase_d_reconcile_positions", now)
         self.store.start_execution_reconciliation(run_id, scope="positions", started_at=now)
         local = self.store.phase_d_local_positions()
-        venue_rows = self.adapter.get_positions()
+        try:
+            self._checkpoint(fault_hook, "before_reconciliation")
+            venue_rows = self.adapter.get_positions()
+            freshness = getattr(self.adapter, "positions_observation_is_fresh", None)
+            if not callable(freshness) or not freshness():
+                raise _StaleVenueObservation("position_observation_stale_or_freshness_unavailable")
+        except _StaleVenueObservation as exc:
+            self.store.record_execution_reconciliation_item(
+                reconciliation_run_id=run_id, item_id=stable_id("phase_d_reconcile_item", run_id, "stale_positions"),
+                item_type="position", state=ReconciliationState.INCOMPLETE.value, reason=str(exc),
+                local={"positions": local}, recorded_at=now,
+            )
+            self.store.complete_execution_reconciliation(
+                run_id, state=ReconciliationState.INCOMPLETE.value, completed_at=now, evidence={"reason": str(exc)},
+            )
+            return {"reconciliation_run_id": run_id, "state": ReconciliationState.INCOMPLETE.value,
+                    "mismatches": 0, "local_positions": local, "reason": str(exc)}
+        except Exception as exc:
+            self.store.record_execution_reconciliation_item(
+                reconciliation_run_id=run_id, item_id=stable_id("phase_d_reconcile_item", run_id, "adapter_error"),
+                item_type="position", state=ReconciliationState.INCOMPLETE.value, reason="reconciliation_adapter_error",
+                local={"positions": local}, venue={"error": str(exc)}, recorded_at=now,
+            )
+            self.store.complete_execution_reconciliation(
+                run_id, state=ReconciliationState.INCOMPLETE.value, completed_at=now,
+                evidence={"reason": "reconciliation_adapter_error"},
+            )
+            return {"reconciliation_run_id": run_id, "state": ReconciliationState.INCOMPLETE.value,
+                    "mismatches": 0, "local_positions": local, "reason": "reconciliation_adapter_error"}
         venue = {row.symbol: row for row in venue_rows}
         symbols = sorted(set(local) | set(venue))
         mismatches = 0
-        for symbol in symbols:
-            expected = local.get(symbol, 0.0)
-            observed = venue.get(symbol)
-            actual = observed.signed_quantity if observed else 0.0
-            state = ReconciliationState.MATCHED.value if abs(expected - actual) <= EPSILON else ReconciliationState.MISMATCH.value
-            if not local and not venue:
-                state = ReconciliationState.VERIFIED_FLAT.value
-            if state == ReconciliationState.MISMATCH.value:
-                mismatches += 1
-            observation_id = stable_id("phase_d_position_observation", run_id, symbol)
-            self.store.record_execution_position_observation(
-                observation_id=observation_id, reconciliation_run_id=run_id, symbol=symbol,
-                local_signed_quantity=expected, venue_signed_quantity=actual, state=state,
-                observed_at=now, raw_evidence=observed.raw_payload if observed else {},
-            )
+        try:
+            for symbol in symbols:
+                expected = local.get(symbol, 0.0)
+                observed = venue.get(symbol)
+                actual = observed.signed_quantity if observed else 0.0
+                raw = observed.raw_payload if observed else {}
+                if abs(expected - actual) <= EPSILON:
+                    state, reason = ReconciliationState.MATCHED.value, "position_matched"
+                elif raw.get("external_manual_activity") and abs(expected) <= EPSILON:
+                    state, reason = ReconciliationState.UNKNOWN_POSITION.value, "external_manual_position"
+                elif observed is None:
+                    state, reason = ReconciliationState.MISMATCH.value, "local_position_missing_at_venue"
+                elif expected * actual < -EPSILON:
+                    state, reason = ReconciliationState.MISMATCH.value, "position_direction_mismatch"
+                else:
+                    state, reason = ReconciliationState.MISMATCH.value, "position_quantity_mismatch"
+                if state != ReconciliationState.MATCHED.value:
+                    mismatches += 1
+                observation_id = stable_id("phase_d_position_observation", run_id, symbol)
+                self.store.record_execution_position_observation(
+                    observation_id=observation_id, reconciliation_run_id=run_id, symbol=symbol,
+                    local_signed_quantity=expected, venue_signed_quantity=actual, state=state,
+                    observed_at=now, raw_evidence=raw,
+                )
+                self._checkpoint(fault_hook, "after_position_observation")
+                self.store.record_execution_reconciliation_item(
+                    reconciliation_run_id=run_id, item_id=stable_id("phase_d_reconcile_item", run_id, "position", symbol),
+                    item_type="position", state=state, reason=reason,
+                    local={"symbol": symbol, "signed_quantity": expected},
+                    venue={"symbol": symbol, "signed_quantity": actual, "raw": raw}, recorded_at=now,
+                )
+        except Exception as exc:
             self.store.record_execution_reconciliation_item(
-                reconciliation_run_id=run_id, item_id=stable_id("phase_d_reconcile_item", run_id, "position", symbol),
-                item_type="position", state=state,
-                reason="position_matched" if state == ReconciliationState.MATCHED.value else "reconciliation_position_mismatch",
-                local={"symbol": symbol, "signed_quantity": expected},
-                venue={"symbol": symbol, "signed_quantity": actual, "raw": observed.raw_payload if observed else {}}, recorded_at=now,
+                reconciliation_run_id=run_id, item_id=stable_id("phase_d_reconcile_item", run_id, "partial"),
+                item_type="position", state=ReconciliationState.INCOMPLETE.value, reason="reconciliation_interrupted",
+                local={"positions": local}, venue={"error": str(exc)}, recorded_at=now,
             )
+            self.store.complete_execution_reconciliation(
+                run_id, state=ReconciliationState.INCOMPLETE.value, completed_at=now,
+                evidence={"reason": "reconciliation_interrupted"},
+            )
+            return {"reconciliation_run_id": run_id, "state": ReconciliationState.INCOMPLETE.value,
+                    "mismatches": mismatches, "local_positions": local, "reason": "reconciliation_interrupted"}
         result_state = (
             ReconciliationState.VERIFIED_FLAT.value if not symbols else
             ReconciliationState.MATCHED.value if mismatches == 0 else ReconciliationState.MISMATCH.value
@@ -655,18 +764,93 @@ class ExecutionEngine:
         self.store.complete_execution_reconciliation(run_id, state=result_state, completed_at=now, evidence={"mismatches": mismatches})
         return {"reconciliation_run_id": run_id, "state": result_state, "mismatches": mismatches, "local_positions": local}
 
+    def verify_flat(self, *, fault_hook: Any = None) -> dict[str, Any]:
+        """Fail closed before declaring a recovery baseline safely flat.
+
+        This observes venue positions and orders but never rebaselines or
+        rewrites local accounting.  A future explicit operator action must
+        consume this evidence separately.
+        """
+        now = utc_now()
+        run_id = stable_id("phase_d_verify_flat", now)
+        self.store.start_execution_reconciliation(run_id, scope="verified_flat", started_at=now)
+        local = self.store.phase_d_local_positions()
+        try:
+            self._checkpoint(fault_hook, "before_reconciliation")
+            venue_rows = self.adapter.get_positions()
+            list_open_orders = getattr(self.adapter, "list_open_orders", None)
+            if not callable(list_open_orders):
+                raise _StaleVenueObservation("open_order_observation_unavailable")
+            open_orders = list_open_orders()
+            freshness = getattr(self.adapter, "positions_observation_is_fresh", None)
+            if not callable(freshness) or not freshness():
+                raise _StaleVenueObservation("position_observation_stale_or_freshness_unavailable")
+        except Exception as exc:
+            reason = str(exc) if isinstance(exc, _StaleVenueObservation) else "verified_flat_adapter_error"
+            self.store.record_execution_reconciliation_item(
+                reconciliation_run_id=run_id, item_id=stable_id("phase_d_reconcile_item", run_id, "verification_error"),
+                item_type="verified_flat", state=ReconciliationState.INCOMPLETE.value, reason=reason,
+                local={"positions": local}, venue={"error": str(exc)}, recorded_at=now,
+            )
+            self.store.complete_execution_reconciliation(
+                run_id, state=ReconciliationState.INCOMPLETE.value, completed_at=now, evidence={"reason": reason},
+            )
+            return {"reconciliation_run_id": run_id, "state": ReconciliationState.INCOMPLETE.value, "reason": reason}
+        venue_positions = {row.symbol: row.signed_quantity for row in venue_rows if abs(row.signed_quantity) > EPSILON}
+        unresolved = self.store.execution_unresolved_submissions()
+        active_orders = [
+            order for order in open_orders
+            if order.status in {VenueOrderStatus.ACKNOWLEDGED, VenueOrderStatus.PARTIALLY_FILLED}
+        ]
+        failures: list[str] = []
+        if local:
+            failures.append("local_position_not_flat")
+        if venue_positions:
+            failures.append("venue_position_not_flat")
+        if active_orders:
+            failures.append("open_order_present")
+        if unresolved:
+            failures.append("unresolved_submission_present")
+        state = ReconciliationState.VERIFIED_FLAT.value if not failures else ReconciliationState.INCOMPLETE.value
+        reason = "verified_flat" if not failures else ",".join(failures)
+        for order in active_orders:
+            self.store.record_execution_reconciliation_item(
+                reconciliation_run_id=run_id,
+                item_id=stable_id("phase_d_reconcile_item", run_id, "open_order", order.client_order_id),
+                item_type="open_order", state=ReconciliationState.INCOMPLETE.value, reason="open_order_present",
+                venue=self._venue_order_evidence(order), recorded_at=now,
+            )
+        self.store.record_execution_reconciliation_item(
+            reconciliation_run_id=run_id, item_id=stable_id("phase_d_reconcile_item", run_id, "verified_flat"),
+            item_type="verified_flat", state=state, reason=reason,
+            local={"positions": local, "unresolved_intent_ids": [item["intent_id"] for item in unresolved]},
+            venue={"positions": venue_positions, "open_order_ids": [item.client_order_id for item in active_orders]}, recorded_at=now,
+        )
+        self.store.complete_execution_reconciliation(
+            run_id, state=state, completed_at=now,
+            evidence={"reason": reason, "local_positions": local, "venue_positions": venue_positions,
+                      "open_orders": len(active_orders), "unresolved_submissions": len(unresolved)},
+        )
+        return {"reconciliation_run_id": run_id, "state": state, "reason": reason,
+                "local_positions": local, "venue_positions": venue_positions,
+                "open_orders": len(active_orders), "unresolved_submissions": len(unresolved)}
+
     def _apply_venue_order(
         self, intent: ExecutionIntent, submission: ExecutionSubmission, order: VenueOrder, *, source: str,
+        fault_hook: Any = None,
     ) -> ExecutionIntent:
         # Fill events can arrive before their acknowledgement.  Persist and
         # deduplicate them first, then derive state from the strongest evidence.
         for fill in self.adapter.list_fills(submission.client_order_id):
+            self._checkpoint(fault_hook, "before_local_fill_persistence")
             self.store.record_execution_venue_fill(intent.intent_id, submission.submission_id, fill)
+            self._checkpoint(fault_hook, "after_local_fill_persistence")
         persisted_fills = sum(float(row["quantity"]) for row in self.store.list_execution_fills(intent.intent_id))
         updated_submission = self.store.update_execution_submission(
             intent.intent_id, state=order.status.value, venue_order_id=order.venue_order_id,
             filled_quantity=order.filled_quantity, raw_evidence=self._venue_order_evidence(order), updated_at=order.venue_timestamp,
         )
+        self._checkpoint(fault_hook, "after_submission_persistence")
         if order.filled_quantity > persisted_fills + EPSILON:
             # A venue position/order is evidence of exposure, not permission to
             # invent fills.  Surface missing fill provenance and fail closed.
@@ -675,10 +859,17 @@ class ExecutionEngine:
                 source=source, raw_evidence={"venue_filled_quantity": order.filled_quantity, "local_filled_quantity": persisted_fills},
             )
         next_state = self._state_for_order(order, persisted_fills, updated_submission.requested_quantity)
-        return self.store.transition_execution_intent(
+        current = self._required_intent(intent.intent_id)
+        if current.state is ExecutionState.CANCEL_PENDING and next_state is ExecutionState.ACKNOWLEDGED:
+            # A restart between cancellation persistence and venue response
+            # must not treat a stale open-order read as a cancellation rollback.
+            return current
+        result = self.store.transition_execution_intent(
             intent.intent_id, next_state, reason=self._order_reason(order), source=source,
             raw_evidence=self._venue_order_evidence(order),
         )
+        self._checkpoint(fault_hook, "after_state_transition_persistence")
+        return result
 
     @staticmethod
     def _state_for_order(order: VenueOrder, persisted_fills: float, requested_quantity: float) -> ExecutionState:
@@ -718,3 +909,8 @@ class ExecutionEngine:
         if not submission:
             raise KeyError(f"No Phase-D submission for intent: {intent_id}")
         return submission
+
+    @staticmethod
+    def _checkpoint(fault_hook: Any, checkpoint: str) -> None:
+        if fault_hook:
+            fault_hook(checkpoint)

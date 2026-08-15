@@ -173,8 +173,35 @@ committed `copy_execution_attempt` and `copy_execution_fills` record. These
 legacy rows retain their original meaning and are never rewritten. A skipped
 paper entry becomes a durable D `BLOCKED` intent with its original reason;
 legitimate paper reductions/closes remain projected as `FILLED` intents.
-- **D.3:** extend crash, stale-read, race, and account-reconciliation chaos
-  coverage.
+
+## D.3 reconciliation and chaos hardening
+
+`DeterministicFaultInjector` creates reproducible process-loss analogues at
+intent persistence, state transitions, submit, acknowledgement, fill
+persistence, cancellation, and reconciliation checkpoints. A fault never
+creates a retry path: a persisted submission identity resumes through
+reconciliation and venue fill IDs remain deduplicated by the ledger.
+
+Position reconciliation now records `INCOMPLETE` for adapter failure, stale
+or freshness-unknown observations, and an interrupted observation pass.
+Manual simulator positions are labelled `UNKNOWN_POSITION`, and quantity,
+direction, and missing-local/missing-venue cases carry distinct reasons.
+The latest incomplete/mismatch run blocks new exposure; it does not rewrite
+local fill provenance. The read model exposes this as execution health.
+
+`verify_flat()` is evidence-only. It succeeds only when the adapter reports
+a fresh position observation, no local or venue position, no open order able
+to create exposure, and no submission in an ambiguous/in-flight state. It
+records a reconciliation run but does not rebaseline, delete, or invent any
+history. An explicit operator rebaseline remains future work.
+
+| Degraded condition | OPEN / ADD | REDUCE / CLOSE | CANCEL |
+| --- | --- | --- | --- |
+| Position mismatch or stale/unavailable reconciliation | Blocked | Only when caller supplies a direction-and-size-bounded verified position | Existing cancellation may reconcile; no blind retry |
+| Unknown/in-flight increasing submission | Blocked | Available if independently bounded | Reconcile first |
+| Direction mismatch | Blocked | Blocked when it would increase the observed opposite exposure | Reconcile first |
+| Hard transport stop | Blocked | Blocked because no safe adapter action can be transmitted | Blocked |
+
 - **D.4:** add a strictly read-only real-venue shadow adapter for metadata and
   account comparison; still no signing or order writes.
 - **D.5:** separately review a live adapter skeleton with multiple independent
