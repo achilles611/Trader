@@ -24,7 +24,10 @@ class ControlCenterLauncherTests(unittest.TestCase):
             config = replace(base, artifacts=replace(base.artifacts, database_path=Path(directory) / "copytrade.sqlite3"))
             app = create_control_center_app(config)
         paths = {item.path for item in app.routes}
-        self.assertTrue({"/api/recovery", "/api/recovery/{wallet}/safe-rebaseline", "/api/execution"} <= paths)
+        self.assertTrue({
+            "/api/recovery", "/api/recovery/{wallet}/safe-rebaseline", "/api/execution",
+            "/api/execution/shadow/refresh",
+        } <= paths)
 
 
 if __name__ == "__main__":  # pragma: no cover

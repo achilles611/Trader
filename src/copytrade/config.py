@@ -44,6 +44,16 @@ class SourceConfig:
 
 
 @dataclass(frozen=True)
+class ShadowObservationConfig:
+    """Read-only D.4 account observation; it carries no trading authority."""
+
+    enabled: bool = False
+    venue: str = "hyperliquid"
+    account_id: str = ""
+    max_age_seconds: float = 60.0
+
+
+@dataclass(frozen=True)
 class CapitalConfig:
     initial_capital: float = 200.0
     currency: str = "USD"
@@ -243,6 +253,7 @@ class CopyTradeConfig:
     mode: str = "paper"
     live_enabled: bool = False
     source: SourceConfig = field(default_factory=SourceConfig)
+    shadow_observation: ShadowObservationConfig = field(default_factory=ShadowObservationConfig)
     capital: CapitalConfig = field(default_factory=CapitalConfig)
     sizing: SizingConfig = field(default_factory=SizingConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
@@ -269,6 +280,7 @@ class CopyTradeConfig:
             raise ValueError("copytrade config must be a YAML mapping.")
 
         source = _section(document, "source")
+        shadow_observation = _section(document, "shadow_observation")
         capital = _section(document, "capital")
         sizing = _section(document, "sizing")
         risk = _section(document, "risk")
@@ -296,6 +308,7 @@ class CopyTradeConfig:
             mode=mode,
             live_enabled=live_enabled,
             source=SourceConfig(**source),
+            shadow_observation=ShadowObservationConfig(**shadow_observation),
             capital=CapitalConfig(**capital),
             sizing=SizingConfig(
                 **{
@@ -360,6 +373,15 @@ class CopyTradeConfig:
             raise ValueError("Live copy trading requires COPYTRADE_MODE=live and COPYTRADE_LIVE_ENABLED=true.")
         if self.mode == "live":
             raise ValueError("Live copy trading is not implemented in this alpha; use paper mode.")
+        if self.shadow_observation.venue.lower() != "hyperliquid":
+            raise ValueError("D.4 shadow observation currently supports only the Hyperliquid public read-only venue.")
+        if self.shadow_observation.max_age_seconds <= 0:
+            raise ValueError("shadow_observation.max_age_seconds must be positive.")
+        if self.shadow_observation.enabled:
+            account_id = self.shadow_observation.account_id.lower()
+            if not (account_id.startswith("0x") and len(account_id) == 42
+                    and all(character in "0123456789abcdef" for character in account_id[2:])):
+                raise ValueError("shadow_observation.account_id must be a public 0x-prefixed 20-byte account address.")
         if self.capital.initial_capital <= 0:
             raise ValueError("capital.initial_capital must be positive.")
         if not 0 <= self.sizing.small_fraction <= self.sizing.medium_fraction <= self.sizing.large_fraction <= 1:

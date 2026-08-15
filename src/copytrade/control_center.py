@@ -456,6 +456,7 @@ class CopyControlCenter:
 
     def __init__(
         self, config: CopyTradeConfig, database: CopyTradeDatabase | None = None, *, execution_service: Any | None = None,
+        shadow_adapter: Any | None = None,
     ) -> None:
         self.config = config
         self.database = database or CopyTradeDatabase(config.artifacts.database_path)
@@ -463,6 +464,7 @@ class CopyControlCenter:
         self.store = ControlCenterStore(config.artifacts.database_path)
         self.store.initialize()
         self._execution_service = execution_service
+        self._shadow_adapter = shadow_adapter
 
     def _paper_service(self) -> Any:
         """Return the single service that owns mutable PAPER engine state."""
@@ -1104,7 +1106,26 @@ class CopyControlCenter:
 
     def execution_health(self) -> dict[str, Any]:
         """Versioned Phase-D visibility from ledger state, never live transport."""
-        return self.database.execution_read_model()
+        result = self.database.execution_read_model()
+        shadow = self.config.shadow_observation
+        if shadow.enabled:
+            from .shadow import SHADOW_EXECUTION_DOMAIN, shadow_execution_account_id
+            account_id = shadow.account_id.lower()
+            result["shadow"] = self.database.shadow_read_model(
+                configured=True, venue=shadow.venue.lower(), account_id=account_id,
+                execution_domain=SHADOW_EXECUTION_DOMAIN,
+                execution_account_id=shadow_execution_account_id(shadow.venue, account_id),
+            )
+        return result
+
+    def refresh_shadow_observation(self) -> dict[str, Any]:
+        """Perform one remote read-only D.4 refresh and persist its evidence."""
+        shadow = self.config.shadow_observation
+        if not shadow.enabled:
+            return self.database.shadow_read_model(configured=False)
+        from .shadow import HyperliquidReadOnlyShadowAdapter, ShadowObservationService
+        adapter = self._shadow_adapter or HyperliquidReadOnlyShadowAdapter(self.config.source)
+        return ShadowObservationService(self.database, adapter, shadow).refresh()
 
     def activity(self, *, limit: int = 100, wallet: str | None = None) -> list[dict[str, Any]]:
         manual = self.store.activities(limit=limit, wallet=wallet)
@@ -1481,6 +1502,12 @@ def create_control_center_app(
     @app.get("/api/execution")
     async def api_execution() -> dict[str, Any]:
         return center.execution_health()
+
+    @app.post("/api/execution/shadow/refresh")
+    async def api_refresh_shadow_observation() -> dict[str, Any]:
+        # This endpoint appends local evidence after public venue reads only;
+        # it has no execution adapter, write, signing, or credential path.
+        return center.refresh_shadow_observation()
 
     @app.get("/api/recovery")
     async def api_recovery(wallet: str | None = None) -> dict[str, Any]:

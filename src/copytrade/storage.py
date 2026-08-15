@@ -482,6 +482,18 @@ class CopyTradeDatabase:
                 );
                 CREATE INDEX IF NOT EXISTS idx_phase_d_execution_integrity_issues_scope
                     ON phase_d_execution_integrity_issues(execution_domain, execution_account_id, recorded_at);
+                -- D.4 observations are independent, append-only read-only
+                -- evidence. They are never execution authority by themselves.
+                CREATE TABLE IF NOT EXISTS phase_d_shadow_observations (
+                    observation_id TEXT PRIMARY KEY, execution_domain TEXT NOT NULL,
+                    execution_account_id TEXT NOT NULL, venue TEXT NOT NULL, account_id TEXT NOT NULL,
+                    state TEXT NOT NULL, freshness TEXT NOT NULL, observed_at TEXT, received_at TEXT NOT NULL,
+                    reason TEXT NOT NULL, components_json TEXT NOT NULL DEFAULT '{}',
+                    normalized_json TEXT NOT NULL DEFAULT '{}', comparison_json TEXT NOT NULL DEFAULT '{}',
+                    raw_evidence_json TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE INDEX IF NOT EXISTS idx_phase_d_shadow_observations_scope
+                    ON phase_d_shadow_observations(execution_domain, execution_account_id, received_at, observation_id);
                 """
             )
             self._ensure_column(connection, "copy_signals", "target_position_before", "REAL NOT NULL DEFAULT 0")
@@ -3316,6 +3328,98 @@ class CopyTradeDatabase:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def record_shadow_observation(self, observation: Mapping[str, Any]) -> bool:
+        """Append one already-sanitized D.4 observation without rewriting history."""
+        required = (
+            "observation_id", "execution_domain", "execution_account_id", "venue", "account_id", "state",
+            "freshness", "received_at", "reason", "components", "normalized", "comparison", "raw_evidence",
+        )
+        missing = [name for name in required if name not in observation]
+        if missing:
+            raise ValueError("Shadow observation missing required fields: " + ", ".join(missing))
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO phase_d_shadow_observations(
+                    observation_id, execution_domain, execution_account_id, venue, account_id, state, freshness,
+                    observed_at, received_at, reason, components_json, normalized_json, comparison_json, raw_evidence_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(observation["observation_id"]), str(observation["execution_domain"]),
+                    str(observation["execution_account_id"]), str(observation["venue"]), str(observation["account_id"]),
+                    str(observation["state"]), str(observation["freshness"]), observation.get("observed_at"),
+                    str(observation["received_at"]), str(observation["reason"]),
+                    _dump(dict(observation["components"])), _dump(dict(observation["normalized"])),
+                    _dump(dict(observation["comparison"])), _dump(dict(observation["raw_evidence"])),
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def latest_shadow_observation(
+        self, *, execution_domain: str, execution_account_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT * FROM phase_d_shadow_observations
+                   WHERE execution_domain=? AND execution_account_id=?
+                   ORDER BY received_at DESC, observation_id DESC LIMIT 1""",
+                (execution_domain, execution_account_id),
+            ).fetchone()
+        if row is None:
+            return None
+        value = dict(row)
+        for name, default in (
+            ("components_json", {}), ("normalized_json", {}), ("comparison_json", {}), ("raw_evidence_json", {}),
+        ):
+            value[name[:-5]] = _load(value.pop(name), default)
+        return value
+
+    def list_shadow_observations(
+        self, *, execution_domain: str, execution_account_id: str, limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM phase_d_shadow_observations
+                   WHERE execution_domain=? AND execution_account_id=?
+                   ORDER BY received_at DESC, observation_id DESC LIMIT ?""",
+                (execution_domain, execution_account_id, limit),
+            ).fetchall()
+        values: list[dict[str, Any]] = []
+        for row in rows:
+            value = dict(row)
+            for name, default in (
+                ("components_json", {}), ("normalized_json", {}), ("comparison_json", {}), ("raw_evidence_json", {}),
+            ):
+                value[name[:-5]] = _load(value.pop(name), default)
+            values.append(value)
+        return values
+
+    def shadow_read_model(
+        self, *, configured: bool = False, venue: str | None = None, account_id: str | None = None,
+        execution_domain: str | None = None, execution_account_id: str | None = None,
+    ) -> dict[str, Any]:
+        """D.4 operator visibility; it never feeds simulator execution authority."""
+        if not configured:
+            return {
+                "configured": False, "state": "NOT_CONFIGURED", "read_only": True,
+                "reason": "shadow_observation_not_configured", "latest_observation": None, "history": [],
+            }
+        if not all((venue, account_id, execution_domain, execution_account_id)):
+            raise ValueError("Configured shadow read model requires venue, account, domain, and account scope.")
+        latest = self.latest_shadow_observation(
+            execution_domain=str(execution_domain), execution_account_id=str(execution_account_id),
+        )
+        return {
+            "configured": True, "read_only": True, "venue": str(venue), "account_id": str(account_id),
+            "execution_domain": str(execution_domain), "execution_account_id": str(execution_account_id),
+            "state": latest["state"] if latest else "NOT_YET_OBSERVED",
+            "freshness": latest["freshness"] if latest else "UNKNOWN",
+            "reason": latest["reason"] if latest else "shadow_observation_pending",
+            "latest_observation": latest,
+            "history": self.list_shadow_observations(
+                execution_domain=str(execution_domain), execution_account_id=str(execution_account_id), limit=20,
+            ),
+        }
+
     def execution_read_model(self, *, limit: int = 50) -> dict[str, Any]:
         """Stable read model for the future control center; no mutable engine access."""
         execution_domain, execution_account_id = "SIMULATOR", "SIMULATOR:default"
@@ -3433,6 +3537,7 @@ class CopyTradeDatabase:
             "integrity_issues": self.list_execution_integrity_issues(
                 execution_domain=execution_domain, execution_account_id=execution_account_id,
             )[:limit],
+            "shadow": self.shadow_read_model(),
             "paper_compatibility_audit": {
                 "execution_domain": "PAPER_COMPAT",
                 "execution_account_id": "PAPER_COMPAT:legacy_paper",

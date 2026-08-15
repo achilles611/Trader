@@ -14,6 +14,14 @@ source:
   subscribe_position_state: true
   subscribe_market_data: true
 
+# Phase D.4 is opt-in, public-account observation only.  This setting cannot
+# enable trading, signing, submissions, cancellations, or live copy mode.
+shadow_observation:
+  enabled: false
+  venue: hyperliquid
+  account_id: ""
+  max_age_seconds: 60.0
+
 # Optionally list manually researched wallets.  Importing a CSV is usually
 # preferable so this example remains non-prescriptive.
 targets: []

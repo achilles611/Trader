@@ -51,6 +51,7 @@ All tables are additive and use the `phase_d_` namespace. Existing
 | `phase_d_execution_reconciliation_runs/items` | Independently-scoped intent-order, position, open-order, and verified-flat evidence and discrepancies |
 | `phase_d_execution_position_observations` | Local-fill-derived exposure compared with venue observations |
 | `phase_d_execution_integrity_issues` | Immutable contradictions such as conflicting IDs, side conflicts, and overfills |
+| `phase_d_shadow_observations` | Append-only D.4 public-account shadow snapshots, bounded raw provenance, freshness, and non-authoritative comparison |
 
 Every Phase-D row is scoped by `execution_domain` and `execution_account_id`.
 Simulator lifecycle work uses `SIMULATOR` / `SIMULATOR:default`; the legacy
@@ -164,8 +165,9 @@ position mismatches. It is the fault-injection lab for D.1–D.3.
 `GET /api/execution` and the Control Center health response read only the
 Phase-D database ledger. They expose simulator-only mode, entry/transport
 state shape, reconciliation, unknown submissions, outstanding/partial orders,
-position mismatches, local exposure, recent intents, and recent fills. There
-is no execution control or live-enable route.
+position mismatches, local exposure, recent intents, and recent fills. D.4
+adds separate shadow-observation visibility without making it execution
+authority. There is no execution control or live-enable route.
 
 ## Remaining roadmap
 
@@ -242,8 +244,60 @@ history. An explicit operator rebaseline remains future work.
 | Direction mismatch | Blocked | Blocked when it would increase the observed opposite exposure | Reconcile first |
 | Hard transport stop | Blocked | Blocked because no safe adapter action can be transmitted | Blocked |
 
-- **D.4:** add a strictly read-only real-venue shadow adapter for metadata and
-  account comparison; still no signing or order writes.
+## D.4 read-only real-venue shadow initiation
+
+D.4 can observe a configured public Hyperliquid account through
+`HyperliquidReadOnlyShadowAdapter`. It is a separate capability boundary from
+`ExecutionAdapter`: it exposes one account-observation operation backed only
+by the existing unauthenticated, rate-governed `/info` client. It has no
+submission, cancellation, amend, transfer, withdrawal, signing, nonce, private
+key, credential, or live-mode capability. The execution engine continues to
+reject it because only `SIMULATOR_ONLY` adapters may enter that write-capable
+engine.
+
+`shadow_observation` is disabled by default and accepts only a public
+`0x` account identifier, venue name, and maximum evidence age. It accepts no
+credential and no environment variable can turn it into live copy trading.
+Shadow rows use `SHADOW_REAL_VENUE` and a deterministic
+`SHADOW:hyperliquid:<account>` scope, never `SIMULATOR` or `PAPER_COMPAT`.
+Account A's snapshots are therefore neither visible as nor usable for account
+B's scope.
+
+One refresh requests account state/positions, open orders, and instrument
+metadata. It normalizes finite signed quantities, symbols, balances, order
+identifiers/statuses, and precision while retaining bounded raw response
+provenance. Each snapshot records venue timestamp, local receipt time,
+component state, freshness, normalized values, and a deterministic comparison.
+Snapshots are append-only. A failed later refresh is persisted as
+`INCOMPLETE`; the read model selects that newest result rather than presenting
+an older healthy snapshot as current.
+
+Freshness is based on a venue-supplied snapshot timestamp and the configured
+maximum age. Missing, invalid, future, or stale timestamps are respectively
+`UNKNOWN`/`STALE` and incomplete. Local receipt time never makes old venue
+evidence fresh. A valid empty array is retained as an empty observation; a
+failed/partial request is explicitly incomplete and is never turned into an
+empty position or order list.
+
+The initial comparison uses simulator positions only as clearly labelled
+non-authoritative operator context. It reports exact, quantity, direction,
+venue-only, local-only, unsupported-symbol, external-unattributed-order, and
+incomplete states.
+It cannot attribute a real order by symbol/size coincidence. Shadow evidence
+does not clear position or open-order latches, integrity issues, or any D.3.2
+combined safety state; it does not authorize an entry or a reduction. A
+configured unhealthy shadow is operator-visible, while an unconfigured shadow
+does not make the simulator unusable.
+
+The Control Center System view and `GET /api/execution` show configured state,
+venue/account, latest observation, freshness, component/comparison status, and
+historical evidence. Its `POST /api/execution/shadow/refresh` endpoint only
+performs public reads and appends local audit evidence; it cannot mutate venue
+state and presents no execution or live-enable control.
+
+- **D.4 remaining hardening:** broaden read-only schema support only when a
+  venue supplies a documented timestamp/complete account snapshot contract;
+  do not infer missing freshness or attribution.
 - **D.5:** separately review a live adapter skeleton with multiple independent
   enablement gates, credential isolation, and explicit acceptance. No D.0
   configuration can make capital move.

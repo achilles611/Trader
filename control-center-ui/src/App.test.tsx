@@ -21,6 +21,7 @@ let emptyUniverse = false;
 let filteredEmpty = false;
 let discoveryJobResponse: Record<string, unknown> | null = null;
 let discoveryJobDetailResponse: Record<string, unknown> | null = null;
+let shadowResponse: Record<string, unknown> = { configured: false, state: "NOT_CONFIGURED", freshness: "UNKNOWN" };
 
 function payload(path: string) {
   if (path.startsWith("/api/overview")) return { counts: { total_discovered: emptyUniverse ? 0 : 20, qualified: 2, shadow: 1, active: 0 }, funnel: [], top_candidates: [candidate], recent_activity: [] };
@@ -31,6 +32,8 @@ function payload(path: string) {
   if (path.startsWith("/api/discovery/source/test")) return { source: "Official HyperCore node data", connection_state: "READY", aws_credentials_detected: true, requester_pays_access: "ready", cache: { object_count: 1, size_bytes: 42 } };
   if (path.startsWith("/api/discovery/jobs/")) return discoveryJobDetailResponse || { job_id: "discovery-1", status: "queued", stage: "queued", configuration: { preset: "standard", candidate_limit: 2500 } };
   if (path.startsWith("/api/discovery/jobs")) return discoveryJobResponse || { job_id: "discovery-1", status: "queued", stage: "queued", configuration: { preset: "standard", candidate_limit: 2500 } };
+  if (path.startsWith("/api/execution/shadow/refresh")) return shadowResponse;
+  if (path.startsWith("/api/execution")) return { shadow: shadowResponse };
   if (path.startsWith("/api/system")) return { health: { mode: "paper", paper_only: true, database: { connected: true }, websocket: { available: true }, watcher: { state: "NOT_ATTACHED", desired_target_count: 0, subscribed_target_count: 0, membership_in_sync: true }, recovery: { wallets: [{ wallet: candidate.wallet, state: "RECOVERY_INCOMPLETE" }] } }, risk: { limits: [] } };
   if (path.startsWith("/api/candidates?")) return { items: emptyUniverse || filteredEmpty ? [] : [candidate], page: path.includes("page=2") ? 2 : 1, page_size: 50, total: emptyUniverse ? 0 : filteredEmpty ? 1 : 51, pages: 2 };
   if (path.startsWith(`/api/candidates/${candidate.wallet}`)) return { identity: { wallet: candidate.wallet, operator_state: "shadow", research_state: "qualified" }, score: { total: 87.3, eligible: true, components: { consistency: 9 }, penalties: { drawdown: 1 }, reasons: ["fixture_reason"] }, phase_a_prefilter_reasons: ["phase_a_fixture"], phase_b_hard_gates: ["phase_b_fixture"], target_performance: {}, follower_performance: {}, latency: { status: "unavailable" }, analysis_window: {} };
@@ -44,6 +47,7 @@ beforeEach(() => {
   filteredEmpty = false;
   discoveryJobResponse = null;
   discoveryJobDetailResponse = null;
+  shadowResponse = { configured: false, state: "NOT_CONFIGURED", freshness: "UNKNOWN" };
   vi.stubGlobal("WebSocket", WebSocketStub);
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => new Response(JSON.stringify(payload(String(input))), { status: 200, headers: { "Content-Type": "application/json" } })));
 });
@@ -186,6 +190,17 @@ describe("copy control center", () => {
     expect(screen.getByText("REST budget")).toBeInTheDocument();
     expect(screen.getByText("429 retry signals")).toBeInTheDocument();
     expect(screen.getByText("Recovery gaps")).toBeInTheDocument();
+  });
+
+  it("exposes the read-only real-venue shadow state without live execution controls", async () => {
+    shadowResponse = { configured: true, venue: "hyperliquid", account_id: candidate.wallet, state: "INCOMPLETE", freshness: "STALE", latest_observation: { comparison: { positions: { state: "INCOMPLETE" }, open_orders: { state: "INCOMPLETE" } } } };
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "System" }));
+    expect(await screen.findByText("Real-venue shadow observation")).toBeInTheDocument();
+    expect(screen.getByText("Public-account reads only. This cannot sign, submit, cancel, or enable live execution.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh read-only shadow observation" }));
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/execution/shadow/refresh", expect.objectContaining({ method: "POST" })));
+    expect(screen.queryByRole("button", { name: /Enable live|Cancel order|Submit order/i })).not.toBeInTheDocument();
   });
 
   it("shows discovery websocket progress and completion navigation", async () => {

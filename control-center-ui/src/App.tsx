@@ -105,7 +105,7 @@ export function App() {
       {page === "Portfolio" && <PortfolioPage portfolio={portfolio} />}
       {page === "Positions" && <PositionsPage livePositions={livePositions} />}
       {page === "Activity" && <ActivityPage liveItems={liveActivity} />}
-      {page === "System" && <SystemPage control={control} watcherHealth={watcherHealth} />}
+      {page === "System" && <><SystemPage control={control} watcherHealth={watcherHealth} /><ShadowObservationStatus /></>}
     </main>
     {toast && <div className={`toast ${toast.tone}`} role="alert"><span>{toast.tone === "error" ? "Action failed" : toast.tone === "warning" ? "Warning" : "Updated"}</span>{toast.message}<button onClick={() => setToast(null)} aria-label="Dismiss notification">×</button></div>}
     {confirmation && <ConfirmationDialog item={confirmation} close={() => setConfirmation(null)} />}
@@ -255,6 +255,20 @@ function SystemPage({ control, watcherHealth }: { control: ControlState | null; 
   const watcher = watcherHealth || health.watcher || {};
   const recovery = health.recovery?.wallets || [];
   return <div className="page-grid">{loadError && <section className="panel span-12"><p className="empty-note">Unable to load system status: {loadError}</p></section>}<section className="panel span-6"><PanelTitle title="System health" /><MetricList values={[["Mode", health.mode || "—"], ["Paper-only", health.paper_only ? "Yes" : "—"], ["Database", health.database?.connected ? "Connected" : "Degraded"], ["Watcher", watcher.state || "NOT_ATTACHED"], ["Supervisor", watcher.supervisor_state || watcher.state || "NOT_ATTACHED"], ["Desired targets", watcher.desired_target_count ?? 0], ["Subscribed targets", watcher.subscribed_target_count ?? 0], ["Membership", watcher.membership_in_sync ? "IN SYNC" : "OUT OF SYNC"], ["Active entry targets", watcher.active_entry_target_count ?? 0], ["Open sleeve wallets", watcher.open_sleeve_wallet_count ?? 0], ["Recovery gaps", recovery.filter((item: any) => item.state !== "CONTINUOUS").length], ["Market data", health.market_data?.fresh ? "Fresh" : "Stale / unavailable"], ["Kill switch", health.kill_switch?.active ? "ACTIVE" : "Off"]]} /></section><section className="panel span-6"><PanelTitle title="Paper control state" /><MetricList values={[["State", control?.state || "—"], ["New OPEN entries", control?.entries_allowed ? "Allowed" : "Paused"], ["Existing exits", "Enabled"], ["WebSocket", health.websocket?.available ? "Available" : "Unavailable"], ["Hyperliquid API", apiRate.state || "READY"], ["REST budget", `${Number(apiRate.estimated_weight_last_minute || 0).toLocaleString()} / ${Number(apiRate.documented_limit || 1200).toLocaleString()} weighted units`], ["429 retry signals", apiRate.retry_count ?? 0], ["HyperCore source", source.connection_state || "SETUP REQUIRED"], ["Cache size", `${Number(source.cache?.size_bytes || 0).toLocaleString()} bytes`], ["Last discovery", health.last_discovery_run?.started_at || "—"], ["Last Phase B", health.last_phase_b_run?.started_at || "—"]]} /></section><section className="panel span-12"><PanelTitle title="Risk controls — current / limit" /><div className="risk-grid">{(risk.limits || []).map((item: any) => <div key={item.label}><div><span>{item.label}</span><strong>{percent(item.current)} / {percent(item.limit)}</strong></div><div className="progress"><i style={{ width: `${Math.min(100, Number(item.current) / Math.max(Number(item.limit), 0.00001) * 100)}%` }} /></div></div>)}</div><p className="muted">These values reflect the existing paper risk gates. This GUI cannot override risk controls or bypass paper-mode validation.</p></section></div>;
+}
+
+function ShadowObservationStatus() {
+  const [shadow, setShadow] = useState<any>(null); const [error, setError] = useState<string | null>(null);
+  const load = useCallback(async () => {
+    try { setShadow((await api<any>("/api/execution")).shadow || {}); setError(null); }
+    catch (failure) { setError(failure instanceof Error ? failure.message : "Could not load shadow observation."); }
+  }, []);
+  useEffect(() => { void load(); }, [load]);
+  const refresh = async () => {
+    try { await post("/api/execution/shadow/refresh"); await load(); }
+    catch (failure) { setError(failure instanceof Error ? failure.message : "Could not refresh shadow observation."); }
+  };
+  return <section className="panel shadow-observation-panel"><PanelTitle title="Real-venue shadow observation" subtitle="Public-account reads only. This cannot sign, submit, cancel, or enable live execution." />{error && <p className="empty-note">{error}</p>}<MetricList values={[["Configured", shadow?.configured ? "Yes" : "No"], ["Venue", shadow?.venue || "—"], ["Account", shadow?.account_id || "—"], ["Observation", shadow?.state || "NOT_CONFIGURED"], ["Freshness", shadow?.freshness || "UNKNOWN"], ["Last observed", shadow?.latest_observation?.observed_at || "—"], ["Last received", shadow?.latest_observation?.received_at || "—"], ["Position comparison", shadow?.latest_observation?.comparison?.positions?.state || "—"], ["Open-order comparison", shadow?.latest_observation?.comparison?.open_orders?.state || "—"]]} />{shadow?.configured ? <button className="button minor" onClick={() => void refresh()}>Refresh read-only shadow observation</button> : <p className="muted">Shadow observation is not configured. It is distinct from simulator and PAPER execution authority.</p>}</section>;
 }
 
 function CandidateDossier({ detail, close, action }: { detail: Record<string, any>; close: () => void; action: (wallet: string, state: string) => void }) {
