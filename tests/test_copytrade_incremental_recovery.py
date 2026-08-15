@@ -19,7 +19,13 @@ def config(root: Path) -> CopyTradeConfig:
     return CopyTradeConfig(
         artifacts=ArtifactConfig(database_path=root / "incremental.sqlite3", obsidian_root=root / "obsidian"),
         sizing=SizingConfig(min_history=1),
-        paper_execution=PaperExecutionConfig(fee_rate=0, slippage_bps=0, min_order_notional=1, random_seed=7),
+        paper_execution=PaperExecutionConfig(
+            fee_rate=0, slippage_bps=0, min_order_notional=1, random_seed=7,
+            # This fixture tests reconstruction chunk equivalence.  Keep the
+            # initial reference market valid across slow Windows workers;
+            # stale-market policy is covered by dedicated tests.
+            market_data_max_age_ms=60_000,
+        ),
         risk=RiskConfig(
             kill_switch_path=root / "kill", max_total_committed_fraction=1, max_capital_per_target_fraction=1,
             max_capital_per_symbol_fraction=1, max_signal_age_seconds=86_400,
