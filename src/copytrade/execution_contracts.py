@@ -103,6 +103,9 @@ LEGAL_EXECUTION_TRANSITIONS: dict[ExecutionState, frozenset[ExecutionState]] = {
     ExecutionState.CANCELLED: frozenset({ExecutionState.FILLED, ExecutionState.RECONCILIATION_REQUIRED}),
     ExecutionState.REJECTED_BY_VENUE: frozenset({ExecutionState.RECONCILIATION_REQUIRED}),
     ExecutionState.EXPIRED: frozenset({ExecutionState.RECONCILIATION_REQUIRED}),
+    # Contradictory immutable venue evidence discovered after a fill must
+    # surface as an alarm instead of being hidden by terminal state.
+    ExecutionState.FILLED: frozenset({ExecutionState.RECONCILIATION_REQUIRED}),
     ExecutionState.RECONCILIATION_REQUIRED: frozenset({
         ExecutionState.ACKNOWLEDGED, ExecutionState.PARTIALLY_FILLED, ExecutionState.FILLED,
         ExecutionState.CANCELLED, ExecutionState.REJECTED_BY_VENUE, ExecutionState.EXPIRED,
@@ -160,13 +163,16 @@ class ExecutionIntent:
     provenance: dict[str, Any] = field(default_factory=dict)
     exposure_effect: ExposureEffect = ExposureEffect.NEUTRAL
     supersedes_intent_id: str | None = None
+    execution_domain: str = "SIMULATOR"
+    execution_account_id: str = "SIMULATOR:default"
     state: ExecutionState = ExecutionState.CREATED
     updated_at: object | None = None
 
     @classmethod
     def from_copy_signal(
         cls, signal: CopySignal, *, accepted_at: object | None = None, provenance: dict[str, Any] | None = None,
-        supersedes_intent_id: str | None = None,
+        supersedes_intent_id: str | None = None, execution_domain: str = "SIMULATOR",
+        execution_account_id: str = "SIMULATOR:default",
     ) -> "ExecutionIntent":
         effect = exposure_effect_for_action(signal.action)
         if signal.target_quantity <= 0:
@@ -195,7 +201,8 @@ class ExecutionIntent:
             action=signal.action.lower(), direction=signal.direction.lower(), requested_quantity=abs(signal.target_quantity),
             requested_capital=signal.requested_capital, source_event_timestamp=signal.source_event_timestamp,
             accepted_at=accepted, provenance=semantic_provenance, exposure_effect=effect,
-            supersedes_intent_id=supersedes_intent_id, updated_at=accepted,
+            supersedes_intent_id=supersedes_intent_id, execution_domain=execution_domain,
+            execution_account_id=execution_account_id, updated_at=accepted,
         )
 
 
@@ -222,6 +229,8 @@ class ExecutionSubmission:
     venue_order_id: str | None = None
     filled_quantity: float = 0.0
     raw_evidence: dict[str, Any] = field(default_factory=dict)
+    execution_domain: str = "SIMULATOR"
+    execution_account_id: str = "SIMULATOR:default"
 
 
 @dataclass(frozen=True)
@@ -256,6 +265,7 @@ class VenueFill:
     price: float
     fee: float
     venue_timestamp: object
+    side: str | None = None
     raw_payload: dict[str, Any] = field(default_factory=dict)
 
 
@@ -283,3 +293,5 @@ class ExecutionSafetyContext:
     market_evidence_current: bool = True
     reconciliation_healthy: bool = True
     verified_positions: dict[str, float] = field(default_factory=dict)
+    verified_positions_current: bool = False
+    verified_positions_authoritative: bool = False

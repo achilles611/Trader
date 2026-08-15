@@ -1,4 +1,4 @@
-# Phase D.0 — execution foundation
+# Phase D — execution foundation and hardening
 
 Phase D is the safety boundary between a Phase-C economic copy decision and a
 future venue action. D.0 establishes durable contracts and a deterministic
@@ -43,13 +43,21 @@ All tables are additive and use the `phase_d_` namespace. Existing
 
 | Table | Responsibility |
 | --- | --- |
-| `phase_d_execution_intents` | Immutable C→D contract, current lifecycle state, provenance, schema version |
+| `phase_d_execution_intents` | Immutable C→D contract, domain/account ownership, current lifecycle state, provenance, schema version |
 | `phase_d_execution_state_events` | Append-only legal transition history |
 | `phase_d_execution_risk_decisions` | Admission decision and structured evidence before submission |
-| `phase_d_execution_submissions` | One deterministic client-order identity per D.0 intent |
-| `phase_d_execution_fills` | Deduplicated normalized venue fills and raw evidence |
+| `phase_d_execution_submissions` | One deterministic client-order identity per intent, with monotonic venue evidence |
+| `phase_d_execution_fills` | Deduplicated normalized venue fills, executed side, and raw evidence |
 | `phase_d_execution_reconciliation_runs/items` | Order/account reconciliation evidence and discrepancies |
 | `phase_d_execution_position_observations` | Local-fill-derived exposure compared with venue observations |
+| `phase_d_execution_integrity_issues` | Immutable contradictions such as conflicting IDs, side conflicts, and overfills |
+
+Every Phase-D row is scoped by `execution_domain` and `execution_account_id`.
+Simulator lifecycle work uses `SIMULATOR` / `SIMULATOR:default`; the legacy
+paper compatibility projection uses `PAPER_COMPAT` /
+`PAPER_COMPAT:legacy_paper`. These domains are never combined for local
+positions, admission, reconciliation health, or the simulator control read
+model. PAPER_COMPAT remains available as a distinct audit projection.
 
 `CopyTradeDatabase.prepare_execution_submission()` writes the submission row
 and transitions the intent to `SUBMITTING` in one SQLite `BEGIN IMMEDIATE`
@@ -79,9 +87,15 @@ remain fills on a cancelled remainder, so the final order state stays
   non-equivalent record raises rather than rewriting history.
 - A unique deterministic `client_order_id` and the prepare transaction make
   concurrent submission workers converge on one external request.
-- `venue_fill_id` is unique per submission, so duplicate/out-of-order fill
-  delivery has one accounting effect.
-- A restart at `CREATED`/`VALIDATING` resumes admission. A restart at
+- `venue_fill_id` is globally unique and duplicate/out-of-order delivery has
+  one accounting effect only when the immutable fill economics agree. A
+  conflicting reuse is recorded as an integrity issue, not ignored.
+- Submission evidence is monotonic: stale acknowledgements cannot regress a
+  terminal/cancelled state or decrease recorded fill quantity. A conflicting
+  non-null venue-order ID is an integrity issue and is never overwritten.
+- A restart at `CREATED`/`VALIDATING` or `READY` requires a newly supplied,
+  explicit safety/admission context; it does not infer health from defaults.
+  A restart at
   `SUBMITTING`, `SUBMISSION_UNKNOWN`, or `RECONCILIATION_REQUIRED` reconciles;
   it never blindly invokes `submit` again.
 
@@ -95,11 +109,17 @@ Authoritative evidence may converge to `ACKNOWLEDGED`, `PARTIALLY_FILLED`,
 fill quantity becomes `RECONCILIATION_REQUIRED`; the ledger never fabricates a
 fill just to make local accounting match a venue position.
 
-Local positions are calculated from deduplicated Phase-D fills, not desired
-intent quantities. `reconcile_positions()` stores the venue observation and
-the discrepancy. An unresolved increase intent or current position mismatch
-blocks new increases. D.0 deliberately has no automatic rebaseline: any
-future verified-flat recovery must be an explicit, audited operator action.
+Local positions are calculated from deduplicated Phase-D fills using each
+fill's executed `BUY`/`SELL` side, never desired intent direction or quantity.
+A fill-side conflict, conflicting fill identity, or overfill is retained as
+evidence, makes the intent `RECONCILIATION_REQUIRED` where transitionable,
+and inhibits future increases for that account. `reconcile_positions()` stores
+the venue observation and the discrepancy. Account-position health is a
+latched authority: only a successful `account_positions`/`verified_flat` run
+for the same domain/account clears an incomplete or mismatch state. Per-intent
+order reconciliation cannot clear it. D.0 deliberately has no automatic
+rebaseline: any future verified-flat recovery must be an explicit, audited
+operator action.
 
 ## Risk and exit semantics
 
@@ -111,8 +131,10 @@ future verified-flat recovery must be an explicit, audited operator action.
   exposure but do not casually remove a safe reduction.
 
 `REDUCE` and `FLATTEN` intents use `reduce_only=True` in the normalized
-submission request. When a verified position is supplied, D.0 rejects an exit
-that would exceed it or reverse its direction using
+submission request. During degraded reconciliation, an exit requires a
+current authoritative verified position snapshot; otherwise it is blocked as
+`reduce_only_verified_position_required`. Once that snapshot is present, D.0
+still rejects an exit that would exceed it or reverse its direction using
 `reduce_only_size_exceeds_position` or `reduce_only_direction_mismatch`.
 
 ## Adapter and simulator
@@ -161,7 +183,10 @@ New durable PAPER attempts write their Phase-D intent, decision, submission,
 fill, and transition evidence inside the existing atomic paper commit. That
 transaction remains the sole economic authority for legacy claims, virtual
 sleeves, simulated fills, and portfolio snapshots, so the compatibility
-projection cannot double-apply a sleeve or P&L mutation.
+projection cannot double-apply a sleeve or P&L mutation. The projection is
+explicitly tagged `PAPER_COMPAT` / `PAPER_COMPAT:legacy_paper`, preventing
+paper economics from becoming simulator exposure or simulator reconciliation
+authority.
 
 Because PAPER evidence is already terminal at that point, its compatibility
 projection writes one immutable terminal event with the semantic lifecycle in
@@ -186,8 +211,10 @@ Position reconciliation now records `INCOMPLETE` for adapter failure, stale
 or freshness-unknown observations, and an interrupted observation pass.
 Manual simulator positions are labelled `UNKNOWN_POSITION`, and quantity,
 direction, and missing-local/missing-venue cases carry distinct reasons.
-The latest incomplete/mismatch run blocks new exposure; it does not rewrite
-local fill provenance. The read model exposes this as execution health.
+The latest incomplete/mismatch account run blocks new exposure; an order-only
+run cannot clear that authority. It does not rewrite local fill provenance.
+The read model exposes account and intent-order reconciliation separately as
+execution health.
 
 `verify_flat()` is evidence-only. It succeeds only when the adapter reports
 a fresh position observation, no local or venue position, no open order able

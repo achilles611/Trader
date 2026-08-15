@@ -97,8 +97,16 @@ class PhaseDPaperIntegrationTests(unittest.TestCase):
             engine = PaperExecutionEngine(config(root), database)
             engine.process_signal(signal("open"))
             close = engine.process_signal(signal("close", action="close", quantity=1, before=1), forced_reason=None)
+            blocked = engine.process_signal(signal("new-entry"), forced_reason="entry_control_paused")
             self.assertEqual(close.status, "filled")
             self.assertEqual(database.get_execution_intent_for_signal(close.signal_id).state, ExecutionState.FILLED)  # type: ignore[union-attr]
+            self.assertEqual(blocked.status, "skipped")
+            blocked_intent = database.get_execution_intent_for_signal(blocked.signal_id)
+            self.assertEqual(blocked_intent.state, ExecutionState.BLOCKED)  # type: ignore[union-attr]
+            self.assertEqual(
+                database.latest_execution_risk_decision(blocked_intent.intent_id)["reason"],  # type: ignore[union-attr]
+                "entry_control_paused",
+            )
 
 
 if __name__ == "__main__":  # pragma: no cover

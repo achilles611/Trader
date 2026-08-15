@@ -22,6 +22,7 @@ from .execution_contracts import (
     ReconciliationState,
     TERMINAL_EXECUTION_STATES,
     VenueFill,
+    VenueOrderStatus,
     validate_execution_transition,
 )
 from .models import (
@@ -392,7 +393,9 @@ class CopyTradeDatabase:
                     requested_quantity REAL NOT NULL, requested_capital REAL NOT NULL,
                     source_event_timestamp TEXT NOT NULL, accepted_at TEXT NOT NULL,
                     provenance_json TEXT NOT NULL, exposure_effect TEXT NOT NULL,
-                    supersedes_intent_id TEXT, state TEXT NOT NULL, updated_at TEXT NOT NULL
+                    supersedes_intent_id TEXT, execution_domain TEXT NOT NULL DEFAULT 'SIMULATOR',
+                    execution_account_id TEXT NOT NULL DEFAULT 'SIMULATOR:default',
+                    state TEXT NOT NULL, updated_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_phase_d_execution_intents_state
                     ON phase_d_execution_intents(state, updated_at);
@@ -417,7 +420,8 @@ class CopyTradeDatabase:
                 CREATE TABLE IF NOT EXISTS phase_d_execution_submissions (
                     submission_id TEXT PRIMARY KEY, intent_id TEXT NOT NULL UNIQUE,
                     client_order_id TEXT NOT NULL UNIQUE, requested_quantity REAL NOT NULL,
-                    side TEXT NOT NULL, state TEXT NOT NULL, venue_order_id TEXT,
+                    side TEXT NOT NULL, execution_domain TEXT NOT NULL DEFAULT 'SIMULATOR',
+                    execution_account_id TEXT NOT NULL DEFAULT 'SIMULATOR:default', state TEXT NOT NULL, venue_order_id TEXT,
                     filled_quantity REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL, raw_evidence_json TEXT NOT NULL DEFAULT '{}',
                     FOREIGN KEY(intent_id) REFERENCES phase_d_execution_intents(intent_id)
@@ -427,6 +431,8 @@ class CopyTradeDatabase:
                 CREATE TABLE IF NOT EXISTS phase_d_execution_fills (
                     execution_fill_id TEXT PRIMARY KEY, intent_id TEXT NOT NULL,
                     submission_id TEXT NOT NULL, venue_fill_id TEXT NOT NULL,
+                    execution_domain TEXT NOT NULL DEFAULT 'SIMULATOR',
+                    execution_account_id TEXT NOT NULL DEFAULT 'SIMULATOR:default', side TEXT NOT NULL DEFAULT 'BUY',
                     quantity REAL NOT NULL, price REAL NOT NULL, fee REAL NOT NULL,
                     venue_timestamp TEXT NOT NULL, received_at TEXT NOT NULL,
                     raw_evidence_json TEXT NOT NULL DEFAULT '{}',
@@ -436,10 +442,14 @@ class CopyTradeDatabase:
                 );
                 CREATE INDEX IF NOT EXISTS idx_phase_d_execution_fills_intent
                     ON phase_d_execution_fills(intent_id, venue_timestamp);
+                CREATE INDEX IF NOT EXISTS idx_phase_d_execution_fills_domain_account
+                    ON phase_d_execution_fills(execution_domain, execution_account_id, venue_timestamp);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_phase_d_execution_fills_venue_fill_id
                     ON phase_d_execution_fills(venue_fill_id);
                 CREATE TABLE IF NOT EXISTS phase_d_execution_reconciliation_runs (
                     reconciliation_run_id TEXT PRIMARY KEY, scope TEXT NOT NULL,
+                    execution_domain TEXT NOT NULL DEFAULT 'SIMULATOR',
+                    execution_account_id TEXT NOT NULL DEFAULT 'SIMULATOR:default',
                     state TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT,
                     evidence_json TEXT NOT NULL DEFAULT '{}'
                 );
@@ -454,16 +464,71 @@ class CopyTradeDatabase:
                     ON phase_d_execution_reconciliation_items(reconciliation_run_id, state);
                 CREATE TABLE IF NOT EXISTS phase_d_execution_position_observations (
                     observation_id TEXT PRIMARY KEY, reconciliation_run_id TEXT NOT NULL,
-                    symbol TEXT NOT NULL, local_signed_quantity REAL NOT NULL,
+                    execution_domain TEXT NOT NULL DEFAULT 'SIMULATOR',
+                    execution_account_id TEXT NOT NULL DEFAULT 'SIMULATOR:default', symbol TEXT NOT NULL, local_signed_quantity REAL NOT NULL,
                     venue_signed_quantity REAL, state TEXT NOT NULL, observed_at TEXT NOT NULL,
                     raw_evidence_json TEXT NOT NULL DEFAULT '{}',
                     FOREIGN KEY(reconciliation_run_id) REFERENCES phase_d_execution_reconciliation_runs(reconciliation_run_id)
                 );
-                CREATE INDEX IF NOT EXISTS idx_phase_d_execution_position_observations_symbol
-                    ON phase_d_execution_position_observations(symbol, observed_at);
+                CREATE INDEX IF NOT EXISTS idx_phase_d_execution_position_observations_scope_symbol
+                    ON phase_d_execution_position_observations(execution_domain, execution_account_id, symbol, observed_at);
+                CREATE TABLE IF NOT EXISTS phase_d_execution_integrity_issues (
+                    issue_id TEXT PRIMARY KEY, execution_domain TEXT NOT NULL,
+                    execution_account_id TEXT NOT NULL, intent_id TEXT, submission_id TEXT,
+                    category TEXT NOT NULL, reason TEXT NOT NULL, existing_json TEXT NOT NULL DEFAULT '{}',
+                    received_json TEXT NOT NULL DEFAULT '{}', recorded_at TEXT NOT NULL,
+                    FOREIGN KEY(intent_id) REFERENCES phase_d_execution_intents(intent_id),
+                    FOREIGN KEY(submission_id) REFERENCES phase_d_execution_submissions(submission_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_phase_d_execution_integrity_issues_scope
+                    ON phase_d_execution_integrity_issues(execution_domain, execution_account_id, recorded_at);
                 """
             )
             self._ensure_column(connection, "copy_signals", "target_position_before", "REAL NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "phase_d_execution_intents", "execution_domain", "TEXT NOT NULL DEFAULT 'SIMULATOR'")
+            self._ensure_column(connection, "phase_d_execution_intents", "execution_account_id", "TEXT NOT NULL DEFAULT 'SIMULATOR:default'")
+            self._ensure_column(connection, "phase_d_execution_submissions", "execution_domain", "TEXT NOT NULL DEFAULT 'SIMULATOR'")
+            self._ensure_column(connection, "phase_d_execution_submissions", "execution_account_id", "TEXT NOT NULL DEFAULT 'SIMULATOR:default'")
+            self._ensure_column(connection, "phase_d_execution_fills", "execution_domain", "TEXT NOT NULL DEFAULT 'SIMULATOR'")
+            self._ensure_column(connection, "phase_d_execution_fills", "execution_account_id", "TEXT NOT NULL DEFAULT 'SIMULATOR:default'")
+            fill_side_added = self._ensure_column(
+                connection, "phase_d_execution_fills", "side", "TEXT NOT NULL DEFAULT 'BUY'",
+            )
+            self._ensure_column(connection, "phase_d_execution_reconciliation_runs", "execution_domain", "TEXT NOT NULL DEFAULT 'SIMULATOR'")
+            self._ensure_column(connection, "phase_d_execution_reconciliation_runs", "execution_account_id", "TEXT NOT NULL DEFAULT 'SIMULATOR:default'")
+            self._ensure_column(connection, "phase_d_execution_position_observations", "execution_domain", "TEXT NOT NULL DEFAULT 'SIMULATOR'")
+            self._ensure_column(connection, "phase_d_execution_position_observations", "execution_account_id", "TEXT NOT NULL DEFAULT 'SIMULATOR:default'")
+            connection.execute(
+                """UPDATE phase_d_execution_intents SET execution_domain='PAPER_COMPAT',
+                   execution_account_id='PAPER_COMPAT:legacy_paper'
+                   WHERE intent_id IN (
+                       SELECT intent_id FROM phase_d_execution_state_events
+                       WHERE source IN ('paper_execution_commit', 'paper_bridge')
+                   )"""
+            )
+            connection.execute(
+                """UPDATE phase_d_execution_submissions
+                   SET execution_domain=(SELECT execution_domain FROM phase_d_execution_intents
+                                         WHERE intent_id=phase_d_execution_submissions.intent_id),
+                       execution_account_id=(SELECT execution_account_id FROM phase_d_execution_intents
+                                             WHERE intent_id=phase_d_execution_submissions.intent_id)"""
+            )
+            connection.execute(
+                """UPDATE phase_d_execution_fills
+                   SET execution_domain=(SELECT execution_domain FROM phase_d_execution_submissions
+                                         WHERE submission_id=phase_d_execution_fills.submission_id),
+                       execution_account_id=(SELECT execution_account_id FROM phase_d_execution_submissions
+                                             WHERE submission_id=phase_d_execution_fills.submission_id)"""
+            )
+            if fill_side_added:
+                # Only pre-side-contract rows derive this unavailable field
+                # from their submission.  Later reconciliation may record an
+                # executed-side conflict, which must remain immutable.
+                connection.execute(
+                    """UPDATE phase_d_execution_fills
+                       SET side=(SELECT side FROM phase_d_execution_submissions
+                                 WHERE submission_id=phase_d_execution_fills.submission_id)"""
+                )
             self._ensure_column(connection, "copy_signals", "target_leverage", "REAL")
             self._ensure_column(connection, "copy_raw_fills", "source_closed_pnl", "REAL")
             self._ensure_column(connection, "copy_raw_fills", "is_liquidation", "INTEGER NOT NULL DEFAULT 0")
@@ -592,10 +657,12 @@ class CopyTradeDatabase:
                 )
 
     @staticmethod
-    def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> bool:
         present = {str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
         if column not in present:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            return True
+        return False
 
     def upsert_target(self, target: Target) -> None:
         with self._connect() as connection:
@@ -2501,7 +2568,10 @@ class CopyTradeDatabase:
         ).fetchone()
         if existing:
             return
-        intent = ExecutionIntent.from_copy_signal(signal, accepted_at=attempt.decided_at)
+        intent = ExecutionIntent.from_copy_signal(
+            signal, accepted_at=attempt.decided_at, execution_domain="PAPER_COMPAT",
+            execution_account_id="PAPER_COMPAT:legacy_paper",
+        )
         allowed = attempt.status == "filled" and bool(fills)
         projection_reason = attempt.reason if allowed or attempt.status != "filled" else "paper_filled_without_fill_evidence"
         state = ExecutionState.FILLED if allowed and fills else ExecutionState.BLOCKED
@@ -2509,12 +2579,13 @@ class CopyTradeDatabase:
             """INSERT INTO phase_d_execution_intents(
                 intent_id, contract_version, signal_id, source_event_id, target_wallet, campaign_id, symbol,
                 action, direction, requested_quantity, requested_capital, source_event_timestamp, accepted_at,
-                provenance_json, exposure_effect, supersedes_intent_id, state, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                provenance_json, exposure_effect, supersedes_intent_id, execution_domain, execution_account_id, state, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (intent.intent_id, intent.contract_version, intent.signal_id, intent.source_event_id, intent.target_wallet,
              intent.campaign_id, intent.symbol, intent.action, intent.direction, intent.requested_quantity,
              intent.requested_capital, iso(intent.source_event_timestamp), iso(attempt.decided_at), _dump(intent.provenance),
-             intent.exposure_effect.value, intent.supersedes_intent_id, state.value, iso(attempt.decided_at)),
+             intent.exposure_effect.value, intent.supersedes_intent_id, intent.execution_domain,
+             intent.execution_account_id, state.value, iso(attempt.decided_at)),
         )
         # PAPER has already completed its economic lifecycle inside this
         # transaction.  Store one immutable terminal projection event rather
@@ -2550,23 +2621,26 @@ class CopyTradeDatabase:
         connection.execute(
             """INSERT INTO phase_d_execution_submissions(
                 submission_id, intent_id, client_order_id, requested_quantity, side, state, venue_order_id,
-                filled_quantity, created_at, updated_at, raw_evidence_json)
-               VALUES (?, ?, ?, ?, ?, 'FILLED', ?, ?, ?, ?, ?)""",
+                execution_domain, execution_account_id, filled_quantity, created_at, updated_at, raw_evidence_json)
+               VALUES (?, ?, ?, ?, ?, 'FILLED', ?, ?, ?, ?, ?, ?, ?)""",
             (submission_id, intent.intent_id, client_order_id, quantity,
              "BUY" if (intent.direction == "long") == (intent.action in {"open", "add"}) else "SELL",
-             stable_id("phase_d_paper_order", attempt.attempt_id), quantity, iso(attempt.decided_at), iso(attempt.decided_at),
+             stable_id("phase_d_paper_order", attempt.attempt_id), intent.execution_domain, intent.execution_account_id,
+             quantity, iso(attempt.decided_at), iso(attempt.decided_at),
              _dump({"paper_compatibility": True, "legacy_attempt_id": attempt.attempt_id})),
         )
         for fill in fills:
             connection.execute(
                 """INSERT INTO phase_d_execution_fills(
                     execution_fill_id, intent_id, submission_id, venue_fill_id, quantity, price, fee,
-                    venue_timestamp, received_at, raw_evidence_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    execution_domain, execution_account_id, side, venue_timestamp, received_at, raw_evidence_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (stable_id("phase_d_execution_fill_v1", submission_id,
                            stable_id("phase_d_paper_fill", attempt.attempt_id, fill.execution_fill_id)),
                  intent.intent_id, submission_id, stable_id("phase_d_paper_fill", attempt.attempt_id, fill.execution_fill_id),
-                 fill.quantity, fill.price, fill.fee, iso(fill.timestamp), iso(attempt.decided_at),
+                 fill.quantity, fill.price, fill.fee, intent.execution_domain, intent.execution_account_id,
+                 "BUY" if (intent.direction == "long") == (intent.action in {"open", "add"}) else "SELL",
+                 iso(fill.timestamp), iso(attempt.decided_at),
                  _dump({"paper_compatibility": True, "legacy_execution_fill_id": fill.execution_fill_id, **fill.raw})),
             )
 
@@ -2589,7 +2663,8 @@ class CopyTradeDatabase:
             requested_capital=float(row["requested_capital"]), source_event_timestamp=as_utc(row["source_event_timestamp"]),
             accepted_at=as_utc(row["accepted_at"]), contract_version=version,
             provenance=_load(row["provenance_json"], {}), exposure_effect=ExposureEffect(row["exposure_effect"]),
-            supersedes_intent_id=row["supersedes_intent_id"], state=ExecutionState(row["state"]),
+            supersedes_intent_id=row["supersedes_intent_id"], execution_domain=row["execution_domain"],
+            execution_account_id=row["execution_account_id"], state=ExecutionState(row["state"]),
             updated_at=as_utc(row["updated_at"]),
         )
 
@@ -2600,7 +2675,8 @@ class CopyTradeDatabase:
             requested_quantity=float(row["requested_quantity"]), side=row["side"], state=row["state"],
             venue_order_id=row["venue_order_id"], filled_quantity=float(row["filled_quantity"]),
             created_at=as_utc(row["created_at"]), updated_at=as_utc(row["updated_at"]),
-            raw_evidence=_load(row["raw_evidence_json"], {}),
+            raw_evidence=_load(row["raw_evidence_json"], {}), execution_domain=row["execution_domain"],
+            execution_account_id=row["execution_account_id"],
         )
 
     @staticmethod
@@ -2616,6 +2692,8 @@ class CopyTradeDatabase:
             and iso(existing.source_event_timestamp) == iso(requested.source_event_timestamp)
             and existing.exposure_effect == requested.exposure_effect
             and existing.supersedes_intent_id == requested.supersedes_intent_id
+            and existing.execution_domain == requested.execution_domain
+            and existing.execution_account_id == requested.execution_account_id
             and _dump(existing.provenance) == _dump(requested.provenance)
         )
 
@@ -2637,13 +2715,14 @@ class CopyTradeDatabase:
                 """INSERT INTO phase_d_execution_intents(
                     intent_id, contract_version, signal_id, source_event_id, target_wallet, campaign_id, symbol,
                     action, direction, requested_quantity, requested_capital, source_event_timestamp, accepted_at,
-                    provenance_json, exposure_effect, supersedes_intent_id, state, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    provenance_json, exposure_effect, supersedes_intent_id, execution_domain, execution_account_id, state, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (intent.intent_id, intent.contract_version, intent.signal_id, intent.source_event_id, intent.target_wallet,
                  intent.campaign_id, intent.symbol, intent.action, intent.direction, intent.requested_quantity,
                  intent.requested_capital, iso(intent.source_event_timestamp), iso(intent.accepted_at),
                  _dump(intent.provenance), intent.exposure_effect.value, intent.supersedes_intent_id,
-                 intent.state.value, iso(intent.updated_at or intent.accepted_at)),
+                 intent.execution_domain, intent.execution_account_id, intent.state.value,
+                 iso(intent.updated_at or intent.accepted_at)),
             )
             self._append_phase_d_state_event(
                 connection, intent.intent_id, None, intent.state, "intent_accepted", "phase_c", intent.accepted_at, {},
@@ -2775,9 +2854,10 @@ class CopyTradeDatabase:
             connection.execute(
                 """INSERT INTO phase_d_execution_submissions(
                     submission_id, intent_id, client_order_id, requested_quantity, side, state, venue_order_id,
-                    filled_quantity, created_at, updated_at, raw_evidence_json)
-                   VALUES (?, ?, ?, ?, ?, 'PREPARED', NULL, 0, ?, ?, '{}')""",
-                (submission_id, intent_id, client_order_id, requested_quantity, side, iso(at), iso(at)),
+                    execution_domain, execution_account_id, filled_quantity, created_at, updated_at, raw_evidence_json)
+                   VALUES (?, ?, ?, ?, ?, 'PREPARED', NULL, ?, ?, 0, ?, ?, '{}')""",
+                (submission_id, intent_id, client_order_id, requested_quantity, side, intent.execution_domain,
+                 intent.execution_account_id, iso(at), iso(at)),
             )
             connection.execute(
                 "UPDATE phase_d_execution_intents SET state=?, updated_at=? WHERE intent_id=?",
@@ -2804,6 +2884,7 @@ class CopyTradeDatabase:
         self, intent_id: str, *, state: str, venue_order_id: str | None, filled_quantity: float,
         raw_evidence: Mapping[str, Any], updated_at: object | None = None,
     ) -> ExecutionSubmission:
+        """Persist only monotonic venue evidence; stale reads cannot regress it."""
         at = as_utc(updated_at)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -2813,54 +2894,232 @@ class CopyTradeDatabase:
             if not row:
                 raise KeyError(f"No Phase-D submission for intent {intent_id}")
             current = self._phase_d_submission_from_row(row)
+            if current.venue_order_id and venue_order_id and current.venue_order_id != venue_order_id:
+                self._record_execution_integrity_issue(
+                    connection, execution_domain=current.execution_domain, execution_account_id=current.execution_account_id,
+                    intent_id=intent_id, submission_id=current.submission_id,
+                    category="CONFLICTING_VENUE_ORDER_ID", reason="submission_venue_order_id_conflict",
+                    existing={"venue_order_id": current.venue_order_id, "state": current.state,
+                              "filled_quantity": current.filled_quantity},
+                    received={"venue_order_id": venue_order_id, "state": state, "filled_quantity": filled_quantity,
+                              "raw_evidence": dict(raw_evidence)}, recorded_at=at,
+                )
+                return current
+            current_rank = self._submission_state_rank(current.state)
+            incoming_rank = self._submission_state_rank(state)
+            next_state = state if incoming_rank > current_rank or current.state == state else current.state
+            next_filled = max(current.filled_quantity, filled_quantity)
+            next_order_id = current.venue_order_id or venue_order_id
+            next_updated_at = max(as_utc(current.updated_at), at)
+            next_evidence = (
+                dict(raw_evidence)
+                if incoming_rank > current_rank or (state == current.state and at >= as_utc(current.updated_at))
+                else current.raw_evidence
+            )
             connection.execute(
                 """UPDATE phase_d_execution_submissions
                    SET state=?, venue_order_id=COALESCE(?, venue_order_id), filled_quantity=?, updated_at=?, raw_evidence_json=?
                    WHERE intent_id=?""",
-                (state, venue_order_id, max(current.filled_quantity, filled_quantity), iso(at),
-                 _dump(dict(raw_evidence)), intent_id),
+                (next_state, next_order_id, next_filled, iso(next_updated_at), _dump(next_evidence), intent_id),
             )
             row = connection.execute(
                 "SELECT * FROM phase_d_execution_submissions WHERE intent_id=?", (intent_id,)
             ).fetchone()
         return self._phase_d_submission_from_row(row)
 
+    @staticmethod
+    def _submission_state_rank(state: str) -> int:
+        return {
+            "PREPARED": 0,
+            VenueOrderStatus.ACKNOWLEDGED.value: 1,
+            VenueOrderStatus.PARTIALLY_FILLED.value: 2,
+            VenueOrderStatus.CANCELLED.value: 3,
+            VenueOrderStatus.REJECTED.value: 3,
+            VenueOrderStatus.EXPIRED.value: 3,
+            VenueOrderStatus.FILLED.value: 4,
+        }.get(state, 0)
+
+    @staticmethod
+    def _record_execution_integrity_issue(
+        connection: sqlite3.Connection, *, execution_domain: str, execution_account_id: str,
+        intent_id: str | None, submission_id: str | None, category: str, reason: str,
+        existing: Mapping[str, Any] | None, received: Mapping[str, Any] | None, recorded_at: object,
+    ) -> None:
+        issue_id = stable_id(
+            "phase_d_execution_integrity", execution_domain, execution_account_id, intent_id, submission_id,
+            category, reason, _dump(dict(existing or {})), _dump(dict(received or {})),
+        )
+        connection.execute(
+            """INSERT OR IGNORE INTO phase_d_execution_integrity_issues(
+                issue_id, execution_domain, execution_account_id, intent_id, submission_id, category, reason,
+                existing_json, received_json, recorded_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (issue_id, execution_domain, execution_account_id, intent_id, submission_id, category, reason,
+             _dump(dict(existing or {})), _dump(dict(received or {})), iso(recorded_at)),
+        )
+
     def record_execution_venue_fill(
         self, intent_id: str, submission_id: str, fill: VenueFill, *, received_at: object | None = None,
     ) -> bool:
-        """Deduplicate venue fills before they can affect any local accounting read model."""
+        """Persist immutable venue evidence and fail closed on identity collisions."""
         execution_fill_id = stable_id("phase_d_execution_fill_v1", submission_id, fill.venue_fill_id)
+        at = as_utc(received_at)
         with self._connect() as connection:
-            cursor = connection.execute(
-                """INSERT OR IGNORE INTO phase_d_execution_fills(
-                    execution_fill_id, intent_id, submission_id, venue_fill_id, quantity, price, fee,
-                    venue_timestamp, received_at, raw_evidence_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (execution_fill_id, intent_id, submission_id, fill.venue_fill_id, fill.quantity, fill.price,
-                 fill.fee, iso(fill.venue_timestamp), iso(received_at), _dump(fill.raw_payload)),
+            connection.execute("BEGIN IMMEDIATE")
+            submission_row = connection.execute(
+                "SELECT * FROM phase_d_execution_submissions WHERE submission_id=?", (submission_id,)
+            ).fetchone()
+            if not submission_row:
+                raise KeyError(f"Unknown Phase-D submission: {submission_id}")
+            submission = self._phase_d_submission_from_row(submission_row)
+            if submission.intent_id != intent_id:
+                self._record_execution_integrity_issue(
+                    connection, execution_domain=submission.execution_domain, execution_account_id=submission.execution_account_id,
+                    intent_id=intent_id, submission_id=submission_id, category="FILL_SUBMISSION_INTENT_CONFLICT",
+                    reason="fill_submission_does_not_belong_to_intent",
+                    existing={"submission_intent_id": submission.intent_id},
+                    received={"intent_id": intent_id, "venue_fill_id": fill.venue_fill_id}, recorded_at=at,
+                )
+                return False
+            side = (fill.side or submission.side).upper()
+            incoming = {
+                "intent_id": intent_id, "submission_id": submission_id, "venue_fill_id": fill.venue_fill_id,
+                "execution_domain": submission.execution_domain, "execution_account_id": submission.execution_account_id,
+                "side": side, "quantity": float(fill.quantity), "price": float(fill.price), "fee": float(fill.fee),
+                "venue_order_id": fill.raw_payload.get("venue_order_id"), "client_order_id": fill.client_order_id,
+            }
+            if fill.client_order_id != submission.client_order_id or side not in {"BUY", "SELL"}:
+                self._record_execution_integrity_issue(
+                    connection, execution_domain=submission.execution_domain, execution_account_id=submission.execution_account_id,
+                    intent_id=intent_id, submission_id=submission_id, category="FILL_IDENTITY_CONFLICT",
+                    reason="fill_side_or_client_order_conflicts_with_submission",
+                    existing={"client_order_id": submission.client_order_id, "side": submission.side},
+                    received=incoming, recorded_at=at,
+                )
+                return False
+            if side != submission.side:
+                self._record_execution_integrity_issue(
+                    connection, execution_domain=submission.execution_domain, execution_account_id=submission.execution_account_id,
+                    intent_id=intent_id, submission_id=submission_id, category="FILL_SIDE_CONFLICT",
+                    reason="fill_side_conflicts_with_submission",
+                    existing={"side": submission.side}, received=incoming, recorded_at=at,
+                )
+            existing = connection.execute(
+                "SELECT * FROM phase_d_execution_fills WHERE venue_fill_id=?", (fill.venue_fill_id,)
+            ).fetchone()
+            if existing:
+                existing_raw = _load(existing["raw_evidence_json"], {})
+                equivalent = (
+                    existing["intent_id"] == intent_id and existing["submission_id"] == submission_id
+                    and existing["execution_domain"] == submission.execution_domain
+                    and existing["execution_account_id"] == submission.execution_account_id
+                    and existing["side"] == side and float(existing["quantity"]) == float(fill.quantity)
+                    and float(existing["price"]) == float(fill.price) and float(existing["fee"]) == float(fill.fee)
+                    and existing_raw.get("venue_order_id") == fill.raw_payload.get("venue_order_id")
+                )
+                if not equivalent:
+                    self._record_execution_integrity_issue(
+                        connection, execution_domain=submission.execution_domain, execution_account_id=submission.execution_account_id,
+                        intent_id=intent_id, submission_id=submission_id, category="CONFLICTING_VENUE_FILL_ID",
+                        reason="venue_fill_id_conflicts_with_immutable_evidence",
+                        existing={
+                            "intent_id": existing["intent_id"], "submission_id": existing["submission_id"],
+                            "execution_domain": existing["execution_domain"],
+                            "execution_account_id": existing["execution_account_id"], "side": existing["side"],
+                            "quantity": existing["quantity"], "price": existing["price"], "fee": existing["fee"],
+                            "venue_order_id": existing_raw.get("venue_order_id"),
+                        }, received=incoming, recorded_at=at,
+                    )
+                return False
+            connection.execute(
+                """INSERT INTO phase_d_execution_fills(
+                    execution_fill_id, intent_id, submission_id, venue_fill_id, execution_domain, execution_account_id,
+                    side, quantity, price, fee, venue_timestamp, received_at, raw_evidence_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (execution_fill_id, intent_id, submission_id, fill.venue_fill_id, submission.execution_domain,
+                 submission.execution_account_id, side, fill.quantity, fill.price, fill.fee,
+                 iso(fill.venue_timestamp), iso(at), _dump(fill.raw_payload)),
             )
-        return cursor.rowcount == 1
+            total = float(connection.execute(
+                "SELECT COALESCE(SUM(quantity), 0) FROM phase_d_execution_fills WHERE submission_id=?", (submission_id,)
+            ).fetchone()[0])
+            if total > submission.requested_quantity + 1e-12:
+                self._record_execution_integrity_issue(
+                    connection, execution_domain=submission.execution_domain, execution_account_id=submission.execution_account_id,
+                    intent_id=intent_id, submission_id=submission_id, category="OVERFILL_DETECTED",
+                    reason="deduplicated_fill_quantity_exceeds_requested_quantity",
+                    existing={"requested_quantity": submission.requested_quantity},
+                    received={"deduplicated_fill_quantity": total, "venue_fill_id": fill.venue_fill_id}, recorded_at=at,
+                )
+        return True
 
-    def list_execution_fills(self, intent_id: str | None = None) -> list[dict[str, Any]]:
+    def list_execution_fills(
+        self, intent_id: str | None = None, *, execution_domain: str | None = None,
+        execution_account_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         query = "SELECT * FROM phase_d_execution_fills"
         values: list[Any] = []
+        clauses: list[str] = []
         if intent_id:
-            query += " WHERE intent_id=?"
+            clauses.append("intent_id=?")
             values.append(intent_id)
+        if execution_domain:
+            clauses.append("execution_domain=?")
+            values.append(execution_domain)
+        if execution_account_id:
+            clauses.append("execution_account_id=?")
+            values.append(execution_account_id)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY venue_timestamp, execution_fill_id"
         with self._connect() as connection:
             rows = connection.execute(query, values).fetchall()
         return [{**dict(row), "raw_evidence": _load(row["raw_evidence_json"], {})} for row in rows]
 
+    def list_execution_integrity_issues(
+        self, *, execution_domain: str | None = None, execution_account_id: str | None = None,
+        intent_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM phase_d_execution_integrity_issues"
+        clauses: list[str] = []
+        values: list[Any] = []
+        for column, value in (("execution_domain", execution_domain), ("execution_account_id", execution_account_id),
+                              ("intent_id", intent_id)):
+            if value is not None:
+                clauses.append(f"{column}=?")
+                values.append(value)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY recorded_at, issue_id"
+        with self._connect() as connection:
+            rows = connection.execute(query, values).fetchall()
+        return [{**dict(row), "existing": _load(row["existing_json"], {}), "received": _load(row["received_json"], {})}
+                for row in rows]
+
+    def execution_has_integrity_issue(
+        self, *, intent_id: str | None = None, execution_domain: str = "SIMULATOR",
+        execution_account_id: str = "SIMULATOR:default",
+    ) -> bool:
+        query = """SELECT 1 FROM phase_d_execution_integrity_issues
+                   WHERE execution_domain=? AND execution_account_id=?"""
+        values: list[Any] = [execution_domain, execution_account_id]
+        if intent_id:
+            query += " AND intent_id=?"
+            values.append(intent_id)
+        query += " LIMIT 1"
+        with self._connect() as connection:
+            return connection.execute(query, values).fetchone() is not None
+
     def start_execution_reconciliation(
         self, reconciliation_run_id: str, *, scope: str, started_at: object, evidence: Mapping[str, Any] | None = None,
+        execution_domain: str = "SIMULATOR", execution_account_id: str = "SIMULATOR:default",
     ) -> None:
         with self._connect() as connection:
             connection.execute(
                 """INSERT OR IGNORE INTO phase_d_execution_reconciliation_runs(
-                    reconciliation_run_id, scope, state, started_at, completed_at, evidence_json)
-                   VALUES (?, ?, 'RECONCILING', ?, NULL, ?)""",
-                (reconciliation_run_id, scope, iso(started_at), _dump(dict(evidence or {}))),
+                    reconciliation_run_id, scope, execution_domain, execution_account_id, state, started_at, completed_at, evidence_json)
+                   VALUES (?, ?, ?, ?, 'RECONCILING', ?, NULL, ?)""",
+                (reconciliation_run_id, scope, execution_domain, execution_account_id, iso(started_at), _dump(dict(evidence or {}))),
             )
 
     def record_execution_reconciliation_item(
@@ -2881,15 +3140,16 @@ class CopyTradeDatabase:
     def record_execution_position_observation(
         self, *, observation_id: str, reconciliation_run_id: str, symbol: str, local_signed_quantity: float,
         venue_signed_quantity: float | None, state: str, observed_at: object, raw_evidence: Mapping[str, Any] | None = None,
+        execution_domain: str = "SIMULATOR", execution_account_id: str = "SIMULATOR:default",
     ) -> None:
         with self._connect() as connection:
             connection.execute(
                 """INSERT OR IGNORE INTO phase_d_execution_position_observations(
-                    observation_id, reconciliation_run_id, symbol, local_signed_quantity, venue_signed_quantity,
-                    state, observed_at, raw_evidence_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (observation_id, reconciliation_run_id, symbol, local_signed_quantity, venue_signed_quantity,
-                 state, iso(observed_at), _dump(dict(raw_evidence or {}))),
+                    observation_id, reconciliation_run_id, execution_domain, execution_account_id, symbol,
+                    local_signed_quantity, venue_signed_quantity, state, observed_at, raw_evidence_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (observation_id, reconciliation_run_id, execution_domain, execution_account_id, symbol,
+                 local_signed_quantity, venue_signed_quantity, state, iso(observed_at), _dump(dict(raw_evidence or {}))),
             )
 
     def complete_execution_reconciliation(
@@ -2902,104 +3162,147 @@ class CopyTradeDatabase:
                 (state, iso(completed_at), _dump(dict(evidence or {})), reconciliation_run_id),
             )
 
-    def latest_execution_reconciliation(self) -> dict[str, Any] | None:
+    def latest_execution_reconciliation(
+        self, *, scopes: Iterable[str] | None = None, execution_domain: str = "SIMULATOR",
+        execution_account_id: str = "SIMULATOR:default",
+    ) -> dict[str, Any] | None:
+        values: list[Any] = [execution_domain, execution_account_id]
+        query = """SELECT * FROM phase_d_execution_reconciliation_runs
+                   WHERE execution_domain=? AND execution_account_id=?"""
+        if scopes:
+            scope_values = list(scopes)
+            query += " AND scope IN (" + ",".join("?" for _ in scope_values) + ")"
+            values.extend(scope_values)
+        query += " ORDER BY started_at DESC, reconciliation_run_id DESC LIMIT 1"
         with self._connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM phase_d_execution_reconciliation_runs ORDER BY started_at DESC, reconciliation_run_id DESC LIMIT 1"
-            ).fetchone()
+            row = connection.execute(query, values).fetchone()
         return {**dict(row), "evidence": _load(row["evidence_json"], {})} if row else None
 
-    def phase_d_local_positions(self) -> dict[str, float]:
-        """Reconstruct local exposure from deduplicated fills; never from intent wishes."""
+    def phase_d_local_positions(
+        self, *, execution_domain: str = "SIMULATOR", execution_account_id: str = "SIMULATOR:default",
+    ) -> dict[str, float]:
+        """Reconstruct scoped exposure from executed fill side, never intent wishes."""
         with self._connect() as connection:
             rows = connection.execute(
-                """SELECT intent.symbol, intent.action, intent.direction, fill.quantity
+                """SELECT intent.symbol, fill.side, fill.quantity
                    FROM phase_d_execution_fills AS fill
                    JOIN phase_d_execution_intents AS intent ON intent.intent_id=fill.intent_id
+                   WHERE fill.execution_domain=? AND fill.execution_account_id=?
                    ORDER BY fill.venue_timestamp, fill.execution_fill_id"""
+                , (execution_domain, execution_account_id)
             ).fetchall()
         positions: dict[str, float] = {}
         for row in rows:
-            signed = float(row["quantity"])
-            if row["direction"] == "short":
-                signed *= -1
-            if row["action"] in {"reduce", "close"}:
-                signed *= -1
+            signed = float(row["quantity"]) if row["side"] == "BUY" else -float(row["quantity"])
             positions[row["symbol"]] = positions.get(row["symbol"], 0.0) + signed
         return {symbol: quantity for symbol, quantity in positions.items() if abs(quantity) > 1e-12}
 
-    def execution_has_unresolved_entry_risk(self) -> bool:
-        """Return only *current* D evidence that must fail closed for entries."""
+    def execution_account_reconciliation_unhealthy(
+        self, *, execution_domain: str = "SIMULATOR", execution_account_id: str = "SIMULATOR:default",
+    ) -> bool:
+        account_run = self.latest_execution_reconciliation(
+            scopes=("account_positions", "positions", "verified_flat"), execution_domain=execution_domain,
+            execution_account_id=execution_account_id,
+        )
+        return bool(account_run and account_run["state"] not in {
+            ReconciliationState.MATCHED.value, ReconciliationState.VERIFIED_FLAT.value,
+        })
+
+    def execution_has_unresolved_entry_risk(
+        self, *, execution_domain: str = "SIMULATOR", execution_account_id: str = "SIMULATOR:default",
+    ) -> bool:
+        """Return scoped evidence that must fail closed for exposure increases."""
         with self._connect() as connection:
             unresolved = connection.execute(
                 """SELECT 1 FROM phase_d_execution_intents
                    WHERE exposure_effect='INCREASE' AND state IN (
                        'SUBMITTING', 'SUBMISSION_UNKNOWN', 'ACKNOWLEDGED', 'PARTIALLY_FILLED',
                        'CANCEL_PENDING', 'RECONCILIATION_REQUIRED'
-                   )
+                   ) AND execution_domain=? AND execution_account_id=?
                    LIMIT 1"""
+                , (execution_domain, execution_account_id)
             ).fetchone()
             if unresolved:
                 return True
-            incomplete_run = connection.execute(
-                """SELECT 1 FROM phase_d_execution_reconciliation_runs
-                   WHERE reconciliation_run_id=(
-                       SELECT reconciliation_run_id FROM phase_d_execution_reconciliation_runs
-                       ORDER BY started_at DESC, reconciliation_run_id DESC LIMIT 1
-                   ) AND state IN ('RECONCILING', 'MISMATCH', 'INCOMPLETE')"""
+            integrity = connection.execute(
+                """SELECT 1 FROM phase_d_execution_integrity_issues
+                   WHERE execution_domain=? AND execution_account_id=? LIMIT 1""",
+                (execution_domain, execution_account_id),
             ).fetchone()
-            if incomplete_run:
-                return True
-            mismatch = connection.execute(
-                """SELECT 1 FROM phase_d_execution_position_observations AS observation
-                   WHERE observation.observed_at=(
-                       SELECT MAX(newer.observed_at) FROM phase_d_execution_position_observations AS newer
-                       WHERE newer.symbol=observation.symbol
-                   ) AND observation.state NOT IN ('MATCHED', 'VERIFIED_FLAT') LIMIT 1"""
-            ).fetchone()
-        return mismatch is not None
+        return integrity is not None or self.execution_account_reconciliation_unhealthy(
+            execution_domain=execution_domain, execution_account_id=execution_account_id,
+        )
 
-    def execution_unresolved_submissions(self) -> list[dict[str, Any]]:
+    def execution_unresolved_submissions(
+        self, *, execution_domain: str = "SIMULATOR", execution_account_id: str = "SIMULATOR:default",
+    ) -> list[dict[str, Any]]:
         """Durable ambiguity that prevents a verified-flat declaration."""
         with self._connect() as connection:
             rows = connection.execute(
                 """SELECT intent_id, state, updated_at FROM phase_d_execution_intents
                    WHERE state IN ('SUBMITTING', 'SUBMISSION_UNKNOWN', 'RECONCILIATION_REQUIRED', 'CANCEL_PENDING')
+                     AND execution_domain=? AND execution_account_id=?
                    ORDER BY updated_at, intent_id"""
+                , (execution_domain, execution_account_id)
             ).fetchall()
         return [dict(row) for row in rows]
 
     def execution_read_model(self, *, limit: int = 50) -> dict[str, Any]:
         """Stable read model for the future control center; no mutable engine access."""
+        execution_domain, execution_account_id = "SIMULATOR", "SIMULATOR:default"
         with self._connect() as connection:
             state_rows = connection.execute(
-                "SELECT state, COUNT(*) AS count FROM phase_d_execution_intents GROUP BY state"
+                """SELECT state, COUNT(*) AS count FROM phase_d_execution_intents
+                   WHERE execution_domain=? AND execution_account_id=? GROUP BY state""",
+                (execution_domain, execution_account_id),
             ).fetchall()
             intents = connection.execute(
                 """SELECT intent_id, signal_id, target_wallet, campaign_id, symbol, action, direction,
-                          requested_quantity, requested_capital, exposure_effect, state, accepted_at, updated_at
-                   FROM phase_d_execution_intents ORDER BY updated_at DESC, intent_id DESC LIMIT ?""",
-                (limit,),
+                          requested_quantity, requested_capital, exposure_effect, state, accepted_at, updated_at,
+                          execution_domain, execution_account_id
+                   FROM phase_d_execution_intents WHERE execution_domain=? AND execution_account_id=?
+                   ORDER BY updated_at DESC, intent_id DESC LIMIT ?""",
+                (execution_domain, execution_account_id, limit),
             ).fetchall()
             submissions = connection.execute(
                 """SELECT submission_id, intent_id, client_order_id, state, venue_order_id, requested_quantity,
-                          filled_quantity, updated_at FROM phase_d_execution_submissions
+                          filled_quantity, updated_at, execution_domain, execution_account_id
+                   FROM phase_d_execution_submissions WHERE execution_domain=? AND execution_account_id=?
                    ORDER BY updated_at DESC, submission_id DESC LIMIT ?""",
-                (limit,),
+                (execution_domain, execution_account_id, limit),
             ).fetchall()
             fills = connection.execute(
-                """SELECT execution_fill_id, intent_id, submission_id, venue_fill_id, quantity, price, fee,
-                          venue_timestamp, received_at FROM phase_d_execution_fills
+                """SELECT execution_fill_id, intent_id, submission_id, venue_fill_id, side, quantity, price, fee,
+                          venue_timestamp, received_at, execution_domain, execution_account_id
+                   FROM phase_d_execution_fills WHERE execution_domain=? AND execution_account_id=?
                    ORDER BY venue_timestamp DESC, execution_fill_id DESC LIMIT ?""",
-                (limit,),
+                (execution_domain, execution_account_id, limit),
             ).fetchall()
             discrepancies = connection.execute(
-                """SELECT * FROM phase_d_execution_reconciliation_items
-                   WHERE state NOT IN ('MATCHED', 'VERIFIED_FLAT') ORDER BY recorded_at DESC LIMIT ?""",
-                (limit,),
+                """SELECT item.* FROM phase_d_execution_reconciliation_items AS item
+                   JOIN phase_d_execution_reconciliation_runs AS run
+                     ON run.reconciliation_run_id=item.reconciliation_run_id
+                   WHERE item.state NOT IN ('MATCHED', 'VERIFIED_FLAT')
+                     AND run.execution_domain=? AND run.execution_account_id=?
+                   ORDER BY item.recorded_at DESC LIMIT ?""",
+                (execution_domain, execution_account_id, limit),
             ).fetchall()
+            paper_counts = connection.execute(
+                """SELECT COUNT(*) AS intents,
+                          (SELECT COUNT(*) FROM phase_d_execution_fills
+                           WHERE execution_domain='PAPER_COMPAT' AND execution_account_id='PAPER_COMPAT:legacy_paper') AS fills
+                   FROM phase_d_execution_intents
+                   WHERE execution_domain='PAPER_COMPAT' AND execution_account_id='PAPER_COMPAT:legacy_paper'"""
+            ).fetchone()
         current_states = {str(row["state"]): int(row["count"]) for row in state_rows}
-        reconciliation = self.latest_execution_reconciliation()
+        reconciliation = self.latest_execution_reconciliation(
+            scopes=("account_positions", "positions", "verified_flat"), execution_domain=execution_domain,
+            execution_account_id=execution_account_id,
+        )
+        intent_reconciliation = self.latest_execution_reconciliation(
+            scopes=("intent_order", "order"), execution_domain=execution_domain,
+            execution_account_id=execution_account_id,
+        )
         reconciliation_state = reconciliation["state"] if reconciliation else "NOT_YET_RUN"
         if reconciliation_state in {ReconciliationState.INCOMPLETE.value, ReconciliationState.RECONCILING.value}:
             health_state = "RECONCILIATION_INCOMPLETE"
@@ -3009,7 +3312,9 @@ class CopyTradeDatabase:
             health_state = "VERIFIED_FLAT"
         else:
             health_state = "CONTINUOUS"
-        entry_blocked = self.execution_has_unresolved_entry_risk()
+        entry_blocked = self.execution_has_unresolved_entry_risk(
+            execution_domain=execution_domain, execution_account_id=execution_account_id,
+        )
         return {
             "execution_mode": "SIMULATOR_ONLY",
             "live_order_transmission": False,
@@ -3018,6 +3323,10 @@ class CopyTradeDatabase:
             "hard_transport_stop": {"active": False, "reason": "no_live_transport_exists"},
             "adapter_state": "SIMULATOR_ONLY",
             "reconciliation": reconciliation,
+            "reconciliation_authorities": {
+                "account_positions": reconciliation,
+                "intent_order": intent_reconciliation,
+            },
             "execution_health": {
                 "state": health_state,
                 "entry_inhibited": entry_blocked,
@@ -3032,9 +3341,20 @@ class CopyTradeDatabase:
                 {**dict(row), "local": _load(row["local_json"], {}), "venue": _load(row["venue_json"], {})}
                 for row in discrepancies
             ],
-            "local_positions": self.phase_d_local_positions(),
+            "local_positions": self.phase_d_local_positions(
+                execution_domain=execution_domain, execution_account_id=execution_account_id,
+            ),
             "recent_intents": [dict(row) for row in intents],
             "recent_fills": [dict(row) for row in fills],
+            "integrity_issues": self.list_execution_integrity_issues(
+                execution_domain=execution_domain, execution_account_id=execution_account_id,
+            )[:limit],
+            "paper_compatibility_audit": {
+                "execution_domain": "PAPER_COMPAT",
+                "execution_account_id": "PAPER_COMPAT:legacy_paper",
+                "intent_count": int(paper_counts["intents"]),
+                "fill_count": int(paper_counts["fills"]),
+            },
         }
 
     def dashboard_snapshot(self) -> dict[str, Any]:

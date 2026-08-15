@@ -30,7 +30,7 @@ class PhaseDExecutionFoundationTests(unittest.TestCase):
         database = CopyTradeDatabase(directory / "copy.sqlite3")
         database.initialize()
         adapter = DeterministicExecutionSimulator(plans)
-        return database, ExecutionEngine(database, adapter), adapter
+        return database, ExecutionEngine(database, adapter, safety_context=ExecutionSafetyContext()), adapter
 
     def test_duplicate_signals_and_concurrent_workers_create_one_intent_and_one_submit(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -69,7 +69,7 @@ class PhaseDExecutionFoundationTests(unittest.TestCase):
             intent = engine.process_signal(signal("timeout"))
             self.assertEqual(intent.state, ExecutionState.SUBMISSION_UNKNOWN)
             self.assertEqual(adapter.submit_calls, 1)
-            restarted = ExecutionEngine(database, adapter)
+            restarted = ExecutionEngine(database, adapter, safety_context=ExecutionSafetyContext())
             resolved = restarted.resume_intent(intent.intent_id)
             self.assertEqual(resolved.state, ExecutionState.ACKNOWLEDGED)
             self.assertEqual(adapter.submit_calls, 1)
@@ -94,7 +94,7 @@ class PhaseDExecutionFoundationTests(unittest.TestCase):
 
             intent = engine.process_signal(signal("crash"), fault_hook=crash)
             self.assertEqual(intent.state, ExecutionState.SUBMISSION_UNKNOWN)
-            restored = ExecutionEngine(database, adapter).resume_intent(intent.intent_id)
+            restored = ExecutionEngine(database, adapter, safety_context=ExecutionSafetyContext()).resume_intent(intent.intent_id)
             self.assertEqual(restored.state, ExecutionState.FILLED)
             self.assertEqual(adapter.submit_calls, 1)
             self.assertEqual(database.phase_d_local_positions(), {"BTC": 1.0})
@@ -128,7 +128,13 @@ class PhaseDExecutionFoundationTests(unittest.TestCase):
             blocked = engine.process_signal(signal("blocked-entry"))
             self.assertEqual(blocked.state, ExecutionState.BLOCKED)
             self.assertEqual(database.latest_execution_risk_decision(blocked.intent_id)["reason"], "entry_blocked_reconciliation_required")
-            closed = engine.process_signal(signal("exit", action="close"))
+            closed = engine.process_signal(
+                signal("exit", action="close", quantity=0.5),
+                context=ExecutionSafetyContext(
+                    verified_positions={"BTC": 0.5}, verified_positions_current=True,
+                    verified_positions_authoritative=True,
+                ),
+            )
             self.assertEqual(closed.state, ExecutionState.FILLED)
 
     def test_reduce_only_validation_bounds_a_close_to_verified_venue_position(self) -> None:

@@ -12,7 +12,7 @@ from src.copytrade.execution import (
     SimulatorScenario,
     SimulatorStep,
 )
-from src.copytrade.execution_contracts import ExecutionState
+from src.copytrade.execution_contracts import ExecutionSafetyContext, ExecutionState
 from src.copytrade.models import CopySignal, as_utc, stable_id
 from src.copytrade.storage import CopyTradeDatabase
 
@@ -32,7 +32,7 @@ class DeterministicSimulatorTests(unittest.TestCase):
     def setup_engine(self, root: Path, simulator: DeterministicExecutionSimulator):
         database = CopyTradeDatabase(root / "copy.sqlite3")
         database.initialize()
-        return database, ExecutionEngine(database, simulator)
+        return database, ExecutionEngine(database, simulator, safety_context=ExecutionSafetyContext())
 
     def test_timeout_before_acceptance_remains_unknown_without_resubmit(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

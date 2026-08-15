@@ -41,7 +41,7 @@ class PhaseDChaosRecoveryTests(unittest.TestCase):
         database = CopyTradeDatabase(directory / "copy.sqlite3")
         database.initialize()
         adapter = DeterministicExecutionSimulator(plans)
-        return database, ExecutionEngine(database, adapter), adapter
+        return database, ExecutionEngine(database, adapter, safety_context=ExecutionSafetyContext()), adapter
 
     def test_crash_checkpoints_preserve_resume_and_exactly_once_fills(self) -> None:
         cases = (
@@ -63,7 +63,7 @@ class PhaseDChaosRecoveryTests(unittest.TestCase):
                     intent = engine.process_signal(item, fault_hook=fault)
                 self.assertIsNotNone(intent)
                 self.assertEqual(intent.state, expected)  # type: ignore[union-attr]
-                restored = ExecutionEngine(database, adapter).resume_intent(intent.intent_id)  # type: ignore[union-attr]
+                restored = ExecutionEngine(database, adapter, safety_context=ExecutionSafetyContext()).resume_intent(intent.intent_id)  # type: ignore[union-attr]
                 self.assertEqual(restored.state, ExecutionState.FILLED)
                 self.assertEqual(adapter.submit_calls, 1)
                 self.assertEqual(len(database.list_execution_fills(restored.intent_id)), 1)
@@ -106,7 +106,10 @@ class PhaseDChaosRecoveryTests(unittest.TestCase):
             self.assertEqual(engine.reconcile_positions()["state"], "MISMATCH")
             unsafe = engine.process_signal(
                 signal("direction-close", action="close"),
-                context=ExecutionSafetyContext(verified_positions={"BTC": -1.0}),
+                context=ExecutionSafetyContext(
+                    verified_positions={"BTC": -1.0}, verified_positions_current=True,
+                    verified_positions_authoritative=True,
+                ),
             )
             self.assertEqual(unsafe.state, ExecutionState.BLOCKED)
             self.assertEqual(engine.store.latest_execution_risk_decision(unsafe.intent_id)["reason"], "reduce_only_direction_mismatch")
@@ -141,7 +144,7 @@ class PhaseDChaosRecoveryTests(unittest.TestCase):
                 partial.intent_id, fault_hook=DeterministicFaultInjector(["after_cancel_acceptance"]),
             )
             self.assertEqual(cancelled.state, ExecutionState.RECONCILIATION_REQUIRED)
-            repaired = ExecutionEngine(database, adapter).resume_intent(partial.intent_id)
+            repaired = ExecutionEngine(database, adapter, safety_context=ExecutionSafetyContext()).resume_intent(partial.intent_id)
             self.assertEqual(repaired.state, ExecutionState.CANCELLED)
             self.assertAlmostEqual(sum(float(row["quantity"]) for row in database.list_execution_fills(partial.intent_id)), 0.25)
 
@@ -151,7 +154,7 @@ class PhaseDChaosRecoveryTests(unittest.TestCase):
             with self.assertRaises(InjectedExecutionFault):
                 engine.reconcile_intent(unknown.intent_id, fault_hook=DeterministicFaultInjector(["before_reconciliation"]))
             self.assertEqual(database.latest_execution_reconciliation()["state"], "RECONCILING")
-            repaired = ExecutionEngine(database, adapter).resume_intent(unknown.intent_id)
+            repaired = ExecutionEngine(database, adapter, safety_context=ExecutionSafetyContext()).resume_intent(unknown.intent_id)
             self.assertEqual(repaired.state, ExecutionState.ACKNOWLEDGED)
 
     def test_global_venue_fill_identity_cannot_be_applied_to_two_submissions(self) -> None:
@@ -176,7 +179,7 @@ class PhaseDChaosRecoveryTests(unittest.TestCase):
             self.assertEqual(unknown.state, ExecutionState.SUBMISSION_UNKNOWN)
             with ThreadPoolExecutor(max_workers=2) as workers:
                 results = list(workers.map(
-                    lambda _: ExecutionEngine(database, adapter).resume_intent(unknown.intent_id), range(2),
+                    lambda _: ExecutionEngine(database, adapter, safety_context=ExecutionSafetyContext()).resume_intent(unknown.intent_id), range(2),
                 ))
             self.assertEqual({result.state for result in results}, {ExecutionState.ACKNOWLEDGED})
             self.assertEqual(adapter.submit_calls, 1)

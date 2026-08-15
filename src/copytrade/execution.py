@@ -7,7 +7,7 @@ handling, or live venue adapter here.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import Any, Iterable, Protocol
 
@@ -264,7 +264,7 @@ class DeterministicExecutionSimulator:
 
     def emit_fill(
         self, client_order_id: str, quantity: float, *, price: float = 100.0, fee: float = 0.0,
-        venue_fill_id: str | None = None, timestamp: object | None = None,
+        venue_fill_id: str | None = None, timestamp: object | None = None, side: str | None = None,
     ) -> VenueFill:
         if client_order_id not in self._orders:
             raise KeyError(f"Unknown simulator client order: {client_order_id}")
@@ -272,7 +272,8 @@ class DeterministicExecutionSimulator:
         fill = VenueFill(
             venue_fill_id=venue_fill_id or stable_id("sim_fill", client_order_id, len(fills)),
             client_order_id=client_order_id, quantity=abs(quantity), price=price, fee=fee,
-            venue_timestamp=as_utc(timestamp) if timestamp is not None else self.clock.advance(), raw_payload={"simulator": True},
+            venue_timestamp=as_utc(timestamp) if timestamp is not None else self.clock.advance(), side=side,
+            raw_payload={"simulator": True},
         )
         # Duplicate delivery remains observable to the adapter but is later
         # deduplicated by the Phase-D ledger using venue_fill_id.
@@ -375,9 +376,10 @@ class DeterministicExecutionSimulator:
         positions: dict[str, float] = {}
         for client_order_id, fills in self._fills.items():
             request = self._requests[client_order_id]
-            signed = sum(fill.quantity for fill in {fill.venue_fill_id: fill for fill in fills}.values())
-            if request.side == "SELL":
-                signed *= -1
+            signed = sum(
+                fill.quantity if (fill.side or request.side).upper() == "BUY" else -fill.quantity
+                for fill in {fill.venue_fill_id: fill for fill in fills}.values()
+            )
             positions[request.symbol] = positions.get(request.symbol, 0.0) + signed
         return positions
 
@@ -393,6 +395,8 @@ class D0ExecutionRiskGate:
             "source_recovery_continuous": context.source_recovery_continuous,
             "market_evidence_current": context.market_evidence_current,
             "reconciliation_healthy": context.reconciliation_healthy,
+            "verified_positions_current": context.verified_positions_current,
+            "verified_positions_authoritative": context.verified_positions_authoritative,
             "effect": intent.exposure_effect.value,
         }
         if context.hard_transport_stop:
@@ -408,6 +412,9 @@ class D0ExecutionRiskGate:
                 return False, "entry_blocked_stale_market_evidence", evidence
         elif intent.exposure_effect in {ExposureEffect.REDUCE, ExposureEffect.FLATTEN}:
             verified = context.verified_positions.get(intent.symbol)
+            if not context.reconciliation_healthy:
+                if verified is None or not context.verified_positions_current or not context.verified_positions_authoritative:
+                    return False, "reduce_only_verified_position_required", evidence
             if verified is not None:
                 intended_sign = 1.0 if intent.direction == "long" else -1.0
                 if verified * intended_sign <= EPSILON:
@@ -433,7 +440,10 @@ class PaperExecutionLedgerBridge:
 
     def record(self, signal: CopySignal, attempt: ExecutionAttempt, fills: Iterable[ExecutionFill]) -> ExecutionIntent:
         intent = self.store.create_or_get_execution_intent(
-            ExecutionIntent.from_copy_signal(signal, accepted_at=attempt.decided_at)
+            ExecutionIntent.from_copy_signal(
+                signal, accepted_at=attempt.decided_at, execution_domain="PAPER_COMPAT",
+                execution_account_id="PAPER_COMPAT:legacy_paper",
+            )
         )
         if intent.state is ExecutionState.CREATED:
             intent = self.store.transition_execution_intent(
@@ -491,16 +501,26 @@ class PaperExecutionLedgerBridge:
 class ExecutionEngine:
     """Durable Phase-D lifecycle coordinator over a strictly non-live adapter."""
 
-    def __init__(self, store: CopyTradeDatabase, adapter: ExecutionAdapter, risk_gate: D0ExecutionRiskGate | None = None) -> None:
+    def __init__(
+        self, store: CopyTradeDatabase, adapter: ExecutionAdapter, risk_gate: D0ExecutionRiskGate | None = None,
+        safety_context: ExecutionSafetyContext | None = None,
+    ) -> None:
         if adapter.adapter_mode != "SIMULATOR_ONLY":
             raise ValueError("Phase D.0 only accepts a SIMULATOR_ONLY execution adapter.")
         self.store, self.adapter, self.risk_gate = store, adapter, risk_gate or D0ExecutionRiskGate()
+        # A caller may provide a current authority source at engine creation.
+        # There is deliberately no permissive default when neither this nor a
+        # per-call context is supplied.
+        self.safety_context = safety_context
 
     def accept_signal(
         self, signal: CopySignal, *, accepted_at: object | None = None, provenance: dict[str, Any] | None = None,
     ) -> ExecutionIntent:
         return self.store.create_or_get_execution_intent(
-            ExecutionIntent.from_copy_signal(signal, accepted_at=accepted_at, provenance=provenance)
+            ExecutionIntent.from_copy_signal(
+                signal, accepted_at=accepted_at, provenance=provenance, execution_domain="SIMULATOR",
+                execution_account_id="SIMULATOR:default",
+            )
         )
 
     def process_signal(
@@ -513,14 +533,19 @@ class ExecutionEngine:
     def resume_intent(
         self, intent_id: str, *, context: ExecutionSafetyContext | None = None, fault_hook: Any = None,
     ) -> ExecutionIntent:
-        safety = context or ExecutionSafetyContext()
         intent = self._required_intent(intent_id)
+        admission_context = context or self.safety_context
         if intent.state in {ExecutionState.CREATED, ExecutionState.VALIDATING}:
-            intent = self.validate_intent(intent.intent_id, context=safety, fault_hook=fault_hook)
-        if intent.state is ExecutionState.READY:
-            if safety.hard_transport_stop:
+            # Restart reconciliation is safe without a new admission decision;
+            # admission and submission are not.  Missing context therefore
+            # leaves pre-submit work pending rather than assuming health.
+            if admission_context is None:
                 return intent
-            return self.submit_ready_intent(intent.intent_id, context=safety, fault_hook=fault_hook)
+            intent = self.validate_intent(intent.intent_id, context=admission_context, fault_hook=fault_hook)
+        if intent.state is ExecutionState.READY:
+            if admission_context is None or admission_context.hard_transport_stop:
+                return intent
+            return self.submit_ready_intent(intent.intent_id, context=admission_context, fault_hook=fault_hook)
         if intent.state in {
             ExecutionState.SUBMITTING, ExecutionState.SUBMISSION_UNKNOWN, ExecutionState.RECONCILIATION_REQUIRED,
             ExecutionState.CANCEL_PENDING,
@@ -537,10 +562,16 @@ class ExecutionEngine:
             self._checkpoint(fault_hook, "after_state_transition_persistence")
         if intent.state is not ExecutionState.VALIDATING:
             return intent
-        allowed, reason, evidence = self.risk_gate.evaluate(intent, context)
-        if intent.exposure_effect is ExposureEffect.INCREASE and self.store.execution_has_unresolved_entry_risk():
+        account_unhealthy = self.store.execution_account_reconciliation_unhealthy(
+            execution_domain=intent.execution_domain, execution_account_id=intent.execution_account_id,
+        )
+        safety = replace(context, reconciliation_healthy=context.reconciliation_healthy and not account_unhealthy)
+        allowed, reason, evidence = self.risk_gate.evaluate(intent, safety)
+        if intent.exposure_effect is ExposureEffect.INCREASE and self.store.execution_has_unresolved_entry_risk(
+            execution_domain=intent.execution_domain, execution_account_id=intent.execution_account_id,
+        ):
             allowed, reason = False, "entry_blocked_reconciliation_required"
-            evidence = {**evidence, "unresolved_phase_d_execution": True}
+            evidence = {**evidence, "unresolved_phase_d_execution": True, "account_reconciliation_unhealthy": account_unhealthy}
         decision = ExecutionRiskDecision(
             decision_id=stable_id("phase_d_risk_decision", intent_id, allowed, reason, evidence),
             intent_id=intent_id, allowed=allowed, reason=reason, evaluated_at=utc_now(), evidence=evidence,
@@ -628,7 +659,10 @@ class ExecutionEngine:
             return intent
         now = utc_now()
         run_id = stable_id("phase_d_reconcile_order", intent_id, now)
-        self.store.start_execution_reconciliation(run_id, scope="order", started_at=now, evidence={"intent_id": intent_id})
+        self.store.start_execution_reconciliation(
+            run_id, scope="intent_order", started_at=now, evidence={"intent_id": intent_id},
+            execution_domain=intent.execution_domain, execution_account_id=intent.execution_account_id,
+        )
         self._checkpoint(fault_hook, "before_reconciliation")
         try:
             fills = self.adapter.list_fills(submission.client_order_id)
@@ -680,8 +714,11 @@ class ExecutionEngine:
         """Record account evidence; unavailable or stale reads never clear risk."""
         now = utc_now()
         run_id = stable_id("phase_d_reconcile_positions", now)
-        self.store.start_execution_reconciliation(run_id, scope="positions", started_at=now)
-        local = self.store.phase_d_local_positions()
+        self.store.start_execution_reconciliation(
+            run_id, scope="account_positions", started_at=now, execution_domain="SIMULATOR",
+            execution_account_id="SIMULATOR:default",
+        )
+        local = self.store.phase_d_local_positions(execution_domain="SIMULATOR", execution_account_id="SIMULATOR:default")
         try:
             self._checkpoint(fault_hook, "before_reconciliation")
             venue_rows = self.adapter.get_positions()
@@ -736,7 +773,8 @@ class ExecutionEngine:
                 self.store.record_execution_position_observation(
                     observation_id=observation_id, reconciliation_run_id=run_id, symbol=symbol,
                     local_signed_quantity=expected, venue_signed_quantity=actual, state=state,
-                    observed_at=now, raw_evidence=raw,
+                    observed_at=now, raw_evidence=raw, execution_domain="SIMULATOR",
+                    execution_account_id="SIMULATOR:default",
                 )
                 self._checkpoint(fault_hook, "after_position_observation")
                 self.store.record_execution_reconciliation_item(
@@ -773,8 +811,11 @@ class ExecutionEngine:
         """
         now = utc_now()
         run_id = stable_id("phase_d_verify_flat", now)
-        self.store.start_execution_reconciliation(run_id, scope="verified_flat", started_at=now)
-        local = self.store.phase_d_local_positions()
+        self.store.start_execution_reconciliation(
+            run_id, scope="verified_flat", started_at=now, execution_domain="SIMULATOR",
+            execution_account_id="SIMULATOR:default",
+        )
+        local = self.store.phase_d_local_positions(execution_domain="SIMULATOR", execution_account_id="SIMULATOR:default")
         try:
             self._checkpoint(fault_hook, "before_reconciliation")
             venue_rows = self.adapter.get_positions()
@@ -797,7 +838,9 @@ class ExecutionEngine:
             )
             return {"reconciliation_run_id": run_id, "state": ReconciliationState.INCOMPLETE.value, "reason": reason}
         venue_positions = {row.symbol: row.signed_quantity for row in venue_rows if abs(row.signed_quantity) > EPSILON}
-        unresolved = self.store.execution_unresolved_submissions()
+        unresolved = self.store.execution_unresolved_submissions(
+            execution_domain="SIMULATOR", execution_account_id="SIMULATOR:default",
+        )
         active_orders = [
             order for order in open_orders
             if order.status in {VenueOrderStatus.ACKNOWLEDGED, VenueOrderStatus.PARTIALLY_FILLED}
@@ -845,12 +888,22 @@ class ExecutionEngine:
             self._checkpoint(fault_hook, "before_local_fill_persistence")
             self.store.record_execution_venue_fill(intent.intent_id, submission.submission_id, fill)
             self._checkpoint(fault_hook, "after_local_fill_persistence")
-        persisted_fills = sum(float(row["quantity"]) for row in self.store.list_execution_fills(intent.intent_id))
+        persisted_fills = sum(float(row["quantity"]) for row in self.store.list_execution_fills(
+            intent.intent_id, execution_domain=intent.execution_domain, execution_account_id=intent.execution_account_id,
+        ))
         updated_submission = self.store.update_execution_submission(
             intent.intent_id, state=order.status.value, venue_order_id=order.venue_order_id,
             filled_quantity=order.filled_quantity, raw_evidence=self._venue_order_evidence(order), updated_at=order.venue_timestamp,
         )
         self._checkpoint(fault_hook, "after_submission_persistence")
+        if self.store.execution_has_integrity_issue(
+            intent_id=intent.intent_id, execution_domain=intent.execution_domain,
+            execution_account_id=intent.execution_account_id,
+        ):
+            return self.store.transition_execution_intent(
+                intent.intent_id, ExecutionState.RECONCILIATION_REQUIRED, reason="execution_integrity_failure",
+                source=source, raw_evidence={"submission_id": submission.submission_id},
+            )
         if order.filled_quantity > persisted_fills + EPSILON:
             # A venue position/order is evidence of exposure, not permission to
             # invent fills.  Surface missing fill provenance and fail closed.
