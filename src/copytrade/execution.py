@@ -8,6 +8,7 @@ handling, or live venue adapter here.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any, Iterable, Protocol
 
 from .execution_contracts import (
@@ -68,39 +69,89 @@ class SimulatorPlan:
     hide_order_reads: bool = False
 
 
+@dataclass
+class SimulatedClock:
+    """Injectable monotonic clock so scenario replay never depends on sleeps."""
+
+    current: object = "2026-01-01T00:00:00+00:00"
+
+    def now(self) -> object:
+        return as_utc(self.current)
+
+    def advance(self, milliseconds: int = 1) -> object:
+        self.current = as_utc(self.current) + timedelta(milliseconds=milliseconds)
+        return self.now()
+
+
+@dataclass(frozen=True)
+class SimulatorStep:
+    """One deterministic venue-side event, reusable across scenario replays."""
+
+    action: str
+    quantity: float = 0.0
+    price: float = 100.0
+    fee: float = 0.0
+    artifact_id: str | None = None
+    milliseconds: int = 1
+
+
+@dataclass(frozen=True)
+class SimulatorScenario:
+    """Explicit ordered script; no randomness or wall-clock timing is implied."""
+
+    name: str
+    submit_mode: str = "acknowledged"
+    submit_steps: tuple[SimulatorStep, ...] = ()
+    reconciliation_steps: tuple[SimulatorStep, ...] = ()
+
+
 class DeterministicExecutionSimulator:
     """Fault-injection laboratory; never a networked or live execution adapter."""
 
     adapter_name = "deterministic_execution_simulator"
     adapter_mode = "SIMULATOR_ONLY"
 
-    def __init__(self, plans: Iterable[SimulatorPlan] = ()) -> None:
+    def __init__(
+        self, plans: Iterable[SimulatorPlan] = (), *, scenarios: Iterable[SimulatorScenario] = (),
+        clock: SimulatedClock | None = None,
+    ) -> None:
         self._plans = list(plans)
+        self._scenarios = list(scenarios)
+        self.clock = clock or SimulatedClock()
         self._orders: dict[str, VenueOrder] = {}
         self._fills: dict[str, list[VenueFill]] = {}
         self._requests: dict[str, SubmissionRequest] = {}
         self._hidden_reads: set[str] = set()
         self._reported_positions: dict[str, float] | None = None
+        self._external_orders: dict[str, VenueOrder] = {}
+        self._unavailable = False
+        self._stale_positions: list[VenuePosition] | None = None
+        self._pending_reconciliation_steps: dict[str, tuple[SimulatorStep, ...]] = {}
         self.submit_calls = 0
 
     def submit(self, request: SubmissionRequest) -> VenueOrder:
         # A simulator retry returns the original order.  The engine itself is
         # deliberately stricter and will reconcile rather than call submit a
         # second time after ambiguity.
+        self._require_available()
         self.submit_calls += 1
         if request.client_order_id in self._orders:
             return self._orders[request.client_order_id]
-        plan = self._plans.pop(0) if self._plans else SimulatorPlan()
+        scenario = self._scenarios.pop(0) if self._scenarios else None
+        plan = self._plans.pop(0) if self._plans else SimulatorPlan(mode=scenario.submit_mode if scenario else "immediate_fill")
         if plan.mode not in {
-            "immediate_fill", "acknowledged", "partial", "rejected", "rejected_timeout", "accepted_timeout", "delayed_ack",
+            "immediate_fill", "acknowledged", "partial", "rejected", "rejected_timeout", "accepted_timeout",
+            "timeout_before_accept", "delayed_ack",
         }:
             raise ValueError(f"Unsupported simulator plan: {plan.mode}")
+        if plan.mode == "timeout_before_accept":
+            raise AmbiguousSubmissionError("simulated_timeout_before_venue_acceptance")
         self._requests[request.client_order_id] = request
         if plan.mode in {"rejected", "rejected_timeout"}:
             order = VenueOrder(
                 client_order_id=request.client_order_id, venue_order_id=stable_id("sim_order", request.client_order_id),
                 status=VenueOrderStatus.REJECTED, requested_quantity=request.quantity, filled_quantity=0.0,
-                reason=plan.reason or "venue_rejected_simulated", venue_timestamp=utc_now(),
+                reason=plan.reason or "venue_rejected_simulated", venue_timestamp=self.clock.now(),
                 raw_payload={"simulator_plan": plan.mode},
             )
             self._orders[request.client_order_id] = order
@@ -111,7 +162,7 @@ class DeterministicExecutionSimulator:
         order = VenueOrder(
             client_order_id=request.client_order_id, venue_order_id=stable_id("sim_order", request.client_order_id),
             status=VenueOrderStatus.ACKNOWLEDGED, requested_quantity=request.quantity, filled_quantity=0.0,
-            venue_timestamp=utc_now(), raw_payload={"simulator_plan": plan.mode},
+            venue_timestamp=self.clock.now(), raw_payload={"simulator_plan": plan.mode},
         )
         self._orders[request.client_order_id] = order
         self._fills[request.client_order_id] = []
@@ -127,30 +178,40 @@ class DeterministicExecutionSimulator:
                 request.client_order_id, quantity, price=plan.price, fee=quantity * plan.price * plan.fee_rate,
                 venue_fill_id=stable_id("sim_fill", request.client_order_id, index),
             )
+        if scenario:
+            self._apply_steps(request.client_order_id, scenario.submit_steps)
+            self._pending_reconciliation_steps[request.client_order_id] = scenario.reconciliation_steps
         if plan.mode == "accepted_timeout":
             raise AmbiguousSubmissionError("simulated_timeout_after_venue_acceptance")
         return self._orders[request.client_order_id]
 
     def cancel(self, client_order_id: str) -> VenueOrder:
+        self._require_available()
         order = self._orders.get(client_order_id)
         if not order:
             raise AmbiguousSubmissionError("simulated_cancel_unknown_order")
         if order.status is not VenueOrderStatus.FILLED:
             order = VenueOrder(
-                **{**order.__dict__, "status": VenueOrderStatus.CANCELLED, "venue_timestamp": utc_now(),
+                **{**order.__dict__, "status": VenueOrderStatus.CANCELLED, "venue_timestamp": self.clock.now(),
                    "raw_payload": {**order.raw_payload, "cancelled": True}}
             )
             self._orders[client_order_id] = order
         return order
 
     def get_order(self, client_order_id: str) -> VenueOrder | None:
+        self._require_available()
+        self._apply_steps(client_order_id, self._pending_reconciliation_steps.pop(client_order_id, ()))
         return None if client_order_id in self._hidden_reads else self._orders.get(client_order_id)
 
     def list_fills(self, client_order_id: str) -> list[VenueFill]:
+        self._require_available()
         return list(self._fills.get(client_order_id, ()))
 
     def get_positions(self) -> list[VenuePosition]:
-        observed = utc_now()
+        self._require_available()
+        if self._stale_positions is not None:
+            return list(self._stale_positions)
+        observed = self.clock.now()
         positions = self._reported_positions if self._reported_positions is not None else self._calculated_positions()
         return [
             VenuePosition(symbol=symbol, signed_quantity=quantity, observed_at=observed, raw_payload={"simulator": True})
@@ -158,9 +219,11 @@ class DeterministicExecutionSimulator:
         ]
 
     def get_balances(self) -> dict[str, Any]:
+        self._require_available()
         return {"mode": self.adapter_mode, "currency": "USD", "available": None}
 
     def get_instrument_metadata(self, symbol: str) -> dict[str, Any]:
+        self._require_available()
         return {"symbol": symbol, "mode": self.adapter_mode, "minimum_quantity": 0.0, "quantity_precision": None}
 
     def emit_fill(
@@ -173,7 +236,7 @@ class DeterministicExecutionSimulator:
         fill = VenueFill(
             venue_fill_id=venue_fill_id or stable_id("sim_fill", client_order_id, len(fills)),
             client_order_id=client_order_id, quantity=abs(quantity), price=price, fee=fee,
-            venue_timestamp=as_utc(timestamp), raw_payload={"simulator": True},
+            venue_timestamp=as_utc(timestamp) if timestamp is not None else self.clock.advance(), raw_payload={"simulator": True},
         )
         # Duplicate delivery remains observable to the adapter but is later
         # deduplicated by the Phase-D ledger using venue_fill_id.
@@ -201,6 +264,69 @@ class DeterministicExecutionSimulator:
     def set_reported_positions(self, positions: dict[str, float] | None) -> None:
         """Inject stale/mismatched venue account truth for reconciliation tests."""
         self._reported_positions = dict(positions) if positions is not None else None
+
+    def set_temporary_unavailable(self, unavailable: bool = True) -> None:
+        self._unavailable = unavailable
+
+    def set_stale_positions(self, positions: list[VenuePosition] | None) -> None:
+        self._stale_positions = list(positions) if positions is not None else None
+
+    def inject_external_position(self, symbol: str, signed_quantity: float) -> None:
+        """Venue-side manual activity: deliberately has no local intent provenance."""
+        positions = dict(self._reported_positions or self._calculated_positions())
+        positions[symbol] = signed_quantity
+        self._reported_positions = positions
+
+    def inject_external_order(self, symbol: str, signed_quantity: float) -> VenueOrder:
+        identifier = stable_id("sim_external_order", symbol, signed_quantity, len(self._external_orders))
+        order = VenueOrder(
+            client_order_id=identifier, venue_order_id=identifier, status=VenueOrderStatus.ACKNOWLEDGED,
+            requested_quantity=abs(signed_quantity), filled_quantity=0.0, venue_timestamp=self.clock.now(),
+            raw_payload={"simulator": True, "external_manual_activity": True, "symbol": symbol, "signed_quantity": signed_quantity},
+        )
+        self._external_orders[identifier] = order
+        return order
+
+    def list_open_orders(self) -> list[VenueOrder]:
+        self._require_available()
+        local = [order for order in self._orders.values() if order.status in {
+            VenueOrderStatus.ACKNOWLEDGED, VenueOrderStatus.PARTIALLY_FILLED,
+        }]
+        return [*local, *self._external_orders.values()]
+
+    def replay_steps(self, client_order_id: str, steps: Iterable[SimulatorStep]) -> VenueOrder | None:
+        """Apply an explicit ordered script after submission or during reconciliation."""
+        self._apply_steps(client_order_id, tuple(steps))
+        return self._orders.get(client_order_id)
+
+    def _apply_steps(self, client_order_id: str, steps: Iterable[SimulatorStep]) -> None:
+        for step in steps:
+            self.clock.advance(step.milliseconds)
+            if step.action == "fill":
+                self.emit_fill(client_order_id, step.quantity, price=step.price, fee=step.fee, venue_fill_id=step.artifact_id)
+            elif step.action == "cancel":
+                self.cancel(client_order_id)
+            elif step.action == "hide_order":
+                self.set_order_read_visible(client_order_id, False)
+            elif step.action == "show_order":
+                self.set_order_read_visible(client_order_id, True)
+            elif step.action == "duplicate_fill":
+                fills = self._fills.get(client_order_id, [])
+                if not fills:
+                    raise ValueError("duplicate_fill requires a previous fill")
+                fills.append(fills[-1])
+            elif step.action == "external_position":
+                self.inject_external_position(self._requests[client_order_id].symbol, step.quantity)
+            elif step.action == "unavailable":
+                self.set_temporary_unavailable(True)
+            elif step.action == "available":
+                self.set_temporary_unavailable(False)
+            elif step.action != "noop":
+                raise ValueError(f"Unsupported simulator script action: {step.action}")
+
+    def _require_available(self) -> None:
+        if self._unavailable:
+            raise ConnectionError("simulated_venue_temporarily_unavailable")
 
     def _calculated_positions(self) -> dict[str, float]:
         positions: dict[str, float] = {}

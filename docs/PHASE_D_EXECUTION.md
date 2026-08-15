@@ -137,8 +137,26 @@ is no execution control or live-enable route.
 
 ## Remaining roadmap
 
-- **D.1:** exercise fuller deterministic simulator lifecycle and operator
-  workflows through this boundary.
+## D.1 deterministic simulator
+
+D.1 turns the simulator into a scriptable venue-side state machine. A
+`SimulatorScenario` is an explicit ordered list of `SimulatorStep`s and a
+`SimulatedClock`, so replay is reproducible without sleeps or wall-clock IDs.
+Scripts can emit fills before acknowledgement, delay visibility until a query,
+duplicate fills, hide/stale order or position reads, inject temporary
+unavailability, and create independent manual orders or positions. The
+simulator owns its orders, fills, positions, and external activity in memory;
+it never reads the local Phase-D SQLite ledger to answer reconciliation.
+
+Timeout-before-acceptance, timeout-after-acceptance, timeout-after-rejection,
+and timeout-after-fill remain different outcomes. All begin conservatively as
+`SUBMISSION_UNKNOWN` unless the simulator supplies authoritative rejection;
+only reconciliation changes that state. A cancellation never removes an
+already emitted fill, and duplicate fill artifact IDs are intentionally
+delivered to prove ledger deduplication.
+
+- **D.2:** put paper execution alongside/behind the D ledger and prove parity
+  without changing paper economics.
 - **D.2:** put paper execution alongside/behind the D ledger and prove parity
   without changing paper economics.
 - **D.3:** extend crash, stale-read, race, and account-reconciliation chaos
