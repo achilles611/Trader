@@ -155,10 +155,24 @@ only reconciliation changes that state. A cancellation never removes an
 already emitted fill, and duplicate fill artifact IDs are intentionally
 delivered to prove ledger deduplication.
 
-- **D.2:** put paper execution alongside/behind the D ledger and prove parity
-  without changing paper economics.
-- **D.2:** put paper execution alongside/behind the D ledger and prove parity
-  without changing paper economics.
+## D.2 paper execution integration
+
+New durable PAPER attempts write their Phase-D intent, decision, submission,
+fill, and transition evidence inside the existing atomic paper commit. That
+transaction remains the sole economic authority for legacy claims, virtual
+sleeves, simulated fills, and portfolio snapshots, so the compatibility
+projection cannot double-apply a sleeve or P&L mutation.
+
+Because PAPER evidence is already terminal at that point, its compatibility
+projection writes one immutable terminal event with the semantic lifecycle in
+its evidence instead of replaying intermediate transitions as separate SQLite
+writes. Future venue adapters continue to use the full live state machine.
+
+The bridge also repairs a missing D projection on restart from an already
+committed `copy_execution_attempt` and `copy_execution_fills` record. These
+legacy rows retain their original meaning and are never rewritten. A skipped
+paper entry becomes a durable D `BLOCKED` intent with its original reason;
+legitimate paper reductions/closes remain projected as `FILLED` intents.
 - **D.3:** extend crash, stale-read, race, and account-reconciliation chaos
   coverage.
 - **D.4:** add a strictly read-only real-venue shadow adapter for metadata and

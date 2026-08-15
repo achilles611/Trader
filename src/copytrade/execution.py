@@ -26,7 +26,7 @@ from .execution_contracts import (
     VenuePosition,
     order_side,
 )
-from .models import CopySignal, as_utc, stable_id, utc_now
+from .models import CopySignal, ExecutionAttempt, ExecutionFill, as_utc, stable_id, utc_now
 from .storage import CopyTradeDatabase
 
 
@@ -372,6 +372,77 @@ class D0ExecutionRiskGate:
                 if intent.requested_quantity > abs(verified) + EPSILON:
                     return False, "reduce_only_size_exceeds_position", evidence
         return True, "approved", evidence
+
+
+class PaperExecutionLedgerBridge:
+    """Additive D.2 projection of authoritative PAPER execution evidence.
+
+    Phase C still owns the paper economic transaction (claim, sleeve mutation,
+    legacy fills, and portfolio snapshot).  Once that transaction commits,
+    this bridge mirrors its immutable result into the Phase-D ledger exactly
+    once.  It never writes a sleeve or changes legacy economics, so the two
+    systems cannot both apply a fill.  Restarting with the same signal repairs
+    a missing projection from the committed legacy attempt/fills.
+    """
+
+    def __init__(self, store: CopyTradeDatabase) -> None:
+        self.store = store
+
+    def record(self, signal: CopySignal, attempt: ExecutionAttempt, fills: Iterable[ExecutionFill]) -> ExecutionIntent:
+        intent = self.store.create_or_get_execution_intent(
+            ExecutionIntent.from_copy_signal(signal, accepted_at=attempt.decided_at)
+        )
+        if intent.state is ExecutionState.CREATED:
+            intent = self.store.transition_execution_intent(
+                intent.intent_id, ExecutionState.VALIDATING, reason="paper_execution_projection_started", source="paper_bridge",
+            )
+        materialized_fills = tuple(fills)
+        allowed = attempt.status == "filled" and bool(materialized_fills)
+        projection_reason = attempt.reason if allowed or attempt.status != "filled" else "paper_filled_without_fill_evidence"
+        decision = ExecutionRiskDecision(
+            decision_id=stable_id("phase_d_paper_risk", intent.intent_id, attempt.attempt_id, attempt.status, attempt.reason),
+            intent_id=intent.intent_id, allowed=allowed, reason=projection_reason, evaluated_at=attempt.decided_at,
+            evidence={"paper_attempt_id": attempt.attempt_id, "paper_status": attempt.status, "paper_compatibility": True},
+        )
+        self.store.record_execution_risk_decision(decision)
+        if intent.state is ExecutionState.VALIDATING:
+            intent = self.store.transition_execution_intent(
+                intent.intent_id, ExecutionState.READY if allowed else ExecutionState.BLOCKED,
+                reason=projection_reason, source="paper_risk", raw_evidence=decision.evidence,
+            )
+        if not allowed or intent.state is ExecutionState.FILLED:
+            return intent
+        if intent.state is not ExecutionState.READY:
+            return intent
+        quantity = sum(fill.quantity for fill in materialized_fills)
+        if quantity <= EPSILON:
+            raise ValueError("Paper filled execution cannot project zero fill quantity.")
+        submission, _ = self.store.prepare_execution_submission(
+            intent.intent_id, submission_id=stable_id("phase_d_paper_submission", intent.intent_id),
+            client_order_id=stable_id("phase_d_paper_client_order", intent.intent_id),
+            side=order_side(intent.exposure_effect, intent.direction), requested_quantity=quantity,
+            created_at=attempt.decided_at,
+        )
+        for fill in materialized_fills:
+            self.store.record_execution_venue_fill(
+                intent.intent_id, submission.submission_id,
+                VenueFill(
+                    venue_fill_id=stable_id("phase_d_paper_fill", attempt.attempt_id, fill.execution_fill_id),
+                    client_order_id=submission.client_order_id, quantity=fill.quantity, price=fill.price, fee=fill.fee,
+                    venue_timestamp=fill.timestamp,
+                    raw_payload={"paper_compatibility": True, "legacy_execution_fill_id": fill.execution_fill_id, **fill.raw},
+                ), received_at=attempt.decided_at,
+            )
+        self.store.update_execution_submission(
+            intent.intent_id, state=VenueOrderStatus.FILLED.value,
+            venue_order_id=stable_id("phase_d_paper_order", attempt.attempt_id), filled_quantity=quantity,
+            raw_evidence={"paper_compatibility": True, "legacy_attempt_id": attempt.attempt_id}, updated_at=attempt.decided_at,
+        )
+        return self.store.transition_execution_intent(
+            intent.intent_id, ExecutionState.FILLED, reason="paper_execution_filled", source="paper_bridge",
+            occurred_at=attempt.decided_at,
+            raw_evidence={"paper_compatibility": True, "legacy_attempt_id": attempt.attempt_id},
+        )
 
 
 class ExecutionEngine:

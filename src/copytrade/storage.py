@@ -2225,6 +2225,19 @@ class CopyTradeDatabase:
                  fill.fee, fill.slippage_bps, iso(fill.timestamp), _dump(fill.raw)),
             )
 
+    def list_execution_fills_for_attempt(self, attempt_id: str) -> list[ExecutionFill]:
+        """Compatibility read of historical PAPER fills for the D.2 bridge."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM copy_execution_fills WHERE attempt_id=? ORDER BY timestamp, execution_fill_id", (attempt_id,)
+            ).fetchall()
+        return [ExecutionFill(
+            execution_fill_id=row["execution_fill_id"], attempt_id=row["attempt_id"], sleeve_id=row["sleeve_id"],
+            price=float(row["price"]), quantity=float(row["quantity"]), notional=float(row["notional"]),
+            fee=float(row["fee"]), slippage_bps=float(row["slippage_bps"]), timestamp=as_utc(row["timestamp"]),
+            raw=_load(row["raw_json"], {}),
+        ) for row in rows]
+
     def insert_backtest_run(self, run: BacktestRun) -> None:
         with self._connect() as connection:
             connection.execute(
@@ -2378,6 +2391,7 @@ class CopyTradeDatabase:
     def commit_execution(
         self, signal: CopySignal, attempt: ExecutionAttempt, sleeves: Iterable[VirtualTargetPosition],
         fills: Iterable[ExecutionFill], *, snapshot: dict[str, float] | None, fault_hook: Any = None,
+        phase_d_projection: bool = False,
     ) -> bool:
         """The paper execution idempotency boundary.
 
@@ -2389,6 +2403,7 @@ class CopyTradeDatabase:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                fill_rows = tuple(fills)
                 exists = connection.execute("SELECT 1 FROM copy_execution_claims WHERE signal_id=?", (signal.signal_id,)).fetchone()
                 if exists:
                     connection.rollback()
@@ -2442,7 +2457,7 @@ class CopyTradeDatabase:
                     )
                 if fault_hook:
                     fault_hook("after_sleeves")
-                for fill in fills:
+                for fill in fill_rows:
                     connection.execute(
                         """INSERT INTO copy_execution_fills(execution_fill_id, attempt_id, sleeve_id, price, quantity,
                         notional, fee, slippage_bps, timestamp, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -2457,6 +2472,8 @@ class CopyTradeDatabase:
                         (snapshot_id, iso(attempt.decided_at), snapshot["cash"], snapshot["equity"], snapshot["committed_capital"],
                          snapshot["drawdown_fraction"], snapshot.get("peak_equity"), snapshot.get("max_drawdown_fraction", 0.0)),
                     )
+                if phase_d_projection:
+                    self._commit_phase_d_paper_projection(connection, signal, attempt, fill_rows)
                 if fault_hook:
                     fault_hook("before_commit")
                 connection.commit()
@@ -2464,6 +2481,89 @@ class CopyTradeDatabase:
             except Exception:
                 connection.rollback()
                 raise
+
+    def _commit_phase_d_paper_projection(
+        self, connection: sqlite3.Connection, signal: CopySignal, attempt: ExecutionAttempt, fills: tuple[ExecutionFill, ...],
+    ) -> None:
+        """Write the D.2 compatibility projection in the legacy paper transaction.
+
+        This is deliberately a compact SQL projection rather than a call to
+        the public D methods, avoiding extra connection/commit latency on the
+        Phase-C market-evidence path. Existing D.0 rows are never rewritten.
+        """
+        existing = connection.execute(
+            "SELECT 1 FROM phase_d_execution_intents WHERE signal_id=?", (signal.signal_id,)
+        ).fetchone()
+        if existing:
+            return
+        intent = ExecutionIntent.from_copy_signal(signal, accepted_at=attempt.decided_at)
+        allowed = attempt.status == "filled" and bool(fills)
+        projection_reason = attempt.reason if allowed or attempt.status != "filled" else "paper_filled_without_fill_evidence"
+        state = ExecutionState.FILLED if allowed and fills else ExecutionState.BLOCKED
+        connection.execute(
+            """INSERT INTO phase_d_execution_intents(
+                intent_id, contract_version, signal_id, source_event_id, target_wallet, campaign_id, symbol,
+                action, direction, requested_quantity, requested_capital, source_event_timestamp, accepted_at,
+                provenance_json, exposure_effect, supersedes_intent_id, state, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (intent.intent_id, intent.contract_version, intent.signal_id, intent.source_event_id, intent.target_wallet,
+             intent.campaign_id, intent.symbol, intent.action, intent.direction, intent.requested_quantity,
+             intent.requested_capital, iso(intent.source_event_timestamp), iso(attempt.decided_at), _dump(intent.provenance),
+             intent.exposure_effect.value, intent.supersedes_intent_id, state.value, iso(attempt.decided_at)),
+        )
+        # PAPER has already completed its economic lifecycle inside this
+        # transaction.  Store one immutable terminal projection event rather
+        # than replaying intermediate D transitions one SQLite write at a
+        # time.  The evidence preserves the semantic path for audit while the
+        # live state machine remains the authority for future venue adapters.
+        reason = "paper_execution_committed" if allowed else projection_reason
+        source = "paper_execution_commit"
+        connection.execute(
+            """INSERT INTO phase_d_execution_state_events(
+                event_id, intent_id, sequence, previous_state, next_state, reason, source, occurred_at, raw_evidence_json)
+               VALUES (?, ?, 1, NULL, ?, ?, ?, ?, ?)""",
+            (stable_id("phase_d_execution_state", intent.intent_id, 1, None, state.value, reason, source),
+             intent.intent_id, state.value, reason, source, iso(attempt.decided_at),
+             _dump({
+                 "paper_compatibility": True, "legacy_attempt_id": attempt.attempt_id,
+                 "projected_lifecycle": (["CREATED", "VALIDATING", "READY", "SUBMITTING", "FILLED"]
+                                         if allowed else ["CREATED", "VALIDATING", "BLOCKED"]),
+             })),
+        )
+        connection.execute(
+            """INSERT INTO phase_d_execution_risk_decisions(decision_id, intent_id, allowed, reason, evaluated_at, evidence_json)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (stable_id("phase_d_paper_risk", intent.intent_id, attempt.attempt_id, attempt.status, attempt.reason),
+             intent.intent_id, int(allowed), projection_reason, iso(attempt.decided_at),
+             _dump({"paper_compatibility": True, "paper_attempt_id": attempt.attempt_id, "paper_status": attempt.status})),
+        )
+        if not allowed or not fills:
+            return
+        quantity = sum(fill.quantity for fill in fills)
+        submission_id = stable_id("phase_d_paper_submission", intent.intent_id)
+        client_order_id = stable_id("phase_d_paper_client_order", intent.intent_id)
+        connection.execute(
+            """INSERT INTO phase_d_execution_submissions(
+                submission_id, intent_id, client_order_id, requested_quantity, side, state, venue_order_id,
+                filled_quantity, created_at, updated_at, raw_evidence_json)
+               VALUES (?, ?, ?, ?, ?, 'FILLED', ?, ?, ?, ?, ?)""",
+            (submission_id, intent.intent_id, client_order_id, quantity,
+             "BUY" if (intent.direction == "long") == (intent.action in {"open", "add"}) else "SELL",
+             stable_id("phase_d_paper_order", attempt.attempt_id), quantity, iso(attempt.decided_at), iso(attempt.decided_at),
+             _dump({"paper_compatibility": True, "legacy_attempt_id": attempt.attempt_id})),
+        )
+        for fill in fills:
+            connection.execute(
+                """INSERT INTO phase_d_execution_fills(
+                    execution_fill_id, intent_id, submission_id, venue_fill_id, quantity, price, fee,
+                    venue_timestamp, received_at, raw_evidence_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (stable_id("phase_d_execution_fill_v1", submission_id,
+                           stable_id("phase_d_paper_fill", attempt.attempt_id, fill.execution_fill_id)),
+                 intent.intent_id, submission_id, stable_id("phase_d_paper_fill", attempt.attempt_id, fill.execution_fill_id),
+                 fill.quantity, fill.price, fill.fee, iso(fill.timestamp), iso(attempt.decided_at),
+                 _dump({"paper_compatibility": True, "legacy_execution_fill_id": fill.execution_fill_id, **fill.raw})),
+            )
 
     # ------------------------------------------------------------------
     # Phase D execution ledger.  This is deliberately separate from the

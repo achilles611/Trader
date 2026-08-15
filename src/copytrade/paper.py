@@ -9,8 +9,9 @@ from typing import Any, Iterable
 
 from .config import CopyTradeConfig, RiskConfig, SizingConfig
 from .equity import is_equity_observation_usable
+from .execution import PaperExecutionLedgerBridge
 from .models import CopySignal, ExecutionAttempt, ExecutionFill, PositionEvent, PositionEventType, VirtualTargetPosition, as_utc, stable_id
-from .storage import CopyTradeStore
+from .storage import CopyTradeDatabase, CopyTradeStore
 
 
 @dataclass(frozen=True)
@@ -250,6 +251,10 @@ class PaperExecutionEngine:
         self.equity_history = [self.portfolio.equity]
         self.risk, self.rng = CopyRiskEngine(config.risk), random.Random(config.paper_execution.random_seed)
         self._pending_fills: list[ExecutionFill] = []
+        # D.2 records every newly committed PAPER economic result in the
+        # Phase-D ledger.  The bridge is intentionally absent for lightweight
+        # protocol fakes/backtests that do not expose the durable database.
+        self._phase_d_bridge = PaperExecutionLedgerBridge(store) if isinstance(store, CopyTradeDatabase) else None
 
     def restore(
         self, sleeves: Iterable[VirtualTargetPosition], snapshot: dict[str, Any] | None = None,
@@ -288,6 +293,7 @@ class PaperExecutionEngine:
     ) -> ExecutionAttempt:
         existing = getattr(self.store, "get_execution_attempt", lambda _id: None)(signal.signal_id) if self.store else None
         if existing:
+            self._project_phase_d(signal, existing, getattr(self.store, "list_execution_fills_for_attempt", lambda _id: ())(existing.attempt_id))
             return existing
         original = copy.deepcopy(self.portfolio)
         self._pending_fills = []
@@ -310,15 +316,30 @@ class PaperExecutionEngine:
         snapshot = self._snapshot() if attempt.status == "filled" else None
         if self.store:
             try:
-                committed = self.store.commit_execution(signal, attempt, self.portfolio.sleeves.values(), self._pending_fills, snapshot=snapshot, fault_hook=fault_hook)  # type: ignore[attr-defined]
+                commit_kwargs: dict[str, object] = {"snapshot": snapshot, "fault_hook": fault_hook}
+                if isinstance(self.store, CopyTradeDatabase):
+                    # One transaction is the economic and D.2 evidence
+                    # boundary.  The compatibility ledger never applies a
+                    # second sleeve, fill, or portfolio mutation.
+                    commit_kwargs["phase_d_projection"] = True
+                committed = self.store.commit_execution(  # type: ignore[attr-defined]
+                    signal, attempt, self.portfolio.sleeves.values(), self._pending_fills, **commit_kwargs,
+                )
                 if not committed:
                     self.portfolio = original
-                    return self.store.get_execution_attempt(signal.signal_id)  # type: ignore[attr-defined]
+                    existing = self.store.get_execution_attempt(signal.signal_id)  # type: ignore[attr-defined]
+                    self._project_phase_d(signal, existing, getattr(self.store, "list_execution_fills_for_attempt", lambda _id: ())(existing.attempt_id))
+                    return existing
             except Exception:
                 self.portfolio = original
                 raise
         self.equity_history.append(self.portfolio.equity)
         return attempt
+
+    def _project_phase_d(self, signal: CopySignal, attempt: ExecutionAttempt, fills: Iterable[ExecutionFill]) -> None:
+        if not self._phase_d_bridge:
+            return
+        self._phase_d_bridge.record(signal, attempt, fills)
 
     def _entry(self, signal: CopySignal, price: float, received: object, order_time: object) -> ExecutionAttempt:
         execution_price = self._execution_price(price, signal.direction, opening=True)
