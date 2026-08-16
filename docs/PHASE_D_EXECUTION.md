@@ -272,6 +272,16 @@ Snapshots are append-only. A failed later refresh is persisted as
 `INCOMPLETE`; the read model selects that newest result rather than presenting
 an older healthy snapshot as current.
 
+D.4 distinguishes local **attempt** time from local **receipt** time. Freshness
+uses the venue timestamp against receipt time, while current-state selection
+uses latest attempt time so a slow older response cannot overwrite a newer
+failed attempt merely by committing later. Equal attempt times fail closed:
+an `INCOMPLETE` result sorts ahead of a complete one, then receipt time and a
+stable observation ID provide deterministic ordering. This policy is preserved
+across restart. The read model retains all component states from that newest
+material attempt; it never falls back to an older successful open-order,
+position, balance, or metadata component.
+
 Freshness is based on a venue-supplied snapshot timestamp and the configured
 maximum age. Missing, invalid, future, or stale timestamps are respectively
 `UNKNOWN`/`STALE` and incomplete. Local receipt time never makes old venue
@@ -289,15 +299,37 @@ combined safety state; it does not authorize an entry or a reduction. A
 configured unhealthy shadow is operator-visible, while an unconfigured shadow
 does not make the simulator unusable.
 
+Finite non-zero quantities, including dust, remain position evidence; there is
+no comparison epsilon that can turn a distinct position into a match. Exact
+zero is the only flat representation. Duplicate positions, malformed or
+non-finite numerics, missing/unknown open-order statuses, invalid timestamps,
+and malformed account sections make their component `INCOMPLETE` rather than
+an empty result. A successful empty list is the only empty observation.
+
+Before persistence, raw provenance is recursively bounded by depth, item,
+string, and total-node limits. Non-finite raw values are represented as a
+literal marker rather than serialized as JSON `NaN`/`Infinity`; headers,
+request internals, stack traces, and environment data are not stored. The
+service also verifies that an observer result has exactly the configured venue,
+account, domain, and account scope. A mismatched observer result becomes an
+account-scoped incomplete snapshot and cannot create cross-account evidence.
+
+The D.4 observer accepts only the public Hyperliquid HTTPS `/info` host. The
+account configuration cannot select an arbitrary URL, method, or endpoint.
+
 The Control Center System view and `GET /api/execution` show configured state,
 venue/account, latest observation, freshness, component/comparison status, and
-historical evidence. Its `POST /api/execution/shadow/refresh` endpoint only
-performs public reads and appends local audit evidence; it cannot mutate venue
-state and presents no execution or live-enable control.
+historical evidence. During a refresh it labels previous evidence as pending,
+coalesces repeated clicks, and displays the returned newest result without an
+optimistic health transition. Its `POST /api/execution/shadow/refresh` endpoint
+only performs public reads and appends local audit evidence; it cannot mutate
+venue state and presents no execution or live-enable control.
 
-- **D.4 remaining hardening:** broaden read-only schema support only when a
-  venue supplies a documented timestamp/complete account snapshot contract;
-  do not infer missing freshness or attribution.
+**D.4 is closed and frozen.** Its closure audit covers concurrent/out-of-order
+refresh attempts, restart ordering, cross-account scope attacks, hostile
+payloads, freshness boundaries, bounded provenance, read-model mixed health,
+and D.3.2 authority independence. Future schema support remains read-only D.4
+maintenance only when it preserves these invariants.
 - **D.5:** separately review a live adapter skeleton with multiple independent
   enablement gates, credential isolation, and explicit acceptance. No D.0
   configuration can make capital move.

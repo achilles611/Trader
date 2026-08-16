@@ -487,7 +487,8 @@ class CopyTradeDatabase:
                 CREATE TABLE IF NOT EXISTS phase_d_shadow_observations (
                     observation_id TEXT PRIMARY KEY, execution_domain TEXT NOT NULL,
                     execution_account_id TEXT NOT NULL, venue TEXT NOT NULL, account_id TEXT NOT NULL,
-                    state TEXT NOT NULL, freshness TEXT NOT NULL, observed_at TEXT, received_at TEXT NOT NULL,
+                    state TEXT NOT NULL, freshness TEXT NOT NULL, observed_at TEXT, attempted_at TEXT NOT NULL,
+                    received_at TEXT NOT NULL,
                     reason TEXT NOT NULL, components_json TEXT NOT NULL DEFAULT '{}',
                     normalized_json TEXT NOT NULL DEFAULT '{}', comparison_json TEXT NOT NULL DEFAULT '{}',
                     raw_evidence_json TEXT NOT NULL DEFAULT '{}'
@@ -497,6 +498,14 @@ class CopyTradeDatabase:
                 """
             )
             self._ensure_column(connection, "copy_signals", "target_position_before", "REAL NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "phase_d_shadow_observations", "attempted_at", "TEXT")
+            connection.execute(
+                "UPDATE phase_d_shadow_observations SET attempted_at=received_at WHERE attempted_at IS NULL"
+            )
+            connection.execute(
+                """CREATE INDEX IF NOT EXISTS idx_phase_d_shadow_observations_current
+                   ON phase_d_shadow_observations(execution_domain, execution_account_id, attempted_at, received_at, observation_id)"""
+            )
             self._ensure_column(connection, "phase_d_execution_intents", "execution_domain", "TEXT NOT NULL DEFAULT 'SIMULATOR'")
             self._ensure_column(connection, "phase_d_execution_intents", "execution_account_id", "TEXT NOT NULL DEFAULT 'SIMULATOR:default'")
             self._ensure_column(connection, "phase_d_execution_submissions", "execution_domain", "TEXT NOT NULL DEFAULT 'SIMULATOR'")
@@ -3332,7 +3341,7 @@ class CopyTradeDatabase:
         """Append one already-sanitized D.4 observation without rewriting history."""
         required = (
             "observation_id", "execution_domain", "execution_account_id", "venue", "account_id", "state",
-            "freshness", "received_at", "reason", "components", "normalized", "comparison", "raw_evidence",
+            "freshness", "attempted_at", "received_at", "reason", "components", "normalized", "comparison", "raw_evidence",
         )
         missing = [name for name in required if name not in observation]
         if missing:
@@ -3341,13 +3350,13 @@ class CopyTradeDatabase:
             cursor = connection.execute(
                 """INSERT OR IGNORE INTO phase_d_shadow_observations(
                     observation_id, execution_domain, execution_account_id, venue, account_id, state, freshness,
-                    observed_at, received_at, reason, components_json, normalized_json, comparison_json, raw_evidence_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    observed_at, attempted_at, received_at, reason, components_json, normalized_json, comparison_json, raw_evidence_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     str(observation["observation_id"]), str(observation["execution_domain"]),
                     str(observation["execution_account_id"]), str(observation["venue"]), str(observation["account_id"]),
                     str(observation["state"]), str(observation["freshness"]), observation.get("observed_at"),
-                    str(observation["received_at"]), str(observation["reason"]),
+                    str(observation["attempted_at"]), str(observation["received_at"]), str(observation["reason"]),
                     _dump(dict(observation["components"])), _dump(dict(observation["normalized"])),
                     _dump(dict(observation["comparison"])), _dump(dict(observation["raw_evidence"])),
                 ),
@@ -3361,7 +3370,9 @@ class CopyTradeDatabase:
             row = connection.execute(
                 """SELECT * FROM phase_d_shadow_observations
                    WHERE execution_domain=? AND execution_account_id=?
-                   ORDER BY received_at DESC, observation_id DESC LIMIT 1""",
+                   ORDER BY COALESCE(attempted_at, received_at) DESC,
+                            CASE state WHEN 'INCOMPLETE' THEN 1 ELSE 0 END DESC,
+                            received_at DESC, observation_id DESC LIMIT 1""",
                 (execution_domain, execution_account_id),
             ).fetchone()
         if row is None:
@@ -3380,7 +3391,9 @@ class CopyTradeDatabase:
             rows = connection.execute(
                 """SELECT * FROM phase_d_shadow_observations
                    WHERE execution_domain=? AND execution_account_id=?
-                   ORDER BY received_at DESC, observation_id DESC LIMIT ?""",
+                   ORDER BY COALESCE(attempted_at, received_at) DESC,
+                            CASE state WHEN 'INCOMPLETE' THEN 1 ELSE 0 END DESC,
+                            received_at DESC, observation_id DESC LIMIT ?""",
                 (execution_domain, execution_account_id, limit),
             ).fetchall()
         values: list[dict[str, Any]] = []

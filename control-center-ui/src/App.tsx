@@ -258,17 +258,20 @@ function SystemPage({ control, watcherHealth }: { control: ControlState | null; 
 }
 
 function ShadowObservationStatus() {
-  const [shadow, setShadow] = useState<any>(null); const [error, setError] = useState<string | null>(null);
+  const [shadow, setShadow] = useState<any>(null); const [error, setError] = useState<string | null>(null); const [refreshing, setRefreshing] = useState(false);
   const load = useCallback(async () => {
     try { setShadow((await api<any>("/api/execution")).shadow || {}); setError(null); }
     catch (failure) { setError(failure instanceof Error ? failure.message : "Could not load shadow observation."); }
   }, []);
   useEffect(() => { void load(); }, [load]);
   const refresh = async () => {
-    try { await post("/api/execution/shadow/refresh"); await load(); }
+    if (refreshing) return;
+    setRefreshing(true);
+    try { setShadow(await post<any>("/api/execution/shadow/refresh")); setError(null); }
     catch (failure) { setError(failure instanceof Error ? failure.message : "Could not refresh shadow observation."); }
+    finally { setRefreshing(false); }
   };
-  return <section className="panel shadow-observation-panel"><PanelTitle title="Real-venue shadow observation" subtitle="Public-account reads only. This cannot sign, submit, cancel, or enable live execution." />{error && <p className="empty-note">{error}</p>}<MetricList values={[["Configured", shadow?.configured ? "Yes" : "No"], ["Venue", shadow?.venue || "—"], ["Account", shadow?.account_id || "—"], ["Observation", shadow?.state || "NOT_CONFIGURED"], ["Freshness", shadow?.freshness || "UNKNOWN"], ["Last observed", shadow?.latest_observation?.observed_at || "—"], ["Last received", shadow?.latest_observation?.received_at || "—"], ["Position comparison", shadow?.latest_observation?.comparison?.positions?.state || "—"], ["Open-order comparison", shadow?.latest_observation?.comparison?.open_orders?.state || "—"]]} />{shadow?.configured ? <button className="button minor" onClick={() => void refresh()}>Refresh read-only shadow observation</button> : <p className="muted">Shadow observation is not configured. It is distinct from simulator and PAPER execution authority.</p>}</section>;
+  return <section className="panel shadow-observation-panel"><PanelTitle title="Real-venue shadow observation" subtitle="Public-account reads only. This cannot sign, submit, cancel, or enable live execution." />{error && <p className="empty-note">{error}</p>}{refreshing && <p className="muted" role="status">Refreshing read-only evidence. Existing evidence is pending replacement and is not newly verified.</p>}<MetricList values={[["Configured", shadow?.configured ? "Yes" : "No"], ["Venue", shadow?.venue || "—"], ["Account", shadow?.account_id || "—"], ["Observation", shadow?.state || "NOT_CONFIGURED"], ["Freshness", shadow?.freshness || "UNKNOWN"], ["Last observed", shadow?.latest_observation?.observed_at || "—"], ["Last received", shadow?.latest_observation?.received_at || "—"], ["Position comparison", shadow?.latest_observation?.comparison?.positions?.state || "—"], ["Open-order comparison", shadow?.latest_observation?.comparison?.open_orders?.state || "—"]]} />{shadow?.configured ? <button className="button minor" onClick={() => void refresh()} disabled={refreshing}>{refreshing ? "Refreshing read-only shadow observation" : "Refresh read-only shadow observation"}</button> : <p className="muted">Shadow observation is not configured. It is distinct from simulator and PAPER execution authority.</p>}</section>;
 }
 
 function CandidateDossier({ detail, close, action }: { detail: Record<string, any>; close: () => void; action: (wallet: string, state: string) => void }) {

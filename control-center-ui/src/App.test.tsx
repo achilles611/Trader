@@ -203,6 +203,29 @@ describe("copy control center", () => {
     expect(screen.queryByRole("button", { name: /Enable live|Cancel order|Submit order/i })).not.toBeInTheDocument();
   });
 
+  it("marks prior shadow evidence pending and coalesces repeated refresh clicks", async () => {
+    shadowResponse = { configured: true, venue: "hyperliquid", account_id: candidate.wallet, state: "COMPLETE", freshness: "FRESH" };
+    let resolveRefresh: (response: Response) => void = () => { throw new Error("Refresh promise was not created."); };
+    const deferredFetch = vi.fn((input: RequestInfo | URL) => {
+      if (String(input).startsWith("/api/execution/shadow/refresh")) {
+        return new Promise<Response>((resolve) => { resolveRefresh = resolve; });
+      }
+      return Promise.resolve(new Response(JSON.stringify(payload(String(input))), { status: 200, headers: { "Content-Type": "application/json" } }));
+    });
+    vi.stubGlobal("fetch", deferredFetch);
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "System" }));
+    const refresh = await screen.findByRole("button", { name: "Refresh read-only shadow observation" });
+    fireEvent.click(refresh);
+    expect(await screen.findByRole("status")).toHaveTextContent("Existing evidence is pending replacement");
+    expect(refresh).toBeDisabled();
+    fireEvent.click(refresh);
+    expect(deferredFetch.mock.calls.filter(([path]) => String(path).startsWith("/api/execution/shadow/refresh"))).toHaveLength(1);
+    resolveRefresh(new Response(JSON.stringify({ ...shadowResponse, state: "INCOMPLETE", freshness: "UNKNOWN" }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Refresh read-only shadow observation" })).toBeEnabled());
+    expect(screen.getByText("INCOMPLETE")).toBeInTheDocument();
+  });
+
   it("shows discovery websocket progress and completion navigation", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Discovery" }));

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
+import json
+import sqlite3
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -14,7 +17,9 @@ from src.copytrade.models import CopySignal, as_utc, stable_id
 from src.copytrade.shadow import (
     SHADOW_EXECUTION_DOMAIN,
     HyperliquidReadOnlyShadowAdapter,
+    ShadowObservation,
     ShadowObservationService,
+    compare_shadow_observation,
     shadow_execution_account_id,
 )
 from src.copytrade.storage import CopyTradeDatabase
@@ -50,6 +55,39 @@ class FailingShadowAdapter:
 
     def observe_account(self, account_id: str, *, max_age_seconds: float, received_at: object | None = None) -> Any:
         raise RuntimeError("deliberately unpersisted transport diagnostic")
+
+
+class ForeignAccountShadowAdapter:
+    """Returns a valid-looking observation for the wrong account to attack scope binding."""
+
+    adapter_name = "foreign_account_read_only_shadow"
+    adapter_mode = "READ_ONLY_SHADOW"
+    venue = "hyperliquid"
+
+    def __init__(self, observation: ShadowObservation) -> None:
+        self.observation = observation
+
+    def observe_account(self, account_id: str, *, max_age_seconds: float, received_at: object | None = None) -> ShadowObservation:
+        return self.observation
+
+
+class GatedShadowAdapter:
+    """Deterministically holds one otherwise-valid observation in flight."""
+
+    adapter_name = "gated_read_only_shadow"
+    adapter_mode = "READ_ONLY_SHADOW"
+    venue = "hyperliquid"
+
+    def __init__(self, delegate: HyperliquidReadOnlyShadowAdapter, started: threading.Event, release: threading.Event) -> None:
+        self.delegate = delegate
+        self.started = started
+        self.release = release
+
+    def observe_account(self, account_id: str, *, max_age_seconds: float, received_at: object | None = None) -> ShadowObservation:
+        self.started.set()
+        if not self.release.wait(timeout=1):
+            raise RuntimeError("test refresh release was not received")
+        return self.delegate.observe_account(account_id, max_age_seconds=max_age_seconds, received_at=received_at)
 
 
 def payloads(
@@ -113,6 +151,14 @@ class PhaseD4ReadOnlyShadowTests(unittest.TestCase):
                 ExecutionEngine(database, adapter)  # type: ignore[arg-type]
         with self.assertRaises(ValueError):
             CopyTradeConfig(mode="live", live_enabled=True).validate()
+        with self.assertRaises(ValueError):
+            CopyTradeConfig(
+                source=SourceConfig(info_url="https://localhost/info"), shadow_observation=shadow_config(),
+            ).validate()
+        with self.assertRaises(ValueError):
+            HyperliquidReadOnlyShadowAdapter(SourceConfig(info_url="http://api.hyperliquid.xyz/info"))
+        with self.assertRaises(ValueError):
+            CopyTradeConfig(shadow_observation=ShadowObservationConfig(enabled=True, account_id=ACCOUNT_A, max_age_seconds=float("inf"))).validate()
 
     def test_fresh_normalization_preserves_signed_positions_balances_orders_and_metadata(self) -> None:
         fixture = FakePublicInfoClient(payloads())
@@ -148,6 +194,24 @@ class PhaseD4ReadOnlyShadowTests(unittest.TestCase):
         )
         self.assertEqual(malformed.state, "INCOMPLETE")
         self.assertEqual(malformed.components["positions"]["reason"], "numeric_value_non_finite")
+        self.assertFalse(malformed.components["positions"]["empty"])
+
+    def test_freshness_boundaries_and_future_venue_time_fail_closed(self) -> None:
+        one_before = self.adapter(FakePublicInfoClient(payloads(TIME - timedelta(seconds=59)))).observe_account(
+            ACCOUNT_A, max_age_seconds=60.0, received_at=TIME,
+        )
+        exact_boundary = self.adapter(FakePublicInfoClient(payloads(TIME - timedelta(seconds=60)))).observe_account(
+            ACCOUNT_A, max_age_seconds=60.0, received_at=TIME,
+        )
+        one_after = self.adapter(FakePublicInfoClient(payloads(TIME - timedelta(seconds=61)))).observe_account(
+            ACCOUNT_A, max_age_seconds=60.0, received_at=TIME,
+        )
+        future = self.adapter(FakePublicInfoClient(payloads(TIME + timedelta(seconds=1)))).observe_account(
+            ACCOUNT_A, max_age_seconds=60.0, received_at=TIME,
+        )
+        self.assertEqual((one_before.state, exact_boundary.state), ("COMPLETE", "COMPLETE"))
+        self.assertEqual(one_after.components["positions"]["freshness"], "STALE")
+        self.assertEqual((future.state, future.components["positions"]["reason"]), ("INCOMPLETE", "venue_timestamp_in_future"))
 
     def test_empty_is_distinct_from_failure_and_failed_refresh_replaces_current_health(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -188,6 +252,29 @@ class PhaseD4ReadOnlyShadowTests(unittest.TestCase):
             self.assertEqual(latest["raw_evidence"], {"observer": {"error_class": "RuntimeError"}})
             self.assertNotIn("deliberately", str(latest["raw_evidence"]))
 
+    def test_restart_keeps_newest_mixed_component_health_without_success_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            database = self.database(root)
+            ShadowObservationService(database, self.adapter(FakePublicInfoClient(payloads(positions=[], orders=[]))), shadow_config()).refresh(
+                received_at=TIME, attempted_at=TIME,
+            )
+            mixed_payload = payloads(positions=[])
+            mixed_payload["openOrders"] = TimeoutError("open order channel unavailable")
+            latest = ShadowObservationService(
+                database, self.adapter(FakePublicInfoClient(mixed_payload)), shadow_config(),
+            ).refresh(received_at=TIME + timedelta(seconds=2), attempted_at=TIME + timedelta(seconds=1))
+            self.assertEqual(latest["state"], "INCOMPLETE")
+            self.assertEqual(latest["latest_observation"]["components"]["positions"]["state"], "OBSERVED")
+            self.assertEqual(latest["latest_observation"]["components"]["open_orders"]["state"], "INCOMPLETE")
+            restarted = CopyTradeDatabase(root / "copy.sqlite3")
+            restarted.initialize()
+            current = restarted.latest_shadow_observation(
+                execution_domain=SHADOW_EXECUTION_DOMAIN,
+                execution_account_id=shadow_execution_account_id("hyperliquid", ACCOUNT_A),
+            )
+            self.assertEqual(current["components"]["open_orders"]["reason"], "open_order_observation_unavailable")
+
     def test_unsupported_fresh_venue_symbol_is_a_discrepancy_not_a_match(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             database = self.database(Path(temp))
@@ -201,6 +288,159 @@ class PhaseD4ReadOnlyShadowTests(unittest.TestCase):
             comparison = result["latest_observation"]["comparison"]
             self.assertEqual(comparison["positions"]["items"][0]["state"], "UNSUPPORTED_SYMBOL")
             self.assertEqual(comparison["open_orders"]["items"][0]["state"], "UNSUPPORTED_SYMBOL")
+
+    def test_hostile_payloads_keep_dust_and_fail_closed_without_unbounded_or_nonfinite_provenance(self) -> None:
+        dust = self.adapter(FakePublicInfoClient(payloads(
+            positions=[{"position": {"coin": "BTC", "szi": "1e-13"}}], orders=[],
+        ))).observe_account(ACCOUNT_A, max_age_seconds=60.0, received_at=TIME)
+        self.assertEqual(dust.normalized["positions"], [{"symbol": "BTC", "signed_quantity": 1e-13}])
+
+        duplicate = payloads(positions=[
+            {"position": {"coin": "BTC", "szi": "1"}}, {"position": {"coin": "BTC", "szi": "-1"}},
+        ])
+        duplicate_observation = self.adapter(FakePublicInfoClient(duplicate)).observe_account(
+            ACCOUNT_A, max_age_seconds=60.0, received_at=TIME,
+        )
+        self.assertEqual(duplicate_observation.components["positions"]["reason"], "position_symbol_duplicate")
+        self.assertFalse(duplicate_observation.components["positions"]["empty"])
+
+        unknown_status = payloads()
+        unknown_status["openOrders"]["orders"][0]["status"] = "mystery"
+        unknown_order = self.adapter(FakePublicInfoClient(unknown_status)).observe_account(
+            ACCOUNT_A, max_age_seconds=60.0, received_at=TIME,
+        )
+        self.assertEqual(unknown_order.components["open_orders"]["reason"], "open_order_status_unknown")
+        self.assertFalse(unknown_order.components["open_orders"]["empty"])
+
+        infinite_balance = payloads()
+        infinite_balance["clearinghouseState"]["marginSummary"]["accountValue"] = "Infinity"
+        invalid_balance = self.adapter(FakePublicInfoClient(infinite_balance)).observe_account(
+            ACCOUNT_A, max_age_seconds=60.0, received_at=TIME,
+        )
+        self.assertEqual(invalid_balance.components["balances"]["reason"], "numeric_value_non_finite")
+        self.assertFalse(invalid_balance.components["balances"]["empty"])
+
+        hostile = payloads()
+        hostile["meta"]["untrusted"] = [
+            {"text": "x" * 5_000, "nan": float("nan"), "infinity": float("inf")} for _ in range(200)
+        ]
+        bounded = self.adapter(FakePublicInfoClient(hostile)).observe_account(
+            ACCOUNT_A, max_age_seconds=60.0, received_at=TIME,
+        )
+        serialized = json.dumps(bounded.raw_evidence, allow_nan=False)
+        self.assertLess(len(serialized), 300_000)
+        self.assertIn("<non_finite_float>", serialized)
+
+    def test_attempt_order_beats_late_commit_and_tied_failure_fails_closed_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            database = self.database(root)
+            scope = shadow_execution_account_id("hyperliquid", ACCOUNT_A)
+            started, release = threading.Event(), threading.Event()
+            slow_service = ShadowObservationService(
+                database,
+                GatedShadowAdapter(self.adapter(FakePublicInfoClient(payloads(positions=[], orders=[]))), started, release),
+                shadow_config(),
+                clock=lambda: TIME,
+            )
+            worker_errors: list[BaseException] = []
+
+            def slow_refresh() -> None:
+                try:
+                    slow_service.refresh(received_at=TIME + timedelta(seconds=10), attempted_at=TIME)
+                except BaseException as exc:  # pragma: no cover - assertion below makes this diagnostic
+                    worker_errors.append(exc)
+
+            worker = threading.Thread(target=slow_refresh)
+            worker.start()
+            self.assertTrue(started.wait(timeout=1))
+            ShadowObservationService(database, FailingShadowAdapter(), shadow_config(), clock=lambda: TIME).refresh(
+                received_at=TIME + timedelta(seconds=2), attempted_at=TIME + timedelta(seconds=1),
+            )
+            release.set()
+            worker.join(timeout=1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(worker_errors, [])
+            latest = database.latest_shadow_observation(
+                execution_domain=SHADOW_EXECUTION_DOMAIN, execution_account_id=scope,
+            )
+            self.assertEqual(latest["reason"], "shadow_adapter_observation_failed")
+
+            tied_success = self.adapter(FakePublicInfoClient(payloads(positions=[], orders=[]))).observe_account(
+                ACCOUNT_A, max_age_seconds=60.0, received_at=TIME + timedelta(seconds=20),
+            )
+            ShadowObservationService(database, FailingShadowAdapter(), shadow_config(), clock=lambda: TIME).refresh(
+                received_at=TIME + timedelta(seconds=3), attempted_at=TIME + timedelta(seconds=2),
+            )
+            database.record_shadow_observation(tied_success.as_storage_record(
+                compare_shadow_observation(database, tied_success), attempted_at=TIME + timedelta(seconds=2),
+            ))
+            restarted = CopyTradeDatabase(root / "copy.sqlite3")
+            restarted.initialize()
+            current = restarted.latest_shadow_observation(
+                execution_domain=SHADOW_EXECUTION_DOMAIN, execution_account_id=scope,
+            )
+            self.assertEqual(current["state"], "INCOMPLETE")
+            self.assertEqual(current["reason"], "shadow_adapter_observation_failed")
+
+    def test_scope_binding_blocks_cross_account_observation_and_disabled_refresh_reads_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = self.database(Path(temp))
+            foreign_observation = self.adapter(FakePublicInfoClient(payloads())).observe_account(
+                ACCOUNT_B, max_age_seconds=60.0, received_at=TIME,
+            )
+            result = ShadowObservationService(
+                database, ForeignAccountShadowAdapter(foreign_observation), shadow_config(), clock=lambda: TIME,
+            ).refresh(received_at=TIME, attempted_at=TIME)
+            self.assertEqual(result["latest_observation"]["reason"], "shadow_observation_scope_mismatch")
+            self.assertIsNone(database.latest_shadow_observation(
+                execution_domain=SHADOW_EXECUTION_DOMAIN,
+                execution_account_id=shadow_execution_account_id("hyperliquid", ACCOUNT_B),
+            ))
+
+            fixture = FakePublicInfoClient(payloads())
+            disabled = ShadowObservationService(
+                database, self.adapter(fixture), ShadowObservationConfig(), clock=lambda: TIME,
+            ).refresh()
+            self.assertEqual(disabled["state"], "NOT_CONFIGURED")
+            self.assertEqual(fixture.calls, [])
+
+    def test_pre_hardening_shadow_schema_migrates_before_current_order_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "copy.sqlite3"
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(
+                    """CREATE TABLE phase_d_shadow_observations (
+                        observation_id TEXT PRIMARY KEY, execution_domain TEXT NOT NULL,
+                        execution_account_id TEXT NOT NULL, venue TEXT NOT NULL, account_id TEXT NOT NULL,
+                        state TEXT NOT NULL, freshness TEXT NOT NULL, observed_at TEXT, received_at TEXT NOT NULL,
+                        reason TEXT NOT NULL, components_json TEXT NOT NULL DEFAULT '{}',
+                        normalized_json TEXT NOT NULL DEFAULT '{}', comparison_json TEXT NOT NULL DEFAULT '{}',
+                        raw_evidence_json TEXT NOT NULL DEFAULT '{}'
+                    )"""
+                )
+                connection.execute(
+                    """INSERT INTO phase_d_shadow_observations(
+                        observation_id, execution_domain, execution_account_id, venue, account_id, state, freshness,
+                        observed_at, received_at, reason, components_json, normalized_json, comparison_json, raw_evidence_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        "legacy-d4", SHADOW_EXECUTION_DOMAIN, shadow_execution_account_id("hyperliquid", ACCOUNT_A),
+                        "hyperliquid", ACCOUNT_A, "COMPLETE", "FRESH", TIME.isoformat(), TIME.isoformat(),
+                        "legacy", "{}", "{}", "{}", "{}",
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            database = CopyTradeDatabase(path)
+            database.initialize()
+            migrated = database.latest_shadow_observation(
+                execution_domain=SHADOW_EXECUTION_DOMAIN,
+                execution_account_id=shadow_execution_account_id("hyperliquid", ACCOUNT_A),
+            )
+            self.assertEqual(migrated["attempted_at"], TIME.isoformat())
 
     def test_persistence_restart_and_account_domain_isolation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -238,11 +478,8 @@ class PhaseD4ReadOnlyShadowTests(unittest.TestCase):
             self.assertEqual(before["state"], "NOT_YET_OBSERVED")
             refreshed = center.refresh_shadow_observation()
             self.assertTrue(refreshed["read_only"])
-            # The fixture's timestamp is deliberately old relative to the
-            # real service receipt clock: Control Center must retain that as
-            # current stale evidence rather than fabricate a healthy result.
-            self.assertEqual(refreshed["state"], "INCOMPLETE")
-            self.assertEqual(center.execution_health()["shadow"]["state"], "INCOMPLETE")
+            self.assertEqual(refreshed["state"], "COMPLETE")
+            self.assertEqual(center.execution_health()["shadow"]["state"], "COMPLETE")
 
     def test_shadow_agreement_cannot_clear_open_order_or_integrity_authority(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

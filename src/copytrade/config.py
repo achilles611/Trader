@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import os
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
 from dotenv import load_dotenv
 
 from .models import jsonable
+
+
+_D4_HYPERLIQUID_INFO_HOSTS = {"api.hyperliquid.xyz", "api.hyperliquid-testnet.xyz"}
 
 
 def _bool(value: Any, default: bool = False) -> bool:
@@ -373,15 +378,29 @@ class CopyTradeConfig:
             raise ValueError("Live copy trading requires COPYTRADE_MODE=live and COPYTRADE_LIVE_ENABLED=true.")
         if self.mode == "live":
             raise ValueError("Live copy trading is not implemented in this alpha; use paper mode.")
-        if self.shadow_observation.venue.lower() != "hyperliquid":
+        shadow_venue = str(self.shadow_observation.venue).lower()
+        if shadow_venue != "hyperliquid":
             raise ValueError("D.4 shadow observation currently supports only the Hyperliquid public read-only venue.")
-        if self.shadow_observation.max_age_seconds <= 0:
+        max_shadow_age = self.shadow_observation.max_age_seconds
+        if (isinstance(max_shadow_age, bool) or not isinstance(max_shadow_age, (int, float))
+                or not math.isfinite(max_shadow_age) or max_shadow_age <= 0):
             raise ValueError("shadow_observation.max_age_seconds must be positive.")
         if self.shadow_observation.enabled:
-            account_id = self.shadow_observation.account_id.lower()
+            account_id = str(self.shadow_observation.account_id).lower()
             if not (account_id.startswith("0x") and len(account_id) == 42
                     and all(character in "0123456789abcdef" for character in account_id[2:])):
                 raise ValueError("shadow_observation.account_id must be a public 0x-prefixed 20-byte account address.")
+            parsed_info_url = urlparse(str(self.source.info_url))
+            if (
+                parsed_info_url.scheme != "https"
+                or parsed_info_url.hostname not in _D4_HYPERLIQUID_INFO_HOSTS
+                or parsed_info_url.port is not None
+                or parsed_info_url.path.rstrip("/") != "/info"
+                or parsed_info_url.params
+                or parsed_info_url.query
+                or parsed_info_url.fragment
+            ):
+                raise ValueError("D.4 shadow observation requires the public Hyperliquid HTTPS /info endpoint.")
         if self.capital.initial_capital <= 0:
             raise ValueError("capital.initial_capital must be positive.")
         if not 0 <= self.sizing.small_fraction <= self.sizing.medium_fraction <= self.sizing.large_fraction <= 1:

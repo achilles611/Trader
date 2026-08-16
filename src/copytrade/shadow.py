@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol
+from urllib.parse import urlparse
 
 from .config import ShadowObservationConfig, SourceConfig
 from .hyperliquid import HyperliquidPublicAdapter
@@ -22,6 +23,8 @@ SHADOW_EXECUTION_DOMAIN = "SHADOW_REAL_VENUE"
 _OPEN_STATUSES = {"OPEN", "ACKNOWLEDGED", "PARTIALLY_FILLED"}
 _MAX_EVIDENCE_ITEMS = 100
 _MAX_EVIDENCE_TEXT = 2_048
+_MAX_EVIDENCE_NODES = 1_000
+_HYPERLIQUID_INFO_HOSTS = {"api.hyperliquid.xyz", "api.hyperliquid-testnet.xyz"}
 
 
 class ReadOnlyShadowVenueAdapter(Protocol):
@@ -64,7 +67,7 @@ class ShadowObservation:
     raw_evidence: dict[str, Any]
     reason: str = ""
 
-    def as_storage_record(self, comparison: Mapping[str, Any]) -> dict[str, Any]:
+    def as_storage_record(self, comparison: Mapping[str, Any], *, attempted_at: object | None = None) -> dict[str, Any]:
         return {
             "observation_id": self.observation_id,
             "execution_domain": self.execution_domain,
@@ -74,6 +77,7 @@ class ShadowObservation:
             "state": self.state,
             "freshness": self.freshness,
             "observed_at": iso(self.observed_at) if self.observed_at is not None else None,
+            "attempted_at": iso(attempted_at if attempted_at is not None else self.received_at),
             "received_at": iso(self.received_at),
             "reason": self.reason,
             "components": self.components,
@@ -100,17 +104,22 @@ class HyperliquidReadOnlyShadowAdapter:
         self, source_config: SourceConfig, *, public_client: HyperliquidPublicAdapter | None = None,
         clock: Callable[[], object] = utc_now,
     ) -> None:
+        _validate_hyperliquid_info_url(source_config.info_url)
         self._public_client = public_client or HyperliquidPublicAdapter(source_config)
         self._clock = clock
 
     def observe_account(self, account_id: str, *, max_age_seconds: float, received_at: object | None = None) -> ShadowObservation:
         account = normalize_shadow_account_id(account_id)
-        received = as_utc(received_at or self._clock())
         raw: dict[str, Any] = {}
         components: dict[str, dict[str, Any]] = {}
         normalized: dict[str, Any] = {"positions": [], "open_orders": [], "balances": {}, "instruments": []}
 
         clearing = self._read("clearinghouse_state", {"type": "clearinghouseState", "user": account}, raw)
+        orders = self._read("open_orders", {"type": "openOrders", "user": account}, raw)
+        metadata = self._read("instrument_metadata", {"type": "meta"}, raw)
+        # Production receipt time is captured after every public read. A
+        # caller-supplied timestamp exists solely for deterministic tests.
+        received = as_utc(received_at if received_at is not None else self._clock())
         if isinstance(clearing, dict):
             positions, position_error = _normalize_positions(clearing)
             balances, balance_error = _normalize_balances(clearing)
@@ -129,7 +138,6 @@ class HyperliquidReadOnlyShadowAdapter:
             components["positions"] = _failed_component("clearinghouse_state_unavailable")
             components["balances"] = _failed_component("clearinghouse_state_unavailable")
 
-        orders = self._read("open_orders", {"type": "openOrders", "user": account}, raw)
         order_payload, order_timestamp_source = _open_order_payload(orders)
         if order_payload is not None:
             open_orders, order_error = _normalize_open_orders(order_payload)
@@ -142,7 +150,6 @@ class HyperliquidReadOnlyShadowAdapter:
         else:
             components["open_orders"] = _failed_component("open_order_observation_unavailable")
 
-        metadata = self._read("instrument_metadata", {"type": "meta"}, raw)
         if isinstance(metadata, dict):
             instruments, metadata_error = _normalize_instruments(metadata)
             timestamp, timestamp_error = _snapshot_timestamp(metadata)
@@ -185,26 +192,38 @@ class HyperliquidReadOnlyShadowAdapter:
 class ShadowObservationService:
     """Persist and compare a D.4 observation without changing execution safety."""
 
-    def __init__(self, store: CopyTradeDatabase, adapter: ReadOnlyShadowVenueAdapter, config: ShadowObservationConfig) -> None:
+    def __init__(
+        self, store: CopyTradeDatabase, adapter: ReadOnlyShadowVenueAdapter, config: ShadowObservationConfig,
+        *, clock: Callable[[], object] = utc_now,
+    ) -> None:
         self.store = store
         self.adapter = adapter
         self.config = config
+        self._clock = clock
 
-    def refresh(self, *, received_at: object | None = None) -> dict[str, Any]:
+    def refresh(self, *, received_at: object | None = None, attempted_at: object | None = None) -> dict[str, Any]:
         if not self.config.enabled:
             return self.store.shadow_read_model(configured=False)
-        received = as_utc(received_at or utc_now())
+        attempted = as_utc(attempted_at if attempted_at is not None else self._clock())
         try:
             observation = self.adapter.observe_account(
-                self.config.account_id, max_age_seconds=self.config.max_age_seconds, received_at=received,
+                self.config.account_id, max_age_seconds=self.config.max_age_seconds, received_at=received_at,
             )
         except Exception as exc:
             # An observer implementation fault must not leave a prior healthy
             # result looking current. Persist one bounded, failed snapshot
             # instead; this never propagates exception text or credentials.
-            observation = _failed_observation(self.adapter, self.config, received, type(exc).__name__)
+            received = as_utc(received_at if received_at is not None else self._clock())
+            observation = _failed_observation(self.config, received, type(exc).__name__)
+        if not _matches_configured_scope(observation, self.config):
+            observation = _failed_observation(
+                self.config,
+                as_utc(received_at if received_at is not None else self._clock()),
+                "ShadowObservationScopeMismatch",
+                reason="shadow_observation_scope_mismatch",
+            )
         comparison = compare_shadow_observation(self.store, observation)
-        self.store.record_shadow_observation(observation.as_storage_record(comparison))
+        self.store.record_shadow_observation(observation.as_storage_record(comparison, attempted_at=attempted))
         return self.store.shadow_read_model(
             configured=True, venue=observation.venue, account_id=observation.account_id,
             execution_domain=observation.execution_domain, execution_account_id=observation.execution_account_id,
@@ -238,7 +257,7 @@ def compare_shadow_observation(store: CopyTradeDatabase, observation: ShadowObse
                 state, reason = "VENUE_ONLY_POSITION", "venue_position_has_no_simulator_provenance"
             elif symbol not in venue_positions:
                 state, reason = "LOCAL_ONLY_POSITION", "simulator_position_not_observed_at_shadow_venue"
-            elif abs(local - venue) <= 1e-12:
+            elif local == venue:
                 state, reason = "MATCHED", "quantity_and_direction_match"
             elif local * venue < 0:
                 state, reason = "DIRECTION_MISMATCH", "signed_position_direction_differs"
@@ -299,7 +318,9 @@ def _normalize_positions(payload: Mapping[str, Any]) -> tuple[list[dict[str, Any
             if symbol in symbols:
                 raise ValueError("position_symbol_duplicate")
             symbols.add(symbol)
-            if abs(quantity) > 1e-12:
+            # Retain finite dust as exposure evidence. Exact zero (including
+            # -0.0) is the only representation that means flat here.
+            if quantity != 0.0:
                 positions.append({"symbol": symbol, "signed_quantity": quantity})
     except ValueError as exc:
         return [], str(exc)
@@ -342,7 +363,12 @@ def _normalize_open_orders(rows: list[Any]) -> tuple[list[dict[str, Any]], str |
             normalized_side = {"B": "BUY", "BUY": "BUY", "A": "SELL", "S": "SELL", "SELL": "SELL"}.get(side)
             if normalized_side is None:
                 raise ValueError("open_order_side_invalid")
-            status = str(row.get("status") or "OPEN").upper()
+            status_value = row.get("status")
+            if not isinstance(status_value, str) or not status_value.strip():
+                raise ValueError("open_order_status_missing")
+            status = status_value.upper()
+            if status not in _OPEN_STATUSES:
+                raise ValueError("open_order_status_unknown")
             orders.append({
                 "order_id": order_id, "symbol": _symbol(row.get("coin")), "side": normalized_side,
                 "quantity": abs(_finite_number(row.get("sz") if row.get("sz") is not None else row.get("origSz"))),
@@ -386,7 +412,10 @@ def _component(
     state = "OBSERVED" if parse_error is None and freshness == "FRESH" else "INCOMPLETE"
     return {
         "state": state, "freshness": freshness, "reason": reason, "observed_at": iso(observed_at) if observed_at else None,
-        "empty": values in ({}, []), "advisory": advisory,
+        # An empty normalized container proves absence only after successful
+        # parsing. A malformed/unsupported payload must remain non-empty
+        # failure evidence even if its safe normalized fallback is [].
+        "empty": parse_error is None and values in ({}, []), "advisory": advisory,
     }
 
 
@@ -396,10 +425,10 @@ def _failed_component(reason: str, *, advisory: bool = False) -> dict[str, Any]:
 
 
 def _failed_observation(
-    adapter: ReadOnlyShadowVenueAdapter, config: ShadowObservationConfig, received_at: object, error_class: str,
+    config: ShadowObservationConfig, received_at: object, error_class: str, *, reason: str = "shadow_adapter_observation_failed",
 ) -> ShadowObservation:
     """Turn an unexpected observer failure into current, append-only evidence."""
-    venue = str(adapter.venue).lower()
+    venue = str(config.venue).lower()
     account = normalize_shadow_account_id(config.account_id)
     components = {
         "positions": _failed_component("shadow_adapter_observation_failed"),
@@ -421,8 +450,40 @@ def _failed_observation(
         components=components,
         normalized=normalized,
         raw_evidence={"observer": {"error_class": error_class}},
-        reason="shadow_adapter_observation_failed",
+        reason=reason,
     )
+
+
+def _matches_configured_scope(observation: Any, config: ShadowObservationConfig) -> bool:
+    """Keep a future/injected observer from redirecting evidence to another account."""
+    if not isinstance(observation, ShadowObservation):
+        return False
+    venue = str(config.venue).lower()
+    try:
+        account = normalize_shadow_account_id(config.account_id)
+    except ValueError:
+        return False
+    return (
+        observation.execution_domain == SHADOW_EXECUTION_DOMAIN
+        and observation.venue == venue
+        and observation.account_id == account
+        and observation.execution_account_id == shadow_execution_account_id(venue, account)
+    )
+
+
+def _validate_hyperliquid_info_url(value: object) -> None:
+    """Permit the public Hyperliquid information endpoint, never an arbitrary URL."""
+    parsed = urlparse(str(value))
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in _HYPERLIQUID_INFO_HOSTS
+        or parsed.port is not None
+        or parsed.path.rstrip("/") != "/info"
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("D.4 shadow observation requires the public Hyperliquid HTTPS /info endpoint.")
 
 
 def _snapshot_timestamp(payload: Mapping[str, Any]) -> tuple[object | None, str | None]:
@@ -485,16 +546,41 @@ def _symbol(value: Any) -> str:
     return symbol
 
 
-def _bounded_evidence(value: Any, *, depth: int = 0) -> Any:
+def _bounded_evidence(value: Any) -> Any:
+    return _bounded_evidence_value(value, depth=0, remaining=[_MAX_EVIDENCE_NODES])
+
+
+def _bounded_evidence_value(value: Any, *, depth: int, remaining: list[int]) -> Any:
+    if remaining[0] <= 0:
+        return "<truncated_items>"
+    remaining[0] -= 1
     if depth >= 8:
         return "<truncated_depth>"
     if isinstance(value, Mapping):
-        return {
-            str(key)[:128]: _bounded_evidence(item, depth=depth + 1)
-            for key, item in list(value.items())[:_MAX_EVIDENCE_ITEMS]
-        }
+        result: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= _MAX_EVIDENCE_ITEMS or remaining[0] <= 0:
+                result["<truncated_items>"] = True
+                break
+            result[str(key)[:128]] = _bounded_evidence_value(item, depth=depth + 1, remaining=remaining)
+        return result
     if isinstance(value, (list, tuple)):
-        return [_bounded_evidence(item, depth=depth + 1) for item in value[:_MAX_EVIDENCE_ITEMS]]
+        result = []
+        for index, item in enumerate(value):
+            if index >= _MAX_EVIDENCE_ITEMS or remaining[0] <= 0:
+                result.append("<truncated_items>")
+                break
+            result.append(_bounded_evidence_value(item, depth=depth + 1, remaining=remaining))
+        return result
     if isinstance(value, str):
         return value[:_MAX_EVIDENCE_TEXT]
-    return value
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else "<non_finite_float>"
+    if isinstance(value, int):
+        try:
+            return value if len(str(value)) <= _MAX_EVIDENCE_TEXT else "<integer_too_large>"
+        except ValueError:
+            return "<integer_too_large>"
+    return f"<unsupported_type:{type(value).__name__}>"
