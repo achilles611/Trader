@@ -10,6 +10,7 @@ models/
 reports/
 viz/
 run_archives/
+runtime/
 
 # Generated dependencies and build outputs are reproduced by CI/release jobs.
 node_modules/

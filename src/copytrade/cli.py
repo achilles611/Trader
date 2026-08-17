@@ -20,6 +20,7 @@ from .paper import TargetSizeClassifier
 from .reporting import ObsidianExporter
 from .scoring import FollowerMetrics, score_candidate, select_diverse_targets
 from .service import CopyTradeService
+from .science_storage import ColdArchiveSpool, StorageRoots, migrate_sqlite_to_hot
 
 
 def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -107,11 +108,28 @@ def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
     sizing.add_argument("--fractions", default="0.03,0.10,0.20", help="Comma-separated target entry fractions to classify against a 10% prior-median demo history.")
     sizing.add_argument("--equity", type=float, default=1000.0, help="Illustrative target equity.")
 
+    storage_status = command("copy-storage-status", "Report scientific hot/cold storage health without changing execution state.")
+    storage_migrate = command("copy-storage-migrate", "Safely snapshot and migrate a legacy SQLite database to the hot root.")
+    storage_migrate.add_argument("--source", required=True, help="Legacy SQLite database path; it is never deleted.")
+    storage_migrate.add_argument("--destination", help="Optional hot destination; defaults to configured active database.")
+    archive_flush = command("copy-archive-flush", "Flush the local hot archival spool to cold storage; never use in a decision path.")
+
 
 def run_copytrade_command(args: argparse.Namespace) -> int:
     config = CopyTradeConfig.from_yaml(args.config)
-    service = CopyTradeService(config)
     command = args.command
+    roots = StorageRoots(home=Path.cwd(), hot_root=config.artifacts.database_path.parent, cold_root=config.storage.cold_root)
+    spool = ColdArchiveSpool(roots, max_bytes=config.storage.archive_spool_max_bytes, max_age_seconds=config.storage.archive_spool_max_age_seconds)
+    if command == "copy-storage-status":
+        _print({**roots.cold_status(), "hot_database": str(config.artifacts.database_path), "spool": spool.backlog()})
+        return 0
+    if command == "copy-storage-migrate":
+        _print(migrate_sqlite_to_hot(source=Path(args.source), destination=Path(args.destination) if args.destination else config.artifacts.database_path, roots=roots))
+        return 0
+    if command == "copy-archive-flush":
+        _print(spool.flush_once())
+        return 0
+    service = CopyTradeService(config)
     if command == "copy-import":
         targets = service.import_wallets(args.wallet)
         if args.file:

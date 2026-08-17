@@ -254,6 +254,32 @@ class ArtifactConfig:
 
 
 @dataclass(frozen=True)
+class StorageConfig:
+    """Portable hot/cold roots. Environment variables take precedence at deployment."""
+
+    hot_root: Path = Path("runtime/hot")
+    cold_root: Path = Path("runtime/cold")
+    archive_spool_max_bytes: int = 512 * 1024 * 1024
+    archive_spool_max_age_seconds: int = 7 * 24 * 60 * 60
+
+
+@dataclass(frozen=True)
+class ScientificExecutionConfig:
+    """D.5 scientific gate for the production copytrade service.
+
+    The default stays off only for frozen pre-D.5 compatibility fixtures. The
+    checked-in deployment configuration enables it, where raw source signals
+    are persisted as observations and fail closed until a model decision route
+    supplies independent scientific authority.
+    """
+
+    enabled: bool = False
+    max_position_age_seconds: float = 600.0
+    entry_min_effective_confidence: float = 0.60
+    exit_effective_confidence: float = 0.52
+
+
+@dataclass(frozen=True)
 class CopyTradeConfig:
     mode: str = "paper"
     live_enabled: bool = False
@@ -270,6 +296,8 @@ class CopyTradeConfig:
     regimes: RegimeConfig = field(default_factory=RegimeConfig)
     finalist_requirements: FinalistRequirementsConfig = field(default_factory=FinalistRequirementsConfig)
     analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
+    storage: StorageConfig = field(default_factory=StorageConfig)
+    scientific_execution: ScientificExecutionConfig = field(default_factory=ScientificExecutionConfig)
     artifacts: ArtifactConfig = field(default_factory=ArtifactConfig)
     targets: tuple[dict[str, Any], ...] = ()
     config_path: Path = Path("config/copytrade.yaml")
@@ -300,11 +328,24 @@ class CopyTradeConfig:
         regimes = _section(document, "regimes")
         finalist_requirements = _section(document, "finalist_requirements")
         analysis = _section(document, "analysis")
+        storage = _section(document, "storage")
+        scientific_execution = _section(document, "scientific_execution")
         artifacts = _section(document, "artifacts")
         database = _section(document, "database")
         obsidian = _section(document, "obsidian")
         dashboard = _section(document, "dashboard")
         future_live = _section(document, "future_live_execution")
+        configured_home = os.getenv("BEELZEBUB_HOME")
+        configured_hot_root = Path(os.getenv("BEELZEBUB_HOT_ROOT") or (Path(configured_home) / "runtime" / "hot" if configured_home else storage.get("hot_root", "runtime/hot")))
+        configured_cold_root = Path(os.getenv("BEELZEBUB_COLD_ROOT") or (Path(configured_home) / "runtime" / "cold" if configured_home else storage.get("cold_root", "runtime/cold")))
+        configured_database_path = Path(database.get("path", artifacts.get("database_path", "artifacts/copytrade.sqlite3")))
+        configured_obsidian_root = Path(obsidian.get("root", artifacts.get("obsidian_root", "artifacts/obsidian")))
+        if configured_home or os.getenv("BEELZEBUB_HOT_ROOT"):
+            if not configured_database_path.is_absolute():
+                configured_database_path = configured_hot_root / configured_database_path.name
+        if configured_home or os.getenv("BEELZEBUB_COLD_ROOT"):
+            if not configured_obsidian_root.is_absolute():
+                configured_obsidian_root = configured_cold_root / configured_obsidian_root.name
 
         mode = os.getenv("COPYTRADE_MODE", str(document.get("mode", "paper"))).lower()
         live_setting = os.getenv("COPYTRADE_LIVE_ENABLED")
@@ -354,11 +395,19 @@ class CopyTradeConfig:
             regimes=RegimeConfig(**regimes),
             finalist_requirements=FinalistRequirementsConfig(**finalist_requirements),
             analysis=AnalysisConfig(**analysis),
+            storage=StorageConfig(
+                **{
+                    **storage,
+                    "hot_root": configured_hot_root,
+                    "cold_root": configured_cold_root,
+                }
+            ),
+            scientific_execution=ScientificExecutionConfig(**scientific_execution),
             artifacts=ArtifactConfig(
                 **{
                     **artifacts,
-                    "database_path": Path(database.get("path", artifacts.get("database_path", "artifacts/copytrade.sqlite3"))),
-                    "obsidian_root": Path(obsidian.get("root", artifacts.get("obsidian_root", "artifacts/obsidian"))),
+                    "database_path": configured_database_path,
+                    "obsidian_root": configured_obsidian_root,
                     "dashboard_host": dashboard.get("host", artifacts.get("dashboard_host", ArtifactConfig().dashboard_host)),
                     "dashboard_port": dashboard.get("port", artifacts.get("dashboard_port", ArtifactConfig().dashboard_port)),
                 }
@@ -435,6 +484,12 @@ class CopyTradeConfig:
             raise ValueError("analysis rate-limit backoff configuration is invalid.")
         if self.analysis.walk_forward_min_windows <= 0:
             raise ValueError("analysis.walk_forward_min_windows must be positive.")
+        if self.storage.archive_spool_max_bytes <= 0 or self.storage.archive_spool_max_age_seconds <= 0:
+            raise ValueError("storage archive spool bounds must be positive.")
+        if not 0 < self.scientific_execution.max_position_age_seconds <= 600:
+            raise ValueError("scientific_execution.max_position_age_seconds must be in (0, 600].")
+        if not 0 <= self.scientific_execution.exit_effective_confidence < self.scientific_execution.entry_min_effective_confidence <= 1:
+            raise ValueError("scientific execution confidence thresholds must provide entry/exit hysteresis.")
         if not 0 <= self.analysis.high_suitability_score <= 100:
             raise ValueError("analysis.high_suitability_score must be in [0, 100].")
         if self.analysis.market_evidence_bucket_seconds <= 0:

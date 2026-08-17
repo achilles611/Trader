@@ -160,13 +160,29 @@ analysis:
   market_evidence_enabled: true
   market_evidence_bucket_seconds: 60
 
+storage:
+  # Environment overrides: BEELZEBUB_HOME, BEELZEBUB_HOT_ROOT, BEELZEBUB_COLD_ROOT.
+  # E: is the production hot root; relative defaults keep CI/test runs portable.
+  hot_root: runtime/hot
+  cold_root: runtime/cold
+  archive_spool_max_bytes: 536870912
+  archive_spool_max_age_seconds: 604800
+
+scientific_execution:
+  # Raw wallet actions are observations only. Until an independently
+  # validated model route is attached, they record a scientific skip decision.
+  enabled: true
+  max_position_age_seconds: 600
+  entry_min_effective_confidence: 0.60
+  exit_effective_confidence: 0.52
+
 artifacts: {}
 
 database:
-  path: artifacts/copytrade.sqlite3
+  path: runtime/hot/copytrade.sqlite3
 
 obsidian:
-  root: artifacts/obsidian
+  root: runtime/cold/obsidian
 
 dashboard:
   host: 127.0.0.1
