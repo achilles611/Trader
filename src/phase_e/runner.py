@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
 from .ledger import CorpusProvenanceError, ExperimentConflictError, PhaseELedger
-from .types import ExperimentConclusion, ExperimentResult, ExperimentStatus, RejectionReason, canonical_hash
+from .types import CANONICALIZATION_VERSION, ExperimentConclusion, ExperimentResult, ExperimentStatus, RejectionReason, canonical_hash
 
 
 def utc_now() -> str:
@@ -21,11 +21,11 @@ class NullExperimentRunner:
     """
 
     STATISTIC_NAME = "DETERMINISTIC_NULL_EFFECT"
+    CODE_VERSION = "phase-e1-null-runner-v1"
+    CONFIG_VERSION = "phase-e1-null-config-v1"
 
-    def __init__(self, ledger: PhaseELedger, *, code_version: str = "phase-e1-null-runner-v1", config_version: str = "phase-e1-null-config-v1", clock: Callable[[], str] = utc_now) -> None:
+    def __init__(self, ledger: PhaseELedger, *, clock: Callable[[], str] = utc_now) -> None:
         self.ledger = ledger
-        self.code_version = code_version
-        self.config_version = config_version
         self.clock = clock
 
     def run(self, experiment_id: str, *, before_evaluate: Callable[[], None] | None = None) -> dict[str, Any]:
@@ -96,7 +96,8 @@ class NullExperimentRunner:
             confidence_interval_high=0.0,
             statistic={
                 "name": self.STATISTIC_NAME,
-                "method_version": self.code_version,
+                "method_version": self.CODE_VERSION,
+                "canonicalization_version": CANONICALIZATION_VERSION,
                 "corpus_provenance_hash": experiment["corpus_provenance_hash"],
                 "specification_hash": experiment["specification_hash"],
                 "minimum_sample_size": minimum,
@@ -107,5 +108,6 @@ class NullExperimentRunner:
 
     def _validate_runner_contract(self, experiment: Mapping[str, Any]) -> None:
         definition = experiment["definition"]
-        if definition.get("code_version") != self.code_version or definition.get("config_version") != self.config_version:
+        if (definition.get("code_version") != self.CODE_VERSION
+                or definition.get("config_version") != self.CONFIG_VERSION):
             raise CorpusProvenanceError("Experiment code/config identity is stale or unavailable; E.1 refuses to evaluate it.")

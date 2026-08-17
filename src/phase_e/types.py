@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -17,6 +18,7 @@ from typing import Any, Mapping
 
 
 PHASE_E_SCHEMA_VERSION = "phase-e1"
+CANONICALIZATION_VERSION = "phase-e1-type-tagged-sha256-v1"
 SUPPORTED_SHORT_HORIZONS = frozenset({5, 15, 30, 60, 120, 300, 600})
 
 
@@ -57,6 +59,8 @@ class RejectionReason(StrEnum):
 
 
 def _utc(value: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"Invalid ISO-8601 UTC timestamp: {value!r}")
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (TypeError, ValueError) as exc:
@@ -93,7 +97,51 @@ def _json_value(value: Any, *, path: str = "value") -> Any:
 
 
 def canonical_json(value: Any) -> str:
-    return json.dumps(_json_value(value), sort_keys=True, separators=(",", ":"), allow_nan=False)
+    """Return type-tagged canonical identity JSON.
+
+    Floats use their exact IEEE-754 hexadecimal representation.  Every JSON
+    type is tagged so a user mapping can never collide with an encoded scalar.
+    This representation is for hashing only; ``storage_json`` preserves normal
+    JSON values for persisted documents.
+    """
+
+    def encode(item: Any, *, path: str) -> Any:
+        if item is None:
+            return ["null"]
+        if isinstance(item, bool):
+            return ["bool", item]
+        if isinstance(item, str):
+            return ["string", unicodedata.normalize("NFC", item)]
+        if isinstance(item, int):
+            return ["integer", str(item)]
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                raise ValueError(f"{path} must not contain NaN or Infinity.")
+            if item == 0.0:
+                item = 0.0  # Canonicalize IEEE-754 negative zero.
+            return ["float64", item.hex()]
+        if isinstance(item, Mapping):
+            pairs = []
+            keys = list(item)
+            if any(not isinstance(key, str) for key in keys):
+                raise ValueError(f"{path} has a non-string mapping key.")
+            normalized_keys = {key: unicodedata.normalize("NFC", key) for key in keys}
+            if len(set(normalized_keys.values())) != len(keys):
+                raise ValueError(f"{path} has mapping keys that collide after Unicode normalization.")
+            for key in sorted(keys, key=normalized_keys.__getitem__):
+                canonical_key = normalized_keys[key]
+                pairs.append([canonical_key, encode(item[key], path=f"{path}.{canonical_key}")])
+            return ["mapping", pairs]
+        if isinstance(item, (tuple, list)):
+            return ["sequence", [encode(child, path=f"{path}[]") for child in item]]
+        raise ValueError(f"{path} contains unsupported value type {type(item).__name__}.")
+
+    return json.dumps(encode(value, path="value"), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+def storage_json(value: Any) -> str:
+    """Persist ordinary JSON while applying the same finite/type checks."""
+    return json.dumps(_json_value(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
 def canonical_hash(value: Any) -> str:
@@ -101,12 +149,9 @@ def canonical_hash(value: Any) -> str:
 
 
 def finite_number(value: Any, *, name: str, minimum: float | None = None, maximum: float | None = None) -> float:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a finite number.")
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be a finite number.") from exc
+    numeric = float(value)
     if not math.isfinite(numeric):
         raise ValueError(f"{name} must not be NaN or Infinity.")
     if minimum is not None and numeric < minimum:
@@ -133,14 +178,26 @@ class OutcomeHorizon:
 class FeatureReference:
     feature_id: str
     version: int
+    lookback_seconds: int = 0
+    lookforward_seconds: int = 0
 
     def __post_init__(self) -> None:
         if (not isinstance(self.feature_id, str) or not self.feature_id.strip()
                 or isinstance(self.version, bool) or not isinstance(self.version, int) or self.version <= 0):
             raise ValueError("Feature references require a nonempty ID and positive version.")
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+               for value in (self.lookback_seconds, self.lookforward_seconds)):
+            raise ValueError("Feature lookback/lookforward bounds must be nonnegative integer seconds.")
+        if self.lookforward_seconds != 0:
+            raise ValueError("Predictive feature references cannot require forward information.")
 
     def payload(self) -> dict[str, Any]:
-        return {"feature_id": self.feature_id, "version": self.version}
+        return {
+            "feature_id": self.feature_id,
+            "version": self.version,
+            "lookback_seconds": self.lookback_seconds,
+            "lookforward_seconds": self.lookforward_seconds,
+        }
 
 
 @dataclass(frozen=True)
@@ -172,21 +229,28 @@ class PartitionIdentity:
     embargo_seconds: int
     random_seed: int
     horizon: OutcomeHorizon
+    feature_lookback_seconds: int = 0
+    sampling_algorithm: str = "NONE_V1"
+    outcome_boundary_policy: str = "END_EXCLUSIVE_OUTCOME_CONTAINED"
 
     def __post_init__(self) -> None:
-        if not self.partition_id.strip():
+        if not isinstance(self.partition_id, str) or not self.partition_id.strip():
             raise ValueError("Partition identity requires an ID.")
         if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
-               for value in (self.purge_seconds, self.embargo_seconds)):
-            raise ValueError("Partition purge and embargo values must be nonnegative integers.")
+               for value in (self.purge_seconds, self.embargo_seconds, self.feature_lookback_seconds)):
+            raise ValueError("Partition purge, embargo, and feature lookback values must be nonnegative integer seconds.")
         if isinstance(self.random_seed, bool) or not isinstance(self.random_seed, int):
             raise ValueError("Partition random seed must be an integer.")
+        if not isinstance(self.sampling_algorithm, str) or not self.sampling_algorithm.strip():
+            raise ValueError("Partition sampling algorithm/version is required.")
+        if self.outcome_boundary_policy != "END_EXCLUSIVE_OUTCOME_CONTAINED":
+            raise ValueError("Partitions must require each outcome window to end within its end-exclusive split.")
         train_start, train_end = _utc(self.train_start), _utc(self.train_end)
         validation_start, validation_end = _utc(self.validation_start), _utc(self.validation_end)
         test_start, test_end = _utc(self.test_start), _utc(self.test_end)
         if not train_start < train_end < validation_start < validation_end < test_start < test_end:
             raise ValueError("Train, validation, and test partitions must be strictly time ordered and non-overlapping.")
-        required_gap = self.horizon.seconds + self.purge_seconds + self.embargo_seconds
+        required_gap = self.horizon.seconds + self.feature_lookback_seconds + self.purge_seconds + self.embargo_seconds
         if (validation_start - train_end).total_seconds() < required_gap:
             raise ValueError("Train and validation partitions violate the horizon-aware purge/embargo requirement.")
         if (test_start - validation_end).total_seconds() < required_gap:
@@ -204,6 +268,10 @@ class PartitionIdentity:
             "purge_seconds": self.purge_seconds,
             "embargo_seconds": self.embargo_seconds,
             "random_seed": self.random_seed,
+            "sampling_algorithm": self.sampling_algorithm,
+            "feature_lookback_seconds": self.feature_lookback_seconds,
+            "interval_semantics": "START_INCLUSIVE_END_EXCLUSIVE",
+            "outcome_boundary_policy": self.outcome_boundary_policy,
             "outcome_horizon": self.horizon.payload(),
         }
 
@@ -240,6 +308,12 @@ class HypothesisDefinition:
     predecessor_id: str | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.outcome_horizon, OutcomeHorizon) or not isinstance(self.partition, PartitionIdentity):
+            raise ValueError("Hypotheses require typed outcome-horizon and partition contracts.")
+        if not isinstance(self.statistical_test, StatisticSpec):
+            raise ValueError("Hypotheses require a typed statistical-test contract.")
+        if any(not isinstance(item, FeatureReference) for item in self.required_features):
+            raise ValueError("Hypothesis feature references must use FeatureReference contracts.")
         required_text = (
             self.hypothesis_id, self.title, self.proposition, self.null_hypothesis,
             self.alternative_hypothesis, self.population_definition, self.entry_definition,
@@ -250,6 +324,8 @@ class HypothesisDefinition:
             raise ValueError("Hypotheses require explicit identity, proposition, population, outcome, comparator, and provenance text.")
         if isinstance(self.version, bool) or not isinstance(self.version, int) or self.version <= 0:
             raise ValueError("Hypothesis version must be a positive integer.")
+        if self.predecessor_id is not None and (not isinstance(self.predecessor_id, str) or not self.predecessor_id.strip()):
+            raise ValueError("Hypothesis predecessor ID must be nonempty text when provided.")
         if (isinstance(self.minimum_sample_size, bool) or not isinstance(self.minimum_sample_size, int)
                 or self.minimum_sample_size <= 0):
             raise ValueError("Hypothesis minimum sample size must be positive.")
@@ -263,6 +339,12 @@ class HypothesisDefinition:
             raise ValueError("Hypothesis feature references must be unique.")
         if any(not isinstance(item, str) or not item.strip() for item in (*self.inclusion_rules, *self.exclusion_rules)):
             raise ValueError("Hypothesis inclusion and exclusion rules must be nonempty text.")
+        expected_transforms = {f"{item.feature_id}@{item.version}" for item in self.required_features}
+        if set(self.feature_transforms) != expected_transforms:
+            raise ValueError("Feature transforms must declare exactly one transform for every required feature version.")
+        required_lookback = max((item.lookback_seconds for item in self.required_features), default=0)
+        if self.partition.feature_lookback_seconds != required_lookback:
+            raise ValueError("Partition feature lookback must equal the maximum declared feature lookback.")
         _json_value(self.feature_transforms, path="feature_transforms")
         _json_value(self.success_threshold, path="success_threshold")
         _json_value(self.failure_threshold, path="failure_threshold")
@@ -272,6 +354,7 @@ class HypothesisDefinition:
         """Identity material, intentionally excluding only registration time."""
         return {
             "schema_version": PHASE_E_SCHEMA_VERSION,
+            "canonicalization_version": CANONICALIZATION_VERSION,
             "hypothesis_id": self.hypothesis_id,
             "version": self.version,
             "title": self.title,
@@ -300,7 +383,9 @@ class HypothesisDefinition:
         }
 
     def canonical_payload(self) -> dict[str, Any]:
-        return {**self.scientific_payload(), "created_at": normalized_utc(self.created_at)}
+        # Creation/registration time is immutable ledger metadata.  It is not
+        # a scientific criterion and therefore cannot perturb identity.
+        return self.scientific_payload()
 
     @property
     def definition_hash(self) -> str:
@@ -319,6 +404,10 @@ class ExperimentResult:
     rejection_reason: RejectionReason | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.conclusion, ExperimentConclusion):
+            raise ValueError("Experiment conclusion must use the declared conclusion vocabulary.")
+        if self.rejection_reason is not None and not isinstance(self.rejection_reason, RejectionReason):
+            raise ValueError("Experiment rejection reason must use the declared rejection vocabulary.")
         if isinstance(self.sample_count, bool) or not isinstance(self.sample_count, int) or self.sample_count < 0:
             raise ValueError("Experiment sample count must be a nonnegative integer.")
         finite_number(self.effect_size, name="effect size")

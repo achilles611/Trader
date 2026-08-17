@@ -5,7 +5,7 @@ append-only scientific ledger.  It intentionally exposes no prediction,
 signal, execution, or capital-allocation capability.
 """
 
-from .ledger import CorpusProvenanceError, ExperimentConflictError, PhaseELedger
+from .ledger import CorpusProvenanceError, ExperimentConflictError, LedgerIntegrityError, PhaseELedger
 from .runner import NullExperimentRunner
 from .types import (
     ExperimentConclusion,
@@ -28,6 +28,7 @@ __all__ = [
     "ExperimentStatus",
     "FeatureReference",
     "HypothesisDefinition",
+    "LedgerIntegrityError",
     "NullExperimentRunner",
     "OutcomeHorizon",
     "PartitionIdentity",
