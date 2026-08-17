@@ -8,7 +8,7 @@ Beelzebub uses an explicit hot/cold boundary:
 | Cold | `D:\BeelzebubData` | archives, logs, exports, Obsidian, historical source cache, experiments, graveyard, snapshots, backups |
 | Legacy | `C:\Users\atlas\Documents\Trader` | retained source copy until post-migration review |
 
-Set these environment values for the interactive account or the service wrapper before starting the application:
+The checked-in Windows deployment configuration already defaults to these roots. Environment values remain available for a service wrapper, an alternate host, or a temporary test run:
 
 ```powershell
 $env:BEELZEBUB_HOME = 'E:\Beelzebub'
@@ -16,7 +16,7 @@ $env:BEELZEBUB_HOT_ROOT = 'E:\Beelzebub\runtime\hot'
 $env:BEELZEBUB_COLD_ROOT = 'D:\BeelzebubData'
 ```
 
-The code does not hard-code these paths. Without overrides it uses relative `runtime/hot` and `runtime/cold` roots so Linux CI and temporary-directory tests remain portable.
+The environment overrides take precedence over the deployment configuration, so Linux CI and temporary-directory tests can still supply portable roots.
 
 `copytrade.sqlite3` and its WAL must remain hot. D: is never opened by the observation → feature → confidence → decision → risk/reconciliation path. The cold archive worker only copies completed local spool files and writes a checksum/record-count manifest. Missing D: reports `DEGRADED_ARCHIVAL`; the active engine and all safety gates continue unchanged while the bounded E: spool accumulates archival work. Spool byte and age limits prevent unbounded E: growth.
 

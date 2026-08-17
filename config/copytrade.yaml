@@ -162,9 +162,9 @@ analysis:
 
 storage:
   # Environment overrides: BEELZEBUB_HOME, BEELZEBUB_HOT_ROOT, BEELZEBUB_COLD_ROOT.
-  # E: is the production hot root; relative defaults keep CI/test runs portable.
+  # Windows deployment roots: active state stays on E:, archival state stays on D:.
   hot_root: runtime/hot
-  cold_root: runtime/cold
+  cold_root: D:/BeelzebubData
   archive_spool_max_bytes: 536870912
   archive_spool_max_age_seconds: 604800
 
@@ -182,7 +182,7 @@ database:
   path: runtime/hot/copytrade.sqlite3
 
 obsidian:
-  root: runtime/cold/obsidian
+  root: D:/BeelzebubData/obsidian
 
 dashboard:
   host: 127.0.0.1
