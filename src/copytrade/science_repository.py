@@ -12,6 +12,7 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
+from threading import Lock, local
 from typing import Any, Iterator, Mapping
 
 from .science_storage import ColdArchiveSpool
@@ -35,16 +36,49 @@ class ScientificRepository:
     def __init__(self, path: str | Path, *, archive_spool: ColdArchiveSpool | None = None) -> None:
         self.path = Path(path)
         self.archive_spool = archive_spool
+        self._initialized = False
+        self._initialize_lock = Lock()
+        self._session_local = local()
 
-    @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _new_connection(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.path, timeout=5)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=NORMAL")
         connection.execute("PRAGMA busy_timeout=5000")
+        return connection
+
+    @contextmanager
+    def session(self) -> Iterator[None]:
+        """Reuse one connection for a bounded worker batch on this thread.
+
+        Individual repository methods still commit their own durable state,
+        while avoiding repeated Windows SQLite connection setup during a batch.
+        Other workers receive their own thread-local connection and retain the
+        lease/transaction semantics below.
+        """
+        if getattr(self._session_local, "connection", None) is not None:
+            yield
+            return
+        connection = self._new_connection()
+        self._session_local.connection = connection
+        try:
+            yield
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            self._session_local.connection = None
+            connection.close()
+
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        connection = getattr(self._session_local, "connection", None)
+        owns_connection = connection is None
+        if owns_connection:
+            connection = self._new_connection()
         try:
             yield connection
             connection.commit()
@@ -52,11 +86,18 @@ class ScientificRepository:
             connection.rollback()
             raise
         finally:
-            connection.close()
+            if owns_connection:
+                connection.close()
 
     def initialize(self) -> None:
-        with self._connect() as connection:
-            connection.executescript(
+        if self._initialized:
+            return
+        with self._initialize_lock:
+            if self._initialized:
+                return
+            with self._connect() as connection:
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS science_features (
                     feature_id TEXT NOT NULL, version INTEGER NOT NULL, definition_json TEXT NOT NULL,
@@ -170,6 +211,11 @@ class ScientificRepository:
                     role TEXT PRIMARY KEY, model_id TEXT NOT NULL, version INTEGER NOT NULL,
                     evidence_json TEXT NOT NULL, assigned_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS science_model_calibrations (
+                    calibration_id TEXT PRIMARY KEY, model_id TEXT NOT NULL, version INTEGER NOT NULL,
+                    source_fingerprint TEXT NOT NULL, payload_json TEXT NOT NULL, payload_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL, UNIQUE(model_id, version, source_fingerprint)
+                );
                 CREATE TABLE IF NOT EXISTS science_drift_events (
                     event_id TEXT PRIMARY KEY, object_type TEXT NOT NULL, object_id TEXT NOT NULL,
                     version INTEGER NOT NULL, state TEXT NOT NULL, reason TEXT NOT NULL,
@@ -205,6 +251,8 @@ class ScientificRepository:
                     BEGIN SELECT RAISE(ABORT, 'indicator provenance is immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS science_models_immutable BEFORE UPDATE OF definition_json, definition_hash ON science_models
                     BEGIN SELECT RAISE(ABORT, 'model definition is immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS science_model_calibrations_immutable BEFORE UPDATE ON science_model_calibrations
+                    BEGIN SELECT RAISE(ABORT, 'model calibration is immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS science_observations_immutable BEFORE UPDATE ON science_observations
                     BEGIN SELECT RAISE(ABORT, 'scientific observations are immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS science_feature_values_immutable BEFORE UPDATE ON science_feature_values
@@ -213,8 +261,9 @@ class ScientificRepository:
                     BEGIN SELECT RAISE(ABORT, 'outcome labels are immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS science_search_families_immutable BEFORE UPDATE ON science_search_families
                     BEGIN SELECT RAISE(ABORT, 'search-family definitions are immutable'); END;
-                """
-            )
+                    """
+                )
+            self._initialized = True
 
     def register_feature(self, feature_id: str, version: int, definition: Mapping[str, Any], *, created_at: str, code_sha: str) -> dict[str, Any]:
         self.initialize()
@@ -352,6 +401,23 @@ class ScientificRepository:
         with self._connect() as connection:
             connection.execute("INSERT OR REPLACE INTO science_latency_measurements VALUES (?, ?, ?, ?, ?)", (measurement_id, observed_at, stage, elapsed_ms, _dump(dict(metadata or {}))))
 
+    def latency_report(self) -> dict[str, dict[str, float | int]]:
+        self.initialize()
+        with self._connect() as connection:
+            rows = connection.execute("SELECT stage, elapsed_ms FROM science_latency_measurements ORDER BY stage, elapsed_ms").fetchall()
+        grouped: dict[str, list[float]] = {}
+        for row in rows:
+            grouped.setdefault(str(row["stage"]), []).append(float(row["elapsed_ms"]))
+        def percentile(values: list[float], fraction: float) -> float:
+            if len(values) == 1:
+                return values[0]
+            index = (len(values) - 1) * fraction
+            lower, upper = int(index), min(len(values) - 1, int(index) + 1)
+            return values[lower] + (values[upper] - values[lower]) * (index - lower)
+        return {stage: {"count": len(values), "mean_ms": sum(values) / len(values), "max_ms": max(values),
+                        "p50_ms": percentile(values, 0.50), "p95_ms": percentile(values, 0.95), "p99_ms": percentile(values, 0.99)}
+                for stage, values in grouped.items()}
+
     # Phase D.6 runtime evidence.  These tables are additive to the D.5
     # scientific objects above; none of them alter frozen execution evidence.
     def record_observation(self, observation_id: str, *, kind: str, source: str, source_event_id: str, wallet: str | None,
@@ -420,6 +486,32 @@ class ScientificRepository:
                 "source_observation_ids": list(source_observation_ids), "data_fingerprint": data_fingerprint,
                 "materialized_at": materialized_at}
 
+    def record_feature_values(self, values: list[Mapping[str, Any]]) -> None:
+        """Persist one observation's immutable values in one SQLite transaction."""
+        self.initialize()
+        with self._connect() as connection:
+            for item in values:
+                body = {"value": item["value"]}
+                existing = connection.execute("SELECT * FROM science_feature_values WHERE feature_value_id=?", (item["feature_value_id"],)).fetchone()
+                if existing:
+                    if _load(existing["value_json"], {}) != body or bool(existing["missing"]) != bool(item["missing"]):
+                        raise ValueError("Feature-value identity has conflicting immutable evidence.")
+                    continue
+                try:
+                    connection.execute("""INSERT INTO science_feature_values VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
+                        item["feature_value_id"], item["feature_id"], int(item["feature_version"]), item["observation_id"],
+                        _dump(body), int(bool(item["missing"])), _dump(list(item["source_observation_ids"])),
+                        item["data_fingerprint"], item["materialized_at"],
+                    ))
+                except sqlite3.IntegrityError as exc:
+                    prior = connection.execute("""SELECT * FROM science_feature_values
+                        WHERE feature_id=? AND feature_version=? AND observation_id=?""", (
+                        item["feature_id"], int(item["feature_version"]), item["observation_id"],
+                    )).fetchone()
+                    if prior and _load(prior["value_json"], {}) == body and bool(prior["missing"]) == bool(item["missing"]):
+                        continue
+                    raise ValueError("Feature observation/version has conflicting immutable evidence.") from exc
+
     def list_feature_values(self, *, observation_ids: tuple[str, ...] = (), feature_id: str | None = None) -> list[dict[str, Any]]:
         query: str = "SELECT * FROM science_feature_values"
         values: list[Any] = []
@@ -478,6 +570,25 @@ class ScientificRepository:
                 "subject_version": subject_version, "state": "PENDING", "priority": priority, "created_at": created_at,
                 "available_at": available_at, "attempt_count": 0, "max_attempts": max_attempts,
                 "input_fingerprint": input_fingerprint}
+
+    def supersede_available_work(self, *, work_type: str, subject_type: str, subject_id: str,
+                                 subject_version: int, keep_fingerprint: str) -> int:
+        """Retire stale, not-yet-leased semantic work when newer evidence arrives.
+
+        Leased work is deliberately left alone: the worker that owns it must
+        either finish against its frozen input or lose its lease.  This keeps
+        queue history auditable while avoiding a backlog of expensive research
+        jobs for intermediate feature/label snapshots.
+        """
+        self.initialize()
+        with self._connect() as connection:
+            cursor = connection.execute("""UPDATE science_work_queue SET state='SUPERSEDED',
+                completed_at=COALESCE(completed_at, available_at), result_reference='newer evidence fingerprint queued'
+                WHERE work_type=? AND subject_type=? AND subject_id=? AND subject_version=?
+                  AND state IN ('PENDING', 'RETRYABLE') AND input_fingerprint<>?""", (
+                work_type, subject_type, subject_id, subject_version, keep_fingerprint,
+            ))
+        return int(cursor.rowcount)
 
     def claim_work(self, *, worker_id: str, now: str, lease_expires_at: str) -> dict[str, Any] | None:
         self.initialize()
@@ -614,6 +725,35 @@ class ScientificRepository:
     def model_roles(self) -> list[dict[str, Any]]:
         return self._rows("SELECT * FROM science_model_roles ORDER BY role", lambda row: {"role": row["role"], "model_id": row["model_id"], "version": row["version"], "evidence": _load(row["evidence_json"], {}), "assigned_at": row["assigned_at"]})
 
+    def record_model_calibration(self, calibration_id: str, *, model_id: str, version: int,
+                                 source_fingerprint: str, payload: Mapping[str, Any], created_at: str) -> dict[str, Any]:
+        self.initialize()
+        body, digest = dict(payload), canonical_hash(payload)
+        with self._connect() as connection:
+            existing = connection.execute("SELECT * FROM science_model_calibrations WHERE calibration_id=?", (calibration_id,)).fetchone()
+            if existing:
+                if existing["payload_hash"] != digest:
+                    raise ValueError("Model calibration identity has conflicting immutable evidence.")
+                return self._calibration_payload(existing)
+            try:
+                connection.execute("INSERT INTO science_model_calibrations VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                   (calibration_id, model_id, version, source_fingerprint, _dump(body), digest, created_at))
+            except sqlite3.IntegrityError as exc:
+                existing = connection.execute("""SELECT * FROM science_model_calibrations WHERE
+                    model_id=? AND version=? AND source_fingerprint=?""", (model_id, version, source_fingerprint)).fetchone()
+                if existing and existing["payload_hash"] == digest:
+                    return self._calibration_payload(existing)
+                raise ValueError("Model calibration source fingerprint conflicts.") from exc
+        return {"calibration_id": calibration_id, "model_id": model_id, "version": version,
+                "source_fingerprint": source_fingerprint, "payload": body, "created_at": created_at}
+
+    def list_model_calibrations(self, *, model_id: str | None = None) -> list[dict[str, Any]]:
+        query, values = "SELECT * FROM science_model_calibrations", []
+        if model_id:
+            query += " WHERE model_id=?"; values.append(model_id)
+        query += " ORDER BY created_at DESC, calibration_id DESC"
+        return self._rows(query, self._calibration_payload, values)
+
     def record_drift(self, event_id: str, *, object_type: str, object_id: str, version: int, state: str, reason: str, evidence: Mapping[str, Any], created_at: str) -> None:
         self.initialize()
         with self._connect() as connection:
@@ -673,7 +813,7 @@ class ScientificRepository:
     def health(self) -> dict[str, Any]:
         self.initialize()
         with self._connect() as connection:
-            counts = {table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("science_features", "science_hypotheses", "science_experiments", "science_indicators", "science_models", "science_forward_predictions", "science_graveyard", "science_decisions")}
+            counts = {table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("science_features", "science_hypotheses", "science_experiments", "science_indicators", "science_models", "science_forward_predictions", "science_graveyard", "science_decisions", "science_model_calibrations")}
         return {"database": str(self.path), "state": "READY", "counts": counts}
 
     def _rows(self, query: str, mapper: Any, values: list[Any] | tuple[Any, ...] = ()) -> list[dict[str, Any]]:
@@ -743,3 +883,9 @@ class ScientificRepository:
     @staticmethod
     def _model_payload(row: sqlite3.Row) -> dict[str, Any]:
         return {"model_id": row["model_id"], "version": row["version"], "state": row["state"], "definition": _load(row["definition_json"], {}), "created_at": row["created_at"], "predecessor_id": row["predecessor_id"]}
+
+    @staticmethod
+    def _calibration_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {"calibration_id": row["calibration_id"], "model_id": row["model_id"], "version": row["version"],
+                "source_fingerprint": row["source_fingerprint"], "payload": _load(row["payload_json"], {}),
+                "created_at": row["created_at"]}

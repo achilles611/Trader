@@ -20,6 +20,7 @@ from .rate_limit import shared_hyperliquid_info_limiter
 from .reconstruction import FillAggregate, PositionReconstructor, ReconstructionResult, aggregate_partial_fills
 from .storage import CopyTradeDatabase, RECONSTRUCTION_SCHEMA_VERSION, ReconstructionCursor
 from .science_repository import ScientificRepository
+from .scientific_worker import ScientificWorker
 
 
 class _PaperExecutionAuthority:
@@ -52,9 +53,14 @@ class CopyTradeService:
         self.config = config
         self.database = database or CopyTradeDatabase(config.artifacts.database_path)
         self.database.initialize()
+        # D.5's execution gate remains independently opt-in.  D.6's worker
+        # may collect public evidence while normal paper-copy compatibility
+        # tests run, but it never changes the execution route by itself.
         self.science_repository = ScientificRepository(self.database.path) if config.scientific_execution.enabled else None
         if self.science_repository:
             self.science_repository.initialize()
+        worker_repository = self.science_repository or (ScientificRepository(self.database.path) if config.scientific_worker.enabled else None)
+        self.scientific_worker = ScientificWorker(worker_repository, config) if worker_repository else None
         # Phase C owns the durable operator/control state.  Keeping its gate
         # beside signal processing means a watcher cannot bypass the UI's
         # paper-entry controls, while raw evidence and exit handling remain
@@ -547,6 +553,16 @@ class CopyTradeService:
             "target_fill_price": event.price, "source_fill_timestamp": event.event_timestamp.isoformat(),
             "local_receive_timestamp": received_at.isoformat(), "market_reference_age_ms": age_ms,
         }
+        if self.scientific_worker is not None:
+            # This bridge records evidence and queues feature work only.  It
+            # intentionally does not run research or execute a PAPER order in
+            # this latency-sensitive reconstruction callback.
+            self.scientific_worker.ingest_observation(
+                kind="WALLET_FILL", source="copytrade_public_reconstruction", source_event_id=signal.signal_id,
+                wallet=event.target_wallet, symbol=event.symbol, event_at=event.event_timestamp, received_at=received_at,
+                payload={"position_event_id": event.event_id, "side": signal.direction, "action": signal.action,
+                         "price": event.price, "notional": event.notional, "estimated_cost": self.config.paper_execution.fee_rate},
+            )
         if self.science_repository is not None:
             # D.5 production topology: source actions are retained as sensor
             # evidence, never turned directly into PAPER exposure or an exit.
@@ -646,6 +662,13 @@ class CopyTradeService:
             price = _float_or_none(value)
             if price is not None and price > 0:
                 self.market_cache.update_mid(str(symbol), price, timestamp=observed_at, received_at=received)
+                if self.scientific_worker is not None:
+                    self.scientific_worker.ingest_observation(
+                        kind="MARKET_PRICE", source="hyperliquid_public_market",
+                        source_event_id=stable_id("scientific_market_price", str(symbol), observed_at, price),
+                        symbol=str(symbol), event_at=received, received_at=received,
+                        payload={"price": price, "source_timestamp": str(observed_at)},
+                    )
         engine = self._live_engine
         if engine is None and self.database.list_virtual_positions(open_only=True):
             engine = self._execution_engine()

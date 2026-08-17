@@ -289,6 +289,11 @@ class ScientificWorkerConfig:
     max_batch_size: int = 64
     max_attempts: int = 3
     max_worker_threads: int = 1
+    max_processes: int = 1
+    max_sqlite_write_batch: int = 64
+    max_hot_cache_bytes: int = 268_435_456
+    max_historical_materialization_bytes: int = 134_217_728
+    historical_resamples: int = 250
     max_proposals_per_family_per_cycle: int = 4
     max_registered_per_family_per_day: int = 12
     max_historical_tests_per_cycle: int = 8
@@ -527,6 +532,10 @@ class CopyTradeConfig:
             raise ValueError("scientific worker polling, lease, batch, and retry bounds must be positive.")
         if worker.max_worker_threads <= 0 or worker.max_worker_threads > 8:
             raise ValueError("scientific worker thread count must be between 1 and 8.")
+        if (worker.max_processes <= 0 or worker.max_processes > 2 or worker.max_sqlite_write_batch <= 0
+                or worker.max_hot_cache_bytes <= 0 or worker.max_historical_materialization_bytes <= 0
+                or worker.historical_resamples <= 0):
+            raise ValueError("scientific worker resource bounds and historical resamples must be positive.")
         if min(worker.max_proposals_per_family_per_cycle, worker.max_registered_per_family_per_day,
                worker.max_historical_tests_per_cycle, worker.max_forward_shadow_candidates,
                worker.max_active_candidate_models, worker.minimum_sample,

@@ -183,6 +183,11 @@ scientific_worker:
   max_batch_size: 64
   max_attempts: 3
   max_worker_threads: 1
+  max_processes: 1
+  max_sqlite_write_batch: 64
+  max_hot_cache_bytes: 268435456
+  max_historical_materialization_bytes: 134217728
+  historical_resamples: 250
   max_proposals_per_family_per_cycle: 4
   max_registered_per_family_per_day: 12
   max_historical_tests_per_cycle: 8

@@ -26,7 +26,7 @@ class ScientificScheduler:
     def run_once(self, *, max_items: int | None = None) -> dict[str, object]:
         return self.worker.run_once(max_items=max_items)
 
-    def run_forever(self) -> None:
+    def run_forever(self, *, max_items: int | None = None) -> None:
         while not self._stop.is_set():
-            self.worker.run_once()
+            self.worker.run_once(max_items=max_items)
             self._stop.wait(self.poll_interval_seconds)

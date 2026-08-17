@@ -32,4 +32,13 @@ class ScientificLatencyMonitor:
         stages: dict[str, list[float]] = {}
         for sample in self.samples:
             stages.setdefault(sample["stage"], []).append(sample["elapsed_ms"])
-        return {stage: {"count": len(values), "mean_ms": sum(values) / len(values), "max_ms": max(values)} for stage, values in stages.items()}
+        def percentile(values: list[float], fraction: float) -> float:
+            ordered = sorted(values)
+            if len(ordered) == 1:
+                return ordered[0]
+            index = (len(ordered) - 1) * fraction
+            lower, upper = int(index), min(len(ordered) - 1, int(index) + 1)
+            return ordered[lower] + (ordered[upper] - ordered[lower]) * (index - lower)
+        return {stage: {"count": len(values), "mean_ms": sum(values) / len(values), "max_ms": max(values),
+                        "p50_ms": percentile(values, 0.50), "p95_ms": percentile(values, 0.95), "p99_ms": percentile(values, 0.99)}
+                for stage, values in stages.items()}
