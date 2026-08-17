@@ -19,6 +19,7 @@ from .paper import PaperExecutionEngine, SignalFactory, TargetSizeClassifier
 from .rate_limit import shared_hyperliquid_info_limiter
 from .reconstruction import FillAggregate, PositionReconstructor, ReconstructionResult, aggregate_partial_fills
 from .storage import CopyTradeDatabase, RECONSTRUCTION_SCHEMA_VERSION, ReconstructionCursor
+from .science_repository import ScientificRepository
 
 
 class _PaperExecutionAuthority:
@@ -51,6 +52,9 @@ class CopyTradeService:
         self.config = config
         self.database = database or CopyTradeDatabase(config.artifacts.database_path)
         self.database.initialize()
+        self.science_repository = ScientificRepository(self.database.path) if config.scientific_execution.enabled else None
+        if self.science_repository:
+            self.science_repository.initialize()
         # Phase C owns the durable operator/control state.  Keeping its gate
         # beside signal processing means a watcher cannot bypass the UI's
         # paper-entry controls, while raw evidence and exit handling remain
@@ -543,6 +547,24 @@ class CopyTradeService:
             "target_fill_price": event.price, "source_fill_timestamp": event.event_timestamp.isoformat(),
             "local_receive_timestamp": received_at.isoformat(), "market_reference_age_ms": age_ms,
         }
+        if self.science_repository is not None:
+            # D.5 production topology: source actions are retained as sensor
+            # evidence, never turned directly into PAPER exposure or an exit.
+            # A later scientific model router must emit its own decision record
+            # after validated indicators, confidence, edge, and risk gates.
+            metadata.update({"scientific_gate": "required", "source_action_role": "sensor_observation"})
+            self.science_repository.record_decision(
+                stable_id("scientific_raw_observation_skip", signal.signal_id), created_at=received_at.isoformat(),
+                symbol=signal.symbol, decision="SKIP",
+                payload={
+                    "reason": "scientific_decision_required", "source_signal_id": signal.signal_id,
+                    "source_wallet": signal.target_wallet, "source_action": signal.action,
+                    "source_leverage_ignored": True, "execution_mode": "SIMULATION_SHADOW_ONLY",
+                    "observation": {"position_event_id": event.event_id, "price": event.price, "timestamp": event.event_timestamp.isoformat()},
+                },
+            )
+            engine.process_signal(signal, received_at=received_at, market_metadata=metadata, forced_reason="scientific_decision_required")
+            return
         entry_block = (
             "source_recovery_not_continuous" if recovery_state != "CONTINUOUS" and signal.action in {"open", "add"}
             else self.control_store.entry_block_reason(signal.target_wallet, signal.action)

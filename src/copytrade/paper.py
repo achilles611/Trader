@@ -223,7 +223,9 @@ class CopyRiskEngine:
         if (now - signal.source_event_timestamp).total_seconds() > self.config.max_signal_age_seconds: return RiskDecision(False, 0.0, "stale_signal")
         if self.config.symbol_allowlist and signal.symbol not in self.config.symbol_allowlist: return RiskDecision(False, 0.0, "symbol_not_allowlisted")
         if signal.symbol in self.config.symbol_blocklist: return RiskDecision(False, 0.0, "symbol_blocklisted")
-        if self.config.max_leverage is not None and signal.target_leverage is not None and signal.target_leverage > self.config.max_leverage: return RiskDecision(False, 0.0, "leverage_limit")
+        # Source-wallet leverage is a sensor attribute, not risk authority.
+        # Scientific/paper leverage is independently derived and capped by the
+        # risk policy; this legacy compatibility engine must never copy it.
         if portfolio.drawdown_fraction >= self.config.max_copy_drawdown_fraction: return RiskDecision(False, 0.0, "max_drawdown")
         if portfolio.consecutive_losses >= self.config.max_consecutive_losses: return RiskDecision(False, 0.0, "consecutive_losses")
         cap_base = portfolio.cap_base(self.config.risk_cap_base, now)
