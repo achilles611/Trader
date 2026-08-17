@@ -283,7 +283,10 @@ class ScientificExecutionConfig:
 class ScientificWorkerConfig:
     """Bounded, paper/shadow-only automation parameters for Phase D.6."""
 
-    enabled: bool = True
+    # The checked-in deployment configuration enables this. Keeping the
+    # dataclass default off preserves isolated historical/PAPER fixtures that
+    # construct a config without opting into D.6 infrastructure.
+    enabled: bool = False
     poll_interval_seconds: float = 1.0
     lease_seconds: float = 30.0
     max_batch_size: int = 64
