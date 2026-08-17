@@ -1,8 +1,8 @@
 # Copy-trading research alpha
 
 This subsystem researches publicly observable traders and paper-copies their
-signals. It extends the ETH/swarm bot; it does not share state, credentials, or
-the Coinbase execution path.
+signals. It is the sole supported application runtime; Phase D.6 permanently
+removed the unrelated ETH/Coinbase bot and its exchange client.
 
 It is paper-only. There is no live copy execution adapter in this release.
 

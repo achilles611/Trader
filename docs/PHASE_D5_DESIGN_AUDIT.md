@@ -38,7 +38,10 @@ The frozen D.4 baseline is a sound starting point because live copy trading is s
 - the copytrade Hyperliquid client contains public `/info` and websocket reads, not exchange signing;
 - the normal runtime dependency set does not contain the Hyperliquid trading SDK.
 
-The repository does contain a separate Coinbase-capable `src/eth_bot` subsystem and generic historical live flags. Those are explicitly **not** authority for D.5 and must never be reused as copytrade live gates or credential sources.
+At the time of this historical D.5 audit the repository still contained a
+separate Coinbase-capable subsystem. Phase D.6 removed that subsystem, its
+flags, credentials, configuration, and dependency; it cannot be reused as
+copytrade authority.
 
 No current D.4 medium/high defect was found by this design audit. The findings below are **blocking D.5 design requirements**: they become safety defects only if a live adapter is implemented without resolving them.
 
@@ -156,7 +159,7 @@ The signer process must prove only its public signer address to the coordinator.
 
 Severity if ignored: **High**.
 
-`COPYTRADE_MODE=live` plus `COPYTRADE_LIVE_ENABLED=true` may remain prerequisite intent signals, but they are never sufficient to create transport authority. Likewise, `LIVE_TRADING_ENABLED`, `BOT_TRADING_ENABLED`, and the Coinbase credentials used by `src/eth_bot` are unrelated and must be ignored by D.5.
+`COPYTRADE_MODE=live` plus `COPYTRADE_LIVE_ENABLED=true` may remain prerequisite intent signals, but they are never sufficient to create transport authority. The unrelated legacy global live flags, Coinbase credentials, and legacy exchange client described in the original audit no longer exist after Phase D.6.
 
 D.5 requires a short-lived, explicit, account-bound **LiveAuthorizationSession** persisted without secrets. It should include:
 

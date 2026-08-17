@@ -5,7 +5,7 @@ import asyncio
 from dataclasses import replace
 from json import dumps
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from .analytics import campaign_return_series
 from .analysis import CandidateAnalysisPipeline, _config_fingerprint
@@ -325,3 +325,26 @@ def _score_payload(score: Any) -> dict[str, Any]:
 
 def _print(payload: object) -> None:
     print(dumps(payload, indent=2, default=str))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the sole supported Beelzebub command surface.
+
+    The legacy ETH/Coinbase CLI was intentionally removed in Phase D.6.  This
+    entry point owns only public-data copy-trade research and its paper/shadow
+    scientific controls.
+    """
+    parser = argparse.ArgumentParser(prog="beelzebub", description="Beelzebub paper-only scientific research controls.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    add_copytrade_parsers(subparsers)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return run_copytrade_command(args)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+    return 2  # pragma: no cover - argparse.error exits
