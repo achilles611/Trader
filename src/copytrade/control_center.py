@@ -1383,6 +1383,10 @@ def create_control_center_app(
     async def api_science_automated() -> dict[str, Any]:
         return center.science.automated()
 
+    @app.get("/api/science/data-ignition")
+    async def api_science_data_ignition() -> dict[str, Any]:
+        return center.science.data_ignition()
+
     @app.post("/api/science/pause")
     async def api_science_pause(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         return center.science.pause_automated_worker(str((payload or {}).get("reason") or "operator requested scientific pause"))

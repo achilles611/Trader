@@ -13,6 +13,7 @@ from .science_storage import ColdArchiveSpool, StorageRoots
 
 class ScientificReadModel:
     def __init__(self, config: CopyTradeConfig, database_path: str | Path) -> None:
+        self.config = config
         database_path = Path(database_path)
         cold_root = config.storage.cold_root
         self.roots = StorageRoots(home=database_path.parent.parent, hot_root=database_path.parent, cold_root=cold_root)
@@ -98,6 +99,12 @@ class ScientificReadModel:
             "resource_state": {"hot_free_bytes": disk_usage(self.repository.path.parent).free, **self.storage()},
             "scheduler": "external durable CLI process; current database state is shown above",
         }
+
+    def data_ignition(self) -> dict[str, Any]:
+        """D.7 projection generated from manifests and observations, never counters."""
+        from .data_ignition import DataIgnitionCommissioner
+        from .scientific_worker import ScientificWorker
+        return DataIgnitionCommissioner(self.repository, ScientificWorker(self.repository, self.config), self.config).status()
 
     def pause_automated_worker(self, reason: str) -> dict[str, Any]:
         from .models import iso, utc_now

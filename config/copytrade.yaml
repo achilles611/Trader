@@ -204,6 +204,26 @@ scientific_worker:
   minimum_hot_free_bytes: 1073741824
   horizons_seconds: [15, 30, 60, 120, 180, 300, 600]
 
+# The first real source hour contained nearly 800k normalized observations.
+# This measured, meaningful hour is the bounded commissioning interval; the
+# requester-pays byte cap still prevents an oversized expanded campaign.
+commissioning:
+  enabled: true
+  historical_start: "2026-08-17T00:00:00Z"
+  historical_end: "2026-08-17T01:00:00Z"
+  max_download_bytes: 1073741824
+  max_hours_per_run: 168
+  max_concurrency: 1
+  # The verified raw archive is retained in full; this deterministic, bounded
+  # hot corpus is the source selected for one D.6 research campaign.
+  max_corpus_observations: 256
+  min_coverage_fraction: 1.0
+  max_live_receive_lag_seconds: 120.0
+  observer_reconnect_initial_seconds: 1.0
+  observer_reconnect_max_seconds: 30.0
+  observation_wallets: []
+  archive_verified_sources: true
+
 artifacts: {}
 
 database:

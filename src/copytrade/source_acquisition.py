@@ -62,6 +62,47 @@ class HyperCoreObject:
         return f"s3://{self.bucket}/{self.key}"
 
 
+@dataclass(frozen=True)
+class HistoricalHourPlan:
+    """One explicit UTC slot in a bounded historical acquisition request."""
+
+    start: str
+    end: str
+
+
+def historical_hour_slots(start: str | datetime, end: str | datetime, *, maximum_hours: int) -> tuple[HistoricalHourPlan, ...]:
+    """Return deterministic, end-exclusive UTC-hour slots for D.7.
+
+    This intentionally has no relationship to the short recent-discovery
+    lookback.  A caller must name both endpoints and the requested range is
+    bounded before any source listing or download occurs.
+    """
+    if maximum_hours <= 0:
+        raise ValueError("Historical acquisition maximum_hours must be positive.")
+    def utc_boundary(value: str | datetime) -> datetime:
+        if isinstance(value, str) and not value.strip().endswith("Z"):
+            raise ValueError("Historical acquisition boundaries must use an explicit Z UTC offset.")
+        parsed = as_utc(value)
+        if isinstance(value, datetime) and (value.tzinfo is None or value.utcoffset() != timedelta(0)):
+            raise ValueError("Historical acquisition datetime boundaries must be UTC.")
+        return HyperCoreSourceAcquisition._floor_to_hour(parsed)
+    try:
+        first, last = utc_boundary(start), utc_boundary(end)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Historical acquisition start/end must be ISO-8601 UTC timestamps.") from exc
+    if first.tzinfo != timezone.utc or last.tzinfo != timezone.utc:
+        raise ValueError("Historical acquisition boundaries must be UTC.")
+    if last <= first:
+        raise ValueError("Historical acquisition end must be after start.")
+    count = int((last - first).total_seconds() // 3600)
+    if count <= 0 or count > maximum_hours:
+        raise ValueError(f"Historical acquisition range contains {count} hourly slots; configured maximum is {maximum_hours}.")
+    return tuple(HistoricalHourPlan(
+        iso(first + timedelta(hours=index)).replace("+00:00", "Z"),
+        iso(first + timedelta(hours=index + 1)).replace("+00:00", "Z"),
+    ) for index in range(count))
+
+
 PRESETS: dict[str, dict[str, Any]] = {
     "quick": {"hourly_object_count": 1, "candidate_limit": 1_000, "min_activity": 2, "max_activity_age": "30d"},
     "standard": {"hourly_object_count": 6, "candidate_limit": 2_500, "min_activity": 2, "max_activity_age": "30d"},
@@ -290,6 +331,27 @@ class HyperCoreSourceAcquisition:
                 f"within the bounded {lookback}-hour source lookback."
             )
         return sorted(found, key=lambda item: (item.data_hour_start or "", item.key))
+
+    def resolve_historical_slots(
+        self, slots: Iterable[HistoricalHourPlan], *, cancelled: Callable[[], bool] | None = None,
+    ) -> dict[str, HyperCoreObject | None]:
+        """Resolve exactly named historical hours without a root archive scan.
+
+        Results contain ``None`` for an absent official hour.  That absence is
+        evidence for the D.7 coverage authority, not a reason to pretend the
+        surrounding downloaded files provide complete coverage.
+        """
+        selected = tuple(slots)
+        if not selected:
+            raise ValueError("Historical acquisition requires at least one UTC-hour slot.")
+        client = self._client()
+        resolved: dict[str, HyperCoreObject | None] = {}
+        for slot in selected:
+            if cancelled and cancelled():
+                break
+            hour = self._floor_to_hour(as_utc(slot.start))
+            resolved[iso(hour).replace("+00:00", "Z")] = self._resolve_slot(client, hour)
+        return resolved
 
     def resolve_recent(self, window: timedelta, *, maximum_objects: int | None = None) -> list[HyperCoreObject]:
         """Compatibility wrapper: a window now means a UTC-hour object count."""

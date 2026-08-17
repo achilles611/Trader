@@ -24,6 +24,7 @@ from .science_storage import ColdArchiveSpool, StorageRoots, migrate_sqlite_to_h
 from .science_repository import ScientificRepository
 from .scientific_scheduler import ScientificScheduler
 from .scientific_worker import ScientificWorker, WorkerStage
+from .data_ignition import DataIgnitionCommissioner, PublicObservationService
 
 
 def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -136,6 +137,24 @@ def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
     science_bootstrap.add_argument("--max-cycles", type=int, default=128)
     science_reproduce = science_subparsers.add_parser("reproduce", help="Print the immutable inputs and result for one historical experiment.")
     science_reproduce.add_argument("--experiment", required=True)
+    science_source = science_subparsers.add_parser("source-status", help="Show official historical-source readiness and the D.7 evidence capability audit.")
+    science_source.add_argument("--test-access", action="store_true", help="Perform one bounded requester-pays source probe when credentials are configured.")
+    science_plan = science_subparsers.add_parser("plan-history", help="Persist deterministic, bounded UTC historical-source hour slots.")
+    science_plan.add_argument("--start", help="Inclusive UTC ISO-8601 start; defaults to commissioning.historical_start.")
+    science_plan.add_argument("--end", help="Exclusive UTC ISO-8601 end; defaults to commissioning.historical_end.")
+    science_acquire = science_subparsers.add_parser("acquire-history", help="Resolve, forecast, verify, ingest, and archive a bounded historical range.")
+    science_acquire.add_argument("--start", help="Inclusive UTC ISO-8601 start; defaults to commissioning.historical_start.")
+    science_acquire.add_argument("--end", help="Exclusive UTC ISO-8601 end; defaults to commissioning.historical_end.")
+    science_subparsers.add_parser("cancel-history", help="Request durable cancellation between historical source objects.")
+    science_coverage = science_subparsers.add_parser("coverage", help="Calculate first-class D.7 historical coverage and quality evidence.")
+    science_coverage.add_argument("--start", help="Inclusive UTC ISO-8601 start; defaults to commissioning.historical_start.")
+    science_coverage.add_argument("--end", help="Exclusive UTC ISO-8601 end; defaults to commissioning.historical_end.")
+    science_commission = science_subparsers.add_parser("commission", help="Run bounded D.7 acquisition and the existing D.6 science loop.")
+    science_commission.add_argument("--start", help="Inclusive UTC ISO-8601 start; defaults to commissioning.historical_start.")
+    science_commission.add_argument("--end", help="Exclusive UTC ISO-8601 end; defaults to commissioning.historical_end.")
+    science_commission.add_argument("--max-cycles", type=int, default=128)
+    science_observe = science_subparsers.add_parser("observe", help="Run the public allMids/userFills observer; it only persists scientific observations.")
+    science_observe.add_argument("--duration", type=float, help="Optional bounded observer duration in seconds for smoke tests.")
 
 
 def run_copytrade_command(args: argparse.Namespace) -> int:
@@ -155,6 +174,7 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
     if command == "science":
         repository = ScientificRepository(config.artifacts.database_path, archive_spool=spool)
         worker = ScientificWorker(repository, config)
+        ignition = DataIgnitionCommissioner(repository, worker, config)
         science_command = args.science_command
         if science_command == "run":
             scheduler = ScientificScheduler(worker, poll_interval_seconds=config.scientific_worker.poll_interval_seconds)
@@ -168,7 +188,7 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
             _print(worker.run_once(max_items=args.max_items))
             return 0
         if science_command == "status":
-            _print(_science_status(repository, roots, spool))
+            _print({**_science_status(repository, roots, spool), "data_ignition": ignition.status()})
             return 0
         if science_command == "pause":
             worker.pause(args.reason)
@@ -196,6 +216,33 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
                 raise ValueError("Unknown historical experiment ID.")
             hypothesis = next((item for item in repository.list_hypotheses() if item["hypothesis_id"] == experiment["hypothesis_id"] and int(item["version"]) == int(experiment["hypothesis_version"])), None)
             _print({"experiment": experiment, "hypothesis": hypothesis, "reproducible": True, "execution_mode": "SIMULATION_SHADOW_ONLY"})
+            return 0
+        if science_command == "source-status":
+            _print(ignition.source_status(test_access=args.test_access))
+            return 0
+        if science_command == "plan-history":
+            _print(ignition.plan_history(args.start, args.end))
+            return 0
+        if science_command == "acquire-history":
+            _print(ignition.acquire_history(args.start, args.end))
+            return 0
+        if science_command == "cancel-history":
+            _print(ignition.cancel_history())
+            return 0
+        if science_command == "coverage":
+            start, end = args.start or config.commissioning.historical_start, args.end or config.commissioning.historical_end
+            _print(ignition.coverage.calculate(str(start).replace("+00:00", "Z"), str(end).replace("+00:00", "Z")))
+            return 0
+        if science_command == "commission":
+            _print(ignition.commission(args.start, args.end, max_cycles=args.max_cycles))
+            return 0
+        if science_command == "observe":
+            observer = PublicObservationService(ignition)
+            try:
+                _print(asyncio.run(observer.run(duration_seconds=args.duration)))
+            except KeyboardInterrupt:
+                observer.stop()
+                _print({"state": "STOPPED", "reason": "keyboard_interrupt", "paper_only": True})
             return 0
     service = CopyTradeService(config)
     if command == "copy-import":
@@ -382,8 +429,9 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
 def _science_counts(repository: ScientificRepository) -> dict[str, int]:
     hypotheses = repository.list_hypotheses()
     forward = repository.list_forward_records()
+    observations = repository.observation_counts()
     return {
-        "observations": len(repository.list_observations(limit=5_000)),
+        "observations": sum(observations.values()),
         "features": len(repository.list_feature_values()),
         "candidate_patterns": len(repository.list_discoveries()),
         "proposals": len(repository.list_discoveries()),

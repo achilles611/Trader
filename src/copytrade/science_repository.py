@@ -11,6 +11,7 @@ import hashlib
 import json
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock, local
 from typing import Any, Iterator, Mapping
@@ -227,16 +228,52 @@ class ScientificRepository:
                 CREATE TABLE IF NOT EXISTS science_journals (
                     journal_date TEXT PRIMARY KEY, payload_json TEXT NOT NULL, updated_at TEXT NOT NULL
                 );
+                -- D.7 acquisition evidence is mutable operational state with
+                -- immutable provenance fields.  It is deliberately separate
+                -- from observations, which remain append-only scientific data.
+                CREATE TABLE IF NOT EXISTS science_acquisition_manifest (
+                    expected_start TEXT PRIMARY KEY, expected_end TEXT NOT NULL, source_name TEXT NOT NULL,
+                    state TEXT NOT NULL, source_identifier TEXT, local_path TEXT,
+                    expected_bytes INTEGER, downloaded_bytes INTEGER, object_checksum TEXT, local_sha256 TEXT,
+                    acquired_at TEXT, parser_version TEXT, schema_version INTEGER,
+                    observation_count INTEGER NOT NULL DEFAULT 0, duplicate_count INTEGER NOT NULL DEFAULT 0,
+                    malformed_count INTEGER NOT NULL DEFAULT 0, first_event_at TEXT, last_event_at TEXT,
+                    failure_reason TEXT, retry_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS science_data_coverage (
+                    coverage_id TEXT PRIMARY KEY, interval_start TEXT NOT NULL, interval_end TEXT NOT NULL,
+                    source_name TEXT NOT NULL, state TEXT NOT NULL, coverage_fraction REAL NOT NULL,
+                    expected_hours INTEGER NOT NULL, verified_hours INTEGER NOT NULL, missing_hours INTEGER NOT NULL,
+                    malformed_hours INTEGER NOT NULL, parsed_hours INTEGER NOT NULL, observation_count INTEGER NOT NULL,
+                    duplicate_count INTEGER NOT NULL, timestamp_anomalies INTEGER NOT NULL,
+                    first_event_at TEXT, last_event_at TEXT, wallet_attribution_quality TEXT NOT NULL,
+                    market_evidence_availability TEXT NOT NULL, details_json TEXT NOT NULL, computed_at TEXT NOT NULL,
+                    UNIQUE(interval_start, interval_end, source_name)
+                );
+                CREATE TABLE IF NOT EXISTS science_corpus_snapshots (
+                    corpus_fingerprint TEXT PRIMARY KEY, interval_start TEXT NOT NULL, interval_end TEXT NOT NULL,
+                    coverage_id TEXT NOT NULL REFERENCES science_data_coverage(coverage_id),
+                    observation_fingerprint TEXT NOT NULL, feature_versions_json TEXT NOT NULL,
+                    symbols_json TEXT NOT NULL, code_sha TEXT NOT NULL, config_sha TEXT NOT NULL,
+                    payload_json TEXT NOT NULL, created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS science_acquisition_control (
+                    control_id INTEGER PRIMARY KEY CHECK(control_id=1), cancel_requested INTEGER NOT NULL,
+                    reason TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_science_hypothesis_state ON science_hypotheses(state, registered_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_science_experiment_hypothesis ON science_experiments(hypothesis_id, hypothesis_version, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_science_prediction_experiment ON science_forward_predictions(experiment_id, predicted_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_science_decision_time ON science_decisions(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_science_observation_time ON science_observations(normalized_at, observation_id);
                 CREATE INDEX IF NOT EXISTS idx_science_observation_symbol ON science_observations(symbol, normalized_at);
+                CREATE INDEX IF NOT EXISTS idx_science_observation_source_time ON science_observations(source, kind, normalized_at, observation_id);
                 CREATE INDEX IF NOT EXISTS idx_science_feature_observation ON science_feature_values(observation_id, feature_id, feature_version);
                 CREATE INDEX IF NOT EXISTS idx_science_outcome_horizon ON science_outcome_labels(horizon_seconds, resolved_at);
                 CREATE INDEX IF NOT EXISTS idx_science_work_claim ON science_work_queue(state, available_at, priority DESC, created_at);
                 CREATE INDEX IF NOT EXISTS idx_science_work_lease ON science_work_queue(state, lease_expires_at);
+                CREATE INDEX IF NOT EXISTS idx_science_acquisition_state ON science_acquisition_manifest(state, expected_start);
+                CREATE INDEX IF NOT EXISTS idx_science_coverage_interval ON science_data_coverage(interval_start, interval_end, computed_at DESC);
                 CREATE TRIGGER IF NOT EXISTS science_features_immutable BEFORE UPDATE OF definition_json, definition_hash ON science_features
                     BEGIN SELECT RAISE(ABORT, 'scientific feature definition is immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS science_hypotheses_immutable BEFORE UPDATE OF definition_json, config_hash ON science_hypotheses
@@ -261,6 +298,8 @@ class ScientificRepository:
                     BEGIN SELECT RAISE(ABORT, 'outcome labels are immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS science_search_families_immutable BEFORE UPDATE ON science_search_families
                     BEGIN SELECT RAISE(ABORT, 'search-family definitions are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS science_corpus_snapshots_immutable BEFORE UPDATE ON science_corpus_snapshots
+                    BEGIN SELECT RAISE(ABORT, 'research corpus snapshot is immutable'); END;
                     """
                 )
             self._initialized = True
@@ -450,6 +489,53 @@ class ScientificRepository:
                 "config_hash": config_hash, "quality_flags": dict(quality_flags), "payload": body,
                 "payload_hash": digest, "persisted_at": persisted_at}
 
+    def record_observations_batch(self, records: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        """Append a bounded set of normalized observations in one transaction.
+
+        This is a transport optimization for D.7 archive parsing only.  Each
+        item is checked against the same immutable identity and source-event
+        constraints as ``record_observation``; no scientific semantics are
+        skipped and the returned rows retain per-item insertion truth.
+        """
+        if not records:
+            return []
+        self.initialize()
+        result: list[dict[str, Any]] = []
+        with self._connect() as connection:
+            for record in records:
+                observation_id = str(record["observation_id"])
+                body, digest = dict(record["payload"]), canonical_hash(record["payload"])
+                existing = connection.execute("SELECT * FROM science_observations WHERE observation_id=?", (observation_id,)).fetchone()
+                if existing:
+                    if existing["payload_hash"] != digest or existing["raw_fingerprint"] != record["raw_fingerprint"]:
+                        raise ValueError("Observation identity has conflicting immutable evidence.")
+                    result.append({**self._observation_payload(existing), "inserted": False})
+                    continue
+                try:
+                    connection.execute("""INSERT INTO science_observations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
+                        observation_id, record["kind"], record["source"], record["source_event_id"],
+                        str(record["wallet"]).lower() if record.get("wallet") else None, record.get("symbol"),
+                        record["event_at"], record["received_at"], record["normalized_at"], record["network"],
+                        record["raw_fingerprint"], int(record["schema_version"]), record["code_sha"], record["config_hash"],
+                        _dump(dict(record["quality_flags"])), _dump(body), digest, record["persisted_at"],
+                    ))
+                except sqlite3.IntegrityError as exc:
+                    prior = connection.execute("SELECT * FROM science_observations WHERE source=? AND source_event_id=?", (record["source"], record["source_event_id"])).fetchone()
+                    if prior and prior["payload_hash"] == digest:
+                        result.append({**self._observation_payload(prior), "inserted": False})
+                        continue
+                    raise ValueError("Source event identity has conflicting immutable evidence.") from exc
+                result.append({
+                    "observation_id": observation_id, "kind": record["kind"], "source": record["source"],
+                    "source_event_id": record["source_event_id"], "wallet": str(record["wallet"]).lower() if record.get("wallet") else None,
+                    "symbol": record.get("symbol"), "event_at": record["event_at"], "received_at": record["received_at"],
+                    "normalized_at": record["normalized_at"], "network": record["network"], "raw_fingerprint": record["raw_fingerprint"],
+                    "schema_version": record["schema_version"], "code_sha": record["code_sha"], "config_hash": record["config_hash"],
+                    "quality_flags": dict(record["quality_flags"]), "payload": body, "payload_hash": digest,
+                    "persisted_at": record["persisted_at"], "inserted": True,
+                })
+        return result
+
     def list_observations(self, *, after: tuple[str, str] | None = None, limit: int = 500, kinds: tuple[str, ...] = ()) -> list[dict[str, Any]]:
         query: str = "SELECT * FROM science_observations"
         values: list[Any] = []
@@ -465,6 +551,102 @@ class ScientificRepository:
         query += " ORDER BY normalized_at, observation_id LIMIT ?"
         values.append(max(1, min(limit, 5_000)))
         return self._rows(query, self._observation_payload, values)
+
+    def recent_observations_excluding_source(self, *, source: str, limit: int = 1_000) -> list[dict[str, Any]]:
+        """Return recent non-archive observations for live forward scheduling."""
+        query = "SELECT * FROM science_observations WHERE source<>? ORDER BY normalized_at DESC, observation_id DESC LIMIT ?"
+        rows = self._rows(query, self._observation_payload, [source, max(1, min(limit, 5_000))])
+        return list(reversed(rows))
+
+    def observation_by_id(self, observation_id: str) -> dict[str, Any] | None:
+        self.initialize()
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM science_observations WHERE observation_id=?", (observation_id,)).fetchone()
+        return self._observation_payload(row) if row else None
+
+    def observations_by_ids(self, observation_ids: tuple[str, ...]) -> list[dict[str, Any]]:
+        if not observation_ids:
+            return []
+        result: list[dict[str, Any]] = []
+        for offset in range(0, len(observation_ids), 500):
+            part = observation_ids[offset:offset + 500]
+            result.extend(self._rows("SELECT * FROM science_observations WHERE observation_id IN (" + ",".join("?" for _ in part) + ")", self._observation_payload, list(part)))
+        return sorted(result, key=lambda item: (str(item["normalized_at"]), str(item["observation_id"])))
+
+    def select_observations_evenly(
+        self, *, source: str, kind: str, start: str, end: str, maximum: int,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        """Read a deterministic time-stratified sample without scanning an archive.
+
+        Each stratum uses the source/time index to select its earliest unseen
+        observation.  This gives a bounded research corpus broad chronological
+        coverage even when one official hour contains hundreds of thousands of
+        fills, while retaining every raw record separately.
+        """
+        self.initialize()
+        with self._connect() as connection:
+            total = int(connection.execute("SELECT COUNT(*) FROM science_observations WHERE source=? AND kind=? AND normalized_at>=? AND normalized_at<?", (source, kind, start, end)).fetchone()[0])
+            if total == 0:
+                return 0, []
+            count = min(maximum, total)
+            begin = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            finish = datetime.fromisoformat(end.replace("Z", "+00:00"))
+            span_seconds = (finish - begin).total_seconds()
+            selected: list[sqlite3.Row] = []
+            selected_ids: set[str] = set()
+            for index in range(count):
+                threshold = begin + timedelta(seconds=(span_seconds * index / count))
+                threshold_text = threshold.isoformat().replace("+00:00", "Z")
+                values: list[Any] = [source, kind, threshold_text, end]
+                row = connection.execute("""SELECT * FROM science_observations
+                    WHERE source=? AND kind=? AND normalized_at>=? AND normalized_at<?
+                    ORDER BY normalized_at, observation_id LIMIT 1""", values).fetchone()
+                if row is not None and str(row["observation_id"]) not in selected_ids:
+                    selected.append(row)
+                    selected_ids.add(str(row["observation_id"]))
+            # A sparse source can produce duplicate strata.  Complete those
+            # few positions with a chronological scan; dense source hours use
+            # only the indexed queries above.
+            if len(selected) < count:
+                remaining = connection.execute("""SELECT * FROM science_observations
+                    WHERE source=? AND kind=? AND normalized_at>=? AND normalized_at<?
+                    ORDER BY normalized_at, observation_id""", (source, kind, start, end)).fetchall()
+                for row in remaining:
+                    if str(row["observation_id"]) in selected_ids:
+                        continue
+                    selected.append(row)
+                    selected_ids.add(str(row["observation_id"]))
+                    if len(selected) == count:
+                        break
+        return total, [self._observation_payload(row) for row in selected]
+
+    def observations_before(self, *, symbol: str | None, end: str, lookback_seconds: int, limit: int = 5_000,
+                            source: str | None = None, kinds: tuple[str, ...] = ()) -> list[dict[str, Any]]:
+        start = datetime.fromisoformat(end.replace("Z", "+00:00")).timestamp() - max(1, lookback_seconds)
+        start_text = datetime.fromtimestamp(start, timezone.utc).isoformat().replace("+00:00", "Z")
+        clauses, values = ["normalized_at>=?", "normalized_at<=?"], [start_text, end]
+        if symbol:
+            clauses.append("symbol=?"); values.append(symbol)
+        if source:
+            clauses.append("source=?"); values.append(source)
+        if kinds:
+            clauses.append("kind IN (" + ",".join("?" for _ in kinds) + ")"); values.extend(kinds)
+        query = "SELECT * FROM science_observations WHERE " + " AND ".join(clauses) + " ORDER BY normalized_at DESC, observation_id DESC LIMIT ?"
+        values.append(max(1, min(limit, 5_000)))
+        return list(reversed(self._rows(query, self._observation_payload, values)))
+
+    def first_market_price_at_or_after(self, *, symbol: str | None, at: str,
+                                       source: str | None = None) -> dict[str, Any] | None:
+        clauses, values = ["kind='MARKET_PRICE'", "normalized_at>=?"], [at]
+        if symbol:
+            clauses.append("symbol=?"); values.append(symbol)
+        if source:
+            clauses.append("source=?"); values.append(source)
+        query = "SELECT * FROM science_observations WHERE " + " AND ".join(clauses) + " ORDER BY normalized_at, observation_id LIMIT 1"
+        self.initialize()
+        with self._connect() as connection:
+            row = connection.execute(query, values).fetchone()
+        return self._observation_payload(row) if row else None
 
     def record_feature_value(self, feature_value_id: str, *, feature_id: str, feature_version: int, observation_id: str,
                              value: Any, missing: bool, source_observation_ids: tuple[str, ...], data_fingerprint: str,
@@ -571,6 +753,28 @@ class ScientificRepository:
                 "available_at": available_at, "attempt_count": 0, "max_attempts": max_attempts,
                 "input_fingerprint": input_fingerprint}
 
+    def enqueue_work_batch(self, records: list[Mapping[str, Any]]) -> None:
+        """Durably enqueue bounded independent work with the normal unique key."""
+        if not records:
+            return
+        self.initialize()
+        with self._connect() as connection:
+            for record in records:
+                if int(record["max_attempts"]) <= 0:
+                    raise ValueError("Work max_attempts must be positive.")
+                try:
+                    connection.execute("""INSERT INTO science_work_queue(work_id, work_type, subject_type, subject_id, subject_version, state, priority, created_at, available_at, attempt_count, max_attempts, input_fingerprint)
+                        VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, 0, ?, ?)""", (
+                        record["work_id"], record["work_type"], record["subject_type"], record["subject_id"], int(record["subject_version"]),
+                        int(record["priority"]), record["created_at"], record["available_at"], int(record["max_attempts"]), record["input_fingerprint"],
+                    ))
+                except sqlite3.IntegrityError:
+                    prior = connection.execute("SELECT 1 FROM science_work_queue WHERE work_type=? AND subject_type=? AND subject_id=? AND subject_version=? AND input_fingerprint=?", (
+                        record["work_type"], record["subject_type"], record["subject_id"], int(record["subject_version"]), record["input_fingerprint"],
+                    )).fetchone()
+                    if prior is None:
+                        raise
+
     def supersede_available_work(self, *, work_type: str, subject_type: str, subject_id: str,
                                  subject_version: int, keep_fingerprint: str) -> int:
         """Retire stale, not-yet-leased semantic work when newer evidence arrives.
@@ -588,6 +792,75 @@ class ScientificRepository:
                   AND state IN ('PENDING', 'RETRYABLE') AND input_fingerprint<>?""", (
                 work_type, subject_type, subject_id, subject_version, keep_fingerprint,
             ))
+        return int(cursor.rowcount)
+
+    def supersede_pending_observation_work_except(
+        self, *, work_types: tuple[str, ...], scope_observation_ids: tuple[str, ...], observation_ids: tuple[str, ...], reason: str,
+    ) -> int:
+        """Retire only unleased projection work outside a selected D.7 corpus.
+
+        The raw observations remain immutable.  This records the operational
+        corpus-selection decision instead of deleting evidence or allowing an
+        archive-sized queue to crowd out current observation processing.
+        """
+        if not work_types or not scope_observation_ids:
+            return 0
+        self.initialize()
+        type_marks = ",".join("?" for _ in work_types)
+        clauses = [f"work_type IN ({type_marks})", "subject_type='observation'", "state IN ('PENDING', 'RETRYABLE')",
+                   "subject_id IN (" + ",".join("?" for _ in scope_observation_ids) + ")"]
+        values: list[Any] = [*work_types, *scope_observation_ids]
+        if observation_ids:
+            clauses.append("subject_id NOT IN (" + ",".join("?" for _ in observation_ids) + ")")
+            values.extend(observation_ids)
+        with self._connect() as connection:
+            cursor = connection.execute("UPDATE science_work_queue SET state='SUPERSEDED', completed_at=COALESCE(completed_at, available_at), result_reference=? WHERE " + " AND ".join(clauses), [reason[:500], *values])
+        return int(cursor.rowcount)
+
+    def supersede_pending_source_observation_work_except(
+        self, *, work_types: tuple[str, ...], source: str, start: str, end: str, observation_ids: tuple[str, ...], reason: str,
+    ) -> int:
+        """Retire unleased projection work for one persisted source interval."""
+        if not work_types:
+            return 0
+        self.initialize()
+        type_marks = ",".join("?" for _ in work_types)
+        selected_clause, selected_values = "", []
+        if observation_ids:
+            selected_clause = " AND subject_id NOT IN (" + ",".join("?" for _ in observation_ids) + ")"
+            selected_values = list(observation_ids)
+        query = f"""UPDATE science_work_queue SET state='SUPERSEDED', completed_at=COALESCE(completed_at, available_at), result_reference=?
+            WHERE work_type IN ({type_marks}) AND subject_type='observation' AND state IN ('PENDING', 'RETRYABLE')
+              AND EXISTS (SELECT 1 FROM science_observations AS observation
+                          WHERE observation.observation_id=science_work_queue.subject_id
+                            AND observation.source=? AND observation.normalized_at>=? AND observation.normalized_at<?){selected_clause}"""
+        with self._connect() as connection:
+            cursor = connection.execute(query, [reason[:500], *work_types, source, start, end, *selected_values])
+        return int(cursor.rowcount)
+
+    def supersede_pending_historical_observation_work_except(
+        self, *, work_types: tuple[str, ...], source: str, observation_ids: tuple[str, ...], reason: str,
+    ) -> int:
+        """Keep projection work only for the current bounded historical corpus.
+
+        Archive records remain immutable.  This is deliberately wider than an
+        hour boundary because official hourly files can contain events a few
+        milliseconds either side of that boundary; those retained records are
+        not part of the declared research interval and must not create a
+        second, unbounded D.6 workload.
+        """
+        if not work_types:
+            return 0
+        self.initialize()
+        type_marks = ",".join("?" for _ in work_types)
+        selected_clause = " AND subject_id NOT IN (" + ",".join("?" for _ in observation_ids) + ")" if observation_ids else ""
+        query = f"""UPDATE science_work_queue SET state='SUPERSEDED', completed_at=COALESCE(completed_at, available_at), result_reference=?
+            WHERE work_type IN ({type_marks}) AND subject_type='observation' AND state IN ('PENDING', 'RETRYABLE')
+              AND EXISTS (SELECT 1 FROM science_observations AS observation
+                          WHERE observation.observation_id=science_work_queue.subject_id
+                            AND observation.source=?){selected_clause}"""
+        with self._connect() as connection:
+            cursor = connection.execute(query, [reason[:500], *work_types, source, *observation_ids])
         return int(cursor.rowcount)
 
     def claim_work(self, *, worker_id: str, now: str, lease_expires_at: str) -> dict[str, Any] | None:
@@ -810,6 +1083,200 @@ class ScientificRepository:
     def list_decisions(self, *, limit: int = 100) -> list[dict[str, Any]]:
         return self._rows("SELECT * FROM science_decisions ORDER BY created_at DESC LIMIT ?", lambda row: {"decision_id": row["decision_id"], "created_at": row["created_at"], "symbol": row["symbol"], "decision": row["decision"], "payload": _load(row["payload_json"], {})}, [max(1, min(limit, 500))])
 
+    # ----- D.7 source manifest, coverage, and corpus authority ---------------------
+    _ACQUISITION_STATES = frozenset({
+        "PLANNED", "AVAILABLE", "DOWNLOADING", "VERIFIED", "PARSED", "INGESTED",
+        "MISSING_SOURCE", "FAILED", "SUPERSEDED",
+    })
+
+    def record_acquisition_hour(
+        self, *, expected_start: str, expected_end: str, source_name: str, state: str, updated_at: str,
+        source_identifier: str | None = None, local_path: str | None = None, expected_bytes: int | None = None,
+        downloaded_bytes: int | None = None, object_checksum: str | None = None, local_sha256: str | None = None,
+        acquired_at: str | None = None, parser_version: str | None = None, schema_version: int | None = None,
+        observation_count: int | None = None, duplicate_count: int | None = None, malformed_count: int | None = None,
+        first_event_at: str | None = None, last_event_at: str | None = None, failure_reason: str | None = None,
+        increment_retry: bool = False,
+    ) -> dict[str, Any]:
+        """Persist one D.7 source-hour state without erasing prior provenance.
+
+        A successful historical hour may never be downgraded back to PLANNED by
+        a restart.  Retrying a failed hour retains the reason and increments an
+        auditable retry counter instead of concealing the earlier failure.
+        """
+        if state not in self._ACQUISITION_STATES:
+            raise ValueError(f"Unsupported acquisition manifest state: {state}")
+        if not expected_start or not expected_end or expected_end <= expected_start:
+            raise ValueError("Acquisition manifest requires an ordered UTC source-hour interval.")
+        self.initialize()
+        with self._connect() as connection:
+            existing = connection.execute("SELECT * FROM science_acquisition_manifest WHERE expected_start=?", (expected_start,)).fetchone()
+            if existing is not None:
+                if existing["expected_end"] != expected_end or existing["source_name"] != source_name:
+                    raise ValueError("Acquisition source-hour identity has conflicting immutable provenance.")
+                if existing["state"] == "INGESTED" and state not in {"INGESTED", "SUPERSEDED"}:
+                    return self._acquisition_payload(existing)
+                for column, value in (("source_identifier", source_identifier), ("object_checksum", object_checksum), ("local_sha256", local_sha256)):
+                    if value is not None and existing[column] not in (None, value):
+                        raise ValueError(f"Acquisition manifest {column} conflicts with immutable provenance.")
+                connection.execute("""UPDATE science_acquisition_manifest SET
+                    state=?, source_identifier=COALESCE(?, source_identifier), local_path=COALESCE(?, local_path),
+                    expected_bytes=COALESCE(?, expected_bytes), downloaded_bytes=COALESCE(?, downloaded_bytes),
+                    object_checksum=COALESCE(?, object_checksum), local_sha256=COALESCE(?, local_sha256),
+                    acquired_at=COALESCE(?, acquired_at), parser_version=COALESCE(?, parser_version),
+                    schema_version=COALESCE(?, schema_version), observation_count=COALESCE(?, observation_count),
+                    duplicate_count=COALESCE(?, duplicate_count), malformed_count=COALESCE(?, malformed_count),
+                    first_event_at=COALESCE(?, first_event_at), last_event_at=COALESCE(?, last_event_at),
+                    failure_reason=COALESCE(?, failure_reason), retry_count=retry_count+?, updated_at=? WHERE expected_start=?""", (
+                    state, source_identifier, local_path, expected_bytes, downloaded_bytes, object_checksum, local_sha256,
+                    acquired_at, parser_version, schema_version, observation_count, duplicate_count, malformed_count,
+                    first_event_at, last_event_at, failure_reason, int(increment_retry), updated_at, expected_start,
+                ))
+            else:
+                connection.execute("""INSERT INTO science_acquisition_manifest(
+                    expected_start, expected_end, source_name, state, source_identifier, local_path, expected_bytes,
+                    downloaded_bytes, object_checksum, local_sha256, acquired_at, parser_version, schema_version,
+                    observation_count, duplicate_count, malformed_count, first_event_at, last_event_at, failure_reason,
+                    retry_count, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
+                    expected_start, expected_end, source_name, state, source_identifier, local_path, expected_bytes,
+                    downloaded_bytes, object_checksum, local_sha256, acquired_at, parser_version, schema_version,
+                    observation_count or 0, duplicate_count or 0, malformed_count or 0, first_event_at, last_event_at,
+                    failure_reason, int(increment_retry), updated_at,
+                ))
+            row = connection.execute("SELECT * FROM science_acquisition_manifest WHERE expected_start=?", (expected_start,)).fetchone()
+        assert row is not None
+        return self._acquisition_payload(row)
+
+    def list_acquisition_manifest(self, *, start: str | None = None, end: str | None = None) -> list[dict[str, Any]]:
+        query, values = "SELECT * FROM science_acquisition_manifest", []
+        clauses: list[str] = []
+        if start:
+            clauses.append("expected_start>=?"); values.append(start)
+        if end:
+            clauses.append("expected_start<?"); values.append(end)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY expected_start"
+        return self._rows(query, self._acquisition_payload, values)
+
+    def acquisition_hour(self, expected_start: str) -> dict[str, Any] | None:
+        self.initialize()
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM science_acquisition_manifest WHERE expected_start=?", (expected_start,)).fetchone()
+        return self._acquisition_payload(row) if row else None
+
+    def record_coverage(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Store a reproducible data-quality calculation for one source range."""
+        required = {"coverage_id", "interval_start", "interval_end", "source_name", "state", "coverage_fraction",
+                    "expected_hours", "verified_hours", "missing_hours", "malformed_hours", "parsed_hours",
+                    "observation_count", "duplicate_count", "timestamp_anomalies", "wallet_attribution_quality",
+                    "market_evidence_availability", "computed_at"}
+        missing = sorted(required - set(payload))
+        if missing:
+            raise ValueError("Coverage payload missing fields: " + ", ".join(missing))
+        self.initialize()
+        with self._connect() as connection:
+            connection.execute("""INSERT INTO science_data_coverage VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(interval_start, interval_end, source_name) DO UPDATE SET
+                    coverage_id=excluded.coverage_id, state=excluded.state, coverage_fraction=excluded.coverage_fraction,
+                    expected_hours=excluded.expected_hours, verified_hours=excluded.verified_hours, missing_hours=excluded.missing_hours,
+                    malformed_hours=excluded.malformed_hours, parsed_hours=excluded.parsed_hours,
+                    observation_count=excluded.observation_count, duplicate_count=excluded.duplicate_count,
+                    timestamp_anomalies=excluded.timestamp_anomalies, first_event_at=excluded.first_event_at,
+                    last_event_at=excluded.last_event_at, wallet_attribution_quality=excluded.wallet_attribution_quality,
+                    market_evidence_availability=excluded.market_evidence_availability, details_json=excluded.details_json,
+                    computed_at=excluded.computed_at""", (
+                payload["coverage_id"], payload["interval_start"], payload["interval_end"], payload["source_name"],
+                payload["state"], float(payload["coverage_fraction"]), int(payload["expected_hours"]),
+                int(payload["verified_hours"]), int(payload["missing_hours"]), int(payload["malformed_hours"]),
+                int(payload["parsed_hours"]), int(payload["observation_count"]), int(payload["duplicate_count"]),
+                int(payload["timestamp_anomalies"]), payload.get("first_event_at"), payload.get("last_event_at"),
+                payload["wallet_attribution_quality"], payload["market_evidence_availability"],
+                _dump(dict(payload.get("details", {}))), payload["computed_at"],
+            ))
+            row = connection.execute("SELECT * FROM science_data_coverage WHERE interval_start=? AND interval_end=? AND source_name=?", (
+                payload["interval_start"], payload["interval_end"], payload["source_name"],
+            )).fetchone()
+        assert row is not None
+        return self._coverage_payload(row)
+
+    def latest_coverage(self, *, start: str | None = None, end: str | None = None) -> dict[str, Any] | None:
+        query, values = "SELECT * FROM science_data_coverage", []
+        if start and end:
+            query += " WHERE interval_start=? AND interval_end=?"; values = [start, end]
+        query += " ORDER BY computed_at DESC LIMIT 1"
+        self.initialize()
+        with self._connect() as connection:
+            row = connection.execute(query, values).fetchone()
+        return self._coverage_payload(row) if row else None
+
+    def record_corpus_snapshot(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        required = {"corpus_fingerprint", "interval_start", "interval_end", "coverage_id", "observation_fingerprint",
+                    "feature_versions", "symbols", "code_sha", "config_sha", "created_at"}
+        absent = sorted(required - set(payload))
+        if absent:
+            raise ValueError("Corpus snapshot missing fields: " + ", ".join(absent))
+        self.initialize()
+        body = dict(payload)
+        with self._connect() as connection:
+            existing = connection.execute("SELECT * FROM science_corpus_snapshots WHERE corpus_fingerprint=?", (payload["corpus_fingerprint"],)).fetchone()
+            if existing:
+                if _load(existing["payload_json"], {}) != body:
+                    raise ValueError("Corpus fingerprint conflicts with immutable snapshot evidence.")
+                return self._corpus_payload(existing)
+            connection.execute("""INSERT INTO science_corpus_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )""", (
+                payload["corpus_fingerprint"], payload["interval_start"], payload["interval_end"], payload["coverage_id"],
+                payload["observation_fingerprint"], _dump(list(payload["feature_versions"])), _dump(list(payload["symbols"])),
+                payload["code_sha"], payload["config_sha"], _dump(body), payload["created_at"],
+            ))
+            row = connection.execute("SELECT * FROM science_corpus_snapshots WHERE corpus_fingerprint=?", (payload["corpus_fingerprint"],)).fetchone()
+        assert row is not None
+        return self._corpus_payload(row)
+
+    def latest_corpus_snapshot(self) -> dict[str, Any] | None:
+        self.initialize()
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM science_corpus_snapshots ORDER BY created_at DESC LIMIT 1").fetchone()
+        return self._corpus_payload(row) if row else None
+
+    def set_acquisition_cancelled(self, cancelled: bool, *, reason: str, updated_at: str) -> None:
+        self.initialize()
+        with self._connect() as connection:
+            connection.execute("""INSERT INTO science_acquisition_control VALUES (1, ?, ?, ?) ON CONFLICT(control_id) DO UPDATE SET
+                cancel_requested=excluded.cancel_requested, reason=excluded.reason, updated_at=excluded.updated_at""",
+                (int(cancelled), reason, updated_at))
+
+    def acquisition_control(self) -> dict[str, Any]:
+        self.initialize()
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM science_acquisition_control WHERE control_id=1").fetchone()
+        return {"cancel_requested": bool(row["cancel_requested"]) if row else False,
+                "reason": row["reason"] if row else "", "updated_at": row["updated_at"] if row else None}
+
+    def latest_observation(self, *, kind: str) -> dict[str, Any] | None:
+        self.initialize()
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM science_observations WHERE kind=? ORDER BY received_at DESC, observation_id DESC LIMIT 1", (kind,)).fetchone()
+        return self._observation_payload(row) if row else None
+
+    def observation_exists(self, *, source: str, source_event_id: str) -> bool:
+        self.initialize()
+        with self._connect() as connection:
+            row = connection.execute("SELECT 1 FROM science_observations WHERE source=? AND source_event_id=?", (source, source_event_id)).fetchone()
+        return row is not None
+
+    def observation_for_source_event(self, *, source: str, source_event_id: str) -> dict[str, Any] | None:
+        self.initialize()
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM science_observations WHERE source=? AND source_event_id=?", (source, source_event_id)).fetchone()
+        return self._observation_payload(row) if row else None
+
+    def observation_counts(self) -> dict[str, int]:
+        self.initialize()
+        with self._connect() as connection:
+            rows = connection.execute("SELECT kind, COUNT(*) AS count FROM science_observations GROUP BY kind").fetchall()
+        return {str(row["kind"]): int(row["count"]) for row in rows}
+
     def health(self) -> dict[str, Any]:
         self.initialize()
         with self._connect() as connection:
@@ -831,6 +1298,36 @@ class ScientificRepository:
                 "code_sha": row["code_sha"], "config_hash": row["config_hash"],
                 "quality_flags": _load(row["quality_flags_json"], {}), "payload": _load(row["payload_json"], {}),
                 "payload_hash": row["payload_hash"], "persisted_at": row["persisted_at"]}
+
+    @staticmethod
+    def _acquisition_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {name: row[name] for name in row.keys()}
+
+    @staticmethod
+    def _coverage_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "coverage_id": row["coverage_id"], "interval_start": row["interval_start"], "interval_end": row["interval_end"],
+            "source_name": row["source_name"], "state": row["state"], "coverage_fraction": row["coverage_fraction"],
+            "expected_hours": row["expected_hours"], "verified_hours": row["verified_hours"],
+            "missing_hours": row["missing_hours"], "malformed_hours": row["malformed_hours"],
+            "parsed_hours": row["parsed_hours"], "observation_count": row["observation_count"],
+            "duplicate_count": row["duplicate_count"], "timestamp_anomalies": row["timestamp_anomalies"],
+            "first_event_at": row["first_event_at"], "last_event_at": row["last_event_at"],
+            "wallet_attribution_quality": row["wallet_attribution_quality"],
+            "market_evidence_availability": row["market_evidence_availability"],
+            "details": _load(row["details_json"], {}), "computed_at": row["computed_at"],
+        }
+
+    @staticmethod
+    def _corpus_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "corpus_fingerprint": row["corpus_fingerprint"], "interval_start": row["interval_start"],
+            "interval_end": row["interval_end"], "coverage_id": row["coverage_id"],
+            "observation_fingerprint": row["observation_fingerprint"],
+            "feature_versions": _load(row["feature_versions_json"], []), "symbols": _load(row["symbols_json"], []),
+            "code_sha": row["code_sha"], "config_sha": row["config_sha"],
+            "payload": _load(row["payload_json"], {}), "created_at": row["created_at"],
+        }
 
     @staticmethod
     def _feature_value_payload(row: sqlite3.Row) -> dict[str, Any]:

@@ -315,6 +315,31 @@ class ScientificWorkerConfig:
 
 
 @dataclass(frozen=True)
+class CommissioningConfig:
+    """Bounded D.7 public-evidence acquisition and observation settings.
+
+    ``enabled`` is deliberately off in the library default so the frozen D.0-
+    D.6 fixtures retain their original semantics.  The production YAML turns
+    it on, which makes historical research fail closed until a proven corpus
+    snapshot exists.  These settings do not grant execution authority.
+    """
+
+    enabled: bool = False
+    historical_start: str = "2026-08-01T00:00:00Z"
+    historical_end: str = "2026-08-08T00:00:00Z"
+    max_download_bytes: int = 1_073_741_824
+    max_hours_per_run: int = 168
+    max_concurrency: int = 1
+    max_corpus_observations: int = 256
+    min_coverage_fraction: float = 1.0
+    max_live_receive_lag_seconds: float = 120.0
+    observer_reconnect_initial_seconds: float = 1.0
+    observer_reconnect_max_seconds: float = 30.0
+    observation_wallets: tuple[str, ...] = ()
+    archive_verified_sources: bool = True
+
+
+@dataclass(frozen=True)
 class CopyTradeConfig:
     mode: str = "paper"
     live_enabled: bool = False
@@ -334,6 +359,7 @@ class CopyTradeConfig:
     storage: StorageConfig = field(default_factory=StorageConfig)
     scientific_execution: ScientificExecutionConfig = field(default_factory=ScientificExecutionConfig)
     scientific_worker: ScientificWorkerConfig = field(default_factory=ScientificWorkerConfig)
+    commissioning: CommissioningConfig = field(default_factory=CommissioningConfig)
     artifacts: ArtifactConfig = field(default_factory=ArtifactConfig)
     targets: tuple[dict[str, Any], ...] = ()
     config_path: Path = Path("config/copytrade.yaml")
@@ -367,6 +393,7 @@ class CopyTradeConfig:
         storage = _section(document, "storage")
         scientific_execution = _section(document, "scientific_execution")
         scientific_worker = _section(document, "scientific_worker")
+        commissioning = _section(document, "commissioning")
         artifacts = _section(document, "artifacts")
         database = _section(document, "database")
         obsidian = _section(document, "obsidian")
@@ -442,6 +469,9 @@ class CopyTradeConfig:
             scientific_execution=ScientificExecutionConfig(**scientific_execution),
             scientific_worker=ScientificWorkerConfig(
                 **{**scientific_worker, "horizons_seconds": tuple(scientific_worker.get("horizons_seconds", ScientificWorkerConfig().horizons_seconds))}
+            ),
+            commissioning=CommissioningConfig(
+                **{**commissioning, "observation_wallets": tuple(commissioning.get("observation_wallets", ())) }
             ),
             artifacts=ArtifactConfig(
                 **{
@@ -548,6 +578,24 @@ class CopyTradeConfig:
             raise ValueError("scientific worker statistical and edge gates are invalid.")
         if worker.minimum_hot_free_bytes <= 0 or not worker.horizons_seconds or any(not 0 < horizon <= 600 for horizon in worker.horizons_seconds):
             raise ValueError("scientific worker storage and horizon bounds are invalid.")
+        commissioning = self.commissioning
+        if (commissioning.max_download_bytes <= 0 or commissioning.max_hours_per_run <= 0 or commissioning.max_concurrency <= 0
+                or commissioning.max_corpus_observations <= 0):
+            raise ValueError("commissioning download, hour, concurrency, and corpus bounds must be positive.")
+        if commissioning.max_corpus_observations > 5_000:
+            raise ValueError("commissioning.max_corpus_observations must not exceed the bounded D.6 hot corpus limit of 5000.")
+        if commissioning.max_concurrency > 4:
+            raise ValueError("commissioning.max_concurrency must be between 1 and 4.")
+        if not 0 < commissioning.min_coverage_fraction <= 1:
+            raise ValueError("commissioning.min_coverage_fraction must be in (0, 1].")
+        if (commissioning.max_live_receive_lag_seconds <= 0 or commissioning.observer_reconnect_initial_seconds <= 0
+                or commissioning.observer_reconnect_max_seconds < commissioning.observer_reconnect_initial_seconds):
+            raise ValueError("commissioning live-observation timing bounds are invalid.")
+        for wallet in commissioning.observation_wallets:
+            normalized = str(wallet).lower()
+            if not (normalized.startswith("0x") and len(normalized) == 42
+                    and all(character in "0123456789abcdef" for character in normalized[2:])):
+                raise ValueError("commissioning.observation_wallets must contain public 0x-prefixed 20-byte wallet addresses.")
         if not 0 <= self.analysis.high_suitability_score <= 100:
             raise ValueError("analysis.high_suitability_score must be in [0, 100].")
         if self.analysis.market_evidence_bucket_seconds <= 0:

@@ -124,27 +124,53 @@ class ScientificWorker:
         Source time and receipt time remain separate. Impossible future source
         time is rejected before it can contaminate a feature or outcome.
         """
+        return self.ingest_observations(({
+            "kind": kind, "source": source, "source_event_id": source_event_id, "payload": payload,
+            "event_at": event_at, "received_at": received_at, "wallet": wallet, "symbol": symbol,
+            "network": network, "quality_flags": quality_flags,
+        },))[0]
+
+    def ingest_observations(self, observations: tuple[Mapping[str, Any], ...] | list[Mapping[str, Any]], *, schedule_features: bool = True) -> list[dict[str, Any]]:
+        """Append a bounded batch through the same D.6 observation bridge.
+
+        Archive parsers may call this to avoid one SQLite transaction per raw
+        event.  It keeps the immutable observation identity and queues exactly
+        the same feature materialization work as ``ingest_observation``.
+        """
         now = _utc_now()
-        event_time = _time(event_at)
-        receive_time = _time(received_at or now)
-        if event_time > receive_time + timedelta(minutes=5):
-            raise ValueError("Future observation timestamp exceeds the scientific tolerance.")
-        if not kind or not source or not source_event_id:
-            raise ValueError("Observation kind, source, and source_event_id are required.")
-        body = dict(payload)
-        raw_fingerprint = canonical_hash(body)
-        normalized_at = _iso(event_time)
-        observation_id = f"obs-{canonical_hash({'source': source, 'source_event_id': source_event_id, 'payload': raw_fingerprint})[:28]}"
-        observation = self.repository.record_observation(
-            observation_id, kind=kind, source=source, source_event_id=source_event_id, wallet=wallet,
-            symbol=symbol or str(body.get("symbol") or "") or None, event_at=_iso(event_time), received_at=_iso(receive_time),
-            normalized_at=normalized_at, network=network, raw_fingerprint=raw_fingerprint, schema_version=1,
-            code_sha=self._code_sha, config_hash=self._config_hash, quality_flags=dict(quality_flags or {}),
-            payload=body, persisted_at=_iso(now),
-        )
-        self._enqueue(WorkerStage.FEATURE_MATERIALIZATION, "observation", observation_id, 1, raw_fingerprint)
-        self.repository.set_stage_health(WorkerStage.OBSERVATION_INGEST.value, "ACTIVE", detail={"observation_id": observation_id, "kind": kind}, updated_at=_iso(now))
-        return observation
+        prepared: list[dict[str, Any]] = []
+        for item in observations:
+            kind, source, source_event_id = str(item.get("kind") or ""), str(item.get("source") or ""), str(item.get("source_event_id") or "")
+            if not kind or not source or not source_event_id:
+                raise ValueError("Observation kind, source, and source_event_id are required.")
+            event_time = _time(item["event_at"])
+            receive_time = _time(item.get("received_at") or now)
+            if event_time > receive_time + timedelta(minutes=5):
+                raise ValueError("Future observation timestamp exceeds the scientific tolerance.")
+            body = dict(item.get("payload") or {})
+            raw_fingerprint = canonical_hash(body)
+            prepared.append({
+                "observation_id": f"obs-{canonical_hash({'source': source, 'source_event_id': source_event_id, 'payload': raw_fingerprint})[:28]}",
+                "kind": kind, "source": source, "source_event_id": source_event_id, "wallet": item.get("wallet"),
+                "symbol": item.get("symbol") or str(body.get("symbol") or "") or None, "event_at": _iso(event_time),
+                "received_at": _iso(receive_time), "normalized_at": _iso(event_time),
+                "network": str(item.get("network") or "mainnet-public"), "raw_fingerprint": raw_fingerprint,
+                "schema_version": 1, "code_sha": self._code_sha, "config_hash": self._config_hash,
+                "quality_flags": dict(item.get("quality_flags") or {}), "payload": body, "persisted_at": _iso(now),
+            })
+        rows = self.repository.record_observations_batch(prepared)
+        work_time = _iso(now)
+        feature_work = [{
+            "work_id": f"work-{canonical_hash({'stage': WorkerStage.FEATURE_MATERIALIZATION.value, 'subject': 'observation', 'id': row['observation_id'], 'version': 1, 'fingerprint': row['raw_fingerprint']})[:28]}",
+            "work_type": WorkerStage.FEATURE_MATERIALIZATION.value, "subject_type": "observation", "subject_id": row["observation_id"],
+            "subject_version": 1, "priority": _WORK_PRIORITIES[WorkerStage.FEATURE_MATERIALIZATION], "created_at": work_time,
+            "available_at": work_time, "max_attempts": self.settings.max_attempts, "input_fingerprint": row["raw_fingerprint"],
+        } for row in rows]
+        if schedule_features:
+            self.repository.enqueue_work_batch(feature_work)
+        if rows:
+            self.repository.set_stage_health(WorkerStage.OBSERVATION_INGEST.value, "ACTIVE", detail={"observation_count": len(rows), "kinds": sorted({row["kind"] for row in rows})}, updated_at=work_time)
+        return rows
 
     # ----- worker lifecycle -----------------------------------------------------------
     def run_once(self, *, max_items: int | None = None) -> dict[str, object]:
@@ -226,6 +252,18 @@ class ScientificWorker:
 
     def _schedule_incremental_work(self, now: datetime) -> None:
         observations = self.repository.list_observations(limit=1_000)
+        if self.config.commissioning.enabled:
+            selection = self.repository.get_watermark("d7_historical_corpus_selection")
+            selected_ids = set(selection.get("details", {}).get("selected_observation_ids", [])) if selection else set()
+            # D.7 archive data is retained in full but its bounded corpus is
+            # the only historical source allowed to create new D.6 projection
+            # work. Live observations remain eligible for forward shadow.
+            if selected_ids:
+                historical = self.repository.observations_by_ids(tuple(sorted(selected_ids)))
+                live = self.repository.recent_observations_excluding_source(
+                    source="HISTORICAL_OFFICIAL_ARCHIVE", limit=1_000,
+                )
+                observations = sorted([*historical, *live], key=lambda row: (str(row["normalized_at"]), str(row["observation_id"])))
         observation_fingerprint = canonical_hash([(row["observation_id"], row["raw_fingerprint"]) for row in observations])
         labels = self.repository.list_outcome_labels()
         labelled = {(row["observation_id"], int(row["horizon_seconds"])) for row in labels}
@@ -359,10 +397,16 @@ class ScientificWorker:
         raise ValueError(f"Unsupported scientific work stage {stage}.")
 
     def _materialize_features(self, observation_id: str, now: datetime) -> str:
-        observation = next((item for item in self.repository.list_observations(limit=5_000) if item["observation_id"] == observation_id), None)
+        observation = self.repository.observation_by_id(observation_id)
         if observation is None:
             raise ValueError("Feature materialization requires a persisted observation.")
-        all_observations = self.repository.list_observations(limit=5_000)
+        if self.config.commissioning.enabled and observation["source"] == "HISTORICAL_OFFICIAL_ARCHIVE":
+            all_observations = self.repository.observations_before(
+                symbol=observation.get("symbol"), end=str(observation["normalized_at"]), lookback_seconds=600,
+                source="HISTORICAL_OFFICIAL_ARCHIVE",
+            )
+        else:
+            all_observations = self.repository.list_observations(limit=5_000)
         with self.latency.measure("observation_to_feature", observation_id=observation_id):
             values = self._feature_values(observation, all_observations)
             rows: list[dict[str, Any]] = []
@@ -413,25 +457,37 @@ class ScientificWorker:
 
     # ----- labels, discovery, and experiments -----------------------------------------
     def _label_outcomes(self, observation_id: str, now: datetime) -> str:
-        observations = self.repository.list_observations(limit=5_000)
-        anchor = next((item for item in observations if item["observation_id"] == observation_id), None)
+        anchor = self.repository.observation_by_id(observation_id)
         if anchor is None or anchor["kind"] != "WALLET_FILL":
             return "not an outcome anchor"
         anchor_time, symbol = _time(str(anchor["normalized_at"])), anchor.get("symbol")
-        market = [item for item in observations if item["kind"] == "MARKET_PRICE" and item.get("symbol") == symbol]
+        historical = self.config.commissioning.enabled and anchor["source"] == "HISTORICAL_OFFICIAL_ARCHIVE"
+        market = ([] if historical else [item for item in self.repository.list_observations(limit=5_000)
+                                         if item["kind"] == "MARKET_PRICE" and item.get("symbol") == symbol])
         start_price = _finite(anchor["payload"].get("price"))
         if start_price is None:
-            prior = [item for item in market if _time(str(item["normalized_at"])) <= anchor_time]
+            prior = ([item for item in market if _time(str(item["normalized_at"])) <= anchor_time]
+                     if not historical else self.repository.observations_before(
+                         symbol=symbol, end=str(anchor["normalized_at"]), lookback_seconds=600,
+                         source="HISTORICAL_OFFICIAL_ARCHIVE", kinds=("MARKET_PRICE",)))
             start_price = _finite(prior[-1]["payload"].get("price")) if prior else None
         if not start_price or start_price <= 0:
             return "awaiting anchor price"
         resolved = 0
         for horizon in self.settings.horizons_seconds:
-            end_candidates = [item for item in market if _time(str(item["normalized_at"])) >= anchor_time + timedelta(seconds=horizon) and _finite(item["payload"].get("price"))]
-            if not end_candidates:
-                continue
-            end = end_candidates[0]
-            path = [item for item in market if anchor_time <= _time(str(item["normalized_at"])) <= _time(str(end["normalized_at"])) and _finite(item["payload"].get("price"))]
+            if historical:
+                end = self.repository.first_market_price_at_or_after(
+                    symbol=symbol, at=_iso(anchor_time + timedelta(seconds=horizon)), source="HISTORICAL_OFFICIAL_ARCHIVE",
+                )
+                if end is None or _finite(end["payload"].get("price")) is None:
+                    continue
+                path = [end]
+            else:
+                end_candidates = [item for item in market if _time(str(item["normalized_at"])) >= anchor_time + timedelta(seconds=horizon) and _finite(item["payload"].get("price"))]
+                if not end_candidates:
+                    continue
+                end = end_candidates[0]
+                path = [item for item in market if anchor_time <= _time(str(item["normalized_at"])) <= _time(str(end["normalized_at"])) and _finite(item["payload"].get("price"))]
             end_price = float(_finite(end["payload"].get("price")) or start_price)
             gross_long = end_price / start_price - 1.0
             direction = 1.0 if str(anchor["payload"].get("side") or anchor["payload"].get("action") or "").lower() in {"buy", "long", "open_long"} else -1.0
@@ -450,7 +506,11 @@ class ScientificWorker:
         return f"labels:{resolved}"
 
     def _research_records(self) -> list[dict[str, Any]]:
-        observations = {item["observation_id"]: item for item in self.repository.list_observations(limit=5_000)}
+        selection = self.repository.get_watermark("d7_historical_corpus_selection") if self.config.commissioning.enabled else None
+        selected_ids = tuple(sorted(selection.get("details", {}).get("selected_observation_ids", []))) if selection else ()
+        source_rows = (self.repository.observations_by_ids(selected_ids) if selected_ids
+                       else self.repository.list_observations(limit=5_000))
+        observations = {item["observation_id"]: item for item in source_rows}
         feature_values = self.repository.list_feature_values()
         features: dict[str, dict[str, float]] = {}
         for value in feature_values:
@@ -463,7 +523,29 @@ class ScientificWorker:
                 records.append({"observation_id": label["observation_id"], "timestamp": observation["normalized_at"], "symbol": observation.get("symbol"), "horizon_seconds": label["horizon_seconds"], "features": features.get(label["observation_id"], {}), "net_outcome": float(label["payload"]["net_outcome"]), "outcome": label["payload"]})
         return sorted(records, key=lambda item: (item["timestamp"], item["observation_id"]))[-2_000:]
 
+    def _commissioning_snapshot(self) -> dict[str, Any] | None:
+        """Return a D.7 corpus only when its declared coverage policy passed.
+
+        Pre-D.7 fixture configurations deliberately keep commissioning off, so
+        their frozen D.6 behavior is unchanged.  Production D.7 research is
+        fail-closed: a hypothesis cannot be promoted from unproven, partial,
+        missing, or corrupt historical evidence.
+        """
+        if not self.config.commissioning.enabled:
+            return {"corpus_fingerprint": "d6-compatibility-local-evidence", "payload": {"coverage": {"state": "COMPATIBILITY"}}}
+        snapshot = self.repository.latest_corpus_snapshot()
+        coverage = snapshot.get("payload", {}).get("coverage", {}) if snapshot else {}
+        if (not snapshot or coverage.get("state") != "PROVEN_COMPLETE"
+                or float(coverage.get("coverage_fraction") or 0.0) < self.config.commissioning.min_coverage_fraction):
+            return None
+        return snapshot
+
     def _discover(self, now: datetime) -> str:
+        snapshot = self._commissioning_snapshot()
+        if snapshot is None:
+            self.repository.set_stage_health(WorkerStage.PATTERN_DISCOVERY.value, "COVERAGE_BLOCKED",
+                                             detail={"reason": "D.7 corpus coverage is not PROVEN_COMPLETE"}, updated_at=_iso(now))
+            return "coverage blocked"
         records = self._research_records()
         family = SearchFamily("initial-interpretable", 1, ("wallet_action", "wallet_disagreement", "short_term_return", "local_momentum"), (self.settings.horizons_seconds[0],), 1, self.settings.minimum_sample, self.settings.max_proposals_per_family_per_cycle, self.settings.minimum_effect_size)
         candidates = self.discovery.discover(family, records)
@@ -482,7 +564,7 @@ class ScientificWorker:
             hypothesis_id = f"hypothesis-{canonical_hash(candidate.payload())[:24]}"
             if (hypothesis_id, 1) in existing_hypotheses:
                 continue
-            definition = self._hypothesis_from_candidate(candidate, records, now)
+            definition = self._hypothesis_from_candidate(candidate, records, now, corpus_fingerprint=str(snapshot["corpus_fingerprint"]))
             if self.hypotheses.similar_rejections(definition, minimum_similarity=0.95):
                 continue
             self.hypotheses.register(definition, state=HypothesisState.REGISTERED)
@@ -490,21 +572,28 @@ class ScientificWorker:
         self.repository.set_watermark("last_observation_processed", records[-1]["timestamp"] if records else "", updated_at=_iso(now), details={"records": len(records), "registered": registered})
         return f"discoveries:{len(candidates)} registered:{registered}"
 
-    def _hypothesis_from_candidate(self, candidate: Any, records: list[dict[str, Any]], now: datetime) -> HypothesisDefinition:
+    def _hypothesis_from_candidate(self, candidate: Any, records: list[dict[str, Any]], now: datetime, *, corpus_fingerprint: str = "d6-compatibility-local-evidence") -> HypothesisDefinition:
         start = records[0]["timestamp"] if records else _iso(now)
         end = records[-1]["timestamp"] if records else _iso(now)
         split_index = max(1, int(len(records) * 0.75))
         discovery_end = records[split_index - 1]["timestamp"] if records else end
         validation_start = _iso(_time(str(discovery_end)) + timedelta(seconds=float(candidate.horizon_seconds)))
         hypothesis_id = f"hypothesis-{canonical_hash(candidate.payload())[:24]}"
-        return HypothesisDefinition(hypothesis_id, 1, f"{candidate.feature_id} {candidate.condition} {candidate.threshold:.6g}", f"{candidate.feature_id} {candidate.condition} threshold predicts positive cost-adjusted {candidate.horizon_seconds}s outcome", "Condition has no positive net effect after costs.", "Condition has positive net effect after costs.", ((candidate.feature_id, candidate.feature_version),), {"condition": candidate.condition, "threshold": candidate.threshold, "discovery_id": candidate.discovery_id}, tuple(sorted({str(record.get("symbol") or "") for record in records if record.get("symbol")})), ("unknown", "calm", "volatile"), candidate.horizon_seconds, f"{candidate.feature_id} {candidate.condition} {candidate.threshold}", "cost-adjusted directional outcome", {"transaction_cost": 0.001}, 0, {"fee": 0.001}, {"slippage": 0.0}, self.settings.minimum_sample, {"start": start, "end": discovery_end}, {"start": validation_start, "end": end}, float(candidate.horizon_seconds), {"minimum_effect_size": self.settings.minimum_effect_size, "maximum_q_value": self.settings.maximum_q_value}, {"net_expectancy": 0.0}, candidate.family_id, _iso(now), self._code_sha, {"discovery": candidate.data_fingerprint}, tags=("automated", "interpretable", candidate.feature_id))
+        return HypothesisDefinition(hypothesis_id, 1, f"{candidate.feature_id} {candidate.condition} {candidate.threshold:.6g}", f"{candidate.feature_id} {candidate.condition} threshold predicts positive cost-adjusted {candidate.horizon_seconds}s outcome", "Condition has no positive net effect after costs.", "Condition has positive net effect after costs.", ((candidate.feature_id, candidate.feature_version),), {"condition": candidate.condition, "threshold": candidate.threshold, "discovery_id": candidate.discovery_id}, tuple(sorted({str(record.get("symbol") or "") for record in records if record.get("symbol")})), ("unknown", "calm", "volatile"), candidate.horizon_seconds, f"{candidate.feature_id} {candidate.condition} {candidate.threshold}", "cost-adjusted directional outcome", {"transaction_cost": 0.001}, 0, {"fee": 0.001}, {"slippage": 0.0}, self.settings.minimum_sample, {"start": start, "end": discovery_end}, {"start": validation_start, "end": end}, float(candidate.horizon_seconds), {"minimum_effect_size": self.settings.minimum_effect_size, "maximum_q_value": self.settings.maximum_q_value, "coverage_policy": "PROVEN_COMPLETE" if self.config.commissioning.enabled else "D6_COMPATIBILITY"}, {"net_expectancy": 0.0}, candidate.family_id, _iso(now), self._code_sha, {"discovery": candidate.data_fingerprint, "corpus": corpus_fingerprint}, tags=("automated", "interpretable", candidate.feature_id))
 
     def _evaluate_hypotheses(self, now: datetime) -> str:
+        snapshot = self._commissioning_snapshot()
+        if snapshot is None:
+            self.repository.set_stage_health(WorkerStage.HISTORICAL_EXPERIMENT.value, "COVERAGE_BLOCKED",
+                                             detail={"reason": "D.7 corpus coverage is not PROVEN_COMPLETE"}, updated_at=_iso(now))
+            return "coverage blocked"
         records = self._research_records()
         candidates = self.repository.list_hypotheses(state="REGISTERED")[:self.settings.max_historical_tests_per_cycle]
         pending: list[tuple[dict[str, Any], list[dict[str, Any]], str]] = []
         for hypothesis in candidates:
             definition = hypothesis["definition"]
+            if self.config.commissioning.enabled and definition.get("data_fingerprints", {}).get("corpus") != snapshot["corpus_fingerprint"]:
+                continue
             thresholds = definition.get("thresholds", {})
             feature = definition.get("feature_versions", [{}])[0].get("feature_id")
             condition, threshold = thresholds.get("condition"), float(thresholds.get("threshold", 0.0))
@@ -514,8 +603,8 @@ class ScientificWorker:
             if len(filtered) < self.settings.minimum_sample:
                 continue
             experiment_id = f"experiment-{canonical_hash({'hypothesis': hypothesis['config_hash'], 'records': [record['observation_id'] for record in filtered]})[:24]}"
-            config = {"temporal_ordered": True, "purge_embargo_seconds": definition["purge_embargo_seconds"], "family": definition["multiple_testing_family"], "validation_fraction": 0.33, "cost_adjusted": True}
-            fingerprint = HistoricalExperimentEngine.fingerprint(filtered, config)
+            config = {"temporal_ordered": True, "purge_embargo_seconds": definition["purge_embargo_seconds"], "family": definition["multiple_testing_family"], "validation_fraction": 0.33, "cost_adjusted": True, "corpus_snapshot": snapshot["corpus_fingerprint"]}
+            fingerprint = canonical_hash({"corpus_snapshot": snapshot["corpus_fingerprint"], "scientific_records": HistoricalExperimentEngine.fingerprint(filtered, config)})
             self.repository.create_experiment(experiment_id, hypothesis_id=hypothesis["hypothesis_id"], hypothesis_version=hypothesis["version"], kind="HISTORICAL", state="RUNNING", dataset_fingerprint=fingerprint, configuration=config, created_at=_iso(now))
             object_definition = self._hypothesis_from_payload(definition)
             self.hypotheses.transition(object_definition, from_state=HypothesisState.REGISTERED, to_state=HypothesisState.HISTORICAL_TESTING, reason="automated bounded historical evaluation", event_id=f"event-{experiment_id}", created_at=_iso(now), evidence={"records": len(filtered)})
@@ -559,7 +648,7 @@ class ScientificWorker:
 
     # ----- forward evidence, promotion, models, decisions, drift ----------------------
     def _emit_predictions(self, observation_id: str, now: datetime) -> str:
-        observation = next((item for item in self.repository.list_observations(limit=5_000) if item["observation_id"] == observation_id), None)
+        observation = self.repository.observation_by_id(observation_id)
         if observation is None or observation["kind"] != "WALLET_FILL":
             return "no forward anchor"
         # Historical labels make an observation ineligible for forward shadow:
