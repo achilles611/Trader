@@ -106,7 +106,7 @@ python main.py copy-backtest --wallet 0xYOUR_PUBLIC_WALLET
 python main.py copy-report --wallet 0xYOUR_PUBLIC_WALLET
 ```
 
-See [docs/COPYTRADING.md](docs/COPYTRADING.md) for the full architecture, configuration, safeguards, workflow, limitations, and tests.
+See [docs/COPYTRADING.md](docs/COPYTRADING.md) for the full architecture, configuration, safeguards, workflow, limitations, and tests. The D.5 scientific refactor is documented in [docs/SCIENTIFIC_ALPHA_ENGINE.md](docs/SCIENTIFIC_ALPHA_ENGINE.md) and the Windows hot/cold deployment layout in [docs/STORAGE_TOPOLOGY_WINDOWS.md](docs/STORAGE_TOPOLOGY_WINDOWS.md). The configured D.5 service treats wallet activity as sensor evidence and fails raw wallet actions closed until a validated scientific model decision exists.
 
 Run the production orchestration cycle wrapper:
 

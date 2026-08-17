@@ -22,6 +22,7 @@ from .control_center_read_model import phase_b_candidate_view
 from .discovery import build_discovery_provider, parse_activity_age
 from .models import as_utc, iso, jsonable, stable_id, utc_now
 from .rate_limit import shared_hyperliquid_info_limiter
+from .science_read_model import ScientificReadModel
 from .source_acquisition import HyperCoreSourceAcquisition, HyperCoreSourceError, cache_directory, discovery_preset
 from .storage import CopyTradeDatabase
 
@@ -463,6 +464,7 @@ class CopyControlCenter:
         self.database.initialize()
         self.store = ControlCenterStore(config.artifacts.database_path)
         self.store.initialize()
+        self.science = ScientificReadModel(config, self.database.path)
         self._execution_service = execution_service
         self._shadow_adapter = shadow_adapter
 
@@ -1367,7 +1369,51 @@ def create_control_center_app(
 
     @app.get("/api/health")
     async def api_health() -> dict[str, Any]:
-        return center.health(live_watcher_health)
+        return {**center.health(live_watcher_health), "science": center.science.health()}
+
+    @app.get("/api/science/health")
+    async def api_science_health() -> dict[str, Any]:
+        return center.science.health()
+
+    @app.get("/api/science/ecosystem")
+    async def api_science_ecosystem() -> dict[str, Any]:
+        return center.science.ecosystem()
+
+    @app.get("/api/wallet-sensors")
+    async def api_wallet_sensors() -> dict[str, Any]:
+        return center.science.wallet_sensors()
+
+    @app.get("/api/hypotheses")
+    async def api_hypotheses(state: str | None = None) -> dict[str, Any]:
+        return center.science.hypotheses(state)
+
+    @app.get("/api/experiments")
+    async def api_experiments(kind: str | None = None) -> dict[str, Any]:
+        return center.science.experiments(kind)
+
+    @app.get("/api/indicators")
+    async def api_indicators() -> dict[str, Any]:
+        return center.science.indicators()
+
+    @app.get("/api/models")
+    async def api_models() -> dict[str, Any]:
+        return center.science.models()
+
+    @app.get("/api/confidence")
+    async def api_confidence() -> dict[str, Any]:
+        return center.science.confidence()
+
+    @app.get("/api/decisions")
+    async def api_decisions() -> dict[str, Any]:
+        return center.science.decisions()
+
+    @app.get("/api/graveyard")
+    async def api_graveyard(search: str = "") -> dict[str, Any]:
+        return center.science.graveyard(search)
+
+    @app.get("/api/storage")
+    async def api_storage() -> dict[str, Any]:
+        return center.science.storage()
 
     @app.get("/api/overview")
     async def api_overview() -> dict[str, Any]:

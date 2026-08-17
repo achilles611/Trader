@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, post } from "./api";
 import type { Candidate, CandidatesResponse, ControlState, Portfolio } from "./types";
+import { ConfidencePage, EcosystemPage, ScienceResourcePage } from "./ScienceViews";
 
-type Page = "Overview" | "Discovery" | "Candidates" | "Shadow" | "Active" | "Portfolio" | "Positions" | "Activity" | "System";
-const pages: Page[] = ["Overview", "Discovery", "Candidates", "Shadow", "Active", "Portfolio", "Positions", "Activity", "System"];
+type Page = "Ecosystem" | "Data Soil" | "Wallet Sensors" | "Hypothesis Lab" | "Indicator Forge" | "Experiments" | "Confidence Engine" | "Execution + Risk" | "Watchers + Alerts" | "Graveyard" | "Overview" | "Discovery" | "Candidates" | "Shadow" | "Active" | "Portfolio" | "Positions" | "Activity" | "System";
+const pages: Page[] = ["Ecosystem", "Data Soil", "Wallet Sensors", "Hypothesis Lab", "Indicator Forge", "Experiments", "Confidence Engine", "Execution + Risk", "Watchers + Alerts", "Graveyard", "Overview", "Discovery", "Candidates", "Shadow", "Active", "Portfolio", "Positions", "Activity", "System"];
 
 const money = (value: unknown) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(Number(value || 0));
 const percent = (value: unknown) => `${(Number(value || 0) * 100).toFixed(1)}%`;
@@ -79,14 +80,14 @@ export function App() {
 
   return <div className="shell">
     <aside className="sidebar">
-      <div className="brand"><span className="brand-mark">T</span><div><strong>TRADER</strong><small>COPY CONTROL CENTER</small></div></div>
-      <div className="mode-stamp">PAPER ONLY</div>
+      <div className="brand"><span className="brand-mark">B</span><div><strong>BEELZEBUB</strong><small>SCIENTIFIC ALPHA ENGINE</small></div></div>
+      <div className="mode-stamp">SIMULATION / SHADOW ONLY</div>
       <nav aria-label="Primary navigation">{pages.map((item) => <button key={item} className={page === item ? "nav-item selected" : "nav-item"} aria-current={page === item ? "page" : undefined} onClick={() => setPage(item)}>{item}</button>)}</nav>
       <div className="sidebar-foot"><span className="status-dot good" /> Local research terminal<br />No live execution capability</div>
     </aside>
     <main className="main">
       <header className="topbar">
-        <div><div className="eyebrow">PAPER-COPY OPERATIONS</div><h1>{page}</h1></div>
+        <div><div className="eyebrow">SCIENTIFIC ALPHA OPERATIONS</div><h1>{page}</h1></div>
         <div className="header-controls">
           <span className={`control-chip ${control?.entries_allowed ? "running" : "paused"}`}>{control?.state || "CONNECTING"}</span>
           {control?.entries_allowed
@@ -97,6 +98,16 @@ export function App() {
         </div>
       </header>
       <section className="paper-banner"><strong>PAPER POSITIONS ONLY</strong><span>Research and simulated execution only. No credentials, signing, order submission, or live-mode controls exist in this application.</span></section>
+      {page === "Ecosystem" && <EcosystemPage navigate={(target) => setPage(target as Page)} />}
+      {page === "Data Soil" && <ScienceResourcePage endpoint="/api/science/health" title="Data Soil / Provenance" subtitle="Feature, database, storage, and archival evidence health." columns={[]} />}
+      {page === "Wallet Sensors" && <ScienceResourcePage endpoint="/api/wallet-sensors" title="Wallet Sensors" subtitle="Wallets are behavioral sensors, never direct execution authorities." columns={["wallet", "evidence_confidence", "updated_at", "metrics"]} />}
+      {page === "Hypothesis Lab" && <ScienceResourcePage endpoint="/api/hypotheses" title="Hypothesis Lab" subtitle="Immutable falsifiable propositions and declared test conditions." columns={["hypothesis_id", "version", "state", "registered_at", "config_hash", "definition"]} />}
+      {page === "Indicator Forge" && <ScienceResourcePage endpoint="/api/indicators" title="Indicator Forge" subtitle="Validated relationships with provenance, regimes, decay, and evidence state." columns={["indicator_id", "version", "state", "created_at", "provenance"]} />}
+      {page === "Experiments" && <ScienceResourcePage endpoint="/api/experiments" title="Experiments" subtitle="Historical and forward evidence remain separate, cost-adjusted, and reproducible." columns={["experiment_id", "kind", "state", "hypothesis_id", "dataset_fingerprint", "result"]} />}
+      {page === "Confidence Engine" && <ConfidencePage />}
+      {page === "Execution + Risk" && <ScienceResourcePage endpoint="/api/decisions" title="Execution + Risk" subtitle="Explainable simulation/shadow decisions after model, edge, and risk gates." columns={["created_at", "symbol", "decision", "payload"]} />}
+      {page === "Watchers + Alerts" && <ScienceResourcePage endpoint="/api/science/health" title="Watchers + Alerts" subtitle="Operational data is unavailable until real watcher evidence is persisted." columns={[]} />}
+      {page === "Graveyard" && <ScienceResourcePage endpoint="/api/graveyard" title="Graveyard" subtitle="Rejected hypotheses are permanent evidence and searchable before rediscovery." columns={["hypothesis_id", "version", "reason", "recorded_at", "payload"]} search />}
       {page === "Overview" && <Overview data={overview} portfolio={portfolio} navigate={setPage} />}
       {page === "Discovery" && <DiscoveryPage discoveryJob={discoveryJob} navigate={setPage} confirmation={setConfirmation} refresh={refresh} />}
       {page === "Candidates" && <CandidatesPage key={discoveryRevision} notify={setToast} confirmation={setConfirmation} refresh={refresh} navigate={setPage} />}

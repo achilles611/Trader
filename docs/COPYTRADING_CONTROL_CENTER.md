@@ -86,3 +86,10 @@ Phase C reads B.2 through a read-only normalization boundary. The persisted Phas
 
 All Phase C state is persisted in the existing SQLite database via the additive `copy_control_center_state` and `copy_control_center_activity` tables.
 Candidate-discovery orchestration is additionally persisted in `copy_control_center_jobs`; downloaded public node-data cache objects are ignored by Git with the rest of `artifacts/`.
+# D.5 scientific Control Center
+
+The Control Center now leads with the Beelzebub scientific ecosystem. Its left rail includes Ecosystem, Data Soil, Wallet Sensors, Hypothesis Lab, Indicator Forge, Experiments, Confidence Engine, Execution + Risk, Watchers + Alerts, and Graveyard, while the prior paper-copy operational pages remain available for compatibility.
+
+All scientific views are read models from SQLite. Empty or unavailable sources render `No evidence`, `Unavailable`, or `Not configured`; they do not fabricate P&L, health, candidates, alerts, or confidence. The ecosystem map is clickable and shows module health plus the persistent scientific cycle. The right rail reports actual scientific storage status and explicitly states the simulation/shadow-only authority boundary.
+
+The UI has no endpoint to arm live execution, submit/cancel venue orders, or move capital. D.4 read-only shadow refresh remains an operator-context read only.
