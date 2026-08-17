@@ -21,6 +21,9 @@ from .reporting import ObsidianExporter
 from .scoring import FollowerMetrics, score_candidate, select_diverse_targets
 from .service import CopyTradeService
 from .science_storage import ColdArchiveSpool, StorageRoots, migrate_sqlite_to_hot
+from .science_repository import ScientificRepository
+from .scientific_scheduler import ScientificScheduler
+from .scientific_worker import ScientificWorker, WorkerStage
 
 
 def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -114,6 +117,26 @@ def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
     storage_migrate.add_argument("--destination", help="Optional hot destination; defaults to configured active database.")
     archive_flush = command("copy-archive-flush", "Flush the local hot archival spool to cold storage; never use in a decision path.")
 
+    science = command("science", "Operate the durable, simulation/shadow-only automated scientific worker.")
+    science_subparsers = science.add_subparsers(dest="science_command", required=True)
+    science_run = science_subparsers.add_parser("run", help="Run the worker continuously until interrupted.")
+    science_run.add_argument("--max-items", type=int, help="Optional bounded items per scheduler tick.")
+    science_once = science_subparsers.add_parser("run-once", help="Process currently available scientific work and exit.")
+    science_once.add_argument("--max-items", type=int, help="Maximum queue items for this invocation.")
+    science_subparsers.add_parser("status", help="Show truthful queue, cursor, storage, and scientific-object state.")
+    science_pause = science_subparsers.add_parser("pause", help="Fail-safe pause; durable work remains queued.")
+    science_pause.add_argument("--reason", default="operator requested scientific pause")
+    science_subparsers.add_parser("resume", help="Resume durable scientific work.")
+    science_backfill = science_subparsers.add_parser("backfill", help="Explicitly materialize available local observations and outcomes.")
+    science_backfill.add_argument("--max-cycles", type=int, default=128)
+    science_rebuild = science_subparsers.add_parser("rebuild", help="Explicitly rerun bounded research over immutable local evidence.")
+    science_rebuild.add_argument("--explicit", action="store_true", help="Required acknowledgement; rebuild never deletes evidence.")
+    science_rebuild.add_argument("--max-cycles", type=int, default=128)
+    science_bootstrap = science_subparsers.add_parser("bootstrap", help="Run the bounded local-data bootstrap and report exact counts.")
+    science_bootstrap.add_argument("--max-cycles", type=int, default=128)
+    science_reproduce = science_subparsers.add_parser("reproduce", help="Print the immutable inputs and result for one historical experiment.")
+    science_reproduce.add_argument("--experiment", required=True)
+
 
 def run_copytrade_command(args: argparse.Namespace) -> int:
     config = CopyTradeConfig.from_yaml(args.config)
@@ -129,6 +152,51 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
     if command == "copy-archive-flush":
         _print(spool.flush_once())
         return 0
+    if command == "science":
+        repository = ScientificRepository(config.artifacts.database_path, archive_spool=spool)
+        worker = ScientificWorker(repository, config)
+        science_command = args.science_command
+        if science_command == "run":
+            scheduler = ScientificScheduler(worker, poll_interval_seconds=config.scientific_worker.poll_interval_seconds)
+            try:
+                scheduler.run_forever(max_items=args.max_items)
+            except KeyboardInterrupt:
+                scheduler.stop()
+                _print({"state": "STOPPED", "reason": "keyboard_interrupt", "queue": repository.work_queue_status(now="operator-interrupt")})
+            return 0
+        if science_command == "run-once":
+            _print(worker.run_once(max_items=args.max_items))
+            return 0
+        if science_command == "status":
+            _print(_science_status(repository, roots, spool))
+            return 0
+        if science_command == "pause":
+            worker.pause(args.reason)
+            _print(_science_status(repository, roots, spool))
+            return 0
+        if science_command == "resume":
+            worker.resume()
+            _print(_science_status(repository, roots, spool))
+            return 0
+        if science_command == "backfill":
+            _print({"mode": "BACKFILL", "summary": worker.run_until_idle(max_cycles=args.max_cycles), "status": _science_status(repository, roots, spool)})
+            return 0
+        if science_command == "rebuild":
+            if not args.explicit:
+                raise ValueError("science rebuild requires --explicit; it never deletes immutable evidence.")
+            _queue_explicit_rebuild(worker)
+            _print({"mode": "EXPLICIT_REBUILD", "summary": worker.run_until_idle(max_cycles=args.max_cycles), "status": _science_status(repository, roots, spool)})
+            return 0
+        if science_command == "bootstrap":
+            _print({"mode": "BOUNDED_LOCAL_BOOTSTRAP", "summary": worker.run_until_idle(max_cycles=args.max_cycles), "counts": _science_counts(repository)})
+            return 0
+        if science_command == "reproduce":
+            experiment = next((item for item in repository.list_experiments(kind="HISTORICAL") if item["experiment_id"] == args.experiment), None)
+            if experiment is None:
+                raise ValueError("Unknown historical experiment ID.")
+            hypothesis = next((item for item in repository.list_hypotheses() if item["hypothesis_id"] == experiment["hypothesis_id"] and int(item["version"]) == int(experiment["hypothesis_version"])), None)
+            _print({"experiment": experiment, "hypothesis": hypothesis, "reproducible": True, "execution_mode": "SIMULATION_SHADOW_ONLY"})
+            return 0
     service = CopyTradeService(config)
     if command == "copy-import":
         targets = service.import_wallets(args.wallet)
@@ -309,6 +377,51 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
         _print({"allocations_use_available_capital": True, "prior_median_fraction": 0.10, "classification": output})
         return 0
     raise ValueError(f"Unsupported copy-trading command: {command}")
+
+
+def _science_counts(repository: ScientificRepository) -> dict[str, int]:
+    hypotheses = repository.list_hypotheses()
+    forward = repository.list_forward_records()
+    return {
+        "observations": len(repository.list_observations(limit=5_000)),
+        "features": len(repository.list_feature_values()),
+        "candidate_patterns": len(repository.list_discoveries()),
+        "proposals": len(repository.list_discoveries()),
+        "registered_hypotheses": sum(item["state"] == "REGISTERED" for item in hypotheses),
+        "historical_rejects": len(repository.list_graveyard()),
+        "historical_survivors": sum(item["state"] == "FORWARD_SHADOW" for item in hypotheses),
+        "forward_predictions": len(forward),
+        "resolved_forward_predictions": sum(item["outcome"] is not None for item in forward),
+        "promoted_indicators": len(repository.list_indicators()),
+        "candidate_models": len(repository.list_models()),
+    }
+
+
+def _science_status(repository: ScientificRepository, roots: StorageRoots, spool: ColdArchiveSpool) -> dict[str, Any]:
+    return {
+        "execution_mode": "SIMULATION_SHADOW_ONLY",
+        "worker_control": repository.worker_control(),
+        "queue": repository.work_queue_status(now="status"),
+        "watermarks": repository.list_watermarks(),
+        "stage_health": repository.stage_health(),
+        "counts": _science_counts(repository),
+        "storage": {**roots.cold_status(), "spool": spool.backlog(), "hot_database": str(repository.path)},
+    }
+
+
+def _queue_explicit_rebuild(worker: ScientificWorker) -> None:
+    """Create a new, auditable queue generation without deleting evidence."""
+    fingerprint = worker._workflow_fingerprint()
+    for stage, subject_type, subject_id in (
+        (WorkerStage.PATTERN_DISCOVERY, "family", "initial-interpretable"),
+        (WorkerStage.HISTORICAL_EXPERIMENT, "family", "initial-interpretable"),
+        (WorkerStage.FORWARD_RESOLUTION, "prediction-scan", "all"),
+        (WorkerStage.INDICATOR_PROMOTION, "promotion-scan", "all"),
+        (WorkerStage.MODEL_BUILD, "model-scan", "all"),
+        (WorkerStage.MODEL_CALIBRATION, "model-calibration", "all"),
+        (WorkerStage.DRIFT_EVALUATION, "drift-scan", "all"),
+    ):
+        worker._enqueue(stage, subject_type, subject_id, 2, fingerprint)
 
 
 def _score_payload(score: Any) -> dict[str, Any]:

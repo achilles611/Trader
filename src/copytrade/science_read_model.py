@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from shutil import disk_usage
 from typing import Any
 
 from .config import CopyTradeConfig
@@ -67,3 +68,43 @@ class ScientificReadModel:
 
     def storage(self) -> dict[str, Any]:
         return {**self.roots.cold_status(), "spool": self.spool.backlog(), "hot_database": str(self.repository.path)}
+
+    def automated(self) -> dict[str, Any]:
+        """Truthful D.6 projection; it never fabricates worker activity."""
+        forward = self.repository.list_forward_records()
+        journal = self.repository.latest_journal()
+        return {
+            "execution_mode": "SIMULATION_SHADOW_ONLY",
+            "worker_control": self.repository.worker_control(),
+            "queue": self.repository.work_queue_status(now="control-center-read"),
+            "watermarks": self.repository.list_watermarks(),
+            "stage_health": self.repository.stage_health(),
+            "discoveries": self.repository.list_discoveries()[:50],
+            "model_roles": self.repository.model_roles(),
+            "model_calibrations": self.repository.list_model_calibrations()[:25],
+            "drift": self.repository.list_drift()[:50],
+            "journal": journal,
+            "latency": self.repository.latency_report(),
+            "counts": {
+                "observations": len(self.repository.list_observations(limit=5_000)),
+                "feature_values": len(self.repository.list_feature_values()),
+                "forward_predictions": len(forward),
+                "resolved_forward_predictions": sum(item["outcome"] is not None for item in forward),
+                "discoveries": len(self.repository.list_discoveries()),
+                "hypotheses": len(self.repository.list_hypotheses()),
+                "indicators": len(self.repository.list_indicators()),
+                "models": len(self.repository.list_models()),
+            },
+            "resource_state": {"hot_free_bytes": disk_usage(self.repository.path.parent).free, **self.storage()},
+            "scheduler": "external durable CLI process; current database state is shown above",
+        }
+
+    def pause_automated_worker(self, reason: str) -> dict[str, Any]:
+        from .models import iso, utc_now
+        self.repository.set_worker_paused(True, reason=reason or "operator requested scientific pause", updated_at=iso(utc_now()))
+        return self.automated()
+
+    def resume_automated_worker(self) -> dict[str, Any]:
+        from .models import iso, utc_now
+        self.repository.set_worker_paused(False, reason="", updated_at=iso(utc_now()))
+        return self.automated()

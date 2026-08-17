@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, post } from "./api";
 import type { Candidate, CandidatesResponse, ControlState, Portfolio } from "./types";
-import { ConfidencePage, EcosystemPage, ScienceResourcePage } from "./ScienceViews";
+import { AutomatedSciencePage, ConfidencePage, EcosystemPage, ScienceResourcePage } from "./ScienceViews";
 
-type Page = "Ecosystem" | "Data Soil" | "Wallet Sensors" | "Hypothesis Lab" | "Indicator Forge" | "Experiments" | "Confidence Engine" | "Execution + Risk" | "Watchers + Alerts" | "Graveyard" | "Overview" | "Discovery" | "Candidates" | "Shadow" | "Active" | "Portfolio" | "Positions" | "Activity" | "System";
-const pages: Page[] = ["Ecosystem", "Data Soil", "Wallet Sensors", "Hypothesis Lab", "Indicator Forge", "Experiments", "Confidence Engine", "Execution + Risk", "Watchers + Alerts", "Graveyard", "Overview", "Discovery", "Candidates", "Shadow", "Active", "Portfolio", "Positions", "Activity", "System"];
+type Page = "Automated Science" | "Ecosystem" | "Data Soil" | "Wallet Sensors" | "Hypothesis Lab" | "Indicator Forge" | "Experiments" | "Confidence Engine" | "Execution + Risk" | "Watchers + Alerts" | "Graveyard" | "Overview" | "Discovery" | "Candidates" | "Shadow" | "Active" | "Portfolio" | "Positions" | "Activity" | "System";
+const pages: Page[] = ["Automated Science", "Ecosystem", "Data Soil", "Wallet Sensors", "Hypothesis Lab", "Indicator Forge", "Experiments", "Confidence Engine", "Execution + Risk", "Watchers + Alerts", "Graveyard", "Overview", "Discovery", "Candidates", "Shadow", "Active", "Portfolio", "Positions", "Activity", "System"];
 
 const money = (value: unknown) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(Number(value || 0));
 const percent = (value: unknown) => `${(Number(value || 0) * 100).toFixed(1)}%`;
@@ -99,6 +99,7 @@ export function App() {
       </header>
       <section className="paper-banner"><strong>PAPER POSITIONS ONLY</strong><span>Research and simulated execution only. No credentials, signing, order submission, or live-mode controls exist in this application.</span></section>
       {page === "Ecosystem" && <EcosystemPage navigate={(target) => setPage(target as Page)} />}
+      {page === "Automated Science" && <AutomatedSciencePage />}
       {page === "Data Soil" && <ScienceResourcePage endpoint="/api/science/health" title="Data Soil / Provenance" subtitle="Feature, database, storage, and archival evidence health." columns={[]} />}
       {page === "Wallet Sensors" && <ScienceResourcePage endpoint="/api/wallet-sensors" title="Wallet Sensors" subtitle="Wallets are behavioral sensors, never direct execution authorities." columns={["wallet", "evidence_confidence", "updated_at", "metrics"]} />}
       {page === "Hypothesis Lab" && <ScienceResourcePage endpoint="/api/hypotheses" title="Hypothesis Lab" subtitle="Immutable falsifiable propositions and declared test conditions." columns={["hypothesis_id", "version", "state", "registered_at", "config_hash", "definition"]} />}

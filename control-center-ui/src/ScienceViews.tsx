@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api } from "./api";
+import { api, post } from "./api";
 
 type Navigate = (page: string) => void;
 
@@ -18,6 +18,22 @@ export function EcosystemPage({ navigate }: { navigate: Navigate }) {
     <ScienceRail health={data?.health} />
   </div>;
 }
+
+export function AutomatedSciencePage() {
+  const [data, setData] = useState<any>(null); const [error, setError] = useState<string | null>(null); const [busy, setBusy] = useState(false);
+  const load = useCallback(() => { void api<any>("/api/science/automated").then((result) => { setData(result); setError(null); }).catch((cause) => setError(cause instanceof Error ? cause.message : "Unavailable")); }, []);
+  useEffect(() => { load(); }, [load]);
+  const control = async (path: string) => { setBusy(true); try { setData(await post<any>(path)); setError(null); } catch (cause) { setError(cause instanceof Error ? cause.message : "Control unavailable"); } finally { setBusy(false); } };
+  const queue = data?.queue?.states || {}; const counts = data?.counts || {}; const paused = Boolean(data?.worker_control?.paused);
+  return <div className="science-layout"><section className="panel span-8"><div className="toolbar"><div><span className="eyebrow">D.6 AUTOMATED SCIENCE</span><h2>Continuous learning loop</h2><p className="muted">Durable research automation only. This control changes queue processing, never live or mainnet authority.</p></div><div><button className="button minor" onClick={load} disabled={busy}>Refresh</button>{paused ? <button className="button positive" onClick={() => void control("/api/science/resume")} disabled={busy}>Resume Research</button> : <button className="button warning" onClick={() => void control("/api/science/pause")} disabled={busy}>Pause Research</button>}</div></div>
+    {error && <p className="empty-note science-message">Unavailable: {error}</p>}
+    <div className="metric-grid"><Metric label="Worker" value={paused ? "PAUSED" : "READY"} /><Metric label="Queued" value={String((queue.PENDING || 0) + (queue.RETRYABLE || 0))} /><Metric label="Leased" value={String(queue.LEASED || 0)} /><Metric label="Observations" value={String(counts.observations || 0)} /><Metric label="Features" value={String(counts.feature_values || 0)} /><Metric label="Forward resolved" value={`${counts.resolved_forward_predictions || 0}/${counts.forward_predictions || 0}`} /><Metric label="Indicators" value={String(counts.indicators || 0)} /><Metric label="Models" value={String(counts.models || 0)} /></div>
+    <section className="table-panel"><h3>Current loop</h3><div className="science-cycle">{["Observe", "Features", "Discover", "Historical", "Forward", "Promote", "Model", "Drift"].map((step, index, all) => <span key={step}>{step}{index < all.length - 1 && <b>↓</b>}</span>)}</div><p className="muted">{data?.scheduler || "Unavailable"}</p></section>
+    <div className="table-scroll"><table><thead><tr><th>Stage</th><th>State</th><th>Updated</th><th>Detail</th></tr></thead><tbody>{(data?.stage_health || []).map((item: any) => <tr key={item.stage}><td>{item.stage}</td><td>{item.state}</td><td>{item.updated_at}</td><td title={display(item.detail)}>{short(item.detail)}</td></tr>)}{!(data?.stage_health || []).length && <tr><td colSpan={4} className="empty">No worker stage has run yet.</td></tr>}</tbody></table></div>
+  </section><aside className="science-rail"><section className="panel"><span className="eyebrow">QUEUE TRUTH</span><h2>{paused ? "Paused" : "Durable"}</h2><dl className="metric-list">{Object.entries(queue).map(([state, count]) => <div key={state}><dt>{state}</dt><dd>{String(count)}</dd></div>)}</dl></section><section className="panel"><span className="eyebrow">RESOURCE STATE</span><dl className="metric-list"><div><dt>Hot free</dt><dd>{data?.resource_state?.hot_free_bytes ?? "—"} bytes</dd></div><div><dt>Cold archive</dt><dd>{data?.resource_state?.state || "Unavailable"}</dd></div><div><dt>Mode</dt><dd>{data?.execution_mode || "Unavailable"}</dd></div></dl></section></aside></div>;
+}
+
+function Metric({ label, value }: { label: string; value: string }) { return <div className="metric-card"><span>{label}</span><strong>{value}</strong></div>; }
 
 export function ScienceResourcePage({ endpoint, title, subtitle, columns, search }: { endpoint: string; title: string; subtitle: string; columns: string[]; search?: boolean }) {
   const [data, setData] = useState<any>(null); const [error, setError] = useState<string | null>(null); const [query, setQuery] = useState("");

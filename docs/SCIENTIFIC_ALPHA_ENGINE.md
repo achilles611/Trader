@@ -6,7 +6,14 @@ The D.5 scientific engine replaces the old wallet-score-to-copy mental model. A 
 
 ## Scientific loop
 
-`OBSERVE → DISCOVER → REGISTER → HISTORICAL TEST → FORWARD SHADOW → PROMOTE → DECIDE / EXECUTE → LEARN`
+`OBSERVE → FEATURES → DISCOVER → REGISTER → HISTORICAL TEST → FORWARD SHADOW → PROMOTE → MODEL → CALIBRATE → SHADOW DECIDE → DRIFT / LEARN`
+
+Phase D.6 supplies the durable SQLite queue and one long-lived worker that
+operates this loop incrementally. Public wallet and market observations are
+persisted with provenance, features/outcomes are immutable, and research jobs
+are fingerprinted so an old job cannot silently read future evidence. See
+[the D.6 operating guide](PHASE_D6_AUTOMATED_SCIENCE.md) for queue/restart,
+CLI, resource, calibration, and drift details.
 
 Features carry an ID, version, exact definition, units, source inputs, freshness requirements, missing-data semantics, timestamp, and code SHA. Existing semantic versions cannot be changed. Wallet sensors expose measurable short-horizon behavior (holding horizon, latency survivability, MAE/MFE, specialization, alpha half-life and evidence confidence) rather than calling wallet profit a trade probability.
 
@@ -42,3 +49,8 @@ The engine produces only simulation/shadow decisions. The frozen `ExecutionEngin
 - `science_read_model.py`: read-only Control Center projection.
 
 Run `python main.py copy-storage-status` to check storage, `copy-storage-migrate --source <legacy.sqlite3>` for a verified SQLite migration, and `copy-archive-flush` from a background/archive schedule only. Never call cold archival flushing from a decision or reconciliation path.
+
+Run `python main.py science run` for the single continuous D.6 worker or
+`science run-once` for a bounded tick. These commands can produce only
+simulation/shadow scientific decisions; no mode or UI control adds live
+authority.

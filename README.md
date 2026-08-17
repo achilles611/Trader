@@ -21,6 +21,7 @@ and models before emitting only shadow/simulation decisions.
 cd E:\Beelzebub
 .\.venv\Scripts\python.exe -m pip install -r requirements.lock
 .\.venv\Scripts\python.exe main.py copy-storage-status
+.\.venv\Scripts\python.exe main.py science run-once
 .\.venv\Scripts\python.exe main.py copy-control-center --with-watcher
 ```
 
@@ -32,6 +33,7 @@ external venues.
 
 - [Copy-trading architecture](docs/COPYTRADING.md)
 - [Scientific Alpha Engine](docs/SCIENTIFIC_ALPHA_ENGINE.md)
+- [Phase D.6 automated science](docs/PHASE_D6_AUTOMATED_SCIENCE.md)
 - [Windows storage topology](docs/STORAGE_TOPOLOGY_WINDOWS.md)
 - [Control Center](docs/COPYTRADING_CONTROL_CENTER.md)
 

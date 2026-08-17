@@ -1379,6 +1379,18 @@ def create_control_center_app(
     async def api_science_ecosystem() -> dict[str, Any]:
         return center.science.ecosystem()
 
+    @app.get("/api/science/automated")
+    async def api_science_automated() -> dict[str, Any]:
+        return center.science.automated()
+
+    @app.post("/api/science/pause")
+    async def api_science_pause(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        return center.science.pause_automated_worker(str((payload or {}).get("reason") or "operator requested scientific pause"))
+
+    @app.post("/api/science/resume")
+    async def api_science_resume() -> dict[str, Any]:
+        return center.science.resume_automated_worker()
+
     @app.get("/api/wallet-sensors")
     async def api_wallet_sensors() -> dict[str, Any]:
         return center.science.wallet_sensors()
