@@ -280,6 +280,33 @@ class ScientificExecutionConfig:
 
 
 @dataclass(frozen=True)
+class ScientificWorkerConfig:
+    """Bounded, paper/shadow-only automation parameters for Phase D.6."""
+
+    enabled: bool = True
+    poll_interval_seconds: float = 1.0
+    lease_seconds: float = 30.0
+    max_batch_size: int = 64
+    max_attempts: int = 3
+    max_worker_threads: int = 1
+    max_proposals_per_family_per_cycle: int = 4
+    max_registered_per_family_per_day: int = 12
+    max_historical_tests_per_cycle: int = 8
+    max_forward_shadow_candidates: int = 8
+    max_active_candidate_models: int = 3
+    minimum_sample: int = 12
+    minimum_effect_size: float = 0.0001
+    maximum_q_value: float = 0.05
+    minimum_forward_observations: int = 5
+    minimum_forward_net_expectancy: float = 0.0
+    minimum_edge: float = 0.0001
+    drift_minimum_observations: int = 20
+    drift_net_expectancy_floor: float = 0.0
+    minimum_hot_free_bytes: int = 1_073_741_824
+    horizons_seconds: tuple[int, ...] = (15, 30, 60, 120, 180, 300, 600)
+
+
+@dataclass(frozen=True)
 class CopyTradeConfig:
     mode: str = "paper"
     live_enabled: bool = False
@@ -298,6 +325,7 @@ class CopyTradeConfig:
     analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     scientific_execution: ScientificExecutionConfig = field(default_factory=ScientificExecutionConfig)
+    scientific_worker: ScientificWorkerConfig = field(default_factory=ScientificWorkerConfig)
     artifacts: ArtifactConfig = field(default_factory=ArtifactConfig)
     targets: tuple[dict[str, Any], ...] = ()
     config_path: Path = Path("config/copytrade.yaml")
@@ -330,6 +358,7 @@ class CopyTradeConfig:
         analysis = _section(document, "analysis")
         storage = _section(document, "storage")
         scientific_execution = _section(document, "scientific_execution")
+        scientific_worker = _section(document, "scientific_worker")
         artifacts = _section(document, "artifacts")
         database = _section(document, "database")
         obsidian = _section(document, "obsidian")
@@ -403,6 +432,9 @@ class CopyTradeConfig:
                 }
             ),
             scientific_execution=ScientificExecutionConfig(**scientific_execution),
+            scientific_worker=ScientificWorkerConfig(
+                **{**scientific_worker, "horizons_seconds": tuple(scientific_worker.get("horizons_seconds", ScientificWorkerConfig().horizons_seconds))}
+            ),
             artifacts=ArtifactConfig(
                 **{
                     **artifacts,
@@ -490,6 +522,20 @@ class CopyTradeConfig:
             raise ValueError("scientific_execution.max_position_age_seconds must be in (0, 600].")
         if not 0 <= self.scientific_execution.exit_effective_confidence < self.scientific_execution.entry_min_effective_confidence <= 1:
             raise ValueError("scientific execution confidence thresholds must provide entry/exit hysteresis.")
+        worker = self.scientific_worker
+        if worker.poll_interval_seconds <= 0 or worker.lease_seconds <= 0 or worker.max_batch_size <= 0 or worker.max_attempts <= 0:
+            raise ValueError("scientific worker polling, lease, batch, and retry bounds must be positive.")
+        if worker.max_worker_threads <= 0 or worker.max_worker_threads > 8:
+            raise ValueError("scientific worker thread count must be between 1 and 8.")
+        if min(worker.max_proposals_per_family_per_cycle, worker.max_registered_per_family_per_day,
+               worker.max_historical_tests_per_cycle, worker.max_forward_shadow_candidates,
+               worker.max_active_candidate_models, worker.minimum_sample,
+               worker.minimum_forward_observations, worker.drift_minimum_observations) <= 0:
+            raise ValueError("scientific worker research budgets and sample gates must be positive.")
+        if not 0 <= worker.maximum_q_value <= 1 or worker.minimum_effect_size < 0 or worker.minimum_edge < 0:
+            raise ValueError("scientific worker statistical and edge gates are invalid.")
+        if worker.minimum_hot_free_bytes <= 0 or not worker.horizons_seconds or any(not 0 < horizon <= 600 for horizon in worker.horizons_seconds):
+            raise ValueError("scientific worker storage and horizon bounds are invalid.")
         if not 0 <= self.analysis.high_suitability_score <= 100:
             raise ValueError("analysis.high_suitability_score must be in [0, 100].")
         if self.analysis.market_evidence_bucket_seconds <= 0:
