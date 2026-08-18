@@ -126,11 +126,36 @@ verification rebind current D evidence and independently replay membership,
 features, and outcomes in one immediate transaction. The standalone no-trading
 operator surface is `python main.py materialization {plan,build,status,verify,reproduce,list}`.
 
+## E.3 outcome-blind hypothesis generation
+
+E.3 is the next frozen scientific boundary. It verifies E.2 at its trust
+boundary, then derives a small versioned family of typed predicates from only
+the frozen training predictor artifacts. Its SQLite authorizer allow-lists
+membership, feature, sampling-design, and materialization metadata; outcome
+artifacts, outcome missingness, experiment results, legacy D.6 discovery, and
+performance relations are structurally unavailable to the generator.
+
+An immutable hypothesis family predeclares feature references, predicate
+operators, threshold policy, exact horizon, comparator, test plan, support and
+coverage rules, budgets, duplicate semantics, and multiple-testing-family
+rule. `FIXED_THRESHOLD_V1`, `SIGN_SPLIT_V1`, and nearest-rank
+`TRAIN_QUANTILE_V1` are deterministic predictor-only policies. Candidate
+ordering and budget selection use scientific structure only, never a label or
+performance statistic.
+
+E.3 freezes its complete candidate universe (and durable suppression evidence)
+before mapping eligible candidates to immutable E.1 hypotheses. The E.3
+proposal preserves E.2 fingerprints, typed predicate, threshold provenance,
+training support, missingness, correction-family identity, and E.1 mapping.
+Append-only lifecycle evidence reconciles the projection and manifest so a
+forged COMPLETE status cannot be trusted. E.3 has no prediction, signal,
+execution, or capital authority. See `PHASE_E3_HYPOTHESIS_GENERATION.md`.
+
 ## Roadmap
 
 - E.1 — frozen scientific experiment foundation.
 - E.2 — deterministic scientific materialization and sampling.
-- E.3 — narrow falsifiable hypothesis generation.
+- E.3 — outcome-blind, train-only, frozen hypothesis generation.
 - E.4 — historical experimentation over frozen E.2 artifacts.
 - E.5 — robustness, FDR, regime validation, and walk-forward gates.
 - E.6 — inspectable confidence accumulation, contradiction, and decay.
