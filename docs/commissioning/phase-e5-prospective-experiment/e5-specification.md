@@ -6,7 +6,11 @@ Scientific baseline: `ee990643ea096e32f97c6177b4b1a165241d05e7`
 
 Protocol: `e5-protocol-v1.json`
 
-Status at this document revision: methodology implementation complete; immutable protocol identity is assigned by the final freeze commit. No E.5 acquisition has started.
+Protocol ID: `e5p-ae597d81614b76feba54168141de6a73`
+
+Protocol hash: `ae597d81614b76feba54168141de6a738876107639213a56a1c1aaa21c17c27f`
+
+Status at this document revision: methodology frozen; no E.5 acquisition has started.
 
 ## 1. Purpose and frozen history
 

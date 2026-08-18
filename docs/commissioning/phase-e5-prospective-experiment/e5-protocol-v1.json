@@ -1,0 +1,228 @@
+{
+  "admissibility": {
+    "cross_block_wallet_transaction_endpoint_campaign_or_exposure_edges": 0,
+    "failure_semantics": "NO_EFFECT_ESTIMATE_P_VALUE_CI_OR_BOOTSTRAP_HAS_AUTHORITY",
+    "local_time_window_seconds": 30,
+    "maximum_sampling_weight_ratio": 5.0,
+    "maximum_shares": {
+      "block": 0.05,
+      "complement_block": 0.05,
+      "component": 0.05,
+      "contrast_information": 0.05,
+      "endpoint_family": 0.025,
+      "local_time_window": 0.025,
+      "predicate_block": 0.05,
+      "symbol": 0.1,
+      "wallet": 0.01
+    },
+    "minimum_support": {
+      "blocks": 48,
+      "effective_blocks": 40.0,
+      "effective_blocks_per_arm": 40.0,
+      "effective_contrast_blocks": 40.0,
+      "effective_symbols": 12.0,
+      "mixed_blocks": 40,
+      "observations": 600,
+      "observations_per_arm": 240
+    },
+    "ordering": [
+      "protocol_integrity",
+      "maturity",
+      "missingness",
+      "dependence",
+      "concentration",
+      "effective_support",
+      "inference"
+    ]
+  },
+  "authority": {
+    "execution": false,
+    "prediction": false,
+    "signal": false,
+    "trading": false
+  },
+  "estimand": {
+    "formula": "sum_g q_g*(mean_w(Y|P,g)-mean_w(Y|notP,g))/sum_g q_g; q_g=W1g*W0g/(W1g+W0g)",
+    "interpretation": "observational within-session association, not randomized treatment effect",
+    "name": "DESIGN_WEIGHTED_COMMON_WITHIN_BLOCK_PREDICATE_MINUS_COMPLEMENT_MEAN_V1",
+    "practical_effect_floor": 0.001
+  },
+  "experimental_unit": {
+    "claim": "approximately independent market-session replicate after design exclusions",
+    "connected_components": "DIAGNOSTIC_AND_GATE_ONLY_NOT_RESAMPLING_UNITS",
+    "cross_block_dependence": "FAIL_CLOSED",
+    "primary_unit": "ONE_PRECOMMITTED_SEPARATED_30_MINUTE_MARKET_SESSION_BLOCK_V1",
+    "within_block_dependence": "UNRESTRICTED_RETAINED_BY_ONE_CLUSTER_MULTIPLIER"
+  },
+  "historical_compatibility": {
+    "e4_materializations_eligible": false,
+    "e4_rows_eligible": false,
+    "synthetic_fixture_namespace": "SYNTHETIC_E5_ONLY_NEVER_PRODUCTION"
+  },
+  "hypothesis_family": {
+    "comparator": "PREDICATE_COMPLEMENT_WITHIN_EACH_PRIMARY_BLOCK",
+    "family_id": "WALLET_ACTION_SIGN_PROSPECTIVE_V1",
+    "family_membership": "EXACT_TWO_MEMBERS_FROZEN_NO_REMOVAL",
+    "family_version": 1,
+    "members": [
+      {
+        "hypothesis_id": "wallet-action-gt-zero",
+        "ordinal": 0,
+        "predicate": "wallet_action@1 GT 0"
+      },
+      {
+        "hypothesis_id": "wallet-action-lt-zero",
+        "ordinal": 1,
+        "predicate": "wallet_action@1 LT 0"
+      }
+    ],
+    "outcome_blind_origin": "FROZEN_E3_WALLET_ACTION_SIGN_CONTROL_FAMILY"
+  },
+  "identity": {
+    "code_commit": "c8adc82020afc0e6ca4e4a28c09d8e75120abcd4",
+    "configuration_hashes": {
+      "admissibility": "bound-in-protocol-hash",
+      "inference": "bound-in-protocol-hash",
+      "sampling": "bound-in-protocol-hash"
+    },
+    "created_at": "2026-08-18T15:43:00Z",
+    "frozen_at": "2026-08-18T15:43:09Z",
+    "hash_algorithm": "PHASE_E_TYPE_TAGGED_SHA256_V1",
+    "protocol_hash": "ae597d81614b76feba54168141de6a738876107639213a56a1c1aaa21c17c27f",
+    "protocol_id": "e5p-ae597d81614b76feba54168141de6a73",
+    "schema_version": "phase-e5-prospective-protocol-v1"
+  },
+  "inference": {
+    "alternative": "ESTIMAND_DIFFERS_FROM_ZERO",
+    "base_seed": 550017,
+    "bootstrap_weights": "WEBB_SIX_POINT_MEAN_ZERO_UNIT_VARIANCE_V1",
+    "canonical_block_order": "PRIMARY_BLOCK_HASH_ASCENDING_V1",
+    "cluster_unit": "FROZEN_PRIMARY_MARKET_SESSION_BLOCK",
+    "confidence_interval": "EQUAL_TAILED_BOOTSTRAP_T_TYPE7_QUANTILES_V1",
+    "confidence_level": 0.95,
+    "degenerate_variance": "INFERENCE_REFUSED",
+    "direction": "TWO_SIDED",
+    "method": "RESTRICTED_STUDENTIZED_WILD_CLUSTER_BOOTSTRAP_T_LOCO_V1",
+    "minimum_valid_replication_fraction": 0.99,
+    "model": "DESIGN_WEIGHTED_BLOCK_FIXED_EFFECTS_WITH_COMMON_PREDICATE_SLOPE_V1",
+    "null": "WITHIN_BLOCK_PREDICATE_MINUS_COMPLEMENT_ESTIMAND_EQUALS_ZERO",
+    "p_value": "PLUS_ONE_ABSOLUTE_BOOTSTRAP_T_EXCEEDANCE_V1",
+    "replications": 9999,
+    "restriction": "BLOCK_FIXED_EFFECTS_ONLY_UNDER_NULL",
+    "seed_derivation": "SHA256_PROTOCOL_HASH_HYPOTHESIS_ID_BASE_SEED_V1",
+    "singleton_clusters": "ALLOWED_ONLY_IF_ALL_GLOBAL_SUPPORT_AND_LEVERAGE_GATES_PASS",
+    "studentization": "DELETE_ONE_PRIMARY_BLOCK_JACKKNIFE_EACH_DRAW_V1",
+    "unequal_clusters": "ALLOWED_ONLY_WITHIN_FROZEN_CONCENTRATION_ENVELOPE"
+  },
+  "lifecycle": {
+    "first_admission_irreversibly_locks_protocol": true,
+    "initial_state": "FROZEN_NOT_STARTED",
+    "semantic_change_requires_successor": true,
+    "successor_naming": "phase-e5-prospective-protocol-v2-or-later"
+  },
+  "missingness": {
+    "correction": "NONE_COMPLETE_RESOLUTION_REQUIRED_V1",
+    "ipw_authorized": false,
+    "mature_missing_action": "FAMILY_WIDE_MISSINGNESS_GATE_FAILED",
+    "maximum_unresolved_concentration": 0.0,
+    "overall_minimum_resolution_rate": 1.0,
+    "per_block_minimum_resolution_rate": 1.0,
+    "per_graph_density_stratum_minimum_resolution_rate": 1.0,
+    "per_liquidity_stratum_minimum_resolution_rate": 1.0,
+    "per_symbol_minimum_resolution_rate": 1.0,
+    "per_time_stratum_minimum_resolution_rate": 1.0,
+    "sensitivity_bound_authorized": false
+  },
+  "multiplicity": {
+    "decision": "ADJUSTED_P_AT_MOST_ALPHA_AND_ABS_EFFECT_AT_LEAST_PRACTICAL_FLOOR",
+    "denominator": 2,
+    "family_alpha": 0.05,
+    "family_change_after_freeze": "FORBIDDEN",
+    "method": "HOLM_BONFERRONI_FWER_V1",
+    "unevaluable_member_p_value": 1.0
+  },
+  "outcome": {
+    "definition": "PROSPECTIVE_SIGNED_NET_RETURN_FROM_ANCHOR_TO_FIRST_QUALIFYING_TRADE_PRINT_V1",
+    "economic_window": "ANCHOR_THROUGH_ACTUAL_QUALIFYING_PRINT_AT_ANCHOR_PLUS_5_TO_10_SECONDS",
+    "horizon_seconds": 5,
+    "ingestion_grace_seconds": 120,
+    "late_evidence": "STALE_NOT_REOPENED_PROTOCOL_INTEGRITY_REVIEW_REQUIRED",
+    "maturity": "ANCHOR_PLUS_10_SECONDS_PLUS_120_SECOND_INGESTION_GRACE",
+    "maximum_resolution_lag_seconds": 10
+  },
+  "protected_data": {
+    "debug_outcome_exposure_before_inference": false,
+    "logging_outcome_exposure_before_inference": false,
+    "maximum_reserved_test_queries": 0,
+    "outcome_repository": "SEPARATE_CAPABILITY_SEALED_UNTIL_ELIGIBLE_FOR_INFERENCE_V1",
+    "prefreeze_evaluation_outcome_reads": 0,
+    "selection_repository": "PREDICTOR_SIDE_CAPABILITY_ONLY_V1",
+    "ui_outcome_exposure_before_inference": false
+  },
+  "protocol_version": 1,
+  "replay": {
+    "canonicalization": "PHASE_E_TYPE_TAGGED_SHA256_V1",
+    "required_hashes": [
+      "protocol",
+      "family",
+      "experimental_unit",
+      "block_schedule",
+      "observations",
+      "admissibility",
+      "dependence_diagnostics",
+      "bootstrap_distribution",
+      "ordered_results"
+    ],
+    "rng_replay": "IDENTICAL_PROTOCOL_HYPOTHESIS_BASE_SEED_AND_CANONICAL_BLOCK_ORDER",
+    "row_order_invariance": true
+  },
+  "sampling": {
+    "eligible_hours": "ALL_UTC_HOURS_AS_SELECTED_BY_FROZEN_HASHED_SCHEDULE",
+    "observation_rule": "FIRST_ELIGIBLE_WALLET_EVENT_PER_BLOCK_WITH_60S_WALLET_COOLDOWN_V1",
+    "post_start_adaptation": "FORBIDDEN_EXCEPT_RULES_EXPLICITLY_ENCODED_HERE",
+    "schedule": {
+      "acquisition_start": "2026-09-01T00:00:00Z",
+      "algorithm": "HASHED_SLOT_WITHIN_FIXED_8DAY_EPOCH_V1",
+      "block_count": 60,
+      "epoch_seconds": 691200,
+      "hard_stop": "2027-12-25T00:00:00Z",
+      "minimum_separation_seconds": 604800,
+      "replacement_blocks": 0,
+      "sample_duration_seconds": 1800,
+      "schedule_seed": 550017,
+      "slot_seconds": 1800,
+      "slots_per_epoch_prefix": 47
+    },
+    "selection_inputs": "PREDICTOR_AND_ACQUISITION_METADATA_AVAILABLE_AT_ANCHOR_ONLY",
+    "source_partition": "NEW_E5_PROSPECTIVE_ONLY",
+    "symbol_eligibility": {
+      "lookback_24h_minimum_prints": 172800,
+      "lookback_30m_maximum_interprint_gap_seconds": 2,
+      "lookback_30m_minimum_prints": 3600,
+      "outcome_or_postanchor_fields": "FORBIDDEN",
+      "rule": "PREANCHOR_CONTINUOUS_TRADE_LIQUIDITY_V1",
+      "source": "AUTHORITATIVE_PHASE_D_MARKET_TRADE_TIMESTAMPS_ONLY",
+      "source_discontinuity_allowed": false
+    },
+    "wallet_cohort_count": 4,
+    "wallet_cohort_salt": "BEELZEBUB_E5_V1_WALLET_COHORT_FIXED_BEFORE_ACQUISITION",
+    "wallet_rule": "HASH_COHORT_MATCH_AND_FIRST_ADMITTED_BLOCK_ONLY_V1"
+  },
+  "schema": "phase-e5-prospective-protocol-v1",
+  "scientific_history": {
+    "phase_d": "FROZEN",
+    "phase_e1": "FROZEN",
+    "phase_e2": "FROZEN",
+    "phase_e3": "FROZEN",
+    "phase_e4_1_review_commit": "ee990643ea096e32f97c6177b4b1a165241d05e7",
+    "phase_e4_v1": "PERMANENTLY_INCONCLUSIVE"
+  },
+  "stopping": {
+    "block_target": 60,
+    "effect_or_p_value_monitoring": "FORBIDDEN",
+    "hard_stop": "2027-12-25T00:00:00Z",
+    "replacement_or_extension": "FORBIDDEN",
+    "rule": "FIXED_60_SCHEDULED_8DAY_EPOCH_BLOCKS_AND_FIXED_HARD_STOP_V1",
+    "terminal_insufficient_support": "INCONCLUSIVE_NO_EXTENSION"
+  }
+}

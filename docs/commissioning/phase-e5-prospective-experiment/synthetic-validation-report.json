@@ -1,0 +1,38 @@
+{
+  "accepted": true,
+  "fixture_namespace": "SYNTHETIC_E5_ONLY_NEVER_PRODUCTION",
+  "null_acceptance_limit": 0.06949358868961793,
+  "protocol_hash": "ae597d81614b76feba54168141de6a738876107639213a56a1c1aaa21c17c27f",
+  "protocol_id": "e5p-ae597d81614b76feba54168141de6a73",
+  "scenarios": [
+    {
+      "confidence_interval_coverage": 0.95,
+      "rejection_rate": 0.046,
+      "rejections": 23,
+      "replications": 999,
+      "scenario": "independent-null",
+      "trials": 500,
+      "true_effect": 0.0
+    },
+    {
+      "confidence_interval_coverage": 0.96,
+      "rejection_rate": 0.038,
+      "rejections": 19,
+      "replications": 999,
+      "scenario": "heterogeneous-heavy-tail-null",
+      "trials": 500,
+      "true_effect": 0.0
+    },
+    {
+      "confidence_interval_coverage": 0.946,
+      "rejection_rate": 1.0,
+      "rejections": 500,
+      "replications": 999,
+      "scenario": "independent-true-effect",
+      "trials": 500,
+      "true_effect": 0.5
+    }
+  ],
+  "schema": "phase-e5-synthetic-validation-v1",
+  "validation_hash": "e99a544128a712bc450a7508f68498f24698c25df5f623c88e6c3b05edb34a02"
+}

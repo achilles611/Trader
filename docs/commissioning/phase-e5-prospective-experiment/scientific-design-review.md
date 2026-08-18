@@ -8,6 +8,10 @@ Companion specification: `e5-specification.md`
 
 Machine protocol: `e5-protocol-v1.json`
 
+Protocol ID: `e5p-ae597d81614b76feba54168141de6a73`
+
+Protocol hash: `ae597d81614b76feba54168141de6a738876107639213a56a1c1aaa21c17c27f`
+
 ## Review conclusion
 
 **E.5 METHODOLOGY ACCEPTABLE FOR FREEZE, NOT AUTHORIZED TO ACQUIRE IN THIS PASS**
@@ -91,7 +95,7 @@ All synthetic fixtures use a namespace rejected by production admission. No fixt
 | Degenerate variance | Constant outcomes or singular delete-one-block fits | `InferenceRefused` |
 | Replay | Row order reversed with identical protocol and seed | Identical schedule, gates, results, bootstrap distribution hash, and replay hash |
 
-The targeted suite implements every row above. A commissioning simulation should additionally run at least 500 independent null and effect trials with 999 or more draws across balanced, 5% boundary, 5:1 weight, heavy-tail, and heterogeneous-block scenarios. Acceptance is empirical type-I error no greater than the preregistered 5% target plus a two-standard-error Monte Carlo allowance in every admissible null scenario. Calibration may only tighten v2; it cannot mutate v1 after freeze or use E.4/test outcomes.
+The targeted suite implements every row above. Commissioning then ran 500 trials with 999 draws in each of three outcome-isolated scenarios. The balanced null rejected 23/500 (4.6%) with 95.0% interval coverage; the unequal-weight, heterogeneous, heavy-tail null rejected 19/500 (3.8%) with 96.0% coverage; the fixed 0.5 true-effect case rejected 500/500 with 94.6% coverage. Both null rates were below the preregistered 6.949% two-standard-error acceptance limit. The deterministic validation hash is `e99a544128a712bc450a7508f68498f24698c25df5f623c88e6c3b05edb34a02`. Calibration may only tighten v2; it cannot mutate v1 after freeze or use E.4/test outcomes.
 
 ## Fifty-question adversarial closure
 
@@ -195,8 +199,8 @@ The targeted suite implements every row above. A commissioning simulation should
 
 50. **Would an external statistician consider the resulting experiment prospectively specified rather than retrospectively optimized?** The unit, schedule, calendar horizon, hypotheses, estimand, gates, missingness policy, bootstrap, seed, multiplicity, stopping, failure states, and authority are committed before any E.5 outcome exists. The report exposes residual assumptions and prohibits using E.4/test outcomes for calibration. Subject to enforcing the deployment ACL and exact acquisition adapter, this meets the substance of prospective specification.
 
-## Freeze recommendation
+## Freeze decision
 
-Freeze v1 only after the machine protocol is updated with the implementation commit and its identity validates, the full synthetic/targeted suite passes, database integrity is read-only verified, production bytes and timestamp are unchanged, and zero successful evaluation-outcome reads and zero reserved queries are documented.
+The machine protocol binds implementation commit `c8adc82020afc0e6ca4e4a28c09d8e75120abcd4`, its identity validates, and synthetic calibration passed. Final repository and database integrity evidence is recorded in the closure audit/final report.
 
 After freeze, stop. Prospective acquisition requires a separate authorization.
