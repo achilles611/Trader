@@ -15,9 +15,10 @@ from typing import Any, Sequence
 from .materialization import (
     ALL_ELIGIBLE_V1,
     DETERMINISTIC_HASH_V1,
-    TIME_STRATIFIED_HASH_V1,
+    TIME_STRATIFIED_HASH_V2,
     EligibilitySpec,
     MaterializationSpec,
+    OutcomeResolutionSpec,
     PhaseEMaterializer,
     StratificationSpec,
 )
@@ -61,11 +62,12 @@ def _spec(args: argparse.Namespace, materializer: PhaseEMaterializer) -> Materia
     algorithm = args.sampling_algorithm
     sample_size = None if algorithm == ALL_ELIGIBLE_V1 else args.sample_size
     stratification = (StratificationSpec("UTC_TIME_BUCKET", args.stratify_bucket_seconds)
-                      if algorithm == TIME_STRATIFIED_HASH_V1 else StratificationSpec())
+                      if algorithm == TIME_STRATIFIED_HASH_V2 else StratificationSpec())
     return MaterializationSpec(
         source_universe=universe, partition=partition, eligibility=eligibility, required_features=features,
         outcome_horizon=OutcomeHorizon(args.horizon_seconds), sampling_algorithm=algorithm,
         sampling_seed=args.seed, target_count=sample_size, tier=args.tier, purpose=args.purpose,
+        outcome_resolution=OutcomeResolutionSpec(maximum_lag_seconds=args.outcome_maximum_lag_seconds),
         stratification=stratification,
     )
 
@@ -83,12 +85,14 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--kind", action="append", default=None, help="Eligible anchor kind; repeatable (default: WALLET_FILL).")
         command.add_argument("--feature", action="append", default=[], help="Required D feature: feature_id@version[:lookback_seconds].")
         command.add_argument("--horizon-seconds", type=int, default=5, help="Declared E.1 outcome horizon in seconds.")
-        command.add_argument("--sampling-algorithm", choices=(ALL_ELIGIBLE_V1, DETERMINISTIC_HASH_V1, TIME_STRATIFIED_HASH_V1), default=DETERMINISTIC_HASH_V1)
+        command.add_argument("--sampling-algorithm", choices=(ALL_ELIGIBLE_V1, DETERMINISTIC_HASH_V1, TIME_STRATIFIED_HASH_V2), default=DETERMINISTIC_HASH_V1)
         command.add_argument("--sample-size", type=int, default=10_000, help="Requested count; ignored by ALL_ELIGIBLE_V1.")
         command.add_argument("--seed", type=int, default=0, help="Immutable deterministic sampling seed.")
         command.add_argument("--tier", default="PILOT", help="Predeclared infrastructure tier label.")
         command.add_argument("--purpose", default="operator_requested_materialization", help="Predeclared non-evaluative purpose label.")
-        command.add_argument("--stratify-bucket-seconds", type=int, help="Required only for TIME_STRATIFIED_HASH_V1.")
+        command.add_argument("--stratify-bucket-seconds", type=int, help="Required only for TIME_STRATIFIED_HASH_V2.")
+        command.add_argument("--outcome-maximum-lag-seconds", type=int, default=5,
+                             help="Maximum allowed delay after the declared horizon for the first same-symbol trade print.")
         return command
 
     specification_command("plan", "Inspect the full source universe and outcome-blind materialization estimate.")

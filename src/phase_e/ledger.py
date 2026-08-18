@@ -337,6 +337,8 @@ class PhaseELedger:
                 documented_pre_interval_anomaly = (
                     coverage_integers["timestamp_anomalies"] == 1
                     and first < begin <= last < finish
+                    and (begin - first).total_seconds() <= 1.0
+                    and str(row["d_source_name"]).split(":", 1)[0] == "hyperliquid_hypercore_node_fills_by_block"
                 )
                 if not in_interval and not documented_pre_interval_anomaly:
                     raise ValueError("Coverage event timestamps fall outside the end-exclusive corpus interval.")

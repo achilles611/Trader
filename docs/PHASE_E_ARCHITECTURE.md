@@ -76,22 +76,38 @@ writes only `phase_e_materialization*` tables. It does not change a
 
 The original D.7 snapshot's observation fingerprint deliberately covers the
 256 D.6 commissioning anchors. E.2 validates that frozen snapshot/coverage,
-then derives a separate E-owned fingerprint over every immutable
+then derives a separate E-owned V2 full-row fingerprint over every immutable
 `HISTORICAL_OFFICIAL_ARCHIVE` observation in the same end-exclusive interval.
-The full retained evidence is therefore reachable without revising D.
+The full retained evidence is therefore reachable without revising D. Parsed,
+fixed-width UTC keys prevent whole/fractional-second text-order errors.
+
+For the official historical archive, D's `normalized_at` is the canonical UTC
+form of source `event_at`; E.2 verifies their instant equality and uses that
+event time for partitions, ordering, lookbacks, and horizons. `received_at` is
+the acquisition clock and belongs to a separate future live/prospective
+contract, not retrospective E.2.
 
 An immutable E.2 specification binds D provenance, full source fingerprint,
 E.1 partition/horizon/lookback, features, eligibility, sampling
-algorithm/version and seed, tier, causal stratification, missing-data policy,
-and materializer code/config versions. It freezes membership before it reads
-or attaches an outcome. Missing data is an explicit artifact, never a member
-deletion or replacement.
+algorithm/version and seed, tier/purpose audit namespace, causal
+stratification, outcome-resolution semantics, missing-data policy, and
+materializer code/config versions. It freezes membership and an immutable
+sampling-design artifact before it reads or attaches an outcome. Missing data
+is an explicit artifact, never a member deletion or replacement.
 
 `ALL_ELIGIBLE_V1`, `DETERMINISTIC_HASH_V1`, and
-`TIME_STRATIFIED_HASH_V1` are initial immutable algorithms. Time buckets use
-only information known at the anchor. Final member order is always normalized
-timestamp plus observation ID, independent of database return order or worker
-timing.
+`TIME_STRATIFIED_HASH_V2` are the current immutable algorithms. Time buckets
+use only event time known at the anchor; V2 uses seeded remainder assignment
+and deterministic backfill, then records per-partition/per-stratum population,
+selection, inclusion-probability, and sampling-weight metadata. Final member
+order is event time plus observation ID, independent of database return order
+or worker timing. `TIME_STRATIFIED_HASH_V1` remains readable only for legacy
+artifacts because its lexical remainder allocation could bias early buckets.
+
+Features cannot cross a partition start or the bound source universe. Outcomes
+use the anchor fill price and first same-symbol official-archive trade at or
+after the exact endpoint within an explicit versioned maximum lag and before
+the split end. Sparse or malformed evidence remains a reasoned missing artifact.
 
 ```mermaid
 stateDiagram-v2
@@ -104,9 +120,11 @@ stateDiagram-v2
     VERIFYING --> COMPLETE
 ```
 
-Every E.2 read reconciles projection state against append-only events, frozen
-membership, artifact counts, and hashes. The standalone no-trading operator
-surface is `python main.py materialization {plan,build,status,verify,reproduce,list}`.
+Every E.2 read reconciles projection state against exact append-only lifecycle
+events, frozen membership/design, artifact counts, and hashes. Completion and
+verification rebind current D evidence and independently replay membership,
+features, and outcomes in one immediate transaction. The standalone no-trading
+operator surface is `python main.py materialization {plan,build,status,verify,reproduce,list}`.
 
 ## Roadmap
 

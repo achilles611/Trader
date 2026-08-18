@@ -275,6 +275,13 @@ class PhaseE1ScientificFoundationTests(unittest.TestCase):
         with self.assertRaises(CorpusProvenanceError):
             self.ledger.resolve_phase_d_corpus("corpus-d7-unexplained-anomaly")
 
+        self._record_corpus(
+            fingerprint="corpus-d7-overbroad-pre-interval", timestamp_anomalies=1,
+            first_event_at="2026-08-16T23:59:58Z",
+        )
+        with self.assertRaises(CorpusProvenanceError):
+            self.ledger.resolve_phase_d_corpus("corpus-d7-overbroad-pre-interval")
+
     def test_coverage_recomputation_timestamp_does_not_rewrite_frozen_snapshot_evidence(self) -> None:
         before = self.ledger.resolve_phase_d_corpus(CORPUS)
         with closing(sqlite3.connect(self.path)) as connection:
