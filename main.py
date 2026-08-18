@@ -15,4 +15,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "hypothesis-generation":
         from src.phase_e.generation_cli import generation_main
         raise SystemExit(generation_main(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "hypothesis-evaluation":
+        from src.phase_e.evaluation_cli import main as evaluation_main
+        raise SystemExit(evaluation_main(sys.argv[2:]))
     raise SystemExit(copytrade_main())
