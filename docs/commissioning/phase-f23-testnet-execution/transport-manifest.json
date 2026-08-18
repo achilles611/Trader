@@ -1,0 +1,16 @@
+{
+  "schema": "phase-f3-hyperliquid-testnet-transport-manifest-v1",
+  "adapter_identity": "phase-f3-hyperliquid-testnet-v1",
+  "adapter_version": 1,
+  "official_sdk": "hyperliquid-python-sdk==0.24.0",
+  "supported_venue": "HYPERLIQUID",
+  "mode": "TESTNET_ONLY",
+  "allowed_host": "https://api.hyperliquid-testnet.xyz",
+  "execution_domain": "HYPERLIQUID_TESTNET",
+  "account_identity_reference": "runtime:HYPERLIQUID_TESTNET_ACCOUNT_ADDRESS",
+  "signer_type": "API_WALLET",
+  "secret_reference": "runtime:HYPERLIQUID_TESTNET_API_WALLET_PRIVATE_KEY",
+  "mainnet_authority": false,
+  "withdrawal_capability": false,
+  "transfer_capability": false
+}

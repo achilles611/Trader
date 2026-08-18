@@ -3,6 +3,8 @@ PyYAML>=6.0.2
 python-dotenv>=1.0.1
 requests>=2.32.3
 websockets>=13.0
+# Phase F.3 delegates all Hyperliquid action signing to the official SDK.
+hyperliquid-python-sdk==0.24.0
 fastapi>=0.115.0
 uvicorn>=0.30.0
 # Required by the documented HyperCore requester-pays S3 + .lz4 discovery path.

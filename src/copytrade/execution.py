@@ -510,18 +510,16 @@ class ExecutionEngine:
         safety_context: ExecutionSafetyContext | None = None, *, execution_domain: str | None = None,
         execution_account_id: str | None = None,
     ) -> None:
-        if adapter.adapter_mode not in {"SIMULATOR_ONLY", "HYPERLIQUID_TESTNET"}:
-            raise ValueError("Execution adapter mode is not commissioned by Phase D.")
+        if adapter.adapter_mode != "SIMULATOR_ONLY":
+            raise ValueError("The frozen ExecutionEngine remains SIMULATOR_ONLY.")
         if execution_domain is None:
-            execution_domain = "SIMULATOR" if adapter.adapter_mode == "SIMULATOR_ONLY" else "HYPERLIQUID_TESTNET"
+            execution_domain = "SIMULATOR"
         if execution_account_id is None:
             execution_account_id = "SIMULATOR:default" if execution_domain == "SIMULATOR" else None
         if not execution_account_id:
             raise ValueError("An explicit Phase D execution account identity is required.")
-        if adapter.adapter_mode == "SIMULATOR_ONLY" and execution_domain not in {"SIMULATOR", "LANE_II_SIMULATOR"}:
+        if execution_domain not in {"SIMULATOR", "LANE_II_SIMULATOR"}:
             raise ValueError("Simulator adapters may only serve a commissioned simulator execution domain.")
-        if adapter.adapter_mode == "HYPERLIQUID_TESTNET" and execution_domain != "HYPERLIQUID_TESTNET":
-            raise ValueError("The Hyperliquid testnet adapter may only serve HYPERLIQUID_TESTNET.")
         self.store, self.adapter, self.risk_gate = store, adapter, risk_gate or D0ExecutionRiskGate()
         self.execution_domain = execution_domain
         self.execution_account_id = execution_account_id
@@ -621,6 +619,20 @@ class ExecutionEngine:
             return self.resume_intent(intent_id, context=context, fault_hook=fault_hook)
         if context.hard_transport_stop:
             return intent
+        if intent.exposure_effect is ExposureEffect.INCREASE:
+            transport_health = getattr(self.adapter, "entry_transport_health", None)
+            if callable(transport_health):
+                healthy, reason = transport_health()
+                if not healthy:
+                    evidence = {"adapter_name": self.adapter.adapter_name, "transport_health": reason}
+                    self.store.record_execution_risk_decision(ExecutionRiskDecision(
+                        decision_id=stable_id("phase_d_transport_health_decision", intent_id, reason),
+                        intent_id=intent_id, allowed=False, reason=reason, evaluated_at=utc_now(), evidence=evidence,
+                    ))
+                    return self.store.transition_execution_intent(
+                        intent_id, ExecutionState.BLOCKED, reason=reason,
+                        source="transport_health_gate", raw_evidence=evidence,
+                    )
         # Re-check volatile account safety at the adapter boundary.  An intent
         # can be READY from an earlier admission while new reconciliation or
         # integrity evidence arrives; that earlier approval must never authorize
@@ -663,14 +675,18 @@ class ExecutionEngine:
         except AmbiguousSubmissionError as exc:
             return self.store.transition_execution_intent(
                 intent_id, ExecutionState.SUBMISSION_UNKNOWN, reason="submission_unknown_timeout",
-                source="adapter", raw_evidence={"error": str(exc), "client_order_id": submission.client_order_id},
+                source="adapter", raw_evidence={
+                    "error_class": type(exc).__name__, "client_order_id": submission.client_order_id,
+                },
             )
         except Exception as exc:
             # At this boundary failure is ambiguous unless an adapter returns
             # authoritative venue rejection evidence.
             return self.store.transition_execution_intent(
                 intent_id, ExecutionState.SUBMISSION_UNKNOWN, reason="submission_unknown_adapter_error",
-                source="adapter", raw_evidence={"error": str(exc), "client_order_id": submission.client_order_id},
+                source="adapter", raw_evidence={
+                    "error_class": type(exc).__name__, "client_order_id": submission.client_order_id,
+                },
             )
         self._checkpoint(fault_hook, "before_local_ack_persistence")
         return self._apply_venue_order(intent, submission, order, source="submit_ack", fault_hook=fault_hook)
@@ -690,7 +706,7 @@ class ExecutionEngine:
         except Exception as exc:
             return self.store.transition_execution_intent(
                 intent_id, ExecutionState.RECONCILIATION_REQUIRED, reason="cancel_outcome_unknown", source="adapter",
-                raw_evidence={"error": str(exc)},
+                raw_evidence={"error_class": type(exc).__name__},
             )
         return self._apply_venue_order(intent, submission, order, source="cancel_ack", fault_hook=fault_hook)
 
@@ -715,7 +731,8 @@ class ExecutionEngine:
             self.store.record_execution_reconciliation_item(
                 reconciliation_run_id=run_id, item_id=stable_id("phase_d_reconcile_item", run_id, "adapter_error"),
                 item_type="order", state=ReconciliationState.INCOMPLETE.value, reason="reconciliation_adapter_error",
-                intent_id=intent_id, submission_id=submission.submission_id, venue={"error": str(exc)}, recorded_at=now,
+                intent_id=intent_id, submission_id=submission.submission_id,
+                venue={"error_class": type(exc).__name__}, recorded_at=now,
             )
             self.store.complete_execution_reconciliation(run_id, state=ReconciliationState.INCOMPLETE.value, completed_at=now)
             if intent.state is ExecutionState.SUBMITTING:
@@ -784,7 +801,7 @@ class ExecutionEngine:
             self.store.record_execution_reconciliation_item(
                 reconciliation_run_id=run_id, item_id=stable_id("phase_d_reconcile_item", run_id, "adapter_error"),
                 item_type="position", state=ReconciliationState.INCOMPLETE.value, reason="reconciliation_adapter_error",
-                local={"positions": local}, venue={"error": str(exc)}, recorded_at=now,
+                local={"positions": local}, venue={"error_class": type(exc).__name__}, recorded_at=now,
             )
             self.store.complete_execution_reconciliation(
                 run_id, state=ReconciliationState.INCOMPLETE.value, completed_at=now,
@@ -831,7 +848,7 @@ class ExecutionEngine:
             self.store.record_execution_reconciliation_item(
                 reconciliation_run_id=run_id, item_id=stable_id("phase_d_reconcile_item", run_id, "partial"),
                 item_type="position", state=ReconciliationState.INCOMPLETE.value, reason="reconciliation_interrupted",
-                local={"positions": local}, venue={"error": str(exc)}, recorded_at=now,
+                local={"positions": local}, venue={"error_class": type(exc).__name__}, recorded_at=now,
             )
             self.store.complete_execution_reconciliation(
                 run_id, state=ReconciliationState.INCOMPLETE.value, completed_at=now,
@@ -869,7 +886,7 @@ class ExecutionEngine:
             self.store.record_execution_reconciliation_item(
                 reconciliation_run_id=run_id, item_id=stable_id("phase_d_reconcile_item", run_id, "observation_error"),
                 item_type="open_order", state=ReconciliationState.INCOMPLETE.value, reason=reason,
-                venue={"error": str(exc)}, recorded_at=now,
+                venue={"error_class": type(exc).__name__}, recorded_at=now,
             )
             self.store.complete_execution_reconciliation(
                 run_id, state=ReconciliationState.INCOMPLETE.value, completed_at=now, evidence={"reason": reason},
@@ -937,7 +954,7 @@ class ExecutionEngine:
             self.store.record_execution_reconciliation_item(
                 reconciliation_run_id=run_id, item_id=stable_id("phase_d_reconcile_item", run_id, "verification_error"),
                 item_type="verified_flat", state=ReconciliationState.INCOMPLETE.value, reason=reason,
-                local={"positions": local}, venue={"error": str(exc)}, recorded_at=now,
+                local={"positions": local}, venue={"error_class": type(exc).__name__}, recorded_at=now,
             )
             self.store.complete_execution_reconciliation(
                 run_id, state=ReconciliationState.INCOMPLETE.value, completed_at=now, evidence={"reason": reason},
@@ -981,6 +998,39 @@ class ExecutionEngine:
                 "local_positions": local, "venue_positions": venue_positions,
                 "open_orders": len(active_orders), "unresolved_submissions": len(unresolved),
                 "open_order_reconciliation_run_id": open_order_observation["reconciliation_run_id"]}
+
+    def startup_reconcile(self, *, fault_hook: Any = None) -> dict[str, Any]:
+        """Rebuild venue truth before a networked adapter may accept entries."""
+        active_states = {
+            ExecutionState.SUBMITTING, ExecutionState.SUBMISSION_UNKNOWN, ExecutionState.ACKNOWLEDGED,
+            ExecutionState.PARTIALLY_FILLED, ExecutionState.CANCEL_PENDING,
+            ExecutionState.RECONCILIATION_REQUIRED,
+        }
+        repaired: list[str] = []
+        for intent in self.store.list_execution_intents(states=active_states):
+            if (
+                intent.execution_domain == self.execution_domain
+                and intent.execution_account_id == self.execution_account_id
+            ):
+                self.reconcile_intent(intent.intent_id, fault_hook=fault_hook)
+                repaired.append(intent.intent_id)
+        positions = self.reconcile_positions(fault_hook=fault_hook)
+        orders = self.reconcile_open_orders()
+        matched = (
+            positions["state"] in {ReconciliationState.MATCHED.value, ReconciliationState.VERIFIED_FLAT.value}
+            and orders["state"] == ReconciliationState.MATCHED.value
+        )
+        if matched:
+            mark_reconciled = getattr(self.adapter, "mark_startup_reconciled", None)
+            if callable(mark_reconciled):
+                mark_reconciled()
+        return {
+            "state": ReconciliationState.MATCHED.value if matched else ReconciliationState.INCOMPLETE.value,
+            "positions": positions,
+            "open_orders": orders,
+            "reconciled_intent_ids": repaired,
+            "entries_eligible": matched,
+        }
 
     def _apply_venue_order(
         self, intent: ExecutionIntent, submission: ExecutionSubmission, order: VenueOrder, *, source: str,
@@ -1076,3 +1126,27 @@ class ExecutionEngine:
     def _checkpoint(fault_hook: Any, checkpoint: str) -> None:
         if fault_hook:
             fault_hook(checkpoint)
+
+
+class HyperliquidTestnetExecutionEngine(ExecutionEngine):
+    """Additive F.3 coordinator that cannot weaken the frozen simulator engine."""
+
+    def __init__(
+        self, store: CopyTradeDatabase, adapter: ExecutionAdapter,
+        risk_gate: D0ExecutionRiskGate | None = None,
+        safety_context: ExecutionSafetyContext | None = None,
+        *, execution_account_id: str,
+    ) -> None:
+        if adapter.adapter_mode != "HYPERLIQUID_TESTNET":
+            raise ValueError("HyperliquidTestnetExecutionEngine requires HYPERLIQUID_TESTNET.")
+        if not execution_account_id or execution_account_id in {"SIMULATOR:default", "HYPERLIQUID:default"}:
+            raise ValueError("An explicit Hyperliquid testnet execution account identity is required.")
+        adapter_account = getattr(adapter, "execution_account_id", None)
+        if adapter_account is not None and adapter_account != execution_account_id:
+            raise ValueError("Hyperliquid testnet adapter and engine account identities do not match.")
+        self.store = store
+        self.adapter = adapter
+        self.risk_gate = risk_gate or D0ExecutionRiskGate()
+        self.execution_domain = "HYPERLIQUID_TESTNET"
+        self.execution_account_id = execution_account_id
+        self.safety_context = safety_context
