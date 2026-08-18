@@ -39,6 +39,14 @@ closing check/use races. Changed coverage counters/details, observation count,
 feature definition, snapshot content, malformed numeric values, or reused
 fingerprints fail closed.
 
+`science_data_coverage.computed_at` may change when D recomputes the same
+coverage projection. It is operational timing metadata, not rewritten source
+evidence: E.1 retains the snapshot-time coverage payload while requiring every
+semantic coverage field to match current D state. The only accepted nonzero
+timestamp anomaly is the documented single D.7 event before the requested
+interval; the frozen start-inclusive/end-exclusive corpus interval excludes
+that event. In-interval or ambiguous anomalies fail closed.
+
 Partitions use start-inclusive/end-exclusive intervals. Each split gap covers
 the outcome horizon, maximum declared feature lookback, purge, and embargo.
 Feature references forbid lookforward, outcome anchors must be contained in

@@ -302,7 +302,7 @@ class PhaseELedger:
             if (coverage_integers["expected_hours"] <= 0
                     or coverage_integers["verified_hours"] != coverage_integers["expected_hours"]
                     or coverage_integers["parsed_hours"] != coverage_integers["expected_hours"]
-                    or any(coverage_integers[name] != 0 for name in ("missing_hours", "malformed_hours", "timestamp_anomalies"))):
+                    or any(coverage_integers[name] != 0 for name in ("missing_hours", "malformed_hours"))):
                 raise ValueError("PROVEN_COMPLETE coverage has contradictory completeness counters.")
             features_raw = self._load_phase_d(row["feature_versions_json"], "feature versions")
             if not isinstance(features_raw, list):
@@ -325,10 +325,23 @@ class PhaseELedger:
             last_event_at = None if row["d_last_event_at"] is None else normalized_utc(str(row["d_last_event_at"]))
             if (first_event_at is None) != (last_event_at is None):
                 raise ValueError("Coverage must provide both first and last event timestamps or neither.")
-            if first_event_at is not None and not (
-                _instant(interval_start) <= _instant(first_event_at) <= _instant(last_event_at) < _instant(interval_end)
-            ):
-                raise ValueError("Coverage event timestamps fall outside the end-exclusive corpus interval.")
+            if first_event_at is not None:
+                first, last = _instant(first_event_at), _instant(last_event_at)
+                begin, finish = _instant(interval_start), _instant(interval_end)
+                in_interval = begin <= first <= last < finish
+                # D.7 retains a documented source event immediately before
+                # the requested interval as provenance.  That row is not a
+                # corpus member under the frozen end-exclusive interval rule.
+                # Permit only this exact, auditable boundary form; any other
+                # anomaly remains an integrity failure.
+                documented_pre_interval_anomaly = (
+                    coverage_integers["timestamp_anomalies"] == 1
+                    and first < begin <= last < finish
+                )
+                if not in_interval and not documented_pre_interval_anomaly:
+                    raise ValueError("Coverage event timestamps fall outside the end-exclusive corpus interval.")
+                if in_interval and coverage_integers["timestamp_anomalies"] != 0:
+                    raise ValueError("Coverage reports an unexplained in-interval timestamp anomaly.")
         except (KeyError, TypeError, ValueError) as exc:
             raise CorpusProvenanceError(f"Phase D corpus snapshot has malformed provenance: {exc}") from exc
         coverage_record = {
@@ -362,11 +375,27 @@ class PhaseELedger:
         for name, value in snapshot_columns.items():
             if payload.get(name) != value:
                 raise CorpusProvenanceError(f"Phase D corpus payload conflicts with immutable {name} provenance.")
-        if not isinstance(payload_coverage, Mapping) or dict(payload_coverage) != coverage_record:
-            raise CorpusProvenanceError("Phase D corpus payload does not exactly match its bound coverage record.")
+        if not isinstance(payload_coverage, Mapping):
+            raise CorpusProvenanceError("Phase D corpus payload lacks its bound coverage record.")
+        bound_coverage_record = dict(payload_coverage)
+        try:
+            bound_computed_at = normalized_utc(str(bound_coverage_record.get("computed_at")))
+        except ValueError as exc:
+            raise CorpusProvenanceError("Phase D corpus payload has an invalid bound coverage timestamp.") from exc
+        # ``science_data_coverage`` is a mutable current coverage projection.
+        # Its recomputation timestamp is operational metadata, while the
+        # snapshot payload retains the immutable coverage evidence at the
+        # moment the corpus was frozen.  Recalculation must not invalidate an
+        # otherwise byte-for-byte identical scientific source; every semantic
+        # coverage field remains exact and fail-closed.
+        current_semantic_coverage = {key: value for key, value in coverage_record.items() if key != "computed_at"}
+        bound_semantic_coverage = {key: value for key, value in bound_coverage_record.items() if key != "computed_at"}
+        if current_semantic_coverage != bound_semantic_coverage:
+            raise CorpusProvenanceError("Phase D corpus payload conflicts with current semantic coverage evidence.")
+        bound_coverage_record["computed_at"] = bound_computed_at
         if (_instant(interval_start) >= _instant(interval_end)
-                or coverage_record["interval_start"] != interval_start
-                or coverage_record["interval_end"] != interval_end):
+                or bound_coverage_record["interval_start"] != interval_start
+                or bound_coverage_record["interval_end"] != interval_end):
             raise CorpusProvenanceError("Phase D corpus and coverage intervals must match exactly and be ordered.")
         if not all(isinstance(value, str) and value for value in (row["observation_fingerprint"], row["code_sha"], row["config_sha"])):
             raise CorpusProvenanceError("Phase D corpus snapshot has missing provenance hashes.")
@@ -397,7 +426,7 @@ class PhaseELedger:
             raise CorpusProvenanceError("Phase D feature provenance is unavailable.") from exc
         source_snapshot = {
             "corpus_snapshot": payload,
-            "coverage": coverage_record,
+            "coverage": bound_coverage_record,
             "snapshot_columns": snapshot_columns,
             "feature_definitions": feature_definitions,
         }
@@ -411,7 +440,7 @@ class PhaseELedger:
             observation_fingerprint=str(row["observation_fingerprint"]),
             source_code_version=str(row["code_sha"]),
             source_config_hash=str(row["config_sha"]),
-            verified_observation_count=coverage_record["observation_count"],
+            verified_observation_count=bound_coverage_record["observation_count"],
             feature_versions=features,
             source_snapshot=source_snapshot,
             source_snapshot_hash=canonical_hash(source_snapshot),

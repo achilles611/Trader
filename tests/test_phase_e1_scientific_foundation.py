@@ -189,7 +189,8 @@ class PhaseE1ScientificFoundationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def _record_corpus(self, *, fingerprint: str = CORPUS, payload_observation_fingerprint: str = "observations-e1", coverage_state: str = "PROVEN_COMPLETE") -> None:
+    def _record_corpus(self, *, fingerprint: str = CORPUS, payload_observation_fingerprint: str = "observations-e1", coverage_state: str = "PROVEN_COMPLETE",
+                       timestamp_anomalies: int = 0, first_event_at: str = "2026-08-17T00:00:01Z") -> None:
         self.phase_d.register_feature(
             "wallet_action", 1, {"source": "normalized_fill", "transform": "identity"},
             created_at=NOW, code_sha="d7-data-ignition-v1",
@@ -208,8 +209,8 @@ class PhaseE1ScientificFoundationTests(unittest.TestCase):
             "parsed_hours": 1,
             "observation_count": 25,
             "duplicate_count": 0,
-            "timestamp_anomalies": 0,
-            "first_event_at": "2026-08-17T00:00:01Z",
+            "timestamp_anomalies": timestamp_anomalies,
+            "first_event_at": first_event_at,
             "last_event_at": "2026-08-17T00:59:59Z",
             "wallet_attribution_quality": "official_per_fill",
             "market_evidence_availability": "trade_print_only",
@@ -260,6 +261,27 @@ class PhaseE1ScientificFoundationTests(unittest.TestCase):
             with self.assertRaises(sqlite3.DatabaseError):
                 connection.execute("DELETE FROM phase_e_experiment_events")
         self.assertEqual(len(self.ledger.events(registered["experiment_id"])), 3)
+
+    def test_documented_pre_interval_timestamp_anomaly_is_excluded_not_treated_as_corpus_corruption(self) -> None:
+        self._record_corpus(
+            fingerprint="corpus-d7-boundary-anomaly", timestamp_anomalies=1,
+            first_event_at="2026-08-16T23:59:59.892000Z",
+        )
+        provenance = self.ledger.resolve_phase_d_corpus("corpus-d7-boundary-anomaly")
+        self.assertEqual(provenance.coverage_state, "PROVEN_COMPLETE")
+        self.assertEqual(provenance.interval_start, "2026-08-17T00:00:00Z")
+
+        self._record_corpus(fingerprint="corpus-d7-unexplained-anomaly", timestamp_anomalies=1)
+        with self.assertRaises(CorpusProvenanceError):
+            self.ledger.resolve_phase_d_corpus("corpus-d7-unexplained-anomaly")
+
+    def test_coverage_recomputation_timestamp_does_not_rewrite_frozen_snapshot_evidence(self) -> None:
+        before = self.ledger.resolve_phase_d_corpus(CORPUS)
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute("UPDATE science_data_coverage SET computed_at=? WHERE coverage_id=?", ("2026-08-17T03:00:00Z", "coverage-" + CORPUS))
+            connection.commit()
+        after = self.ledger.resolve_phase_d_corpus(CORPUS)
+        self.assertEqual(canonical_hash(before.payload()), canonical_hash(after.payload()))
 
     def test_missing_or_corrupt_d_provenance_fails_closed_before_registration(self) -> None:
         with self.assertRaises(CorpusProvenanceError):

@@ -89,3 +89,22 @@ E.1 may be frozen only while all targeted and complete repository tests pass,
 the D diff remains empty, and the final Git working tree is clean. Scalable
 materialization must implement the frozen interval/lookback/lookforward and
 outcome-containment contract; it must not reinterpret it.
+
+## E.2 commissioning integrity correction
+
+Real D.7 commissioning exposed two narrow resolver assumptions that rejected
+the frozen evidence for operational rather than scientific changes. D.7
+retains one documented source event immediately before the declared interval,
+counts it as a timestamp anomaly, and excludes it from the end-exclusive
+corpus. E.1 now accepts only that exact one-boundary form; in-interval,
+post-interval, multiple, or otherwise unexplained anomalies still fail closed.
+
+Separately, `science_data_coverage` is a mutable coverage projection and a
+later recomputation updates only `computed_at`. E.1 now preserves the immutable
+coverage payload embedded in the corpus snapshot while requiring every other
+coverage field to match current D state exactly. Counter, details, source,
+interval, feature, snapshot, or provenance drift remains a hard failure.
+
+Both corrections have E.1 regression coverage. They change no Phase D code or
+evidence and preserve the E.1 scientific contract; they make its provenance
+resolver correctly represent the documented frozen D.7 evidence.
