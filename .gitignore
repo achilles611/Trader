@@ -3,6 +3,7 @@ __pycache__/
 .env
 aws secret key.txt
 .venv/
+.venv*/
 artifacts/
 logs/
 state/

@@ -503,15 +503,28 @@ class PaperExecutionLedgerBridge:
 
 
 class ExecutionEngine:
-    """Durable Phase-D lifecycle coordinator over a strictly non-live adapter."""
+    """Durable Phase-D lifecycle coordinator over one explicit account scope."""
 
     def __init__(
         self, store: CopyTradeDatabase, adapter: ExecutionAdapter, risk_gate: D0ExecutionRiskGate | None = None,
-        safety_context: ExecutionSafetyContext | None = None,
+        safety_context: ExecutionSafetyContext | None = None, *, execution_domain: str | None = None,
+        execution_account_id: str | None = None,
     ) -> None:
-        if adapter.adapter_mode != "SIMULATOR_ONLY":
-            raise ValueError("Phase D.0 only accepts a SIMULATOR_ONLY execution adapter.")
+        if adapter.adapter_mode not in {"SIMULATOR_ONLY", "HYPERLIQUID_TESTNET"}:
+            raise ValueError("Execution adapter mode is not commissioned by Phase D.")
+        if execution_domain is None:
+            execution_domain = "SIMULATOR" if adapter.adapter_mode == "SIMULATOR_ONLY" else "HYPERLIQUID_TESTNET"
+        if execution_account_id is None:
+            execution_account_id = "SIMULATOR:default" if execution_domain == "SIMULATOR" else None
+        if not execution_account_id:
+            raise ValueError("An explicit Phase D execution account identity is required.")
+        if adapter.adapter_mode == "SIMULATOR_ONLY" and execution_domain not in {"SIMULATOR", "LANE_II_SIMULATOR"}:
+            raise ValueError("Simulator adapters may only serve a commissioned simulator execution domain.")
+        if adapter.adapter_mode == "HYPERLIQUID_TESTNET" and execution_domain != "HYPERLIQUID_TESTNET":
+            raise ValueError("The Hyperliquid testnet adapter may only serve HYPERLIQUID_TESTNET.")
         self.store, self.adapter, self.risk_gate = store, adapter, risk_gate or D0ExecutionRiskGate()
+        self.execution_domain = execution_domain
+        self.execution_account_id = execution_account_id
         # A caller may provide a current authority source at engine creation.
         # There is deliberately no permissive default when neither this nor a
         # per-call context is supplied.
@@ -520,10 +533,12 @@ class ExecutionEngine:
     def accept_signal(
         self, signal: CopySignal, *, accepted_at: object | None = None, provenance: dict[str, Any] | None = None,
     ) -> ExecutionIntent:
+        if self.execution_domain != "SIMULATOR" or self.execution_account_id != "SIMULATOR:default":
+            raise ValueError("Phase-C signals cannot be admitted into a Lane II or venue execution scope.")
         return self.store.create_or_get_execution_intent(
             ExecutionIntent.from_copy_signal(
-                signal, accepted_at=accepted_at, provenance=provenance, execution_domain="SIMULATOR",
-                execution_account_id="SIMULATOR:default",
+                signal, accepted_at=accepted_at, provenance=provenance, execution_domain=self.execution_domain,
+                execution_account_id=self.execution_account_id,
             )
         )
 
@@ -742,10 +757,12 @@ class ExecutionEngine:
         now = utc_now()
         run_id = stable_id("phase_d_reconcile_positions", now)
         self.store.start_execution_reconciliation(
-            run_id, scope="account_positions", started_at=now, execution_domain="SIMULATOR",
-            execution_account_id="SIMULATOR:default",
+            run_id, scope="account_positions", started_at=now, execution_domain=self.execution_domain,
+            execution_account_id=self.execution_account_id,
         )
-        local = self.store.phase_d_local_positions(execution_domain="SIMULATOR", execution_account_id="SIMULATOR:default")
+        local = self.store.phase_d_local_positions(
+            execution_domain=self.execution_domain, execution_account_id=self.execution_account_id,
+        )
         try:
             self._checkpoint(fault_hook, "before_reconciliation")
             venue_rows = self.adapter.get_positions()
@@ -800,8 +817,8 @@ class ExecutionEngine:
                 self.store.record_execution_position_observation(
                     observation_id=observation_id, reconciliation_run_id=run_id, symbol=symbol,
                     local_signed_quantity=expected, venue_signed_quantity=actual, state=state,
-                    observed_at=now, raw_evidence=raw, execution_domain="SIMULATOR",
-                    execution_account_id="SIMULATOR:default",
+                    observed_at=now, raw_evidence=raw, execution_domain=self.execution_domain,
+                    execution_account_id=self.execution_account_id,
                 )
                 self._checkpoint(fault_hook, "after_position_observation")
                 self.store.record_execution_reconciliation_item(
@@ -839,8 +856,8 @@ class ExecutionEngine:
         now = utc_now()
         run_id = stable_id("phase_d_reconcile_open_orders", now)
         self.store.start_execution_reconciliation(
-            run_id, scope="open_orders", started_at=now, execution_domain="SIMULATOR",
-            execution_account_id="SIMULATOR:default",
+            run_id, scope="open_orders", started_at=now, execution_domain=self.execution_domain,
+            execution_account_id=self.execution_account_id,
         )
         try:
             list_open_orders = getattr(self.adapter, "list_open_orders", None)
@@ -902,10 +919,12 @@ class ExecutionEngine:
         now = utc_now()
         run_id = stable_id("phase_d_verify_flat", now)
         self.store.start_execution_reconciliation(
-            run_id, scope="verified_flat", started_at=now, execution_domain="SIMULATOR",
-            execution_account_id="SIMULATOR:default",
+            run_id, scope="verified_flat", started_at=now, execution_domain=self.execution_domain,
+            execution_account_id=self.execution_account_id,
         )
-        local = self.store.phase_d_local_positions(execution_domain="SIMULATOR", execution_account_id="SIMULATOR:default")
+        local = self.store.phase_d_local_positions(
+            execution_domain=self.execution_domain, execution_account_id=self.execution_account_id,
+        )
         open_order_observation = self.reconcile_open_orders()
         try:
             self._checkpoint(fault_hook, "before_reconciliation")
@@ -926,7 +945,7 @@ class ExecutionEngine:
             return {"reconciliation_run_id": run_id, "state": ReconciliationState.INCOMPLETE.value, "reason": reason}
         venue_positions = {row.symbol: row.signed_quantity for row in venue_rows if abs(row.signed_quantity) > EPSILON}
         unresolved = self.store.execution_unresolved_submissions(
-            execution_domain="SIMULATOR", execution_account_id="SIMULATOR:default",
+            execution_domain=self.execution_domain, execution_account_id=self.execution_account_id,
         )
         active_orders = open_order_observation["active_orders"]
         failures: list[str] = []
@@ -1040,6 +1059,11 @@ class ExecutionEngine:
         intent = self.store.get_execution_intent(intent_id)
         if not intent:
             raise KeyError(f"Unknown Phase-D execution intent: {intent_id}")
+        if (
+            intent.execution_domain != self.execution_domain
+            or intent.execution_account_id != self.execution_account_id
+        ):
+            raise ValueError("Phase-D intent does not belong to this engine's execution scope.")
         return intent
 
     def _required_submission(self, intent_id: str) -> ExecutionSubmission:

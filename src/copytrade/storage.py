@@ -2746,7 +2746,9 @@ class CopyTradeDatabase:
                  iso(intent.updated_at or intent.accepted_at)),
             )
             self._append_phase_d_state_event(
-                connection, intent.intent_id, None, intent.state, "intent_accepted", "phase_c", intent.accepted_at, {},
+                connection, intent.intent_id, None, intent.state, "intent_accepted",
+                "lane_ii_bridge" if intent.provenance.get("lane_ii", {}).get("source") == "LANE_II" else "phase_c",
+                intent.accepted_at, {},
             )
         return intent
 
