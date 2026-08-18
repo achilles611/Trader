@@ -1,0 +1,35 @@
+{
+  "schema": "phase-f1-trader-v0-strategy-artifact-v1",
+  "strategy_id": "trader-v0",
+  "strategy_version": "1",
+  "authority_basis": "TRADER_V0_OPERATIONAL_SIMULATION_SHADOW_COMMISSIONING",
+  "scope": "SIMULATION_SHADOW_TRADE_INTENT_REQUEST_ONLY",
+  "allowed_input_sources": [
+    "CONFIGURATION_OR_RISK_POLICY",
+    "CURRENT_ACCOUNT_OR_EXECUTION_STATE",
+    "LIVE_PUBLIC_MARKET_DATA",
+    "LIVE_PUBLIC_WALLET_ACTIVITY",
+    "OPERATIONAL_INDICATOR"
+  ],
+  "decision_policy": {
+    "entry_effective_confidence": 0.6,
+    "entry_signal_ttl_seconds": 10.0,
+    "market_evidence_ttl_seconds": 10.0,
+    "require_positive_alpha_survival": true,
+    "require_positive_net_edge_after_friction": true,
+    "source_wallet_action_is_evidence_only": true
+  },
+  "exit_policy": {
+    "exit_effective_confidence": 0.52,
+    "maximum_position_age_seconds": 600.0,
+    "exit_on_hard_risk": true,
+    "exit_on_input_integrity_failure": true,
+    "exit_on_non_positive_net_edge": true,
+    "exit_on_regime_invalidation": true
+  },
+  "risk_policy": {
+    "maximum_requested_notional_ceiling": 1000.0,
+    "source_wallet_leverage_is_sizing_authority": false
+  },
+  "strategy_artifact_hash": "ec61fd3a2a71d6b6e6356f3fe9f89f0060c433432790213990dd3abcb15156c4"
+}

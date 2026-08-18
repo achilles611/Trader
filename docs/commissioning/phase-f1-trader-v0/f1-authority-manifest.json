@@ -1,0 +1,15 @@
+{
+  "schema": "phase-f1-trader-v0-commissioning-v1",
+  "f0_manifest_hash": "f2c4df16e2815278c500ff406090886b2a32eb53c0751a2c8e4086d7a381ee41",
+  "strategy_identity": "trader-strategy-f86f9ddcdbecd20bde686ee413e5cc66",
+  "strategy_artifact_hash": "ec61fd3a2a71d6b6e6356f3fe9f89f0060c433432790213990dd3abcb15156c4",
+  "records": [
+    {"owner": "TRADER_LANE", "capability": "EXECUTION", "state": "DENIED", "basis": "F1_TRADER_V0_HAS_NO_EXECUTION_AUTHORITY"},
+    {"owner": "TRADER_LANE", "capability": "LIVE_CAPITAL", "state": "DENIED", "basis": "F1_TRADER_V0_HAS_NO_LIVE_CAPITAL_AUTHORITY"},
+    {"owner": "TRADER_LANE", "capability": "PREDICTION", "state": "DENIED", "basis": "F1_TRADER_V0_HAS_NO_PREDICTION_AUTHORITY"},
+    {"owner": "TRADER_LANE", "capability": "SCIENTIFIC_EVALUATION", "state": "DENIED", "basis": "F1_TRADER_V0_HAS_NO_SCIENTIFIC_EVALUATION_AUTHORITY"},
+    {"owner": "TRADER_LANE", "capability": "SIGNAL", "state": "GRANTED", "basis": "TRADER_V0_OPERATIONAL_SIMULATION_SHADOW_COMMISSIONING"},
+    {"owner": "TRADER_LANE", "capability": "TRADING", "state": "DENIED", "basis": "F1_TRADER_V0_HAS_NO_TRADING_AUTHORITY"}
+  ],
+  "manifest_hash": "985844cf6ebd96499a3803a6955567d8f06e1ccf53a9e7282f6738d15e9bab48"
+}
