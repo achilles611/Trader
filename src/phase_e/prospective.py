@@ -335,6 +335,63 @@ def _wallet_cohort_checked(protocol: Mapping[str, Any], wallet_id: str) -> int:
 
 
 @dataclass(frozen=True)
+class SymbolEligibilitySnapshot:
+    eligible: bool
+    prior_24h_prints: int
+    prior_30m_prints: int
+    maximum_30m_interprint_gap_seconds: float | None
+    source_discontinuity: bool
+    snapshot_hash: str
+
+
+def preanchor_symbol_eligibility(
+    protocol: Mapping[str, Any], *, symbol: str, anchor_at: str,
+    trade_timestamps: Sequence[str], source_discontinuity: bool,
+) -> SymbolEligibilitySnapshot:
+    """Evaluate the exact frozen liquidity rule from timestamps strictly before the anchor."""
+    checked = validate_protocol_document(protocol)
+    if not isinstance(symbol, str) or not symbol:
+        raise ValueError("Symbol is required for eligibility.")
+    if not isinstance(source_discontinuity, bool):
+        raise ValueError("Source-discontinuity state must be a boolean.")
+    anchor = _utc(anchor_at)
+    instants = sorted(_utc(value) for value in trade_timestamps)
+    if any(item >= anchor for item in instants):
+        raise ProtocolIntegrityError("Pre-anchor symbol eligibility received post-anchor timestamps.")
+    start_24h = anchor - timedelta(hours=24)
+    start_30m = anchor - timedelta(minutes=30)
+    prior_24h = [item for item in instants if item >= start_24h]
+    prior_30m = [item for item in prior_24h if item >= start_30m]
+    boundaries = [start_30m, *prior_30m, anchor]
+    maximum_gap = (
+        max((right - left).total_seconds() for left, right in zip(boundaries, boundaries[1:]))
+        if len(boundaries) >= 2 else None
+    )
+    rule = checked["sampling"]["symbol_eligibility"]
+    eligible = (
+        len(prior_24h) >= int(rule["lookback_24h_minimum_prints"])
+        and len(prior_30m) >= int(rule["lookback_30m_minimum_prints"])
+        and maximum_gap is not None
+        and maximum_gap <= float(rule["lookback_30m_maximum_interprint_gap_seconds"])
+        and not source_discontinuity
+    )
+    payload = {
+        "schema": "phase-e5-preanchor-symbol-eligibility-v1",
+        "protocol_hash": checked["identity"]["protocol_hash"], "symbol": symbol,
+        "anchor_at": normalized_utc(anchor_at),
+        "timestamp_fingerprint": canonical_hash([normalized_utc(item.isoformat()) for item in prior_24h]),
+        "prior_24h_prints": len(prior_24h), "prior_30m_prints": len(prior_30m),
+        "maximum_30m_interprint_gap_seconds": maximum_gap,
+        "source_discontinuity": source_discontinuity, "eligible": eligible,
+    }
+    return SymbolEligibilitySnapshot(
+        eligible=eligible, prior_24h_prints=len(prior_24h), prior_30m_prints=len(prior_30m),
+        maximum_30m_interprint_gap_seconds=maximum_gap, source_discontinuity=source_discontinuity,
+        snapshot_hash=canonical_hash(payload),
+    )
+
+
+@dataclass(frozen=True)
 class DesignObservation:
     """Outcome-blind prospective membership and dependence metadata."""
 

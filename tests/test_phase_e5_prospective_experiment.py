@@ -32,6 +32,7 @@ from src.phase_e.prospective import (
     evaluate_admissibility,
     holm_adjust,
     load_frozen_protocol,
+    preanchor_symbol_eligibility,
     scheduled_blocks,
     scientific_replay_hash,
     validate_protocol_document,
@@ -319,6 +320,24 @@ class PhaseE5ProspectiveExperimentTests(unittest.TestCase):
             604800,
         )
         self.assertEqual(wallet_cohort(self.protocol, "wallet-x"), wallet_cohort(self.protocol, "wallet-x"))
+
+    def test_symbol_eligibility_is_exact_and_rejects_postanchor_metadata(self) -> None:
+        anchor = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        timestamps = [_utc_text(anchor - timedelta(seconds=0.5 * offset)) for offset in range(1, 172801)]
+        snapshot = preanchor_symbol_eligibility(
+            self.protocol, symbol="SYN", anchor_at=_utc_text(anchor), trade_timestamps=timestamps,
+            source_discontinuity=False,
+        )
+        self.assertTrue(snapshot.eligible)
+        self.assertEqual(snapshot.prior_24h_prints, 172800)
+        self.assertEqual(snapshot.prior_30m_prints, 3600)
+        self.assertEqual(snapshot.maximum_30m_interprint_gap_seconds, 0.5)
+        with self.assertRaisesRegex(ProtocolIntegrityError, "post-anchor"):
+            preanchor_symbol_eligibility(
+                self.protocol, symbol="SYN", anchor_at=_utc_text(anchor),
+                trade_timestamps=[*timestamps, _utc_text(anchor + timedelta(seconds=1))],
+                source_discontinuity=False,
+            )
 
     def test_checked_in_frozen_protocol_matches_implementation_contract(self) -> None:
         if not FROZEN_PROTOCOL.exists():
