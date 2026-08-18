@@ -1,0 +1,20 @@
+{
+  "schema": "phase-f0-lane-ii-authority-boundary-v1",
+  "version": "phase-f0-lane-ii-boundary-v1",
+  "records": [
+    {"owner": "PHASE_D_EXECUTION_SOVEREIGN", "capability": "EXECUTION", "state": "PHASE_D_SOVEREIGN", "basis": "PHASE_D_INDEPENDENT_RISK_SAFETY_AND_EXECUTION"},
+    {"owner": "SCIENTIFIC_LANE", "capability": "EXECUTION", "state": "DENIED", "basis": "SCIENTIFIC_LANE_HAS_NO_OPERATIONAL_AUTHORITY"},
+    {"owner": "SCIENTIFIC_LANE", "capability": "LIVE_CAPITAL", "state": "DENIED", "basis": "SCIENTIFIC_LANE_HAS_NO_OPERATIONAL_AUTHORITY"},
+    {"owner": "SCIENTIFIC_LANE", "capability": "PREDICTION", "state": "DENIED", "basis": "SCIENTIFIC_LANE_HAS_NO_OPERATIONAL_AUTHORITY"},
+    {"owner": "SCIENTIFIC_LANE", "capability": "SCIENTIFIC_EVALUATION", "state": "PROTOCOL_GATED", "basis": "E5_FROZEN_PROTOCOL_GATES_ONLY"},
+    {"owner": "SCIENTIFIC_LANE", "capability": "SIGNAL", "state": "DENIED", "basis": "SCIENTIFIC_LANE_HAS_NO_OPERATIONAL_AUTHORITY"},
+    {"owner": "SCIENTIFIC_LANE", "capability": "TRADING", "state": "DENIED", "basis": "SCIENTIFIC_LANE_HAS_NO_OPERATIONAL_AUTHORITY"},
+    {"owner": "TRADER_LANE", "capability": "EXECUTION", "state": "DENIED", "basis": "F0_NO_LANE_II_AUTHORITY_HAS_BEEN_COMMISSIONED"},
+    {"owner": "TRADER_LANE", "capability": "LIVE_CAPITAL", "state": "DENIED", "basis": "F0_NO_LANE_II_AUTHORITY_HAS_BEEN_COMMISSIONED"},
+    {"owner": "TRADER_LANE", "capability": "PREDICTION", "state": "DENIED", "basis": "F0_NO_LANE_II_AUTHORITY_HAS_BEEN_COMMISSIONED"},
+    {"owner": "TRADER_LANE", "capability": "SCIENTIFIC_EVALUATION", "state": "DENIED", "basis": "F0_NO_LANE_II_AUTHORITY_HAS_BEEN_COMMISSIONED"},
+    {"owner": "TRADER_LANE", "capability": "SIGNAL", "state": "DENIED", "basis": "F0_NO_LANE_II_AUTHORITY_HAS_BEEN_COMMISSIONED"},
+    {"owner": "TRADER_LANE", "capability": "TRADING", "state": "DENIED", "basis": "F0_NO_LANE_II_AUTHORITY_HAS_BEEN_COMMISSIONED"}
+  ],
+  "manifest_hash": "f2c4df16e2815278c500ff406090886b2a32eb53c0751a2c8e4086d7a381ee41"
+}
