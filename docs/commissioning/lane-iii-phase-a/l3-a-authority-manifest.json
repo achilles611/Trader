@@ -1,0 +1,25 @@
+{
+  "schema": "lane-iii-phase-a-constitutional-foundation-v1",
+  "version": "lane-iii-phase-a-v1",
+  "records": [
+    {"capability": "ACCESS_BROKER_ACCOUNT", "status": "DENIED", "basis": "L3_A_CONSTITUTIONAL_BOUNDARY"},
+    {"capability": "ACCESS_PROP_ACCOUNT", "status": "DENIED", "basis": "L3_A_CONSTITUTIONAL_BOUNDARY"},
+    {"capability": "CHANGE_HARD_RISK_LIMITS", "status": "DENIED", "basis": "L3_A_CONSTITUTIONAL_BOUNDARY"},
+    {"capability": "COMPUTE_CONFIDENCE", "status": "SEMANTICS_ONLY", "basis": "L3_A_CONSTITUTIONAL_BOUNDARY"},
+    {"capability": "CONSTRUCT_MARKET_HYPOTHESES", "status": "CONTRACT_ONLY", "basis": "L3_A_CONSTITUTIONAL_BOUNDARY"},
+    {"capability": "CONTROL_FOLLOWER_ACCOUNTS", "status": "DENIED", "basis": "L3_A_CONSTITUTIONAL_BOUNDARY"},
+    {"capability": "EXECUTE_FUTURES_ORDERS", "status": "DENIED", "basis": "L3_A_CONSTITUTIONAL_BOUNDARY"},
+    {"capability": "GENERATE_TRADE_SIGNALS", "status": "DENIED", "basis": "L3_A_CONSTITUTIONAL_BOUNDARY"},
+    {"capability": "LIVE_CAPITAL_AUTHORITY", "status": "DENIED", "basis": "L3_A_CONSTITUTIONAL_BOUNDARY"},
+    {"capability": "MODIFY_ACTIVE_STRATEGY_FROM_PNL", "status": "DENIED", "basis": "L3_A_CONSTITUTIONAL_BOUNDARY"},
+    {"capability": "MODIFY_LANE_II", "status": "DENIED", "basis": "L3_A_CONSTITUTIONAL_BOUNDARY"},
+    {"capability": "MODIFY_PHASE_E", "status": "DENIED", "basis": "L3_A_CONSTITUTIONAL_BOUNDARY"},
+    {"capability": "OBSERVE_DOM_RESTING_LIQUIDITY", "status": "ARCHITECTURE_ONLY", "basis": "L3_A_CONSTITUTIONAL_BOUNDARY"},
+    {"capability": "OBSERVE_MNQ_MARKET_DATA", "status": "ARCHITECTURE_ONLY", "basis": "L3_A_CONSTITUTIONAL_BOUNDARY"},
+    {"capability": "OBSERVE_OPTIONS_CONTEXT", "status": "ARCHITECTURE_ONLY", "basis": "L3_A_CONSTITUTIONAL_BOUNDARY"},
+    {"capability": "OVERRIDE_FLATTEN", "status": "DENIED", "basis": "L3_A_CONSTITUTIONAL_BOUNDARY"},
+    {"capability": "REQUEST_FUTURES_EXECUTION", "status": "CONTRACT_ONLY", "basis": "L3_A_CONSTITUTIONAL_BOUNDARY"},
+    {"capability": "SCIENTIFIC_AUTHORITY", "status": "DENIED", "basis": "L3_A_CONSTITUTIONAL_BOUNDARY"}
+  ],
+  "manifest_hash": "a0cf55741f1ba0db7d713dd3f8523257b82edb9b432367d470b715ea9126a8a9"
+}
