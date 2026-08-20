@@ -13,7 +13,7 @@ The architecture permits future order-flow, resting-liquidity, CRT, derivatives,
 | Item | Record |
 | --- | --- |
 | Branch | `codex/l3-a-constitutional-foundation` |
-| Final commit | `PENDING_FINAL_COMMIT` |
+| Implementation freeze commit | `fa685fc3a2cfe061f45b107df6835a795f9e7e06` |
 | Targeted L3-A test count | 22 passed |
 | Full backend test count | 381 passed; 1 pre-existing Phase F.3 import error (missing `hyperliquid` SDK); 382 run in 353.053s |
 | Phase D modifications | none |
