@@ -1,0 +1,119 @@
+{
+  "authority": "DIRECTIONAL_SIGNAL_ONLY",
+  "denied_authority": [
+    "ACCOUNT_SELECTION",
+    "BROKER_CONTACT",
+    "COPIER_CONTROL",
+    "EXECUTION_INTENT_CONSTRUCTION",
+    "HARD_RISK_OVERRIDE",
+    "LIVE_CAPITAL",
+    "ORDER_CONSTRUCTION",
+    "PHASE_E_MODIFICATION",
+    "POSITION_RECONCILIATION",
+    "POSITION_SIZING",
+    "SELF_MODIFICATION"
+  ],
+  "expected_l3c_configuration_hash": "7e731c61ed7a3b75209bbc31af149dde8185a3e2babb6f1a640952f9be7f250f",
+  "expected_l3c_version": "lane-iii-phase-c-v1",
+  "instrument": "MNQ",
+  "outputs": [
+    "NO_TRADE",
+    "LONG",
+    "SHORT",
+    "EXIT"
+  ],
+  "policy": {
+    "allowed_hypotheses": [
+      {
+        "direction": "BULLISH",
+        "kind": "REVERSAL"
+      },
+      {
+        "direction": "BEARISH",
+        "kind": "CONTINUATION"
+      }
+    ],
+    "confidence_semantics": "RELATIVE_SUPPORT_NOT_PROBABILITY",
+    "entry_dominance_margin": "0.10",
+    "entry_relative_support": "0.65",
+    "evidence_freshness_seconds": 30,
+    "hypothesis_freshness_seconds": 15,
+    "hypothesis_history_limit": 256,
+    "maximum_entry_hypothesis_age_seconds": 60,
+    "maximum_thesis_age_seconds": 120,
+    "minimum_entry_family_count": 3,
+    "minimum_retention_family_count": 2,
+    "reentry_cooldown_seconds": 30,
+    "required_entry_families": [
+      "STRUCTURAL_CONTEXT",
+      "ORDER_FLOW",
+      "RESTING_LIQUIDITY"
+    ],
+    "retention_dominance_margin": "0.03",
+    "retention_relative_support": "0.58",
+    "same_event_reversal": false,
+    "signal_ttl_seconds": 5,
+    "strategy_owned_position_truth": false,
+    "strategy_owned_sizing": false,
+    "version": "lane-iii-phase-d-v1"
+  },
+  "policy_semantics": {
+    "active_state_semantics": "STRATEGY_DECISION_STATE_NOT_POSITION_OR_FILL_TRUTH",
+    "active_thesis_qualified": "NO_TRADE_ACTIVE_THESIS_RETAINED",
+    "candidate_ranking": "RELATIVE_SUPPORT_DESC_THEN_HYPOTHESIS_ID_ASC",
+    "competition_scope": "EVERY_CURRENT_L3C_HYPOTHESIS_INCLUDING_UNAUTHORIZED",
+    "degraded_quality_exit_semantics": "STRATEGY_SIGNAL_ONLY_NOT_SOVEREIGN_FLATTEN",
+    "dependence_control": "CONSUME_EACH_L3C_FAMILY_CONTRIBUTION_ONCE_NEVER_RECOUNT_EVIDENCE",
+    "entry_conjunction": [
+      "ALL_DATA_QUALITY_FIELDS_HEALTHY",
+      "HYPOTHESIS_ARCHETYPE_ALLOWED",
+      "HYPOTHESIS_STATE_ACTIVE",
+      "NO_INVALIDATOR",
+      "NO_CONTRADICTORY_EVIDENCE_OR_FAMILY_CONTRIBUTION",
+      "HYPOTHESIS_AND_CONTRIBUTING_EVIDENCE_FRESH",
+      "RELATIVE_SUPPORT_AT_OR_ABOVE_ENTRY_THRESHOLD",
+      "LEAD_AT_OR_ABOVE_ENTRY_DOMINANCE_MARGIN",
+      "REQUIRED_POSITIVE_FAMILY_BREADTH",
+      "HYPOTHESIS_NOT_PREVIOUSLY_SIGNALED",
+      "EVENT_TIME_REENTRY_COOLDOWN_COMPLETE"
+    ],
+    "exit_precedence": [
+      "THESIS_MISSING",
+      "DATA_QUALITY_DEGRADED",
+      "THESIS_INVALIDATED",
+      "THESIS_EXPIRED",
+      "THESIS_MAXIMUM_AGE",
+      "DECISIVE_OPPOSING_HYPOTHESIS",
+      "BLOCKING_CONTRADICTION",
+      "CONFIDENCE_BELOW_RETENTION_THRESHOLD",
+      "RETENTION_FAMILY_BREADTH_LOST",
+      "RETENTION_DOMINANCE_LOST",
+      "HYPOTHESIS_OR_EVIDENCE_STALE"
+    ],
+    "opposing_entry_while_active": "EXIT_ONLY_NO_SAME_EVENT_REVERSAL",
+    "same_hypothesis_reentry": "PROHIBITED_WITH_BOUNDED_HISTORY",
+    "same_source_state_repeat": "RETURN_IDENTICAL_DECISION_ID",
+    "time_source": "L3C_EVALUATION_EVENT_TIME_ONLY"
+  },
+  "schema": "lane-iii-phase-d-trader-v0-strategy-artifact-v1",
+  "signal_contract_fields": [
+    "decision_id",
+    "strategy_identity",
+    "strategy_artifact_hash",
+    "decision",
+    "hypothesis_id",
+    "related_hypothesis_id",
+    "created_at",
+    "expires_at",
+    "relative_support_snapshot",
+    "family_summary",
+    "reason_code",
+    "l3c_snapshot_hash",
+    "data_quality_hash",
+    "source_state_hash"
+  ],
+  "strategy_artifact_hash": "9cc6526264ca340dbff8ca32f680d05563bed0e617c746c5af1bdceb4ccbc90a",
+  "strategy_id": "l3-trader-v0",
+  "strategy_identity": "l3-strategy-f6f549ced930c2b411b965984ffff555",
+  "strategy_version": "1"
+}
