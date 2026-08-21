@@ -14,9 +14,11 @@ import argparse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
+import logging
 import select
 import socket
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Iterable
@@ -112,6 +114,27 @@ class CommissioningSummary:
         }
 
 
+@dataclass(frozen=True)
+class NinjaTraderListenerRuntimeStatus:
+    """Sanitized status for the GUI-owned observation worker."""
+
+    state: str
+    host: str
+    port: int
+    error: str | None
+    start_attempts: int
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "state": self.state,
+            "host": self.host,
+            "port": self.port,
+            "error": self.error,
+            "start_attempts": self.start_attempts,
+            "authority": "OBSERVE_ONLY",
+        }
+
+
 class NinjaTraderCommissioningHarness:
     def __init__(
         self,
@@ -174,7 +197,7 @@ class NinjaTraderCommissioningHarness:
                 self.summary.reject(error)
         return self.summary
 
-    def run(self, duration_seconds: float) -> CommissioningSummary:
+    def run(self, duration_seconds: float, *, stop_event: threading.Event | None = None) -> CommissioningSummary:
         if duration_seconds <= 0:
             raise ValueError("Commissioning duration must be positive.")
         listener = self.bridge.open_listener()
@@ -198,7 +221,7 @@ class NinjaTraderCommissioningHarness:
                 self._mark(NinjaTraderHealthStream.LOCAL_BRIDGE, StreamHealth.DISCONNECTED)
 
         try:
-            while time.monotonic() < deadline:
+            while time.monotonic() < deadline and (stop_event is None or not stop_event.is_set()):
                 readable = [listener, *connections]
                 ready, _, _ = select.select(readable, [], [], min(0.25, deadline - time.monotonic()))
                 if not ready:
@@ -248,6 +271,136 @@ class NinjaTraderCommissioningHarness:
             # persisted commissioning report.
             self._mark(NinjaTraderHealthStream.LOCAL_BRIDGE, StreamHealth.DISCONNECTED)
         return self.summary
+
+    def run_until_stopped(self, stop_event: threading.Event) -> CommissioningSummary:
+        """Run the exact receiver loop used for commissioning until stopped."""
+        return self.run(365.0 * 24.0 * 60.0 * 60.0, stop_event=stop_event)
+
+
+class NinjaTraderListenerWorker:
+    """One managed, read-only GUI/runtime owner for the existing receiver loop."""
+
+    _STARTUP_TIMEOUT_SECONDS = 5.0
+    _SHUTDOWN_TIMEOUT_SECONDS = 5.0
+
+    def __init__(
+        self,
+        config: LoopbackBridgeConfig = LoopbackBridgeConfig(),
+        *,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        self.config = config
+        self._logger = logger or logging.getLogger(__name__)
+        self._lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._ready_event = threading.Event()
+        self._finished_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._harness: NinjaTraderCommissioningHarness | None = None
+        self._state = "NEW"
+        self._error: str | None = None
+        self._start_attempts = 0
+
+    def status(self) -> NinjaTraderListenerRuntimeStatus:
+        with self._lock:
+            return NinjaTraderListenerRuntimeStatus(
+                state=self._state,
+                host=self.config.host,
+                port=self.config.port,
+                error=self._error,
+                start_attempts=self._start_attempts,
+            )
+
+    def start(self, *, timeout_seconds: float = _STARTUP_TIMEOUT_SECONDS) -> NinjaTraderListenerRuntimeStatus:
+        """Start once, wait for a bind result, and never select an alternate port."""
+        if timeout_seconds <= 0:
+            raise ValueError("Listener startup timeout must be positive.")
+        with self._lock:
+            if self._state in {"STARTING", "LISTENING"}:
+                return self.status()
+            if self._thread is not None and self._thread.is_alive():
+                return self.status()
+            self._stop_event = threading.Event()
+            self._ready_event = threading.Event()
+            self._finished_event = threading.Event()
+            self._error = None
+            self._state = "STARTING"
+            self._start_attempts += 1
+            self._harness = NinjaTraderCommissioningHarness(
+                self.config, on_listener_started=self._listener_started,
+            )
+            self._thread = threading.Thread(
+                target=self._run,
+                name="NINJATRADER_OBSERVER",
+                daemon=False,
+            )
+            self._thread.start()
+        if not self._ready_event.wait(timeout_seconds):
+            with self._lock:
+                self._state = "FAILED"
+                self._error = "listener_start_timeout"
+            self._logger.error(
+                "NINJATRADER_OBSERVER FAILED %s:%s listener_start_timeout",
+                self.config.host,
+                self.config.port,
+            )
+            self.stop(timeout_seconds=self._SHUTDOWN_TIMEOUT_SECONDS)
+        return self.status()
+
+    def stop(self, *, timeout_seconds: float = _SHUTDOWN_TIMEOUT_SECONDS) -> NinjaTraderListenerRuntimeStatus:
+        """Request a clean receiver-loop exit and wait for its socket to close."""
+        if timeout_seconds <= 0:
+            raise ValueError("Listener shutdown timeout must be positive.")
+        with self._lock:
+            if self._state == "NEW":
+                self._state = "STOPPED"
+                return self.status()
+            self._stop_event.set()
+            thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout_seconds)
+        with self._lock:
+            if thread is not None and thread.is_alive():
+                self._state = "FAILED"
+                self._error = "listener_shutdown_timeout"
+                self._logger.error(
+                    "NINJATRADER_OBSERVER FAILED %s:%s listener_shutdown_timeout",
+                    self.config.host,
+                    self.config.port,
+                )
+            elif self._state != "FAILED":
+                self._state = "STOPPED"
+            return self.status()
+
+    def _listener_started(self, host: str, port: int) -> None:
+        with self._lock:
+            self._state = "LISTENING"
+            self._error = None
+            self._ready_event.set()
+        self._logger.info("NINJATRADER_OBSERVER LISTENING %s:%s", host, port)
+
+    def _run(self) -> None:
+        harness = self._harness
+        assert harness is not None
+        try:
+            harness.run_until_stopped(self._stop_event)
+        except (OSError, ValueError) as exc:
+            detail = f"{type(exc).__name__}: {exc}"
+            with self._lock:
+                self._state = "FAILED"
+                self._error = detail
+                self._ready_event.set()
+            self._logger.error(
+                "NINJATRADER_OBSERVER FAILED %s:%s %s",
+                self.config.host,
+                self.config.port,
+                detail,
+            )
+        finally:
+            with self._lock:
+                if self._state not in {"FAILED", "STOPPED"}:
+                    self._state = "STOPPED"
+                self._finished_event.set()
 
 
 def _write_report(path: str, report: dict[str, object]) -> None:

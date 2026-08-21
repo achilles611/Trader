@@ -10,11 +10,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import sqlite3
 from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
+
+from src.l3f_provider.ninjatrader_commission import NinjaTraderListenerWorker
 
 from .config import CopyTradeConfig
 from .contracts import PHASE_B_RECOMMENDATION_SCHEMA_VERSION
@@ -34,6 +37,7 @@ CONTROL_PAUSED = "PAUSED"
 CONTROL_STATES = {CONTROL_RUNNING, CONTROL_ENTRIES_PAUSED, CONTROL_EXITING, CONTROL_PAUSED}
 OPERATOR_STATES = {"new", "approved", "shadow", "active", "muted", "rejected"}
 WATCHER_MAX_SUBSCRIPTIONS = 10
+NINJATRADER_RUNTIME_LOGGER = logging.getLogger("uvicorn.error")
 
 
 def _load(value: str | None, default: Any) -> Any:
@@ -1284,6 +1288,7 @@ def create_control_center_app(
     *, watcher_service: Any | None = None, watcher_factory: Any | None = None,
     watcher_poll_interval_seconds: float = 1.0, watcher_retry_delay_seconds: float = 3.0,
     watcher_stop_timeout_seconds: float = 3.0, discovery_source: HyperCoreSourceAcquisition | None = None,
+    ninjatrader_listener_factory: Callable[[], NinjaTraderListenerWorker] | None = None,
 ) -> Any:
     """Create the local FastAPI Phase C application; no live-trading routes exist."""
     try:
@@ -1305,6 +1310,7 @@ def create_control_center_app(
     execution_service = watcher_service or CopyTradeService(config, database)
     center = CopyControlCenter(config, execution_service.database, execution_service=execution_service)
     watcher_runtime: dict[str, Any] = {}
+    ninjatrader_runtime: dict[str, NinjaTraderListenerWorker] = {}
     job_runtime: dict[str, asyncio.Task[Any]] = {}
     source = discovery_source or HyperCoreSourceAcquisition(cache_directory(config.artifacts.database_path))
     discovery_orchestrator = CandidateDiscoveryOrchestrator(execution_service, center.store, source)
@@ -1322,8 +1328,32 @@ def create_control_center_app(
         if supervisor is not None:
             supervisor.wake()
 
+    def ninja_listener_health() -> dict[str, object]:
+        listener = ninjatrader_runtime.get("listener")
+        if listener is None:
+            return {
+                "state": "UNSTARTED",
+                "host": "127.0.0.1",
+                "port": 48135,
+                "error": None,
+                "start_attempts": 0,
+                "authority": "OBSERVE_ONLY",
+            }
+        return listener.status().as_dict()
+
     @asynccontextmanager
     async def lifespan(_: Any) -> Any:
+        # The Control Center application owns this worker for its entire
+        # lifespan. It is deliberately outside routes, views, and websocket
+        # connections so refreshes/remounts cannot create another listener.
+        listener = (
+            ninjatrader_listener_factory()
+            if ninjatrader_listener_factory is not None
+            else NinjaTraderListenerWorker(logger=NINJATRADER_RUNTIME_LOGGER)
+        )
+        ninjatrader_runtime["listener"] = listener
+        app.state.ninjatrader_observer = listener
+        listener.start()
         # A thread cannot be safely resumed after a process restart.  Preserve
         # its durable record and make the interruption explicit to operators.
         for job in center.store.list_jobs(job_type="candidate_discovery", limit=200):
@@ -1348,6 +1378,7 @@ def create_control_center_app(
         try:
             yield
         finally:
+            listener.stop()
             supervisor = watcher_runtime.get("supervisor")
             task = watcher_runtime.get("task")
             if supervisor is not None:
@@ -1369,7 +1400,11 @@ def create_control_center_app(
 
     @app.get("/api/health")
     async def api_health() -> dict[str, Any]:
-        return {**center.health(live_watcher_health), "science": center.science.health()}
+        return {
+            **center.health(live_watcher_health),
+            "science": center.science.health(),
+            "ninjatrader_observer": ninja_listener_health(),
+        }
 
     @app.get("/api/science/health")
     async def api_science_health() -> dict[str, Any]:
@@ -1559,7 +1594,13 @@ def create_control_center_app(
 
     @app.get("/api/system")
     async def api_system() -> dict[str, Any]:
-        return {"health": center.health(live_watcher_health), "risk": center.risk_panel(), "source": source.source_status(), "paper_only": True}
+        return {
+            "health": center.health(live_watcher_health),
+            "risk": center.risk_panel(),
+            "source": source.source_status(),
+            "ninjatrader_observer": ninja_listener_health(),
+            "paper_only": True,
+        }
 
     @app.get("/api/execution")
     async def api_execution() -> dict[str, Any]:

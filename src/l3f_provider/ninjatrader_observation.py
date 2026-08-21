@@ -426,9 +426,20 @@ class LoopbackNinjaTraderBridge:
 
     def open_listener(self) -> socket.socket:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind((self.config.host, self.config.port))
-        listener.listen(16)
+        # Windows SO_REUSEADDR permits another process to bind this endpoint,
+        # which defeats the single-owner listener invariant. Prefer exclusive
+        # ownership there; retain the conventional restart-friendly setting on
+        # platforms that do not expose the Windows socket option.
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            listener.bind((self.config.host, self.config.port))
+            listener.listen(16)
+        except Exception:
+            listener.close()
+            raise
         return listener
 
     def decode_frame(self, frame: bytes) -> NinjaTraderObservation:

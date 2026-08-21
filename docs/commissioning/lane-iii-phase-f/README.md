@@ -20,6 +20,12 @@ The command binds exactly `127.0.0.1:48135`, emits a sanitized `LISTENING` statu
 
 The fresh `l3f3.2` run used that exact command for 60 seconds. It reached `LISTENING` and saved [receiver-observation-2026-08-21-l3f3.2.json](receiver-observation-2026-08-21-l3f3.2.json), but received and rejected zero frames. The installed AddOn and market-observer sources match this repository; the latest NinjaTrader trace instead shows the AddOn was finalized on 2026-08-20, with no new bridge activity. Reload/activate the current AddOn and the `MNQ SEP26` market observer in NinjaTrader, then rerun the same Beelzebub command. This capture is lifecycle evidence only and does not satisfy the authentic observation, reconnect, reconciliation, or shadow gates.
 
+## GUI/runtime listener ownership
+
+The normal BeezConsole launch starts `main.py copy-control-center --with-watcher`. Its application-level owner is the FastAPI lifespan in `src/copytrade/control_center.py`, not a route, page, websocket, or frontend component. At application startup it starts one `NinjaTraderListenerWorker`, which runs the same `NinjaTraderCommissioningHarness` receive loop as the bounded commissioning command. It logs `NINJATRADER_OBSERVER LISTENING 127.0.0.1:48135`; `/api/health` and `/api/system` expose its sanitized `OBSERVE_ONLY` state.
+
+At application shutdown the lifespan stops and joins that worker, closing its listener so a fresh GUI runtime can reclaim `127.0.0.1:48135`. A second in-process start request reuses the already-listening worker. On Windows the receiver uses exclusive socket ownership, so a port collision reports `NINJATRADER_OBSERVER FAILED` with the actual bind error; it does not choose a different port or disable the GUI.
+
 The implementation is [tradovate_observation.py](../../../src/l3f_provider/tradovate_observation.py). It sits outside the frozen Lane III package and contains a named read-only REST transport, a read-only WebSocket subscription client, strict L3-B normalization, account/position/order observation, reconciliation, health tracking, secret redaction, and future-only compliance diagnostics. It contains no real order authority.
 
 See [closure audit](closure-audit.md) for the current hard-gate result.

@@ -8,8 +8,8 @@
 - Strict L3-B quote/trade/aggregated-DOM conversion and safe fixture capture.
 - Account/position/order observation model, startup reconciliation, health, stale/disconnect/token lifecycle.
 - Lucid risk profile, session boundary, future rate diagnostic, microscalping diagnostic.
-- 58 focused `l3f`/`l3f2`/`l3f3` tests pass locally; no frozen `l3a`–`l3e` source changed.
-- Complete repository suite: **556 passed** in 383.512 seconds on 2026-08-21.
+- 60 focused `l3f`/`l3f2`/`l3f3` tests pass locally; no frozen `l3a`–`l3e` source changed.
+- Complete repository suite: **558 passed** in 372.522 seconds on 2026-08-21.
 
 ## L3-F3 commissioning result: DEPTH GATE PASSED; FREEZE REMAINS BLOCKED
 
@@ -20,6 +20,8 @@ The native observed contract identity is `MNQ SEP26`. A fresh post-restart captu
 The receiver was then run on 2026-08-21 for a fresh 60-second receive-only listen. It bound successfully to `127.0.0.1:48135`, accepted zero observations, and rejected zero frames; every provider stream remained `UNKNOWN` and `LOCAL_BRIDGE` ended `DISCONNECTED` when the listener stopped. The sanitized report is [receiver-observation-2026-08-21.json](receiver-observation-2026-08-21.json). This is not a substitute for the historical capture above: it means the current AddOn/NinjaTrader/Lucid chain was not delivering while this pass listened.
 
 `l3f3.2` subsequently started the same receiver through `main.py ninjatrader-observe`, making Beelzebub the explicit listener owner. The 60-second run reached `LISTENING` at `127.0.0.1:48135` without stdin or an auxiliary listener, then safely stopped with zero accepted and zero rejected observations; see [receiver-observation-2026-08-21-l3f3.2.json](receiver-observation-2026-08-21-l3f3.2.json). The installed NinjaTrader AddOn and observer sources hash-identically to the repository. The current process still provided no bridge connection; the newest available trace records AddOn finalization on 2026-08-20. Authentic observations therefore remain blocked on AddOn/observer activation or reload in the current NinjaTrader runtime, followed by a fresh capture.
+
+`l3f3.3` makes the existing receiver an ordinary Control Center runtime worker. The FastAPI lifespan starts one `NinjaTraderListenerWorker` before serving the GUI and stops/joins it during shutdown; the worker reuses the commissioning receiver loop and binds only `127.0.0.1:48135`. Focused lifecycle tests verify the listening endpoint with `netstat -ano`, prove GUI startup reaches `LISTENING`, repeated initialization does not duplicate the worker, shutdown releases the port, a new worker reacquires it, and a Windows bind collision remains visible and fail-closed on the configured port. This closes listener-runtime ownership only; it is not authentic market-flow evidence.
 
 The remaining freeze gates are therefore runtime-blocked: the current receiver did not receive authentic observations; exact contract metadata beyond the native name has not been emitted as authenticated bridge data; no authentic execution callback is available without an order, which remains prohibited; an explicit provider disconnect/reconnect has not been commissioned; and the live `l3b → l3c → l3d` shadow path has not yet been driven by the authentic stream. The focused `l3f` suite passes. The rule profile also retains unknown drawdown behavior, news status, and account-specific mandatory flat deadline.
 
