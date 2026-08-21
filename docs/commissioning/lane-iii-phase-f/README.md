@@ -8,6 +8,18 @@ The Level 2 re-commissioning capture subsequently accepted 46,214 genuine `DEPTH
 
 Fresh l3f3 commissioning on 2026-08-21 listened for 60 seconds on `127.0.0.1:48135` and accepted zero frames. The sanitized result is [receiver-observation-2026-08-21.json](receiver-observation-2026-08-21.json). It proves the new receiver was available but does not prove a currently connected NinjaTrader/Lucid source, so it leaves the runtime freeze gate blocked.
 
+## Beelzebub-owned receiver command
+
+The canonical receiver lifecycle is owned by the primary Beelzebub entry point:
+
+```powershell
+.\.venv312\Scripts\python.exe main.py ninjatrader-observe --duration-seconds 60 --report-file docs\commissioning\lane-iii-phase-f\receiver-observation-YYYY-MM-DD.json
+```
+
+The command binds exactly `127.0.0.1:48135`, emits a sanitized `LISTENING` status event to stderr before its receive loop, accepts only NinjaTrader-to-Beelzebub frames, writes a sanitized aggregate report naming Beelzebub as listener owner, and closes its listener after the bounded duration. It reads no stdin and requires no PowerShell setup, socket preparation, or broker-side action to start or stop. A zero-observation completion exits with status `3`; that is a commissioning failure, not an indication that the listener failed to bind.
+
+The fresh `l3f3.2` run used that exact command for 60 seconds. It reached `LISTENING` and saved [receiver-observation-2026-08-21-l3f3.2.json](receiver-observation-2026-08-21-l3f3.2.json), but received and rejected zero frames. The installed AddOn and market-observer sources match this repository; the latest NinjaTrader trace instead shows the AddOn was finalized on 2026-08-20, with no new bridge activity. Reload/activate the current AddOn and the `MNQ SEP26` market observer in NinjaTrader, then rerun the same Beelzebub command. This capture is lifecycle evidence only and does not satisfy the authentic observation, reconnect, reconciliation, or shadow gates.
+
 The implementation is [tradovate_observation.py](../../../src/l3f_provider/tradovate_observation.py). It sits outside the frozen Lane III package and contains a named read-only REST transport, a read-only WebSocket subscription client, strict L3-B normalization, account/position/order observation, reconciliation, health tracking, secret redaction, and future-only compliance diagnostics. It contains no real order authority.
 
 See [closure audit](closure-audit.md) for the current hard-gate result.

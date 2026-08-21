@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from src.l3f_provider.ninjatrader_commission import NinjaTraderCommissioningHarness
@@ -187,7 +191,7 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
         finally:
             listener.close()
 
-        _, result, failures, thread, client = self._start_receiver()
+        harness, result, failures, thread, client = self._start_receiver()
         try:
             client.sendall(frame("HEALTH", 1) + b"\n")
             client.shutdown(socket.SHUT_WR)
@@ -257,7 +261,7 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
         self.assertEqual(transitions, ["UNKNOWN", "CONNECTING", "HEALTHY", "DISCONNECTED", "HEALTHY", "DISCONNECTED"])
 
     def test_receiver_shutdown_closes_open_client_and_marks_transport_disconnected(self):
-        _, result, failures, thread, client = self._start_receiver(duration=0.35)
+        harness, result, failures, thread, client = self._start_receiver(duration=0.35)
         try:
             client.sendall(frame("HEALTH", 1) + b"\n")
             self._finish_receiver(result, failures, thread)
@@ -276,6 +280,51 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
             report["provider_health"]["local_bridge_transitions"],
             ["UNKNOWN", "CONNECTING", "DISCONNECTED"],
         )
+
+    def test_beelzebub_command_owns_listener_without_stdin_or_broker_frames(self):
+        port = self._ephemeral_port()
+        root = Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            report_file = Path(directory) / "commissioning.json"
+            process = subprocess.Popen(
+                [
+                    sys.executable, "main.py", "ninjatrader-observe",
+                    "--port", str(port), "--duration-seconds", "0.15",
+                    "--report-file", str(report_file),
+                ],
+                cwd=root,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                status_line = process.stderr.readline()
+                self.assertEqual(json.loads(status_line), {
+                    "authority": "OBSERVE_ONLY", "event": "LISTENING", "host": "127.0.0.1", "port": port,
+                })
+                with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+                    pass
+                stdout, stderr = process.communicate(timeout=2)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+            self.assertEqual(process.returncode, 3)  # no authentic observations is not a successful commission
+            self.assertEqual(stderr, "")
+            report = json.loads(stdout)
+            self.assertEqual(report["listener"], {"host": "127.0.0.1", "port": port, "ready": True})
+            self.assertEqual(report["accepted_observations"], 0)
+            self.assertEqual(report["authority"], "OBSERVE_ONLY")
+            self.assertEqual(report["capture"]["mode"], "OBSERVE_ONLY")
+            self.assertFalse(report["capture"]["real_capital_touched"])
+            self.assertEqual(report["runtime"], {
+                "entrypoint": "main.py ninjatrader-observe",
+                "listener_owner": "BEELZEBUB",
+                "stdin_required": False,
+                "transport_direction": "NINJATRADER_TO_BEELZEBUB",
+            })
+            self.assertEqual(json.loads(report_file.read_text(encoding="utf-8")), report)
 
     def test_strict_wire_rejects_unknown_fields_duplicate_keys_bool_sequence_and_unknown_alias(self):
         base = json.loads(frame("HEALTH", 1))

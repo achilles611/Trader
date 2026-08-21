@@ -1,9 +1,11 @@
-"""Reproducible, read-only L3-F2 NinjaTrader commissioning receiver.
+"""Beelzebub-owned, read-only NinjaTrader commissioning receiver.
 
-Run ``python -m src.l3f_provider.ninjatrader_commission --duration-seconds 60``
-before activating the already-installed read-only AddOn/market observer.  The
-program only accepts local observation frames; it never sends a byte to
-NinjaTrader and prints no payload, identifier, or secret.
+Run ``python main.py ninjatrader-observe --duration-seconds 60`` before
+activating the already-installed read-only AddOn/market observer. Beelzebub
+itself owns the listener lifecycle: it binds loopback, receives frames, writes
+only a sanitized aggregate report, and closes the listener on shutdown. The
+program never sends a byte to NinjaTrader and prints no payload, identifier,
+or secret.
 """
 
 from __future__ import annotations
@@ -16,7 +18,8 @@ import select
 import socket
 import sys
 import time
-from typing import Iterable
+from pathlib import Path
+from typing import Callable, Iterable
 
 from .ninjatrader_observation import (
     AccountClass, LOOPBACK_HOST, LoopbackBridgeConfig, LoopbackNinjaTraderBridge,
@@ -29,6 +32,7 @@ from .tradovate_observation import StreamHealth
 @dataclass
 class CommissioningSummary:
     listener_ready: bool = False
+    listener_port: int = 48135
     accepted: int = 0
     rejected: int = 0
     duplicates: int = 0
@@ -80,7 +84,7 @@ class CommissioningSummary:
         order_count = lucid_snapshots.get("ORDER")
         return {
             "schema": "lane-iii-phase-f3-ninjatrader-commissioning-v1",
-            "listener": {"host": LOOPBACK_HOST, "ready": self.listener_ready},
+            "listener": {"host": LOOPBACK_HOST, "port": self.listener_port, "ready": self.listener_ready},
             "accepted_observations": self.accepted,
             "rejected_observations": self.rejected,
             "duplicate_observations": self.duplicates,
@@ -109,10 +113,17 @@ class CommissioningSummary:
 
 
 class NinjaTraderCommissioningHarness:
-    def __init__(self, config: LoopbackBridgeConfig = LoopbackBridgeConfig()) -> None:
+    def __init__(
+        self,
+        config: LoopbackBridgeConfig = LoopbackBridgeConfig(),
+        *,
+        on_listener_started: Callable[[str, int], None] | None = None,
+    ) -> None:
         self.bridge = LoopbackNinjaTraderBridge(config)
         self.summary = CommissioningSummary()
+        self.summary.listener_port = config.port
         self.health = NinjaTraderHealthTracker()
+        self._on_listener_started = on_listener_started
         self.summary.set_health(self.health)
 
     @staticmethod
@@ -169,6 +180,8 @@ class NinjaTraderCommissioningHarness:
         listener = self.bridge.open_listener()
         listener.setblocking(False)
         self.summary.listener_ready = True
+        if self._on_listener_started is not None:
+            self._on_listener_started(LOOPBACK_HOST, self.bridge.config.port)
         self._mark(NinjaTraderHealthStream.LOCAL_BRIDGE, StreamHealth.CONNECTING)
         deadline = time.monotonic() + duration_seconds
         connections: dict[socket.socket, bytearray] = {}
@@ -237,18 +250,51 @@ class NinjaTraderCommissioningHarness:
         return self.summary
 
 
+def _write_report(path: str, report: dict[str, object]) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", encoding="utf-8", newline="\n") as handle:
+        json.dump(report, handle, sort_keys=True, indent=2)
+        handle.write("\n")
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Read-only L3-F2 NinjaTrader commissioning receiver")
+    parser = argparse.ArgumentParser(description="Beelzebub-owned read-only NinjaTrader commissioning receiver")
     parser.add_argument("--port", type=int, default=48135)
     parser.add_argument("--duration-seconds", type=float, default=60.0)
+    parser.add_argument("--report-file", help="Optional sanitized JSON commissioning report path.")
     args = parser.parse_args(argv)
     try:
-        harness = NinjaTraderCommissioningHarness(LoopbackBridgeConfig(port=args.port))
+        config = LoopbackBridgeConfig(port=args.port)
+
+        def listener_started(host: str, port: int) -> None:
+            # This JSON Lines status event is intentionally emitted before the
+            # receive loop. It proves Beelzebub, not a shell helper, owns the
+            # listener without disclosing a provider payload or identifier.
+            print(json.dumps({"authority": "OBSERVE_ONLY", "event": "LISTENING", "host": host, "port": port}, sort_keys=True), file=sys.stderr, flush=True)
+
+        harness = NinjaTraderCommissioningHarness(config, on_listener_started=listener_started)
         summary = harness.run(args.duration_seconds)
     except (OSError, ValueError) as error:
-        print(json.dumps({"schema": "lane-iii-phase-f3-ninjatrader-commissioning-v1", "listener": {"host": LOOPBACK_HOST, "ready": False}, "error": type(error).__name__}, sort_keys=True))
+        print(json.dumps({"schema": "lane-iii-phase-f3-ninjatrader-commissioning-v1", "listener": {"host": LOOPBACK_HOST, "port": args.port, "ready": False}, "error": type(error).__name__}, sort_keys=True))
         return 2
-    print(json.dumps(summary.safe_report(), sort_keys=True))
+    report = summary.safe_report()
+    report["capture"] = {
+        "duration_seconds": args.duration_seconds,
+        "mode": "OBSERVE_ONLY",
+        "orders_submitted": 0,
+        "orders_modified_or_cancelled": 0,
+        "real_capital_touched": False,
+    }
+    report["runtime"] = {
+        "entrypoint": "main.py ninjatrader-observe",
+        "listener_owner": "BEELZEBUB",
+        "stdin_required": False,
+        "transport_direction": "NINJATRADER_TO_BEELZEBUB",
+    }
+    if args.report_file:
+        _write_report(args.report_file, report)
+    print(json.dumps(report, sort_keys=True))
     return 0 if summary.accepted else 3
 
 

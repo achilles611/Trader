@@ -1,0 +1,62 @@
+{
+  "accepted_observations": 0,
+  "account_binding": {
+    "lucid_alias_identified": false,
+    "sim101_identified_separately": false
+  },
+  "authority": "OBSERVE_ONLY",
+  "capture": {
+    "duration_seconds": 60.0,
+    "mode": "OBSERVE_ONLY",
+    "orders_modified_or_cancelled": 0,
+    "orders_submitted": 0,
+    "real_capital_touched": false
+  },
+  "duplicate_observations": 0,
+  "error_details": {},
+  "errors": {},
+  "listener": {
+    "host": "127.0.0.1",
+    "port": 48135,
+    "ready": true
+  },
+  "market_data": {
+    "depth": false,
+    "quotes": false,
+    "trades": false
+  },
+  "observation_types": {},
+  "provider_health": {
+    "local_bridge_transitions": [
+      "UNKNOWN",
+      "CONNECTING",
+      "DISCONNECTED"
+    ],
+    "streams": {
+      "ACCOUNT_STREAM": "UNKNOWN",
+      "DEPTH_STREAM": "UNKNOWN",
+      "LOCAL_BRIDGE": "DISCONNECTED",
+      "LUCID_CONNECTION": "UNKNOWN",
+      "MARKET_DATA_STREAM": "UNKNOWN",
+      "NINJATRADER_PROCESS": "UNKNOWN",
+      "ORDER_STREAM": "UNKNOWN",
+      "POSITION_STREAM": "UNKNOWN"
+    }
+  },
+  "rejected_observations": 0,
+  "runtime": {
+    "entrypoint": "main.py ninjatrader-observe",
+    "listener_owner": "BEELZEBUB",
+    "stdin_required": false,
+    "transport_direction": "NINJATRADER_TO_BEELZEBUB"
+  },
+  "schema": "lane-iii-phase-f3-ninjatrader-commissioning-v1",
+  "state": {
+    "account": false,
+    "executions": false,
+    "lucid_position_truth": "UNAVAILABLE",
+    "lucid_working_order_truth": "UNAVAILABLE",
+    "orders": false,
+    "position": false
+  }
+}
