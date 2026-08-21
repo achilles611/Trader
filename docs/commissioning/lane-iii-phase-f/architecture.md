@@ -1,9 +1,9 @@
 # Architecture
 
 ```text
-Tradovate REST / WebSocket (explicit DEMO or LIVE)
-                 ↓ read-only named operations
-    L3-F observation service + market-data adapter
+Lucid / CQG → NinjaTrader 8 Desktop → read-only AddOn → localhost-only one-way bridge
+                                                        ↓
+    L3-F3 loopback receiver + provider-neutral market-data adapter
                  ↓ canonical L3-B events
             frozen L3-B → L3-C → L3-D
                  ↓
@@ -12,6 +12,8 @@ Tradovate REST / WebSocket (explicit DEMO or LIVE)
            no provider execution path
 ```
 
-`RequestsTradovateReadOnlyClient` exposes only authentication plus named account, contract, position, and order reads. `TradovateReadOnlyWebSocket` exposes only authorization, quote/DOM/tick-chart subscription, and user synchronization. There is no generic provider request function and no strategy receives either client.
+Direct Tradovate remains retained as a structurally useful but unavailable account path. NinjaTrader is a separately modeled provider seam. Neither surface exposes a generic provider request function and no strategy receives either client.
 
 Provider account/order/position observations are reconciled separately from market evidence. They never become L3-C evidence.
+
+The receiver admits only complete, bounded, sanitized observation frames through `NinjaTraderObservation.from_wire()` and `NinjaTraderSessionLedger`. It has no response writes and no access to a NinjaTrader `Account` object. Transport loss is recorded as `LOCAL_BRIDGE` provider health, independently of account and market streams.

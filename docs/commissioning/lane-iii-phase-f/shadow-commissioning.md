@@ -9,4 +9,4 @@ authenticated provider observations → L3-F → frozen L3-B → frozen L3-C →
 
 Record capability status, resolved contract, sanitized packet hashes, stream health, reconciliation state, and signal count. Label all artifacts `OBSERVED_EXTERNAL` or `SIMULATED`; `LIVE_EXECUTION` cannot be produced by l3f.
 
-Current result: **not performed**. Provider credentials, account mapping, contract selection, and entitlement are absent. Real provider requests: 0. Real orders: 0.
+Current result: **not performed through the bridge**. Operator UI evidence confirms candidate NinjaTrader feeds; bridge-level account mapping, contract resolution, callbacks, and canonical L3-B output remain uncommissioned. Real orders: 0.

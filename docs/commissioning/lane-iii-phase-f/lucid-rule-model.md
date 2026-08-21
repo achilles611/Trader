@@ -1,6 +1,6 @@
 # Lucid rule model and compliance diagnostics
 
-The versioned risk profile contains program/stage, nominal size, max quantity, loss/drawdown data, news status, flat/reopen/session times, and automation-policy status. Internal limits are tighter: 1 MNQ vs firm 20, $200 daily internal ceiling vs $1,000 maximum loss, and 15:58 ET vs 16:45 ET firm flat time.
+The versioned risk profile contains program/stage, nominal size, max quantity, loss/drawdown data, news status, flat/reopen/session times, and automation-policy status. Internal limits are tighter: 1 MNQ vs firm 20 and $200 daily internal ceiling vs $1,000 maximum loss. The account-specific mandatory flat deadline must be revalidated before any future execution readiness claim.
 
 News restriction and drawdown behavior are **UNKNOWN**, so they block any later live readiness. The current source provenance is the Lucid General FAQ observed 2026-08-20; policy must be rechecked before any future authority.
 

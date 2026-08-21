@@ -13,7 +13,7 @@
 | Liquidation balance | $24,000 |
 | Daily loss limit | disabled |
 | News restriction | **UNKNOWN** |
-| Firm / internal flat | 16:45 / 15:58 `America/New_York` |
-| Reopen / initial session | 18:00 / 09:35–15:30 `America/New_York` |
+| Firm / internal flat | firm deadline **UNKNOWN** / internal preemptive time requires revalidation |
+| Reopen / initial session | **UNKNOWN** for account-specific future execution readiness |
 
-The profile is an external risk contract, not market evidence. The non-secret provider account ID is intentionally unset at commissioning time; l3f refuses arbitrary account selection.
+The profile is an external risk contract, not market evidence. The exact NinjaTrader provider account identifier is runtime-only; l3f2 refuses arbitrary account selection.

@@ -1,0 +1,51 @@
+{
+  "schema": "lane-iii-phase-f3-ninjatrader-commissioning-v1",
+  "capture": {
+    "date": "2026-08-21",
+    "duration_seconds": 60,
+    "mode": "OBSERVE_ONLY",
+    "orders_submitted": 0,
+    "orders_modified_or_cancelled": 0,
+    "real_capital_touched": false
+  },
+  "listener": {
+    "host": "127.0.0.1",
+    "port": 48135,
+    "ready": true
+  },
+  "accepted_observations": 0,
+  "rejected_observations": 0,
+  "duplicate_observations": 0,
+  "observation_types": {},
+  "provider_health": {
+    "streams": {
+      "ACCOUNT_STREAM": "UNKNOWN",
+      "DEPTH_STREAM": "UNKNOWN",
+      "LOCAL_BRIDGE": "DISCONNECTED",
+      "LUCID_CONNECTION": "UNKNOWN",
+      "MARKET_DATA_STREAM": "UNKNOWN",
+      "NINJATRADER_PROCESS": "UNKNOWN",
+      "ORDER_STREAM": "UNKNOWN",
+      "POSITION_STREAM": "UNKNOWN"
+    },
+    "local_bridge_transitions": ["UNKNOWN", "CONNECTING", "DISCONNECTED"]
+  },
+  "account_binding": {
+    "lucid_alias_identified": false,
+    "sim101_identified_separately": false
+  },
+  "market_data": {
+    "quotes": false,
+    "trades": false,
+    "depth": false
+  },
+  "state": {
+    "account": false,
+    "position": false,
+    "orders": false,
+    "executions": false,
+    "lucid_position_truth": "UNAVAILABLE",
+    "lucid_working_order_truth": "UNAVAILABLE"
+  },
+  "authority": "OBSERVE_ONLY"
+}
