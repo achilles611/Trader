@@ -134,12 +134,23 @@ class NinjaTraderCommissioningHarness:
         config: LoopbackBridgeConfig = LoopbackBridgeConfig(),
         *,
         on_listener_started: Callable[[str, int], None] | None = None,
+        on_observation: Callable[[NinjaTraderObservation], None] | None = None,
+        on_local_bridge_state: Callable[[StreamHealth], None] | None = None,
+        on_rejection: Callable[[NinjaTraderObservationError], None] | None = None,
+        on_duplicate: Callable[[], None] | None = None,
     ) -> None:
         self.bridge = LoopbackNinjaTraderBridge(config)
         self.summary = CommissioningSummary()
         self.summary.listener_port = config.port
         self.health = NinjaTraderHealthTracker()
         self._on_listener_started = on_listener_started
+        # These are one-way, best-effort notifications to a downstream
+        # shadow consumer.  The listener never receives a response and a
+        # consumer failure can never stop the observation boundary.
+        self._on_observation = on_observation
+        self._on_local_bridge_state = on_local_bridge_state
+        self._on_rejection = on_rejection
+        self._on_duplicate = on_duplicate
         self.summary.set_health(self.health)
 
     @staticmethod
@@ -147,8 +158,20 @@ class NinjaTraderCommissioningHarness:
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     def _mark(self, stream: NinjaTraderHealthStream, state: StreamHealth, at: str | None = None) -> None:
+        prior = self.health.snapshot().streams[stream]
         self.health.mark(stream, state, at or self._now())
         self.summary.set_health(self.health)
+        if (
+            stream is NinjaTraderHealthStream.LOCAL_BRIDGE
+            and prior is not state
+            and self._on_local_bridge_state is not None
+        ):
+            try:
+                self._on_local_bridge_state(state)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "NINJATRADER_OBSERVER downstream transport notification refused"
+                )
 
     def _record_observation_health(self, observation: NinjaTraderObservation) -> None:
         at = observation.ninja_receipt_time
@@ -184,10 +207,32 @@ class NinjaTraderCommissioningHarness:
             try:
                 observation = self.bridge.accept_observation(frame)
                 self.summary.accept(observation)
-                if observation is not None:
-                    self._record_observation_health(observation)
+                if observation is None:
+                    if self._on_duplicate is not None:
+                        try:
+                            self._on_duplicate()
+                        except Exception:
+                            logging.getLogger(__name__).exception(
+                                "NINJATRADER_OBSERVER downstream duplicate notification refused"
+                            )
+                    continue
+                self._record_observation_health(observation)
+                if self._on_observation is not None:
+                    try:
+                        self._on_observation(observation)
+                    except Exception:
+                        logging.getLogger(__name__).exception(
+                            "NINJATRADER_OBSERVER downstream observation notification refused"
+                        )
             except NinjaTraderObservationError as error:
                 self.summary.reject(error)
+                if self._on_rejection is not None:
+                    try:
+                        self._on_rejection(error)
+                    except Exception:
+                        logging.getLogger(__name__).exception(
+                            "NINJATRADER_OBSERVER downstream rejection notification refused"
+                        )
         return self.summary
 
     def run(self, duration_seconds: float, *, stop_event: threading.Event | None = None) -> CommissioningSummary:
@@ -291,6 +336,10 @@ class NinjaTraderListenerWorker:
         config: LoopbackBridgeConfig = LoopbackBridgeConfig(),
         *,
         logger: logging.Logger | None = None,
+        on_observation: Callable[[NinjaTraderObservation], None] | None = None,
+        on_local_bridge_state: Callable[[StreamHealth], None] | None = None,
+        on_rejection: Callable[[NinjaTraderObservationError], None] | None = None,
+        on_duplicate: Callable[[], None] | None = None,
     ) -> None:
         self.config = config
         self._logger = logger or logging.getLogger(__name__)
@@ -300,6 +349,10 @@ class NinjaTraderListenerWorker:
         self._finished_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._harness: NinjaTraderCommissioningHarness | None = None
+        self._on_observation = on_observation
+        self._on_local_bridge_state = on_local_bridge_state
+        self._on_rejection = on_rejection
+        self._on_duplicate = on_duplicate
         self._state = "NEW"
         self._error: str | None = None
         self._start_attempts = 0
@@ -313,6 +366,29 @@ class NinjaTraderListenerWorker:
                 error=self._error,
                 start_attempts=self._start_attempts,
             )
+
+    def set_shadow_sinks(
+        self,
+        *,
+        on_observation: Callable[[NinjaTraderObservation], None],
+        on_local_bridge_state: Callable[[StreamHealth], None],
+        on_rejection: Callable[[NinjaTraderObservationError], None],
+        on_duplicate: Callable[[], None],
+    ) -> None:
+        """Attach the sole downstream shadow consumer before listener startup.
+
+        This is intentionally unavailable after startup so UI reconnects and
+        runtime churn cannot replace or duplicate a consumer mid-stream.
+        """
+        if not all(callable(value) for value in (on_observation, on_local_bridge_state, on_rejection, on_duplicate)):
+            raise ValueError("Shadow sinks must be callable.")
+        with self._lock:
+            if self._state not in {"NEW", "STOPPED"} or (self._thread is not None and self._thread.is_alive()):
+                raise RuntimeError("NINJATRADER_OBSERVER shadow sinks may be attached only before startup")
+            self._on_observation = on_observation
+            self._on_local_bridge_state = on_local_bridge_state
+            self._on_rejection = on_rejection
+            self._on_duplicate = on_duplicate
 
     def start(self, *, timeout_seconds: float = _STARTUP_TIMEOUT_SECONDS) -> NinjaTraderListenerRuntimeStatus:
         """Start once, wait for a bind result, and never select an alternate port."""
@@ -330,7 +406,12 @@ class NinjaTraderListenerWorker:
             self._state = "STARTING"
             self._start_attempts += 1
             self._harness = NinjaTraderCommissioningHarness(
-                self.config, on_listener_started=self._listener_started,
+                self.config,
+                on_listener_started=self._listener_started,
+                on_observation=self._on_observation,
+                on_local_bridge_state=self._on_local_bridge_state,
+                on_rejection=self._on_rejection,
+                on_duplicate=self._on_duplicate,
             )
             self._thread = threading.Thread(
                 target=self._run,

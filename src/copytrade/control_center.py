@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from src.l3f_provider.ninjatrader_commission import NinjaTraderListenerWorker
+from src.l3f_provider.shadow_runtime import LaneIIIShadowRuntime
 
 from .config import CopyTradeConfig
 from .contracts import PHASE_B_RECOMMENDATION_SCHEMA_VERSION
@@ -1289,6 +1290,7 @@ def create_control_center_app(
     watcher_poll_interval_seconds: float = 1.0, watcher_retry_delay_seconds: float = 3.0,
     watcher_stop_timeout_seconds: float = 3.0, discovery_source: HyperCoreSourceAcquisition | None = None,
     ninjatrader_listener_factory: Callable[[], NinjaTraderListenerWorker] | None = None,
+    lane_iii_shadow_factory: Callable[[], LaneIIIShadowRuntime] | None = None,
 ) -> Any:
     """Create the local FastAPI Phase C application; no live-trading routes exist."""
     try:
@@ -1341,6 +1343,23 @@ def create_control_center_app(
             }
         return listener.status().as_dict()
 
+    def lane_iii_shadow_health() -> dict[str, object]:
+        shadow = ninjatrader_runtime.get("shadow")
+        if shadow is None:
+            return {
+                "schema": "lane-iii-live-shadow-v1",
+                "mode": "LANE_III_SHADOW",
+                "state": "UNSTARTED",
+                "authority": {
+                    "observation": "OBSERVE_ONLY",
+                    "interpretation": "SHADOW_ONLY",
+                    "decision": "SHADOW_ONLY",
+                    "execution": "DENIED",
+                    "live_capital": "DENIED",
+                },
+            }
+        return shadow.status()
+
     @asynccontextmanager
     async def lifespan(_: Any) -> Any:
         # The Control Center application owns this worker for its entire
@@ -1351,10 +1370,21 @@ def create_control_center_app(
         ninjatrader_runtime["active"] = True
         listener: NinjaTraderListenerWorker | None = None
         try:
+            shadow = lane_iii_shadow_factory() if lane_iii_shadow_factory is not None else LaneIIIShadowRuntime()
+            if type(shadow) is not LaneIIIShadowRuntime:
+                raise RuntimeError("LANE_III_SHADOW factory must return the exact shadow runtime")
+            ninjatrader_runtime["shadow"] = shadow
+            app.state.lane_iii_shadow = shadow
             listener = (
                 ninjatrader_listener_factory()
                 if ninjatrader_listener_factory is not None
                 else NinjaTraderListenerWorker(logger=NINJATRADER_RUNTIME_LOGGER)
+            )
+            listener.set_shadow_sinks(
+                on_observation=shadow.ingest,
+                on_local_bridge_state=shadow.on_transport_state,
+                on_rejection=shadow.record_raw_rejection,
+                on_duplicate=shadow.record_raw_duplicate,
             )
             ninjatrader_runtime["listener"] = listener
             app.state.ninjatrader_observer = listener
@@ -1402,9 +1432,12 @@ def create_control_center_app(
                     watcher_runtime.clear()
                     ninjatrader_runtime.clear()
                     app.state.ninjatrader_observer = None
+                    app.state.lane_iii_shadow = None
 
     app = FastAPI(title="Trader Copy Control Center", version="1.0", docs_url=None, redoc_url=None,
                   lifespan=lifespan)
+    app.state.ninjatrader_observer = None
+    app.state.lane_iii_shadow = None
 
     @app.exception_handler(sqlite3.Error)
     async def database_unavailable(_: Any, __: sqlite3.Error) -> Any:
@@ -1421,7 +1454,19 @@ def create_control_center_app(
             **center.health(live_watcher_health),
             "science": center.science.health(),
             "ninjatrader_observer": ninja_listener_health(),
+            "lane_iii_shadow": lane_iii_shadow_health(),
         }
+
+    @app.get("/api/lane-iii/shadow")
+    async def api_lane_iii_shadow() -> dict[str, object]:
+        return lane_iii_shadow_health()
+
+    @app.get("/api/lane-iii/shadow/audit")
+    async def api_lane_iii_shadow_audit(limit: int = Query(100, ge=1, le=512)) -> dict[str, object]:
+        shadow = ninjatrader_runtime.get("shadow")
+        if shadow is None:
+            return {"mode": "LANE_III_SHADOW", "items": []}
+        return {"mode": "LANE_III_SHADOW", "items": shadow.audit_records(limit)}
 
     @app.get("/api/science/health")
     async def api_science_health() -> dict[str, Any]:
@@ -1616,6 +1661,7 @@ def create_control_center_app(
             "risk": center.risk_panel(),
             "source": source.source_status(),
             "ninjatrader_observer": ninja_listener_health(),
+            "lane_iii_shadow": lane_iii_shadow_health(),
             "paper_only": True,
         }
 

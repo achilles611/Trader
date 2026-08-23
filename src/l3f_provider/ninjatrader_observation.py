@@ -352,7 +352,7 @@ class NinjaTraderMarketDataAdapter(MarketDataProviderAdapter):
 
     def _header(self, raw: RawProviderEvent, record: NinjaTraderObservation, stream: MarketStream) -> EventHeader:
         provider_time = record.provider_timestamp
-        return EventHeader("l3f2-" + canonical_hash({"wire": record.wire_hash(), "stream": stream.value})[:32], self.source, self.contract.canonical, EventTimestamps(raw.received_at, provider_time=provider_time), stream, record.observation_id, raw.payload_hash, record.provider_sequence, None)
+        return EventHeader("l3f2-" + canonical_hash({"wire": record.wire_hash(), "stream": stream.value})[:32], self.source, self.contract.canonical, EventTimestamps(raw.received_at, exchange_time=record.exchange_timestamp, provider_time=provider_time), stream, record.observation_id, raw.payload_hash, record.provider_sequence, None)
 
     def _contract_check(self, record: NinjaTraderObservation) -> None:
         value = record.payload.get("contract_id")
