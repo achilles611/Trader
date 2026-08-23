@@ -1,26 +1,19 @@
-"""Beelzebub-owned, read-only NinjaTrader commissioning receiver.
+"""Beelzebub-owned, read-only NinjaTrader runtime receiver.
 
-Run ``python main.py ninjatrader-observe --duration-seconds 60`` before
-activating the already-installed read-only AddOn/market observer. Beelzebub
-itself owns the listener lifecycle: it binds loopback, receives frames, writes
-only a sanitized aggregate report, and closes the listener on shutdown. The
-program never sends a byte to NinjaTrader and prints no payload, identifier,
-or secret.
+The Control Center FastAPI lifespan is the sole production owner. The worker
+binds loopback, receives frames, and closes the listener on shutdown. It never
+sends a byte to NinjaTrader or exposes a payload, identifier, or secret.
 """
 
 from __future__ import annotations
 
-import argparse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-import json
 import logging
 import select
 import socket
-import sys
 import threading
 import time
-from pathlib import Path
 from typing import Callable, Iterable
 
 from .ninjatrader_observation import (
@@ -201,12 +194,6 @@ class NinjaTraderCommissioningHarness:
         if duration_seconds <= 0:
             raise ValueError("Commissioning duration must be positive.")
         listener = self.bridge.open_listener()
-        listener.setblocking(False)
-        self.summary.listener_ready = True
-        if self._on_listener_started is not None:
-            self._on_listener_started(LOOPBACK_HOST, self.bridge.config.port)
-        self._mark(NinjaTraderHealthStream.LOCAL_BRIDGE, StreamHealth.CONNECTING)
-        deadline = time.monotonic() + duration_seconds
         connections: dict[socket.socket, bytearray] = {}
 
         def close_connection(connection: socket.socket) -> None:
@@ -215,12 +202,22 @@ class NinjaTraderCommissioningHarness:
                 self.ingest((bytes(data),))
             try:
                 connection.close()
+            except OSError:
+                # A reset peer may already have invalidated its local socket.
+                # Cleanup and provider-health transitions must still complete.
+                pass
             finally:
                 # A peer disconnect is an explicit transport condition. It
                 # does not mutate account/position/order reconciliation.
                 self._mark(NinjaTraderHealthStream.LOCAL_BRIDGE, StreamHealth.DISCONNECTED)
 
         try:
+            listener.setblocking(False)
+            self.summary.listener_ready = True
+            if self._on_listener_started is not None:
+                self._on_listener_started(LOOPBACK_HOST, self.bridge.config.port)
+            self._mark(NinjaTraderHealthStream.LOCAL_BRIDGE, StreamHealth.CONNECTING)
+            deadline = time.monotonic() + duration_seconds
             while time.monotonic() < deadline and (stop_event is None or not stop_event.is_set()):
                 readable = [listener, *connections]
                 ready, _, _ = select.select(readable, [], [], min(0.25, deadline - time.monotonic()))
@@ -248,6 +245,12 @@ class NinjaTraderCommissioningHarness:
                         # byte. This bounds even newline-free hostile input.
                         chunk = source.recv(min(4096, self.bridge.config.maximum_frame_bytes + 1 - buffered))
                     except BlockingIOError:
+                        continue
+                    except OSError:
+                        # NinjaTrader may terminate or reset a client socket
+                        # without a graceful FIN. That is a client transport
+                        # transition, not a failure of the listener owner.
+                        close_connection(source)
                         continue
                     if not chunk:
                         close_connection(source)
@@ -336,15 +339,21 @@ class NinjaTraderListenerWorker:
             )
             self._thread.start()
         if not self._ready_event.wait(timeout_seconds):
+            timed_out = False
             with self._lock:
-                self._state = "FAILED"
-                self._error = "listener_start_timeout"
-            self._logger.error(
-                "NINJATRADER_OBSERVER FAILED %s:%s listener_start_timeout",
-                self.config.host,
-                self.config.port,
-            )
-            self.stop(timeout_seconds=self._SHUTDOWN_TIMEOUT_SECONDS)
+                # The bind callback may have won the race immediately after
+                # wait() expired. Never overwrite a real LISTENING result.
+                if self._state == "STARTING":
+                    self._state = "FAILED"
+                    self._error = "listener_start_timeout"
+                    timed_out = True
+            if timed_out:
+                self._logger.error(
+                    "NINJATRADER_OBSERVER FAILED %s:%s listener_start_timeout",
+                    self.config.host,
+                    self.config.port,
+                )
+                self.stop(timeout_seconds=self._SHUTDOWN_TIMEOUT_SECONDS)
         return self.status()
 
     def stop(self, *, timeout_seconds: float = _SHUTDOWN_TIMEOUT_SECONDS) -> NinjaTraderListenerRuntimeStatus:
@@ -374,6 +383,8 @@ class NinjaTraderListenerWorker:
 
     def _listener_started(self, host: str, port: int) -> None:
         with self._lock:
+            if self._state != "STARTING" or self._stop_event.is_set():
+                return
             self._state = "LISTENING"
             self._error = None
             self._ready_event.set()
@@ -384,7 +395,7 @@ class NinjaTraderListenerWorker:
         assert harness is not None
         try:
             harness.run_until_stopped(self._stop_event)
-        except (OSError, ValueError) as exc:
+        except Exception as exc:
             detail = f"{type(exc).__name__}: {exc}"
             with self._lock:
                 self._state = "FAILED"
@@ -401,55 +412,3 @@ class NinjaTraderListenerWorker:
                 if self._state not in {"FAILED", "STOPPED"}:
                     self._state = "STOPPED"
                 self._finished_event.set()
-
-
-def _write_report(path: str, report: dict[str, object]) -> None:
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("w", encoding="utf-8", newline="\n") as handle:
-        json.dump(report, handle, sort_keys=True, indent=2)
-        handle.write("\n")
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Beelzebub-owned read-only NinjaTrader commissioning receiver")
-    parser.add_argument("--port", type=int, default=48135)
-    parser.add_argument("--duration-seconds", type=float, default=60.0)
-    parser.add_argument("--report-file", help="Optional sanitized JSON commissioning report path.")
-    args = parser.parse_args(argv)
-    try:
-        config = LoopbackBridgeConfig(port=args.port)
-
-        def listener_started(host: str, port: int) -> None:
-            # This JSON Lines status event is intentionally emitted before the
-            # receive loop. It proves Beelzebub, not a shell helper, owns the
-            # listener without disclosing a provider payload or identifier.
-            print(json.dumps({"authority": "OBSERVE_ONLY", "event": "LISTENING", "host": host, "port": port}, sort_keys=True), file=sys.stderr, flush=True)
-
-        harness = NinjaTraderCommissioningHarness(config, on_listener_started=listener_started)
-        summary = harness.run(args.duration_seconds)
-    except (OSError, ValueError) as error:
-        print(json.dumps({"schema": "lane-iii-phase-f3-ninjatrader-commissioning-v1", "listener": {"host": LOOPBACK_HOST, "port": args.port, "ready": False}, "error": type(error).__name__}, sort_keys=True))
-        return 2
-    report = summary.safe_report()
-    report["capture"] = {
-        "duration_seconds": args.duration_seconds,
-        "mode": "OBSERVE_ONLY",
-        "orders_submitted": 0,
-        "orders_modified_or_cancelled": 0,
-        "real_capital_touched": False,
-    }
-    report["runtime"] = {
-        "entrypoint": "main.py ninjatrader-observe",
-        "listener_owner": "BEELZEBUB",
-        "stdin_required": False,
-        "transport_direction": "NINJATRADER_TO_BEELZEBUB",
-    }
-    if args.report_file:
-        _write_report(args.report_file, report)
-    print(json.dumps(report, sort_keys=True))
-    return 0 if summary.accepted else 3
-
-
-if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())

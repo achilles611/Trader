@@ -9,4 +9,4 @@ authenticated provider observations → L3-F → frozen L3-B → frozen L3-C →
 
 Record capability status, resolved contract, sanitized packet hashes, stream health, reconciliation state, and signal count. Label all artifacts `OBSERVED_EXTERNAL` or `SIMULATED`; `LIVE_EXECUTION` cannot be produced by l3f.
 
-Current result: **not performed through the bridge**. Operator UI evidence confirms candidate NinjaTrader feeds; bridge-level account mapping, contract resolution, callbacks, and canonical L3-B output remain uncommissioned. Real orders: 0.
+Current result: authentic NinjaTrader bridge observation is commissioned for the persistent Lucid alias, separate Sim101 classification, native `MNQ SEP26`, quote, trade, and aggregated L2 callbacks. Driving the downstream live `l3b → l3c → l3d` shadow path is intentionally outside the observer freeze and has not been used to claim decision or execution readiness. Real orders: 0.

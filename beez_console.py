@@ -44,11 +44,14 @@ def project_root(*, frozen: bool | None = None, executable: str | None = None, s
 
 def validate_project_root(root: Path) -> tuple[Path, Path]:
     """Require the executable to live beside the project-local runtime."""
-    python = root / ".venv" / "Scripts" / "python.exe"
+    # requirements.lock is generated and the Lane III runtime is tested with
+    # Python 3.12. The legacy .venv in this checkout is Python 3.10 and cannot
+    # import stdlib StrEnum, so it is not a valid Beelzebub runtime.
+    python = root / ".venv312" / "Scripts" / "python.exe"
     entrypoint = root / "main.py"
     if not entrypoint.is_file() or not python.is_file():
         raise RuntimeError(
-            "BeezConsole must be located in the Trader project root beside main.py and .venv\\Scripts\\python.exe."
+            "BeezConsole must be located in the Trader project root beside main.py and .venv312\\Scripts\\python.exe."
         )
     return python, entrypoint
 

@@ -30,7 +30,7 @@ class StaticProvider:
         return iter(self.observations)
 
 
-def test_config(root: Path) -> CopyTradeConfig:
+def _test_config(root: Path) -> CopyTradeConfig:
     return CopyTradeConfig(
         artifacts=ArtifactConfig(database_path=root / "suitability.sqlite3", obsidian_root=root / "obsidian"),
         sizing=SizingConfig(min_history=1, max_equity_age_seconds=86_400),
@@ -71,7 +71,7 @@ def campaigns(wallet: str, pnls: list[float], *, symbols: tuple[str, ...] = ("BT
 
 class SuitabilityEvidenceTests(unittest.TestCase):
     def test_relative_weights_normalize_perfect_scores_and_never_exceed_fixed_scale(self) -> None:
-        cfg = test_config(Path(tempfile.gettempdir()))
+        cfg = _test_config(Path(tempfile.gettempdir()))
         metrics = TraderMetrics(
             target_wallet=STEADY, calculated_at=utc_now(), history_days=365, campaign_count=100,
             closed_campaign_count=100, realized_pnl=1_000, net_pnl=1_000, wins=100, losses=0,
@@ -105,7 +105,7 @@ class SuitabilityEvidenceTests(unittest.TestCase):
     def test_finalist_policy_rejects_low_confidence_and_missing_copyability_without_mutating_score(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             cfg = replace(
-                test_config(Path(temp)),
+                _test_config(Path(temp)),
                 finalist_requirements=FinalistRequirementsConfig(
                     minimum_confidence_score=60, require_copyability_evidence=True,
                 ),
@@ -145,7 +145,7 @@ class SuitabilityEvidenceTests(unittest.TestCase):
             )
 
     def test_steady_repeatable_trader_beats_jackpot_and_uncopyable_trader_is_hard_gated(self) -> None:
-        cfg = test_config(Path(tempfile.gettempdir()))
+        cfg = _test_config(Path(tempfile.gettempdir()))
         steady_metrics = calculate_trader_metrics(STEADY, campaigns(STEADY, [8, 9, 7, 8, 9, 8]), (), cfg.sizing)
         jackpot_metrics = calculate_trader_metrics(JACKPOT, campaigns(JACKPOT, [2, 2, 2, 2, 2, 200]), (), cfg.sizing)
         follower = FollowerMetrics(expectancy=1, return_fraction=0.08, max_drawdown=0.05, copyability_score=0.8,
@@ -163,7 +163,7 @@ class SuitabilityEvidenceTests(unittest.TestCase):
         self.assertIn("copyability_hard_limit", whale.hard_gates)
 
     def test_confidence_regime_and_friction_are_deterministic_and_separate_from_suitability(self) -> None:
-        cfg = test_config(Path(tempfile.gettempdir()))
+        cfg = _test_config(Path(tempfile.gettempdir()))
         strong = calculate_trader_metrics(STEADY, campaigns(STEADY, [5, 6, 7, 8]), (), cfg.sizing)
         weak = calculate_trader_metrics(STEADY, campaigns(STEADY, [5]), (), cfg.sizing)
         strong.raw["active_days"] = 4
@@ -187,7 +187,7 @@ class SuitabilityEvidenceTests(unittest.TestCase):
     def test_end_to_end_pipeline_stores_funnel_report_and_never_promotes_operator_status(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            service = CopyTradeService(test_config(root))
+            service = CopyTradeService(_test_config(root))
             observed_at = utc_now()
             DiscoveryPipeline(service.database).run(
                 StaticProvider([DiscoveryObservation(STEADY, "suitability_fixture", observed_at, observed_at, evidence_id="seed")]),

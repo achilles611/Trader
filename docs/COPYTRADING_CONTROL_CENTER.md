@@ -16,7 +16,7 @@ cd ..
 Then start the local application with its single supervised paper watcher lifecycle:
 
 ```powershell
-.venv\Scripts\python.exe main.py copy-control-center --with-watcher
+.venv312\Scripts\python.exe main.py copy-control-center --with-watcher
 ```
 
 Open [http://127.0.0.1:8090](http://127.0.0.1:8090).  The frontend build is served by FastAPI. Use `--port 8091` if the default port is occupied.

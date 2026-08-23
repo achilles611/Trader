@@ -4,7 +4,6 @@ import asyncio
 import json
 import socket
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -165,6 +164,49 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
         self.assertTrue(result.listener_ready)
         self.assertTrue(connection.closed)
 
+    def test_abrupt_peer_reset_is_local_and_does_not_end_listener(self):
+        class Connection:
+            closed = False
+
+            def setblocking(self, value):
+                self.nonblocking = value
+
+            def recv(self, _):
+                raise ConnectionResetError("peer reset")
+
+            def close(self):
+                self.closed = True
+
+        class Listener:
+            closed = False
+
+            def __init__(self):
+                self.accepted = False
+
+            def setblocking(self, value):
+                self.nonblocking = value
+
+            def accept(self):
+                if self.accepted:
+                    raise BlockingIOError()
+                self.accepted = True
+                return connection, ("127.0.0.1", 48135)
+
+            def close(self):
+                self.closed = True
+
+        connection = Connection()
+        listener = Listener()
+        harness = NinjaTraderCommissioningHarness()
+        with patch.object(harness.bridge, "open_listener", return_value=listener), \
+             patch("src.l3f_provider.ninjatrader_commission.select.select", side_effect=(([listener], [], []), ([connection], [], []))), \
+             patch("src.l3f_provider.ninjatrader_commission.time.monotonic", side_effect=(0.0, 0.0, 0.0, 0.0, 0.0, 1.0)):
+            result = harness.run(1.0)
+        self.assertTrue(result.listener_ready)
+        self.assertTrue(connection.closed)
+        self.assertTrue(listener.closed)
+        self.assertEqual(result.safe_report()["provider_health"]["streams"]["LOCAL_BRIDGE"], "DISCONNECTED")
+
     def test_receiver_ingests_multiple_frames_from_one_local_connection(self):
         _, result, failures, thread, client = self._start_receiver()
         try:
@@ -223,14 +265,15 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
     def test_receiver_fails_closed_for_bad_encoding_json_and_oversized_frame(self):
         _, result, failures, thread, client = self._start_receiver(maximum_frame_bytes=1024)
         try:
-            client.sendall(b"\xff\n{" + b"\n")
+            client.sendall(b"\xff\n{\n" + frame("HEALTH", 1) + b"\n")
+            time.sleep(0.03)
             # The bounded reader rejects immediately once a newline-free frame
             # exceeds the configured maximum; it does not retain the tail.
             client.sendall(b"x" * 1025 + b"\n")
         finally:
             client.close()
         self._finish_receiver(result, failures, thread)
-        self.assertEqual(result[0].accepted, 0)
+        self.assertEqual(result[0].accepted, 1)
         self.assertGreaterEqual(result[0].rejected, 3)
         self.assertIn("bridge_encoding", result[0].error_details)
         self.assertIn("bridge_json", result[0].error_details)
@@ -285,50 +328,12 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
             ["UNKNOWN", "CONNECTING", "DISCONNECTED"],
         )
 
-    def test_beelzebub_command_owns_listener_without_stdin_or_broker_frames(self):
-        port = self._ephemeral_port()
+    def test_fastapi_lifespan_is_the_only_production_listener_entrypoint(self):
         root = Path(__file__).parents[1]
-        with tempfile.TemporaryDirectory() as directory:
-            report_file = Path(directory) / "commissioning.json"
-            process = subprocess.Popen(
-                [
-                    sys.executable, "main.py", "ninjatrader-observe",
-                    "--port", str(port), "--duration-seconds", "0.15",
-                    "--report-file", str(report_file),
-                ],
-                cwd=root,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            try:
-                status_line = process.stderr.readline()
-                self.assertEqual(json.loads(status_line), {
-                    "authority": "OBSERVE_ONLY", "event": "LISTENING", "host": "127.0.0.1", "port": port,
-                })
-                with socket.create_connection(("127.0.0.1", port), timeout=0.25):
-                    pass
-                stdout, stderr = process.communicate(timeout=2)
-            finally:
-                if process.poll() is None:
-                    process.kill()
-                    process.communicate()
-            self.assertEqual(process.returncode, 3)  # no authentic observations is not a successful commission
-            self.assertEqual(stderr, "")
-            report = json.loads(stdout)
-            self.assertEqual(report["listener"], {"host": "127.0.0.1", "port": port, "ready": True})
-            self.assertEqual(report["accepted_observations"], 0)
-            self.assertEqual(report["authority"], "OBSERVE_ONLY")
-            self.assertEqual(report["capture"]["mode"], "OBSERVE_ONLY")
-            self.assertFalse(report["capture"]["real_capital_touched"])
-            self.assertEqual(report["runtime"], {
-                "entrypoint": "main.py ninjatrader-observe",
-                "listener_owner": "BEELZEBUB",
-                "stdin_required": False,
-                "transport_direction": "NINJATRADER_TO_BEELZEBUB",
-            })
-            self.assertEqual(json.loads(report_file.read_text(encoding="utf-8")), report)
+        self.assertNotIn("ninjatrader-observe", (root / "main.py").read_text(encoding="utf-8"))
+        commission_source = (root / "src" / "l3f_provider" / "ninjatrader_commission.py").read_text(encoding="utf-8")
+        self.assertNotIn("if __name__ ==", commission_source)
+        self.assertNotIn("ArgumentParser", commission_source)
 
     def test_gui_runtime_starts_exactly_one_listener_and_releases_then_reacquires_port(self):
         port = 48135
@@ -355,9 +360,14 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
                     duplicate = worker.start()
                     self.assertEqual(duplicate.state, "LISTENING")
                     self.assertEqual(duplicate.start_attempts, 1)
+                    self.assertEqual(
+                        sum(thread.name == "NINJATRADER_OBSERVER" and thread.is_alive() for thread in threading.enumerate()),
+                        1,
+                    )
 
             asyncio.run(exercise_lifespan())
         self.assertEqual(worker.status().state, "STOPPED")
+        self.assertFalse(any(thread.name == "NINJATRADER_OBSERVER" and thread.is_alive() for thread in threading.enumerate()))
         with self.assertRaises(OSError):
             socket.create_connection(("127.0.0.1", port), timeout=0.1)
         netstat = subprocess.run(["netstat", "-ano"], capture_output=True, text=True, check=True)
@@ -369,32 +379,111 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
         finally:
             self.assertEqual(restarted.stop().state, "STOPPED")
 
-    def test_gui_listener_never_reads_stdin_and_bind_collision_fails_closed(self):
+    def test_duplicate_fastapi_lifespan_is_refused_without_second_worker(self):
+        port = self._ephemeral_port()
+        workers: list[NinjaTraderListenerWorker] = []
+
+        def factory() -> NinjaTraderListenerWorker:
+            worker = NinjaTraderListenerWorker(LoopbackBridgeConfig(port=port))
+            workers.append(worker)
+            return worker
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = replace(CopyTradeConfig(), artifacts=replace(
+                CopyTradeConfig().artifacts, database_path=Path(directory) / "copytrade.sqlite3",
+            ))
+            app = create_control_center_app(config, ninjatrader_listener_factory=factory)
+
+            async def exercise_lifespan() -> None:
+                async with app.router.lifespan_context(app):
+                    with self.assertRaisesRegex(RuntimeError, "duplicate FastAPI lifespan refused"):
+                        async with app.router.lifespan_context(app):
+                            pass
+                    self.assertEqual(len(workers), 1)
+                    self.assertEqual(workers[0].status().state, "LISTENING")
+
+            asyncio.run(exercise_lifespan())
+        self.assertEqual(len(workers), 1)
+        self.assertEqual(workers[0].status().state, "STOPPED")
+
+    def test_ui_refreshes_and_websocket_reconnects_keep_one_listener_owner(self):
+        port = self._ephemeral_port()
+        workers: list[NinjaTraderListenerWorker] = []
+
+        def factory() -> NinjaTraderListenerWorker:
+            worker = NinjaTraderListenerWorker(LoopbackBridgeConfig(port=port))
+            workers.append(worker)
+            return worker
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = replace(CopyTradeConfig(), artifacts=replace(
+                CopyTradeConfig().artifacts, database_path=Path(directory) / "copytrade.sqlite3",
+            ))
+            app = create_control_center_app(config, ninjatrader_listener_factory=factory)
+
+            class DisconnectingWebSocket:
+                sent = 0
+
+                async def accept(self) -> None:
+                    return None
+
+                async def send_json(self, _payload) -> None:
+                    self.sent += 1
+
+                async def receive_text(self) -> str:
+                    from fastapi import WebSocketDisconnect
+                    raise WebSocketDisconnect()
+
+            async def exercise_ui_churn() -> None:
+                health_endpoint = next(route.endpoint for route in app.routes if route.path == "/api/health")
+                websocket_endpoint = next(route.endpoint for route in app.routes if route.path == "/ws")
+                async with app.router.lifespan_context(app):
+                    for _ in range(3):
+                        response = await health_endpoint()
+                        self.assertEqual(response["ninjatrader_observer"]["start_attempts"], 1)
+                    for _ in range(2):
+                        await websocket_endpoint(DisconnectingWebSocket())
+                    self.assertEqual(len(workers), 1)
+                    self.assertEqual(workers[0].status().state, "LISTENING")
+                    self.assertEqual(workers[0].status().start_attempts, 1)
+
+            asyncio.run(exercise_ui_churn())
+        self.assertEqual(workers[0].status().state, "STOPPED")
+
+    def test_gui_listener_never_reads_stdin_and_bind_collision_aborts_app_startup(self):
         port = 48135
         blocker = LoopbackNinjaTraderBridge(LoopbackBridgeConfig(port=port)).open_listener()
         worker = NinjaTraderListenerWorker(LoopbackBridgeConfig(port=port))
+        commission_source = (Path(__file__).parents[1] / "src" / "l3f_provider" / "ninjatrader_commission.py").read_text(encoding="utf-8")
+        self.assertNotIn("stdin", commission_source)
 
-        class NoStdin:
-            def read(self, *_args, **_kwargs):
-                raise AssertionError("GUI listener must not read stdin")
+        with tempfile.TemporaryDirectory() as directory:
+            config = replace(CopyTradeConfig(), artifacts=replace(
+                CopyTradeConfig().artifacts, database_path=Path(directory) / "copytrade.sqlite3",
+            ))
+            app = create_control_center_app(config, ninjatrader_listener_factory=lambda: worker)
 
-            def readline(self, *_args, **_kwargs):
-                raise AssertionError("GUI listener must not read stdin")
+            async def attempt_startup() -> None:
+                async with app.router.lifespan_context(app):
+                    pass
 
-        try:
-            with patch("src.l3f_provider.ninjatrader_commission.sys.stdin", NoStdin()):
+            try:
                 with self.assertLogs("src.l3f_provider.ninjatrader_commission", level="ERROR") as logs:
-                    status = worker.start()
-            self.assertEqual(status.state, "FAILED")
-            self.assertEqual(status.host, "127.0.0.1")
-            self.assertEqual(status.port, port)
-            self.assertEqual(status.start_attempts, 1)
-            self.assertIsNotNone(status.error)
-            self.assertIn("NINJATRADER_OBSERVER FAILED 127.0.0.1:48135", logs.output[0])
-            self.assertEqual(blocker.getsockname(), ("127.0.0.1", port))
-        finally:
-            worker.stop()
-            blocker.close()
+                    with self.assertRaisesRegex(RuntimeError, "NINJATRADER_OBSERVER startup failed at 127.0.0.1:48135"):
+                        asyncio.run(attempt_startup())
+                status = worker.status()
+                self.assertIsNone(app.state.ninjatrader_observer)
+                self.assertEqual(status.state, "FAILED")
+                self.assertEqual(status.host, "127.0.0.1")
+                self.assertEqual(status.port, port)
+                self.assertEqual(status.start_attempts, 1)
+                self.assertIsNotNone(status.error)
+                self.assertIn("NINJATRADER_OBSERVER FAILED 127.0.0.1:48135", logs.output[0])
+                self.assertEqual(blocker.getsockname(), ("127.0.0.1", port))
+                self.assertFalse(any(thread.name == "NINJATRADER_OBSERVER" and thread.is_alive() for thread in threading.enumerate()))
+            finally:
+                worker.stop()
+                blocker.close()
 
     def test_strict_wire_rejects_unknown_fields_duplicate_keys_bool_sequence_and_unknown_alias(self):
         base = json.loads(frame("HEALTH", 1))

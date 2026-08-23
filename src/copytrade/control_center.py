@@ -1310,7 +1310,7 @@ def create_control_center_app(
     execution_service = watcher_service or CopyTradeService(config, database)
     center = CopyControlCenter(config, execution_service.database, execution_service=execution_service)
     watcher_runtime: dict[str, Any] = {}
-    ninjatrader_runtime: dict[str, NinjaTraderListenerWorker] = {}
+    ninjatrader_runtime: dict[str, Any] = {}
     job_runtime: dict[str, asyncio.Task[Any]] = {}
     source = discovery_source or HyperCoreSourceAcquisition(cache_directory(config.artifacts.database_path))
     discovery_orchestrator = CandidateDiscoveryOrchestrator(execution_service, center.store, source)
@@ -1346,45 +1346,62 @@ def create_control_center_app(
         # The Control Center application owns this worker for its entire
         # lifespan. It is deliberately outside routes, views, and websocket
         # connections so refreshes/remounts cannot create another listener.
-        listener = (
-            ninjatrader_listener_factory()
-            if ninjatrader_listener_factory is not None
-            else NinjaTraderListenerWorker(logger=NINJATRADER_RUNTIME_LOGGER)
-        )
-        ninjatrader_runtime["listener"] = listener
-        app.state.ninjatrader_observer = listener
-        listener.start()
-        # A thread cannot be safely resumed after a process restart.  Preserve
-        # its durable record and make the interruption explicit to operators.
-        for job in center.store.list_jobs(job_type="candidate_discovery", limit=200):
-            if job["status"] in {"queued", "acquiring", "parsing", "discovering"}:
-                center.store.update_job(job["job_id"], status="failed", stage="interrupted", finished=True,
-                                        message="Control Center restarted before this discovery job completed.",
-                                        error={"message": "Control Center restarted before this discovery job completed."})
-        if watcher_service is not None:
-            if watcher_factory is None:
-                from .hyperliquid import HyperliquidWatcher
-                factory = HyperliquidWatcher
-            else:
-                factory = watcher_factory
-            supervisor = WatcherMembershipSupervisor(
-                watcher_service, factory, center.store,
-                poll_interval_seconds=watcher_poll_interval_seconds,
-                retry_delay_seconds=watcher_retry_delay_seconds,
-                stop_timeout_seconds=watcher_stop_timeout_seconds,
-            )
-            watcher_runtime["supervisor"] = supervisor
-            watcher_runtime["task"] = asyncio.create_task(supervisor.run())
+        if ninjatrader_runtime.get("active"):
+            raise RuntimeError("NINJATRADER_OBSERVER duplicate FastAPI lifespan refused")
+        ninjatrader_runtime["active"] = True
+        listener: NinjaTraderListenerWorker | None = None
         try:
+            listener = (
+                ninjatrader_listener_factory()
+                if ninjatrader_listener_factory is not None
+                else NinjaTraderListenerWorker(logger=NINJATRADER_RUNTIME_LOGGER)
+            )
+            ninjatrader_runtime["listener"] = listener
+            app.state.ninjatrader_observer = listener
+            listener_status = listener.start()
+            if listener_status.state != "LISTENING":
+                raise RuntimeError(
+                    f"NINJATRADER_OBSERVER startup failed at {listener_status.host}:{listener_status.port}: "
+                    f"{listener_status.error or listener_status.state}"
+                )
+            # A thread cannot be safely resumed after a process restart.  Preserve
+            # its durable record and make the interruption explicit to operators.
+            for job in center.store.list_jobs(job_type="candidate_discovery", limit=200):
+                if job["status"] in {"queued", "acquiring", "parsing", "discovering"}:
+                    center.store.update_job(job["job_id"], status="failed", stage="interrupted", finished=True,
+                                            message="Control Center restarted before this discovery job completed.",
+                                            error={"message": "Control Center restarted before this discovery job completed."})
+            if watcher_service is not None:
+                if watcher_factory is None:
+                    from .hyperliquid import HyperliquidWatcher
+                    factory = HyperliquidWatcher
+                else:
+                    factory = watcher_factory
+                supervisor = WatcherMembershipSupervisor(
+                    watcher_service, factory, center.store,
+                    poll_interval_seconds=watcher_poll_interval_seconds,
+                    retry_delay_seconds=watcher_retry_delay_seconds,
+                    stop_timeout_seconds=watcher_stop_timeout_seconds,
+                )
+                watcher_runtime["supervisor"] = supervisor
+                watcher_runtime["task"] = asyncio.create_task(supervisor.run())
             yield
         finally:
-            listener.stop()
             supervisor = watcher_runtime.get("supervisor")
             task = watcher_runtime.get("task")
-            if supervisor is not None:
-                await supervisor.stop()
-            if task is not None:
-                await asyncio.gather(task, return_exceptions=True)
+            try:
+                if listener is not None:
+                    listener.stop()
+            finally:
+                try:
+                    if supervisor is not None:
+                        await supervisor.stop()
+                    if task is not None:
+                        await asyncio.gather(task, return_exceptions=True)
+                finally:
+                    watcher_runtime.clear()
+                    ninjatrader_runtime.clear()
+                    app.state.ninjatrader_observer = None
 
     app = FastAPI(title="Trader Copy Control Center", version="1.0", docs_url=None, redoc_url=None,
                   lifespan=lifespan)
@@ -1665,7 +1682,14 @@ def create_control_center_app(
                     if previous.get(name) != signature:
                         await websocket.send_json({"type": name, "data": payload, "paper_only": True})
                         previous[name] = signature
-                await asyncio.sleep(1)
+                # Waiting only on changed outbound payloads leaves an idle,
+                # disconnected browser task alive forever. Poll the inbound
+                # ASGI channel so disconnects are observed and application
+                # shutdown can reach the listener-owning lifespan promptly.
+                try:
+                    await asyncio.wait_for(websocket.receive_text(), timeout=1)
+                except TimeoutError:
+                    pass
         except WebSocketDisconnect:
             return
 

@@ -27,8 +27,8 @@ class BeezConsoleTests(unittest.TestCase):
     def test_project_root_validation_reports_missing_main(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / ".venv" / "Scripts").mkdir(parents=True)
-            (root / ".venv" / "Scripts" / "python.exe").touch()
+            (root / ".venv312" / "Scripts").mkdir(parents=True)
+            (root / ".venv312" / "Scripts" / "python.exe").touch()
             with self.assertRaisesRegex(RuntimeError, "main.py"):
                 beez_console.validate_project_root(root)
 
@@ -36,8 +36,18 @@ class BeezConsoleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "main.py").touch()
-            with self.assertRaisesRegex(RuntimeError, ".venv"):
+            with self.assertRaisesRegex(RuntimeError, ".venv312"):
                 beez_console.validate_project_root(root)
+
+    def test_project_root_uses_python_312_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            python = root / ".venv312" / "Scripts" / "python.exe"
+            python.parent.mkdir(parents=True)
+            python.touch()
+            entrypoint = root / "main.py"
+            entrypoint.touch()
+            self.assertEqual(beez_console.validate_project_root(root), (python, entrypoint))
 
     def test_running_server_opens_brave_without_duplicate_backend(self) -> None:
         root = Path(r"C:\\Trader")

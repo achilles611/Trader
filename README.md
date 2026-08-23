@@ -19,10 +19,10 @@ and models before emitting only shadow/simulation decisions.
 
 ```powershell
 cd E:\Beelzebub
-.\.venv\Scripts\python.exe -m pip install -r requirements.lock
-.\.venv\Scripts\python.exe main.py copy-storage-status
-.\.venv\Scripts\python.exe main.py science run-once
-.\.venv\Scripts\python.exe main.py copy-control-center --with-watcher
+.\.venv312\Scripts\python.exe -m pip install -r requirements.lock
+.\.venv312\Scripts\python.exe main.py copy-storage-status
+.\.venv312\Scripts\python.exe main.py science run-once
+.\.venv312\Scripts\python.exe main.py copy-control-center --with-watcher
 ```
 
 Active state is stored on `E:\Beelzebub\runtime\hot`; archival state is on

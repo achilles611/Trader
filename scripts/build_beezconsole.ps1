@@ -9,7 +9,7 @@ if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
 }
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$python = Join-Path $repoRoot ".venv\Scripts\python.exe"
+$python = Join-Path $repoRoot ".venv312\Scripts\python.exe"
 $launcherSource = Join-Path $repoRoot "beez_console.py"
 $iconPng = Join-Path $repoRoot "assets\beezconsole-icon.png"
 $uiRoot = Join-Path $repoRoot "control-center-ui"

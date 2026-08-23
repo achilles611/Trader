@@ -1,28 +1,41 @@
 # Closure audit
 
-## Implemented and tested
+## Status: L3-F3 FROZEN
 
-- Explicit DEMO/LIVE endpoint fence; no fallback.
-- Runtime-only credentials, redaction, named read-only HTTP/WebSocket surfaces.
-- Explicit master-account and concrete-MNQ resolution.
-- Strict L3-B quote/trade/aggregated-DOM conversion and safe fixture capture.
-- Account/position/order observation model, startup reconciliation, health, stale/disconnect/token lifecycle.
-- Lucid risk profile, session boundary, future rate diagnostic, microscalping diagnostic.
-- 60 focused `l3f`/`l3f2`/`l3f3` tests pass locally; no frozen `l3a`–`l3e` source changed.
-- Complete repository suite: **558 passed** in 372.522 seconds on 2026-08-21.
+The 2026-08-23 closure pass established one production owner for the NinjaTrader observation socket: the Control Center FastAPI lifespan creates one `NinjaTraderListenerWorker`, which owns one `NinjaTraderCommissioningHarness` and one `LoopbackNinjaTraderBridge`. The obsolete standalone `main.py ninjatrader-observe` bind path was retired. Routes, page loads, websocket connections, watcher replacement, imports, and tests do not create a production listener.
 
-## L3-F3 commissioning result: DEPTH GATE PASSED; FREEZE REMAINS BLOCKED
+Normal BeezConsole startup now selects the checkout's Python 3.12 environment. The rebuilt local executable launched `main.py copy-control-center --with-watcher`; one Python 3.12 PID owned both the HTTP server and exactly one `127.0.0.1:48135` listener and emitted `NINJATRADER_OBSERVER LISTENING 127.0.0.1:48135`.
 
-Direct Tradovate remains accurately classified `UNAVAILABLE_FOR_THIS_ACCOUNT`. The NinjaTrader AddOn was compiled and produced authentic observations through the localhost-only bridge: 27,492 accepted observations, zero rejected, two connection records, 1,523 account records, 21,739 quotes, 4,224 trades, and four explicit snapshots. The Lucid alias and Sim101 were separately identified. The Lucid snapshots established `FLAT_CONFIRMED` and `NONE_WORKING_CONFIRMED`; neither state was inferred from silence.
+Adversarial lifecycle coverage and live process checks establish:
 
-The native observed contract identity is `MNQ SEP26`. A fresh post-restart capture, after the Level 2 entitlement was active, accepted 51,464 observations with zero rejections: 46,214 `DEPTH`, 3,433 quotes, and 869 trades, along with connection and explicit account snapshot records. The depth stream is genuine NinjaTrader `OnMarketDepth` output and represents aggregated price-level L2 snapshots rebuilt from Add/Update/Remove callbacks. It is not market-by-order data and supplies neither exchange sequence nor exchange timestamp. The prior L1-only/`UnknownSymbol` outcome is stale and superseded.
+- a duplicate worker start is idempotent and a duplicate FastAPI lifespan is refused before a second worker is created;
+- a real Windows port collision logs WinError 10048, aborts application startup with exit code 3, opens no HTTP port, leaves the existing owner untouched, and never selects another port;
+- malformed/incomplete frames and abrupt client resets remain local to the client connection;
+- NinjaTrader-side disconnect/reconnect changes transport health without creating another listener;
+- repeated HTTP refreshes and websocket reconnects leave `start_attempts=1` and one listening PID;
+- idle disconnected websocket tasks are reaped, allowing a single normal Ctrl+C to reach FastAPI lifespan shutdown;
+- normal shutdown joins the worker, leaves no observer thread/process, and releases `48135`; and
+- a fresh backend process reclaims the exact port and again reports one start attempt.
 
-The receiver was then run on 2026-08-21 for a fresh 60-second receive-only listen. It bound successfully to `127.0.0.1:48135`, accepted zero observations, and rejected zero frames; every provider stream remained `UNKNOWN` and `LOCAL_BRIDGE` ended `DISCONNECTED` when the listener stopped. The sanitized report is [receiver-observation-2026-08-21.json](receiver-observation-2026-08-21.json). This is not a substitute for the historical capture above: it means the current AddOn/NinjaTrader/Lucid chain was not delivering while this pass listened.
+## Authentic commissioning evidence
 
-`l3f3.2` subsequently started the same receiver through `main.py ninjatrader-observe`, making Beelzebub the explicit listener owner. The 60-second run reached `LISTENING` at `127.0.0.1:48135` without stdin or an auxiliary listener, then safely stopped with zero accepted and zero rejected observations; see [receiver-observation-2026-08-21-l3f3.2.json](receiver-observation-2026-08-21-l3f3.2.json). The installed NinjaTrader AddOn and observer sources hash-identically to the repository. The current process still provided no bridge connection; the newest available trace records AddOn finalization on 2026-08-20. Authentic observations therefore remain blocked on AddOn/observer activation or reload in the current NinjaTrader runtime, followed by a fresh capture.
+The prior authentic 2026-08-20 evidence remains valid because this pass did not change wire admission, account isolation, market normalization, or frozen Lane III semantics:
 
-`l3f3.3` makes the existing receiver an ordinary Control Center runtime worker. The FastAPI lifespan starts one `NinjaTraderListenerWorker` before serving the GUI and stops/joins it during shutdown; the worker reuses the commissioning receiver loop and binds only `127.0.0.1:48135`. Focused lifecycle tests verify the listening endpoint with `netstat -ano`, prove GUI startup reaches `LISTENING`, repeated initialization does not duplicate the worker, shutdown releases the port, a new worker reacquires it, and a Windows bind collision remains visible and fail-closed on the configured port. This closes listener-runtime ownership only; it is not authentic market-flow evidence.
+- L1/account capture: 27,492 accepted, 0 rejected; 21,739 quotes, 4,224 trades, 1,523 account records, 2 connection records, and 4 explicit snapshots.
+- L2 capture: 51,464 accepted, 0 rejected; 46,214 aggregated depth frames, 3,433 quotes, and 869 trades, plus connection/account snapshot records.
+- Native instrument: `MNQ SEP26`.
+- Account isolation: `Lucid25kflex01` is the provider-evaluation alias and `Sim101` is separately local simulation.
+- The installed AddOn and indicator hashes still match the repository sources on 2026-08-23.
 
-The remaining freeze gates are therefore runtime-blocked: the current receiver did not receive authentic observations; exact contract metadata beyond the native name has not been emitted as authenticated bridge data; no authentic execution callback is available without an order, which remains prohibited; an explicit provider disconnect/reconnect has not been commissioned; and the live `l3b → l3c → l3d` shadow path has not yet been driven by the authentic stream. The focused `l3f` suite passes. The rule profile also retains unknown drawdown behavior, news status, and account-specific mandatory flat deadline.
+A fresh 2026-08-23 provider attempt was **BLOCKED/UNVERIFIED**: NinjaTrader started but remained at its `Welcome` window, produced only a session-break log line, and never connected to `48135`. No credentials were automated and no fresh quote/trade/depth count is claimed. This limitation does not invalidate the prior authentic captures or the newly commissioned listener lifecycle.
 
-No provider request, real order, order change, cancellation, flatten, or real-capital touch occurred. `l3g` must not begin from this state.
+## Integrity and regression
+
+- Focused Lane III A-F, listener, launcher, and Control Center result: 190 passed and 7 subtests passed.
+- Full repository result: 562 passed and 71 subtests passed in 387.06 seconds.
+- Frozen `src/lane_iii` semantic diff from `c7d8c9f` through this closure: empty.
+- No order submission, modification, cancellation, flatten, account mutation, position mutation, strategy selection, signal generation, or live-capital authority was introduced.
+
+Unknown Lucid news rules, drawdown behavior, mandatory flatten/reopen timing, separately authenticated contract metadata, authentic execution callbacks, and downstream live shadow operation are facts for future decision/execution readiness. They are not material to correctness of this observation-only listener and do not block the `l3f3` freeze.
+
+The detailed evidence matrix is in [freeze-closure-2026-08-23.md](freeze-closure-2026-08-23.md).

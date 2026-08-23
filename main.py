@@ -6,9 +6,6 @@ from src.copytrade.cli import main as copytrade_main
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "ninjatrader-observe":
-        from src.l3f_provider.ninjatrader_commission import main as ninjatrader_observe_main
-        raise SystemExit(ninjatrader_observe_main(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "materialization":
         from src.phase_e.cli import main as materialization_main
         raise SystemExit(materialization_main(sys.argv[2:]))

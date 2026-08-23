@@ -4,11 +4,11 @@ The adapter accepts strict provider packets for quotes, trades, and aggregated D
 
 | L3-B requirement | Status |
 | --- | --- |
-| Trade tape | SUPPORTED WITH LIMITATION — tick-chart/packet schema must be commissioned |
-| Best bid/ask | SUPPORTED WITH LIMITATION — entitlement/schema unverified |
-| DOM | SUPPORTED WITH LIMITATION — aggregated depth only, not order-by-order CME depth |
+| Trade tape | AUTHENTICALLY OBSERVED — 4,224 L1-capture trades and 869 L2-capture trades |
+| Best bid/ask | AUTHENTICALLY OBSERVED — 21,739 L1-capture quotes and 3,433 L2-capture quotes |
+| DOM | AUTHENTICALLY OBSERVED WITH LIMITATION — 46,214 aggregated depth frames; not order-by-order CME depth |
 | Timestamps / sequence | SUPPORTED WITH LIMITATION — provider timestamp/sequence preserved when supplied |
-| Volume | SUPPORTED WITH LIMITATION — provider size only; no fabricated totals |
-| Contract / session identity | FULLY MODELED, uncommissioned |
+| Volume | AUTHENTICALLY OBSERVED WITH LIMITATION — provider size only; no fabricated totals |
+| Contract / session identity | PARTIALLY AUTHENTICATED — native `MNQ SEP26` and per-channel session guarding; separate expiry/exchange/tick/point metadata unverified |
 
-Actual entitlement, payload completeness, ordering, and reconnection remain **UNKNOWN**. Malformed, non-tick-aligned, wrong-contract, unsequenced-as-sequenced, or timestamp-free observations fail closed.
+L1 and Level 2 entitlement and the observation payload shapes are authenticated. Depth ordering remains local bridge ordering rather than exchange sequence; disconnect/reconnect lifecycle is tested but the fresh 2026-08-23 provider attempt was unavailable at the NinjaTrader Welcome screen. Malformed, non-tick-aligned, wrong-contract, or falsely sequenced observations fail closed; timestamp absence remains explicit rather than fabricated.
