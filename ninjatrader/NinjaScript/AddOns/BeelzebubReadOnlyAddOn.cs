@@ -286,7 +286,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private static bool senderRunning;
         private static bool senderStopping;
 
-        public static void Publish(string type, string alias, string accountClass, string payload, DateTime? providerTime = null)
+        public static string Publish(string type, string alias, string accountClass, string payload, DateTime? providerTime = null)
         {
             TransportDiagnosticOnce("BRIDGE_PUBLISH_ATTEMPT_" + type);
             lock (outboundFramesLock)
@@ -295,14 +295,16 @@ namespace NinjaTrader.NinjaScript.AddOns
                 // market-data callbacks may otherwise receive numbers in one
                 // thread order but enter the outbound queue in another.
                 long number = ++sequence;
+                string observationId = "nt-" + sessionId + "-" + number;
                 string account = alias == null ? "null" : "{\"alias\":\"" + alias + "\",\"class\":\"" + accountClass + "\"}";
                 string timestamp = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
                 string providerTimestamp = providerTime.HasValue ? providerTime.Value.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture) : "null";
-                string frame = "{\"schema\":\"lane-iii-phase-f2-ninjatrader-observation-v1\",\"observation_id\":\"nt-" + sessionId + "-" + number +
+                string frame = "{\"schema\":\"lane-iii-phase-f2-ninjatrader-observation-v1\",\"observation_id\":\"" + observationId +
                     "\",\"session_id\":\"" + sessionId + "\",\"observation_type\":\"" + type + "\",\"ninja_receipt_time\":\"" + timestamp +
                     "\",\"local_monotonic_sequence\":" + number + ",\"provider_timestamp\":" + (providerTimestamp == "null" ? "null" : "\"" + providerTimestamp + "\"") +
                     ",\"provider_sequence\":null,\"exchange_timestamp\":null,\"account\":" + account + ",\"payload\":" + payload + "}\n";
                 EnqueueLocked(frame);
+                return observationId;
             }
         }
 

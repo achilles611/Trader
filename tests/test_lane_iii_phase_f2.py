@@ -7,7 +7,9 @@ from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 
-from src.lane_iii.market_data import MarketDataSource, RawProviderEvent
+from src.lane_iii.market_data import (
+    AggressorProvenance, AggressorSide, MarketDataSource, RawProviderEvent,
+)
 from src.l3f_provider.ninjatrader_observation import (
     AccountClass, LoopbackBridgeConfig, LoopbackNinjaTraderBridge,
     NinjaTraderAccountIsolation, NinjaTraderContract, NinjaTraderMarketDataAdapter,
@@ -89,6 +91,120 @@ class LaneIIIPhaseF2Tests(unittest.TestCase):
         self.assertEqual(book.bids[0].price, Decimal("20000.00"))
         self.assertIsNone(book.header.provider_sequence)
 
+    def test_native_aggressor_requires_explicit_native_provenance(self):
+        adapter = NinjaTraderMarketDataAdapter(contract())
+        native = self.observation("TRADE", payload={
+            "contract_id": "MNQ SEPT26", "price": "20000.25", "size": 1,
+            "aggressor_side": "BUY", "aggressor_source": "PROVIDER_NATIVE",
+        })
+        event = adapter.normalize(self.raw(native))[0]
+        self.assertIs(event.aggressor_side, AggressorSide.BUY)
+        self.assertIs(event.aggressor_provenance, AggressorProvenance.PROVIDER)
+
+        unproven = self.observation("TRADE", sequence=2, payload={
+            "contract_id": "MNQ SEPT26", "price": "20000.25", "size": 1,
+            "aggressor_side": "BUY",
+        })
+        event = adapter.normalize(self.raw(unproven))[0]
+        self.assertIs(event.aggressor_side, AggressorSide.UNKNOWN)
+        self.assertIs(event.aggressor_provenance, AggressorProvenance.UNAVAILABLE)
+
+    def test_quote_derived_aggressor_classification_is_fail_closed_and_no_lookahead(self):
+        def classify(
+            price: str, bid: object = "20000.00", ask: object = "20000.25", *,
+            quote_first: bool = True, quote_time: str = TIME, trade_time: str = TIME,
+            quote_reference: str | None = None, quote_ask: str = "20000.25",
+        ):
+            adapter = NinjaTraderMarketDataAdapter(contract())
+            quote = self.observation("QUOTE", provider_time=quote_time, payload={
+                "contract_id": "MNQ SEPT26", "bid": "20000.00", "ask": quote_ask,
+                "bid_size": 2, "ask_size": 3,
+            })
+            if quote_first:
+                adapter.normalize(self.raw(quote))
+            trade = self.observation("TRADE", sequence=2, provider_time=trade_time, payload={
+                "contract_id": "MNQ SEPT26", "price": price, "size": 1,
+                "aggressor_side": "UNKNOWN", "aggressor_source": "BID_ASK_CLASSIFICATION",
+                "bid_at_trade": bid, "ask_at_trade": ask,
+                "derivation_quote_observation_id": quote.observation_id if quote_reference is None else quote_reference,
+            })
+            result = adapter.normalize(self.raw(trade))[0]
+            if not quote_first:
+                adapter.normalize(self.raw(quote))
+            return result
+
+        cases = (
+            ("at_ask", "20000.25", "20000.00", "20000.25", AggressorSide.BUY, {}),
+            ("above_ask", "20000.50", "20000.00", "20000.25", AggressorSide.BUY, {}),
+            ("at_bid", "20000.00", "20000.00", "20000.25", AggressorSide.SELL, {}),
+            ("below_bid", "19999.75", "20000.00", "20000.25", AggressorSide.SELL, {}),
+            ("inside_spread", "20000.25", "20000.00", "20000.50", AggressorSide.UNKNOWN, {"quote_ask": "20000.50"}),
+            ("no_bid", "20000.25", None, "20000.25", AggressorSide.UNKNOWN, {}),
+            ("no_ask", "20000.00", "20000.00", None, AggressorSide.UNKNOWN, {}),
+            ("locked", "20000.00", "20000.00", "20000.00", AggressorSide.UNKNOWN, {}),
+            ("crossed", "20000.25", "20000.25", "20000.00", AggressorSide.UNKNOWN, {}),
+        )
+        for name, price, bid, ask, expected, options in cases:
+            with self.subTest(name=name):
+                event = classify(price, bid, ask, **options)
+                self.assertIs(event.aggressor_side, expected)
+                self.assertIs(
+                    event.aggressor_provenance,
+                    AggressorProvenance.QUOTE_DERIVED if expected is not AggressorSide.UNKNOWN else AggressorProvenance.UNAVAILABLE,
+                )
+
+        stale = classify("20000.25", quote_time="2026-08-20T14:59:59Z")
+        self.assertIs(stale.aggressor_side, AggressorSide.UNKNOWN)
+        wrong_reference = classify("20000.25", quote_reference="future-or-unrelated-quote")
+        self.assertIs(wrong_reference.aggressor_side, AggressorSide.UNKNOWN)
+        quote_after_trade = classify("20000.25", quote_first=False)
+        self.assertIs(quote_after_trade.aggressor_side, AggressorSide.UNKNOWN)
+
+    def test_depth_mutation_provenance_is_validated_but_remains_unsequenced_snapshot(self):
+        base = {
+            "contract_id": "MNQ SEPT26",
+            "bids": [{"price": "20000.00", "size": 2}],
+            "asks": [{"price": "20000.25", "size": 3}],
+            "operation": "Add", "side": "Bid", "mutation_price": "20000.00",
+            "mutation_volume": 2, "mutation_position": 0, "is_reset": False,
+        }
+        for index, changes in enumerate((
+            {"operation": "Add", "side": "Bid"},
+            {"operation": "Update", "side": "Ask", "mutation_price": "20000.25", "mutation_volume": 3},
+            {"operation": "Remove", "side": "Bid", "mutation_volume": 0, "bids": [{"price": "19999.75", "size": 1}]},
+            {"operation": "Add", "side": "Ask", "mutation_price": "20000.25", "mutation_volume": 3, "is_reset": True},
+        ), start=1):
+            with self.subTest(changes=changes):
+                payload = base | changes
+                adapter = NinjaTraderMarketDataAdapter(contract())
+                event = adapter.normalize(self.raw(self.observation("DEPTH", sequence=index, payload=payload)))[0]
+                self.assertEqual(type(event).__name__, "BookSnapshotEvent")
+                self.assertIsNone(event.header.provider_sequence)
+
+        invalid = (
+            {"operation": "Replace"},
+            {"side": "Both"},
+            {"mutation_price": "20000.10"},
+            {"mutation_volume": -1},
+            {"mutation_position": -1},
+            {"mutation_position": 2},
+            {"is_reset": "false"},
+        )
+        for index, changes in enumerate(invalid, start=10):
+            with self.subTest(invalid=changes):
+                payload = base | changes
+                adapter = NinjaTraderMarketDataAdapter(contract())
+                with self.assertRaisesRegex(NinjaTraderObservationError, "MALFORMED_PROVIDER_PAYLOAD"):
+                    adapter.normalize(self.raw(self.observation("DEPTH", sequence=index, payload=payload)))
+        for index, missing_field in enumerate(("mutation_price", "mutation_volume"), start=20):
+            with self.subTest(missing_field=missing_field):
+                incomplete = dict(base)
+                del incomplete[missing_field]
+                with self.assertRaisesRegex(NinjaTraderObservationError, "MALFORMED_PROVIDER_PAYLOAD"):
+                    NinjaTraderMarketDataAdapter(contract()).normalize(
+                        self.raw(self.observation("DEPTH", sequence=index, payload=incomplete))
+                    )
+
     def test_wrong_contract_malformed_value_and_missing_timestamp_fail_closed(self):
         adapter = NinjaTraderMarketDataAdapter(contract())
         wrong = self.observation("QUOTE", payload={"contract_id": "MNQ DEC26", "bid": "20000", "ask": "20000.25", "bid_size": 1, "ask_size": 1})
@@ -143,6 +259,29 @@ class LaneIIIPhaseF2Tests(unittest.TestCase):
         self.assertIn("IPAddress.Loopback", source)
         self.assertNotIn("IPAddress.Any", source)
         self.assertNotIn("TcpListener", source)
+
+    def test_ninjascript_trade_provenance_uses_same_callback_quote_and_no_future_data(self):
+        root = Path(__file__).parents[1] / "ninjatrader" / "NinjaScript"
+        observer = (root / "Indicators" / "BeelzebubReadOnlyMarketObserver.cs").read_text(encoding="utf-8")
+        outbound = (root / "AddOns" / "BeelzebubReadOnlyAddOn.cs").read_text(encoding="utf-8")
+        self.assertIn("double bidAtTrade = e.Bid", observer)
+        self.assertIn("double askAtTrade = e.Ask", observer)
+        self.assertIn("BID_ASK_CLASSIFICATION", observer)
+        self.assertIn("derivation_quote_observation_id", observer)
+        self.assertLess(observer.index('Publish("QUOTE"'), observer.index('Publish("TRADE"'))
+        self.assertNotIn("OnBarUpdate", observer)
+        self.assertNotIn("Close[", observer)
+        self.assertNotIn("GetCurrentBid", observer)
+        self.assertIn("public static string Publish", outbound)
+        self.assertIn("OnConnectionStatusUpdate", observer)
+        self.assertIn("ClearMarketState();", observer)
+        self.assertIn("if (e.IsReset)", observer)
+        self.assertIn("e.Time - bestBidTime <= TimeSpan.FromSeconds(10)", observer)
+        self.assertIn("e.Time - bestAskTime <= TimeSpan.FromSeconds(10)", observer)
+        self.assertIn("bid_source_time", observer)
+        self.assertIn("ask_source_time", observer)
+        for field in ("mutation_price", "mutation_volume", "mutation_position", "is_reset"):
+            self.assertIn(field, observer)
 
     def test_no_frozen_lane_iii_source_is_changed_or_networked(self):
         root = Path(__file__).parents[1] / "src" / "lane_iii"

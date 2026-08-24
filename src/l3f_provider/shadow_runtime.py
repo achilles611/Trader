@@ -27,12 +27,14 @@ from src.l3f_provider.tradovate_observation import ProviderErrorCode, StreamHeal
 from src.lane_iii.contracts import canonical_hash, normalized_utc
 from src.lane_iii.hypothesis_engine import HypothesisEngine, HypothesisEngineRefused
 from src.lane_iii.market_data import (
+    AggressorProvenance,
     BookApplyOutcome,
     DataQuality,
     MarketDataPipeline,
     MarketDataRefused,
     OrderingOutcome,
     RawProviderEvent,
+    TradeEvent,
 )
 from src.lane_iii.trader_v0 import SignalDecision, TraderDataQuality, TraderEvaluationRefused, TraderV0
 
@@ -103,6 +105,9 @@ class LaneIIIShadowRuntime:
             "raw_rejected_observations": 0,
             "quote_events": 0,
             "trade_events": 0,
+            "trade_aggressor_provider_native": 0,
+            "trade_aggressor_quote_derived": 0,
+            "trade_aggressor_unknown": 0,
             "depth_events": 0,
             "normalized_admitted_market_events": 0,
             "downstream_rejected_market_events": 0,
@@ -121,6 +126,7 @@ class LaneIIIShadowRuntime:
             "state_resets": 0,
         }
         self._transport_state = StreamHealth.UNKNOWN
+        self._provider_price_state = "UNKNOWN"
         self._market_session_id: str | None = None
         self._generation = 0
         self._last_event_time: datetime | None = None
@@ -300,11 +306,33 @@ class LaneIIIShadowRuntime:
                 else:
                     self._audit_event("NON_MARKET_OBSERVATION", observation=observation)
                 return
+            elif observation.observation_type == "CONNECTION" and observation.payload.get("scope") == "MARKET_DATA":
+                supplied_state = str(observation.payload.get("price_status", "UNKNOWN")).upper()
+                prior_state = self._provider_price_state
+                self._provider_price_state = supplied_state
+                self._audit_event(
+                    "PROVIDER_PRICE_FEED_STATE",
+                    observation=observation,
+                    provider_price_state=supplied_state,
+                    prior_provider_price_state=prior_state,
+                )
+                if supplied_state != "CONNECTED" and prior_state in {"UNKNOWN", "CONNECTED"}:
+                    self._rebuild_downstream()
+                    self._suppress("PROVIDER_PRICE_FEED_NOT_CONNECTED", observation=observation, stale=True)
+                return
             else:
                 self._audit_event("NON_MARKET_OBSERVATION", observation=observation)
                 return
 
             if observation.observation_type == "DEPTH":
+                if observation.payload.get("is_reset") is True:
+                    # NinjaTrader's public reset flag is authoritative for the
+                    # invalidation boundary, even though it does not establish
+                    # a synchronized replacement snapshot. Retain no old book,
+                    # trade-flow, or hypothesis state across that callback.
+                    self._rebuild_downstream()
+                    self._suppress("PROVIDER_DEPTH_RESET", observation=observation, stale=True)
+                    return
                 bids = observation.payload.get("bids")
                 asks = observation.payload.get("asks")
                 if not isinstance(bids, list) or not bids or not isinstance(asks, list) or not asks:
@@ -356,6 +384,13 @@ class LaneIIIShadowRuntime:
                 if len(events) != 1:
                     raise MarketDataRefused("The NinjaTrader adapter must emit exactly one canonical market event.")
                 event = events[0]
+                if isinstance(event, TradeEvent):
+                    counter = {
+                        AggressorProvenance.PROVIDER: "trade_aggressor_provider_native",
+                        AggressorProvenance.QUOTE_DERIVED: "trade_aggressor_quote_derived",
+                        AggressorProvenance.UNAVAILABLE: "trade_aggressor_unknown",
+                    }[event.aggressor_provenance]
+                    self._counters[counter] += 1
                 result = self.pipeline.apply(event)
                 if result.ordering in {OrderingOutcome.DUPLICATE, OrderingOutcome.LATE} or (
                     result.book_application is not None
@@ -490,6 +525,7 @@ class LaneIIIShadowRuntime:
                     "canonical": self.config.contract.canonical.payload(),
                 },
                 "transport_state": self._transport_state.value,
+                "provider_price_state": self._provider_price_state,
                 "state_generation": self._generation,
                 "authority": {
                     "observation": "OBSERVE_ONLY",

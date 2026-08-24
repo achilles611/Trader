@@ -18,6 +18,8 @@ from unittest.mock import patch
 
 from src.copytrade.config import CopyTradeConfig
 from src.copytrade.control_center import create_control_center_app
+from src.lane_iii.contracts import EvidenceFamily
+from src.lane_iii.market_data import DataQuality
 from src.l3f_provider.ninjatrader_commission import NinjaTraderListenerWorker
 from src.l3f_provider.ninjatrader_observation import (
     LoopbackBridgeConfig,
@@ -193,6 +195,47 @@ class LaneIIILiveShadowTests(unittest.TestCase):
         self.assertGreaterEqual(status["counters"]["state_resets"], 1)
         self.assertIn("MARKET_SESSION_BOUNDARY", {item.get("reason_code") for item in runtime.audit_records()})
 
+    def test_provider_price_feed_disconnect_discards_state_before_reconnect(self) -> None:
+        runtime = LaneIIIShadowRuntime()
+        self.feed_healthy_triplet(runtime)
+        first_generation = runtime.status()["state_generation"]
+        runtime.ingest(observation("CONNECTION", 4, event_offset=3, payload={
+            "scope": "MARKET_DATA", "price_status": "ConnectionLost",
+        }))
+        status = runtime.status()
+        self.assertGreater(status["state_generation"], first_generation)
+        self.assertEqual(status["provider_price_state"], "CONNECTIONLOST")
+        self.assertEqual(status["pipeline"]["events_processed"], 0)
+        self.assertIn("PROVIDER_PRICE_FEED_NOT_CONNECTED", {item.get("reason_code") for item in runtime.audit_records()})
+        runtime.ingest(observation("CONNECTION", 5, event_offset=4, payload={
+            "scope": "MARKET_DATA", "price_status": "Connected",
+        }))
+        self.assertEqual(runtime.status()["provider_price_state"], "CONNECTED")
+        self.assertEqual(runtime.status()["counters"]["execution_attempts"], 0)
+
+    def test_provider_depth_reset_discards_all_downstream_state(self) -> None:
+        runtime = LaneIIIShadowRuntime()
+        self.feed_healthy_triplet(runtime)
+        first_generation = runtime.status()["state_generation"]
+        runtime.ingest(observation("DEPTH", 4, event_offset=3, payload={
+            "contract_id": CONTRACT_ID,
+            "bids": [],
+            "asks": [],
+            "operation": "Update",
+            "side": "Bid",
+            "mutation_price": "20000.00",
+            "mutation_volume": 0,
+            "mutation_position": 0,
+            "is_reset": True,
+        }))
+        status = runtime.status()
+        self.assertGreater(status["state_generation"], first_generation)
+        self.assertEqual(status["pipeline"]["events_processed"], 0)
+        self.assertIsNone(runtime.pipeline.latest_quote)
+        self.assertIsNone(runtime.pipeline.latest_trade)
+        self.assertIn("PROVIDER_DEPTH_RESET", {item.get("reason_code") for item in runtime.audit_records()})
+        self.assertEqual(status["counters"]["execution_attempts"], 0)
+
     def test_downstream_exception_discards_state_and_suppresses(self) -> None:
         runtime = LaneIIIShadowRuntime()
         with patch.object(runtime.engine, "observe", side_effect=RuntimeError("synthetic interpreter fault")):
@@ -219,6 +262,71 @@ class LaneIIILiveShadowTests(unittest.TestCase):
         assert quote is not None
         self.assertEqual(quote.header.timestamps.exchange_time, timestamp(1))
         self.assertEqual(quote.header.timestamps.ordering_time, timestamp(1))
+
+    def test_live_shadow_counts_explicit_aggressor_provenance(self) -> None:
+        runtime = LaneIIIShadowRuntime()
+        runtime.ingest(observation("TRADE", 1, payload={
+            "contract_id": CONTRACT_ID, "price": "20000.25", "size": 1,
+            "aggressor_side": "BUY", "aggressor_source": "PROVIDER_NATIVE",
+        }))
+        runtime.ingest(observation("TRADE", 2, event_offset=1, payload={
+            "contract_id": CONTRACT_ID, "price": "20000.25", "size": 1,
+            "aggressor_side": "UNKNOWN", "aggressor_source": "UNKNOWN",
+        }))
+        quote = observation("QUOTE", 3, event_offset=2)
+        runtime.ingest(quote)
+        runtime.ingest(observation("TRADE", 4, event_offset=2, provider_sequence=3, payload={
+            "contract_id": CONTRACT_ID, "price": "20000.25", "size": 1,
+            "aggressor_side": "UNKNOWN", "aggressor_source": "BID_ASK_CLASSIFICATION",
+            "bid_at_trade": "20000.00", "ask_at_trade": "20000.25",
+            "derivation_quote_observation_id": quote.observation_id,
+        }))
+        counters = runtime.status()["counters"]
+        self.assertEqual(counters["trade_aggressor_provider_native"], 1)
+        self.assertEqual(counters["trade_aggressor_quote_derived"], 1)
+        self.assertEqual(counters["trade_aggressor_unknown"], 1)
+        self.assertEqual(counters["execution_attempts"], 0)
+
+    def test_public_boundary_keeps_quote_derived_flow_and_depth_incomplete_without_provider_sequence(self) -> None:
+        runtime = LaneIIIShadowRuntime()
+        # Public NinjaTrader trade/depth callbacks have no authoritative
+        # provider sequence.  The same-callback quote may truthfully classify
+        # side, but neither stream may become directional L3-C evidence.
+        runtime.ingest(replace(observation("DEPTH", 1), provider_sequence=None))
+        for index in range(3):
+            quote = replace(
+                observation("QUOTE", index * 2 + 2, event_offset=index + 1),
+                provider_sequence=None,
+            )
+            runtime.ingest(quote)
+            runtime.ingest(replace(
+                observation("TRADE", index * 2 + 3, event_offset=index + 1, payload={
+                    "contract_id": CONTRACT_ID,
+                    "price": "20000.25",
+                    "size": 1,
+                    "aggressor_side": "UNKNOWN",
+                    "aggressor_source": "BID_ASK_CLASSIFICATION",
+                    "bid_at_trade": "20000.00",
+                    "ask_at_trade": "20000.25",
+                    "derivation_quote_observation_id": quote.observation_id,
+                }),
+                provider_sequence=None,
+            ))
+
+        snapshot = runtime.engine.snapshot()
+        families = {item.evidence.family for item in snapshot.evidence}
+        status = runtime.status()
+        rejected_families = {item.family for item in snapshot.rejected_observations}
+        self.assertNotIn(EvidenceFamily.ORDER_FLOW, families)
+        self.assertNotIn(EvidenceFamily.RESTING_LIQUIDITY, families)
+        self.assertIn(EvidenceFamily.RESTING_LIQUIDITY, rejected_families)
+        self.assertEqual(runtime.pipeline.latest_trade_quality, DataQuality.INCOMPLETE)
+        self.assertEqual(runtime.pipeline.latest_quote_quality, DataQuality.INCOMPLETE)
+        self.assertEqual(runtime.pipeline.book._state().quality, DataQuality.INCOMPLETE)
+        self.assertFalse(runtime.pipeline.trade_flow.measurements().complete)
+        self.assertEqual(status["counters"]["trade_aggressor_quote_derived"], 3)
+        self.assertEqual(status["counters"]["shadow_decision_evaluations"], 0)
+        self.assertEqual(status["counters"]["execution_attempts"], 0)
 
     def test_replay_is_deterministic_and_explicitly_not_live_commissioning(self) -> None:
         def replay() -> tuple[object, ...]:

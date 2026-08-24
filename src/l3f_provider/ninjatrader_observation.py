@@ -334,6 +334,11 @@ class NinjaTraderMarketDataAdapter(MarketDataProviderAdapter):
     def __init__(self, contract: NinjaTraderContract) -> None:
         self.contract = contract
         self._source = MarketDataSource(NINJATRADER_SOURCE, LUCID_CQG_PROVIDER)
+        # A quote-derived aggressor may reference only the immediately
+        # preceding quote emitted from the same NinjaTrader Last callback.
+        # Retaining one value is sufficient and prevents retrospective lookup.
+        self._latest_quote_observation_id: str | None = None
+        self._latest_quote: QuoteEvent | None = None
 
     @property
     def source(self) -> MarketDataSource:
@@ -362,27 +367,103 @@ class NinjaTraderMarketDataAdapter(MarketDataProviderAdapter):
     def _quote(self, raw: RawProviderEvent, record: NinjaTraderObservation) -> QuoteEvent:
         self._contract_check(record)
         try:
-            return QuoteEvent(self._header(raw, record, MarketStream.QUOTE), _decimal(record.payload["bid"], "Bid", positive=True), _decimal(record.payload["ask"], "Ask", positive=True), _quantity(record.payload["bid_size"], "Bid size"), _quantity(record.payload["ask_size"], "Ask size"))
+            quote = QuoteEvent(self._header(raw, record, MarketStream.QUOTE), _decimal(record.payload["bid"], "Bid", positive=True), _decimal(record.payload["ask"], "Ask", positive=True), _quantity(record.payload["bid_size"], "Bid size"), _quantity(record.payload["ask_size"], "Ask size"))
+            self._latest_quote_observation_id = record.observation_id
+            self._latest_quote = quote
+            return quote
         except (KeyError, ValueError) as exc:
             raise NinjaTraderObservationError(ProviderErrorCode.MALFORMED_PROVIDER_PAYLOAD, "quote") from exc
 
     def _trade(self, raw: RawProviderEvent, record: NinjaTraderObservation) -> TradeEvent:
         self._contract_check(record)
         try:
-            side_name = str(record.payload.get("aggressor_side", "UNKNOWN"))
-            side = AggressorSide(side_name) if side_name in {"BUY", "SELL", "UNKNOWN"} else AggressorSide.UNKNOWN
-            return TradeEvent(self._header(raw, record, MarketStream.TRADE), _decimal(record.payload["price"], "Trade price", positive=True), _quantity(record.payload["size"], "Trade size"), side, AggressorProvenance.PROVIDER if side is not AggressorSide.UNKNOWN else AggressorProvenance.UNAVAILABLE)
+            header = self._header(raw, record, MarketStream.TRADE)
+            price = _decimal(record.payload["price"], "Trade price", positive=True)
+            size = _quantity(record.payload["size"], "Trade size")
+            source = str(record.payload.get("aggressor_source", "UNKNOWN"))
+            if source == "PROVIDER_NATIVE":
+                side_name = str(record.payload.get("aggressor_side", "UNKNOWN"))
+                side = AggressorSide(side_name) if side_name in {"BUY", "SELL"} else AggressorSide.UNKNOWN
+                return TradeEvent(
+                    header, price, size, side,
+                    AggressorProvenance.PROVIDER if side is not AggressorSide.UNKNOWN else AggressorProvenance.UNAVAILABLE,
+                )
+            if source == "BID_ASK_CLASSIFICATION":
+                quote_observation_id = record.payload.get("derivation_quote_observation_id")
+                quote = self._latest_quote
+                if (
+                    isinstance(quote_observation_id, str)
+                    and quote_observation_id == self._latest_quote_observation_id
+                    and quote is not None
+                    and quote.header.timestamps.ordering_time == header.timestamps.ordering_time
+                ):
+                    try:
+                        bid = _decimal(record.payload["bid_at_trade"], "Bid at trade", positive=True)
+                        ask = _decimal(record.payload["ask_at_trade"], "Ask at trade", positive=True)
+                    except (KeyError, ValueError):
+                        return TradeEvent(header, price, size)
+                    if bid == quote.bid_price and ask == quote.ask_price and bid < ask:
+                        side = AggressorSide.BUY if price >= ask else AggressorSide.SELL if price <= bid else AggressorSide.UNKNOWN
+                        if side is not AggressorSide.UNKNOWN:
+                            return TradeEvent(
+                                header, price, size, side, AggressorProvenance.QUOTE_DERIVED,
+                                quote.header.event_id,
+                            )
+            return TradeEvent(header, price, size)
         except (KeyError, ValueError) as exc:
             raise NinjaTraderObservationError(ProviderErrorCode.MALFORMED_PROVIDER_PAYLOAD, "trade") from exc
 
     def _depth(self, raw: RawProviderEvent, record: NinjaTraderObservation) -> BookSnapshotEvent:
         self._contract_check(record)
         try:
+            self._validate_depth_mutation(record.payload)
             bids = self._levels(record.payload["bids"], True)
             asks = self._levels(record.payload["asks"], False)
             return BookSnapshotEvent(self._header(raw, record, MarketStream.DEPTH), bids, asks)
         except (KeyError, ValueError) as exc:
             raise NinjaTraderObservationError(ProviderErrorCode.MALFORMED_PROVIDER_PAYLOAD, "depth") from exc
+
+    def _validate_depth_mutation(self, payload: Mapping[str, object]) -> None:
+        mutation_fields = {
+            "operation", "side", "mutation_price", "mutation_volume",
+            "mutation_position", "is_reset",
+        }
+        # Legacy snapshot frames carried only operation/side. They remain
+        # snapshots. New mutation provenance is accepted only as a complete,
+        # internally valid unit and is still not promoted to a BookDeltaEvent.
+        if not any(name in payload for name in mutation_fields - {"operation", "side"}):
+            return
+        if not mutation_fields.issubset(payload):
+            raise ValueError("incomplete_depth_mutation_provenance")
+        if payload["operation"] not in {"Add", "Update", "Remove"}:
+            raise ValueError("depth_mutation_operation")
+        if payload["side"] not in {"Bid", "Ask"}:
+            raise ValueError("depth_mutation_side")
+        price = _decimal(payload["mutation_price"], "Depth mutation price", positive=True)
+        if price % self.contract.tick_size != 0:
+            raise ValueError("depth_mutation_tick_alignment")
+        volume = _quantity(payload["mutation_volume"], "Depth mutation volume", zero=True)
+        position = _wire_integer(payload["mutation_position"], "Depth mutation position")
+        if type(payload["is_reset"]) is not bool:
+            raise ValueError("depth_mutation_reset")
+        rows = payload["bids" if payload["side"] == "Bid" else "asks"]
+        if not isinstance(rows, list):
+            raise ValueError("depth_mutation_book_side")
+        levels = tuple(
+            (
+                _decimal(_mapping(row, "depth_mutation_level")["price"], "Depth mutation level price", positive=True),
+                _quantity(_mapping(row, "depth_mutation_level")["size"], "Depth mutation level size"),
+            )
+            for row in rows
+        )
+        matches = tuple(item for item in levels if item[0] == price)
+        if payload["operation"] == "Remove":
+            if matches:
+                raise ValueError("removed_depth_level_still_present")
+        elif volume <= 0 or matches != ((price, volume),):
+            raise ValueError("depth_upsert_not_reflected_in_snapshot")
+        elif position >= len(levels) or levels[position][0] != price:
+            raise ValueError("depth_mutation_position_mismatch")
 
     @staticmethod
     def _levels(value: object, reverse: bool) -> tuple[BookLevel, ...]:
