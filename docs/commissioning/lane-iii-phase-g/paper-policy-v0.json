@@ -1,0 +1,38 @@
+{
+  "allowed_hypotheses": [
+    "BULLISH_REVERSAL",
+    "BEARISH_CONTINUATION"
+  ],
+  "authority": "EXPERIMENTAL_PAPER_DIRECTION_ONLY",
+  "book_completeness": "UNVERIFIED",
+  "canonical_contract": "MNQU6",
+  "classified_flow_window": 8,
+  "configuration_hash": "a27d9a252324f4f8d4d3448bdf88fdad66ebc21009b849e27f24741b59300e3f",
+  "decision_ttl_seconds": 5,
+  "entry_dominance_margin": "0.10",
+  "entry_family_count": 3,
+  "entry_support_threshold": "0.65",
+  "flow_evidence_lifetime_seconds": 30,
+  "hypothesis_idle_lifetime_seconds": 90,
+  "hypothesis_maximum_lifetime_seconds": 600,
+  "instrument": "MNQ",
+  "liquidity_evidence_lifetime_seconds": 20,
+  "minimum_classified_trades": 3,
+  "native_contract": "MNQ SEP26",
+  "policy_id": "l3g-paper-policy-v0",
+  "reentry_cooldown_seconds": 30,
+  "replenishment_count": 2,
+  "retention_dominance_margin": "0.03",
+  "retention_family_count": 2,
+  "retention_support_threshold": "0.58",
+  "schema": "lane-iii-phase-g-paper-policy-v1",
+  "scientific_eligibility": false,
+  "score_denominator": "10",
+  "sequence_authority": "LOCAL_CALLBACK_ORDER_ONLY",
+  "session_timezone": "America/New_York",
+  "provisional_session_boundary": "00:00",
+  "structural_evidence_lifetime_seconds": 90,
+  "structural_strength": "0.50",
+  "structural_window": 8
+}
+

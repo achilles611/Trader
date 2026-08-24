@@ -24,7 +24,11 @@ from urllib.request import Request, urlopen
 HOST = "127.0.0.1"
 PORT = 8090
 URL = f"http://{HOST}:{PORT}"
-STARTUP_TIMEOUT_SECONDS = 30.0
+# Startup includes a complete verification of the append-only paper audit
+# chain before any listener or execution authority is exposed. The ledger can
+# legitimately take longer than the old 30-second UI watchdog as it grows.
+# Keep this above the separate 90-second NinjaTrader authentication budget.
+STARTUP_TIMEOUT_SECONDS = 120.0
 
 
 def project_root(*, frozen: bool | None = None, executable: str | None = None, source_file: str | None = None) -> Path:
@@ -131,7 +135,10 @@ def wait_for_server(process: subprocess.Popen[bytes] | None, *, timeout_seconds:
         if process is not None and process.poll() is not None:
             raise RuntimeError("The control-center server stopped during startup. See logs\\beez-console-server.log.")
         time.sleep(0.25)
-    raise RuntimeError("The control-center server did not respond within 30 seconds. See logs\\beez-console-server.log.")
+    raise RuntimeError(
+        f"The control-center server did not respond within {timeout_seconds:g} seconds. "
+        "See logs\\beez-console-server.log."
+    )
 
 
 def open_brave(brave: Path, root: Path) -> None:

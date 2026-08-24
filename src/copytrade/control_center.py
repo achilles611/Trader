@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
@@ -19,6 +20,11 @@ from typing import Any, Callable, Iterator
 
 from src.l3f_provider.ninjatrader_commission import NinjaTraderListenerWorker
 from src.l3f_provider.shadow_runtime import LaneIIIShadowRuntime
+from src.l3g_paper.health import sanitized_paper_health
+from src.l3g_paper.ledger import PaperLedger
+from src.l3g_paper.ninjatrader_login import NinjaTraderLoginBootstrap, NinjaTraderLoginState
+from src.l3g_paper.ninjatrader_transport import PaperExecutionTransport
+from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout
 
 from .config import CopyTradeConfig
 from .contracts import PHASE_B_RECOMMENDATION_SCHEMA_VERSION
@@ -1291,6 +1297,10 @@ def create_control_center_app(
     watcher_stop_timeout_seconds: float = 3.0, discovery_source: HyperCoreSourceAcquisition | None = None,
     ninjatrader_listener_factory: Callable[[], NinjaTraderListenerWorker] | None = None,
     lane_iii_shadow_factory: Callable[[], LaneIIIShadowRuntime] | None = None,
+    lane_iii_paper_factory: Callable[[PaperLedger], LaneIIIPaperRuntime] | None = None,
+    paper_execution_transport_factory: Callable[[PaperLedger, Callable[[dict[str, object]], None], Callable[[str], None]], PaperExecutionTransport] | None = None,
+    paper_ledger_factory: Callable[[Path], PaperLedger] | None = None,
+    ninjatrader_login_bootstrap_factory: Callable[[], NinjaTraderLoginBootstrap] | None = None,
 ) -> Any:
     """Create the local FastAPI Phase C application; no live-trading routes exist."""
     try:
@@ -1343,6 +1353,21 @@ def create_control_center_app(
             }
         return listener.status().as_dict()
 
+    def ninja_login_health() -> dict[str, object]:
+        bootstrap = ninjatrader_runtime.get("login_bootstrap")
+        if bootstrap is None:
+            return {
+                "schema": "lane-iii-phase-g-ninjatrader-login-bootstrap-v1",
+                "state": "UNSTARTED",
+                "attempt_count": 0,
+                "ninjatrader_process_detected": False,
+                "login_window_detected": False,
+                "control_center_detected": False,
+                "lucid_connection_state": "UNKNOWN",
+                "failure_category": None,
+            }
+        return bootstrap.status()
+
     def lane_iii_shadow_health() -> dict[str, object]:
         shadow = ninjatrader_runtime.get("shadow")
         if shadow is None:
@@ -1360,6 +1385,25 @@ def create_control_center_app(
             }
         return shadow.status()
 
+    def lane_iii_paper_health() -> dict[str, object]:
+        paper = ninjatrader_runtime.get("paper")
+        if paper is None:
+            return {
+                "schema": "lane-iii-phase-g-paper-runtime-status-v1",
+                "mode": "PAPER_SIM101",
+                "display_mode": "EXPERIMENTAL PAPER",
+                "state": "UNSTARTED",
+                "paper_execution": "DISARMED",
+                "scientific_lane_iii": "INCOMPLETE / BLOCKED ON SEQUENCING",
+                "scientific_eligibility": False,
+                "paper_account": "Sim101",
+                "account_class": "LOCAL_SIMULATION",
+                "market_instrument": "MNQ SEP26",
+                "maximum_quantity": 1,
+                "live_capital": "DENIED",
+            }
+        return paper.status()
+
     @asynccontextmanager
     async def lifespan(_: Any) -> Any:
         # The Control Center application owns this worker for its entire
@@ -1369,22 +1413,69 @@ def create_control_center_app(
             raise RuntimeError("NINJATRADER_OBSERVER duplicate FastAPI lifespan refused")
         ninjatrader_runtime["active"] = True
         listener: NinjaTraderListenerWorker | None = None
+        paper_transport: PaperExecutionTransport | None = None
+        paper_runtime: LaneIIIPaperRuntime | None = None
+        paper_ledger: PaperLedger | None = None
+        login_bootstrap: NinjaTraderLoginBootstrap | None = None
         try:
             shadow = lane_iii_shadow_factory() if lane_iii_shadow_factory is not None else LaneIIIShadowRuntime()
             if type(shadow) is not LaneIIIShadowRuntime:
                 raise RuntimeError("LANE_III_SHADOW factory must return the exact shadow runtime")
             ninjatrader_runtime["shadow"] = shadow
             app.state.lane_iii_shadow = shadow
+            configured_paper_path = os.getenv("BEELZEBUB_L3G_PAPER_LEDGER")
+            paper_path = (
+                Path(configured_paper_path).expanduser().resolve()
+                if configured_paper_path
+                else Path(config.artifacts.database_path).resolve().with_name("lane_iii_paper.sqlite3")
+            )
+            paper_ledger = paper_ledger_factory(paper_path) if paper_ledger_factory is not None else PaperLedger(paper_path)
+            if type(paper_ledger) is not PaperLedger:
+                raise RuntimeError("LANE_III_PAPER ledger factory must return the exact durable ledger")
+            paper_runtime = lane_iii_paper_factory(paper_ledger) if lane_iii_paper_factory is not None else LaneIIIPaperRuntime(paper_ledger)
+            if type(paper_runtime) is not LaneIIIPaperRuntime:
+                raise RuntimeError("LANE_III_PAPER factory must return the exact paper runtime")
+            paper_transport = (
+                paper_execution_transport_factory(paper_ledger, paper_runtime.on_execution_message, paper_runtime.on_execution_bridge_state)
+                if paper_execution_transport_factory is not None
+                else PaperExecutionTransport(
+                    paper_ledger,
+                    on_message=paper_runtime.on_execution_message,
+                    on_bridge_state=paper_runtime.on_execution_bridge_state,
+                )
+            )
+            if type(paper_transport) is not PaperExecutionTransport:
+                raise RuntimeError("LANE_III_PAPER transport factory must return the exact signed transport")
+            paper_runtime.bind_transport(paper_transport)
+            paper_runtime.start()
+            paper_transport.start()
+            fanout = ObservationFanout(
+                shadow_observation=shadow.ingest,
+                shadow_transport=shadow.on_transport_state,
+                shadow_rejection=shadow.record_raw_rejection,
+                shadow_duplicate=shadow.record_raw_duplicate,
+                paper_observation=paper_runtime.ingest,
+                paper_transport=paper_runtime.on_observation_transport_state,
+                paper_rejection=paper_runtime.on_observation_rejection,
+                paper_duplicate=paper_runtime.on_observation_duplicate,
+                record_failure=paper_runtime.record_sink_failure,
+            )
+            ninjatrader_runtime["paper_ledger"] = paper_ledger
+            ninjatrader_runtime["paper"] = paper_runtime
+            ninjatrader_runtime["paper_transport"] = paper_transport
+            ninjatrader_runtime["fanout"] = fanout
+            app.state.lane_iii_paper = paper_runtime
+            app.state.lane_iii_paper_transport = paper_transport
             listener = (
                 ninjatrader_listener_factory()
                 if ninjatrader_listener_factory is not None
                 else NinjaTraderListenerWorker(logger=NINJATRADER_RUNTIME_LOGGER)
             )
-            listener.set_shadow_sinks(
-                on_observation=shadow.ingest,
-                on_local_bridge_state=shadow.on_transport_state,
-                on_rejection=shadow.record_raw_rejection,
-                on_duplicate=shadow.record_raw_duplicate,
+            listener.set_observation_sinks(
+                on_observation=fanout.on_observation,
+                on_local_bridge_state=fanout.on_transport_state,
+                on_rejection=fanout.on_rejection,
+                on_duplicate=fanout.on_duplicate,
             )
             ninjatrader_runtime["listener"] = listener
             app.state.ninjatrader_observer = listener
@@ -1394,6 +1485,19 @@ def create_control_center_app(
                     f"NINJATRADER_OBSERVER startup failed at {listener_status.host}:{listener_status.port}: "
                     f"{listener_status.error or listener_status.state}"
                 )
+            # Listener ownership is established before desktop bootstrap so a
+            # newly started NinjaTrader process cannot build an offline market
+            # callback queue or miss the signed execution handshake.
+            if ninjatrader_login_bootstrap_factory is not None:
+                login_bootstrap = ninjatrader_login_bootstrap_factory()
+            elif ninjatrader_listener_factory is None:
+                login_bootstrap = NinjaTraderLoginBootstrap()
+            if login_bootstrap is not None:
+                if type(login_bootstrap) is not NinjaTraderLoginBootstrap:
+                    raise RuntimeError("NINJATRADER_LOGIN factory must return the exact sealed bootstrap")
+                ninjatrader_runtime["login_bootstrap"] = login_bootstrap
+                app.state.ninjatrader_login_bootstrap = login_bootstrap
+                login_bootstrap.start()
             # A thread cannot be safely resumed after a process restart.  Preserve
             # its durable record and make the interruption explicit to operators.
             for job in center.store.list_jobs(job_type="candidate_discovery", limit=200):
@@ -1420,10 +1524,16 @@ def create_control_center_app(
             supervisor = watcher_runtime.get("supervisor")
             task = watcher_runtime.get("task")
             try:
+                if login_bootstrap is not None:
+                    login_bootstrap.stop()
                 if listener is not None:
                     listener.stop()
             finally:
                 try:
+                    if paper_runtime is not None:
+                        paper_runtime.stop()
+                    if paper_transport is not None:
+                        paper_transport.stop()
                     if supervisor is not None:
                         await supervisor.stop()
                     if task is not None:
@@ -1433,11 +1543,19 @@ def create_control_center_app(
                     ninjatrader_runtime.clear()
                     app.state.ninjatrader_observer = None
                     app.state.lane_iii_shadow = None
+                    app.state.lane_iii_paper = None
+                    app.state.lane_iii_paper_transport = None
+                    app.state.ninjatrader_login_bootstrap = None
+                    if paper_ledger is not None:
+                        paper_ledger.close()
 
     app = FastAPI(title="Trader Copy Control Center", version="1.0", docs_url=None, redoc_url=None,
                   lifespan=lifespan)
     app.state.ninjatrader_observer = None
     app.state.lane_iii_shadow = None
+    app.state.lane_iii_paper = None
+    app.state.lane_iii_paper_transport = None
+    app.state.ninjatrader_login_bootstrap = None
 
     @app.exception_handler(sqlite3.Error)
     async def database_unavailable(_: Any, __: sqlite3.Error) -> Any:
@@ -1453,8 +1571,10 @@ def create_control_center_app(
         return {
             **center.health(live_watcher_health),
             "science": center.science.health(),
+            "ninjatrader_login": ninja_login_health(),
             "ninjatrader_observer": ninja_listener_health(),
             "lane_iii_shadow": lane_iii_shadow_health(),
+            "lane_iii_paper": sanitized_paper_health(lane_iii_paper_health()),
         }
 
     @app.get("/api/lane-iii/shadow")
@@ -1467,6 +1587,48 @@ def create_control_center_app(
         if shadow is None:
             return {"mode": "LANE_III_SHADOW", "items": []}
         return {"mode": "LANE_III_SHADOW", "items": shadow.audit_records(limit)}
+
+    @app.get("/api/lane-iii/paper")
+    async def api_lane_iii_paper() -> dict[str, object]:
+        return lane_iii_paper_health()
+
+    @app.get("/api/lane-iii/paper/audit")
+    async def api_lane_iii_paper_audit(limit: int = Query(100, ge=1, le=512)) -> dict[str, object]:
+        ledger = ninjatrader_runtime.get("paper_ledger")
+        if ledger is None:
+            return {"mode": "PAPER_SIM101", "items": []}
+        return {"mode": "PAPER_SIM101", "items": ledger.recent(limit)}
+
+    @app.post("/api/lane-iii/paper/arm")
+    async def api_lane_iii_paper_arm() -> dict[str, object]:
+        paper = ninjatrader_runtime.get("paper")
+        if paper is None:
+            raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
+        bootstrap = ninjatrader_runtime.get("login_bootstrap")
+        if bootstrap is not None and bootstrap.state is not NinjaTraderLoginState.AUTHENTICATED:
+            raise HTTPException(status_code=409, detail="NinjaTrader desktop authentication is not operational.")
+        return paper.arm()
+
+    @app.post("/api/lane-iii/paper/pause")
+    async def api_lane_iii_paper_pause() -> dict[str, object]:
+        paper = ninjatrader_runtime.get("paper")
+        if paper is None:
+            raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
+        return paper.pause_entries()
+
+    @app.post("/api/lane-iii/paper/resume")
+    async def api_lane_iii_paper_resume() -> dict[str, object]:
+        paper = ninjatrader_runtime.get("paper")
+        if paper is None:
+            raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
+        return paper.resume_entries()
+
+    @app.post("/api/lane-iii/paper/flatten-and-disarm")
+    async def api_lane_iii_paper_flatten_and_disarm() -> dict[str, object]:
+        paper = ninjatrader_runtime.get("paper")
+        if paper is None:
+            raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
+        return paper.flatten_and_disarm()
 
     @app.get("/api/science/health")
     async def api_science_health() -> dict[str, Any]:
@@ -1662,6 +1824,7 @@ def create_control_center_app(
             "source": source.source_status(),
             "ninjatrader_observer": ninja_listener_health(),
             "lane_iii_shadow": lane_iii_shadow_health(),
+            "lane_iii_paper": sanitized_paper_health(lane_iii_paper_health()),
             "paper_only": True,
         }
 

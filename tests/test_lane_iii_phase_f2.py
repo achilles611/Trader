@@ -253,7 +253,16 @@ class LaneIIIPhaseF2Tests(unittest.TestCase):
 
     def test_ninjascript_sources_have_no_execution_api_or_inbound_command_deserializer(self):
         root = Path(__file__).parents[1] / "ninjatrader" / "NinjaScript"
-        source = "\n".join(path.read_text(encoding="utf-8") for path in root.rglob("*.cs"))
+        # Phase F's observation-only boundary applies to its two read-only
+        # publishers.  Phase G adds a separately reviewed, Sim101-sealed
+        # execution AddOn and has its own source-contract tests.
+        source = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (
+                root / "Indicators" / "BeelzebubReadOnlyMarketObserver.cs",
+                root / "AddOns" / "BeelzebubReadOnlyAddOn.cs",
+            )
+        )
         forbidden = (".Submit(", ".Change(", ".Cancel(", ".Flatten(", ".Liquidate(", ".Reverse(", ".CreateOrder(", "AtmStrategy", "Stream.Read", "NetworkStream.Read", "CommandType", "DeserializeCommand")
         self.assertFalse([token for token in forbidden if token in source])
         self.assertIn("IPAddress.Loopback", source)
@@ -275,13 +284,15 @@ class LaneIIIPhaseF2Tests(unittest.TestCase):
         self.assertIn("public static string Publish", outbound)
         self.assertIn("OnConnectionStatusUpdate", observer)
         self.assertIn("ClearMarketState();", observer)
-        self.assertIn("if (e.IsReset)", observer)
+        self.assertNotIn("if (e.IsReset)", observer)
+        self.assertIn('"is_reset\\\":false', observer)
         self.assertIn("e.Time - bestBidTime <= TimeSpan.FromSeconds(10)", observer)
         self.assertIn("e.Time - bestAskTime <= TimeSpan.FromSeconds(10)", observer)
         self.assertIn("bid_source_time", observer)
         self.assertIn("ask_source_time", observer)
         for field in ("mutation_price", "mutation_volume", "mutation_position", "is_reset"):
             self.assertIn(field, observer)
+        self.assertIn("private const int MaximumPublishedBookLevelsPerSide = 10;", observer)
 
     def test_no_frozen_lane_iii_source_is_changed_or_networked(self):
         root = Path(__file__).parents[1] / "src" / "lane_iii"

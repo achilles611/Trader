@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using NinjaTrader.Cbi;
 using NinjaTrader.Data;
 using NinjaTrader.NinjaScript;
@@ -12,6 +13,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 {
     public sealed class BeelzebubReadOnlyMarketObserver : Indicator
     {
+        // Publish the authentic top ten positions on each side. The local view
+        // remains explicitly unverified, but bounding both callback admission
+        // and snapshot size prevents the one-way bridge from silently losing
+        // frames during sustained MNQ depth bursts.
+        private const int MaximumPublishedBookLevelsPerSide = 10;
         private readonly SortedDictionary<double, long> bids = new SortedDictionary<double, long>(Comparer<double>.Create((x, y) => y.CompareTo(x)));
         private readonly SortedDictionary<double, long> asks = new SortedDictionary<double, long>();
         private double bestBid = Double.NaN;
@@ -22,6 +28,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         private DateTime bestAskTime = DateTime.MinValue;
         private bool reportedLevelOne;
         private bool reportedDepth;
+        private bool reportedMarketDataConnected;
 
         protected override void OnStateChange()
         {
@@ -38,6 +45,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         protected override void OnMarketData(MarketDataEventArgs e)
         {
+            PublishMarketConnectedOnce();
             if (!reportedLevelOne)
             {
                 reportedLevelOne = true;
@@ -99,26 +107,46 @@ namespace NinjaTrader.NinjaScript.Indicators
             // Any price-feed transition invalidates locally accumulated quote
             // and book state. A reconnect must rebuild from new callbacks.
             ClearMarketState();
+            reportedMarketDataConnected = String.Equals(e.PriceStatus.ToString(), "Connected", StringComparison.OrdinalIgnoreCase);
             BeelzebubReadOnlyOutbound.Publish("CONNECTION", null, null,
                 "{\"scope\":\"MARKET_DATA\",\"price_status\":\"" + e.PriceStatus + "\"}");
         }
 
         protected override void OnMarketDepth(MarketDepthEventArgs e)
         {
+            PublishMarketConnectedOnce();
             if (!reportedDepth)
             {
                 reportedDepth = true;
                 BeelzebubReadOnlyOutbound.Diagnostic("MARKET_OBSERVER_DEPTH_RECEIVED");
             }
-            if (e.IsReset)
-                ClearMarketState();
+            // NinjaTrader documents IsReset as a UI-reset notification that is
+            // relevant only to columns.  This is an Indicator; its authoritative
+            // lifecycle reset is the price connection transition handled by
+            // OnConnectionStatusUpdate.  Treat Add/Update/Remove as authentic
+            // depth mutations regardless of the column-only flag.
             SortedDictionary<double, long> book = e.MarketDataType == MarketDataType.Bid ? bids : asks;
-            if (e.Operation == Operation.Remove) book.Remove(e.Price); else book[e.Price] = e.Volume;
+            double mutationPrice = e.Price;
+            if (e.Operation == Operation.Remove && (Double.IsNaN(mutationPrice) || Double.IsInfinity(mutationPrice) || mutationPrice <= 0))
+            {
+                if (e.Position < 0 || e.Position >= book.Count)
+                {
+                    BeelzebubReadOnlyOutbound.Diagnostic("MARKET_OBSERVER_UNRESOLVED_DEPTH_REMOVE");
+                    return;
+                }
+                mutationPrice = book.ElementAt(e.Position).Key;
+            }
+            if (Double.IsNaN(mutationPrice) || Double.IsInfinity(mutationPrice) || mutationPrice <= 0)
+                return;
+            if (e.Operation == Operation.Remove) book.Remove(mutationPrice); else book[mutationPrice] = e.Volume;
+            TrimBook(book);
+            if (e.Position >= MaximumPublishedBookLevelsPerSide)
+                return;
             BeelzebubReadOnlyOutbound.Publish("DEPTH", null, null, "{\"contract_id\":\"" + Instrument.FullName
                 + "\",\"bids\":" + Levels(bids) + ",\"asks\":" + Levels(asks) + ",\"operation\":\"" + e.Operation
-                + "\",\"side\":\"" + e.MarketDataType + "\",\"mutation_price\":" + e.Price.ToString(CultureInfo.InvariantCulture)
+                + "\",\"side\":\"" + e.MarketDataType + "\",\"mutation_price\":" + mutationPrice.ToString(CultureInfo.InvariantCulture)
                 + ",\"mutation_volume\":" + e.Volume + ",\"mutation_position\":" + e.Position
-                + ",\"is_reset\":" + e.IsReset.ToString().ToLowerInvariant() + "}", e.Time);
+                + ",\"is_reset\":false}", e.Time);
         }
 
         private void ClearMarketState()
@@ -133,12 +161,39 @@ namespace NinjaTrader.NinjaScript.Indicators
             bestAskTime = DateTime.MinValue;
         }
 
+        private void PublishMarketConnectedOnce()
+        {
+            if (reportedMarketDataConnected)
+                return;
+            reportedMarketDataConnected = true;
+            // An authentic callback proves that this exact instrument's price
+            // stream is currently delivering. It does not assert provider
+            // sequencing, book completeness, or continued future health.
+            BeelzebubReadOnlyOutbound.Publish("CONNECTION", null, null,
+                "{\"scope\":\"MARKET_DATA\",\"price_status\":\"Connected\"}");
+        }
+
         private static string Levels(SortedDictionary<double, long> book)
         {
             List<string> values = new List<string>();
             foreach (KeyValuePair<double, long> item in book)
                 values.Add("{\"price\":" + item.Key.ToString(CultureInfo.InvariantCulture) + ",\"size\":" + item.Value + "}");
             return "[" + String.Join(",", values) + "]";
+        }
+
+        private static void TrimBook(SortedDictionary<double, long> book)
+        {
+            if (book.Count <= MaximumPublishedBookLevelsPerSide)
+                return;
+            List<double> discarded = new List<double>();
+            int index = 0;
+            foreach (KeyValuePair<double, long> item in book)
+            {
+                if (index++ >= MaximumPublishedBookLevelsPerSide)
+                    discarded.Add(item.Key);
+            }
+            foreach (double price in discarded)
+                book.Remove(price);
         }
     }
 }

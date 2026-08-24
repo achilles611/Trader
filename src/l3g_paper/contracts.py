@@ -1,0 +1,572 @@
+"""Immutable Lane III-G experimental-paper authority contracts.
+
+Nothing in this module can represent live-capital authority.  The concrete
+account binding and capability manifest are intentionally closed over Sim101,
+MNQ SEP26, and one contract; widening any of them requires a source change.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from enum import StrEnum
+import json
+from types import MappingProxyType
+from typing import Mapping, Protocol, runtime_checkable
+
+from src.lane_iii.contracts import canonical_hash, normalized_utc
+
+
+PAPER_POLICY_SCHEMA = "lane-iii-phase-g-paper-policy-v1"
+PAPER_RISK_SCHEMA = "lane-iii-phase-g-paper-risk-v1"
+PAPER_RECORD_SCHEMA = "lane-iii-phase-g-paper-record-v1"
+PAPER_POLICY_ID = "l3g-paper-policy-v0"
+PAPER_RISK_PROFILE_ID = "lucid-flex-paper-commissioning-v0"
+PAPER_MODE = "PAPER_SIM101"
+PAPER_ACCOUNT = "Sim101"
+PAPER_ACCOUNT_CLASS = "LOCAL_SIMULATION"
+PAPER_INSTRUMENT = "MNQ SEP26"
+PAPER_CANONICAL_CONTRACT = "MNQU6"
+PAPER_NATIVE_CONTRACT = "MNQ SEP26"
+PAPER_MAXIMUM_QUANTITY = 1
+
+
+class PaperDecisionKind(StrEnum):
+    NO_TRADE = "NO_TRADE"
+    LONG = "LONG"
+    SHORT = "SHORT"
+    EXIT = "EXIT"
+
+
+class HypothesisKind(StrEnum):
+    BULLISH_REVERSAL = "BULLISH_REVERSAL"
+    BEARISH_CONTINUATION = "BEARISH_CONTINUATION"
+
+
+class PaperDirection(StrEnum):
+    LONG = "LONG"
+    SHORT = "SHORT"
+    FLAT = "FLAT"
+
+
+class PaperSourceQuality(StrEnum):
+    PROVISIONAL_CONTIGUOUS_LOCAL_CALLBACKS = "PROVISIONAL_CONTIGUOUS_LOCAL_CALLBACKS"
+    UNUSABLE = "UNUSABLE"
+
+
+class SequenceAuthority(StrEnum):
+    LOCAL_CALLBACK_ORDER_ONLY = "LOCAL_CALLBACK_ORDER_ONLY"
+
+
+class BookCompleteness(StrEnum):
+    UNVERIFIED = "UNVERIFIED"
+
+
+class ExecutionAction(StrEnum):
+    ENTER_LONG = "ENTER_LONG"
+    ENTER_SHORT = "ENTER_SHORT"
+    EXIT = "EXIT"
+    EMERGENCY_FLATTEN = "EMERGENCY_FLATTEN"
+    CANCEL_OWNED_ORDERS = "CANCEL_OWNED_ORDERS"
+    HEARTBEAT = "HEARTBEAT"
+    RECONCILE = "RECONCILE"
+
+
+class PaperRuntimeState(StrEnum):
+    DISABLED = "DISABLED"
+    STARTING = "STARTING"
+    WAITING_FOR_EXECUTION_BRIDGE = "WAITING_FOR_EXECUTION_BRIDGE"
+    RECONCILING = "RECONCILING"
+    READY_DISARMED = "READY_DISARMED"
+    ARMED_FLAT = "ARMED_FLAT"
+    ENTRY_PENDING = "ENTRY_PENDING"
+    LONG = "LONG"
+    SHORT = "SHORT"
+    EXIT_PENDING = "EXIT_PENDING"
+    PAUSED = "PAUSED"
+    LOCKED_OUT = "LOCKED_OUT"
+    FAULTED = "FAULTED"
+    STOPPING = "STOPPING"
+    STOPPED = "STOPPED"
+
+
+class EvidenceFamily(StrEnum):
+    STRUCTURAL_CONTEXT = "STRUCTURAL_CONTEXT"
+    ORDER_FLOW = "ORDER_FLOW"
+    RESTING_LIQUIDITY = "RESTING_LIQUIDITY"
+    VOLATILITY_CONTEXT = "VOLATILITY_CONTEXT"
+    MARKET_REGIME = "MARKET_REGIME"
+
+
+def _utc(value: str, field_name: str) -> str:
+    return normalized_utc(value, field_name)
+
+
+def _now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _jsonable(value: object) -> object:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, StrEnum):
+        return value.value
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, list):
+        return [_jsonable(item) for item in value]
+    return value
+
+
+def canonical_json(payload: Mapping[str, object]) -> bytes:
+    return json.dumps(_jsonable(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+@dataclass(frozen=True)
+class PaperPolicyArtifact:
+    schema: str = PAPER_POLICY_SCHEMA
+    policy_id: str = PAPER_POLICY_ID
+    authority: str = "EXPERIMENTAL_PAPER_DIRECTION_ONLY"
+    instrument: str = "MNQ"
+    native_contract: str = PAPER_NATIVE_CONTRACT
+    canonical_contract: str = PAPER_CANONICAL_CONTRACT
+    scientific_eligibility: bool = False
+    sequence_authority: SequenceAuthority = SequenceAuthority.LOCAL_CALLBACK_ORDER_ONLY
+    book_completeness: BookCompleteness = BookCompleteness.UNVERIFIED
+    allowed_hypotheses: tuple[HypothesisKind, ...] = (
+        HypothesisKind.BULLISH_REVERSAL,
+        HypothesisKind.BEARISH_CONTINUATION,
+    )
+    classified_flow_window: int = 8
+    minimum_classified_trades: int = 3
+    structural_window: int = 8
+    replenishment_count: int = 2
+    structural_evidence_lifetime_seconds: int = 90
+    flow_evidence_lifetime_seconds: int = 30
+    liquidity_evidence_lifetime_seconds: int = 20
+    hypothesis_idle_lifetime_seconds: int = 90
+    hypothesis_maximum_lifetime_seconds: int = 600
+    entry_support_threshold: Decimal = Decimal("0.65")
+    entry_dominance_margin: Decimal = Decimal("0.10")
+    retention_support_threshold: Decimal = Decimal("0.58")
+    retention_dominance_margin: Decimal = Decimal("0.03")
+    entry_family_count: int = 3
+    retention_family_count: int = 2
+    decision_ttl_seconds: int = 5
+    reentry_cooldown_seconds: int = 30
+    structural_strength: Decimal = Decimal("0.50")
+    score_denominator: Decimal = Decimal("10")
+    session_timezone: str = "America/New_York"
+    provisional_session_boundary: str = "00:00"
+
+    def __post_init__(self) -> None:
+        if self.schema != PAPER_POLICY_SCHEMA or self.policy_id != PAPER_POLICY_ID:
+            raise ValueError("The paper policy identity is immutable.")
+        if self.authority != "EXPERIMENTAL_PAPER_DIRECTION_ONLY" or self.scientific_eligibility:
+            raise ValueError("The paper policy cannot acquire scientific or execution authority.")
+        if self.native_contract != PAPER_NATIVE_CONTRACT or self.canonical_contract != PAPER_CANONICAL_CONTRACT:
+            raise ValueError("The paper policy requires exact MNQ SEP26 identity.")
+        if self.allowed_hypotheses != (
+            HypothesisKind.BULLISH_REVERSAL,
+            HypothesisKind.BEARISH_CONTINUATION,
+        ):
+            raise ValueError("The v0 paper directional universe is fixed.")
+
+    def payload(self) -> dict[str, object]:
+        return _jsonable(asdict(self))  # type: ignore[return-value]
+
+    @property
+    def configuration_hash(self) -> str:
+        return canonical_hash(self.payload())
+
+
+@dataclass(frozen=True)
+class PaperRiskProfile:
+    schema: str = PAPER_RISK_SCHEMA
+    profile_id: str = PAPER_RISK_PROFILE_ID
+    mode: str = PAPER_MODE
+    account_name: str = PAPER_ACCOUNT
+    account_class: str = PAPER_ACCOUNT_CLASS
+    instrument: str = PAPER_INSTRUMENT
+    canonical_contract: str = PAPER_CANONICAL_CONTRACT
+    maximum_absolute_position: int = 1
+    maximum_entry_quantity: int = 1
+    maximum_pending_entries: int = 1
+    maximum_simultaneous_thesis: int = 1
+    pyramiding: bool = False
+    averaging: bool = False
+    same_event_reversal: bool = False
+    entry_order_type: str = "MARKET"
+    normal_exit: str = "FLATTEN_OWNED_INSTRUMENT"
+    protective_order_type: str = "STOP_MARKET"
+    protective_stop_distance_points: Decimal = Decimal("25.00")
+    maximum_trade_risk_dollars: Decimal = Decimal("50.00")
+    daily_loss_limit_dollars: Decimal = Decimal("200.00")
+    maximum_position_age_seconds: int = 540
+    entry_session_start: str = "09:35"
+    entry_session_end: str = "15:30"
+    hard_flat_deadline: str = "15:58"
+    session_timezone: str = "America/New_York"
+    reentry_cooldown_seconds: int = 30
+    maximum_session_entries: int = 12
+    maximum_consecutive_losses: int = 4
+    maximum_entry_slippage_points: Decimal = Decimal("2.00")
+    quote_maximum_age_seconds: int = 2
+    classified_trade_maximum_age_seconds: int = 5
+    depth_mutation_maximum_age_seconds: int = 5
+    point_value_dollars: Decimal = Decimal("2.00")
+    tick_size: Decimal = Decimal("0.25")
+    tick_value_dollars: Decimal = Decimal("0.50")
+    paper_only: bool = True
+    approved_for_live: bool = False
+
+    def __post_init__(self) -> None:
+        identity = (self.schema, self.profile_id, self.mode, self.account_name, self.account_class, self.instrument, self.canonical_contract)
+        required = (PAPER_RISK_SCHEMA, PAPER_RISK_PROFILE_ID, PAPER_MODE, PAPER_ACCOUNT, PAPER_ACCOUNT_CLASS, PAPER_INSTRUMENT, PAPER_CANONICAL_CONTRACT)
+        if identity != required:
+            raise ValueError("The Lane III-G risk identity is sealed to Sim101/MNQ SEP26.")
+        if any((self.maximum_absolute_position != 1, self.maximum_entry_quantity != 1, not self.paper_only, self.approved_for_live)):
+            raise ValueError("The paper risk profile cannot represent live or multi-contract authority.")
+        if self.pyramiding or self.averaging or self.same_event_reversal:
+            raise ValueError("Pyramiding, averaging, and same-event reversal are forbidden.")
+
+    def payload(self) -> dict[str, object]:
+        return _jsonable(asdict(self))  # type: ignore[return-value]
+
+    @property
+    def configuration_hash(self) -> str:
+        return canonical_hash(self.payload())
+
+
+@dataclass(frozen=True)
+class ExecutionAccountBinding:
+    account_name: str = PAPER_ACCOUNT
+    account_class: str = PAPER_ACCOUNT_CLASS
+    instrument: str = PAPER_INSTRUMENT
+    canonical_contract: str = PAPER_CANONICAL_CONTRACT
+    maximum_quantity: int = PAPER_MAXIMUM_QUANTITY
+    paper_only: bool = True
+    live_capital: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            self.account_name,
+            self.account_class,
+            self.instrument,
+            self.canonical_contract,
+            self.maximum_quantity,
+            self.paper_only,
+            self.live_capital,
+        ) != (PAPER_ACCOUNT, PAPER_ACCOUNT_CLASS, PAPER_INSTRUMENT, PAPER_CANONICAL_CONTRACT, 1, True, False):
+            raise ValueError("No configurable or live account binding exists in Lane III-G.")
+
+    def payload(self) -> dict[str, object]:
+        return _jsonable(asdict(self))  # type: ignore[return-value]
+
+    @property
+    def binding_hash(self) -> str:
+        return canonical_hash(self.payload())
+
+
+@dataclass(frozen=True)
+class ExecutionCapabilityManifest:
+    adapter: str = "NinjaTraderSim101PaperAdapter"
+    mode: str = PAPER_MODE
+    account_class: str = PAPER_ACCOUNT_CLASS
+    account_name: str = PAPER_ACCOUNT
+    instrument: str = PAPER_INSTRUMENT
+    maximum_quantity: int = 1
+    order_mutation: str = "PAPER_ONLY"
+    live_capital: bool = False
+
+    def __post_init__(self) -> None:
+        if asdict(self) != {
+            "adapter": "NinjaTraderSim101PaperAdapter",
+            "mode": PAPER_MODE,
+            "account_class": PAPER_ACCOUNT_CLASS,
+            "account_name": PAPER_ACCOUNT,
+            "instrument": PAPER_INSTRUMENT,
+            "maximum_quantity": 1,
+            "order_mutation": "PAPER_ONLY",
+            "live_capital": False,
+        }:
+            raise ValueError("Only the compiled Sim101 paper capability may be registered.")
+
+
+@dataclass(frozen=True)
+class PaperEvidence:
+    evidence_id: str
+    hypothesis_kind: HypothesisKind
+    family: EvidenceFamily
+    label: str
+    strength: Decimal
+    supports: bool
+    observed_at: str
+    expires_at: str
+    source_observation_ids: tuple[str, ...]
+    source_local_sequences: tuple[int, ...]
+    source_payload_hashes: tuple[str, ...]
+    quality: PaperSourceQuality = PaperSourceQuality.PROVISIONAL_CONTIGUOUS_LOCAL_CALLBACKS
+    sequence_authority: SequenceAuthority = SequenceAuthority.LOCAL_CALLBACK_ORDER_ONLY
+    book_completeness: BookCompleteness = BookCompleteness.UNVERIFIED
+    scientific_eligibility: bool = False
+    blocking: bool = False
+
+    def __post_init__(self) -> None:
+        _utc(self.observed_at, "Paper evidence time")
+        _utc(self.expires_at, "Paper evidence expiry")
+        if not self.evidence_id.startswith("l3g-pe-"):
+            raise ValueError("Paper evidence requires the l3g namespace.")
+        if not Decimal("0") < self.strength <= Decimal("1"):
+            raise ValueError("Evidence strength must be within (0, 1].")
+        if not self.source_observation_ids or len(self.source_observation_ids) != len(self.source_local_sequences) or len(self.source_observation_ids) != len(self.source_payload_hashes):
+            raise ValueError("Paper evidence provenance arrays must be non-empty and aligned.")
+        if self.scientific_eligibility or self.sequence_authority is not SequenceAuthority.LOCAL_CALLBACK_ORDER_ONLY or self.book_completeness is not BookCompleteness.UNVERIFIED:
+            raise ValueError("Provisional paper evidence cannot be promoted to scientific truth.")
+
+    def payload(self) -> dict[str, object]:
+        return _jsonable(asdict(self))  # type: ignore[return-value]
+
+
+@dataclass(frozen=True)
+class PaperDecision:
+    paper_decision_id: str
+    paper_policy_id: str
+    paper_policy_hash: str
+    decision: PaperDecisionKind
+    created_at: str
+    expires_at: str
+    hypothesis_kind: HypothesisKind | None
+    direction: PaperDirection
+    relative_support: Decimal
+    family_summary: Mapping[str, object]
+    source_observation_ids: tuple[str, ...]
+    source_local_sequences: tuple[int, ...]
+    source_payload_hashes: tuple[str, ...]
+    sequence_authority: SequenceAuthority
+    book_completeness: BookCompleteness
+    scientific_eligibility: bool
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        if not self.paper_decision_id.startswith("l3g-pd-"):
+            raise ValueError("Paper decisions require the l3g-pd namespace.")
+        if self.paper_policy_id != PAPER_POLICY_ID or not self.paper_policy_hash:
+            raise ValueError("Paper decision policy identity is required.")
+        _utc(self.created_at, "Paper decision time")
+        _utc(self.expires_at, "Paper decision expiry")
+        if self.scientific_eligibility or self.sequence_authority is not SequenceAuthority.LOCAL_CALLBACK_ORDER_ONLY or self.book_completeness is not BookCompleteness.UNVERIFIED:
+            raise ValueError("Paper decisions are never scientifically eligible.")
+        if self.decision is PaperDecisionKind.LONG and (self.hypothesis_kind is not HypothesisKind.BULLISH_REVERSAL or self.direction is not PaperDirection.LONG):
+            raise ValueError("Only bullish reversal may create a long paper decision.")
+        if self.decision is PaperDecisionKind.SHORT and (self.hypothesis_kind is not HypothesisKind.BEARISH_CONTINUATION or self.direction is not PaperDirection.SHORT):
+            raise ValueError("Only bearish continuation may create a short paper decision.")
+        if self.decision in {PaperDecisionKind.NO_TRADE, PaperDecisionKind.EXIT} and self.direction is not PaperDirection.FLAT:
+            raise ValueError("NO_TRADE and EXIT have a flat target direction.")
+        object.__setattr__(self, "family_summary", MappingProxyType(dict(self.family_summary)))
+
+    def payload(self) -> dict[str, object]:
+        result = dict(self.__dict__)
+        result["family_summary"] = dict(self.family_summary)
+        return _jsonable(result)  # type: ignore[return-value]
+
+
+@dataclass(frozen=True)
+class PaperExecutionIntent:
+    intent_id: str
+    paper_decision_id: str
+    target_position: PaperDirection
+    requested_quantity: int
+    instrument: str
+    created_at: str
+    expires_at: str
+    policy_hash: str
+    reference_bid: Decimal | None
+    reference_ask: Decimal | None
+    reference_last: Decimal | None
+
+    def __post_init__(self) -> None:
+        if not self.intent_id.startswith("l3g-pi-") or not self.paper_decision_id.startswith("l3g-pd-"):
+            raise ValueError("Paper intent identity is invalid.")
+        if self.instrument != PAPER_INSTRUMENT or self.requested_quantity != 1:
+            raise ValueError("Paper intents are sealed to one MNQ SEP26 contract.")
+        _utc(self.created_at, "Paper intent time")
+        _utc(self.expires_at, "Paper intent expiry")
+        if self.target_position not in {PaperDirection.LONG, PaperDirection.SHORT, PaperDirection.FLAT}:
+            raise ValueError("Unsupported target position.")
+
+    def payload(self) -> dict[str, object]:
+        return _jsonable(asdict(self))  # type: ignore[return-value]
+
+
+@dataclass(frozen=True)
+class PaperRiskGrant:
+    grant_id: str
+    intent_id: str
+    risk_profile_hash: str
+    account_binding_hash: str
+    granted: bool
+    reason_codes: tuple[str, ...]
+    evaluated_at: str
+    expires_at: str
+    current_position: PaperDirection
+    current_working_orders: int
+    daily_realized_pnl: Decimal
+    daily_unrealized_pnl: Decimal
+    session_entry_count: int
+    consecutive_losses: int
+    paper_only: bool = True
+    approved_for_live: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.grant_id.startswith("l3g-pg-") or not self.intent_id.startswith("l3g-pi-"):
+            raise ValueError("Paper risk-grant identity is invalid.")
+        _utc(self.evaluated_at, "Paper risk evaluation time")
+        _utc(self.expires_at, "Paper risk grant expiry")
+        if not self.reason_codes or not self.paper_only or self.approved_for_live:
+            raise ValueError("A risk grant must retain explicit paper-only reasons and authority.")
+        if min(self.current_working_orders, self.session_entry_count, self.consecutive_losses) < 0:
+            raise ValueError("Paper risk counters cannot be negative.")
+
+    def payload(self) -> dict[str, object]:
+        return _jsonable(asdict(self))  # type: ignore[return-value]
+
+    def valid_at(self, at: str) -> bool:
+        use_time = datetime.fromisoformat(_utc(at, "Grant use time").replace("Z", "+00:00"))
+        expiry = datetime.fromisoformat(self.expires_at.replace("Z", "+00:00"))
+        return self.granted and use_time <= expiry
+
+
+@dataclass(frozen=True)
+class PaperExecutionCommand:
+    command_id: str
+    command_sequence: int
+    session_id: str
+    intent_id: str
+    decision_id: str
+    action: ExecutionAction
+    account_name: str
+    account_class: str
+    instrument: str
+    quantity: int
+    expected_position: PaperDirection
+    created_at: str
+    expires_at: str
+    policy_hash: str
+    risk_profile_hash: str
+    account_binding_hash: str
+    reason_code: str
+    risk_grant_id: str
+    signature: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.command_id.startswith("l3g-pc-") or type(self.command_sequence) is not int or self.command_sequence <= 0:
+            raise ValueError("Paper command identity or sequence is invalid.")
+        if not self.session_id or not self.intent_id or not self.decision_id or not self.risk_grant_id:
+            raise ValueError("Paper command provenance is incomplete.")
+        if (self.account_name, self.account_class, self.instrument) != (PAPER_ACCOUNT, PAPER_ACCOUNT_CLASS, PAPER_INSTRUMENT):
+            raise ValueError("Paper commands cannot target another account or instrument.")
+        expected_quantity = 0 if self.action in {ExecutionAction.HEARTBEAT, ExecutionAction.RECONCILE, ExecutionAction.CANCEL_OWNED_ORDERS} else 1
+        if self.quantity != expected_quantity:
+            raise ValueError("Paper command quantity is fixed by its closed action.")
+        expected_target = {
+            ExecutionAction.ENTER_LONG: PaperDirection.LONG,
+            ExecutionAction.ENTER_SHORT: PaperDirection.SHORT,
+            ExecutionAction.EXIT: PaperDirection.FLAT,
+            ExecutionAction.EMERGENCY_FLATTEN: PaperDirection.FLAT,
+            ExecutionAction.CANCEL_OWNED_ORDERS: PaperDirection.FLAT,
+            ExecutionAction.HEARTBEAT: PaperDirection.FLAT,
+            ExecutionAction.RECONCILE: PaperDirection.FLAT,
+        }[self.action]
+        if self.expected_position is not expected_target:
+            raise ValueError("Paper command action and target position do not match.")
+        if not all((self.policy_hash, self.risk_profile_hash, self.account_binding_hash, self.reason_code)):
+            raise ValueError("Paper command authority hashes and reason are required.")
+        _utc(self.created_at, "Paper command time")
+        _utc(self.expires_at, "Paper command expiry")
+
+    def unsigned_payload(self) -> dict[str, object]:
+        result = asdict(self)
+        result.pop("signature")
+        return _jsonable(result)  # type: ignore[return-value]
+
+    def payload(self) -> dict[str, object]:
+        return _jsonable(asdict(self))  # type: ignore[return-value]
+
+    def with_signature(self, signature: str) -> "PaperExecutionCommand":
+        if not signature:
+            raise ValueError("A command signature is required.")
+        return replace(self, signature=signature)
+
+
+@runtime_checkable
+class ExecutionVenueAdapter(Protocol):
+    @property
+    def capability(self) -> ExecutionCapabilityManifest: ...
+
+    def submit(self, command: PaperExecutionCommand, grant: PaperRiskGrant) -> None: ...
+
+
+@runtime_checkable
+class ExecutionReconciler(Protocol):
+    def request_reconciliation(self) -> None: ...
+
+
+@runtime_checkable
+class ExecutionSecretProvider(Protocol):
+    def load_key(self) -> bytes: ...
+
+
+@runtime_checkable
+class ExecutionAuditSink(Protocol):
+    def append(self, kind: str, payload: Mapping[str, object], *, identity: str | None = None) -> str: ...
+
+
+@dataclass(frozen=True)
+class PaperAuthorityBundle:
+    policy: PaperPolicyArtifact = field(default_factory=PaperPolicyArtifact)
+    risk: PaperRiskProfile = field(default_factory=PaperRiskProfile)
+    binding: ExecutionAccountBinding = field(default_factory=ExecutionAccountBinding)
+    capability: ExecutionCapabilityManifest = field(default_factory=ExecutionCapabilityManifest)
+
+    def authority_payload(self) -> dict[str, object]:
+        return {
+            "mode": PAPER_MODE,
+            "scientific_eligibility": False,
+            "paper_execution": "AVAILABLE",
+            "account": PAPER_ACCOUNT,
+            "account_class": PAPER_ACCOUNT_CLASS,
+            "instrument": PAPER_INSTRUMENT,
+            "maximum_quantity": 1,
+            "live_capital": "DENIED",
+            "paper_policy_hash": self.policy.configuration_hash,
+            "risk_profile_hash": self.risk.configuration_hash,
+            "account_binding_hash": self.binding.binding_hash,
+        }
+
+
+def expires_at(created_at: str, seconds: int) -> str:
+    created = datetime.fromisoformat(_utc(created_at, "Creation time").replace("Z", "+00:00"))
+    return (created + timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
+
+
+def deterministic_id(prefix: str, payload: Mapping[str, object]) -> str:
+    if prefix not in {"l3g-pe-", "l3g-pd-", "l3g-pi-", "l3g-pg-", "l3g-pc-", "l3g-es-"}:
+        raise ValueError("Unknown Lane III-G deterministic namespace.")
+    return prefix + canonical_hash(dict(payload))[:32]
+
+
+def refuse_execution_target(value: object) -> None:
+    """Validate the only startup execution target without permissive parsing."""
+    if value != PAPER_MODE:
+        raise ValueError("Lane III-G supports only the compiled PAPER_SIM101 execution target.")
+
+
+POLICY = PaperPolicyArtifact()
+RISK_PROFILE = PaperRiskProfile()
+ACCOUNT_BINDING = ExecutionAccountBinding()
+CAPABILITY = ExecutionCapabilityManifest()
+AUTHORITY = PaperAuthorityBundle(POLICY, RISK_PROFILE, ACCOUNT_BINDING, CAPABILITY)

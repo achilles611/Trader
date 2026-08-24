@@ -8,7 +8,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src.copytrade.config import ArtifactConfig, CommissioningConfig, CopyTradeConfig, StorageConfig
+from src.copytrade.config import ArtifactConfig, CommissioningConfig, CopyTradeConfig, ScientificWorkerConfig, StorageConfig
 from src.copytrade.data_ignition import CoveragePolicy, DataCoverage, DataIgnitionCommissioner, LIVE_PUBLIC_SOURCE, PublicObservationService
 from src.copytrade.science_repository import ScientificRepository
 from src.copytrade.scientific_worker import ScientificWorker
@@ -54,6 +54,9 @@ class DataIgnitionTests(unittest.TestCase):
         config = CopyTradeConfig(
             artifacts=ArtifactConfig(database_path=temp / "hot" / "science.sqlite3"),
             storage=StorageConfig(hot_root=temp / "hot", cold_root=temp / "cold"),
+            # This fixture validates replay/idempotency, not the production
+            # low-disk pause.  Keep it independent of the host's free space.
+            scientific_worker=ScientificWorkerConfig(minimum_hot_free_bytes=1),
             commissioning=CommissioningConfig(enabled=True, historical_start=start, historical_end=end, max_download_bytes=10_000_000,
                                                max_hours_per_run=24, min_coverage_fraction=1.0, archive_verified_sources=True),
         )

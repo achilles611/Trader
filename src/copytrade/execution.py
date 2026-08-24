@@ -604,10 +604,20 @@ class ExecutionEngine:
         current = self._required_intent(intent_id)
         if current.state is not ExecutionState.VALIDATING:
             return current
-        result = self.store.transition_execution_intent(
-            intent_id, ExecutionState.READY if allowed else ExecutionState.BLOCKED,
-            reason=reason, source="risk_gate", raw_evidence=evidence,
-        )
+        try:
+            result = self.store.transition_execution_intent(
+                intent_id, ExecutionState.READY if allowed else ExecutionState.BLOCKED,
+                reason=reason, source="risk_gate", raw_evidence=evidence,
+            )
+        except ValueError:
+            # The durable transition itself is serialized, but another worker
+            # can advance VALIDATING after the read above and before this
+            # transaction begins. Treat that newly durable state as the
+            # idempotent winner; only re-raise if validation still owns it.
+            current = self._required_intent(intent_id)
+            if current.state is ExecutionState.VALIDATING:
+                raise
+            return current
         self._checkpoint(fault_hook, "after_state_transition_persistence")
         return result
 

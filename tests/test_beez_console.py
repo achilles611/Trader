@@ -9,6 +9,9 @@ import beez_console
 
 
 class BeezConsoleTests(unittest.TestCase):
+    def test_startup_watchdog_allows_chain_verification_and_login_budget(self) -> None:
+        self.assertEqual(beez_console.STARTUP_TIMEOUT_SECONDS, 120.0)
+
     def test_project_root_uses_packaged_executable_directory(self) -> None:
         root = beez_console.project_root(frozen=True, executable=r"C:\\Trader\\BeezConsole.exe")
         self.assertEqual(root, Path(r"C:\\Trader"))

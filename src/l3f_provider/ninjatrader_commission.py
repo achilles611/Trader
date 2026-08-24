@@ -144,8 +144,8 @@ class NinjaTraderCommissioningHarness:
         self.summary.listener_port = config.port
         self.health = NinjaTraderHealthTracker()
         self._on_listener_started = on_listener_started
-        # These are one-way, best-effort notifications to a downstream
-        # shadow consumer.  The listener never receives a response and a
+        # These are one-way, best-effort notifications to an external
+        # composite consumer. The listener never receives a response and a
         # consumer failure can never stop the observation boundary.
         self._on_observation = on_observation
         self._on_local_bridge_state = on_local_bridge_state
@@ -367,7 +367,7 @@ class NinjaTraderListenerWorker:
                 start_attempts=self._start_attempts,
             )
 
-    def set_shadow_sinks(
+    def set_observation_sinks(
         self,
         *,
         on_observation: Callable[[NinjaTraderObservation], None],
@@ -375,7 +375,7 @@ class NinjaTraderListenerWorker:
         on_rejection: Callable[[NinjaTraderObservationError], None],
         on_duplicate: Callable[[], None],
     ) -> None:
-        """Attach the sole downstream shadow consumer before listener startup.
+        """Attach the sole downstream composite consumer before startup.
 
         This is intentionally unavailable after startup so UI reconnects and
         runtime churn cannot replace or duplicate a consumer mid-stream.
@@ -384,11 +384,27 @@ class NinjaTraderListenerWorker:
             raise ValueError("Shadow sinks must be callable.")
         with self._lock:
             if self._state not in {"NEW", "STOPPED"} or (self._thread is not None and self._thread.is_alive()):
-                raise RuntimeError("NINJATRADER_OBSERVER shadow sinks may be attached only before startup")
+                raise RuntimeError("NINJATRADER_OBSERVER sinks may be attached only before startup")
             self._on_observation = on_observation
             self._on_local_bridge_state = on_local_bridge_state
             self._on_rejection = on_rejection
             self._on_duplicate = on_duplicate
+
+    def set_shadow_sinks(
+        self,
+        *,
+        on_observation: Callable[[NinjaTraderObservation], None],
+        on_local_bridge_state: Callable[[StreamHealth], None],
+        on_rejection: Callable[[NinjaTraderObservationError], None],
+        on_duplicate: Callable[[], None],
+    ) -> None:
+        """Backward-compatible name for the pre-L3G single-shadow wiring."""
+        self.set_observation_sinks(
+            on_observation=on_observation,
+            on_local_bridge_state=on_local_bridge_state,
+            on_rejection=on_rejection,
+            on_duplicate=on_duplicate,
+        )
 
     def start(self, *, timeout_seconds: float = _STARTUP_TIMEOUT_SECONDS) -> NinjaTraderListenerRuntimeStatus:
         """Start once, wait for a bind result, and never select an alternate port."""
