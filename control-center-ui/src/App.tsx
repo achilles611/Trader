@@ -2,9 +2,10 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, post } from "./api";
 import type { Candidate, CandidatesResponse, ControlState, Portfolio } from "./types";
 import { AutomatedSciencePage, ConfidencePage, DataIgnitionPage, EcosystemPage, ScienceResourcePage } from "./ScienceViews";
+import { SchedulerPage } from "./SchedulerPage";
 
-type Page = "Automated Science" | "Data Ignition" | "Ecosystem" | "Data Soil" | "Wallet Sensors" | "Hypothesis Lab" | "Indicator Forge" | "Experiments" | "Confidence Engine" | "Execution + Risk" | "Lane III Paper" | "Watchers + Alerts" | "Graveyard" | "Overview" | "Discovery" | "Candidates" | "Shadow" | "Active" | "Portfolio" | "Positions" | "Activity" | "System";
-const pages: Page[] = ["Automated Science", "Data Ignition", "Ecosystem", "Data Soil", "Wallet Sensors", "Hypothesis Lab", "Indicator Forge", "Experiments", "Confidence Engine", "Execution + Risk", "Lane III Paper", "Watchers + Alerts", "Graveyard", "Overview", "Discovery", "Candidates", "Shadow", "Active", "Portfolio", "Positions", "Activity", "System"];
+type Page = "Automated Science" | "Data Ignition" | "Ecosystem" | "Data Soil" | "Wallet Sensors" | "Hypothesis Lab" | "Indicator Forge" | "Experiments" | "Confidence Engine" | "Execution + Risk" | "Lane III Paper" | "Task Scheduler" | "Watchers + Alerts" | "Graveyard" | "Overview" | "Discovery" | "Candidates" | "Shadow" | "Active" | "Portfolio" | "Positions" | "Activity" | "System";
+const pages: Page[] = ["Automated Science", "Data Ignition", "Ecosystem", "Data Soil", "Wallet Sensors", "Hypothesis Lab", "Indicator Forge", "Experiments", "Confidence Engine", "Execution + Risk", "Lane III Paper", "Task Scheduler", "Watchers + Alerts", "Graveyard", "Overview", "Discovery", "Candidates", "Shadow", "Active", "Portfolio", "Positions", "Activity", "System"];
 
 const money = (value: unknown) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(Number(value || 0));
 const percent = (value: unknown) => `${(Number(value || 0) * 100).toFixed(1)}%`;
@@ -31,6 +32,7 @@ export function App() {
   const [liveActivity, setLiveActivity] = useState<any[] | null>(null);
   const [discoveryJob, setDiscoveryJob] = useState<Record<string, any> | null>(null);
   const [discoveryRevision, setDiscoveryRevision] = useState(0);
+  const [schedulerRevision, setSchedulerRevision] = useState(0);
   const [toast, setToast] = useState<Toast>(null);
   const [confirmation, setConfirmation] = useState<Confirmation>(null);
 
@@ -56,6 +58,7 @@ export function App() {
         setDiscoveryJob(message.data || null);
         if (["completed", "completed_with_warnings"].includes(message.data?.status)) { setDiscoveryRevision((value) => value + 1); void refresh(); }
       }
+      if (["scheduler_status", "scheduler_schedule_update", "scheduler_run_update", "scheduler_notification"].includes(message.type)) setSchedulerRevision((value) => value + 1);
     };
     ws.onerror = () => undefined;
     return () => ws.close();
@@ -109,6 +112,7 @@ export function App() {
       {page === "Confidence Engine" && <ConfidencePage />}
       {page === "Execution + Risk" && <ScienceResourcePage endpoint="/api/decisions" title="Execution + Risk" subtitle="Explainable simulation/shadow decisions after model, edge, and risk gates." columns={["created_at", "symbol", "decision", "payload"]} />}
       {page === "Lane III Paper" && <LaneIIIPaperPage notify={setToast} confirmation={setConfirmation} />}
+      {page === "Task Scheduler" && <SchedulerPage revision={schedulerRevision} notify={setToast} confirmation={setConfirmation} />}
       {page === "Watchers + Alerts" && <ScienceResourcePage endpoint="/api/science/health" title="Watchers + Alerts" subtitle="Operational data is unavailable until real watcher evidence is persisted." columns={[]} />}
       {page === "Graveyard" && <ScienceResourcePage endpoint="/api/graveyard" title="Graveyard" subtitle="Rejected hypotheses are permanent evidence and searchable before rediscovery." columns={["hypothesis_id", "version", "reason", "recorded_at", "payload"]} search />}
       {page === "Overview" && <Overview data={overview} portfolio={portfolio} navigate={setPage} />}

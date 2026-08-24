@@ -204,6 +204,25 @@ scientific_worker:
   minimum_hot_free_bytes: 1073741824
   horizons_seconds: [15, 30, 60, 120, 180, 300, 600]
 
+# Operations scheduling is durable and local. It only observes, verifies,
+# notifies, exports audit evidence, and invokes the existing scientific worker.
+# It cannot arm a Lane III session or mutate any broker/account state.
+scheduler:
+  enabled: true
+  database_path: null
+  default_timezone: America/Denver
+  poll_interval_seconds: 0.5
+  leader_lease_seconds: 15
+  run_lease_seconds: 15
+  heartbeat_seconds: 3
+  cancellation_grace_seconds: 5
+  max_concurrent_runs: 2
+  max_result_bytes: 262144
+  max_event_bytes: 65536
+  commissioning_probes_enabled: false
+  maximum_catch_up_runs: 3
+  default_max_lateness_seconds: 300
+
 # The first real source hour contained nearly 800k normalized observations.
 # This measured, meaningful hour is the bounded commissioning interval; the
 # requester-pays byte cap still prevents an oversized expanded campaign.

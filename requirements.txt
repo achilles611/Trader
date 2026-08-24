@@ -1,6 +1,7 @@
 jsonschema>=4.23.0
 PyYAML>=6.0.2
 python-dotenv>=1.0.1
+tzdata>=2024.1
 requests>=2.32.3
 websockets>=13.0
 # Phase F.3 delegates all Hyperliquid action signing to the official SDK.

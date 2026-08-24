@@ -25,6 +25,13 @@ from src.l3g_paper.ledger import PaperLedger
 from src.l3g_paper.ninjatrader_login import NinjaTraderLoginBootstrap, NinjaTraderLoginState
 from src.l3g_paper.ninjatrader_transport import PaperExecutionTransport
 from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout
+from src.ops_scheduler.api_models import PreviewRequest, RunNowRequest, ScheduleRequest, ScheduleUpdateRequest, TemplateRequest
+from src.ops_scheduler.engine import SchedulerEngine, SchedulerSettings
+from src.ops_scheduler.models import ScheduleLifecycle
+from src.ops_scheduler.registry import TaskRegistry
+from src.ops_scheduler.service import SchedulerService
+from src.ops_scheduler.store import OperationsStore
+from src.ops_scheduler.tasks import production_task_definitions
 
 from .config import CopyTradeConfig
 from .contracts import PHASE_B_RECOMMENDATION_SCHEMA_VERSION
@@ -1404,6 +1411,38 @@ def create_control_center_app(
             }
         return paper.status()
 
+    scheduler_path = config.scheduler.database_path or Path(config.artifacts.database_path).resolve().with_name("beelzebub_operations.sqlite3")
+    scheduler_store = OperationsStore(scheduler_path, max_result_bytes=config.scheduler.max_result_bytes, max_event_bytes=config.scheduler.max_event_bytes)
+    scheduler_store.initialize()
+    scheduler_settings = SchedulerSettings(
+        enabled=config.scheduler.enabled,
+        default_timezone=config.scheduler.default_timezone,
+        poll_interval_seconds=config.scheduler.poll_interval_seconds,
+        leader_lease_seconds=config.scheduler.leader_lease_seconds,
+        run_lease_seconds=config.scheduler.run_lease_seconds,
+        heartbeat_seconds=config.scheduler.heartbeat_seconds,
+        cancellation_grace_seconds=config.scheduler.cancellation_grace_seconds,
+        max_concurrent_runs=config.scheduler.max_concurrent_runs,
+        maximum_catch_up_runs=config.scheduler.maximum_catch_up_runs,
+        default_max_lateness_seconds=config.scheduler.default_max_lateness_seconds,
+    )
+    scheduler_engine = SchedulerEngine(
+        scheduler_store,
+        TaskRegistry(production_task_definitions(), include_commissioning_probes=config.scheduler.commissioning_probes_enabled),
+        settings=scheduler_settings,
+        dependencies={
+            "control_center_health": lambda: center.health(live_watcher_health),
+            "watcher_health": live_watcher_health,
+            "ninja_listener_health": ninja_listener_health,
+            "lane_iii_paper_health": lane_iii_paper_health,
+            "scheduler_status": lambda: scheduler_engine.status(),
+            "database_paths": lambda: {"application": config.artifacts.database_path, "scheduler": scheduler_path},
+            "scientific_worker": lambda: getattr(execution_service, "scientific_worker", None) or getattr(center._paper_service(), "scientific_worker", None),
+            "audit_export_directory": Path(__file__).resolve().parents[2] / "logs" / "scheduler-audits",
+        },
+    )
+    scheduler_service = SchedulerService(scheduler_store, scheduler_engine.registry, scheduler_engine)
+
     @asynccontextmanager
     async def lifespan(_: Any) -> Any:
         # The Control Center application owns this worker for its entire
@@ -1519,11 +1558,17 @@ def create_control_center_app(
                 )
                 watcher_runtime["supervisor"] = supervisor
                 watcher_runtime["task"] = asyncio.create_task(supervisor.run())
+            # The scheduler is lifespan-owned: routes, page refreshes, and
+            # websocket clients only inspect this exact durable engine.
+            await scheduler_engine.start()
+            app.state.scheduler_engine = scheduler_engine
+            app.state.scheduler_service = scheduler_service
             yield
         finally:
             supervisor = watcher_runtime.get("supervisor")
             task = watcher_runtime.get("task")
             try:
+                await scheduler_engine.stop()
                 if login_bootstrap is not None:
                     login_bootstrap.stop()
                 if listener is not None:
@@ -1546,6 +1591,8 @@ def create_control_center_app(
                     app.state.lane_iii_paper = None
                     app.state.lane_iii_paper_transport = None
                     app.state.ninjatrader_login_bootstrap = None
+                    app.state.scheduler_engine = None
+                    app.state.scheduler_service = scheduler_service
                     if paper_ledger is not None:
                         paper_ledger.close()
 
@@ -1556,6 +1603,8 @@ def create_control_center_app(
     app.state.lane_iii_paper = None
     app.state.lane_iii_paper_transport = None
     app.state.ninjatrader_login_bootstrap = None
+    app.state.scheduler_engine = None
+    app.state.scheduler_service = scheduler_service
 
     @app.exception_handler(sqlite3.Error)
     async def database_unavailable(_: Any, __: sqlite3.Error) -> Any:
@@ -1575,7 +1624,148 @@ def create_control_center_app(
             "ninjatrader_observer": ninja_listener_health(),
             "lane_iii_shadow": lane_iii_shadow_health(),
             "lane_iii_paper": sanitized_paper_health(lane_iii_paper_health()),
+            "scheduler": scheduler_service.status(),
         }
+
+    def scheduler_error(exc: Exception) -> None:
+        if isinstance(exc, KeyError):
+            raise HTTPException(status_code=404, detail="Scheduler record was not found.") from exc
+        if isinstance(exc, RuntimeError) and str(exc) == "STALE_REVISION":
+            raise HTTPException(status_code=409, detail="Schedule revision is stale; refresh before editing.") from exc
+        if isinstance(exc, ValueError):
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise exc
+
+    @app.get("/api/scheduler/status")
+    async def api_scheduler_status() -> dict[str, Any]:
+        return scheduler_service.status()
+
+    @app.get("/api/scheduler/catalog")
+    async def api_scheduler_catalog() -> dict[str, Any]:
+        return scheduler_service.catalog()
+
+    @app.post("/api/scheduler/preview")
+    async def api_scheduler_preview(payload: PreviewRequest) -> dict[str, Any]:
+        try:
+            return scheduler_service.preview(payload.model_dump())
+        except Exception as exc:
+            scheduler_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.get("/api/scheduler/schedules")
+    async def api_scheduler_schedules(lifecycle: str | None = None, task_type: str | None = None,
+                                      page: int = Query(1, ge=1), page_size: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
+        return scheduler_service.schedules(lifecycle=lifecycle, task_type=task_type, page=page, page_size=page_size)
+
+    @app.post("/api/scheduler/schedules")
+    async def api_scheduler_create_schedule(payload: ScheduleRequest) -> dict[str, Any]:
+        try:
+            return scheduler_service.create_schedule(payload.model_dump())
+        except Exception as exc:
+            scheduler_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.get("/api/scheduler/schedules/{schedule_id}")
+    async def api_scheduler_schedule(schedule_id: str) -> dict[str, Any]:
+        try:
+            return scheduler_service.schedule(schedule_id)
+        except Exception as exc:
+            scheduler_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.put("/api/scheduler/schedules/{schedule_id}")
+    async def api_scheduler_update_schedule(schedule_id: str, payload: ScheduleUpdateRequest) -> dict[str, Any]:
+        try:
+            return scheduler_service.update_schedule(schedule_id, payload.model_dump())
+        except Exception as exc:
+            scheduler_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.post("/api/scheduler/schedules/{schedule_id}/pause")
+    async def api_scheduler_pause(schedule_id: str) -> dict[str, Any]:
+        try:
+            return scheduler_service.set_lifecycle(schedule_id, ScheduleLifecycle.PAUSED)
+        except Exception as exc:
+            scheduler_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.post("/api/scheduler/schedules/{schedule_id}/resume")
+    async def api_scheduler_resume(schedule_id: str) -> dict[str, Any]:
+        try:
+            return scheduler_service.set_lifecycle(schedule_id, ScheduleLifecycle.ENABLED)
+        except Exception as exc:
+            scheduler_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.post("/api/scheduler/schedules/{schedule_id}/archive")
+    async def api_scheduler_archive(schedule_id: str) -> dict[str, Any]:
+        try:
+            return scheduler_service.set_lifecycle(schedule_id, ScheduleLifecycle.ARCHIVED)
+        except Exception as exc:
+            scheduler_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.post("/api/scheduler/schedules/{schedule_id}/run-now")
+    async def api_scheduler_run_now(schedule_id: str, payload: RunNowRequest | None = None) -> dict[str, Any]:
+        try:
+            return scheduler_service.run_now(schedule_id, operator_request_id=payload.operator_request_id if payload else None)
+        except Exception as exc:
+            scheduler_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.post("/api/scheduler/templates/{template_id}/instantiate")
+    async def api_scheduler_instantiate(template_id: str, payload: TemplateRequest | None = None) -> dict[str, Any]:
+        try:
+            return scheduler_service.instantiate_template(template_id, name=payload.name if payload else None)
+        except Exception as exc:
+            scheduler_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.get("/api/scheduler/runs")
+    async def api_scheduler_runs(status: str | None = None, task_type: str | None = None, schedule_id: str | None = None,
+                                 page: int = Query(1, ge=1), page_size: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
+        return scheduler_service.runs(status=status, task_type=task_type, schedule_id=schedule_id, page=page, page_size=page_size)
+
+    @app.get("/api/scheduler/runs/{run_id}")
+    async def api_scheduler_run(run_id: str) -> dict[str, Any]:
+        try:
+            return scheduler_service.run(run_id)
+        except Exception as exc:
+            scheduler_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.post("/api/scheduler/runs/{run_id}/cancel")
+    async def api_scheduler_cancel(run_id: str) -> dict[str, Any]:
+        try:
+            return await scheduler_service.cancel(run_id)
+        except Exception as exc:
+            scheduler_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.post("/api/scheduler/runs/{run_id}/retry")
+    async def api_scheduler_retry(run_id: str) -> dict[str, Any]:
+        try:
+            return scheduler_service.retry(run_id)
+        except Exception as exc:
+            scheduler_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.get("/api/scheduler/notifications")
+    async def api_scheduler_notifications(unread_only: bool = False, page: int = Query(1, ge=1),
+                                          page_size: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
+        return scheduler_service.notifications(unread_only=unread_only, page=page, page_size=page_size)
+
+    @app.post("/api/scheduler/notifications/{notification_id}/read")
+    async def api_scheduler_mark_notification(notification_id: str) -> dict[str, Any]:
+        try:
+            return scheduler_service.mark_notification_read(notification_id)
+        except Exception as exc:
+            scheduler_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.post("/api/scheduler/notifications/read-all")
+    async def api_scheduler_mark_all_notifications() -> dict[str, Any]:
+        return scheduler_service.mark_all_notifications_read()
 
     @app.get("/api/lane-iii/shadow")
     async def api_lane_iii_shadow() -> dict[str, object]:
@@ -1891,6 +2081,10 @@ def create_control_center_app(
                     "position_update": {"items": center.positions(), "paper_only": True},
                     "watcher_health": center.health(live_watcher_health)["watcher"],
                     "activity": {"items": center.activity(limit=20)},
+                    "scheduler_status": scheduler_service.status(),
+                    "scheduler_schedule_update": scheduler_service.schedules(page=1, page_size=50),
+                    "scheduler_run_update": scheduler_service.runs(page=1, page_size=50),
+                    "scheduler_notification": scheduler_service.notifications(unread_only=True, page=1, page_size=50),
                 }
                 latest_job = center.store.list_jobs(job_type="candidate_discovery", limit=1)
                 if latest_job:

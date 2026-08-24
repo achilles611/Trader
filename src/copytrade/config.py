@@ -315,6 +315,26 @@ class ScientificWorkerConfig:
 
 
 @dataclass(frozen=True)
+class SchedulerConfig:
+    """Independent operations scheduler settings; it never gains trading authority."""
+
+    enabled: bool = True
+    database_path: Path | None = None
+    default_timezone: str = "America/Denver"
+    poll_interval_seconds: float = 0.5
+    leader_lease_seconds: float = 15.0
+    run_lease_seconds: float = 15.0
+    heartbeat_seconds: float = 3.0
+    cancellation_grace_seconds: float = 5.0
+    max_concurrent_runs: int = 2
+    max_result_bytes: int = 262_144
+    max_event_bytes: int = 65_536
+    commissioning_probes_enabled: bool = False
+    maximum_catch_up_runs: int = 3
+    default_max_lateness_seconds: float = 300.0
+
+
+@dataclass(frozen=True)
 class CommissioningConfig:
     """Bounded D.7 public-evidence acquisition and observation settings.
 
@@ -359,6 +379,7 @@ class CopyTradeConfig:
     storage: StorageConfig = field(default_factory=StorageConfig)
     scientific_execution: ScientificExecutionConfig = field(default_factory=ScientificExecutionConfig)
     scientific_worker: ScientificWorkerConfig = field(default_factory=ScientificWorkerConfig)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     commissioning: CommissioningConfig = field(default_factory=CommissioningConfig)
     artifacts: ArtifactConfig = field(default_factory=ArtifactConfig)
     targets: tuple[dict[str, Any], ...] = ()
@@ -393,6 +414,7 @@ class CopyTradeConfig:
         storage = _section(document, "storage")
         scientific_execution = _section(document, "scientific_execution")
         scientific_worker = _section(document, "scientific_worker")
+        scheduler = _section(document, "scheduler")
         commissioning = _section(document, "commissioning")
         artifacts = _section(document, "artifacts")
         database = _section(document, "database")
@@ -470,6 +492,12 @@ class CopyTradeConfig:
             scientific_worker=ScientificWorkerConfig(
                 **{**scientific_worker, "horizons_seconds": tuple(scientific_worker.get("horizons_seconds", ScientificWorkerConfig().horizons_seconds))}
             ),
+            scheduler=SchedulerConfig(
+                **{
+                    **scheduler,
+                    "database_path": Path(scheduler["database_path"]) if scheduler.get("database_path") else None,
+                }
+            ),
             commissioning=CommissioningConfig(
                 **{**commissioning, "observation_wallets": tuple(commissioning.get("observation_wallets", ())) }
             ),
@@ -497,6 +525,17 @@ class CopyTradeConfig:
             raise ValueError("Live copy trading requires COPYTRADE_MODE=live and COPYTRADE_LIVE_ENABLED=true.")
         if self.mode == "live":
             raise ValueError("Live copy trading is not implemented in this alpha; use paper mode.")
+        scheduler = self.scheduler
+        if not isinstance(scheduler.default_timezone, str) or not scheduler.default_timezone:
+            raise ValueError("scheduler.default_timezone is required.")
+        if scheduler.poll_interval_seconds <= 0 or scheduler.leader_lease_seconds <= 0 or scheduler.run_lease_seconds <= 0:
+            raise ValueError("scheduler intervals and leases must be positive.")
+        if scheduler.heartbeat_seconds <= 0 or scheduler.heartbeat_seconds >= scheduler.run_lease_seconds:
+            raise ValueError("scheduler.heartbeat_seconds must be positive and shorter than run_lease_seconds.")
+        if scheduler.cancellation_grace_seconds < 0 or not 1 <= scheduler.max_concurrent_runs <= 16:
+            raise ValueError("scheduler concurrency or cancellation settings are invalid.")
+        if scheduler.max_result_bytes < 1024 or scheduler.max_event_bytes < 1024 or not 1 <= scheduler.maximum_catch_up_runs <= 10:
+            raise ValueError("scheduler storage limits or catch-up bound are invalid.")
         shadow_venue = str(self.shadow_observation.venue).lower()
         if shadow_venue != "hyperliquid":
             raise ValueError("D.4 shadow observation currently supports only the Hyperliquid public read-only venue.")
