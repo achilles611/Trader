@@ -31,6 +31,10 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const double ExactTickSize = 0.25;
         private const double ProtectiveStopDistance = 25.0;
         private const int ProtectiveAcceptanceSeconds = 3;
+        private const string PaperTimezone = "America/New_York";
+        private const string AsiaProfileHash = "51cf34e6042de9d35413ebbfd41bcc19fb120cd8b18adfe675fbda30f7de92e4";
+        private const string NewYorkProfileHash = "8b8560a08ff41963a7a78d09bc977fbc1faf10f4a11ce58d05f47cacd89e0814";
+        private const string OffSessionProfileHash = "168f289a5847781ccb7a09f2556c4b3aa03e6f767071dc061dc5e3211d3834eb";
 
         private readonly object stateLock = new object();
         private readonly object sendLock = new object();
@@ -55,6 +59,11 @@ namespace NinjaTrader.NinjaScript.AddOns
         private string paperPolicyHash;
         private string riskProfileHash;
         private string accountBindingHash;
+        private string paperSessionKind;
+        private string paperSessionId;
+        private string paperTradeDate;
+        private string paperSessionProfileHash;
+        private long paperSessionGeneration;
         private long lastCommandSequence;
         private DateTime lastHeartbeatUtc = DateTime.MinValue;
         private DateTime protectiveDeadlineUtc = DateTime.MaxValue;
@@ -401,6 +410,11 @@ namespace NinjaTrader.NinjaScript.AddOns
             {
                 processedCommands.Add(commandId);
                 lastCommandSequence = sequence;
+                paperSessionKind = Text(command, "session_kind");
+                paperSessionId = Text(command, "session_id");
+                paperTradeDate = Text(command, "trade_date");
+                paperSessionProfileHash = Text(command, "session_profile_hash");
+                paperSessionGeneration = Integer64(command, "session_generation", 0);
             }
             if (action == "ENTER_LONG" || action == "ENTER_SHORT")
                 SubmitEntry(command, action == "ENTER_LONG");
@@ -440,6 +454,8 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (!ValidTime(Text(command, "created_at"), 5, out timestamp)) return "STALE_OR_FUTURE_COMMAND";
             if (!DateTime.TryParse(Text(command, "expires_at"), CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out expiry) || expiry.ToUniversalTime() < DateTime.UtcNow) return "COMMAND_EXPIRED";
             if (!ExactHashes(command)) return "AUTHORITY_HASH_MISMATCH";
+            string sessionRefusal = ValidatePaperSessionFence(command, action);
+            if (sessionRefusal != null) return sessionRefusal;
             if (!String.Equals(Text(command, "account_name"), ExactAccountName, StringComparison.Ordinal)) return "ACCOUNT_MISMATCH";
             if (!String.Equals(Text(command, "account_class"), ExactAccountClass, StringComparison.Ordinal)) return "ACCOUNT_CLASS_MISMATCH";
             if (!String.Equals(Text(command, "instrument"), ExactInstrumentName, StringComparison.Ordinal)) return "INSTRUMENT_MISMATCH";
@@ -455,6 +471,77 @@ namespace NinjaTrader.NinjaScript.AddOns
             if ((action == "ENTER_LONG" || action == "ENTER_SHORT") && (positionQuantity != 0 || workingEntries != 0 || OwnedWorkingOrders(null).Count != 0)) return "POSITION_OR_ORDER_PRECONDITION";
             if ((action == "ENTER_LONG" || action == "ENTER_SHORT") && foreignActivity) return "FOREIGN_ACTIVITY_LOCKOUT";
             if ((action == "EXIT" || action == "EMERGENCY_FLATTEN") && positionQuantity == 0) return "EXIT_WHILE_FLAT";
+            return null;
+        }
+
+        private static TimeZoneInfo NewYorkTimezone()
+        {
+            // NinjaTrader runs on Windows where the registry name is used;
+            // .NET installations with IANA data accept America/New_York.
+            try { return TimeZoneInfo.FindSystemTimeZoneById(PaperTimezone); }
+            catch (TimeZoneNotFoundException) { return TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"); }
+            catch (InvalidTimeZoneException) { return TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"); }
+        }
+
+        private static bool AsiaStartDay(DateTime local)
+        {
+            return local.DayOfWeek == DayOfWeek.Sunday || local.DayOfWeek == DayOfWeek.Monday
+                || local.DayOfWeek == DayOfWeek.Tuesday || local.DayOfWeek == DayOfWeek.Wednesday
+                || local.DayOfWeek == DayOfWeek.Thursday;
+        }
+
+        private static bool NewYorkStartDay(DateTime local)
+        {
+            return local.DayOfWeek >= DayOfWeek.Monday && local.DayOfWeek <= DayOfWeek.Friday;
+        }
+
+        private static string IsoDate(DateTime local)
+        {
+            return local.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        }
+
+        private string ValidatePaperSessionFence(Dictionary<string, object> command, string action)
+        {
+            if (action != "ENTER_LONG" && action != "ENTER_SHORT") return null;
+            string kind = Text(command, "session_kind");
+            string sessionId = Text(command, "session_id");
+            string tradeDate = Text(command, "trade_date");
+            string profileHash = Text(command, "session_profile_hash");
+            if (String.IsNullOrWhiteSpace(kind) || String.IsNullOrWhiteSpace(sessionId)
+                || String.IsNullOrWhiteSpace(tradeDate) || String.IsNullOrWhiteSpace(profileHash))
+                return "MISSING_SESSION_IDENTITY";
+            DateTime local = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, NewYorkTimezone());
+            DateTime parsedDate;
+            if (!DateTime.TryParseExact(tradeDate, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out parsedDate))
+                return "TRADE_DATE_MISMATCH";
+            TimeSpan clock = local.TimeOfDay;
+            string expectedKind;
+            string expectedDate;
+            string expectedHash;
+            bool insideEntry;
+            if ((clock >= new TimeSpan(18, 0, 0) && AsiaStartDay(local))
+                || (clock < new TimeSpan(2, 0, 0) && AsiaStartDay(local.AddDays(-1))))
+            {
+                expectedKind = "ASIA_GLOBEX";
+                expectedDate = IsoDate(clock >= new TimeSpan(18, 0, 0) ? local.AddDays(1) : local);
+                expectedHash = AsiaProfileHash;
+                insideEntry = (clock >= new TimeSpan(18, 5, 0)) || (clock < new TimeSpan(1, 30, 0));
+            }
+            else if (clock >= new TimeSpan(9, 30, 0) && clock < new TimeSpan(16, 0, 0) && NewYorkStartDay(local))
+            {
+                expectedKind = "NEW_YORK_RTH";
+                expectedDate = IsoDate(local);
+                expectedHash = NewYorkProfileHash;
+                insideEntry = clock >= new TimeSpan(9, 35, 0) && clock < new TimeSpan(15, 30, 0);
+            }
+            else
+                return "SESSION_OFF_SESSION";
+            if (!String.Equals(kind, expectedKind, StringComparison.Ordinal)) return "COMMAND_SESSION_MISMATCH";
+            if (!String.Equals(profileHash, expectedHash, StringComparison.Ordinal)) return "SESSION_PROFILE_HASH_MISMATCH";
+            if (!String.Equals(tradeDate, expectedDate, StringComparison.Ordinal)
+                || !String.Equals(sessionId, "MNQU6:" + expectedKind + ":" + expectedDate, StringComparison.Ordinal))
+                return "TRADE_DATE_MISMATCH";
+            if (!insideEntry) return "ENTRY_CUTOFF_PASSED";
             return null;
         }
 
@@ -789,9 +876,37 @@ namespace NinjaTrader.NinjaScript.AddOns
         private Dictionary<string, object> SessionMessage(string type)
         {
             Dictionary<string, object> message = new Dictionary<string, object>();
+            string kind;
+            string sessionId;
+            string tradeDate;
+            string profileHash;
+            long generation;
+            lock (stateLock)
+            {
+                kind = paperSessionKind;
+                sessionId = paperSessionId;
+                tradeDate = paperTradeDate;
+                profileHash = paperSessionProfileHash;
+                generation = paperSessionGeneration;
+            }
+            if (String.IsNullOrWhiteSpace(kind) || String.IsNullOrWhiteSpace(sessionId)
+                || String.IsNullOrWhiteSpace(tradeDate) || String.IsNullOrWhiteSpace(profileHash))
+            {
+                DateTime local = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, NewYorkTimezone());
+                kind = "OFF_SESSION";
+                tradeDate = IsoDate(local);
+                sessionId = "MNQU6:OFF_SESSION:" + tradeDate;
+                profileHash = OffSessionProfileHash;
+                generation = 0;
+            }
             message["schema"] = WireSchema;
             message["message_type"] = type;
             message["execution_session_id"] = executionSessionId;
+            message["session_kind"] = kind;
+            message["session_id"] = sessionId;
+            message["trade_date"] = tradeDate;
+            message["session_profile_hash"] = profileHash;
+            message["session_generation"] = generation;
             message["timestamp"] = UtcNow();
             return message;
         }

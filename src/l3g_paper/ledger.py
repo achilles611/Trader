@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import json
 from pathlib import Path
 import sqlite3
@@ -14,9 +14,11 @@ from typing import Iterator, Mapping
 from src.lane_iii.contracts import canonical_hash, normalized_utc
 
 from .contracts import ACCOUNT_BINDING, PAPER_RECORD_SCHEMA, POLICY, RISK_PROFILE
+from .sessions import PaperSessionContext, PaperSessionKind, UNSPECIFIED_OFF_SESSION_CONTEXT, context_from_identity
 
 
 _DOMAIN_TABLES = {
+    "OBSERVATION": "lane_iii_paper_observations",
     "SESSION": "lane_iii_paper_sessions",
     "EVIDENCE": "lane_iii_paper_evidence",
     "DECISION": "lane_iii_paper_decisions",
@@ -30,7 +32,7 @@ _DOMAIN_TABLES = {
     "RISK_EVENT": "lane_iii_paper_risk_events",
     "INCIDENT": "lane_iii_paper_incidents",
 }
-_HIGH_VOLUME_DOMAINS = frozenset({"EVIDENCE", "DECISION"})
+_HIGH_VOLUME_DOMAINS = frozenset({"OBSERVATION", "EVIDENCE", "DECISION"})
 _SECRET_KEYS = frozenset({"hmac_key", "password", "token", "connection_credentials", "private_key", "secret", "authorization"})
 
 
@@ -72,6 +74,7 @@ class PaperLedger:
         self._connection.execute("PRAGMA synchronous=FULL")
         self._synchronous_mode = "FULL"
         self._connection.execute("PRAGMA foreign_keys=ON")
+        self._current_session_context = UNSPECIFIED_OFF_SESSION_CONTEXT
         self._create_schema()
         self._chain_status = self._verify_chain_uncached()
         rows = self._connection.execute("SELECT domain, COUNT(*) AS count FROM lane_iii_paper_audit GROUP BY domain").fetchall()
@@ -89,6 +92,13 @@ class PaperLedger:
             daemon=True,
         )
         self._deferred_thread.start()
+
+    def set_session_context(self, context: PaperSessionContext) -> None:
+        """Set the default envelope for asynchronous paper-path records."""
+        if type(context) is not PaperSessionContext:
+            raise ValueError("Paper ledger session context must be immutable and exact.")
+        with self._lock:
+            self._current_session_context = context
 
     def _set_synchronous_mode(self, domain: str) -> None:
         # A separate committed transaction is retained for every record. WAL
@@ -159,7 +169,7 @@ class PaperLedger:
             return upper
         for prefix in (
             "COMMAND_RECEIPT", "POSITION_SNAPSHOT", "ORDER_EVENT", "RISK_GRANT",
-            "RISK_EVENT", "EXECUTION", "EVIDENCE", "DECISION", "INTENT", "COMMAND", "SESSION", "INCIDENT",
+            "RISK_EVENT", "EXECUTION", "OBSERVATION", "EVIDENCE", "DECISION", "INTENT", "COMMAND", "SESSION", "INCIDENT",
         ):
             if upper.startswith(prefix):
                 return prefix
@@ -193,6 +203,30 @@ class PaperLedger:
         _assert_redacted(payload)
         at = normalized_utc(occurred_at or _now(), "Paper ledger occurrence time")
         domain = self._domain(kind)
+        identity_payload = dict(payload)
+        with self._lock:
+            default_context = self._current_session_context
+        session_kind_text = identity_payload.get("session_kind", default_context.session_kind.value)
+        try:
+            session_kind = PaperSessionKind(str(session_kind_text))
+        except ValueError as exc:
+            raise ValueError("Paper ledger record session kind is invalid.") from exc
+        session_id = str(identity_payload.get("session_id", default_context.session_id))
+        trade_date = str(identity_payload.get("trade_date", default_context.trade_date))
+        profile_hash = str(identity_payload.get("session_profile_hash", default_context.session_profile_hash))
+        generation = identity_payload.get("session_generation", default_context.session_generation)
+        if type(generation) is not int:
+            raise ValueError("Paper ledger record session generation is invalid.")
+        # Pre-regime test fixtures used session_id for the authenticated
+        # socket session. Such a shape cannot reach CreateOrder (the compiled
+        # session fence rejects it); retain only enough compatibility to audit
+        # it under a safe OFF_SESSION envelope.
+        if session_kind is PaperSessionKind.OFF_SESSION and not session_id.startswith("MNQU6:OFF_SESSION:"):
+            session_id = UNSPECIFIED_OFF_SESSION_CONTEXT.session_id
+            trade_date = UNSPECIFIED_OFF_SESSION_CONTEXT.trade_date
+            profile_hash = UNSPECIFIED_OFF_SESSION_CONTEXT.session_profile_hash
+            generation = UNSPECIFIED_OFF_SESSION_CONTEXT.session_generation
+        context_from_identity(session_kind, session_id, trade_date, profile_hash, generation)
         common: dict[str, object] = {
             "schema": PAPER_RECORD_SCHEMA,
             "kind": kind,
@@ -204,7 +238,12 @@ class PaperLedger:
             "scientific_eligibility": False,
             "paper_only": True,
             "live_capital": False,
-            "payload": dict(payload),
+            "session_kind": session_kind.value,
+            "session_id": session_id,
+            "trade_date": trade_date,
+            "session_profile_hash": profile_hash,
+            "session_generation": generation,
+            "payload": identity_payload,
         }
         record_identity = identity or "l3g-ledger-" + canonical_hash(common)
         return {
@@ -272,7 +311,7 @@ class PaperLedger:
     ) -> None:
         prepared = self._prepare(kind, payload, identity, occurred_at, execution_session_id)
         if str(prepared["domain"]) not in _HIGH_VOLUME_DOMAINS:
-            raise ValueError("Only evidence and no-side-effect decisions may use deferred persistence.")
+            raise ValueError("Only raw observations, evidence, and no-side-effect decisions may use deferred persistence.")
         with self._ordering_lock, self._deferred_condition:
             if self._deferred_error is not None:
                 raise RuntimeError("Deferred paper ledger writer failed.") from self._deferred_error
@@ -330,18 +369,39 @@ class PaperLedger:
             row = self._connection.execute("SELECT payload_json FROM lane_iii_paper_audit WHERE identity = ?", (identity,)).fetchone()
             return None if row is None else json.loads(str(row["payload_json"]))
 
-    def recent(self, limit: int = 100, *, domain: str | None = None) -> list[dict[str, object]]:
+    def recent(
+        self,
+        limit: int = 100,
+        *,
+        domain: str | None = None,
+        session_kind: PaperSessionKind | str | None = None,
+        trade_date: str | None = None,
+        session_id: str | None = None,
+    ) -> list[dict[str, object]]:
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("Paper ledger query limit is invalid.")
         with self._ordering_lock:
             self.flush_deferred()
         with self._lock:
-            if domain is None:
-                rows = self._connection.execute("SELECT payload_json FROM lane_iii_paper_audit ORDER BY ledger_sequence DESC LIMIT ?", (limit,)).fetchall()
-            else:
+            clauses: list[str] = []
+            values: list[object] = []
+            if domain is not None:
                 if domain not in _DOMAIN_TABLES:
                     raise ValueError("Unknown paper ledger domain.")
-                rows = self._connection.execute("SELECT payload_json FROM lane_iii_paper_audit WHERE domain = ? ORDER BY ledger_sequence DESC LIMIT ?", (domain, limit)).fetchall()
+                clauses.append("domain = ?"); values.append(domain)
+            if session_kind is not None:
+                value = PaperSessionKind(str(session_kind)).value
+                clauses.append("json_extract(payload_json, '$.session_kind') = ?"); values.append(value)
+            if trade_date is not None:
+                date.fromisoformat(trade_date)
+                clauses.append("json_extract(payload_json, '$.trade_date') = ?"); values.append(trade_date)
+            if session_id is not None:
+                clauses.append("json_extract(payload_json, '$.session_id') = ?"); values.append(session_id)
+            where = "" if not clauses else " WHERE " + " AND ".join(clauses)
+            rows = self._connection.execute(
+                "SELECT payload_json FROM lane_iii_paper_audit" + where + " ORDER BY ledger_sequence DESC LIMIT ?",
+                (*values, limit),
+            ).fetchall()
             return [json.loads(str(row["payload_json"])) for row in rows]
 
     def _verify_chain_uncached(self) -> tuple[bool, str | None]:

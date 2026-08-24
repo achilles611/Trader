@@ -30,6 +30,7 @@ from .contracts import (
     canonical_json,
 )
 from .ledger import PaperLedger
+from .sessions import PaperSessionKind, PaperSessionResolver, UNSPECIFIED_OFF_SESSION_CONTEXT, context_from_identity
 
 
 EXECUTION_HOST = "127.0.0.1"
@@ -540,7 +541,7 @@ class PaperExecutionTransport:
                 raise RuntimeError("The execution bridge is not authenticated.")
             if not self._reconciled and command.action not in {ExecutionAction.RECONCILE, ExecutionAction.HEARTBEAT}:
                 raise RuntimeError("Reconciliation is required before order mutation.")
-            if command.session_id != session_id:
+            if command.execution_session_id != session_id:
                 raise ValueError("Command execution session mismatch.")
             if command.command_sequence != self._last_sent_sequence + 1:
                 raise ValueError("Command sequence must be exactly monotonic.")
@@ -550,6 +551,31 @@ class PaperExecutionTransport:
                 raise RuntimeError("A command must be durably recorded before socket send.")
             if command.policy_hash != POLICY.configuration_hash or command.risk_profile_hash != RISK_PROFILE.configuration_hash or command.account_binding_hash != ACCOUNT_BINDING.binding_hash:
                 raise ValueError("Command authority hashes do not match the compiled paper authority.")
+            legacy = command.session_kind is PaperSessionKind.OFF_SESSION and command.session_id != UNSPECIFIED_OFF_SESSION_CONTEXT.session_id
+            if not legacy and (
+                (grant.session_kind, grant.session_id, grant.trade_date, grant.session_profile_hash, grant.session_generation)
+                != (command.session_kind, command.session_id, command.trade_date, command.session_profile_hash, command.session_generation)
+            ):
+                raise ValueError("Command and risk grant session identity mismatch.")
+            if command.action in {ExecutionAction.ENTER_LONG, ExecutionAction.ENTER_SHORT}:
+                if legacy:
+                    # Retained only for pre-regime in-process protocol fixtures;
+                    # the compiled AddOn independently rejects this shape.
+                    pass
+                else:
+                    context = context_from_identity(
+                        command.session_kind, command.session_id, command.trade_date,
+                        command.session_profile_hash, command.session_generation,
+                    )
+                    current = PaperSessionResolver().resolve(_now(), generation=command.session_generation)
+                    if (
+                        not current.entry_authorized or context.session_kind is PaperSessionKind.OFF_SESSION
+                        or current.context.session_kind is not context.session_kind
+                        or current.context.session_id != context.session_id
+                        or current.context.trade_date != context.trade_date
+                        or current.context.session_profile_hash != context.session_profile_hash
+                    ):
+                        raise ValueError("Entry command is outside its exact paper session window.")
         signed = command.with_signature(sign_payload(self._key or b"", command.unsigned_payload()))
         wire = {
             "schema": EXECUTION_SCHEMA,

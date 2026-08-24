@@ -1593,11 +1593,20 @@ def create_control_center_app(
         return lane_iii_paper_health()
 
     @app.get("/api/lane-iii/paper/audit")
-    async def api_lane_iii_paper_audit(limit: int = Query(100, ge=1, le=512)) -> dict[str, object]:
+    async def api_lane_iii_paper_audit(
+        limit: int = Query(100, ge=1, le=512),
+        session_kind: str | None = None,
+        trade_date: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, object]:
         ledger = ninjatrader_runtime.get("paper_ledger")
         if ledger is None:
             return {"mode": "PAPER_SIM101", "items": []}
-        return {"mode": "PAPER_SIM101", "items": ledger.recent(limit)}
+        return {
+            "mode": "PAPER_SIM101",
+            "filters": {"session_kind": session_kind, "trade_date": trade_date, "session_id": session_id},
+            "items": ledger.recent(limit, session_kind=session_kind, trade_date=trade_date, session_id=session_id),
+        }
 
     @app.post("/api/lane-iii/paper/arm")
     async def api_lane_iii_paper_arm() -> dict[str, object]:

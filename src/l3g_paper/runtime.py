@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import threading
@@ -18,21 +18,38 @@ from .contracts import (
     POLICY,
     RISK_PROFILE,
     ExecutionAction,
+    HypothesisKind,
     PaperDecision,
     PaperDecisionKind,
     PaperDirection,
     PaperExecutionCommand,
     PaperRuntimeState,
+    PaperSessionArmGrant,
     deterministic_id,
 )
 from .ledger import PaperLedger
 from .ninjatrader_transport import NinjaTraderSim101PaperAdapter, PaperExecutionTransport
 from .policy import ExperimentalPaperPolicy
 from .risk import PaperRiskAuthority, PaperRiskSnapshot
+from .sessions import (
+    PaperSessionContext,
+    PaperSessionKind,
+    PaperSessionResolver,
+    UNSPECIFIED_OFF_SESSION_CONTEXT,
+    context_from_identity,
+)
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+@dataclass
+class _TradeDateRisk:
+    realized_pnl: Decimal = Decimal("0")
+    unrealized_pnl: Decimal = Decimal("0")
+    entry_count: int = 0
+    consecutive_losses: int = 0
 
 
 class ObservationFanout:
@@ -120,6 +137,15 @@ class LaneIIIPaperRuntime:
         self._transport: PaperExecutionTransport | None = None
         self._adapter: NinjaTraderSim101PaperAdapter | None = None
         self._snapshot = PaperRiskSnapshot(_now())
+        self._session_resolver = PaperSessionResolver()
+        self._session_context = UNSPECIFIED_OFF_SESSION_CONTEXT
+        self._session_generation = 0
+        self._armed_session: PaperSessionArmGrant | None = None
+        self._session_closed_ids: set[tuple[str, int]] = set()
+        self._trade_date_risk: dict[str, _TradeDateRisk] = {}
+        self._session_pnl: dict[str, Decimal] = {}
+        self._entry_session_context: PaperSessionContext | None = None
+        self._hard_flat_started_for: tuple[str, int] | None = None
         self._last_decision: PaperDecision | None = None
         self._last_command: PaperExecutionCommand | None = None
         self._last_order_state: Mapping[str, object] | None = None
@@ -139,6 +165,92 @@ class LaneIIIPaperRuntime:
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
         self._transitions = 0
+
+    @staticmethod
+    def _market_event_timestamp(observation: NinjaTraderObservation) -> str:
+        return observation.exchange_timestamp or observation.provider_timestamp or observation.ninja_receipt_time
+
+    @staticmethod
+    def _context_payload(context: PaperSessionContext) -> dict[str, object]:
+        return context.payload()
+
+    def _set_session_context(self, context: PaperSessionContext, *, reason: str) -> None:
+        prior = self._session_context
+        if (prior.session_id, prior.session_generation) == (context.session_id, context.session_generation):
+            return
+        if prior.session_kind is not PaperSessionKind.OFF_SESSION:
+            self._close_session(prior, reason)
+        self._session_context = context
+        self.ledger.set_session_context(context)
+        if context.session_kind is not PaperSessionKind.OFF_SESSION:
+            trade_risk = self._trade_date_risk.setdefault(context.trade_date, _TradeDateRisk())
+            self._snapshot = replace(
+                self._snapshot, observed_at=_now(), session_kind=context.session_kind,
+                session_id=context.session_id, trade_date=context.trade_date,
+                session_profile_hash=context.session_profile_hash, session_generation=context.session_generation,
+                session_entry_count=0, daily_realized_pnl=trade_risk.realized_pnl,
+                daily_unrealized_pnl=trade_risk.unrealized_pnl,
+                trade_date_entry_count=trade_risk.entry_count, consecutive_losses=trade_risk.consecutive_losses,
+                evidence_warmed=False, depth_reset_recovery=True,
+            )
+            self.ledger.append("SESSION_OPENED", {**context.payload(), "reason": reason}, identity="l3g-paper-session-open-" + canonical_hash(context.payload()))
+        else:
+            self._snapshot = replace(
+                self._snapshot, observed_at=_now(), session_kind=context.session_kind,
+                session_id=context.session_id, trade_date=context.trade_date,
+                session_profile_hash=context.session_profile_hash, session_generation=context.session_generation,
+                session_entry_count=0, evidence_warmed=False, depth_reset_recovery=True,
+            )
+
+    def _close_session(self, context: PaperSessionContext, reason: str) -> None:
+        marker = (context.session_id, context.session_generation)
+        if marker in self._session_closed_ids:
+            return
+        self._session_closed_ids.add(marker)
+        self._armed_session = None
+        self._entries_paused = True
+        self.ledger.append(
+            "SESSION_CLOSED", {
+                **context.payload(), "reason": reason,
+                "session_realized_pnl": str(self._session_pnl.get(context.session_id, Decimal("0"))),
+                "position": self._position.value, "working_owned_orders": self._snapshot.working_owned_orders,
+            }, identity="l3g-paper-session-close-" + canonical_hash({**context.payload(), "reason": reason}),
+        )
+        self.policy.reset("SESSION_CLOSED")
+        if self._position is not PaperDirection.FLAT or self._snapshot.working_owned_orders:
+            self._disarm_after_flat = True
+            self._request_exit("SESSION_BOUNDARY_FLATTEN", emergency=True)
+
+    def _resolve_observation_session(self, observation: NinjaTraderObservation) -> tuple[PaperSessionContext, str | None]:
+        resolution = self._session_resolver.resolve(self._market_event_timestamp(observation), generation=self._session_generation)
+        context = resolution.context
+        if context.session_kind is not PaperSessionKind.OFF_SESSION and (
+            context.session_id != self._session_context.session_id or context.session_kind != self._session_context.session_kind
+        ):
+            self._session_generation += 1
+            # A repeat at the same instant is allowed; resolver monotonicity
+            # protects only backward event time.
+            context = self._session_resolver.resolve(
+                self._market_event_timestamp(observation), generation=self._session_generation,
+            ).context
+        elif context.session_kind is PaperSessionKind.OFF_SESSION:
+            context = self._session_resolver.resolve(
+                self._market_event_timestamp(observation), generation=self._session_generation,
+            ).context
+        self._set_session_context(context, reason=resolution.reason_code or "MARKET_EVENT_SESSION")
+        return context, resolution.reason_code
+
+    def _enforce_session_boundary(self) -> None:
+        context = self._session_context
+        if context.session_kind is PaperSessionKind.OFF_SESSION:
+            return
+        moment = datetime.now(timezone.utc)
+        if context.hard_flat_due_at(moment) and self._hard_flat_started_for != (context.session_id, context.session_generation):
+            self._hard_flat_started_for = (context.session_id, context.session_generation)
+            self._armed_session = None
+            self._entries_paused = True
+            self.ledger.append("RISK_EVENT_HARD_FLAT", {**context.payload(), "reason": "HARD_FLAT_DEADLINE"})
+            self.flatten_and_disarm()
 
     def bind_transport(self, transport: PaperExecutionTransport) -> None:
         if type(transport) is not PaperExecutionTransport:
@@ -193,6 +305,8 @@ class LaneIIIPaperRuntime:
 
     def _heartbeat_loop(self) -> None:
         while not self._heartbeat_stop.wait(1.0):
+            with self._lock:
+                self._enforce_session_boundary()
             with self._lock:
                 transport = self._transport
                 armed = self._state in {
@@ -256,14 +370,35 @@ class LaneIIIPaperRuntime:
 
     def ingest(self, observation: NinjaTraderObservation) -> None:
         with self._lock:
+            context, session_reason = self._resolve_observation_session(observation)
+            raw_payload = {
+                **context.payload(),
+                "observation_id": observation.observation_id,
+                "observation_type": observation.observation_type,
+                "observed_at": self._market_event_timestamp(observation),
+                "ninja_receipt_time": observation.ninja_receipt_time,
+                "provider_timestamp": observation.provider_timestamp,
+                "exchange_timestamp": observation.exchange_timestamp,
+                "local_monotonic_sequence": observation.local_monotonic_sequence,
+                "source_payload_hash": canonical_hash(dict(observation.payload)),
+            }
+            self.ledger.append_deferred(
+                "OBSERVATION_ENVELOPE", raw_payload,
+                identity="l3g-paper-observation-" + canonical_hash(raw_payload),
+                occurred_at=observation.ninja_receipt_time,
+            )
             before_classified = self.policy.classified_trade_count() if observation.observation_type == "TRADE" else 0
-            decision = self.policy.ingest_runtime(observation, current_position=self._position, pending_order=self._state in {PaperRuntimeState.ENTRY_PENDING, PaperRuntimeState.EXIT_PENDING})
+            decision = self.policy.ingest_runtime(
+                observation, current_position=self._position,
+                pending_order=self._state in {PaperRuntimeState.ENTRY_PENDING, PaperRuntimeState.EXIT_PENDING},
+                session_context=context,
+            )
             after_classified, warmed, depth_recovering = self.policy.runtime_gate_state()
             # Paper freshness follows the declared local callback authority.
             # Provider timestamps remain source provenance but independent
             # market-data streams do not form one provider-ordered clock.
-            event_at = observation.ninja_receipt_time
-            update: dict[str, object] = {"observed_at": normalized_utc(observation.ninja_receipt_time, "Runtime observation time")}
+            event_at = self._market_event_timestamp(observation)
+            update: dict[str, object] = {"observed_at": normalized_utc(event_at, "Runtime observation time")}
             if observation.observation_type == "QUOTE" and self._valid_quote(observation):
                 bid, ask = Decimal(str(observation.payload["bid"])), Decimal(str(observation.payload["ask"]))
                 self._last_quote = (bid, ask, event_at)
@@ -300,6 +435,10 @@ class LaneIIIPaperRuntime:
                 decision.decision in {PaperDecisionKind.LONG, PaperDecisionKind.SHORT}
                 and self._state is PaperRuntimeState.ARMED_FLAT
                 and not self._entries_paused
+                and self._armed_session is not None
+                and self._armed_session.valid_at(_now())
+                and self._armed_session.session_id == context.session_id
+                and context.entry_permitted_at(datetime.fromisoformat(normalized_utc(event_at, "Entry event time").replace("Z", "+00:00")))
             ) or (
                 decision.decision is PaperDecisionKind.EXIT
                 and self._position is not PaperDirection.FLAT
@@ -320,7 +459,12 @@ class LaneIIIPaperRuntime:
                 if self._position is not PaperDirection.FLAT:
                     self._request_exit(decision.reason_code)
                 return
-            if self._state is PaperRuntimeState.ARMED_FLAT and not self._entries_paused:
+            if (
+                self._state is PaperRuntimeState.ARMED_FLAT and not self._entries_paused
+                and self._armed_session is not None and self._armed_session.valid_at(_now())
+                and self._armed_session.session_id == context.session_id
+                and context.entry_permitted_at(datetime.fromisoformat(normalized_utc(event_at, "Entry event time").replace("Z", "+00:00")))
+            ):
                 self._request_entry(decision)
 
     @staticmethod
@@ -348,7 +492,7 @@ class LaneIIIPaperRuntime:
         elif pnl <= -RISK_PROFILE.daily_loss_limit_dollars:
             self.risk.lock_out("DAILY_LOSS_LIMIT")
             self._request_exit("DAILY_LOSS_LIMIT", emergency=True)
-        elif self.risk.hard_flat_due(at):
+        elif self._session_context.hard_flat_due_at(datetime.fromisoformat(normalized_utc(at, "Risk exit time").replace("Z", "+00:00"))):
             self._request_exit("HARD_FLAT_DEADLINE")
         elif self.risk.maximum_age_due(self._snapshot, at):
             self._request_exit("MAXIMUM_POSITION_AGE")
@@ -391,10 +535,11 @@ class LaneIIIPaperRuntime:
             return
         if self._last_decision is None:
             decision_id = "l3g-pd-safety-" + canonical_hash({"reason": reason, "at": _now()})[:24]
-            created_at = _now()
         else:
             decision_id = self._last_decision.paper_decision_id
-            created_at = self._last_decision.created_at
+        # Safety authority must be fresh even when the directional decision
+        # which prompted it is older than the five-second intent TTL.
+        created_at = _now()
         # Safety exits use a directional decision provenance but remain an
         # independently risk-evaluated flat intent.
         pseudo = PaperDecision(
@@ -403,6 +548,9 @@ class LaneIIIPaperRuntime:
             (datetime.fromisoformat(normalized_utc(created_at, "Exit decision time").replace("Z", "+00:00")) + timedelta(seconds=5)).isoformat().replace("+00:00", "Z"),
             None, PaperDirection.FLAT, Decimal("1"), {"risk_exit": reason}, (decision_id,), (max(0, self.policy.status().get("last_local_sequence") or 0),), (canonical_hash({"reason": reason}),),
             POLICY.sequence_authority, POLICY.book_completeness, False, reason,
+            self._session_context.session_kind, self._session_context.session_id,
+            self._session_context.trade_date, self._session_context.session_profile_hash,
+            self._session_context.session_generation,
         )
         self.ledger.append("DECISION", pseudo.payload(), identity=pseudo.paper_decision_id, occurred_at=pseudo.created_at, execution_session_id=self._execution_session_id())
         bid, ask, last = self._references()
@@ -421,15 +569,21 @@ class LaneIIIPaperRuntime:
         self._transition(PaperRuntimeState.EXIT_PENDING, reason)
 
     def _make_command(self, intent_id: str, decision_id: str, grant_id: str, action: ExecutionAction, expected: PaperDirection, reason: str) -> PaperExecutionCommand:
-        session = self._execution_session_id()
-        if session is None:
+        execution_session = self._execution_session_id()
+        if execution_session is None:
             raise RuntimeError("No authenticated execution session is available.")
+        context = self._session_context
         self._command_sequence += 1
         created = _now()
         quantity = 0 if action in {ExecutionAction.HEARTBEAT, ExecutionAction.RECONCILE, ExecutionAction.CANCEL_OWNED_ORDERS} else 1
         payload = {
             "command_sequence": self._command_sequence,
-            "session_id": session,
+            "session_id": context.session_id,
+            "session_kind": context.session_kind,
+            "trade_date": context.trade_date,
+            "session_profile_hash": context.session_profile_hash,
+            "session_generation": context.session_generation,
+            "execution_session_id": execution_session,
             "intent_id": intent_id,
             "decision_id": decision_id,
             "action": action.value,
@@ -449,7 +603,7 @@ class LaneIIIPaperRuntime:
         return PaperExecutionCommand(deterministic_id("l3g-pc-", payload), **payload)
 
     def _persist_and_send(self, command: PaperExecutionCommand, grant: object) -> None:
-        self.ledger.append("COMMAND", command.payload(), identity=command.command_id, occurred_at=command.created_at, execution_session_id=command.session_id)
+        self.ledger.append("COMMAND", command.payload(), identity=command.command_id, occurred_at=command.created_at, execution_session_id=command.execution_session_id)
         adapter = self._adapter
         if adapter is None:
             raise RuntimeError("Sim101 paper adapter is unavailable.")
@@ -557,12 +711,20 @@ class LaneIIIPaperRuntime:
             self._entry_fill_price = price
             self._entry_fill_quantity = quantity
             self._entry_direction = expected
+            entry_context = context_from_identity(
+                intent.session_kind, intent.session_id, intent.trade_date,
+                intent.session_profile_hash, intent.session_generation,
+            )
+            self._entry_session_context = entry_context
+            trade_risk = self._trade_date_risk.setdefault(entry_context.trade_date, _TradeDateRisk())
+            trade_risk.entry_count += 1
             self._snapshot = replace(
                 self._snapshot, observed_at=_now(), current_position=expected,
                 current_position_quantity=quantity,
                 position_opened_at=str(message.get("timestamp", _now())),
                 protective_stop_state="PENDING",
                 session_entry_count=self._snapshot.session_entry_count + 1,
+                trade_date_entry_count=trade_risk.entry_count,
             )
             if self._state is PaperRuntimeState.ENTRY_PENDING:
                 self._transition(PaperRuntimeState.LONG if expected is PaperDirection.LONG else PaperRuntimeState.SHORT, "ENTRY_FILL_CONFIRMED")
@@ -574,11 +736,16 @@ class LaneIIIPaperRuntime:
             if self._entry_fill_price is not None and self._entry_fill_quantity > 0:
                 points = price - self._entry_fill_price if self._entry_direction is PaperDirection.LONG else self._entry_fill_price - price
                 realized = points * Decimal("2") * self._entry_fill_quantity
-            daily = self._snapshot.daily_realized_pnl + realized
-            losses = self._snapshot.consecutive_losses + 1 if realized < 0 else 0 if realized > 0 else self._snapshot.consecutive_losses
+            entry_context = self._entry_session_context or self._session_context
+            trade_risk = self._trade_date_risk.setdefault(entry_context.trade_date, _TradeDateRisk())
+            trade_risk.realized_pnl += realized
+            trade_risk.consecutive_losses = trade_risk.consecutive_losses + 1 if realized < 0 else 0 if realized > 0 else trade_risk.consecutive_losses
+            self._session_pnl[entry_context.session_id] = self._session_pnl.get(entry_context.session_id, Decimal("0")) + realized
             self._snapshot = replace(
-                self._snapshot, observed_at=_now(), daily_realized_pnl=daily,
-                consecutive_losses=losses,
+                self._snapshot, observed_at=_now(), daily_realized_pnl=trade_risk.realized_pnl,
+                daily_unrealized_pnl=trade_risk.unrealized_pnl,
+                trade_date_entry_count=trade_risk.entry_count,
+                consecutive_losses=trade_risk.consecutive_losses,
             )
 
     def _apply_position(self, message: Mapping[str, object]) -> None:
@@ -599,6 +766,7 @@ class LaneIIIPaperRuntime:
             self._entry_fill_price = None
             self._entry_fill_quantity = 0
             self._entry_direction = PaperDirection.FLAT
+            self._entry_session_context = None
             target = PaperRuntimeState.READY_DISARMED if self._disarm_after_flat else PaperRuntimeState.PAUSED if self._entries_paused else PaperRuntimeState.ARMED_FLAT
             self._transition(target, "FLAT_POSITION_CONFIRMED")
             self._disarm_after_flat = False
@@ -607,13 +775,28 @@ class LaneIIIPaperRuntime:
         with self._lock:
             if self._state is not PaperRuntimeState.READY_DISARMED:
                 return {"armed": False, "reason_codes": ("STATE_NOT_READY_DISARMED",), "state": self._state.value}
-            allowed, reasons = self.risk.preflight(self._snapshot, at=_now())
-            self.ledger.append("RISK_EVENT_ARM_ATTEMPT", {"allowed": allowed, "reason_codes": reasons, "authority_hash": canonical_hash(AUTHORITY.authority_payload())})
+            context = self._session_context
+            now = _now()
+            current = PaperSessionResolver().resolve(now, generation=context.session_generation)
+            if context.session_kind is PaperSessionKind.OFF_SESSION or current.context.session_id != context.session_id:
+                reasons = ("NO_CURRENT_EVENT_SESSION",)
+                self.ledger.append("RISK_EVENT_ARM_ATTEMPT", {**context.payload(), "allowed": False, "reason_codes": reasons, "authority_hash": canonical_hash(AUTHORITY.authority_payload())})
+                return {"armed": False, "reason_codes": reasons, "state": self._state.value}
+            allowed, reasons = self.risk.preflight(self._snapshot, at=now)
+            self.ledger.append("RISK_EVENT_ARM_ATTEMPT", {**context.payload(), "allowed": allowed, "reason_codes": reasons, "authority_hash": canonical_hash(AUTHORITY.authority_payload())})
             if not allowed:
                 return {"armed": False, "reason_codes": reasons, "state": self._state.value}
+            self._armed_session = PaperSessionArmGrant(
+                context.session_kind, context.session_id, context.trade_date, context.session_profile_hash,
+                context.session_generation, now,
+                context.boundary_at("entry_cutoff").isoformat().replace("+00:00", "Z"),
+            )
             self._entries_paused = False
             self._transition(PaperRuntimeState.ARMED_FLAT, "OPERATOR_ARM_AFTER_PREFLIGHT")
-            return {"armed": True, "reason_codes": ("PAPER_ARMED",), "state": self._state.value}
+            return {
+                "armed": True, "reason_codes": ("PAPER_ARMED",), "state": self._state.value,
+                "session_armed_state": "ARMED_" + context.session_kind.value, "arm_grant": self._armed_session.payload(),
+            }
 
     def pause_entries(self) -> dict[str, object]:
         with self._lock:
@@ -628,6 +811,8 @@ class LaneIIIPaperRuntime:
         with self._lock:
             if not self._entries_paused or self._state is not PaperRuntimeState.PAUSED:
                 return {"resumed": False, "state": self._state.value, "reason": "NOT_PAUSED"}
+            if self._armed_session is None or not self._armed_session.valid_at(_now()):
+                return {"resumed": False, "state": self._state.value, "reason": "SESSION_ARM_EXPIRED"}
             self._entries_paused = False
             target = PaperRuntimeState.ARMED_FLAT if self._position is PaperDirection.FLAT else PaperRuntimeState.LONG if self._position is PaperDirection.LONG else PaperRuntimeState.SHORT
             self._transition(target, "OPERATOR_RESUME_ENTRIES")
@@ -636,6 +821,7 @@ class LaneIIIPaperRuntime:
     def flatten_and_disarm(self) -> dict[str, object]:
         with self._lock:
             self._entries_paused = True
+            self._armed_session = None
             self._disarm_after_flat = True
             self.ledger.append("RISK_EVENT_FLATTEN_AND_DISARM", {"position": self._position.value, "state": self._state.value})
             if self._position is PaperDirection.FLAT and (self._state is PaperRuntimeState.ENTRY_PENDING or self._snapshot.working_owned_orders > 0):
@@ -659,6 +845,9 @@ class LaneIIIPaperRuntime:
             ("pending-order-safety-control",), (max(0, self.policy.status().get("last_local_sequence") or 0),),
             (canonical_hash({"reason": "CANCEL_PENDING_AND_DISARM"}),), POLICY.sequence_authority,
             POLICY.book_completeness, False, "CANCEL_PENDING_AND_DISARM",
+            self._session_context.session_kind, self._session_context.session_id,
+            self._session_context.trade_date, self._session_context.session_profile_hash,
+            self._session_context.session_generation,
         )
         self.ledger.append("DECISION", decision.payload(), identity=decision.paper_decision_id, occurred_at=decision.created_at, execution_session_id=self._execution_session_id())
         bid, ask, last = self._references()
@@ -699,6 +888,11 @@ class LaneIIIPaperRuntime:
             policy = self.policy.status()
             risk = self.risk.status()
             transport = None if self._transport is None else self._transport.status().as_dict()
+            context = self._session_context
+            trade_risk = self._trade_date_risk.get(context.trade_date, _TradeDateRisk())
+            arm_valid = self._armed_session is not None and self._armed_session.valid_at(_now())
+            loss_remaining = max(Decimal("0"), RISK_PROFILE.daily_loss_limit_dollars + min(Decimal("0"), trade_risk.realized_pnl + trade_risk.unrealized_pnl))
+            next_context = PaperSessionResolver().next_valid_session(_now(), generation=context.session_generation)
             return {
                 "schema": "lane-iii-phase-g-paper-runtime-status-v1",
                 "mode": "PAPER_SIM101",
@@ -724,6 +918,32 @@ class LaneIIIPaperRuntime:
                 "daily_unrealized_pnl": str(self._snapshot.daily_unrealized_pnl),
                 "session_entries": self._snapshot.session_entry_count,
                 "consecutive_losses": self._snapshot.consecutive_losses,
+                "current_session": context.session_kind.value,
+                "current_session_id": context.session_id,
+                "trade_date": context.trade_date,
+                "session_generation": context.session_generation,
+                "session_state": context.calendar_state.value,
+                "entry_window": f"{context.entry_start}-{context.entry_cutoff} {context.timezone}",
+                "entry_cutoff": context.entry_cutoff,
+                "hard_flat_deadline": context.hard_flat_deadline,
+                "session_armed_state": "ARMED_" + context.session_kind.value if arm_valid else "DISARMED",
+                "session_arm_grant": None if self._armed_session is None else self._armed_session.payload(),
+                "next_valid_session": None if next_context is None else {
+                    "session_kind": next_context.session_kind.value,
+                    "session_id": next_context.session_id,
+                    "trade_date": next_context.trade_date,
+                },
+                "session_evidence_warmup": bool(self._snapshot.evidence_warmed),
+                "session_support_scores": {
+                    "bullish": str(self.policy.score(_now(), HypothesisKind.BULLISH_REVERSAL)[0]),
+                    "bearish": str(self.policy.score(_now(), HypothesisKind.BEARISH_CONTINUATION)[0]),
+                },
+                "session_pnl": str(self._session_pnl.get(context.session_id, Decimal("0"))),
+                "asia_session_pnl": str(sum(value for key, value in self._session_pnl.items() if ":ASIA_GLOBEX:" in key and key.endswith(context.trade_date))),
+                "new_york_session_pnl": str(sum(value for key, value in self._session_pnl.items() if ":NEW_YORK_RTH:" in key and key.endswith(context.trade_date))),
+                "combined_trade_date_pnl": str(trade_risk.realized_pnl + trade_risk.unrealized_pnl),
+                "combined_trade_date_loss_allowance_remaining": str(loss_remaining),
+                "trade_date_entry_count": trade_risk.entry_count,
                 "last_paper_decision": None if self._last_decision is None else self._last_decision.payload(),
                 "last_risk_result": risk.get("last_risk_result"),
                 "last_command": None if self._last_command is None else self._last_command.payload(),

@@ -34,6 +34,12 @@ from .contracts import (
     expires_at,
 )
 from .time_rules import america_new_york
+from .sessions import (
+    PaperSessionContext,
+    PaperSessionKind,
+    PaperSessionResolver,
+    UNSPECIFIED_OFF_SESSION_CONTEXT,
+)
 
 
 @dataclass(frozen=True)
@@ -45,6 +51,7 @@ class ClassifiedTrade:
     price: Decimal
     size: int
     side: str | None
+    session_id: str
 
 
 @dataclass(frozen=True)
@@ -55,6 +62,7 @@ class QuoteContext:
     observed_at: str
     bid: Decimal
     ask: Decimal
+    session_id: str
 
 
 @dataclass(frozen=True)
@@ -71,6 +79,7 @@ class DepthMutation:
     prior_volume: int | None
     is_reduction: bool
     is_increase: bool
+    session_id: str
 
 
 class ExperimentalPaperPolicy:
@@ -83,6 +92,8 @@ class ExperimentalPaperPolicy:
         self._policy_hash = artifact.configuration_hash
         self._lock = threading.RLock()
         self._market_session_id: str | None = None
+        self._paper_session_context = UNSPECIFIED_OFF_SESSION_CONTEXT
+        self._session_resolver = PaperSessionResolver()
         self._last_local_sequence: int | None = None
         self._last_receipt_time: datetime | None = None
         self._transport_state = StreamHealth.UNKNOWN
@@ -166,6 +177,22 @@ class ExperimentalPaperPolicy:
             self._clear_provisional()
             self._suppress(reason)
 
+    @property
+    def session_context(self) -> PaperSessionContext:
+        with self._lock:
+            return self._paper_session_context
+
+    def _activate_session(self, context: PaperSessionContext) -> bool:
+        prior = self._paper_session_context
+        changed = (prior.session_id, prior.session_generation) != (context.session_id, context.session_generation)
+        if changed:
+            if prior.session_id != UNSPECIFIED_OFF_SESSION_CONTEXT.session_id:
+                self._clear_provisional()
+            self._used_hypothesis_instances.clear()
+            self._last_flat_confirmation = None
+            self._paper_session_context = context
+        return changed
+
     def on_transport_state(self, state: StreamHealth) -> None:
         if type(state) is not StreamHealth:
             raise ValueError("Paper transport state must be explicit.")
@@ -187,6 +214,8 @@ class ExperimentalPaperPolicy:
         if type(decision) is not PaperDecision or decision.decision not in {PaperDecisionKind.LONG, PaperDecisionKind.SHORT}:
             raise ValueError("Only an exact entry decision may be marked used.")
         with self._lock:
+            if (decision.session_id, decision.session_generation) != (self._paper_session_context.session_id, self._paper_session_context.session_generation):
+                raise ValueError("Paper hypothesis cannot cross a session boundary.")
             self._used_hypothesis_instances.add(self._hypothesis_instance(decision))
 
     def confirm_flat(self, at: str) -> None:
@@ -224,23 +253,24 @@ class ExperimentalPaperPolicy:
         # Ninja receipt time is created under the same queue lock as the local
         # sequence, so it safely bounds provisional windows without being
         # mislabeled as a provider timestamp.
-        return self._time(observation.ninja_receipt_time, "NinjaTrader receipt time")
+        return self._time(self._market_event_timestamp(observation), "Paper market event time")
+
+    @staticmethod
+    def _market_event_timestamp(observation: NinjaTraderObservation) -> str:
+        return observation.exchange_timestamp or observation.provider_timestamp or observation.ninja_receipt_time
 
     def _validate_time(self, observation: NinjaTraderObservation) -> str | None:
-        receipt_time = self._time(observation.ninja_receipt_time, "NinjaTrader receipt time")
+        receipt_time = self._time(self._market_event_timestamp(observation), "Paper market event time")
         if self._last_receipt_time is not None and receipt_time < self._last_receipt_time:
             self._clear_provisional()
             return "TIMESTAMP_MOVED_BACKWARD"
         if observation.provider_timestamp is not None:
             provider_time = self._time(observation.provider_timestamp, "Provider event time")
-            if provider_time > receipt_time + timedelta(seconds=1):
+            receipt = self._time(observation.ninja_receipt_time, "NinjaTrader receipt time")
+            if provider_time > receipt + timedelta(seconds=1):
                 self._clear_provisional()
                 return "FUTURE_EVENT_TIMESTAMP"
-            # Provider timestamps from independent quote/trade/depth streams
-            # are not a global sequence and may legitimately cross.  Detect a
-            # genuinely stale callback against its own queue-locked receipt
-            # instead of comparing it with a different stream's timestamp.
-            if receipt_time - provider_time > timedelta(seconds=self.artifact.hypothesis_idle_lifetime_seconds):
+            if receipt - provider_time > timedelta(seconds=self.artifact.hypothesis_idle_lifetime_seconds):
                 self._clear_provisional()
                 return "STALE_EVENT_TIMESTAMP"
         self._last_receipt_time = receipt_time
@@ -252,12 +282,14 @@ class ExperimentalPaperPolicy:
         *,
         current_position: PaperDirection = PaperDirection.FLAT,
         pending_order: bool = False,
+        session_context: PaperSessionContext | None = None,
     ) -> PaperDecision:
         decision = self._ingest(
             observation,
             current_position=current_position,
             pending_order=pending_order,
             evaluate_passive=True,
+            session_context=session_context,
         )
         assert decision is not None
         return decision
@@ -268,6 +300,7 @@ class ExperimentalPaperPolicy:
         *,
         current_position: PaperDirection = PaperDirection.FLAT,
         pending_order: bool = False,
+        session_context: PaperSessionContext | None = None,
     ) -> PaperDecision | None:
         """Ingest every callback but evaluate only decision-relevant events."""
         return self._ingest(
@@ -275,6 +308,7 @@ class ExperimentalPaperPolicy:
             current_position=current_position,
             pending_order=pending_order,
             evaluate_passive=False,
+            session_context=session_context,
         )
 
     def _ingest(
@@ -284,13 +318,34 @@ class ExperimentalPaperPolicy:
         current_position: PaperDirection,
         pending_order: bool,
         evaluate_passive: bool,
+        session_context: PaperSessionContext | None,
     ) -> PaperDecision | None:
         if type(observation) is not NinjaTraderObservation:
             raise ValueError("Paper policy consumes exact admitted NinjaTrader observations.")
         with self._lock:
+            resolution = None if session_context is not None else self._session_resolver.resolve(
+                self._market_event_timestamp(observation), generation=self._paper_session_context.session_generation,
+            )
+            if resolution is not None and resolution.reason_code == "EVENT_TIMESTAMP_MOVED_BACKWARD":
+                if observation.observation_type in {"QUOTE", "TRADE", "DEPTH"}:
+                    time_fault = self._validate_time(observation)
+                    if time_fault is not None:
+                        return self._decision(observation, PaperDecisionKind.NO_TRADE, None, time_fault)
+                self._clear_provisional()
+                return self._decision(observation, PaperDecisionKind.NO_TRADE, None, "TIMESTAMP_MOVED_BACKWARD")
+            context = session_context or resolution.context  # type: ignore[union-attr]
+            self._activate_session(context)
             fault = self._continuity(observation)
             if fault is not None:
                 return self._decision(observation, PaperDecisionKind.NO_TRADE, None, fault)
+
+            if observation.observation_type in {"QUOTE", "TRADE", "DEPTH"}:
+                time_fault = self._validate_time(observation)
+                if time_fault is not None:
+                    return self._decision(observation, PaperDecisionKind.NO_TRADE, None, time_fault)
+
+            if context.session_kind is PaperSessionKind.OFF_SESSION:
+                return self._decision(observation, PaperDecisionKind.NO_TRADE, None, "OFF_SESSION")
 
             if observation.observation_type == "CONNECTION" and observation.payload.get("scope") == "MARKET_DATA":
                 state = str(observation.payload.get("price_status", "UNKNOWN")).upper()
@@ -307,9 +362,6 @@ class ExperimentalPaperPolicy:
             if not self._contract_matches(observation):
                 self._clear_provisional()
                 return self._decision(observation, PaperDecisionKind.NO_TRADE, None, "CONTRACT_MISMATCH")
-            time_fault = self._validate_time(observation)
-            if time_fault is not None:
-                return self._decision(observation, PaperDecisionKind.NO_TRADE, None, time_fault)
             evidence_before = len(self._evidence)
             if observation.observation_type == "QUOTE":
                 reason = self._ingest_quote(observation)
@@ -338,7 +390,10 @@ class ExperimentalPaperPolicy:
         if bid is None or ask is None or bid <= 0 or ask <= 0 or bid >= ask or type(bid_size) is not int or type(ask_size) is not int or bid_size <= 0 or ask_size <= 0:
             self._clear_provisional()
             return "INVALID_OR_CROSSED_QUOTE"
-        quote = QuoteContext(observation.observation_id, observation.local_monotonic_sequence, self._payload_hash(observation), observation.ninja_receipt_time, bid, ask)
+        quote = QuoteContext(
+            observation.observation_id, observation.local_monotonic_sequence, self._payload_hash(observation),
+            self._market_event_timestamp(observation), bid, ask, self._paper_session_context.session_id,
+        )
         self._quotes[quote.observation_id] = quote
         self._quote_order.append(quote.observation_id)
         while len(self._quotes) > self._quote_order.maxlen:
@@ -355,7 +410,7 @@ class ExperimentalPaperPolicy:
         if price is None or price <= 0 or type(size) is not int or size <= 0:
             self._clear_provisional()
             return "INVALID_TRADE"
-        observed_at = observation.ninja_receipt_time
+        observed_at = self._market_event_timestamp(observation)
         side: str | None = None
         quote_reference = observation.payload.get("derivation_quote_observation_id")
         quote = self._quotes.get(str(quote_reference)) if isinstance(quote_reference, str) else None
@@ -379,7 +434,10 @@ class ExperimentalPaperPolicy:
                 side = "BUY"
             elif price <= quote.bid:
                 side = "SELL"
-        trade = ClassifiedTrade(observation.observation_id, observation.local_monotonic_sequence, self._payload_hash(observation), observed_at, price, size, side)
+        trade = ClassifiedTrade(
+            observation.observation_id, observation.local_monotonic_sequence, self._payload_hash(observation),
+            observed_at, price, size, side, self._paper_session_context.session_id,
+        )
         self._trades.append(trade)
         self._counters["trades"] += 1
         if side is None:
@@ -404,12 +462,13 @@ class ExperimentalPaperPolicy:
         self._vwap_notional += trade.price * trade.size
         self._vwap_volume += trade.size
 
-    def _provenance(self, values: Iterable[ClassifiedTrade | DepthMutation]) -> tuple[tuple[str, ...], tuple[int, ...], tuple[str, ...]]:
+    def _provenance(self, values: Iterable[ClassifiedTrade | DepthMutation]) -> tuple[tuple[str, ...], tuple[int, ...], tuple[str, ...], tuple[str, ...]]:
         items = tuple(values)
         return (
             tuple(item.observation_id for item in items),
             tuple(item.local_sequence for item in items),
             tuple(item.payload_hash for item in items),
+            tuple(item.session_id for item in items),
         )
 
     def _put_evidence(
@@ -425,7 +484,9 @@ class ExperimentalPaperPolicy:
         *,
         blocking: bool = False,
     ) -> None:
-        ids, sequences, hashes = self._provenance(sources)
+        ids, sequences, hashes, source_sessions = self._provenance(sources)
+        if not source_sessions or set(source_sessions) != {self._paper_session_context.session_id}:
+            raise ValueError("CROSS_SESSION_SOURCE_SET")
         identity = {
             "policy_hash": self._policy_hash,
             "hypothesis": hypothesis.value,
@@ -437,11 +498,22 @@ class ExperimentalPaperPolicy:
             "sources": ids,
             "sequences": sequences,
             "hashes": hashes,
+            "session_kind": self._paper_session_context.session_kind.value,
+            "session_id": self._paper_session_context.session_id,
+            "trade_date": self._paper_session_context.trade_date,
+            "session_profile_hash": self._paper_session_context.session_profile_hash,
+            "session_generation": self._paper_session_context.session_generation,
         }
         evidence = PaperEvidence(
             deterministic_id("l3g-pe-", identity), hypothesis, family, label, strength, supports,
             normalized_utc(observed_at, "Evidence observed time"), expires_at(observed_at, lifetime_seconds),
             ids, sequences, hashes, blocking=blocking,
+            session_kind=self._paper_session_context.session_kind,
+            session_id=self._paper_session_context.session_id,
+            trade_date=self._paper_session_context.trade_date,
+            session_profile_hash=self._paper_session_context.session_profile_hash,
+            session_generation=self._paper_session_context.session_generation,
+            source_session_ids=source_sessions,
         )
         self._evidence[(hypothesis, family, label)] = evidence
         # A structural range claim is mutually exclusive for the two admitted
@@ -454,6 +526,12 @@ class ExperimentalPaperPolicy:
                 deterministic_id("l3g-pe-", contrary_identity), competitor, family, label, strength, False,
                 normalized_utc(observed_at, "Evidence observed time"), expires_at(observed_at, lifetime_seconds),
                 ids, sequences, hashes,
+                session_kind=self._paper_session_context.session_kind,
+                session_id=self._paper_session_context.session_id,
+                trade_date=self._paper_session_context.trade_date,
+                session_profile_hash=self._paper_session_context.session_profile_hash,
+                session_generation=self._paper_session_context.session_generation,
+                source_session_ids=source_sessions,
             )
             self._evidence[(competitor, family, "CONTRADICTS_" + label)] = contrary
 
@@ -531,7 +609,11 @@ class ExperimentalPaperPolicy:
             else:
                 self._bid_levels[price] = volume
         mutation_time = self._event_time(observation)
-        mutation = DepthMutation(observation.observation_id, observation.local_monotonic_sequence, self._payload_hash(observation), observation.ninja_receipt_time, mutation_time, side, operation, price, volume, prior, reduction, increase)
+        mutation = DepthMutation(
+            observation.observation_id, observation.local_monotonic_sequence, self._payload_hash(observation),
+            self._market_event_timestamp(observation), mutation_time, side, operation, price, volume,
+            prior, reduction, increase, self._paper_session_context.session_id,
+        )
         self._depth.append(mutation)
         price_history: deque[DepthMutation] | None = None
         if side == "BID":
@@ -558,7 +640,12 @@ class ExperimentalPaperPolicy:
         return None
 
     def _active_evidence(self, at: datetime, hypothesis: HypothesisKind) -> tuple[PaperEvidence, ...]:
-        active = tuple(value for value in self._evidence.values() if value.hypothesis_kind is hypothesis and self._time(value.expires_at) >= at)
+        active = tuple(
+            value for value in self._evidence.values()
+            if value.hypothesis_kind is hypothesis and self._time(value.expires_at) >= at
+            and value.session_id == self._paper_session_context.session_id
+            and value.session_generation == self._paper_session_context.session_generation
+        )
         return active
 
     def score(self, at: str, hypothesis: HypothesisKind) -> tuple[Decimal, dict[str, object]]:
@@ -631,7 +718,11 @@ class ExperimentalPaperPolicy:
         return tuple(item[0] for item in combined), tuple(item[1] for item in combined), tuple(item[2] for item in combined)
 
     def _hypothesis_instance(self, decision: PaperDecision) -> str:
-        return canonical_hash({"hypothesis": None if decision.hypothesis_kind is None else decision.hypothesis_kind.value, "sources": decision.source_observation_ids, "policy": decision.paper_policy_hash})
+        return canonical_hash({
+            "hypothesis": None if decision.hypothesis_kind is None else decision.hypothesis_kind.value,
+            "sources": decision.source_observation_ids, "policy": decision.paper_policy_hash,
+            "session_id": decision.session_id, "session_generation": decision.session_generation,
+        })
 
     def _decision(
         self,
@@ -643,7 +734,7 @@ class ExperimentalPaperPolicy:
         score: Decimal = Decimal("0.5"),
         family_summary: Mapping[str, object] | None = None,
     ) -> PaperDecision:
-        created = normalized_utc(observation.provider_timestamp or observation.ninja_receipt_time, "Paper decision time")
+        created = normalized_utc(self._market_event_timestamp(observation), "Paper decision time")
         at = self._time(created)
         source_ids, sequences, hashes = self._decision_sources(hypothesis, at, observation)
         direction = PaperDirection.LONG if kind is PaperDecisionKind.LONG else PaperDirection.SHORT if kind is PaperDecisionKind.SHORT else PaperDirection.FLAT
@@ -664,12 +755,20 @@ class ExperimentalPaperPolicy:
             "book_completeness": BookCompleteness.UNVERIFIED.value,
             "scientific_eligibility": False,
             "reason_code": reason,
+            "session_kind": self._paper_session_context.session_kind.value,
+            "session_id": self._paper_session_context.session_id,
+            "trade_date": self._paper_session_context.trade_date,
+            "session_profile_hash": self._paper_session_context.session_profile_hash,
+            "session_generation": self._paper_session_context.session_generation,
         }
         decision = PaperDecision(
             deterministic_id("l3g-pd-", payload), self.artifact.policy_id, self._policy_hash,
             kind, created, str(payload["expires_at"]), hypothesis, direction, score,
             dict(family_summary or {}), source_ids, sequences, hashes,
             SequenceAuthority.LOCAL_CALLBACK_ORDER_ONLY, BookCompleteness.UNVERIFIED, False, reason,
+            self._paper_session_context.session_kind, self._paper_session_context.session_id,
+            self._paper_session_context.trade_date, self._paper_session_context.session_profile_hash,
+            self._paper_session_context.session_generation,
         )
         self._last_decision = decision
         counter = {
@@ -690,7 +789,7 @@ class ExperimentalPaperPolicy:
         current_position: PaperDirection = PaperDirection.FLAT,
         pending_order: bool = False,
     ) -> PaperDecision:
-        at_text = normalized_utc(observation.ninja_receipt_time, "Paper evaluation time")
+        at_text = normalized_utc(self._market_event_timestamp(observation), "Paper evaluation time")
         at = self._time(at_text)
         if self._transport_state is not StreamHealth.HEALTHY:
             return self._decision(observation, PaperDecisionKind.NO_TRADE, None, "LOCAL_BRIDGE_UNHEALTHY")
@@ -763,6 +862,11 @@ class ExperimentalPaperPolicy:
                 "book_completeness": BookCompleteness.UNVERIFIED.value,
                 "scientific_eligibility": False,
                 "market_session_id": self._market_session_id,
+                "current_session": self._paper_session_context.session_kind.value,
+                "current_session_id": self._paper_session_context.session_id,
+                "trade_date": self._paper_session_context.trade_date,
+                "session_profile_hash": self._paper_session_context.session_profile_hash,
+                "session_generation": self._paper_session_context.session_generation,
                 "last_local_sequence": self._last_local_sequence,
                 "market_price_connected": self._price_connected,
                 "local_bridge": self._transport_state.value,

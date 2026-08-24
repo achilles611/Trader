@@ -16,6 +16,11 @@ from types import MappingProxyType
 from typing import Mapping, Protocol, runtime_checkable
 
 from src.lane_iii.contracts import canonical_hash, normalized_utc
+from .sessions import (
+    PaperSessionKind,
+    UNSPECIFIED_OFF_SESSION_CONTEXT,
+    context_from_identity,
+)
 
 
 PAPER_POLICY_SCHEMA = "lane-iii-phase-g-paper-policy-v1"
@@ -123,6 +128,16 @@ def _jsonable(value: object) -> object:
 
 def canonical_json(payload: Mapping[str, object]) -> bytes:
     return json.dumps(_jsonable(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+def _validate_session_identity(
+    session_kind: PaperSessionKind,
+    session_id: str,
+    trade_date: str,
+    session_profile_hash: str,
+    session_generation: int,
+) -> None:
+    context_from_identity(session_kind, session_id, trade_date, session_profile_hash, session_generation)
 
 
 @dataclass(frozen=True)
@@ -314,6 +329,12 @@ class PaperEvidence:
     book_completeness: BookCompleteness = BookCompleteness.UNVERIFIED
     scientific_eligibility: bool = False
     blocking: bool = False
+    session_kind: PaperSessionKind = UNSPECIFIED_OFF_SESSION_CONTEXT.session_kind
+    session_id: str = UNSPECIFIED_OFF_SESSION_CONTEXT.session_id
+    trade_date: str = UNSPECIFIED_OFF_SESSION_CONTEXT.trade_date
+    session_profile_hash: str = UNSPECIFIED_OFF_SESSION_CONTEXT.session_profile_hash
+    session_generation: int = UNSPECIFIED_OFF_SESSION_CONTEXT.session_generation
+    source_session_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _utc(self.observed_at, "Paper evidence time")
@@ -326,6 +347,11 @@ class PaperEvidence:
             raise ValueError("Paper evidence provenance arrays must be non-empty and aligned.")
         if self.scientific_eligibility or self.sequence_authority is not SequenceAuthority.LOCAL_CALLBACK_ORDER_ONLY or self.book_completeness is not BookCompleteness.UNVERIFIED:
             raise ValueError("Provisional paper evidence cannot be promoted to scientific truth.")
+        _validate_session_identity(self.session_kind, self.session_id, self.trade_date, self.session_profile_hash, self.session_generation)
+        source_sessions = self.source_session_ids or tuple(self.session_id for _ in self.source_observation_ids)
+        if len(source_sessions) != len(self.source_observation_ids) or set(source_sessions) != {self.session_id}:
+            raise ValueError("CROSS_SESSION_SOURCE_SET")
+        object.__setattr__(self, "source_session_ids", tuple(source_sessions))
 
     def payload(self) -> dict[str, object]:
         return _jsonable(asdict(self))  # type: ignore[return-value]
@@ -350,6 +376,11 @@ class PaperDecision:
     book_completeness: BookCompleteness
     scientific_eligibility: bool
     reason_code: str
+    session_kind: PaperSessionKind = UNSPECIFIED_OFF_SESSION_CONTEXT.session_kind
+    session_id: str = UNSPECIFIED_OFF_SESSION_CONTEXT.session_id
+    trade_date: str = UNSPECIFIED_OFF_SESSION_CONTEXT.trade_date
+    session_profile_hash: str = UNSPECIFIED_OFF_SESSION_CONTEXT.session_profile_hash
+    session_generation: int = UNSPECIFIED_OFF_SESSION_CONTEXT.session_generation
 
     def __post_init__(self) -> None:
         if not self.paper_decision_id.startswith("l3g-pd-"):
@@ -366,6 +397,7 @@ class PaperDecision:
             raise ValueError("Only bearish continuation may create a short paper decision.")
         if self.decision in {PaperDecisionKind.NO_TRADE, PaperDecisionKind.EXIT} and self.direction is not PaperDirection.FLAT:
             raise ValueError("NO_TRADE and EXIT have a flat target direction.")
+        _validate_session_identity(self.session_kind, self.session_id, self.trade_date, self.session_profile_hash, self.session_generation)
         object.__setattr__(self, "family_summary", MappingProxyType(dict(self.family_summary)))
 
     def payload(self) -> dict[str, object]:
@@ -387,6 +419,11 @@ class PaperExecutionIntent:
     reference_bid: Decimal | None
     reference_ask: Decimal | None
     reference_last: Decimal | None
+    session_kind: PaperSessionKind = UNSPECIFIED_OFF_SESSION_CONTEXT.session_kind
+    session_id: str = UNSPECIFIED_OFF_SESSION_CONTEXT.session_id
+    trade_date: str = UNSPECIFIED_OFF_SESSION_CONTEXT.trade_date
+    session_profile_hash: str = UNSPECIFIED_OFF_SESSION_CONTEXT.session_profile_hash
+    session_generation: int = UNSPECIFIED_OFF_SESSION_CONTEXT.session_generation
 
     def __post_init__(self) -> None:
         if not self.intent_id.startswith("l3g-pi-") or not self.paper_decision_id.startswith("l3g-pd-"):
@@ -397,6 +434,7 @@ class PaperExecutionIntent:
         _utc(self.expires_at, "Paper intent expiry")
         if self.target_position not in {PaperDirection.LONG, PaperDirection.SHORT, PaperDirection.FLAT}:
             raise ValueError("Unsupported target position.")
+        _validate_session_identity(self.session_kind, self.session_id, self.trade_date, self.session_profile_hash, self.session_generation)
 
     def payload(self) -> dict[str, object]:
         return _jsonable(asdict(self))  # type: ignore[return-value]
@@ -420,6 +458,11 @@ class PaperRiskGrant:
     consecutive_losses: int
     paper_only: bool = True
     approved_for_live: bool = False
+    session_kind: PaperSessionKind = UNSPECIFIED_OFF_SESSION_CONTEXT.session_kind
+    session_id: str = UNSPECIFIED_OFF_SESSION_CONTEXT.session_id
+    trade_date: str = UNSPECIFIED_OFF_SESSION_CONTEXT.trade_date
+    session_profile_hash: str = UNSPECIFIED_OFF_SESSION_CONTEXT.session_profile_hash
+    session_generation: int = UNSPECIFIED_OFF_SESSION_CONTEXT.session_generation
 
     def __post_init__(self) -> None:
         if not self.grant_id.startswith("l3g-pg-") or not self.intent_id.startswith("l3g-pi-"):
@@ -430,6 +473,7 @@ class PaperRiskGrant:
             raise ValueError("A risk grant must retain explicit paper-only reasons and authority.")
         if min(self.current_working_orders, self.session_entry_count, self.consecutive_losses) < 0:
             raise ValueError("Paper risk counters cannot be negative.")
+        _validate_session_identity(self.session_kind, self.session_id, self.trade_date, self.session_profile_hash, self.session_generation)
 
     def payload(self) -> dict[str, object]:
         return _jsonable(asdict(self))  # type: ignore[return-value]
@@ -438,6 +482,33 @@ class PaperRiskGrant:
         use_time = datetime.fromisoformat(_utc(at, "Grant use time").replace("Z", "+00:00"))
         expiry = datetime.fromisoformat(self.expires_at.replace("Z", "+00:00"))
         return self.granted and use_time <= expiry
+
+
+@dataclass(frozen=True)
+class PaperSessionArmGrant:
+    """An operator grant scoped to one exact market session, never a day."""
+
+    session_kind: PaperSessionKind
+    session_id: str
+    trade_date: str
+    session_profile_hash: str
+    session_generation: int
+    granted_at: str
+    expires_at: str
+
+    def __post_init__(self) -> None:
+        _validate_session_identity(self.session_kind, self.session_id, self.trade_date, self.session_profile_hash, self.session_generation)
+        _utc(self.granted_at, "Paper session arm grant time")
+        _utc(self.expires_at, "Paper session arm grant expiry")
+        if self.session_kind is PaperSessionKind.OFF_SESSION:
+            raise ValueError("OFF_SESSION cannot be armed.")
+
+    def valid_at(self, at: str) -> bool:
+        moment = datetime.fromisoformat(_utc(at, "Paper session arm use time").replace("Z", "+00:00"))
+        return moment < datetime.fromisoformat(self.expires_at.replace("Z", "+00:00"))
+
+    def payload(self) -> dict[str, object]:
+        return _jsonable(asdict(self))  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -461,6 +532,11 @@ class PaperExecutionCommand:
     reason_code: str
     risk_grant_id: str
     signature: str = ""
+    session_kind: PaperSessionKind = UNSPECIFIED_OFF_SESSION_CONTEXT.session_kind
+    trade_date: str = UNSPECIFIED_OFF_SESSION_CONTEXT.trade_date
+    session_profile_hash: str = UNSPECIFIED_OFF_SESSION_CONTEXT.session_profile_hash
+    session_generation: int = UNSPECIFIED_OFF_SESSION_CONTEXT.session_generation
+    execution_session_id: str = ""
 
     def __post_init__(self) -> None:
         if not self.command_id.startswith("l3g-pc-") or type(self.command_sequence) is not int or self.command_sequence <= 0:
@@ -487,6 +563,21 @@ class PaperExecutionCommand:
             raise ValueError("Paper command authority hashes and reason are required.")
         _utc(self.created_at, "Paper command time")
         _utc(self.expires_at, "Paper command expiry")
+        # Version-G commands called session_id the authenticated bridge
+        # session.  A legacy object is harmless (the compiled AddOn refuses
+        # its OFF_SESSION context); retain construction compatibility while
+        # all runtime-created commands use a fully qualified market session.
+        legacy_execution_session = (
+            self.session_kind is PaperSessionKind.OFF_SESSION
+            and self.session_id != UNSPECIFIED_OFF_SESSION_CONTEXT.session_id
+            and (not self.execution_session_id or self.execution_session_id == self.session_id)
+        )
+        if legacy_execution_session:
+            object.__setattr__(self, "execution_session_id", self.session_id)
+        else:
+            _validate_session_identity(self.session_kind, self.session_id, self.trade_date, self.session_profile_hash, self.session_generation)
+        if not self.execution_session_id:
+            object.__setattr__(self, "execution_session_id", self.session_id)
 
     def unsigned_payload(self) -> dict[str, object]:
         result = asdict(self)

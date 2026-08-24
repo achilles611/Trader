@@ -24,6 +24,13 @@ from .contracts import (
     expires_at,
 )
 from .time_rules import america_new_york
+from .sessions import (
+    PaperCalendarState,
+    PaperSessionKind,
+    PaperSessionResolver,
+    UNSPECIFIED_OFF_SESSION_CONTEXT,
+    context_from_identity,
+)
 
 
 @dataclass(frozen=True)
@@ -65,15 +72,22 @@ class PaperRiskSnapshot:
     unresolved_execution: bool = False
     locked_out: bool = False
     lockout_reason: str | None = None
+    session_kind: PaperSessionKind = UNSPECIFIED_OFF_SESSION_CONTEXT.session_kind
+    session_id: str = UNSPECIFIED_OFF_SESSION_CONTEXT.session_id
+    trade_date: str = UNSPECIFIED_OFF_SESSION_CONTEXT.trade_date
+    session_profile_hash: str = UNSPECIFIED_OFF_SESSION_CONTEXT.session_profile_hash
+    session_generation: int = UNSPECIFIED_OFF_SESSION_CONTEXT.session_generation
+    trade_date_entry_count: int = 0
 
     def __post_init__(self) -> None:
         normalized_utc(self.observed_at, "Paper risk snapshot time")
-        for value in (self.account_match_count, self.instrument_match_count, self.current_position_quantity, self.working_owned_orders, self.working_entry_orders, self.session_entry_count, self.consecutive_losses):
+        for value in (self.account_match_count, self.instrument_match_count, self.current_position_quantity, self.working_owned_orders, self.working_entry_orders, self.session_entry_count, self.consecutive_losses, self.trade_date_entry_count):
             if type(value) is not int or value < 0:
                 raise ValueError("Paper risk counters must be non-negative integers.")
         for value in (self.quote_observed_at, self.classified_trade_observed_at, self.depth_mutation_observed_at, self.position_opened_at):
             if value is not None:
                 normalized_utc(value, "Paper risk source time")
+        context_from_identity(self.session_kind, self.session_id, self.trade_date, self.session_profile_hash, self.session_generation)
 
 
 class PaperRiskAuthority:
@@ -101,17 +115,26 @@ class PaperRiskAuthority:
     def _time(value: str) -> datetime:
         return datetime.fromisoformat(normalized_utc(value, "Paper risk time").replace("Z", "+00:00"))
 
-    def _inside_entry_session(self, at: datetime) -> bool:
-        local = america_new_york(at)
-        minute = local.hour * 60 + local.minute
-        start_hour, start_minute = (int(value) for value in self.profile.entry_session_start.split(":"))
-        end_hour, end_minute = (int(value) for value in self.profile.entry_session_end.split(":"))
-        return start_hour * 60 + start_minute <= minute <= end_hour * 60 + end_minute
+    @staticmethod
+    def _legacy_session_identity(kind: PaperSessionKind, session_id: str) -> bool:
+        return kind is PaperSessionKind.OFF_SESSION and session_id == UNSPECIFIED_OFF_SESSION_CONTEXT.session_id
+
+    def _context(self, snapshot: PaperRiskSnapshot, at: str):
+        if self._legacy_session_identity(snapshot.session_kind, snapshot.session_id):
+            return PaperSessionResolver().resolve(at, generation=snapshot.session_generation).context
+        return context_from_identity(
+            snapshot.session_kind, snapshot.session_id, snapshot.trade_date,
+            snapshot.session_profile_hash, snapshot.session_generation,
+        )
+
+    def _inside_entry_session(self, at: datetime, snapshot: PaperRiskSnapshot | None = None) -> bool:
+        if snapshot is None:
+            return PaperSessionResolver().resolve(at).entry_authorized
+        return self._context(snapshot, at.isoformat()).entry_permitted_at(at)
 
     def hard_flat_due(self, at: str) -> bool:
-        local = america_new_york(self._time(at))
-        hour, minute = (int(value) for value in self.profile.hard_flat_deadline.split(":"))
-        return local.hour * 60 + local.minute >= hour * 60 + minute
+        resolution = PaperSessionResolver().resolve(at)
+        return resolution.context.hard_flat_due_at(self._time(at))
 
     def maximum_age_due(self, snapshot: PaperRiskSnapshot, at: str) -> bool:
         return snapshot.position_opened_at is not None and self._time(at) - self._time(snapshot.position_opened_at) >= timedelta(seconds=self.profile.maximum_position_age_seconds)
@@ -157,7 +180,12 @@ class PaperRiskAuthority:
                 reasons.append("PAPER_EVIDENCE_NOT_WARMED")
             if snapshot.local_sequence_gap or snapshot.depth_reset_recovery:
                 reasons.append("PAPER_CONTINUITY_UNUSABLE")
-            if not self._inside_entry_session(moment):
+            context = self._context(snapshot, at)
+            if context.session_kind is PaperSessionKind.OFF_SESSION:
+                reasons.append("OFF_SESSION")
+            elif context.calendar_state is PaperCalendarState.HOLIDAY_OVERRIDE_REQUIRED:
+                reasons.append("HOLIDAY_SESSION_UNVERIFIED")
+            elif not self._inside_entry_session(moment, snapshot):
                 reasons.append("OUTSIDE_ENTRY_SESSION")
             if self._locked_out or snapshot.locked_out:
                 reasons.append(self._lockout_reason or snapshot.lockout_reason or "SESSION_LOCKED_OUT")
@@ -165,6 +193,8 @@ class PaperRiskAuthority:
                 reasons.append("DAILY_LOSS_LIMIT")
             if snapshot.session_entry_count >= self.profile.maximum_session_entries:
                 reasons.append("SESSION_ENTRY_CAP")
+            if snapshot.trade_date_entry_count >= self.profile.maximum_session_entries:
+                reasons.append("TRADE_DATE_ENTRY_CAP")
             if snapshot.consecutive_losses >= self.profile.maximum_consecutive_losses:
                 reasons.append("CONSECUTIVE_LOSS_LOCKOUT")
             if reasons:
@@ -197,11 +227,17 @@ class PaperRiskAuthority:
             "reference_bid": None if reference_bid is None else str(reference_bid),
             "reference_ask": None if reference_ask is None else str(reference_ask),
             "reference_last": None if reference_last is None else str(reference_last),
+            "session_kind": decision.session_kind.value,
+            "session_id": decision.session_id,
+            "trade_date": decision.trade_date,
+            "session_profile_hash": decision.session_profile_hash,
+            "session_generation": decision.session_generation,
         }
         return PaperExecutionIntent(
             deterministic_id("l3g-pi-", payload), decision.paper_decision_id, target, 1,
             self.binding.instrument, decision.created_at, decision.expires_at, decision.paper_policy_hash,
-            reference_bid, reference_ask, reference_last,
+            reference_bid, reference_ask, reference_last, decision.session_kind, decision.session_id,
+            decision.trade_date, decision.session_profile_hash, decision.session_generation,
         )
 
     def evaluate(self, intent: PaperExecutionIntent, snapshot: PaperRiskSnapshot, *, at: str) -> PaperRiskGrant:
@@ -210,39 +246,55 @@ class PaperRiskAuthority:
         with self._lock:
             moment = self._time(at)
             reasons = self._identity_reasons(snapshot)
+            context = self._context(snapshot, at)
             if intent.instrument != self.binding.instrument or intent.requested_quantity != 1 or intent.policy_hash != POLICY.configuration_hash:
                 reasons.append("INTENT_AUTHORITY_MISMATCH")
             if self._time(intent.expires_at) < moment:
                 reasons.append("INTENT_EXPIRED")
             if snapshot.unresolved_command or snapshot.unresolved_native_order or snapshot.unresolved_execution:
                 reasons.append("UNRESOLVED_EXECUTION_TRUTH")
-            if self._locked_out or snapshot.locked_out:
-                reasons.append(self._lockout_reason or snapshot.lockout_reason or "SESSION_LOCKED_OUT")
-            pnl = snapshot.daily_realized_pnl + snapshot.daily_unrealized_pnl
-            if pnl <= -self.profile.daily_loss_limit_dollars:
-                reasons.append("DAILY_LOSS_LIMIT")
-                self.lock_out("DAILY_LOSS_LIMIT")
-            if snapshot.session_entry_count >= self.profile.maximum_session_entries:
-                reasons.append("SESSION_ENTRY_CAP")
-            if snapshot.consecutive_losses >= self.profile.maximum_consecutive_losses:
-                reasons.append("CONSECUTIVE_LOSS_LOCKOUT")
 
             if intent.target_position is PaperDirection.FLAT:
                 # Exits remain available while data is stale or entries are
-                # paused, but exact account truth and execution connectivity
-                # are still mandatory.
+                # paused, after a risk lockout, and outside every entry
+                # window. Exact account truth and execution connectivity are
+                # still mandatory.
+                reasons = [reason for reason in reasons if reason != "FOREIGN_ACTIVITY_LOCKOUT"]
                 if not snapshot.execution_bridge_healthy:
                     reasons.append("EXECUTION_BRIDGE_UNHEALTHY")
                 if not snapshot.reconciliation_current:
                     reasons.append("RECONCILIATION_INCOMPLETE")
             else:
+                if self._locked_out or snapshot.locked_out:
+                    reasons.append(self._lockout_reason or snapshot.lockout_reason or "SESSION_LOCKED_OUT")
+                pnl = snapshot.daily_realized_pnl + snapshot.daily_unrealized_pnl
+                if pnl <= -self.profile.daily_loss_limit_dollars:
+                    reasons.append("DAILY_LOSS_LIMIT")
+                    self.lock_out("DAILY_LOSS_LIMIT")
+                if snapshot.session_entry_count >= self.profile.maximum_session_entries:
+                    reasons.append("SESSION_ENTRY_CAP")
+                if snapshot.trade_date_entry_count >= self.profile.maximum_session_entries:
+                    reasons.append("TRADE_DATE_ENTRY_CAP")
+                if snapshot.consecutive_losses >= self.profile.maximum_consecutive_losses:
+                    reasons.append("CONSECUTIVE_LOSS_LOCKOUT")
                 if snapshot.current_position is not PaperDirection.FLAT or snapshot.current_position_quantity != 0:
                     reasons.append("PYRAMIDING_OR_REVERSAL_DENIED")
                 if snapshot.working_entry_orders >= self.profile.maximum_pending_entries or snapshot.working_owned_orders:
                     reasons.append("PENDING_ORDER_LOCKOUT")
-                if not self._inside_entry_session(moment):
+                intent_legacy = self._legacy_session_identity(intent.session_kind, intent.session_id)
+                if not intent_legacy and (
+                    intent.session_kind is not context.session_kind or intent.session_id != context.session_id
+                    or intent.trade_date != context.trade_date or intent.session_profile_hash != context.session_profile_hash
+                    or intent.session_generation != context.session_generation
+                ):
+                    reasons.append("SESSION_IDENTITY_MISMATCH")
+                if context.session_kind is PaperSessionKind.OFF_SESSION:
+                    reasons.append("OFF_SESSION")
+                elif context.calendar_state is PaperCalendarState.HOLIDAY_OVERRIDE_REQUIRED:
+                    reasons.append("HOLIDAY_SESSION_UNVERIFIED")
+                elif not self._inside_entry_session(moment, snapshot):
                     reasons.append("OUTSIDE_ENTRY_SESSION")
-                if self.hard_flat_due(at):
+                if context.hard_flat_due_at(moment):
                     reasons.append("HARD_FLAT_DEADLINE")
                 if not snapshot.local_bridge_healthy or not snapshot.market_price_connected:
                     reasons.append("MARKET_BRIDGE_UNHEALTHY")
@@ -272,12 +324,20 @@ class PaperRiskAuthority:
                 "reason_codes": reason_codes,
                 "evaluated_at": normalized_utc(at, "Risk evaluation time"),
                 "snapshot_hash": canonical_hash({key: str(value) for key, value in snapshot.__dict__.items()}),
+                "session_kind": context.session_kind.value,
+                "session_id": context.session_id,
+                "trade_date": context.trade_date,
+                "session_profile_hash": context.session_profile_hash,
+                "session_generation": context.session_generation,
             }
             grant = PaperRiskGrant(
                 deterministic_id("l3g-pg-", payload), intent.intent_id, self.profile.configuration_hash,
                 self.binding.binding_hash, granted, reason_codes, str(payload["evaluated_at"]), expires_at(str(payload["evaluated_at"]), 5),
                 snapshot.current_position, snapshot.working_owned_orders, snapshot.daily_realized_pnl,
                 snapshot.daily_unrealized_pnl, snapshot.session_entry_count, snapshot.consecutive_losses,
+                session_kind=context.session_kind, session_id=context.session_id,
+                trade_date=context.trade_date, session_profile_hash=context.session_profile_hash,
+                session_generation=context.session_generation,
             )
             self._last_result = grant
             if granted:

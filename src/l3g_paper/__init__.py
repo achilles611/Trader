@@ -19,11 +19,13 @@ from .contracts import (
     PaperExecutionIntent,
     PaperPolicyArtifact,
     PaperRiskGrant,
+    PaperSessionArmGrant,
     PaperRiskProfile,
     PaperRuntimeState,
     PaperSourceQuality,
     SequenceAuthority,
 )
+from .sessions import PaperCalendarState, PaperSessionContext, PaperSessionKind
 
 __all__ = [
     "ACCOUNT_BINDING", "AUTHORITY", "CAPABILITY", "POLICY", "RISK_PROFILE",
@@ -31,5 +33,6 @@ __all__ = [
     "ExecutionCapabilityManifest", "HypothesisKind", "PaperDecision", "PaperDecisionKind",
     "PaperDirection", "PaperExecutionCommand", "PaperExecutionIntent", "PaperPolicyArtifact",
     "PaperRiskGrant", "PaperRiskProfile", "PaperRuntimeState", "PaperSourceQuality",
+    "PaperSessionArmGrant", "PaperSessionContext", "PaperSessionKind", "PaperCalendarState",
     "SequenceAuthority",
 ]
