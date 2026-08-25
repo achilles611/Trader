@@ -32,8 +32,9 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const double ProtectiveStopDistance = 25.0;
         private const int ProtectiveAcceptanceSeconds = 3;
         private const string PaperTimezone = "America/New_York";
-        private const string AsiaProfileHash = "51cf34e6042de9d35413ebbfd41bcc19fb120cd8b18adfe675fbda30f7de92e4";
+        private const string AsiaProfileHash = "55225b35ccdb289d179bb23afd7f3fdb2c5ab193d53aba21603f17ff9f6d43aa";
         private const string NewYorkProfileHash = "8b8560a08ff41963a7a78d09bc977fbc1faf10f4a11ce58d05f47cacd89e0814";
+        private const string NyAfterProfileHash = "e0cea9aa679c24ad4491ad929bcd72832cd3dcb49e2e5a7a64226c8abb5a1db2";
         private const string OffSessionProfileHash = "168f289a5847781ccb7a09f2556c4b3aa03e6f767071dc061dc5e3211d3834eb";
 
         private readonly object stateLock = new object();
@@ -445,7 +446,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             {
                 if (!authenticated) return "NOT_AUTHENTICATED";
                 if (lockedOut && action.StartsWith("ENTER_", StringComparison.Ordinal)) return "LOCKED_OUT";
-                if (!String.Equals(Text(command, "session_id"), executionSessionId, StringComparison.Ordinal)) return "WRONG_EXECUTION_SESSION";
+                if (!String.Equals(Text(command, "execution_session_id"), executionSessionId, StringComparison.Ordinal)) return "WRONG_EXECUTION_SESSION";
                 if (String.IsNullOrWhiteSpace(commandId)) return "MISSING_COMMAND_ID";
                 if (processedCommands.Contains(commandId)) return "DUPLICATE_COMMAND";
                 if (sequence != lastCommandSequence + 1) return "REORDERED_COMMAND";
@@ -504,10 +505,11 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             if (action != "ENTER_LONG" && action != "ENTER_SHORT") return null;
             string kind = Text(command, "session_kind");
+            string family = Text(command, "session_family");
             string sessionId = Text(command, "session_id");
             string tradeDate = Text(command, "trade_date");
             string profileHash = Text(command, "session_profile_hash");
-            if (String.IsNullOrWhiteSpace(kind) || String.IsNullOrWhiteSpace(sessionId)
+            if (String.IsNullOrWhiteSpace(kind) || String.IsNullOrWhiteSpace(family) || String.IsNullOrWhiteSpace(sessionId)
                 || String.IsNullOrWhiteSpace(tradeDate) || String.IsNullOrWhiteSpace(profileHash))
                 return "MISSING_SESSION_IDENTITY";
             DateTime local = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, NewYorkTimezone());
@@ -516,13 +518,15 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return "TRADE_DATE_MISMATCH";
             TimeSpan clock = local.TimeOfDay;
             string expectedKind;
+            string expectedFamily;
             string expectedDate;
             string expectedHash;
             bool insideEntry;
             if ((clock >= new TimeSpan(18, 0, 0) && AsiaStartDay(local))
                 || (clock < new TimeSpan(2, 0, 0) && AsiaStartDay(local.AddDays(-1))))
             {
-                expectedKind = "ASIA_GLOBEX";
+                expectedKind = "ASIA";
+                expectedFamily = "ASIA";
                 expectedDate = IsoDate(clock >= new TimeSpan(18, 0, 0) ? local.AddDays(1) : local);
                 expectedHash = AsiaProfileHash;
                 insideEntry = (clock >= new TimeSpan(18, 5, 0)) || (clock < new TimeSpan(1, 30, 0));
@@ -530,13 +534,24 @@ namespace NinjaTrader.NinjaScript.AddOns
             else if (clock >= new TimeSpan(9, 30, 0) && clock < new TimeSpan(16, 0, 0) && NewYorkStartDay(local))
             {
                 expectedKind = "NEW_YORK_RTH";
+                expectedFamily = "NEW_YORK";
                 expectedDate = IsoDate(local);
                 expectedHash = NewYorkProfileHash;
                 insideEntry = clock >= new TimeSpan(9, 35, 0) && clock < new TimeSpan(15, 30, 0);
             }
+            else if (clock >= new TimeSpan(16, 0, 0) && clock < new TimeSpan(18, 0, 0)
+                && local.DayOfWeek >= DayOfWeek.Monday && local.DayOfWeek <= DayOfWeek.Thursday)
+            {
+                expectedKind = "NY_AFTER";
+                expectedFamily = "NEW_YORK";
+                expectedDate = IsoDate(local);
+                expectedHash = NyAfterProfileHash;
+                insideEntry = clock >= new TimeSpan(16, 5, 0) && clock < new TimeSpan(17, 30, 0);
+            }
             else
                 return "SESSION_OFF_SESSION";
             if (!String.Equals(kind, expectedKind, StringComparison.Ordinal)) return "COMMAND_SESSION_MISMATCH";
+            if (!String.Equals(family, expectedFamily, StringComparison.Ordinal)) return "COMMAND_SESSION_FAMILY_MISMATCH";
             if (!String.Equals(profileHash, expectedHash, StringComparison.Ordinal)) return "SESSION_PROFILE_HASH_MISMATCH";
             if (!String.Equals(tradeDate, expectedDate, StringComparison.Ordinal)
                 || !String.Equals(sessionId, "MNQU6:" + expectedKind + ":" + expectedDate, StringComparison.Ordinal))
@@ -903,6 +918,8 @@ namespace NinjaTrader.NinjaScript.AddOns
             message["message_type"] = type;
             message["execution_session_id"] = executionSessionId;
             message["session_kind"] = kind;
+            message["session_family"] = kind == "NEW_YORK_RTH" || kind == "NY_AFTER"
+                ? "NEW_YORK" : kind == "ASIA" ? "ASIA" : "OFF_SESSION";
             message["session_id"] = sessionId;
             message["trade_date"] = tradeDate;
             message["session_profile_hash"] = profileHash;

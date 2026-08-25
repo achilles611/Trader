@@ -25,9 +25,31 @@ if _NY is None:  # Never substitute a fixed offset for a market timezone.
 
 
 class PaperSessionKind(StrEnum):
-    ASIA_GLOBEX = "ASIA_GLOBEX"
+    # Asia is a single first-class paper session.  The alias preserves only
+    # source compatibility for callers which imported the former enum name;
+    # every serialized identity is now exactly ASIA.
+    ASIA = "ASIA"
+    ASIA_GLOBEX = "ASIA"
     NEW_YORK_RTH = "NEW_YORK_RTH"
+    NY_AFTER = "NY_AFTER"
     OFF_SESSION = "OFF_SESSION"
+
+
+class PaperSessionFamily(StrEnum):
+    NEW_YORK = "NEW_YORK"
+    ASIA = "ASIA"
+    OFF_SESSION = "OFF_SESSION"
+
+
+def session_family(kind: PaperSessionKind) -> PaperSessionFamily:
+    """Return the sealed accounting family for one exact paper session."""
+    if kind in {PaperSessionKind.NEW_YORK_RTH, PaperSessionKind.NY_AFTER}:
+        return PaperSessionFamily.NEW_YORK
+    if kind is PaperSessionKind.ASIA:
+        return PaperSessionFamily.ASIA
+    if kind is PaperSessionKind.OFF_SESSION:
+        return PaperSessionFamily.OFF_SESSION
+    raise ValueError("Unknown paper session kind.")
 
 
 class PaperCalendarState(StrEnum):
@@ -166,21 +188,29 @@ class PaperSessionProfile:
         }
 
 
-ASIA_GLOBEX_PROFILE = PaperSessionProfile(
-    PaperSessionKind.ASIA_GLOBEX, NEW_YORK_TIMEZONE,
+ASIA_PROFILE = PaperSessionProfile(
+    PaperSessionKind.ASIA, NEW_YORK_TIMEZONE,
     "18:00", "18:05", "01:30", "01:58", "02:00", (6, 0, 1, 2, 3),
 )
+# Compatibility symbol only; its identity remains ASIA rather than a
+# separately serialized pre-/post-Globex regime.
+ASIA_GLOBEX_PROFILE = ASIA_PROFILE
 NEW_YORK_RTH_PROFILE = PaperSessionProfile(
     PaperSessionKind.NEW_YORK_RTH, NEW_YORK_TIMEZONE,
     "09:30", "09:35", "15:30", "15:58", "16:00", (0, 1, 2, 3, 4),
+)
+NY_AFTER_PROFILE = PaperSessionProfile(
+    PaperSessionKind.NY_AFTER, NEW_YORK_TIMEZONE,
+    "16:00", "16:05", "17:30", "17:58", "18:00", (0, 1, 2, 3),
 )
 OFF_SESSION_PROFILE = PaperSessionProfile(
     PaperSessionKind.OFF_SESSION, NEW_YORK_TIMEZONE,
     "00:00", "00:00", "00:00", "00:00", "00:00", (),
 )
 SESSION_PROFILES: Mapping[PaperSessionKind, PaperSessionProfile] = MappingProxyType({
-    PaperSessionKind.ASIA_GLOBEX: ASIA_GLOBEX_PROFILE,
+    PaperSessionKind.ASIA: ASIA_PROFILE,
     PaperSessionKind.NEW_YORK_RTH: NEW_YORK_RTH_PROFILE,
+    PaperSessionKind.NY_AFTER: NY_AFTER_PROFILE,
     PaperSessionKind.OFF_SESSION: OFF_SESSION_PROFILE,
 })
 
@@ -227,6 +257,7 @@ class PaperSessionContext:
     def payload(self) -> dict[str, object]:
         return {
             "session_kind": self.session_kind.value,
+            "session_family": self.session_family.value,
             "session_id": self.session_id,
             "trade_date": self.trade_date,
             "timezone": self.timezone,
@@ -239,6 +270,10 @@ class PaperSessionContext:
             "session_generation": self.session_generation,
             "calendar_state": self.calendar_state.value,
         }
+
+    @property
+    def session_family(self) -> PaperSessionFamily:
+        return session_family(self.session_kind)
 
     @property
     def entry_authorized_by_calendar(self) -> bool:
@@ -255,7 +290,7 @@ class PaperSessionContext:
         trading_date = date.fromisoformat(self.trade_date)
         # Asia starts on the evening before its trade date. All of its other
         # boundaries occur on the trade date after midnight.
-        if self.session_kind is PaperSessionKind.ASIA_GLOBEX and name in {"observation_start", "entry_start"}:
+        if self.session_kind is PaperSessionKind.ASIA and name in {"observation_start", "entry_start"}:
             trading_date -= timedelta(days=1)
         return datetime.combine(trading_date, boundary, tzinfo=_NY).astimezone(timezone.utc)
 
@@ -379,12 +414,14 @@ class PaperSessionResolver:
 
         profile: PaperSessionProfile | None = None
         trade_day: date | None = None
-        if current >= _clock("18:00") and local.weekday() in ASIA_GLOBEX_PROFILE.valid_start_weekdays:
-            profile, trade_day = ASIA_GLOBEX_PROFILE, local.date() + timedelta(days=1)
-        elif current < _clock("02:00") and (local.date() - timedelta(days=1)).weekday() in ASIA_GLOBEX_PROFILE.valid_start_weekdays:
-            profile, trade_day = ASIA_GLOBEX_PROFILE, local.date()
+        if current >= _clock("18:00") and local.weekday() in ASIA_PROFILE.valid_start_weekdays:
+            profile, trade_day = ASIA_PROFILE, local.date() + timedelta(days=1)
+        elif current < _clock("02:00") and (local.date() - timedelta(days=1)).weekday() in ASIA_PROFILE.valid_start_weekdays:
+            profile, trade_day = ASIA_PROFILE, local.date()
         elif _clock("09:30") <= current < _clock("16:00") and local.weekday() in NEW_YORK_RTH_PROFILE.valid_start_weekdays:
             profile, trade_day = NEW_YORK_RTH_PROFILE, local.date()
+        elif _clock("16:00") <= current < _clock("18:00") and local.weekday() in NY_AFTER_PROFILE.valid_start_weekdays:
+            profile, trade_day = NY_AFTER_PROFILE, local.date()
         if profile is None or trade_day is None:
             closed = PaperCalendarState.CLOSED if local.weekday() == 5 else self.calendar.state_for(local.date())
             return PaperSessionResolution(self._off_context(local, generation, closed), False, "OFF_SESSION")

@@ -60,6 +60,27 @@ class PaperRuntimeTests(unittest.TestCase):
             self.assertEqual(second_status["session_generation"], first_status["session_generation"])
             runtime.stop(); ledger.close()
 
+    def test_late_local_callback_is_refused_without_resetting_ny_after_evidence_domain(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            runtime = LaneIIIPaperRuntime(ledger)
+            factory = ObservationFactory(start=datetime(2026, 8, 25, 20, 10, tzinfo=timezone.utc))
+            runtime.ingest(factory.quote(100))
+            admitted = runtime.status()
+            late = factory.depth("ADD", 10)
+            late = type(late)(
+                late.observation_id, late.session_id, late.observation_type,
+                (datetime.fromisoformat(late.ninja_receipt_time.replace("Z", "+00:00")) - timedelta(seconds=5)).isoformat().replace("+00:00", "Z"),
+                late.local_monotonic_sequence, late.payload, provider_timestamp=late.provider_timestamp,
+            )
+            runtime.ingest(late)
+            refused = runtime.status()
+            self.assertEqual(admitted["current_session"], "NY_AFTER")
+            self.assertEqual(refused["current_session_id"], admitted["current_session_id"])
+            self.assertEqual(refused["session_generation"], admitted["session_generation"])
+            self.assertTrue(any(item["kind"] == "INCIDENT_STALE_CALLBACK_REFUSED" for item in ledger.recent(20, domain="INCIDENT")))
+            runtime.stop(); ledger.close()
+
     def test_fanout_isolates_sink_failures_and_preserves_both_deliveries(self) -> None:
         calls: list[str] = []; failures: list[tuple[str, str, str]] = []
         def broken(_: object) -> None: calls.append("shadow"); raise RuntimeError()

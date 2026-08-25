@@ -263,7 +263,12 @@ class PaperLedger:
             trade_date = UNSPECIFIED_OFF_SESSION_CONTEXT.trade_date
             profile_hash = UNSPECIFIED_OFF_SESSION_CONTEXT.session_profile_hash
             generation = UNSPECIFIED_OFF_SESSION_CONTEXT.session_generation
-        context_from_identity(session_kind, session_id, trade_date, profile_hash, generation)
+        context = context_from_identity(session_kind, session_id, trade_date, profile_hash, generation)
+        session_family = context.session_family.value
+        supplied_family = identity_payload.get("session_family")
+        if supplied_family is not None and supplied_family != session_family:
+            raise ValueError("Paper ledger record session family is inconsistent with session identity.")
+        identity_payload.setdefault("session_family", session_family)
         common: dict[str, object] = {
             "schema": PAPER_RECORD_SCHEMA,
             "kind": kind,
@@ -276,6 +281,7 @@ class PaperLedger:
             "paper_only": True,
             "live_capital": False,
             "session_kind": session_kind.value,
+            "session_family": session_family,
             "session_id": session_id,
             "trade_date": trade_date,
             "session_profile_hash": profile_hash,
@@ -415,6 +421,7 @@ class PaperLedger:
         *,
         domain: str | None = None,
         session_kind: PaperSessionKind | str | None = None,
+        session_family: str | None = None,
         trade_date: str | None = None,
         session_id: str | None = None,
     ) -> list[dict[str, object]]:
@@ -432,6 +439,10 @@ class PaperLedger:
             if session_kind is not None:
                 value = PaperSessionKind(str(session_kind)).value
                 clauses.append("json_extract(payload_json, '$.session_kind') = ?"); values.append(value)
+            if session_family is not None:
+                if session_family not in {"NEW_YORK", "ASIA", "OFF_SESSION"}:
+                    raise ValueError("Unknown paper session family.")
+                clauses.append("json_extract(payload_json, '$.session_family') = ?"); values.append(session_family)
             if trade_date is not None:
                 date.fromisoformat(trade_date)
                 clauses.append("json_extract(payload_json, '$.trade_date') = ?"); values.append(trade_date)

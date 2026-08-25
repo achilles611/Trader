@@ -33,6 +33,7 @@ from .policy import ExperimentalPaperPolicy
 from .risk import PaperRiskAuthority, PaperRiskSnapshot
 from .sessions import (
     PaperSessionContext,
+    PaperSessionFamily,
     PaperSessionKind,
     PaperSessionResolver,
     UNSPECIFIED_OFF_SESSION_CONTEXT,
@@ -142,7 +143,10 @@ class LaneIIIPaperRuntime:
         self._session_generation = 0
         self._armed_session: PaperSessionArmGrant | None = None
         self._session_closed_ids: set[tuple[str, int]] = set()
-        self._trade_date_risk: dict[str, _TradeDateRisk] = {}
+        # Risk accounting is family-local: NEW_YORK_RTH and NY_AFTER share
+        # one cumulative envelope, while ASIA is independently accounted.
+        # Evidence and arm grants remain scoped to the exact session below.
+        self._family_risk: dict[tuple[str, PaperSessionFamily], _TradeDateRisk] = {}
         self._session_pnl: dict[str, Decimal] = {}
         self._entry_session_context: PaperSessionContext | None = None
         self._hard_flat_started_for: tuple[str, int] | None = None
@@ -186,7 +190,7 @@ class LaneIIIPaperRuntime:
         self._session_context = context
         self.ledger.set_session_context(context)
         if context.session_kind is not PaperSessionKind.OFF_SESSION:
-            trade_risk = self._trade_date_risk.setdefault(context.trade_date, _TradeDateRisk())
+            trade_risk = self._family_risk.setdefault((context.trade_date, context.session_family), _TradeDateRisk())
             self._snapshot = replace(
                 self._snapshot, observed_at=_now(), session_kind=context.session_kind,
                 session_id=context.session_id, trade_date=context.trade_date,
@@ -226,6 +230,13 @@ class LaneIIIPaperRuntime:
 
     def _resolve_observation_session(self, observation: NinjaTraderObservation) -> tuple[PaperSessionContext, str | None]:
         resolution = self._session_resolver.resolve(self._market_event_timestamp(observation), generation=self._session_generation)
+        # A reconnect can drain an older local callback stream after the
+        # active stream has already advanced.  It is not a market-session
+        # transition and must never close, re-open, or donate evidence to the
+        # current session.  Keep the current exact context; ingest() records
+        # and refuses the stale callback before policy/risk admission.
+        if resolution.reason_code == "EVENT_TIMESTAMP_MOVED_BACKWARD":
+            return self._session_context, resolution.reason_code
         context = resolution.context
         if context.session_kind is not PaperSessionKind.OFF_SESSION and (
             context.session_id != self._session_context.session_id or context.session_kind != self._session_context.session_kind
@@ -390,6 +401,21 @@ class LaneIIIPaperRuntime:
                 identity="l3g-paper-observation-" + canonical_hash(raw_payload),
                 occurred_at=observation.ninja_receipt_time,
             )
+            if session_reason == "EVENT_TIMESTAMP_MOVED_BACKWARD":
+                self.ledger.append(
+                    "INCIDENT_STALE_CALLBACK_REFUSED",
+                    {
+                        **context.payload(),
+                        "reason": session_reason,
+                        "observation_id": observation.observation_id,
+                        "observation_type": observation.observation_type,
+                        "ninja_receipt_time": observation.ninja_receipt_time,
+                        "local_monotonic_sequence": observation.local_monotonic_sequence,
+                    },
+                    identity="l3g-stale-callback-" + canonical_hash(raw_payload),
+                    occurred_at=observation.ninja_receipt_time,
+                )
+                return
             before_classified = self.policy.classified_trade_count() if observation.observation_type == "TRADE" else 0
             decision = self.policy.ingest_runtime(
                 observation, current_position=self._position,
@@ -719,7 +745,7 @@ class LaneIIIPaperRuntime:
                 intent.session_profile_hash, intent.session_generation,
             )
             self._entry_session_context = entry_context
-            trade_risk = self._trade_date_risk.setdefault(entry_context.trade_date, _TradeDateRisk())
+            trade_risk = self._family_risk.setdefault((entry_context.trade_date, entry_context.session_family), _TradeDateRisk())
             trade_risk.entry_count += 1
             self._snapshot = replace(
                 self._snapshot, observed_at=_now(), current_position=expected,
@@ -740,7 +766,7 @@ class LaneIIIPaperRuntime:
                 points = price - self._entry_fill_price if self._entry_direction is PaperDirection.LONG else self._entry_fill_price - price
                 realized = points * Decimal("2") * self._entry_fill_quantity
             entry_context = self._entry_session_context or self._session_context
-            trade_risk = self._trade_date_risk.setdefault(entry_context.trade_date, _TradeDateRisk())
+            trade_risk = self._family_risk.setdefault((entry_context.trade_date, entry_context.session_family), _TradeDateRisk())
             trade_risk.realized_pnl += realized
             trade_risk.consecutive_losses = trade_risk.consecutive_losses + 1 if realized < 0 else 0 if realized > 0 else trade_risk.consecutive_losses
             self._session_pnl[entry_context.session_id] = self._session_pnl.get(entry_context.session_id, Decimal("0")) + realized
@@ -892,7 +918,7 @@ class LaneIIIPaperRuntime:
             risk = self.risk.status()
             transport = None if self._transport is None else self._transport.status().as_dict()
             context = self._session_context
-            trade_risk = self._trade_date_risk.get(context.trade_date, _TradeDateRisk())
+            trade_risk = self._family_risk.get((context.trade_date, context.session_family), _TradeDateRisk())
             arm_valid = self._armed_session is not None and self._armed_session.valid_at(_now())
             loss_remaining = max(Decimal("0"), RISK_PROFILE.daily_loss_limit_dollars + min(Decimal("0"), trade_risk.realized_pnl + trade_risk.unrealized_pnl))
             next_context = PaperSessionResolver().next_valid_session(_now(), generation=context.session_generation)
@@ -922,6 +948,7 @@ class LaneIIIPaperRuntime:
                 "session_entries": self._snapshot.session_entry_count,
                 "consecutive_losses": self._snapshot.consecutive_losses,
                 "current_session": context.session_kind.value,
+                "current_session_family": context.session_family.value,
                 "current_session_id": context.session_id,
                 "trade_date": context.trade_date,
                 "session_generation": context.session_generation,
@@ -933,6 +960,7 @@ class LaneIIIPaperRuntime:
                 "session_arm_grant": None if self._armed_session is None else self._armed_session.payload(),
                 "next_valid_session": None if next_context is None else {
                     "session_kind": next_context.session_kind.value,
+                    "session_family": next_context.session_family.value,
                     "session_id": next_context.session_id,
                     "trade_date": next_context.trade_date,
                 },
@@ -942,9 +970,11 @@ class LaneIIIPaperRuntime:
                     "bearish": str(self.policy.score(_now(), HypothesisKind.BEARISH_CONTINUATION)[0]),
                 },
                 "session_pnl": str(self._session_pnl.get(context.session_id, Decimal("0"))),
-                "asia_session_pnl": str(sum(value for key, value in self._session_pnl.items() if ":ASIA_GLOBEX:" in key and key.endswith(context.trade_date))),
-                "new_york_session_pnl": str(sum(value for key, value in self._session_pnl.items() if ":NEW_YORK_RTH:" in key and key.endswith(context.trade_date))),
-                "combined_trade_date_pnl": str(trade_risk.realized_pnl + trade_risk.unrealized_pnl),
+                "asia_session_pnl": str(sum(value for key, value in self._session_pnl.items() if ":ASIA:" in key and key.endswith(context.trade_date))),
+                "new_york_session_pnl": str(sum(value for key, value in self._session_pnl.items() if (":NEW_YORK_RTH:" in key or ":NY_AFTER:" in key) and key.endswith(context.trade_date))),
+                "family_cumulative_pnl": str(trade_risk.realized_pnl + trade_risk.unrealized_pnl),
+                "combined_trade_date_pnl": str(sum(value.realized_pnl + value.unrealized_pnl for (date_key, _), value in self._family_risk.items() if date_key == context.trade_date)),
+                "family_entry_count": trade_risk.entry_count,
                 "combined_trade_date_loss_allowance_remaining": str(loss_remaining),
                 "trade_date_entry_count": trade_risk.entry_count,
                 "last_paper_decision": None if self._last_decision is None else self._last_decision.payload(),

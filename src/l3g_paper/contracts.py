@@ -20,6 +20,7 @@ from .sessions import (
     PaperSessionKind,
     UNSPECIFIED_OFF_SESSION_CONTEXT,
     context_from_identity,
+    session_family,
 )
 
 
@@ -354,7 +355,9 @@ class PaperEvidence:
         object.__setattr__(self, "source_session_ids", tuple(source_sessions))
 
     def payload(self) -> dict[str, object]:
-        return _jsonable(asdict(self))  # type: ignore[return-value]
+        result = asdict(self)
+        result["session_family"] = session_family(self.session_kind).value
+        return _jsonable(result)  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -403,6 +406,7 @@ class PaperDecision:
     def payload(self) -> dict[str, object]:
         result = dict(self.__dict__)
         result["family_summary"] = dict(self.family_summary)
+        result["session_family"] = session_family(self.session_kind).value
         return _jsonable(result)  # type: ignore[return-value]
 
 
@@ -437,7 +441,9 @@ class PaperExecutionIntent:
         _validate_session_identity(self.session_kind, self.session_id, self.trade_date, self.session_profile_hash, self.session_generation)
 
     def payload(self) -> dict[str, object]:
-        return _jsonable(asdict(self))  # type: ignore[return-value]
+        result = asdict(self)
+        result["session_family"] = session_family(self.session_kind).value
+        return _jsonable(result)  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -476,7 +482,9 @@ class PaperRiskGrant:
         _validate_session_identity(self.session_kind, self.session_id, self.trade_date, self.session_profile_hash, self.session_generation)
 
     def payload(self) -> dict[str, object]:
-        return _jsonable(asdict(self))  # type: ignore[return-value]
+        result = asdict(self)
+        result["session_family"] = session_family(self.session_kind).value
+        return _jsonable(result)  # type: ignore[return-value]
 
     def valid_at(self, at: str) -> bool:
         use_time = datetime.fromisoformat(_utc(at, "Grant use time").replace("Z", "+00:00"))
@@ -508,7 +516,9 @@ class PaperSessionArmGrant:
         return moment < datetime.fromisoformat(self.expires_at.replace("Z", "+00:00"))
 
     def payload(self) -> dict[str, object]:
-        return _jsonable(asdict(self))  # type: ignore[return-value]
+        result = asdict(self)
+        result["session_family"] = session_family(self.session_kind).value
+        return _jsonable(result)  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -582,10 +592,13 @@ class PaperExecutionCommand:
     def unsigned_payload(self) -> dict[str, object]:
         result = asdict(self)
         result.pop("signature")
+        result["session_family"] = session_family(self.session_kind).value
         return _jsonable(result)  # type: ignore[return-value]
 
     def payload(self) -> dict[str, object]:
-        return _jsonable(asdict(self))  # type: ignore[return-value]
+        result = asdict(self)
+        result["session_family"] = session_family(self.session_kind).value
+        return _jsonable(result)  # type: ignore[return-value]
 
     def with_signature(self, signature: str) -> "PaperExecutionCommand":
         if not signature:

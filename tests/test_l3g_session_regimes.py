@@ -16,7 +16,7 @@ from src.l3g_paper.policy import ExperimentalPaperPolicy
 from src.l3g_paper.risk import PaperRiskAuthority, PaperRiskSnapshot
 from src.l3g_paper.runtime import LaneIIIPaperRuntime
 from src.l3g_paper.sessions import (
-    ASIA_GLOBEX_PROFILE, NEW_YORK_RTH_PROFILE, PaperCalendarState,
+    ASIA_PROFILE, NEW_YORK_RTH_PROFILE, NY_AFTER_PROFILE, PaperCalendarState,
     PaperSessionCalendar, PaperSessionKind, PaperSessionResolver,
 )
 from src.l3f_provider.tradovate_observation import StreamHealth
@@ -58,13 +58,16 @@ def healthy(context, at: str, **changes: object) -> PaperRiskSnapshot:
 class SessionClassificationTests(unittest.TestCase):
     def test_asia_and_new_york_boundaries_use_america_new_york(self) -> None:
         cases = (
-            ("2026-08-24T22:00:00Z", PaperSessionKind.ASIA_GLOBEX, "2026-08-25", False),  # Sunday 18:00 warmup
-            ("2026-08-25T03:59:00Z", PaperSessionKind.ASIA_GLOBEX, "2026-08-25", True),  # Monday 23:59
-            ("2026-08-25T04:00:00Z", PaperSessionKind.ASIA_GLOBEX, "2026-08-25", True),  # Tuesday 00:00
+            ("2026-08-24T22:00:00Z", PaperSessionKind.ASIA, "2026-08-25", False),  # Sunday 18:00 warmup
+            ("2026-08-25T03:59:00Z", PaperSessionKind.ASIA, "2026-08-25", True),  # Monday 23:59
+            ("2026-08-25T04:00:00Z", PaperSessionKind.ASIA, "2026-08-25", True),  # Tuesday 00:00
             ("2026-08-25T06:00:00Z", PaperSessionKind.OFF_SESSION, "2026-08-25", False),
             ("2026-08-25T13:30:00Z", PaperSessionKind.NEW_YORK_RTH, "2026-08-25", False),
             ("2026-08-25T13:35:00Z", PaperSessionKind.NEW_YORK_RTH, "2026-08-25", True),
             ("2026-08-25T19:30:00Z", PaperSessionKind.NEW_YORK_RTH, "2026-08-25", False),
+            ("2026-08-25T20:00:00Z", PaperSessionKind.NY_AFTER, "2026-08-25", False),
+            ("2026-08-25T20:05:00Z", PaperSessionKind.NY_AFTER, "2026-08-25", True),
+            ("2026-08-25T21:30:00Z", PaperSessionKind.NY_AFTER, "2026-08-25", False),
             ("2026-08-28T22:00:00Z", PaperSessionKind.OFF_SESSION, "2026-08-28", False),  # Friday 18:00
             ("2026-08-29T16:00:00Z", PaperSessionKind.OFF_SESSION, "2026-08-29", False),
         )
@@ -76,6 +79,17 @@ class SessionClassificationTests(unittest.TestCase):
                 self.assertEqual(result.entry_authorized, entry_authorized)
         hard_flat = resolved("2026-08-25T19:58:00Z").context
         self.assertTrue(hard_flat.hard_flat_due_at(datetime(2026, 8, 25, 19, 58, tzinfo=timezone.utc)))
+        ny_after_hard_flat = resolved("2026-08-25T21:58:00Z").context
+        self.assertTrue(ny_after_hard_flat.hard_flat_due_at(datetime(2026, 8, 25, 21, 58, tzinfo=timezone.utc)))
+        self.assertEqual(ny_after_hard_flat.session_family.value, "NEW_YORK")
+
+    def test_new_york_to_after_to_asia_are_distinct_local_evidence_domains(self) -> None:
+        rth = resolved("2026-08-25T19:59:00Z").context
+        after = resolved("2026-08-25T20:05:00Z").context
+        asia = resolved("2026-08-25T22:05:00Z").context
+        self.assertEqual((rth.session_family.value, after.session_family.value, asia.session_family.value), ("NEW_YORK", "NEW_YORK", "ASIA"))
+        self.assertEqual(len({rth.session_id, after.session_id, asia.session_id}), 3)
+        self.assertEqual(len({rth.session_profile_hash, after.session_profile_hash, asia.session_profile_hash}), 3)
 
     def test_holiday_required_fails_closed_and_dst_offsets_are_not_fixed(self) -> None:
         calendar = PaperSessionCalendar({"2026-08-25": PaperCalendarState.HOLIDAY_OVERRIDE_REQUIRED})
@@ -116,7 +130,7 @@ class SessionEvidenceTests(unittest.TestCase):
                 ny = ObservationFactory(start=datetime(2026, 8, 25, 13, 35, tzinfo=timezone.utc))
                 runtime.ingest(ny.quote(101))
                 second = runtime.status()
-                self.assertEqual(first["current_session"], "ASIA_GLOBEX")
+                self.assertEqual(first["current_session"], "ASIA")
                 self.assertEqual(second["current_session"], "NEW_YORK_RTH")
                 self.assertGreater(int(second["session_generation"]), int(first["session_generation"]))
                 self.assertTrue(any(item["kind"] == "SESSION_CLOSED" for item in ledger.recent(20, domain="SESSION")))
@@ -152,9 +166,9 @@ class SessionEvidenceTests(unittest.TestCase):
 
 
 class SessionRiskAndLedgerTests(unittest.TestCase):
-    def test_trade_date_risk_carries_from_asia_into_new_york(self) -> None:
-        asia = resolved("2026-08-24T22:05:00Z").context
+    def test_family_risk_carries_from_new_york_rth_into_ny_after(self) -> None:
         ny = resolved("2026-08-25T13:35:00Z").context
+        after = resolved("2026-08-25T20:05:00Z").context
         policy_decision = replace(warmed_bullish_policy()[2], created_at="2026-08-25T13:35:00Z", expires_at="2026-08-25T13:35:05Z")
         decision = replace(
             policy_decision, session_kind=ny.session_kind, session_id=ny.session_id, trade_date=ny.trade_date,
@@ -168,7 +182,8 @@ class SessionRiskAndLedgerTests(unittest.TestCase):
         self.assertFalse(authority.evaluate(intent, replace(ny_snapshot, trade_date_entry_count=RISK_PROFILE.maximum_session_entries), at="2026-08-25T13:35:00Z").granted)
         self.assertFalse(authority.evaluate(intent, replace(ny_snapshot, foreign_activity=True), at="2026-08-25T13:35:00Z").granted)
         self.assertFalse(authority.evaluate(intent, replace(ny_snapshot, unresolved_execution=True), at="2026-08-25T13:35:00Z").granted)
-        self.assertEqual(asia.trade_date, ny.trade_date)
+        self.assertEqual(after.trade_date, ny.trade_date)
+        self.assertEqual(after.session_family, ny.session_family)
 
     def test_ledger_filters_preserve_session_dimension(self) -> None:
         asia = resolved("2026-08-24T22:05:00Z").context
@@ -186,7 +201,7 @@ class NinjaSessionFenceSourceTests(unittest.TestCase):
     def test_compiled_addon_has_separate_session_and_time_fences(self) -> None:
         source = (Path(__file__).parents[1] / "ninjatrader" / "NinjaScript" / "AddOns" / "BeelzebubPaperExecutionAddOn.cs").read_text(encoding="utf-8")
         for marker in (
-            "America/New_York", "ASIA_GLOBEX", "NEW_YORK_RTH", "ValidatePaperSessionFence",
+            "America/New_York", "ASIA", "NEW_YORK_RTH", "NY_AFTER", "NEW_YORK", "ValidatePaperSessionFence",
             "SESSION_PROFILE_HASH_MISMATCH", "ENTRY_CUTOFF_PASSED", "SESSION_OFF_SESSION",
             "trade_date", "session_generation",
         ):
