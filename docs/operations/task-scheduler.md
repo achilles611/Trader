@@ -69,6 +69,9 @@ code, or bypass L3G fences. Lane III tasks are observe, verify, notify, or
 fixed-directory export only. Session-relative schedules force `SKIP` and fail
 closed when the existing L3G resolver cannot verify a valid window. Audit
 export writes sanitized JSON only to `logs/scheduler-audits/<run-id>.json`.
+Readiness calculates the age of the latest accepted authentic observation in
+UTC. A missing, invalid, stale, or future timestamp is `BLOCKED`; a timestamp
+exactly at `freshness_threshold_seconds` remains fresh.
 
 ## Health and recovery
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 import json
 import sqlite3
@@ -137,12 +138,54 @@ def _session_context(session: str) -> tuple[dict[str, Any], str | None]:
     return {}, "SESSION_CALENDAR_UNAVAILABLE"
 
 
+def _authentic_observation_freshness(
+    listener: Mapping[str, Any],
+    threshold_seconds: float,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    raw = listener.get("last_observation_at")
+    result: dict[str, Any] = {
+        "timestamp": raw,
+        "threshold_seconds": threshold_seconds,
+        "age_seconds": None,
+        "fresh": False,
+        "reason": None,
+    }
+    if not isinstance(raw, str) or not raw.strip():
+        result["reason"] = "MISSING_OBSERVATION_TIMESTAMP"
+        return result
+    try:
+        observed_at = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        result["reason"] = "INVALID_OBSERVATION_TIMESTAMP"
+        return result
+    if observed_at.tzinfo is None:
+        result["reason"] = "INVALID_OBSERVATION_TIMESTAMP"
+        return result
+    current = now or utc_now()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    age_seconds = (current.astimezone(timezone.utc) - observed_at.astimezone(timezone.utc)).total_seconds()
+    result["age_seconds"] = age_seconds
+    if age_seconds < 0:
+        result["reason"] = "FUTURE_OBSERVATION_TIMESTAMP"
+        return result
+    if age_seconds > threshold_seconds:
+        result["reason"] = "STALE_OBSERVATION_TIMESTAMP"
+        return result
+    result["fresh"] = True
+    result["reason"] = "FRESH"
+    return result
+
+
 def session_readiness(context: Any) -> TaskOutcome:
     config = context.configuration
     requested = config["session"]
     session, calendar_reason = _session_context(requested)
     listener = _dependency(context, "ninja_listener_health", {}) or {}
     runtime = _dependency(context, "lane_iii_paper_health", {}) or {}
+    observation_freshness = _authentic_observation_freshness(listener, config["freshness_threshold_seconds"])
     checks: dict[str, Any] = {
         "requested_session": requested,
         "session_resolution": session,
@@ -155,7 +198,7 @@ def session_readiness(context: Any) -> TaskOutcome:
         "zero_working_orders": int(runtime.get("working_owned_orders") or 0) == 0,
         "disarmed": str(runtime.get("session_armed_state") or runtime.get("paper_execution") or "DISARMED") == "DISARMED",
         "live_authority_denied": runtime.get("live_capital", "DENIED") == "DENIED",
-        "authentic_observation_fresh": bool(listener.get("last_observation_at") or listener.get("last_received_at")),
+        "authentic_observation_fresh": observation_freshness["fresh"],
         "mnq_metadata_present": bool(runtime.get("market_instrument")),
     }
     context.progress(1, 1, "READINESS", "Read-only session readiness checks completed.")
@@ -163,8 +206,8 @@ def session_readiness(context: Any) -> TaskOutcome:
     if calendar_reason or not session:
         unmet.append(calendar_reason or "SESSION_CALENDAR_UNAVAILABLE")
     if unmet:
-        return TaskOutcome(status="BLOCKED", result={"checks": checks, "unmet": unmet}, message="Session readiness is blocked; manual arming remains unavailable to the scheduler.")
-    return TaskOutcome(result={"checks": checks}, message="Session is ready for operator review; scheduler did not arm it.")
+        return TaskOutcome(status="BLOCKED", result={"checks": checks, "observation_freshness": observation_freshness, "unmet": unmet}, message="Session readiness is blocked; manual arming remains unavailable to the scheduler.")
+    return TaskOutcome(result={"checks": checks, "observation_freshness": observation_freshness}, message="Session is ready for operator review; scheduler did not arm it.")
 
 
 def session_close_audit(context: Any) -> TaskOutcome:

@@ -116,6 +116,8 @@ class NinjaTraderListenerRuntimeStatus:
     port: int
     error: str | None
     start_attempts: int
+    accepted_observations: int
+    last_observation_at: str | None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -124,6 +126,8 @@ class NinjaTraderListenerRuntimeStatus:
             "port": self.port,
             "error": self.error,
             "start_attempts": self.start_attempts,
+            "accepted_observations": self.accepted_observations,
+            "last_observation_at": self.last_observation_at,
             "authority": "OBSERVE_ONLY",
         }
 
@@ -356,6 +360,8 @@ class NinjaTraderListenerWorker:
         self._state = "NEW"
         self._error: str | None = None
         self._start_attempts = 0
+        self._accepted_observations = 0
+        self._last_observation_at: str | None = None
 
     def status(self) -> NinjaTraderListenerRuntimeStatus:
         with self._lock:
@@ -365,7 +371,17 @@ class NinjaTraderListenerWorker:
                 port=self.config.port,
                 error=self._error,
                 start_attempts=self._start_attempts,
+                accepted_observations=self._accepted_observations,
+                last_observation_at=self._last_observation_at,
             )
+
+    def _record_and_forward_observation(self, observation: NinjaTraderObservation) -> None:
+        with self._lock:
+            self._accepted_observations += 1
+            self._last_observation_at = observation.ninja_receipt_time
+            callback = self._on_observation
+        if callback is not None:
+            callback(observation)
 
     def set_observation_sinks(
         self,
@@ -421,10 +437,12 @@ class NinjaTraderListenerWorker:
             self._error = None
             self._state = "STARTING"
             self._start_attempts += 1
+            self._accepted_observations = 0
+            self._last_observation_at = None
             self._harness = NinjaTraderCommissioningHarness(
                 self.config,
                 on_listener_started=self._listener_started,
-                on_observation=self._on_observation,
+                on_observation=self._record_and_forward_observation,
                 on_local_bridge_state=self._on_local_bridge_state,
                 on_rejection=self._on_rejection,
                 on_duplicate=self._on_duplicate,

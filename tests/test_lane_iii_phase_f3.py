@@ -91,6 +91,15 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
         self.assertEqual(result.rejected, 1)
         self.assertEqual(result.safe_report()["error_details"], {"bridge_schema": 1})
 
+    def test_listener_status_tracks_latest_accepted_authentic_observation(self):
+        worker = NinjaTraderListenerWorker()
+        observation = LoopbackNinjaTraderBridge().accept_observation(frame("QUOTE", 1))
+        self.assertIsNotNone(observation)
+        worker._record_and_forward_observation(observation)
+        status = worker.status().as_dict()
+        self.assertEqual(status["accepted_observations"], 1)
+        self.assertEqual(status["last_observation_at"], TIME)
+
     def test_harness_reports_authoritative_empty_position_and_order_snapshots(self):
         account = {"alias": "Lucid25kflex01", "class": "PROVIDER_EVALUATION"}
         harness = NinjaTraderCommissioningHarness()

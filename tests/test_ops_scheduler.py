@@ -11,6 +11,7 @@ from src.ops_scheduler.models import AuthorityClassification, RunStatus, TaskOut
 from src.ops_scheduler.registry import TaskDefinition, TaskRegistry
 from src.ops_scheduler.service import SchedulerService
 from src.ops_scheduler.store import OperationsStore
+from src.ops_scheduler.tasks import _authentic_observation_freshness
 from src.ops_scheduler.triggers import resolve_occurrences
 
 
@@ -103,3 +104,49 @@ class OperationsSchedulerTests(unittest.TestCase):
                 "name": "Unsafe", "task_type": "test.observe", "task_configuration": {"value": "ok"},
                 "trigger_kind": "SESSION_RELATIVE", "trigger_specification": {"session": "ASIA", "event": "OPEN", "offset_minutes": 0}, "missed_run_policy": "BOUNDED_CATCH_UP",
             })
+
+
+class LaneIIIReadinessFreshnessTests(unittest.TestCase):
+    NOW = datetime(2026, 8, 25, 0, 30, tzinfo=timezone.utc)
+    THRESHOLD = 15.0
+
+    def freshness(self, timestamp: object) -> dict[str, object]:
+        listener = {} if timestamp is None else {"last_observation_at": timestamp}
+        return _authentic_observation_freshness(listener, self.THRESHOLD, now=self.NOW)
+
+    def test_fresh_observation(self) -> None:
+        result = self.freshness("2026-08-25T00:29:50Z")
+        self.assertTrue(result["fresh"])
+        self.assertEqual(result["age_seconds"], 10.0)
+
+    def test_exactly_at_threshold_observation(self) -> None:
+        result = self.freshness("2026-08-25T00:29:45Z")
+        self.assertTrue(result["fresh"])
+        self.assertEqual(result["age_seconds"], self.THRESHOLD)
+
+    def test_stale_observation(self) -> None:
+        result = self.freshness("2026-08-25T00:29:44.999999Z")
+        self.assertFalse(result["fresh"])
+        self.assertEqual(result["reason"], "STALE_OBSERVATION_TIMESTAMP")
+
+    def test_missing_observation(self) -> None:
+        result = self.freshness(None)
+        self.assertFalse(result["fresh"])
+        self.assertEqual(result["reason"], "MISSING_OBSERVATION_TIMESTAMP")
+
+    def test_transport_receive_timestamp_is_not_authentic_observation_evidence(self) -> None:
+        result = _authentic_observation_freshness(
+            {"last_received_at": "2026-08-25T00:29:59Z"}, self.THRESHOLD, now=self.NOW,
+        )
+        self.assertFalse(result["fresh"])
+        self.assertEqual(result["reason"], "MISSING_OBSERVATION_TIMESTAMP")
+
+    def test_invalid_observation(self) -> None:
+        result = self.freshness("not-a-timestamp")
+        self.assertFalse(result["fresh"])
+        self.assertEqual(result["reason"], "INVALID_OBSERVATION_TIMESTAMP")
+
+    def test_future_clock_skew_observation(self) -> None:
+        result = self.freshness("2026-08-25T00:30:00.000001Z")
+        self.assertFalse(result["fresh"])
+        self.assertEqual(result["reason"], "FUTURE_OBSERVATION_TIMESTAMP")
