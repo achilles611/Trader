@@ -955,5 +955,5 @@ class LaneIIIPaperRuntime:
                 "policy": policy,
                 "risk": risk,
                 "transport": transport,
-                "ledger": {"counts": self.ledger.counts(), "chain_valid": self.ledger.chain_status()[0]},
+                "ledger": self.ledger.health_status(),
             }

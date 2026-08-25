@@ -9,6 +9,35 @@ from src.l3g_paper.ledger import PaperLedger
 
 
 class PaperLedgerTests(unittest.TestCase):
+    def test_existing_malformed_image_fails_read_only_before_sidecars_or_schema(self) -> None:
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "malformed.sqlite3"
+            original = b"sealed malformed epoch evidence"
+            path.write_bytes(original)
+            with self.assertRaisesRegex(RuntimeError, "existing ledger quick_check failed") as raised:
+                PaperLedger(path)
+            self.assertIn(str(path.resolve()), str(raised.exception))
+            self.assertEqual(path.read_bytes(), original)
+            self.assertFalse(Path(str(path.resolve()) + "-wal").exists())
+            self.assertFalse(Path(str(path.resolve()) + "-shm").exists())
+
+    def test_health_status_exposes_cached_integrity_and_epoch_metadata(self) -> None:
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "Epoch-002" / "paper.sqlite3"
+            with PaperLedger(path) as ledger:
+                initial = ledger.health_status()
+                self.assertEqual(initial["epoch_id"], "L3G-PAPER-EPOCH-002")
+                self.assertEqual(initial["quick_check_state"], "ok")
+                self.assertTrue(initial["chain_valid"])
+                self.assertEqual(initial["highest_sequence"], 0)
+                ledger.append("COMMAND", {"command_id": "l3g-health"}, identity="l3g-health")
+                current = ledger.health_status()
+                self.assertEqual(current["highest_sequence"], 1)
+                self.assertIsNotNone(current["last_record_time"])
+                self.assertIsNotNone(current["final_record_hash"])
+                self.assertGreater(current["file_size"], 0)
+                self.assertGreater(current["free_bytes"], 0)
+
     def test_high_volume_wal_window_is_bounded_above_default_checkpoint(self) -> None:
         with TemporaryDirectory() as folder, PaperLedger(Path(folder) / "paper.sqlite3") as ledger:
             connection = ledger._connection

@@ -34,6 +34,7 @@ function payload(path: string) {
   if (path.startsWith("/api/discovery/jobs")) return discoveryJobResponse || { job_id: "discovery-1", status: "queued", stage: "queued", configuration: { preset: "standard", candidate_limit: 2500 } };
   if (path.startsWith("/api/execution/shadow/refresh")) return shadowResponse;
   if (path.startsWith("/api/execution")) return { shadow: shadowResponse };
+  if (path.startsWith("/api/lane-iii/paper")) return { state: "READY_DISARMED", ledger: { path: "E:\\BeelzebubData\\Hot\\LaneIII\\Epoch-002\\lane_iii_paper.sqlite3", epoch_id: "L3G-PAPER-EPOCH-002", file_size: 4096, free_bytes: 200000000000, quick_check_state: "ok", chain_valid: true, broken_identity: null, highest_sequence: 12, last_record_time: "2026-08-25T00:30:00Z", wal_size: 1024 } };
   if (path.startsWith("/api/system")) return { health: { mode: "paper", paper_only: true, database: { connected: true }, websocket: { available: true }, watcher: { state: "NOT_ATTACHED", desired_target_count: 0, subscribed_target_count: 0, membership_in_sync: true }, recovery: { wallets: [{ wallet: candidate.wallet, state: "RECOVERY_INCOMPLETE" }] } }, risk: { limits: [] } };
   if (path.startsWith("/api/candidates?")) return { items: emptyUniverse || filteredEmpty ? [] : [candidate], page: path.includes("page=2") ? 2 : 1, page_size: 50, total: emptyUniverse ? 0 : filteredEmpty ? 1 : 51, pages: 2 };
   if (path.startsWith(`/api/candidates/${candidate.wallet}`)) return { identity: { wallet: candidate.wallet, operator_state: "shadow", research_state: "qualified" }, score: { total: 87.3, eligible: true, components: { consistency: 9 }, penalties: { drawdown: 1 }, reasons: ["fixture_reason"] }, phase_a_prefilter_reasons: ["phase_a_fixture"], phase_b_hard_gates: ["phase_b_fixture"], target_performance: {}, follower_performance: {}, latency: { status: "unavailable" }, analysis_window: {} };
@@ -117,6 +118,16 @@ describe("copy control center", () => {
     expect(panel).toHaveTextContent("Desired targets");
     expect(panel).toHaveTextContent("IN SYNC");
     expect(panel).toHaveTextContent("Open sleeve wallets");
+  });
+
+  it("renders Lane III ledger health without triggering a full scan", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Lane III Paper" }));
+    const panel = (await screen.findByText("Ledger health")).closest("section");
+    expect(panel).toHaveTextContent("L3G-PAPER-EPOCH-002");
+    expect(panel).toHaveTextContent("VALID");
+    expect(panel).toHaveTextContent("Highest sequence");
+    expect(panel).toHaveTextContent("12");
   });
 
   it("makes Discovery the clear fresh-install starting point with bounded presets", async () => {

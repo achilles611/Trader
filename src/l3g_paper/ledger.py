@@ -7,6 +7,8 @@ from contextlib import contextmanager
 from datetime import date, datetime, timezone
 import json
 from pathlib import Path
+import re
+import shutil
 import sqlite3
 import threading
 from typing import Iterator, Mapping
@@ -34,6 +36,7 @@ _DOMAIN_TABLES = {
 }
 _HIGH_VOLUME_DOMAINS = frozenset({"OBSERVATION", "EVIDENCE", "DECISION"})
 _SECRET_KEYS = frozenset({"hmac_key", "password", "token", "connection_credentials", "private_key", "secret", "authorization"})
+_EPOCH_DIRECTORY = re.compile(r"^epoch-(\d+)$", re.IGNORECASE)
 
 
 def _now() -> str:
@@ -52,11 +55,38 @@ def _assert_redacted(value: object) -> None:
             _assert_redacted(item)
 
 
+def _read_only_quick_check(path: Path) -> str:
+    """Validate an existing image without creating schema or SQLite sidecars."""
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(f"{path.as_uri()}?mode=ro&immutable=1", uri=True)
+        rows = connection.execute("PRAGMA quick_check").fetchall()
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"LANE_III_PAPER existing ledger quick_check failed for {path}: {exc}") from exc
+    finally:
+        if connection is not None:
+            connection.close()
+    results = [str(row[0]) for row in rows]
+    if results != ["ok"]:
+        detail = "; ".join(results[:10]) or "no result"
+        raise RuntimeError(f"LANE_III_PAPER existing ledger quick_check failed for {path}: {detail}")
+    return "ok"
+
+
+def _epoch_id(path: Path) -> str:
+    for part in reversed(path.parts[:-1]):
+        match = _EPOCH_DIRECTORY.fullmatch(part)
+        if match:
+            return f"L3G-PAPER-EPOCH-{match.group(1)}"
+    return "UNSPECIFIED"
+
+
 class PaperLedger:
     """Thread-safe append-only domain ledger with one global hash chain."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).resolve()
+        existing_quick_check = _read_only_quick_check(self.path) if self.path.exists() else None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(str(self.path), check_same_thread=False, isolation_level=None)
@@ -76,9 +106,16 @@ class PaperLedger:
         self._connection.execute("PRAGMA foreign_keys=ON")
         self._current_session_context = UNSPECIFIED_OFF_SESSION_CONTEXT
         self._create_schema()
+        self._quick_check_state = existing_quick_check or str(self._connection.execute("PRAGMA quick_check").fetchone()[0])
         self._chain_status = self._verify_chain_uncached()
         rows = self._connection.execute("SELECT domain, COUNT(*) AS count FROM lane_iii_paper_audit GROUP BY domain").fetchall()
         self._counts_cache = {str(row["domain"]): int(row["count"]) for row in rows}
+        latest = self._connection.execute(
+            "SELECT ledger_sequence, occurred_at, record_hash FROM lane_iii_paper_audit ORDER BY ledger_sequence DESC LIMIT 1"
+        ).fetchone()
+        self._highest_sequence = 0 if latest is None else int(latest["ledger_sequence"])
+        self._last_record_time = None if latest is None else str(latest["occurred_at"])
+        self._final_record_hash = None if latest is None else str(latest["record_hash"])
         self._ordering_lock = threading.RLock()
         self._deferred_condition = threading.Condition(threading.Lock())
         self._deferred: deque[dict[str, object]] = deque()
@@ -283,7 +320,7 @@ class PaperLedger:
                 record_hash = canonical_hash(chained)
                 final = {**chained, "record_hash": record_hash}
                 serialized = json.dumps(final, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
-                connection.execute(
+                cursor = connection.execute(
                     """
                     INSERT INTO lane_iii_paper_audit
                         (identity, domain, kind, occurred_at, execution_session_id, payload_json, previous_record_hash, record_hash)
@@ -298,6 +335,9 @@ class PaperLedger:
                 previous_hash = record_hash
                 hashes.append(record_hash)
                 self._counts_cache[domain] = self._counts_cache.get(domain, 0) + 1
+                self._highest_sequence = int(cursor.lastrowid)
+                self._last_record_time = at
+                self._final_record_hash = record_hash
         return hashes
 
     def append_deferred(
@@ -431,6 +471,42 @@ class PaperLedger:
     def counts(self) -> dict[str, int]:
         with self._lock:
             return dict(self._counts_cache)
+
+    def health_status(self) -> dict[str, object]:
+        """Return cached integrity state plus inexpensive filesystem metadata."""
+        with self._lock:
+            chain_valid, broken_identity = self._chain_status
+            highest_sequence = self._highest_sequence
+            last_record_time = self._last_record_time
+            final_record_hash = self._final_record_hash
+            quick_check_state = self._quick_check_state
+        try:
+            file_size: int | None = self.path.stat().st_size
+        except OSError:
+            file_size = None
+        wal_path = Path(str(self.path) + "-wal")
+        try:
+            wal_size = wal_path.stat().st_size
+        except OSError:
+            wal_size = 0
+        try:
+            free_bytes: int | None = shutil.disk_usage(self.path.parent).free
+        except OSError:
+            free_bytes = None
+        return {
+            "path": str(self.path),
+            "epoch_id": _epoch_id(self.path),
+            "file_size": file_size,
+            "free_bytes": free_bytes,
+            "quick_check_state": quick_check_state,
+            "chain_valid": chain_valid,
+            "broken_identity": broken_identity,
+            "highest_sequence": highest_sequence,
+            "last_record_time": last_record_time,
+            "final_record_hash": final_record_hash,
+            "wal_size": wal_size,
+            "counts": self.counts(),
+        }
 
     def close(self) -> None:
         with self._ordering_lock:

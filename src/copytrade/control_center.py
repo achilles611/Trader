@@ -54,6 +54,18 @@ WATCHER_MAX_SUBSCRIPTIONS = 10
 NINJATRADER_RUNTIME_LOGGER = logging.getLogger("uvicorn.error")
 
 
+def _assert_hot_paper_ledger_path(paper_path: Path, cold_root: Path) -> None:
+    resolved_path = paper_path.resolve()
+    resolved_cold_root = cold_root.expanduser().resolve()
+    try:
+        resolved_path.relative_to(resolved_cold_root)
+    except ValueError:
+        return
+    raise RuntimeError(
+        f"LANE_III_PAPER active ledger path {resolved_path} may not reside under configured cold storage root {resolved_cold_root}"
+    )
+
+
 def _load(value: str | None, default: Any) -> Any:
     return json.loads(value) if value else default
 
@@ -1356,6 +1368,8 @@ def create_control_center_app(
                 "port": 48135,
                 "error": None,
                 "start_attempts": 0,
+                "accepted_observations": 0,
+                "last_observation_at": None,
                 "authority": "OBSERVE_ONLY",
             }
         return listener.status().as_dict()
@@ -1468,6 +1482,7 @@ def create_control_center_app(
                 if configured_paper_path
                 else Path(config.artifacts.database_path).resolve().with_name("lane_iii_paper.sqlite3")
             )
+            _assert_hot_paper_ledger_path(paper_path, config.storage.cold_root)
             paper_ledger = paper_ledger_factory(paper_path) if paper_ledger_factory is not None else PaperLedger(paper_path)
             if type(paper_ledger) is not PaperLedger:
                 raise RuntimeError("LANE_III_PAPER ledger factory must return the exact durable ledger")

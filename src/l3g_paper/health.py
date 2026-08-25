@@ -27,4 +27,5 @@ def sanitized_paper_health(status: Mapping[str, object]) -> dict[str, object]:
         "combined_trade_date_pnl": status.get("combined_trade_date_pnl", "0"),
         "lockout_or_fault_reason": status.get("lockout_or_fault_reason"),
         "transport": status.get("transport"),
+        "ledger": status.get("ledger"),
     }

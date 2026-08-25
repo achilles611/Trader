@@ -26,6 +26,13 @@ reconciliation.
 The audit database path may be relocated with
 `BEELZEBUB_L3G_PAPER_LEDGER`; this setting changes storage location only and
 cannot change account, instrument, quantity, mode, or execution authority.
+The active path must be on local SSD hot storage and startup fails closed when
+the resolved path is inside `storage.cold_root`. Existing images receive a
+read-only `PRAGMA quick_check` before normal SQLite open, schema creation, WAL
+configuration, or chain scanning; malformed images are never repaired,
+replaced, salvaged, or used to seed a new epoch automatically. `D:\BeelzebubData`
+is cold/archive storage only. Recovered images are forensic evidence only, and
+unrecoverable corruption requires an explicitly commissioned clean epoch.
 Evidence and `NO_TRADE` decisions enter one ordered, non-dropping writer and
 commit in bounded WAL batches at `synchronous=NORMAL` so authentic depth cannot
 outrun persistence. Any decision eligible to cause a paper side effect first
