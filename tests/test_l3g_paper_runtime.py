@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from decimal import Decimal
@@ -10,7 +11,7 @@ from src.l3g_paper.ledger import PaperLedger
 from src.l3g_paper.ninjatrader_transport import PaperExecutionTransport
 from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout
 from src.l3g_paper.contracts import PaperRuntimeState
-from .l3g_helpers import warmed_bullish_policy
+from .l3g_helpers import ObservationFactory, warmed_bullish_policy
 
 
 class PaperRuntimeTests(unittest.TestCase):
@@ -37,6 +38,26 @@ class PaperRuntimeTests(unittest.TestCase):
             })
             self.assertEqual(runtime.state.value, "READY_DISARMED")
             self.assertFalse(runtime.arm()["armed"])
+            runtime.stop(); ledger.close()
+
+    def test_backward_provider_timestamp_does_not_close_the_current_paper_session(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            runtime = LaneIIIPaperRuntime(ledger)
+            factory = ObservationFactory(start=datetime(2026, 8, 25, 19, 0, tzinfo=timezone.utc))
+            first = factory.quote(100); runtime.ingest(first)
+            first_status = runtime.status()
+            crossing = factory.depth("ADD", 10)
+            earlier_provider_time = (datetime.fromisoformat(first.provider_timestamp.replace("Z", "+00:00")) - timedelta(milliseconds=50)).isoformat().replace("+00:00", "Z")
+            crossing = type(crossing)(
+                crossing.observation_id, crossing.session_id, crossing.observation_type,
+                crossing.ninja_receipt_time, crossing.local_monotonic_sequence,
+                crossing.payload, provider_timestamp=earlier_provider_time,
+            )
+            runtime.ingest(crossing)
+            second_status = runtime.status()
+            self.assertEqual(second_status["current_session_id"], first_status["current_session_id"])
+            self.assertEqual(second_status["session_generation"], first_status["session_generation"])
             runtime.stop(); ledger.close()
 
     def test_fanout_isolates_sink_failures_and_preserves_both_deliveries(self) -> None:

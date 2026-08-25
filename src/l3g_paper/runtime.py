@@ -168,7 +168,10 @@ class LaneIIIPaperRuntime:
 
     @staticmethod
     def _market_event_timestamp(observation: NinjaTraderObservation) -> str:
-        return observation.exchange_timestamp or observation.provider_timestamp or observation.ninja_receipt_time
+        # This runtime's declared sequence authority is the queue-locked
+        # local callback order. Provider and exchange timestamps are recorded
+        # as immutable provenance, but are not a cross-stream ordering clock.
+        return observation.ninja_receipt_time
 
     @staticmethod
     def _context_payload(context: PaperSessionContext) -> dict[str, object]:

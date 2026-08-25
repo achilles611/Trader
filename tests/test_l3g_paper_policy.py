@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from src.l3f_provider.tradovate_observation import StreamHealth
 from src.l3g_paper.contracts import PaperDecisionKind, PaperDirection
@@ -155,6 +155,33 @@ class PaperPolicyTests(unittest.TestCase):
         decision = policy.ingest(crossing)
         self.assertNotEqual(decision.reason_code, "TIMESTAMP_MOVED_BACKWARD")
         self.assertEqual(policy.status()["counters"]["resets"], 1)  # connection recovery only
+
+    def test_backward_provider_clock_cannot_reset_local_callback_evidence(self) -> None:
+        policy = ExperimentalPaperPolicy(); policy.on_transport_state(StreamHealth.HEALTHY)
+        factory = ObservationFactory(); policy.ingest(factory.make("CONNECTION", {"scope": "MARKET_DATA", "price_status": "Connected"}))
+        first = factory.quote(100); policy.ingest(first)
+        crossing = factory.depth("ADD", 10)
+        earlier_provider_time = (datetime.fromisoformat(first.provider_timestamp.replace("Z", "+00:00")) - timedelta(milliseconds=50)).isoformat().replace("+00:00", "Z")
+        crossing = type(crossing)(
+            crossing.observation_id, crossing.session_id, crossing.observation_type,
+            crossing.ninja_receipt_time, crossing.local_monotonic_sequence,
+            crossing.payload, provider_timestamp=earlier_provider_time,
+        )
+        decision = policy.ingest(crossing)
+        self.assertNotEqual(decision.reason_code, "TIMESTAMP_MOVED_BACKWARD")
+        self.assertEqual(policy.status()["counters"]["resets"], 1)  # connection recovery only
+
+    def test_small_provider_clock_skew_is_bounded_but_not_rejected(self) -> None:
+        policy = ExperimentalPaperPolicy(); policy.on_transport_state(StreamHealth.HEALTHY)
+        factory = ObservationFactory(); policy.ingest(factory.make("CONNECTION", {"scope": "MARKET_DATA", "price_status": "Connected"}))
+        quote = factory.quote(100)
+        provider_time = (datetime.fromisoformat(quote.ninja_receipt_time.replace("Z", "+00:00")) + timedelta(milliseconds=1200)).isoformat().replace("+00:00", "Z")
+        quote = type(quote)(
+            quote.observation_id, quote.session_id, quote.observation_type,
+            quote.ninja_receipt_time, quote.local_monotonic_sequence,
+            quote.payload, provider_timestamp=provider_time,
+        )
+        self.assertNotEqual(policy.ingest(quote).reason_code, "FUTURE_EVENT_TIMESTAMP")
 
     def test_provider_event_older_than_idle_boundary_is_stale(self) -> None:
         policy = ExperimentalPaperPolicy(); policy.on_transport_state(StreamHealth.HEALTHY)

@@ -42,6 +42,9 @@ from .sessions import (
 )
 
 
+MAXIMUM_PROVIDER_FUTURE_SKEW = timedelta(milliseconds=1250)
+
+
 @dataclass(frozen=True)
 class ClassifiedTrade:
     observation_id: str
@@ -257,7 +260,13 @@ class ExperimentalPaperPolicy:
 
     @staticmethod
     def _market_event_timestamp(observation: NinjaTraderObservation) -> str:
-        return observation.exchange_timestamp or observation.provider_timestamp or observation.ninja_receipt_time
+        # Quote, trade, and depth provider clocks are independent and may
+        # legitimately cross.  The AddOn emits ninja_receipt_time under the
+        # same lock as local_monotonic_sequence, making it the only safe
+        # temporal authority for this local-callback policy.  Provider and
+        # exchange times remain durable source provenance and are separately
+        # checked below for bounded freshness.
+        return observation.ninja_receipt_time
 
     def _validate_time(self, observation: NinjaTraderObservation) -> str | None:
         receipt_time = self._time(self._market_event_timestamp(observation), "Paper market event time")
@@ -267,7 +276,7 @@ class ExperimentalPaperPolicy:
         if observation.provider_timestamp is not None:
             provider_time = self._time(observation.provider_timestamp, "Provider event time")
             receipt = self._time(observation.ninja_receipt_time, "NinjaTrader receipt time")
-            if provider_time > receipt + timedelta(seconds=1):
+            if provider_time > receipt + MAXIMUM_PROVIDER_FUTURE_SKEW:
                 self._clear_provisional()
                 return "FUTURE_EVENT_TIMESTAMP"
             if receipt - provider_time > timedelta(seconds=self.artifact.hypothesis_idle_lifetime_seconds):
