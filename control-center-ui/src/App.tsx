@@ -126,7 +126,7 @@ export function App() {
       {page === "Activity" && <ActivityPage liveItems={liveActivity} />}
       {page === "System" && <><SystemPage control={control} watcherHealth={watcherHealth} /><ShadowObservationStatus /></>}
     </main>
-    {toast && <div className={`toast ${toast.tone}`} role="alert"><span>{toast.tone === "error" ? "Action failed" : toast.tone === "warning" ? "Warning" : "Updated"}</span>{toast.message}<button onClick={() => setToast(null)} aria-label="Dismiss notification">×</button></div>}
+    {toast && <div className={`toast ${toast.tone}`} role="alert"><span className="toast-title">{toast.tone === "error" ? "Action failed" : toast.tone === "warning" ? "Warning" : "Updated"}</span><span className="toast-message">{toast.message}</span><button onClick={() => setToast(null)} aria-label="Dismiss notification">×</button></div>}
     {confirmation && <ConfirmationDialog item={confirmation} close={() => setConfirmation(null)} />}
   </div>;
 }
@@ -350,7 +350,7 @@ function CandidateDossier({ detail, close, action }: { detail: Record<string, an
 
 function ConfirmationDialog({ item, close }: { item: NonNullable<Confirmation>; close: () => void }) {
   const [busy, setBusy] = useState(false); const confirm = async () => { setBusy(true); await item.action(); setBusy(false); close(); };
-  return <div className="modal-backdrop" role="presentation"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><span className="eyebrow">CONSEQUENTIAL PAPER ACTION</span><h2 id="confirm-title">{item.title}</h2><p>{item.body}</p><div><button className="button minor" onClick={close} disabled={busy}>Cancel</button><button className="button critical" onClick={() => void confirm()} disabled={busy}>{busy ? "Working…" : item.confirm}</button></div></section></div>;
+  return <div className="modal-backdrop" role="presentation"><section className="modal confirmation-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-description"><header className="modal-header"><div><span className="eyebrow">CONSEQUENTIAL PAPER ACTION</span><h2 id="confirm-title">{item.title}</h2></div></header><p id="confirm-description">{item.body}</p><footer className="modal-footer"><button className="button minor" onClick={close} disabled={busy}>Cancel</button><div><button className="button critical" onClick={() => void confirm()} disabled={busy}>{busy ? "Working…" : item.confirm}</button></div></footer></section></div>;
 }
 
 function PanelTitle({ title, subtitle, action, onAction }: { title: string; subtitle?: string; action?: string; onAction?: () => void }) { return <div className="panel-title"><div><h2>{title}</h2>{subtitle && <p>{subtitle}</p>}</div>{action && <button className="link-button" onClick={onAction}>{action} →</button>}</div>; }

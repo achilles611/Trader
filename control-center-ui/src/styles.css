@@ -117,3 +117,153 @@ body { background: radial-gradient(ellipse at 68% -10%, rgba(89, 47, 138, .18), 
 .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 14px 0; }.metric-card { min-width: 0; padding: 10px; border: 1px solid #4a3a60; background: #0c0913; }.metric-card span, .metric-card strong { display: block; }.metric-card span { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .06em; }.metric-card strong { color: var(--gold-bright); font-size: 17px; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; }
 @media (max-width: 1300px) { .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 1300px) { .science-layout { grid-template-columns: 1fr; }.science-rail { grid-template-columns: repeat(2, minmax(0, 1fr)); }.ecosystem-map { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+/* Shared window and operations-form system.  These rules deliberately apply
+   to every overlay surface so scheduler, dossier, confirmation, and toast
+   ergonomics stay aligned without moving operational logic into the UI. */
+button, input, select, textarea { font: inherit; }
+
+.modal-backdrop {
+  z-index: 20;
+  padding: 24px;
+  overflow: auto;
+  place-items: center;
+}
+
+.modal {
+  width: min(460px, calc(100vw - 48px));
+  max-height: min(720px, calc(100vh - 48px));
+  min-width: 0;
+  overflow: auto;
+  padding: 20px 22px;
+  background: #121020;
+  border-color: #655077;
+}
+
+.modal h2 {
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+
+.modal p {
+  max-width: 68ch;
+  overflow-wrap: anywhere;
+}
+
+.modal-header,
+.dossier header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.modal-header h2 { margin-bottom: 0; }
+
+.icon-button {
+  display: inline-grid;
+  flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  line-height: 1;
+}
+
+.icon-button:hover:not(:disabled),
+.icon-button:focus-visible {
+  color: var(--gold-bright);
+  border-color: #655077;
+  background: #21182e;
+}
+
+.scheduler-form {
+  width: min(900px, calc(100vw - 48px));
+  max-height: min(900px, calc(100vh - 48px));
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  overflow: hidden;
+  padding: 0;
+}
+
+.scheduler-form .modal-header { padding: 18px 22px 14px; border-bottom: 1px solid var(--border); }
+.modal > .modal-body { display: block; min-height: 0; margin-top: 0; overflow-y: auto; overflow-x: hidden; padding: 16px 22px 18px; overscroll-behavior: contain; }
+.modal-intro { margin-bottom: 14px; }
+
+.form-section { padding: 15px 0; border-top: 1px solid rgba(101, 80, 119, .48); }
+.form-section:first-of-type { padding-top: 0; border-top: 0; }
+.form-section h3 { margin-bottom: 10px; color: var(--gold-bright); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; }
+.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px; }
+.form-field { min-width: 0; display: grid; gap: 6px; }
+.form-field.full, .task-authority.full { grid-column: 1 / -1; }
+.form-field label { color: #d9cee8; font-size: 11px; font-weight: 700; letter-spacing: .02em; }
+.form-field input, .form-field select, .form-field textarea {
+  width: 100%;
+  min-width: 0;
+  min-height: 36px;
+  padding: 7px 9px;
+  color: var(--text);
+  background: #0c0913;
+  border: 1px solid #58456b;
+  border-radius: 4px;
+  outline: none;
+}
+.form-field textarea { min-height: 84px; resize: vertical; line-height: 1.45; }
+.form-field input:focus, .form-field select:focus, .form-field textarea:focus { border-color: var(--gold-bright); box-shadow: 0 0 0 2px rgba(245, 200, 102, .16); }
+.form-field select:disabled { color: #b1a7be; background: #181321; border-color: #4d4160; opacity: .82; cursor: not-allowed; }
+.form-help { color: var(--muted); font-size: 11px; line-height: 1.45; }
+
+.task-authority { padding: 10px 12px; border: 1px solid #4d4160; border-left: 3px solid var(--purple); background: #171223; }
+.task-authority > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.task-authority strong { color: var(--text); font-size: 12px; }
+.task-authority span { flex: 0 0 auto; color: var(--gold-bright); font-size: 10px; font-weight: 800; letter-spacing: .08em; }
+.task-authority p { margin-top: 5px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+
+.form-warning { display: grid; gap: 5px; margin-top: 12px; padding: 10px 12px; border: 1px solid #a17035; border-left-width: 3px; background: #322313; color: #ffdda0; }
+.form-warning strong { color: #fff0b8; font-size: 10px; letter-spacing: .08em; }
+.form-warning p { color: inherit; font-size: 11px; line-height: 1.45; }
+.preview-section .reason-list { margin-top: 0; }
+
+.modal-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 22px; border-top: 1px solid var(--border); background: #121020; }
+.modal-footer > div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.confirmation-dialog { overflow: hidden; }
+.confirmation-dialog .modal-footer { margin: 20px -22px -20px; }
+
+.dossier {
+  z-index: 15;
+  width: min(560px, calc(100vw - 32px));
+  max-width: 100%;
+  height: 100dvh;
+  padding: 18px 20px;
+  overflow-x: hidden;
+  background: #0d0915;
+  border-left-color: #655077;
+}
+.dossier header { position: sticky; top: -18px; z-index: 1; padding: 18px 0 12px; margin-top: -18px; background: #0d0915; }
+.dossier-title { max-width: 430px; overflow-wrap: anywhere; line-height: 1.45; }
+.dossier-actions { gap: 7px; padding: 13px 0; }
+.dossier section { min-width: 0; padding: 14px 0; }
+.dossier pre { max-width: 100%; max-height: min(46vh, 360px); padding: 10px; white-space: pre-wrap; overflow: auto; overflow-wrap: anywhere; border: 1px solid #30253f; border-radius: 3px; background: #090711; }
+.detail-summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 14px; margin: 14px 0 0; }
+.detail-summary > div { min-width: 0; padding: 8px 0; border-bottom: 1px solid #2c233a; }
+.detail-summary dt { color: var(--muted); font-size: 10px; letter-spacing: .06em; text-transform: uppercase; }
+.detail-summary dd { margin: 3px 0 0; color: var(--text); font-size: 12px; overflow-wrap: anywhere; }
+.detail-json h3 { margin-bottom: 8px; }
+
+.toast { z-index: 25; right: 16px; bottom: 16px; width: min(520px, calc(100vw - 32px)); min-width: 0; max-width: calc(100vw - 32px); grid-template-columns: auto minmax(0, 1fr) 24px; padding: 12px; }
+.toast-message { min-width: 0; overflow-wrap: anywhere; line-height: 1.45; }
+.toast button { width: 24px; height: 24px; padding: 0; border-radius: 3px; }
+.toast button:hover { background: rgba(255, 255, 255, .1); }
+
+@media (max-width: 700px) {
+  .modal-backdrop { padding: 14px; }
+  .scheduler-form, .modal { width: min(100%, calc(100vw - 28px)); max-height: calc(100vh - 28px); }
+  .form-grid, .detail-summary { grid-template-columns: 1fr; }
+  .form-field.full, .task-authority.full { grid-column: auto; }
+  .modal-footer { align-items: stretch; flex-direction: column-reverse; }
+  .modal-footer > div { width: 100%; }
+  .modal-footer > div .button { flex: 1; }
+  .dossier { width: min(100%, calc(100vw - 16px)); }
+}
