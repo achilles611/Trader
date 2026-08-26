@@ -14,7 +14,7 @@ import select
 import socket
 import threading
 import time
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 from .ninjatrader_observation import (
     AccountClass, LOOPBACK_HOST, LoopbackBridgeConfig, LoopbackNinjaTraderBridge,
@@ -118,6 +118,9 @@ class NinjaTraderListenerRuntimeStatus:
     start_attempts: int
     accepted_observations: int
     last_observation_at: str | None
+    observation_types: Mapping[str, int]
+    last_level_one_at: str | None
+    last_depth_at: str | None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -128,6 +131,13 @@ class NinjaTraderListenerRuntimeStatus:
             "start_attempts": self.start_attempts,
             "accepted_observations": self.accepted_observations,
             "last_observation_at": self.last_observation_at,
+            "observation_types": dict(sorted(self.observation_types.items())),
+            "market_observer_state": "ACTIVE" if self.last_level_one_at is not None else "NOT_ACTIVE",
+            "market_observer_active": self.last_level_one_at is not None,
+            "market_observer_level_one_received": self.last_level_one_at is not None,
+            "market_observer_depth_received": self.last_depth_at is not None,
+            "last_level_one_at": self.last_level_one_at,
+            "last_depth_at": self.last_depth_at,
             "authority": "OBSERVE_ONLY",
         }
 
@@ -362,6 +372,9 @@ class NinjaTraderListenerWorker:
         self._start_attempts = 0
         self._accepted_observations = 0
         self._last_observation_at: str | None = None
+        self._observation_types: dict[str, int] = {}
+        self._last_level_one_at: str | None = None
+        self._last_depth_at: str | None = None
 
     def status(self) -> NinjaTraderListenerRuntimeStatus:
         with self._lock:
@@ -373,12 +386,21 @@ class NinjaTraderListenerWorker:
                 start_attempts=self._start_attempts,
                 accepted_observations=self._accepted_observations,
                 last_observation_at=self._last_observation_at,
+                observation_types=dict(self._observation_types),
+                last_level_one_at=self._last_level_one_at,
+                last_depth_at=self._last_depth_at,
             )
 
     def _record_and_forward_observation(self, observation: NinjaTraderObservation) -> None:
         with self._lock:
             self._accepted_observations += 1
             self._last_observation_at = observation.ninja_receipt_time
+            kind = observation.observation_type
+            self._observation_types[kind] = self._observation_types.get(kind, 0) + 1
+            if kind in {"QUOTE", "TRADE"}:
+                self._last_level_one_at = observation.ninja_receipt_time
+            elif kind == "DEPTH":
+                self._last_depth_at = observation.ninja_receipt_time
             callback = self._on_observation
         if callback is not None:
             callback(observation)
@@ -439,6 +461,9 @@ class NinjaTraderListenerWorker:
             self._start_attempts += 1
             self._accepted_observations = 0
             self._last_observation_at = None
+            self._observation_types = {}
+            self._last_level_one_at = None
+            self._last_depth_at = None
             self._harness = NinjaTraderCommissioningHarness(
                 self.config,
                 on_listener_started=self._listener_started,

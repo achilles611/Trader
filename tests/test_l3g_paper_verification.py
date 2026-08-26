@@ -233,8 +233,12 @@ class LocalLedgerVerificationTests(unittest.TestCase):
                 # A new controller mirrors a browser/API refresh: it reads the
                 # artifact only and does not own or terminate the child scan.
                 status = LocalLedgerVerificationController(path, root / "runtime" / "audit").status()
-            self.assertEqual(status["status"], "PASS")
+            log_path = controller.paths.log(str(status.get("verification_id") or "missing"))
+            verifier_log = log_path.read_text(encoding="utf-8") if log_path.exists() else "<missing verifier log>"
+            self.assertEqual(status["status"], "PASS", verifier_log)
             self.assertEqual(status["verification_mode"], "full")
+            self.assertTrue(controller.checkpoint_matches_report(status))
+            self.assertFalse(controller.checkpoint_matches_report({**status, "last_full_verification_id": "wrong"}))
             # Reap the detached child handle if its final artifact raced its
             # process exit; this is not needed for artifact consumption.
             for _ in range(20):

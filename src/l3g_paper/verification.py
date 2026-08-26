@@ -1008,6 +1008,17 @@ class LocalLedgerVerificationController:
             return False
         if checkpoint.get("last_verified_hash") != report.get("tip_hash"):
             return False
+        comparisons = (
+            ("ledger_identity", "ledger_identity"),
+            ("ledger_epoch", "ledger_epoch"),
+            ("schema_version", "ledger_schema_version"),
+            ("last_full_verification_id", "last_full_verification_id"),
+            ("last_full_verified_sequence", "last_full_verified_sequence"),
+            ("last_full_verified_hash", "last_full_verified_hash"),
+            ("last_full_quick_check_at", "last_full_quick_check_at"),
+        )
+        if any(checkpoint.get(checkpoint_key) != report.get(report_key) for checkpoint_key, report_key in comparisons):
+            return False
         saved_identity = checkpoint.get("file_identity")
         current_identity = _file_identity(self.ledger_path)
         return isinstance(saved_identity, Mapping) and all(

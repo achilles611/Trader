@@ -22,6 +22,7 @@ from typing import Any, Callable, Iterator, Mapping
 
 from src.l3f_provider.ninjatrader_commission import NinjaTraderListenerWorker
 from src.l3f_provider.shadow_runtime import LaneIIIShadowRuntime
+from src.l3g_paper.commissioning import CommissioningLedgerGateError, evaluate_commissioning_ledger_gate
 from src.l3g_paper.health import ledger_health_projection, sanitized_paper_health
 from src.l3g_paper.ledger import PaperLedger, resolve_ledger_epoch
 from src.l3g_paper.ninjatrader_login import NinjaTraderLoginBootstrap, NinjaTraderLoginState
@@ -34,7 +35,7 @@ from src.ops_scheduler.models import ScheduleLifecycle
 from src.ops_scheduler.registry import TaskRegistry
 from src.ops_scheduler.service import SchedulerService
 from src.ops_scheduler.store import OperationsStore
-from src.ops_scheduler.tasks import production_task_definitions
+from src.ops_scheduler.tasks import _authentic_observation_freshness, production_task_definitions
 
 from .config import CopyTradeConfig
 from .contracts import PHASE_B_RECOMMENDATION_SCHEMA_VERSION
@@ -56,6 +57,7 @@ OPERATOR_STATES = {"new", "approved", "shadow", "active", "muted", "rejected"}
 WATCHER_MAX_SUBSCRIPTIONS = 10
 NINJATRADER_RUNTIME_LOGGER = logging.getLogger("uvicorn.error")
 LEDGER_VERIFICATION_FRESHNESS_SECONDS = 15 * 60
+MARKET_OBSERVER_ACTIVE_FRESHNESS_SECONDS = 15.0
 
 
 def _assert_hot_paper_ledger_path(paper_path: Path, cold_root: Path) -> None:
@@ -1405,9 +1407,34 @@ def create_control_center_app(
                 "start_attempts": 0,
                 "accepted_observations": 0,
                 "last_observation_at": None,
+                "observation_types": {},
+                "market_observer_state": "NOT_ACTIVE",
+                "market_observer_active": False,
+                "market_observer_level_one_received": False,
+                "market_observer_depth_received": False,
+                "last_level_one_at": None,
+                "last_depth_at": None,
+                "market_observer_freshness": {
+                    "timestamp": None,
+                    "threshold_seconds": MARKET_OBSERVER_ACTIVE_FRESHNESS_SECONDS,
+                    "age_seconds": None,
+                    "fresh": False,
+                    "reason": "MISSING_OBSERVATION_TIMESTAMP",
+                },
                 "authority": "OBSERVE_ONLY",
             }
-        return listener.status().as_dict()
+        value = listener.status().as_dict()
+        freshness = _authentic_observation_freshness(
+            {"last_observation_at": value.get("last_level_one_at")},
+            MARKET_OBSERVER_ACTIVE_FRESHNESS_SECONDS,
+        )
+        received = value.get("market_observer_level_one_received") is True
+        value.update({
+            "market_observer_active": freshness["fresh"],
+            "market_observer_state": "ACTIVE" if freshness["fresh"] else "STALE" if received else "NOT_ACTIVE",
+            "market_observer_freshness": freshness,
+        })
+        return value
 
     def ninja_login_health() -> dict[str, object]:
         bootstrap = ninjatrader_runtime.get("login_bootstrap")
@@ -1457,10 +1484,12 @@ def create_control_center_app(
                 "market_instrument": "MNQ SEP26",
                 "maximum_quantity": 1,
                 "live_capital": "DENIED",
+                "market_observer": ninja_listener_health(),
                 "ledger_verification": ledger_verifier.status(),
             }
         status = paper.status()
         verification = ledger_verifier.status()
+        status["market_observer"] = ninja_listener_health()
         status["ledger_verification"] = verification
         raw_ledger = status.get("ledger")
         if isinstance(raw_ledger, Mapping):
@@ -1682,43 +1711,48 @@ def create_control_center_app(
     def ledger_verification_status() -> dict[str, Any]:
         return ledger_verifier.status()
 
-    def require_commissioning_ledger_verification() -> None:
-        """Fail closed on the compact local artifact; never scan in this route."""
-        status = ledger_verification_status()
-        current_status = str(status.get("status") or "UNVERIFIED")
-        if current_status == "IN_PROGRESS":
-            raise HTTPException(status_code=409, detail="Local ledger verification is in progress; commissioning remains denied until PASS.")
-        if current_status == "FAIL":
-            detail = "Local ledger verification failed"
-            if status.get("full_scan_required"):
-                detail += "; an explicit full verification is required"
-            raise HTTPException(status_code=409, detail=detail + ".")
-        if current_status not in {"PASS"}:
-            launched = ledger_verifier.start("auto")
+    def require_commissioning_ledger_verification(
+        commissioning_id: str, runtime_snapshot: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Evaluate one immutable verified-anchor/live-tail snapshot under the runtime lock."""
+        observer = ninja_listener_health()
+        if observer.get("state") == "LISTENING" and observer.get("market_observer_active") is not True:
             raise HTTPException(
                 status_code=409,
-                detail=f"Local ledger verification is required and was launched ({launched.get('verification_id', 'local run')}). Commissioning remains denied until PASS.",
+                detail=(
+                    "MARKET_OBSERVER_NOT_ACTIVE: market-data connectivity may exist, but "
+                    "BeelzebubReadOnlyMarketObserver has produced no QUOTE/TRADE events."
+                ),
             )
-        if (
-            status.get("chain_valid") is not True
-            or status.get("checkpoint_valid") is not True
-            or status.get("full_scan_required")
-            or not ledger_verifier.checkpoint_matches_report(status)
-        ):
-            raise HTTPException(status_code=409, detail="Latest local ledger verification is not a trusted PASS.")
-        completed = status.get("completed_at")
-        try:
-            age = (datetime.now(timezone.utc) - datetime.fromisoformat(str(completed).replace("Z", "+00:00"))).total_seconds()
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=409, detail="Latest local ledger verification has no valid completion timestamp.")
-        if age < 0 or age > LEDGER_VERIFICATION_FRESHNESS_SECONDS:
-            launched = ledger_verifier.start("auto")
-            raise HTTPException(status_code=409, detail=f"Local ledger verification is stale and was launched ({launched.get('verification_id', 'local run')}). Commissioning remains denied until PASS.")
+        status = ledger_verification_status()
         ledger = ninjatrader_runtime.get("paper_ledger")
-        current_tip = 0 if ledger is None else int(ledger.health_status().get("highest_sequence") or 0)
-        if int(status.get("verified_through_sequence") or -1) < current_tip:
-            launched = ledger_verifier.start("auto")
-            raise HTTPException(status_code=409, detail=f"Ledger has an unverified local tail and incremental verification was launched ({launched.get('verification_id', 'local run')}). Commissioning remains denied until PASS.")
+        verified = status.get("verified_through_sequence")
+        full_sequence = status.get("last_full_verified_sequence")
+        tail: Mapping[str, object] = {}
+        if type(ledger) is PaperLedger and type(verified) is int and type(full_sequence) is int:
+            try:
+                tail = ledger.commissioning_tail_snapshot(
+                    verified, last_full_verified_sequence=full_sequence
+                )
+            except (RuntimeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"COMMISSIONING_LEDGER_TAIL_UNCLASSIFIED: {exc}",
+                ) from exc
+        try:
+            return evaluate_commissioning_ledger_gate(
+                status,
+                tail,
+                {**dict(runtime_snapshot), "commissioning_id": commissioning_id},
+                checkpoint_matches_report=ledger_verifier.checkpoint_matches_report(status),
+                freshness_seconds=LEDGER_VERIFICATION_FRESHNESS_SECONDS,
+            )
+        except CommissioningLedgerGateError as exc:
+            launch_detail = ""
+            if exc.launch_auto:
+                launched = ledger_verifier.start("auto")
+                launch_detail = f" Auto verification launched ({launched.get('verification_id', 'local run')})."
+            raise HTTPException(status_code=409, detail=f"{exc.code}: {exc}.{launch_detail}") from exc
 
     def _ledger_schedule() -> dict[str, Any] | None:
         schedules = scheduler_service.schedules(task_type="lane_iii.ledger_verification", page=1, page_size=10).get("items", [])
@@ -2016,7 +2050,6 @@ def create_control_center_app(
         paper = ninjatrader_runtime.get("paper")
         if paper is None:
             raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
-        require_commissioning_ledger_verification()
         bootstrap = ninjatrader_runtime.get("login_bootstrap")
         if bootstrap is not None and bootstrap.state is not NinjaTraderLoginState.AUTHENTICATED:
             # A BeezConsole-only restart can outlast the bounded desktop UI
@@ -2039,7 +2072,6 @@ def create_control_center_app(
         paper = ninjatrader_runtime.get("paper")
         if paper is None:
             raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
-        require_commissioning_ledger_verification()
         bootstrap = ninjatrader_runtime.get("login_bootstrap")
         if bootstrap is not None and bootstrap.state is not NinjaTraderLoginState.AUTHENTICATED:
             transport = paper.status().get("transport")
@@ -2063,7 +2095,6 @@ def create_control_center_app(
         paper = ninjatrader_runtime.get("paper")
         if paper is None:
             raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
-        require_commissioning_ledger_verification()
         bootstrap = ninjatrader_runtime.get("login_bootstrap")
         if bootstrap is not None and bootstrap.state is not NinjaTraderLoginState.AUTHENTICATED:
             transport = paper.status().get("transport")
@@ -2073,7 +2104,7 @@ def create_control_center_app(
                 transport.get("account_class"), transport.get("instrument"),
             ) != ("AUTHENTICATED", True, True, "Sim101", "LOCAL_SIMULATION", "MNQ SEP26"):
                 raise HTTPException(status_code=409, detail="NinjaTrader desktop authentication is not operational.")
-        return paper.commissioning_arm()
+        return paper.commissioning_arm(require_commissioning_ledger_verification)
 
     @app.post("/api/lane-iii/paper/commission-exit")
     async def api_lane_iii_paper_commission_exit() -> dict[str, object]:

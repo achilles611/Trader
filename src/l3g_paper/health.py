@@ -14,6 +14,23 @@ def ledger_health_projection(runtime: Mapping[str, object], verification: Mappin
     status = str(verification.get("status") or "UNVERIFIED")
     verification_pass = status == "PASS" and verification.get("chain_valid") is True
     tail = None if verified is None else max(0, current - verified)
+    watermark = value.get("authority_watermark")
+    authority_sequence = watermark.get("last_authority_mutation_sequence") if isinstance(watermark, Mapping) else None
+    classified_sequence = watermark.get("classified_through_sequence") if isinstance(watermark, Mapping) else None
+    if verification_pass and verified is not None and tail == 0:
+        commissioning_state = "VERIFIED_TO_CURRENT_TIP"
+    elif (
+        verification_pass
+        and verified is not None
+        and type(authority_sequence) is int
+        and authority_sequence <= verified
+        and classified_sequence == current
+    ):
+        commissioning_state = "VERIFIED_ANCHOR_WITH_PASSIVE_LIVE_TAIL"
+    elif verification_pass and verified is not None and type(authority_sequence) is int and authority_sequence > verified:
+        commissioning_state = "UNVERIFIED_AUTHORITY_TAIL"
+    else:
+        commissioning_state = "UNTRUSTED"
     value.update({
         "main_database_bytes": value.get("file_size"),
         "total_footprint_bytes": sum(int(value.get(name) or 0) for name in ("file_size", "wal_size")),
@@ -22,6 +39,9 @@ def ledger_health_projection(runtime: Mapping[str, object], verification: Mappin
         "verified_through_sequence": verified,
         "verified_tip_hash": verification.get("tip_hash"),
         "unverified_tail_rows": tail,
+        "commissioning_ledger_state": commissioning_state,
+        "last_authority_mutation_sequence": authority_sequence,
+        "tail_classified_through_sequence": classified_sequence,
         "last_full_quick_check_at": verification.get("last_full_quick_check_at"),
         "last_full_verification_id": verification.get("last_full_verification_id"),
         "last_full_verified_sequence": verification.get("last_full_verified_sequence"),

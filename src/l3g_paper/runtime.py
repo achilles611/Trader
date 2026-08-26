@@ -29,7 +29,7 @@ from .contracts import (
     PaperSessionArmGrant,
     deterministic_id,
 )
-from .ledger import PaperLedger
+from .ledger import COMMISSIONING_NO_AUTHORITY_EFFECT, PaperLedger
 from .ninjatrader_transport import NinjaTraderSim101PaperAdapter, PaperExecutionTransport
 from .policy import ExperimentalPaperPolicy
 from .risk import PaperRiskAuthority, PaperRiskSnapshot
@@ -218,6 +218,35 @@ class LaneIIIPaperRuntime:
             "instrument": ACCOUNT_BINDING.instrument,
             "occurred_at": _now(),
             "reason": reason,
+        }
+
+    def _commissioning_runtime_snapshot(self, commissioning_id: str) -> dict[str, object]:
+        """Capture broker/runtime authority facts while the admission lock is held."""
+        snapshot = self._snapshot
+        transport = None if self._transport is None else self._transport.status().as_dict()
+        return {
+            **self._session_context.payload(),
+            "commissioning_id": commissioning_id,
+            "account": snapshot.account_name,
+            "account_class": snapshot.account_class,
+            "instrument": snapshot.instrument,
+            "current_position": self._position.value,
+            "current_position_quantity": self._position_quantity,
+            "broker_snapshot_position": snapshot.current_position.value,
+            "broker_snapshot_position_quantity": snapshot.current_position_quantity,
+            "working_owned_orders": snapshot.working_owned_orders,
+            "working_entry_orders": snapshot.working_entry_orders,
+            "position_snapshot_complete": snapshot.position_snapshot_complete,
+            "order_snapshot_complete": snapshot.order_snapshot_complete,
+            "reconciliation_current": snapshot.reconciliation_current,
+            "unresolved_command": snapshot.unresolved_command,
+            "unresolved_native_order": snapshot.unresolved_native_order,
+            "unresolved_execution": snapshot.unresolved_execution,
+            "entry_owner": self._entry_owner.value,
+            "commissioning_ownership_active": self._commissioning_ownership is not None,
+            "live_capital": "DENIED",
+            "runtime_state": self._state.value,
+            "transport": transport,
         }
 
     def _load_unresolved_commissioning_ownership(self) -> _CommissioningOwnership | None:
@@ -510,11 +539,13 @@ class LaneIIIPaperRuntime:
                 self._request_exit("MALFORMED_OBSERVATION", emergency=True)
 
     def on_observation_duplicate(self) -> None:
-        self.policy.on_duplicate()
-        self.ledger.append("INCIDENT_DUPLICATE_OBSERVATION", {"effect": "NO_NEW_PAPER_EVIDENCE"})
+        with self._lock:
+            self.policy.on_duplicate()
+            self.ledger.append("INCIDENT_DUPLICATE_OBSERVATION", {"effect": "NO_NEW_PAPER_EVIDENCE"})
 
     def record_sink_failure(self, sink: str, event: str, error_type: str) -> None:
-        self.ledger.append("INCIDENT_OBSERVATION_SINK_FAILURE", {"sink": sink, "event": event, "error_type": error_type})
+        with self._lock:
+            self.ledger.append("INCIDENT_OBSERVATION_SINK_FAILURE", {"sink": sink, "event": event, "error_type": error_type})
 
     def ingest(self, observation: NinjaTraderObservation) -> None:
         with self._lock:
@@ -607,7 +638,13 @@ class LaneIIIPaperRuntime:
                 and self._position is not PaperDirection.FLAT
             )
             if not can_cause_side_effect:
-                self.ledger.append_deferred("DECISION", decision.payload(), identity=decision.paper_decision_id, occurred_at=decision.created_at, execution_session_id=self._execution_session_id())
+                self.ledger.append_deferred(
+                    "DECISION",
+                    {**decision.payload(), "authority_effect": COMMISSIONING_NO_AUTHORITY_EFFECT},
+                    identity=decision.paper_decision_id,
+                    occurred_at=decision.created_at,
+                    execution_session_id=self._execution_session_id(),
+                )
             else:
                 # append() first flushes every prior evidence/NO_TRADE batch;
                 # a decision eligible to mutate paper state is then committed
@@ -1205,7 +1242,10 @@ class LaneIIIPaperRuntime:
                 "session_armed_state": "ARMED_" + context.session_kind.value, "arm_grant": self._armed_session.payload(),
             }
 
-    def commissioning_arm(self) -> dict[str, object]:
+    def commissioning_arm(
+        self,
+        ledger_preflight: Callable[[str, Mapping[str, object]], Mapping[str, object]] | None = None,
+    ) -> dict[str, object]:
         """Atomically reserve commissioning ownership before exposing ARMED_FLAT."""
         with self._lock:
             if self._entry_owner is not PaperEntryOwner.NONE or self._commissioning_ownership is not None:
@@ -1233,12 +1273,21 @@ class LaneIIIPaperRuntime:
                 reasons = ("NO_CURRENT_EVENT_SESSION",)
                 self.ledger.append("RISK_EVENT_COMMISSIONING_ARM_ATTEMPT", {**context.payload(), "allowed": False, "reason_codes": reasons, "authority_hash": canonical_hash(AUTHORITY.authority_payload())})
                 return {"armed": False, "reason_codes": reasons, "state": self._state.value}
+            commissioning_id = "l3g-commissioning-" + uuid4().hex
+            ledger_evidence: dict[str, object] | None = None
+            if ledger_preflight is not None:
+                preflight_result = ledger_preflight(
+                    commissioning_id, self._commissioning_runtime_snapshot(commissioning_id)
+                )
+                if not isinstance(preflight_result, Mapping):
+                    raise RuntimeError("Commissioning ledger preflight returned an invalid result.")
+                ledger_evidence = dict(preflight_result)
             allowed, reasons = self.risk.preflight(self._snapshot, at=now)
             self.ledger.append("RISK_EVENT_COMMISSIONING_ARM_ATTEMPT", {**context.payload(), "allowed": allowed, "reason_codes": reasons, "authority_hash": canonical_hash(AUTHORITY.authority_payload())})
             if not allowed:
                 return {"armed": False, "reason_codes": reasons, "state": self._state.value}
             ownership = _CommissioningOwnership(
-                "l3g-commissioning-" + uuid4().hex,
+                commissioning_id,
                 "l3g-commissioning-token-" + uuid4().hex,
                 context, now,
             )
@@ -1253,8 +1302,11 @@ class LaneIIIPaperRuntime:
                 context.boundary_at("entry_cutoff").isoformat().replace("+00:00", "Z"),
             )
             self._entries_paused = False
+            reservation_payload = self._ownership_payload(ownership, reason="COMMISSIONING_ARM_AFTER_PREFLIGHT")
+            if ledger_evidence is not None:
+                reservation_payload["ledger_preflight"] = ledger_evidence
             self.ledger.append(
-                "COMMISSIONING_OWNERSHIP_RESERVED", self._ownership_payload(ownership, reason="COMMISSIONING_ARM_AFTER_PREFLIGHT"),
+                "COMMISSIONING_OWNERSHIP_RESERVED", reservation_payload,
                 identity="l3g-commissioning-ownership-reserved-" + ownership.commissioning_id,
                 execution_session_id=self._execution_session_id(),
             )
@@ -1264,6 +1316,7 @@ class LaneIIIPaperRuntime:
                 "state": self._state.value, "commissioning_id": ownership.commissioning_id,
                 "commissioning_token": ownership.commissioning_token,
                 "session_armed_state": "ARMED_" + context.session_kind.value, "arm_grant": self._armed_session.payload(),
+                "ledger_preflight": ledger_evidence,
             }
 
     def commission_entry(self, commissioning_id: str, commissioning_token: str) -> dict[str, object]:

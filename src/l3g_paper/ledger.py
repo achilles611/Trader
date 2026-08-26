@@ -37,6 +37,18 @@ _DOMAIN_TABLES = {
     "INCIDENT": "lane_iii_paper_incidents",
 }
 _HIGH_VOLUME_DOMAINS = frozenset({"OBSERVATION", "EVIDENCE", "DECISION"})
+COMMISSIONING_TAIL_POLICY_VERSION = "l3g-commissioning-passive-tail-v1"
+COMMISSIONING_NO_AUTHORITY_EFFECT = "NONE"
+_COMMISSIONING_WATERMARK_METADATA_KEY = "commissioning_authority_watermark"
+_PASSIVE_MARKET_OBSERVATION_TYPES = frozenset({"QUOTE", "TRADE", "DEPTH"})
+_PASSIVE_EVIDENCE_FAMILIES = frozenset({
+    "STRUCTURAL_CONTEXT", "ORDER_FLOW", "RESTING_LIQUIDITY", "VOLATILITY_CONTEXT", "MARKET_REGIME",
+})
+_PASSIVE_DECISIONS = frozenset({"NO_TRADE", "LONG", "SHORT", "EXIT"})
+_AUTHORITY_SHAPED_PAYLOAD_KEYS = frozenset({
+    "command_id", "grant_id", "intent_id", "order_id", "execution_id", "commissioning_id",
+    "working_order_count", "position_quantity", "risk_authority", "arm_grant", "lockout_reason",
+})
 _SECRET_KEYS = frozenset({"hmac_key", "password", "token", "connection_credentials", "private_key", "secret", "authorization"})
 _EPOCH_DIRECTORY = re.compile(r"^epoch-(\d+)$", re.IGNORECASE)
 _EPOCH_ID = re.compile(r"^L3G-PAPER-EPOCH-[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -56,6 +68,73 @@ def _assert_redacted(value: object) -> None:
     elif isinstance(value, (list, tuple)):
         for item in value:
             _assert_redacted(item)
+
+
+def commissioning_safe_tail_classification(
+    domain: str, kind: str, payload: Mapping[str, object],
+) -> str | None:
+    """Classify only exact, demonstrably no-side-effect live-tail records.
+
+    Returning ``None`` is intentionally fail-closed.  In particular, the
+    high-volume domain name is never sufficient: account/order observations,
+    unmarked decisions, incidents, and all unknown future shapes advance the
+    authority watermark.
+    """
+    if any(key in payload for key in _AUTHORITY_SHAPED_PAYLOAD_KEYS):
+        return None
+    if domain == "OBSERVATION" and kind == "OBSERVATION_ENVELOPE":
+        observation_type = payload.get("observation_type")
+        required = (payload.get("observation_id"), payload.get("local_monotonic_sequence"), payload.get("source_payload_hash"))
+        if observation_type in _PASSIVE_MARKET_OBSERVATION_TYPES and isinstance(required[0], str) and type(required[1]) is int and isinstance(required[2], str):
+            return f"OBSERVATION:{kind}:{observation_type}"
+        return None
+    if domain == "EVIDENCE" and kind == "EVIDENCE":
+        if (
+            isinstance(payload.get("evidence_id"), str)
+            and payload.get("family") in _PASSIVE_EVIDENCE_FAMILIES
+            and payload.get("scientific_eligibility") is False
+            and payload.get("book_completeness") == "UNVERIFIED"
+            and payload.get("sequence_authority") == "LOCAL_CALLBACK_ORDER_ONLY"
+        ):
+            return "EVIDENCE:EVIDENCE"
+        return None
+    if domain == "DECISION" and kind == "DECISION":
+        decision = payload.get("decision")
+        direction = payload.get("direction")
+        expected_direction = {"NO_TRADE": "FLAT", "LONG": "LONG", "SHORT": "SHORT", "EXIT": "FLAT"}.get(str(decision))
+        if (
+            decision in _PASSIVE_DECISIONS
+            and direction == expected_direction
+            and payload.get("authority_effect") == COMMISSIONING_NO_AUTHORITY_EFFECT
+            and payload.get("commissioning") is False
+            and payload.get("strategy_generated") is True
+            and payload.get("scientific_evidence") is False
+            and payload.get("scientific_eligibility") is False
+            and isinstance(payload.get("paper_decision_id"), str)
+        ):
+            return f"DECISION:DECISION:{decision}:AUTHORITY_EFFECT_NONE"
+        return None
+    return None
+
+
+def is_commissioning_safe_unverified_tail_record(record: Mapping[str, object]) -> bool:
+    """Public fail-closed predicate for stored or prepared ledger records."""
+    domain, kind = record.get("domain"), record.get("kind")
+    payload = record.get("payload")
+    if not isinstance(payload, Mapping):
+        serialized = record.get("payload_json")
+        if isinstance(serialized, str):
+            try:
+                decoded = json.loads(serialized)
+            except json.JSONDecodeError:
+                return False
+            payload = decoded.get("payload") if isinstance(decoded, Mapping) else None
+    return (
+        isinstance(domain, str)
+        and isinstance(kind, str)
+        and isinstance(payload, Mapping)
+        and commissioning_safe_tail_classification(domain, kind, payload) is not None
+    )
 
 
 def _read_only_accessibility_check(path: Path) -> str:
@@ -213,12 +292,21 @@ class PaperLedger:
         self._quick_check_state = existing_accessibility or "not_run_local_verifier_required"
         rows = self._connection.execute("SELECT domain, COUNT(*) AS count FROM lane_iii_paper_audit GROUP BY domain").fetchall()
         self._counts_cache = {str(row["domain"]): int(row["count"]) for row in rows}
+        metadata_rows = self._connection.execute(
+            "SELECT metadata_key, metadata_value FROM lane_iii_paper_ledger_metadata"
+        ).fetchall()
+        metadata = {str(row["metadata_key"]): str(row["metadata_value"]) for row in metadata_rows}
+        self._ledger_uuid = metadata["ledger_uuid"]
+        self._schema_version = metadata["schema_version"]
         latest = self._connection.execute(
             "SELECT ledger_sequence, occurred_at, record_hash FROM lane_iii_paper_audit ORDER BY ledger_sequence DESC LIMIT 1"
         ).fetchone()
         self._highest_sequence = 0 if latest is None else int(latest["ledger_sequence"])
         self._last_record_time = None if latest is None else str(latest["occurred_at"])
         self._final_record_hash = None if latest is None else str(latest["record_hash"])
+        self._authority_watermark = self._load_or_rebuild_authority_watermark(
+            metadata.get(_COMMISSIONING_WATERMARK_METADATA_KEY)
+        )
         self._chain_status: tuple[bool | None, str | None] = (True, None) if self._highest_sequence == 0 else (None, None)
         self._ordering_lock = threading.RLock()
         self._deferred_condition = threading.Condition(threading.Lock())
@@ -327,6 +415,134 @@ class PaperLedger:
                     "INSERT OR IGNORE INTO lane_iii_paper_ledger_metadata(metadata_key, metadata_value) VALUES (?, ?)",
                     (key, value),
                 )
+
+    @staticmethod
+    def _watermark_payload(
+        *,
+        classified_through_sequence: int,
+        last_authority_mutation_sequence: int,
+        last_authority_mutation_kind: str | None,
+        last_authority_mutation_domain: str | None,
+        last_authority_mutation_hash: str | None,
+        safe_classification_last_sequences: Mapping[str, int],
+        updated_at: str,
+    ) -> dict[str, object]:
+        return {
+            "policy_version": COMMISSIONING_TAIL_POLICY_VERSION,
+            "classified_through_sequence": classified_through_sequence,
+            "last_authority_mutation_sequence": last_authority_mutation_sequence,
+            "last_authority_mutation_kind": last_authority_mutation_kind,
+            "last_authority_mutation_domain": last_authority_mutation_domain,
+            "last_authority_mutation_hash": last_authority_mutation_hash,
+            "safe_classification_last_sequences": dict(sorted(safe_classification_last_sequences.items())),
+            "updated_at": updated_at,
+        }
+
+    @staticmethod
+    def _stored_record_classification(row: sqlite3.Row) -> str | None:
+        try:
+            document = json.loads(str(row["payload_json"]))
+        except json.JSONDecodeError:
+            return None
+        payload = document.get("payload") if isinstance(document, Mapping) else None
+        if not isinstance(payload, Mapping):
+            return None
+        return commissioning_safe_tail_classification(str(row["domain"]), str(row["kind"]), payload)
+
+    def _store_authority_watermark(self, connection: sqlite3.Connection, watermark: Mapping[str, object]) -> None:
+        connection.execute(
+            """
+            INSERT INTO lane_iii_paper_ledger_metadata(metadata_key, metadata_value) VALUES (?, ?)
+            ON CONFLICT(metadata_key) DO UPDATE SET metadata_value=excluded.metadata_value
+            """,
+            (
+                _COMMISSIONING_WATERMARK_METADATA_KEY,
+                json.dumps(dict(watermark), sort_keys=True, separators=(",", ":")),
+            ),
+        )
+
+    def _rebuild_authority_watermark(self) -> dict[str, object]:
+        """Find the newest unsafe row by scanning backward from the live tip."""
+        cursor = self._highest_sequence
+        safe_last: dict[str, int] = {}
+        last_sequence = 0
+        last_kind: str | None = None
+        last_domain: str | None = None
+        last_hash: str | None = None
+        while cursor > 0 and last_sequence == 0:
+            rows = self._connection.execute(
+                """
+                SELECT ledger_sequence, domain, kind, payload_json, record_hash
+                FROM lane_iii_paper_audit WHERE ledger_sequence <= ?
+                ORDER BY ledger_sequence DESC LIMIT 4096
+                """,
+                (cursor,),
+            ).fetchall()
+            if not rows:
+                break
+            for row in rows:
+                sequence = int(row["ledger_sequence"])
+                classification = self._stored_record_classification(row)
+                if classification is None:
+                    last_sequence = sequence
+                    last_kind = str(row["kind"])
+                    last_domain = str(row["domain"])
+                    last_hash = str(row["record_hash"])
+                    break
+                safe_last[classification] = max(sequence, safe_last.get(classification, 0))
+            cursor = int(rows[-1]["ledger_sequence"]) - 1
+        return self._watermark_payload(
+            classified_through_sequence=self._highest_sequence,
+            last_authority_mutation_sequence=last_sequence,
+            last_authority_mutation_kind=last_kind,
+            last_authority_mutation_domain=last_domain,
+            last_authority_mutation_hash=last_hash,
+            safe_classification_last_sequences=safe_last,
+            updated_at=_now(),
+        )
+
+    def _load_or_rebuild_authority_watermark(self, serialized: str | None) -> dict[str, object]:
+        watermark: dict[str, object] | None = None
+        if serialized:
+            try:
+                candidate = json.loads(serialized)
+            except json.JSONDecodeError:
+                candidate = None
+            if isinstance(candidate, dict) and candidate.get("policy_version") == COMMISSIONING_TAIL_POLICY_VERSION:
+                classified = candidate.get("classified_through_sequence")
+                authority = candidate.get("last_authority_mutation_sequence")
+                safe_last = candidate.get("safe_classification_last_sequences")
+                if (
+                    type(classified) is int
+                    and 0 <= classified <= self._highest_sequence
+                    and type(authority) is int
+                    and 0 <= authority <= classified
+                    and isinstance(safe_last, dict)
+                    and all(
+                        isinstance(key, str) and type(value) is int and 0 <= value <= classified
+                        for key, value in safe_last.items()
+                    )
+                ):
+                    watermark = candidate
+                    if authority:
+                        row = self._connection.execute(
+                            "SELECT kind, domain, record_hash FROM lane_iii_paper_audit WHERE ledger_sequence=?",
+                            (authority,),
+                        ).fetchone()
+                        expected = (
+                            candidate.get("last_authority_mutation_kind"),
+                            candidate.get("last_authority_mutation_domain"),
+                            candidate.get("last_authority_mutation_hash"),
+                        )
+                        if row is None or (str(row["kind"]), str(row["domain"]), str(row["record_hash"])) != expected:
+                            watermark = None
+        if watermark is None or int(watermark["classified_through_sequence"]) != self._highest_sequence:
+            # A missing/old policy or an image appended by an older runtime is
+            # never trusted. Rebuild the safe suffix before commissioning.
+            watermark = self._rebuild_authority_watermark()
+            with self._transaction() as connection:
+                self._store_authority_watermark(connection, watermark)
+        return watermark
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -443,6 +659,9 @@ class PaperLedger:
             return []
         synchronous_domain = "DECISION" if all(str(record["domain"]) in _HIGH_VOLUME_DOMAINS for record in records) else "INCIDENT"
         hashes: list[str] = []
+        watermark = dict(self._authority_watermark)
+        safe_last = dict(watermark.get("safe_classification_last_sequences") or {})
+        inserted = False
         with self._domain_transaction(synchronous_domain) as connection:
             prior = connection.execute(
                 "SELECT record_hash FROM lane_iii_paper_audit ORDER BY ledger_sequence DESC LIMIT 1"
@@ -474,6 +693,7 @@ class PaperLedger:
                     """,
                     (record_identity, domain, kind, at, execution_session_id, serialized, previous_hash, record_hash),
                 )
+                sequence = int(cursor.lastrowid)
                 connection.execute(
                     f"INSERT INTO {_DOMAIN_TABLES[domain]} (identity, kind, occurred_at, execution_session_id, payload_json, record_hash) VALUES (?, ?, ?, ?, ?, ?)",
                     (record_identity, kind, at, execution_session_id, serialized, record_hash),
@@ -515,10 +735,36 @@ class PaperLedger:
                         )
                 previous_hash = record_hash
                 hashes.append(record_hash)
+                inserted = True
+                inner_payload = common.get("payload")
+                classification = (
+                    commissioning_safe_tail_classification(domain, kind, inner_payload)
+                    if isinstance(inner_payload, Mapping)
+                    else None
+                )
+                if classification is None:
+                    watermark.update({
+                        "last_authority_mutation_sequence": sequence,
+                        "last_authority_mutation_kind": kind,
+                        "last_authority_mutation_domain": domain,
+                        "last_authority_mutation_hash": record_hash,
+                    })
+                else:
+                    safe_last[classification] = sequence
+                watermark.update({
+                    "policy_version": COMMISSIONING_TAIL_POLICY_VERSION,
+                    "classified_through_sequence": sequence,
+                    "safe_classification_last_sequences": safe_last,
+                    "updated_at": at,
+                })
                 self._counts_cache[domain] = self._counts_cache.get(domain, 0) + 1
-                self._highest_sequence = int(cursor.lastrowid)
+                self._highest_sequence = sequence
                 self._last_record_time = at
                 self._final_record_hash = record_hash
+            if inserted:
+                self._store_authority_watermark(connection, watermark)
+        if inserted:
+            self._authority_watermark = watermark
         return hashes
 
     def append_deferred(
@@ -698,6 +944,66 @@ class PaperLedger:
         with self._lock:
             return dict(self._counts_cache)
 
+    def commissioning_tail_snapshot(
+        self,
+        verified_through_sequence: int,
+        *,
+        last_full_verified_sequence: int | None = None,
+    ) -> dict[str, object]:
+        """Capture the trusted-anchor boundary without scanning the live tail."""
+        if type(verified_through_sequence) is not int or verified_through_sequence < 0:
+            raise ValueError("Commissioning verified sequence is invalid.")
+        if last_full_verified_sequence is not None and (
+            type(last_full_verified_sequence) is not int or last_full_verified_sequence < 0
+        ):
+            raise ValueError("Commissioning Full verified sequence is invalid.")
+        with self._ordering_lock:
+            self.flush_deferred()
+            with self._lock:
+                tip = self._highest_sequence
+                if verified_through_sequence > tip:
+                    raise RuntimeError("Commissioning verified anchor is beyond the current ledger tip.")
+                watermark = dict(self._authority_watermark)
+                if int(watermark.get("classified_through_sequence") or -1) != tip:
+                    raise RuntimeError("Commissioning authority classification does not reach the captured ledger tip.")
+                hashes: dict[int, str | None] = {}
+                requested = {verified_through_sequence}
+                if last_full_verified_sequence is not None:
+                    requested.add(last_full_verified_sequence)
+                for sequence in requested:
+                    if sequence == 0:
+                        hashes[sequence] = None
+                        continue
+                    row = self._connection.execute(
+                        "SELECT record_hash FROM lane_iii_paper_audit WHERE ledger_sequence=?", (sequence,)
+                    ).fetchone()
+                    hashes[sequence] = None if row is None else str(row["record_hash"])
+                safe_last = dict(watermark.get("safe_classification_last_sequences") or {})
+                tail_kinds = sorted(
+                    classification
+                    for classification, sequence in safe_last.items()
+                    if type(sequence) is int and verified_through_sequence < sequence <= tip
+                )
+                return {
+                    "policy_version": COMMISSIONING_TAIL_POLICY_VERSION,
+                    "ledger_identity": self._ledger_uuid,
+                    "ledger_epoch": self._ledger_epoch,
+                    "ledger_schema_version": self._schema_version,
+                    "verified_through_sequence": verified_through_sequence,
+                    "verified_anchor_record_hash": hashes.get(verified_through_sequence),
+                    "last_full_verified_sequence": last_full_verified_sequence,
+                    "last_full_anchor_record_hash": (
+                        None if last_full_verified_sequence is None else hashes.get(last_full_verified_sequence)
+                    ),
+                    "arm_snapshot_tip": tip,
+                    "arm_snapshot_tip_hash": self._final_record_hash,
+                    "unverified_tail_rows": tip - verified_through_sequence,
+                    "tail_start_sequence": verified_through_sequence + 1 if tip > verified_through_sequence else None,
+                    "tail_end_sequence": tip if tip > verified_through_sequence else None,
+                    "tail_record_kinds": tail_kinds,
+                    **watermark,
+                }
+
     def health_status(self) -> dict[str, object]:
         """Return cached integrity state plus inexpensive filesystem metadata."""
         with self._lock:
@@ -706,6 +1012,7 @@ class PaperLedger:
             last_record_time = self._last_record_time
             final_record_hash = self._final_record_hash
             quick_check_state = self._quick_check_state
+            authority_watermark = dict(self._authority_watermark)
         try:
             file_size: int | None = self.path.stat().st_size
         except OSError:
@@ -733,6 +1040,7 @@ class PaperLedger:
             "final_record_hash": final_record_hash,
             "wal_size": wal_size,
             "counts": self.counts(),
+            "authority_watermark": authority_watermark,
         }
 
     def close(self) -> None:

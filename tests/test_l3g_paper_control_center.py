@@ -59,6 +59,10 @@ class PaperControlCenterTests(unittest.TestCase):
         for path in expected - {"/api/lane-iii/paper/commission-entry"}:
             self.assertEqual(inspect.signature(routes[path].endpoint).parameters, {})
         self.assertEqual(tuple(inspect.signature(routes["/api/lane-iii/paper/commission-entry"].endpoint).parameters), ("body",))
+        arm_source = inspect.getsource(routes["/api/lane-iii/paper/commissioning-arm"].endpoint)
+        entry_source = inspect.getsource(routes["/api/lane-iii/paper/commission-entry"].endpoint)
+        self.assertIn("commissioning_arm(require_commissioning_ledger_verification)", arm_source)
+        self.assertNotIn("require_commissioning_ledger_verification", entry_source)
 
     def test_local_ledger_verification_routes_are_separate_from_execution_authority(self) -> None:
         app = create_control_center_app(CopyTradeConfig())

@@ -99,6 +99,24 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
         status = worker.status().as_dict()
         self.assertEqual(status["accepted_observations"], 1)
         self.assertEqual(status["last_observation_at"], TIME)
+        self.assertEqual(status["market_observer_state"], "ACTIVE")
+        self.assertTrue(status["market_observer_active"])
+        self.assertTrue(status["market_observer_level_one_received"])
+        self.assertFalse(status["market_observer_depth_received"])
+        self.assertEqual(status["observation_types"], {"QUOTE": 1})
+
+    def test_listener_distinguishes_connection_events_from_active_market_observer(self):
+        worker = NinjaTraderListenerWorker()
+        connection = LoopbackNinjaTraderBridge().accept_observation(
+            frame("ACCOUNT", 1, {"alias": "Sim101", "class": "LOCAL_SIMULATION"})
+        )
+        self.assertIsNotNone(connection)
+        worker._record_and_forward_observation(connection)
+        status = worker.status().as_dict()
+        self.assertEqual(status["accepted_observations"], 1)
+        self.assertEqual(status["market_observer_state"], "NOT_ACTIVE")
+        self.assertFalse(status["market_observer_active"])
+        self.assertFalse(status["market_observer_level_one_received"])
 
     def test_harness_reports_authoritative_empty_position_and_order_snapshots(self):
         account = {"alias": "Lucid25kflex01", "class": "PROVIDER_EVALUATION"}

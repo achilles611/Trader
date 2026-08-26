@@ -147,6 +147,67 @@ class CommissioningOwnershipTests(unittest.TestCase):
             self.assertEqual(commands, [])
             self.close(runtime, ledger)
 
+    def test_passive_writer_can_append_across_arm_snapshot_without_crossing_atomic_ownership_boundary(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger, runtime, _ = self.ready_runtime(directory)
+            anchor = int(ledger.health_status()["highest_sequence"])
+            append_before_snapshot = threading.Event()
+            before_snapshot_done = threading.Event()
+            append_after_snapshot = threading.Event()
+            after_snapshot_done = threading.Event()
+
+            def passive_payload(number: int) -> dict[str, object]:
+                return {
+                    "observation_id": f"nt-concurrent-{number}",
+                    "observation_type": "QUOTE",
+                    "local_monotonic_sequence": number,
+                    "source_payload_hash": f"hash-{number}",
+                }
+
+            def writer() -> None:
+                self.assertTrue(append_before_snapshot.wait(2))
+                ledger.append("OBSERVATION_ENVELOPE", passive_payload(1))
+                before_snapshot_done.set()
+                self.assertTrue(append_after_snapshot.wait(2))
+                ledger.append("OBSERVATION_ENVELOPE", passive_payload(2))
+                after_snapshot_done.set()
+
+            captured: dict[str, object] = {}
+
+            def ledger_preflight(commissioning_id: str, runtime_snapshot: object) -> dict[str, object]:
+                append_before_snapshot.set()
+                self.assertTrue(before_snapshot_done.wait(2))
+                captured.update(ledger.commissioning_tail_snapshot(anchor, last_full_verified_sequence=anchor))
+                append_after_snapshot.set()
+                self.assertTrue(after_snapshot_done.wait(2))
+                return {
+                    "ledger_trust_state": "VERIFIED_ANCHOR_WITH_PASSIVE_LIVE_TAIL",
+                    "verified_through_sequence": anchor,
+                    "arm_snapshot_tip": captured["arm_snapshot_tip"],
+                    "commissioning_id": commissioning_id,
+                }
+
+            commands: list[object] = []
+            runtime._persist_and_send = lambda command, grant: commands.append(command)  # type: ignore[method-assign]
+            writer_thread = threading.Thread(target=writer)
+            writer_thread.start()
+            with patch("src.l3g_paper.runtime._now", return_value=self.now):
+                arm_result = runtime.commissioning_arm(ledger_preflight)
+            writer_thread.join(2)
+            self.assertFalse(writer_thread.is_alive())
+            self.assertTrue(arm_result["armed"], arm_result)
+            self.assertLess(anchor, int(captured["arm_snapshot_tip"]))
+            self.assertEqual(captured["last_authority_mutation_sequence"], 0)
+            self.assertEqual(runtime.status()["entry_owner"], PaperEntryOwner.COMMISSIONING.value)
+            self.assertFalse(runtime._request_entry(self.strategy_decision()))  # type: ignore[arg-type]
+            self.assertEqual(commands, [])
+            reservation = ledger.recent_kinds(("COMMISSIONING_OWNERSHIP_RESERVED",), limit=1)[0]
+            self.assertEqual(
+                reservation["payload"]["ledger_preflight"]["arm_snapshot_tip"],
+                captured["arm_snapshot_tip"],
+            )
+            self.close(runtime, ledger)
+
     def test_commissioning_entry_racing_strategy_allows_only_the_commissioning_command(self) -> None:
         with TemporaryDirectory() as directory:
             ledger, runtime, _ = self.ready_runtime(directory)

@@ -71,9 +71,9 @@ sentinel witnesses. Explicit Full verification remains the forensic authority.
 - **Auto** uses Full when no checkpoint exists, Incremental when a checkpoint
   is trusted, and fails closed with `full_scan_required=true` when a checkpoint
   mismatches.
-- **Fast / Incremental** performs SQLite `quick_check`, schema/identity/epoch
-  checks, checkpoint validation, and verifies only the chain tail after the
-  checkpoint.
+- **Fast / Incremental** inherits the retained Full `quick_check` proof,
+  performs schema/identity/epoch checks and checkpoint validation, and verifies
+  only the chain tail after the checkpoint. It never reruns `quick_check`.
 - **Full** performs the same checks plus hash-chain verification from genesis.
 
 The verifier takes one read transaction, so an active append-only writer can
@@ -90,12 +90,44 @@ rows in the scheduler, UI, HTTP request, or WebSocket task. The missed-run
 policy is `SKIP`: one missed time creates a durable missed record and the next
 normal occurrence runs; there is no surprise catch-up scan.
 
-Arming or submitting an explicit commissioning entry consumes the compact
-artifact only. It requires a fresh PASS, trusted checkpoint, valid chain, and
-a verified sequence at or beyond the current ledger tip. An absent/stale tail
-launches a local Auto run and returns a fail-closed denial until PASS. A FAIL,
-IN_PROGRESS, or Full-required result also denies commissioning. Exit and
-flatten safety paths remain available and are not delayed by verification.
+Commissioning ARM consumes the compact verifier artifact plus the writer's
+transactional authority watermark. It requires a fresh PASS, trusted
+checkpoint, valid ledger identity/ancestry, retained Full provenance, and an
+anchor record hash that still matches the ledger. Exact equality with the live
+tip is ideal but not required. When the tip has moved, ARM accepts only
+`VERIFIED_ANCHOR_WITH_PASSIVE_LIVE_TAIL`: every append through the captured
+ARM snapshot was classified, and the last authority-changing or unknown record
+is at or before the verified anchor.
+
+The fail-closed passive policy admits only exact QUOTE/TRADE/DEPTH
+`OBSERVATION_ENVELOPE` shapes, exact paper `EVIDENCE`, and strategy decisions
+that were persisted through the no-side-effect path with
+`authority_effect=NONE`. Domain membership alone grants nothing. Unmarked or
+unknown decisions, account/order observations, intents, grants, commands,
+receipts, order events, executions, position/reconciliation records, session
+or ARM/DISARM changes, commissioning ownership, risk events, incidents, and
+unknown future records advance the authority watermark and produce
+`COMMISSIONING_LEDGER_TAIL_UNTRUSTED` until Auto verifies them.
+
+The watermark and a classification cursor are updated in the same SQLite
+transaction as each append; passive deferred records update the compact cursor
+once per batch, not once per market event. ARM captures the verifier anchor,
+authority watermark, live tip, tail kinds, current broker reconciliation,
+session, and entry ownership while holding the runtime admission lock. The
+accepted evidence is embedded in `COMMISSIONING_OWNERSHIP_RESERVED`. New
+passive observations after that snapshot do not revoke the reservation, while
+other authority paths cannot cross the same lock before ownership is reserved.
+Commissioning entry therefore does not rerun the pre-ARM ledger gate against
+its own ARM/ownership records. Exit and flatten safety paths remain available.
+
+The existing 15-minute commissioning freshness bound is retained. Current
+incremental evidence shows a roughly one-to-two-second verifier over tens of
+thousands of rows, so the established bound is operationally ample without
+allowing a day-old anchor. Stale or authority-bearing tails launch Auto and
+deny ARM. A FAIL, IN_PROGRESS, identity mismatch, unknown classification, or
+Full-required result also denies commissioning. After a lifecycle completes,
+Auto Incremental must cryptographically verify the passive tail and all
+commissioning records before closure can claim PASS.
 
 ## Performance capture
 
