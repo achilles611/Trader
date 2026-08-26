@@ -291,10 +291,20 @@ class PaperLedger:
                     """
             )
             connection.execute("CREATE INDEX IF NOT EXISTS lane_iii_paper_audit_domain_time ON lane_iii_paper_audit(domain, occurred_at)")
-            # Restart recovery reads only the rare commissioning-ownership
-            # records.  Index that narrow operational slice so opening a large
-            # observation ledger never devolves into a historical table scan.
-            connection.execute("CREATE INDEX IF NOT EXISTS lane_iii_paper_audit_kind_sequence ON lane_iii_paper_audit(kind, ledger_sequence DESC)")
+            # This compact operational index is updated in the same transaction
+            # as each immutable audit record below.  It avoids a historical
+            # table scan during restart recovery on a high-volume ledger.
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lane_iii_paper_commissioning_ownership (
+                    commissioning_id TEXT PRIMARY KEY,
+                    reservation_record_json TEXT NOT NULL,
+                    entry_consumed INTEGER NOT NULL,
+                    released INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
             # This metadata has no trading semantics.  It gives the local
             # verifier a stable ledger identity and sealed epoch/schema facts
             # without granting the verifier write access to the ledger.
@@ -468,6 +478,41 @@ class PaperLedger:
                     f"INSERT INTO {_DOMAIN_TABLES[domain]} (identity, kind, occurred_at, execution_session_id, payload_json, record_hash) VALUES (?, ?, ?, ?, ?, ?)",
                     (record_identity, kind, at, execution_session_id, serialized, record_hash),
                 )
+                ownership_payload = common.get("payload")
+                if kind == "COMMISSIONING_OWNERSHIP_RESERVED" and isinstance(ownership_payload, Mapping):
+                    commissioning_id = ownership_payload.get("commissioning_id")
+                    if isinstance(commissioning_id, str) and commissioning_id:
+                        connection.execute(
+                            """
+                            INSERT INTO lane_iii_paper_commissioning_ownership
+                                (commissioning_id, reservation_record_json, entry_consumed, released, updated_at)
+                            VALUES (?, ?, 0, 0, ?)
+                            ON CONFLICT(commissioning_id) DO UPDATE SET
+                                reservation_record_json=excluded.reservation_record_json,
+                                entry_consumed=0, released=0, updated_at=excluded.updated_at
+                            """,
+                            (commissioning_id, serialized, at),
+                        )
+                elif kind == "COMMISSIONING_ENTRY_CONSUMED" and isinstance(ownership_payload, Mapping):
+                    commissioning_id = ownership_payload.get("commissioning_id")
+                    if isinstance(commissioning_id, str) and commissioning_id:
+                        connection.execute(
+                            """
+                            INSERT INTO lane_iii_paper_commissioning_ownership
+                                (commissioning_id, reservation_record_json, entry_consumed, released, updated_at)
+                            VALUES (?, ?, 1, 0, ?)
+                            ON CONFLICT(commissioning_id) DO UPDATE SET
+                                entry_consumed=1, released=0, updated_at=excluded.updated_at
+                            """,
+                            (commissioning_id, serialized, at),
+                        )
+                elif kind == "COMMISSIONING_OWNERSHIP_RELEASED" and isinstance(ownership_payload, Mapping):
+                    commissioning_id = ownership_payload.get("commissioning_id")
+                    if isinstance(commissioning_id, str) and commissioning_id:
+                        connection.execute(
+                            "UPDATE lane_iii_paper_commissioning_ownership SET released=1, updated_at=? WHERE commissioning_id=?",
+                            (at, commissioning_id),
+                        )
                 previous_hash = record_hash
                 hashes.append(record_hash)
                 self._counts_cache[domain] = self._counts_cache.get(domain, 0) + 1
@@ -606,6 +651,24 @@ class PaperLedger:
                 (*kinds, limit),
             ).fetchall()
             return [json.loads(str(row["payload_json"])) for row in rows]
+
+    def unresolved_commissioning_ownership(self) -> tuple[dict[str, object], bool] | None:
+        """Read the transactional recovery marker without scanning audit history."""
+        with self._ordering_lock:
+            self.flush_deferred()
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT reservation_record_json, entry_consumed
+                FROM lane_iii_paper_commissioning_ownership
+                WHERE released=0
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            return json.loads(str(row["reservation_record_json"])), bool(row["entry_consumed"])
 
     def _verify_chain_uncached(self) -> tuple[bool, str | None]:
         with self._lock:

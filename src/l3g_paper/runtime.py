@@ -222,33 +222,13 @@ class LaneIIIPaperRuntime:
 
     def _load_unresolved_commissioning_ownership(self) -> _CommissioningOwnership | None:
         """Rehydrate only an unresolved reservation; never restore strategy authority."""
-        history = self.ledger.recent_kinds((
-            "COMMISSIONING_OWNERSHIP_RESERVED",
-            "COMMISSIONING_ENTRY_CONSUMED",
-            "COMMISSIONING_OWNERSHIP_RELEASED",
-        ), limit=512)
-        states: dict[str, tuple[dict[str, object], bool]] = {}
-        released: set[str] = set()
-        for record in reversed(history):
-            payload = record.get("payload")
-            if not isinstance(payload, Mapping):
-                continue
-            commissioning_id = payload.get("commissioning_id")
-            if not isinstance(commissioning_id, str) or not commissioning_id:
-                continue
-            kind = str(record.get("kind", ""))
-            if kind == "COMMISSIONING_OWNERSHIP_RELEASED":
-                released.add(commissioning_id)
-                states.pop(commissioning_id, None)
-            elif kind == "COMMISSIONING_OWNERSHIP_RESERVED" and commissioning_id not in released:
-                states[commissioning_id] = (dict(payload), False)
-            elif kind == "COMMISSIONING_ENTRY_CONSUMED" and commissioning_id not in released:
-                prior = states.get(commissioning_id)
-                if prior is not None:
-                    states[commissioning_id] = (prior[0], True)
-        if not states:
+        recovery = self.ledger.unresolved_commissioning_ownership()
+        if recovery is None:
             return None
-        payload, consumed = next(reversed(states.values()))
+        record, consumed = recovery
+        payload = record.get("payload")
+        if not isinstance(payload, Mapping):
+            payload = {}
         try:
             context = context_from_identity(
                 PaperSessionKind(str(payload["session_kind"])), str(payload["session_id"]),
