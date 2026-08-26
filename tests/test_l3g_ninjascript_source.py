@@ -27,8 +27,17 @@ class NinjaScriptSourceTests(unittest.TestCase):
             "UNSUPPORTED_ACTION", "POSITION_OR_ORDER_PRECONDITION", "FOREIGN_ACTIVITY_LOCKOUT",
             "REORDERED_COMMAND", "RECONCILIATION_REQUIRED",
             "HEARTBEAT_WATCHDOG", "PROTECTIVE_STOP_ACCEPTANCE_TIMEOUT",
+            "FLATTEN_ACCEPTANCE_TIMEOUT",
         ):
             self.assertIn(denial, source)
+
+    def test_expected_protective_cancellation_is_scoped_to_an_exact_flatten(self) -> None:
+        source = (Path(__file__).parents[1] / "ninjatrader" / "NinjaScript" / "AddOns" / "BeelzebubPaperExecutionAddOn.cs").read_text(encoding="utf-8")
+        self.assertIn("flattenInProgress = true", source)
+        self.assertIn("order.OrderState == OrderState.Cancelled && !flattenInProgress", source)
+        self.assertIn("ExpectedFlattenOrder(order)", source)
+        self.assertIn('"Close", "EXIT", order', source)
+        self.assertIn("flattenFailed) LockAndProtect(\"FLATTEN_ACCEPTANCE_TIMEOUT\")", source)
 
     def test_read_only_addon_remains_without_order_or_inbound_authority(self) -> None:
         source = (Path(__file__).parents[1] / "ninjatrader" / "NinjaScript" / "AddOns" / "BeelzebubReadOnlyAddOn.cs").read_text(encoding="utf-8")

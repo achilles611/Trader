@@ -68,6 +68,14 @@ namespace NinjaTrader.NinjaScript.AddOns
         private long lastCommandSequence;
         private DateTime lastHeartbeatUtc = DateTime.MinValue;
         private DateTime protectiveDeadlineUtc = DateTime.MaxValue;
+        // A commanded exact-instrument flatten must first cancel any working
+        // protective stop.  That expected cancellation is not a protective
+        // failure, but it must still resolve to flat promptly.
+        private bool flattenInProgress;
+        private DateTime flattenDeadlineUtc = DateTime.MaxValue;
+        private string pendingFlattenCommandId;
+        private string pendingFlattenIntentId;
+        private string pendingFlattenDecisionId;
         private Order protectiveOrder;
         private string pendingProtectionCommandId;
         private readonly string bridgeInstanceId = Guid.NewGuid().ToString("N");
@@ -610,6 +618,15 @@ namespace NinjaTrader.NinjaScript.AddOns
                 Reject(command, "FOREIGN_ACTIVITY_LOCKOUT", Text(command, "command_id"));
                 return;
             }
+            lock (stateLock)
+            {
+                flattenInProgress = true;
+                flattenDeadlineUtc = DateTime.UtcNow.AddSeconds(ProtectiveAcceptanceSeconds);
+                protectiveDeadlineUtc = DateTime.MaxValue;
+                pendingFlattenCommandId = Text(command, "command_id");
+                pendingFlattenIntentId = Text(command, "intent_id");
+                pendingFlattenDecisionId = Text(command, "decision_id");
+            }
             CancelOwnedOrders();
             // This exact-instrument Account API call cannot touch any other
             // account or instrument. Preflight refuses foreign MNQ activity.
@@ -635,6 +652,19 @@ namespace NinjaTrader.NinjaScript.AddOns
                 || state == OrderState.TriggerPending || state == OrderState.Working || state == OrderState.PartFilled
                 || state == OrderState.ChangePending || state == OrderState.ChangeSubmitted
                 || state == OrderState.CancelPending || state == OrderState.CancelSubmitted;
+        }
+
+        private bool ExpectedFlattenOrder(Order order)
+        {
+            return flattenInProgress && order != null
+                && order.Instrument != null && String.Equals(order.Instrument.FullName, ExactInstrumentName, StringComparison.Ordinal)
+                && String.Equals(order.Name, "Close", StringComparison.Ordinal);
+        }
+
+        private OwnedOrder ExpectedFlattenOwner(Order order)
+        {
+            return new OwnedOrder(pendingFlattenCommandId, pendingFlattenIntentId, pendingFlattenDecisionId,
+                order.Name ?? "Close", "EXIT", order, DateTime.UtcNow);
         }
 
         private Position CurrentPosition()
@@ -680,7 +710,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                     if (!Working(order.OrderState)) continue;
                     bool exact = order.Instrument != null && String.Equals(order.Instrument.FullName, ExactInstrumentName, StringComparison.Ordinal);
                     OwnedOrder owner;
-                    bool owned = ownedByName.TryGetValue(order.Name ?? String.Empty, out owner) || IsOwnedName(order.Name);
+                    bool expectedFlatten = flattenInProgress && exact && String.Equals(order.Name, "Close", StringComparison.Ordinal);
+                    bool owned = ownedByName.TryGetValue(order.Name ?? String.Empty, out owner) || IsOwnedName(order.Name) || expectedFlatten;
                     if (!exact || !owned) foreign = true;
                     if (exact) working++;
                     if (exact && owned && (owner == null || owner.Role == "ENTRY")) entryWorking++;
@@ -727,6 +758,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                     owner.Order = order;
                     owner.Terminal = !Working(order.OrderState);
                 }
+                else if (ExpectedFlattenOrder(order))
+                    owner = ExpectedFlattenOwner(order);
                 else if (Working(order.OrderState))
                 {
                     foreignActivity = true;
@@ -741,7 +774,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                 {
                     if (order.OrderState == OrderState.Accepted || order.OrderState == OrderState.Working)
                         protectiveDeadlineUtc = DateTime.MaxValue;
-                    if (order.OrderState == OrderState.Rejected || order.OrderState == OrderState.Cancelled)
+                    // Cancellation is expected while an accepted EXIT or
+                    // EMERGENCY_FLATTEN is cancelling owned orders before its
+                    // exact-instrument flatten.  A timeout still fails closed
+                    // if that flatten does not reach flat promptly.
+                    if (order.OrderState == OrderState.Rejected || (order.OrderState == OrderState.Cancelled && !flattenInProgress))
                         LockAndProtect("PROTECTIVE_STOP_REJECTED");
                 }
             }
@@ -763,7 +800,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (e == null || e.Execution == null || e.Execution.Order == null || e.Execution.Order.Account != paperAccount) return;
             Order order = e.Execution.Order;
             OwnedOrder owner;
-            lock (stateLock) ownedByName.TryGetValue(order.Name ?? String.Empty, out owner);
+            lock (stateLock)
+            {
+                ownedByName.TryGetValue(order.Name ?? String.Empty, out owner);
+                if (owner == null && ExpectedFlattenOrder(order))
+                    owner = ExpectedFlattenOwner(order);
+            }
             if (owner == null)
             {
                 lock (stateLock) { foreignActivity = true; lockedOut = true; }
@@ -799,6 +841,17 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
             if (!exact || !authenticated) return;
             int quantity = position.MarketPosition == MarketPosition.Short ? -position.Quantity : position.MarketPosition == MarketPosition.Flat ? 0 : position.Quantity;
+            if (quantity == 0)
+            {
+                lock (stateLock)
+                {
+                    flattenInProgress = false;
+                    flattenDeadlineUtc = DateTime.MaxValue;
+                    pendingFlattenCommandId = null;
+                    pendingFlattenIntentId = null;
+                    pendingFlattenDecisionId = null;
+                }
+            }
             Dictionary<string, object> message = SessionMessage("POSITION_EVENT");
             message["receipt_id"] = "l3g-position-" + Guid.NewGuid().ToString("N");
             message["quantity"] = quantity;
@@ -820,14 +873,29 @@ namespace NinjaTrader.NinjaScript.AddOns
                 Thread.Sleep(250);
                 bool heartbeatLost;
                 bool protectionFailed;
+                bool flattenFailed;
                 lock (stateLock)
                 {
-                    bool ownedActivity = OwnedWorkingOrders(null).Count > 0 || (CurrentPosition() != null && CurrentPosition().Quantity != 0);
+                    Position position = CurrentPosition();
+                    bool positionOpen = position != null && position.Quantity != 0;
+                    bool ownedActivity = OwnedWorkingOrders(null).Count > 0 || positionOpen;
                     heartbeatLost = authenticated && ownedActivity && DateTime.UtcNow - lastHeartbeatUtc > TimeSpan.FromSeconds(5);
                     protectionFailed = protectiveDeadlineUtc != DateTime.MaxValue && DateTime.UtcNow > protectiveDeadlineUtc;
+                    flattenFailed = flattenInProgress && flattenDeadlineUtc != DateTime.MaxValue && DateTime.UtcNow > flattenDeadlineUtc && positionOpen;
+                    if (flattenInProgress && !positionOpen)
+                    {
+                        flattenInProgress = false;
+                        flattenDeadlineUtc = DateTime.MaxValue;
+                        pendingFlattenCommandId = null;
+                        pendingFlattenIntentId = null;
+                        pendingFlattenDecisionId = null;
+                    }
+                    if (flattenFailed)
+                        flattenInProgress = false;
                 }
                 if (heartbeatLost) LockAndProtect("HEARTBEAT_WATCHDOG");
                 if (protectionFailed) LockAndProtect("PROTECTIVE_STOP_ACCEPTANCE_TIMEOUT");
+                if (flattenFailed) LockAndProtect("FLATTEN_ACCEPTANCE_TIMEOUT");
             }
         }
 
@@ -839,6 +907,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                 lockedOut = true;
                 reconciled = false;
                 protectiveDeadlineUtc = DateTime.MaxValue;
+                flattenInProgress = false;
+                flattenDeadlineUtc = DateTime.MaxValue;
+                pendingFlattenCommandId = null;
+                pendingFlattenIntentId = null;
+                pendingFlattenDecisionId = null;
             }
             try
             {

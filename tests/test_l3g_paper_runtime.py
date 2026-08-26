@@ -5,12 +5,15 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from decimal import Decimal
 import unittest
+from unittest.mock import patch
 
 from src.l3f_provider.tradovate_observation import StreamHealth
 from src.l3g_paper.ledger import PaperLedger
 from src.l3g_paper.ninjatrader_transport import PaperExecutionTransport
 from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout
-from src.l3g_paper.contracts import PaperRuntimeState
+from src.l3g_paper.contracts import PaperDirection, PaperRuntimeState, PaperSessionArmGrant
+from src.l3g_paper.risk import PaperRiskSnapshot
+from src.l3g_paper.sessions import PaperSessionResolver
 from .l3g_helpers import ObservationFactory, warmed_bullish_policy
 
 
@@ -114,11 +117,165 @@ class PaperRuntimeTests(unittest.TestCase):
             self.assertEqual(runtime.status()["protective_stop_state"], "WORKING")
             runtime._transition(PaperRuntimeState.EXIT_PENDING, "TEST_EXIT_SENT")
             runtime.on_execution_message({"message_type": "EXECUTION_EVENT", "order_role": "EXIT", "price": "101", "quantity": 1})
+            reconciliation_commands: list[object] = []
+            runtime._execution_session_id = lambda: "l3g-es-test"  # type: ignore[method-assign]
+            runtime._persist_and_send = lambda command, grant: reconciliation_commands.append((command, grant))  # type: ignore[method-assign]
             runtime.on_execution_message({"message_type": "POSITION_EVENT", "quantity": 0, "timestamp": "2026-08-24T14:00:02Z"})
+            self.assertEqual(runtime.state, PaperRuntimeState.RECONCILING)
+            self.assertEqual(reconciliation_commands[0][0].action.value, "RECONCILE")
+            runtime.on_execution_message({
+                "message_type": "RECONCILIATION", "receipt_id": "post-exit-flat", "account_name": "Sim101",
+                "account_class": "LOCAL_SIMULATION", "instrument": "MNQ SEP26", "position_quantity": 0,
+                "working_order_count": 0, "working_entry_count": 0, "position_snapshot_complete": True,
+                "order_snapshot_complete": True, "foreign_activity": False, "timestamp": "2026-08-24T14:00:03Z",
+            })
             status = runtime.status()
             self.assertEqual(runtime.state, PaperRuntimeState.ARMED_FLAT)
             self.assertEqual(status["session_entries"], 1)
             self.assertEqual(status["daily_realized_pnl"], "1.50")
+            runtime.stop(); ledger.close()
+
+    def test_commissioning_entry_is_fixed_and_retains_all_non_strategy_markers(self) -> None:
+        now = "2026-08-24T22:10:00Z"
+        context = PaperSessionResolver().resolve(now, generation=1).context
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            runtime = LaneIIIPaperRuntime(ledger)
+            runtime._state = PaperRuntimeState.ARMED_FLAT
+            runtime._session_context = context
+            runtime._armed_session = PaperSessionArmGrant(
+                context.session_kind, context.session_id, context.trade_date, context.session_profile_hash,
+                context.session_generation, now, "2026-08-25T05:30:00Z",
+            )
+            runtime._snapshot = PaperRiskSnapshot(
+                now, position_snapshot_complete=True, order_snapshot_complete=True,
+                reconciliation_current=True, local_bridge_healthy=True,
+                market_price_connected=True, execution_bridge_healthy=True, evidence_warmed=True,
+                depth_reset_recovery=False, quote_observed_at=now, classified_trade_observed_at=now,
+                depth_mutation_observed_at=now, session_kind=context.session_kind,
+                session_id=context.session_id, trade_date=context.trade_date,
+                session_profile_hash=context.session_profile_hash, session_generation=context.session_generation,
+            )
+            submitted: list[object] = []
+            runtime._persist_and_send = lambda command, grant: submitted.append((command, grant))  # type: ignore[method-assign]
+            runtime._execution_session_id = lambda: "l3g-es-test"  # type: ignore[method-assign]
+            with patch("src.l3g_paper.runtime._now", return_value=now):
+                result = runtime.commission_entry()
+            self.assertTrue(result["submitted"])
+            self.assertEqual(runtime.state, PaperRuntimeState.ENTRY_PENDING)
+            command, grant = submitted[0]
+            self.assertEqual(command.account_name, "Sim101")
+            self.assertEqual(command.instrument, "MNQ SEP26")
+            self.assertEqual(command.quantity, 1)
+            for record in ledger.recent(10):
+                if record["kind"] in {"DECISION", "INTENT", "RISK_GRANT", "COMMAND"}:
+                    self.assertTrue(record["payload"]["commissioning"])
+                    self.assertFalse(record["payload"]["strategy_generated"])
+                    self.assertFalse(record["payload"]["scientific_evidence"])
+            runtime.stop(); ledger.close()
+
+    def test_exit_submission_cannot_reenter_before_exit_pending_is_recorded(self) -> None:
+        now = "2026-08-24T22:10:00Z"
+        context = PaperSessionResolver().resolve(now, generation=1).context
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            runtime = LaneIIIPaperRuntime(ledger)
+            runtime._state = PaperRuntimeState.SHORT
+            runtime._position = PaperDirection.SHORT
+            runtime._position_quantity = -1
+            runtime._session_context = context
+            runtime._snapshot = PaperRiskSnapshot(
+                now, current_position=PaperDirection.SHORT, current_position_quantity=1,
+                position_snapshot_complete=True, order_snapshot_complete=True,
+                reconciliation_current=True, execution_bridge_healthy=True,
+                session_kind=context.session_kind, session_id=context.session_id,
+                trade_date=context.trade_date, session_profile_hash=context.session_profile_hash,
+                session_generation=context.session_generation,
+            )
+            runtime._execution_session_id = lambda: "l3g-es-test"  # type: ignore[method-assign]
+            submitted: list[object] = []
+
+            def send(command: object, grant: object) -> None:
+                submitted.append((command, grant))
+                runtime._request_exit("PROTECTIVE_STOP_REJECTED", emergency=True)
+
+            runtime._persist_and_send = send  # type: ignore[method-assign]
+            with patch("src.l3g_paper.runtime._now", return_value=now):
+                runtime._request_exit("OPPOSING_HYPOTHESIS")
+            self.assertEqual(len(submitted), 1)
+            self.assertEqual(runtime.state, PaperRuntimeState.EXIT_PENDING)
+            runtime.stop(); ledger.close()
+
+    def test_expected_protective_cancellation_during_owned_exit_does_not_lock_authority(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            runtime = LaneIIIPaperRuntime(ledger)
+            runtime._state = PaperRuntimeState.EXIT_PENDING
+            runtime._position = PaperDirection.LONG
+            runtime._position_quantity = 1
+            runtime.on_execution_message({"message_type": "ORDER_EVENT", "order_role": "PROTECTIVE", "order_state": "CANCELLED"})
+            self.assertIsNone(runtime.status()["lockout_or_fault_reason"])
+            runtime.stop(); ledger.close()
+
+    def test_commissioning_exit_requires_clean_reconciliation_and_persists_fill_pnl(self) -> None:
+        now = "2026-08-24T22:10:00Z"
+        context = PaperSessionResolver().resolve(now, generation=1).context
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            runtime = LaneIIIPaperRuntime(ledger)
+            runtime._state = PaperRuntimeState.ARMED_FLAT
+            runtime._session_context = context
+            runtime._armed_session = PaperSessionArmGrant(
+                context.session_kind, context.session_id, context.trade_date, context.session_profile_hash,
+                context.session_generation, now, "2026-08-25T05:30:00Z",
+            )
+            runtime._snapshot = PaperRiskSnapshot(
+                now, position_snapshot_complete=True, order_snapshot_complete=True,
+                reconciliation_current=True, local_bridge_healthy=True,
+                market_price_connected=True, execution_bridge_healthy=True, evidence_warmed=True,
+                depth_reset_recovery=False, quote_observed_at=now, classified_trade_observed_at=now,
+                depth_mutation_observed_at=now, session_kind=context.session_kind,
+                session_id=context.session_id, trade_date=context.trade_date,
+                session_profile_hash=context.session_profile_hash, session_generation=context.session_generation,
+            )
+            submitted: list[object] = []
+            runtime._execution_session_id = lambda: "l3g-es-test"  # type: ignore[method-assign]
+            runtime._persist_and_send = lambda command, grant: submitted.append((command, grant))  # type: ignore[method-assign]
+            runtime._last_quote = (Decimal("100"), Decimal("100.25"), now)
+            with patch("src.l3g_paper.runtime._now", return_value=now):
+                self.assertTrue(runtime.commission_entry()["submitted"])
+                runtime.on_execution_message({
+                    "message_type": "EXECUTION_EVENT", "order_role": "ENTRY", "price": "100.25", "quantity": 1,
+                    "direction": "LONG", "command_id": submitted[0][0].command_id, "decision_id": submitted[0][0].decision_id,
+                    "native_order_id": "entry-order", "native_execution_id": "entry-execution", "timestamp": now,
+                })
+                runtime.on_execution_message({"message_type": "ORDER_EVENT", "order_role": "PROTECTIVE", "order_state": "WORKING"})
+                self.assertTrue(runtime.commission_exit()["submitted"])
+                exit_command = submitted[1][0]
+                self.assertTrue(exit_command.commissioning)
+                self.assertFalse(exit_command.strategy_generated)
+                self.assertEqual(exit_command.action.value, "EXIT")
+                runtime.on_execution_message({"message_type": "ORDER_EVENT", "order_role": "PROTECTIVE", "order_state": "CANCELLED"})
+                runtime.on_execution_message({
+                    "message_type": "EXECUTION_EVENT", "order_role": "EXIT", "price": "101", "quantity": 1,
+                    "command_id": exit_command.command_id, "native_order_id": "exit-order",
+                    "native_execution_id": "exit-execution", "timestamp": now,
+                })
+                runtime.on_execution_message({"message_type": "POSITION_EVENT", "quantity": 0, "timestamp": now})
+                self.assertEqual(runtime.state, PaperRuntimeState.RECONCILING)
+                self.assertEqual(submitted[2][0].action.value, "RECONCILE")
+                runtime.on_execution_message({
+                    "message_type": "RECONCILIATION", "receipt_id": "commission-flat", "account_name": "Sim101",
+                    "account_class": "LOCAL_SIMULATION", "instrument": "MNQ SEP26", "position_quantity": 0,
+                    "working_order_count": 0, "working_entry_count": 0, "position_snapshot_complete": True,
+                    "order_snapshot_complete": True, "foreign_activity": False, "timestamp": now,
+                })
+            closure = next(record["payload"] for record in ledger.recent(10) if record["kind"] == "COMMISSIONING_CLOSURE")
+            self.assertEqual(runtime.state, PaperRuntimeState.READY_DISARMED)
+            self.assertEqual(closure["entry_order_id"], "entry-order")
+            self.assertEqual(closure["exit_order_id"], "exit-order")
+            self.assertEqual(closure["realized_pnl"], "1.50")
+            self.assertEqual(closure["final_working_order_count"], 0)
             runtime.stop(); ledger.close()
 
     def test_ambiguous_restarts_and_unexpected_fills_lock_out(self) -> None:

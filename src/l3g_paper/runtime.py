@@ -164,7 +164,15 @@ class LaneIIIPaperRuntime:
         self._entry_fill_price: Decimal | None = None
         self._entry_fill_quantity = 0
         self._entry_direction = PaperDirection.FLAT
+        self._entry_execution: dict[str, object] | None = None
+        self._exit_execution: dict[str, object] | None = None
+        self._lifecycle_realized_pnl = Decimal("0")
+        self._post_exit_reconciliation_pending = False
         self._command_sequence = 0
+        # A venue callback can arrive synchronously while a durable exit is
+        # being sent.  It must not create a second exit before EXIT_PENDING is
+        # recorded.
+        self._exit_submission_in_progress = False
         self._fault_reason: str | None = None
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
@@ -286,7 +294,7 @@ class LaneIIIPaperRuntime:
             PaperRuntimeState.DISABLED: {PaperRuntimeState.STARTING},
             PaperRuntimeState.STARTING: {PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.FAULTED},
             PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE: {PaperRuntimeState.RECONCILING, PaperRuntimeState.FAULTED, PaperRuntimeState.STOPPING},
-            PaperRuntimeState.RECONCILING: {PaperRuntimeState.READY_DISARMED, PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED, PaperRuntimeState.STOPPING},
+            PaperRuntimeState.RECONCILING: {PaperRuntimeState.READY_DISARMED, PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.PAUSED, PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED, PaperRuntimeState.STOPPING},
             PaperRuntimeState.READY_DISARMED: {PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.RECONCILING, PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.STOPPING},
             PaperRuntimeState.ARMED_FLAT: {PaperRuntimeState.ENTRY_PENDING, PaperRuntimeState.PAUSED, PaperRuntimeState.READY_DISARMED, PaperRuntimeState.RECONCILING, PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED, PaperRuntimeState.STOPPING},
             PaperRuntimeState.ENTRY_PENDING: {PaperRuntimeState.LONG, PaperRuntimeState.SHORT, PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.PAUSED, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED, PaperRuntimeState.RECONCILING, PaperRuntimeState.STOPPING},
@@ -552,20 +560,31 @@ class LaneIIIPaperRuntime:
         if not grant.granted:
             return
         action = ExecutionAction.ENTER_LONG if decision.decision is PaperDecisionKind.LONG else ExecutionAction.ENTER_SHORT
-        command = self._make_command(intent.intent_id, decision.paper_decision_id, grant.grant_id, action, intent.target_position, "AUTONOMOUS_PAPER_ENTRY")
+        command = self._make_command(
+            intent.intent_id, decision.paper_decision_id, grant.grant_id, action, intent.target_position,
+            "COMMISSIONING_PAPER_ENTRY" if decision.commissioning else "AUTONOMOUS_PAPER_ENTRY",
+            commissioning=decision.commissioning,
+            strategy_generated=decision.strategy_generated,
+            scientific_evidence=decision.scientific_evidence,
+        )
         self._persist_and_send(command, grant)
         self._pending_intent = intent
         self._pending_grant = grant
-        self.policy.mark_entry_used(decision)
+        if not decision.commissioning:
+            self.policy.mark_entry_used(decision)
         self._transition(PaperRuntimeState.ENTRY_PENDING, "ENTRY_COMMAND_SENT")
 
     def _request_exit(self, reason: str, *, emergency: bool = False) -> None:
-        if self._position is PaperDirection.FLAT or self._state is PaperRuntimeState.EXIT_PENDING:
+        if self._position is PaperDirection.FLAT or self._state in {
+            PaperRuntimeState.EXIT_PENDING, PaperRuntimeState.LOCKED_OUT,
+            PaperRuntimeState.FAULTED, PaperRuntimeState.STOPPING, PaperRuntimeState.STOPPED,
+        } or self._exit_submission_in_progress:
             return
         if self._last_decision is None:
             decision_id = "l3g-pd-safety-" + canonical_hash({"reason": reason, "at": _now()})[:24]
         else:
             decision_id = self._last_decision.paper_decision_id
+        commissioning = self._last_decision is not None and self._last_decision.commissioning
         # Safety authority must be fresh even when the directional decision
         # which prompted it is older than the five-second intent TTL.
         created_at = _now()
@@ -580,6 +599,7 @@ class LaneIIIPaperRuntime:
             self._session_context.session_kind, self._session_context.session_id,
             self._session_context.trade_date, self._session_context.session_profile_hash,
             self._session_context.session_generation,
+            commissioning, not commissioning, False,
         )
         self.ledger.append("DECISION", pseudo.payload(), identity=pseudo.paper_decision_id, occurred_at=pseudo.created_at, execution_session_id=self._execution_session_id())
         bid, ask, last = self._references()
@@ -593,11 +613,30 @@ class LaneIIIPaperRuntime:
                 self._transition(PaperRuntimeState.FAULTED, self._fault_reason)
             return
         action = ExecutionAction.EMERGENCY_FLATTEN if emergency else ExecutionAction.EXIT
-        command = self._make_command(intent.intent_id, pseudo.paper_decision_id, grant.grant_id, action, PaperDirection.FLAT, reason)
-        self._persist_and_send(command, grant)
-        self._transition(PaperRuntimeState.EXIT_PENDING, reason)
+        command = self._make_command(
+            intent.intent_id, pseudo.paper_decision_id, grant.grant_id, action, PaperDirection.FLAT, reason,
+            commissioning=commissioning, strategy_generated=not commissioning, scientific_evidence=False,
+        )
+        self._exit_submission_in_progress = True
+        try:
+            self._transition(PaperRuntimeState.EXIT_PENDING, reason)
+            self._persist_and_send(command, grant)
+        finally:
+            self._exit_submission_in_progress = False
 
-    def _make_command(self, intent_id: str, decision_id: str, grant_id: str, action: ExecutionAction, expected: PaperDirection, reason: str) -> PaperExecutionCommand:
+    def _make_command(
+        self,
+        intent_id: str,
+        decision_id: str,
+        grant_id: str,
+        action: ExecutionAction,
+        expected: PaperDirection,
+        reason: str,
+        *,
+        commissioning: bool = False,
+        strategy_generated: bool = True,
+        scientific_evidence: bool = False,
+    ) -> PaperExecutionCommand:
         execution_session = self._execution_session_id()
         if execution_session is None:
             raise RuntimeError("No authenticated execution session is available.")
@@ -615,12 +654,12 @@ class LaneIIIPaperRuntime:
             "execution_session_id": execution_session,
             "intent_id": intent_id,
             "decision_id": decision_id,
-            "action": action.value,
+            "action": action,
             "account_name": ACCOUNT_BINDING.account_name,
             "account_class": ACCOUNT_BINDING.account_class,
             "instrument": ACCOUNT_BINDING.instrument,
             "quantity": quantity,
-            "expected_position": expected.value,
+            "expected_position": expected,
             "created_at": created,
             "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=POLICY.decision_ttl_seconds)).isoformat().replace("+00:00", "Z"),
             "policy_hash": POLICY.configuration_hash,
@@ -628,6 +667,9 @@ class LaneIIIPaperRuntime:
             "account_binding_hash": ACCOUNT_BINDING.binding_hash,
             "reason_code": reason,
             "risk_grant_id": grant_id,
+            "commissioning": commissioning,
+            "strategy_generated": strategy_generated,
+            "scientific_evidence": scientific_evidence,
         }
         return PaperExecutionCommand(deterministic_id("l3g-pc-", payload), **payload)
 
@@ -658,11 +700,16 @@ class LaneIIIPaperRuntime:
                     self.risk.lock_out(self._fault_reason)
                     if self._state not in {PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.STOPPING, PaperRuntimeState.STOPPED}:
                         self._transition(PaperRuntimeState.LOCKED_OUT, self._fault_reason)
-                if message.get("order_role") == "PROTECTIVE" and str(message.get("order_state", "")).upper() in {"REJECTED", "CANCELLED", "CANCELED"} and self._position is not PaperDirection.FLAT:
-                    self.risk.lock_out("PROTECTIVE_STOP_REJECTED")
-                    self._request_exit("PROTECTIVE_STOP_REJECTED", emergency=True)
                 role = str(message.get("order_role", "")).upper()
                 order_state = str(message.get("order_state", "")).upper()
+                expected_protective_cancellation = (
+                    role == "PROTECTIVE"
+                    and order_state in {"CANCELLED", "CANCELED"}
+                    and (self._exit_submission_in_progress or self._state is PaperRuntimeState.EXIT_PENDING)
+                )
+                if role == "PROTECTIVE" and order_state in {"REJECTED", "CANCELLED", "CANCELED"} and self._position is not PaperDirection.FLAT and not expected_protective_cancellation:
+                    self.risk.lock_out("PROTECTIVE_STOP_REJECTED")
+                    self._request_exit("PROTECTIVE_STOP_REJECTED", emergency=True)
                 if role == "PROTECTIVE":
                     self._snapshot = replace(self._snapshot, observed_at=_now(), protective_stop_state=order_state or self._snapshot.protective_stop_state)
                 if role == "ENTRY" and order_state in {"REJECTED", "CANCELLED", "CANCELED"} and self._state is PaperRuntimeState.ENTRY_PENDING:
@@ -715,7 +762,10 @@ class LaneIIIPaperRuntime:
             if self._state is PaperRuntimeState.RECONCILING:
                 self._transition(PaperRuntimeState.LOCKED_OUT, self._fault_reason)
         elif self._state is PaperRuntimeState.RECONCILING:
-            self._transition(PaperRuntimeState.READY_DISARMED, "FLAT_RECONCILIATION_COMPLETE")
+            if self._post_exit_reconciliation_pending:
+                self._complete_post_exit_reconciliation(message)
+            else:
+                self._transition(PaperRuntimeState.READY_DISARMED, "FLAT_RECONCILIATION_COMPLETE")
 
     def _apply_execution(self, message: Mapping[str, object]) -> None:
         role = str(message.get("order_role", ""))
@@ -740,6 +790,7 @@ class LaneIIIPaperRuntime:
             self._entry_fill_price = price
             self._entry_fill_quantity = quantity
             self._entry_direction = expected
+            self._entry_execution = dict(message)
             entry_context = context_from_identity(
                 intent.session_kind, intent.session_id, intent.trade_date,
                 intent.session_profile_hash, intent.session_generation,
@@ -776,6 +827,37 @@ class LaneIIIPaperRuntime:
                 trade_date_entry_count=trade_risk.entry_count,
                 consecutive_losses=trade_risk.consecutive_losses,
             )
+            self._exit_execution = dict(message)
+            self._lifecycle_realized_pnl = realized
+            entry = self._entry_execution or {}
+            self.ledger.append(
+                "EXECUTION_REALIZED_PNL",
+                {
+                    "commissioning": bool(self._last_decision is not None and self._last_decision.commissioning),
+                    "strategy_generated": not bool(self._last_decision is not None and self._last_decision.commissioning),
+                    "scientific_evidence": False,
+                    "entry_decision_id": entry.get("decision_id"),
+                    "entry_command_id": entry.get("command_id"),
+                    "entry_execution_id": entry.get("native_execution_id"),
+                    "entry_order_id": entry.get("native_order_id"),
+                    "entry_price": str(self._entry_fill_price) if self._entry_fill_price is not None else None,
+                    "entry_quantity": self._entry_fill_quantity,
+                    "entry_timestamp": entry.get("timestamp"),
+                    "exit_command_id": message.get("command_id"),
+                    "exit_execution_id": message.get("native_execution_id"),
+                    "exit_order_id": message.get("native_order_id"),
+                    "exit_price": str(price),
+                    "exit_quantity": quantity,
+                    "exit_timestamp": message.get("timestamp"),
+                    "contract_value_per_point": "2",
+                    "simulated_fees": "0",
+                    "realized_pnl": str(realized),
+                    "pnl_basis": "AUTHENTIC_ENTRY_AND_EXIT_FILLS",
+                    "position_confirmation": "PENDING",
+                },
+                identity="l3g-realized-pnl-" + str(message.get("native_execution_id", canonical_hash(dict(message)))),
+                execution_session_id=self._execution_session_id(),
+            )
 
     def _apply_position(self, message: Mapping[str, object]) -> None:
         quantity = message.get("quantity")
@@ -789,16 +871,98 @@ class LaneIIIPaperRuntime:
         self._position_quantity = abs(quantity)
         self._snapshot = replace(self._snapshot, observed_at=_now(), current_position=self._position, current_position_quantity=abs(quantity), position_opened_at=None if quantity == 0 else self._snapshot.position_opened_at)
         if quantity == 0 and self._state is PaperRuntimeState.EXIT_PENDING:
-            self.policy.confirm_flat(str(message.get("timestamp", _now())))
-            self._pending_intent = None
-            self._pending_grant = None
-            self._entry_fill_price = None
-            self._entry_fill_quantity = 0
-            self._entry_direction = PaperDirection.FLAT
-            self._entry_session_context = None
-            target = PaperRuntimeState.READY_DISARMED if self._disarm_after_flat else PaperRuntimeState.PAUSED if self._entries_paused else PaperRuntimeState.ARMED_FLAT
-            self._transition(target, "FLAT_POSITION_CONFIRMED")
-            self._disarm_after_flat = False
+            self._post_exit_reconciliation_pending = True
+            self._transition(PaperRuntimeState.RECONCILING, "FLAT_POSITION_PENDING_RECONCILIATION")
+            self._request_reconciliation_after_exit()
+
+    def _request_reconciliation_after_exit(self) -> None:
+        """Require a new signed flat/order snapshot before lifecycle completion."""
+        created_at = _now()
+        commissioning = self._last_decision is not None and self._last_decision.commissioning
+        decision = PaperDecision(
+            "l3g-pd-" + canonical_hash({"reason": "POST_EXIT_RECONCILIATION", "at": created_at})[:32],
+            POLICY.policy_id, POLICY.configuration_hash, PaperDecisionKind.EXIT, created_at,
+            (datetime.fromisoformat(normalized_utc(created_at, "Post-exit reconciliation time").replace("Z", "+00:00")) + timedelta(seconds=5)).isoformat().replace("+00:00", "Z"),
+            None, PaperDirection.FLAT, Decimal("1"), {"safety": "POST_EXIT_RECONCILIATION"},
+            ((self._last_decision.paper_decision_id if self._last_decision is not None else "post-exit-safety"),),
+            (max(0, self.policy.status().get("last_local_sequence") or 0),),
+            (canonical_hash({"reason": "POST_EXIT_RECONCILIATION"}),), POLICY.sequence_authority,
+            POLICY.book_completeness, False, "POST_EXIT_RECONCILIATION",
+            self._session_context.session_kind, self._session_context.session_id,
+            self._session_context.trade_date, self._session_context.session_profile_hash,
+            self._session_context.session_generation,
+            commissioning, not commissioning, False,
+        )
+        self.ledger.append("DECISION", decision.payload(), identity=decision.paper_decision_id, occurred_at=decision.created_at, execution_session_id=self._execution_session_id())
+        bid, ask, last = self._references()
+        intent = self.risk.make_intent(decision, reference_bid=bid, reference_ask=ask, reference_last=last)
+        self.ledger.append("INTENT", intent.payload(), identity=intent.intent_id, occurred_at=intent.created_at, execution_session_id=self._execution_session_id())
+        grant = self.risk.evaluate(intent, self._snapshot, at=created_at)
+        self.ledger.append("RISK_GRANT", grant.payload(), identity=grant.grant_id, occurred_at=grant.evaluated_at, execution_session_id=self._execution_session_id())
+        if not grant.granted:
+            self._fault_reason = "POST_EXIT_RECONCILIATION_AUTHORITY_UNAVAILABLE:" + ",".join(grant.reason_codes)
+            self.risk.lock_out(self._fault_reason)
+            self._transition(PaperRuntimeState.LOCKED_OUT, self._fault_reason)
+            return
+        command = self._make_command(
+            intent.intent_id, decision.paper_decision_id, grant.grant_id, ExecutionAction.RECONCILE, PaperDirection.FLAT,
+            "POST_EXIT_RECONCILIATION", commissioning=commissioning, strategy_generated=not commissioning,
+            scientific_evidence=False,
+        )
+        self._persist_and_send(command, grant)
+
+    def _complete_post_exit_reconciliation(self, reconciliation: Mapping[str, object]) -> None:
+        """Close a fully evidenced lifecycle only after a fresh clean reconciliation."""
+        commissioning = self._last_decision is not None and self._last_decision.commissioning
+        self.policy.confirm_flat(str(reconciliation.get("timestamp", _now())))
+        self._pending_intent = None
+        self._pending_grant = None
+        target = PaperRuntimeState.READY_DISARMED if self._disarm_after_flat else PaperRuntimeState.PAUSED if self._entries_paused else PaperRuntimeState.ARMED_FLAT
+        self._transition(target, "POST_EXIT_FLAT_RECONCILIATION_COMPLETE")
+        if commissioning:
+            entry = self._entry_execution or {}
+            exit_fill = self._exit_execution or {}
+            self.ledger.append(
+                "COMMISSIONING_CLOSURE",
+                {
+                    "commissioning": True,
+                    "strategy_generated": False,
+                    "scientific_evidence": False,
+                    "classification": "EXPLICIT_PAPER_COMMISSIONING",
+                    "entry_decision_id": entry.get("decision_id"),
+                    "entry_command_id": entry.get("command_id"),
+                    "entry_order_id": entry.get("native_order_id"),
+                    "entry_execution_id": entry.get("native_execution_id"),
+                    "entry_price": str(self._entry_fill_price) if self._entry_fill_price is not None else None,
+                    "entry_quantity": self._entry_fill_quantity,
+                    "exit_command_id": exit_fill.get("command_id"),
+                    "exit_order_id": exit_fill.get("native_order_id"),
+                    "exit_execution_id": exit_fill.get("native_execution_id"),
+                    "exit_price": exit_fill.get("price"),
+                    "exit_quantity": exit_fill.get("quantity"),
+                    "contract_value_per_point": "2",
+                    "simulated_fees": "0",
+                    "realized_pnl": str(self._lifecycle_realized_pnl),
+                    "final_position": "FLAT",
+                    "final_quantity": 0,
+                    "final_working_order_count": 0,
+                    "foreign_activity": False,
+                    "reconciliation_state": "CLEAN",
+                    "lock_disarm_state": target.value,
+                    "ledger_hash_chain_required": True,
+                },
+                identity="l3g-commissioning-closure-" + str(exit_fill.get("native_execution_id", canonical_hash(dict(reconciliation)))),
+                execution_session_id=self._execution_session_id(),
+            )
+        self._entry_fill_price = None
+        self._entry_fill_quantity = 0
+        self._entry_direction = PaperDirection.FLAT
+        self._entry_execution = None
+        self._exit_execution = None
+        self._lifecycle_realized_pnl = Decimal("0")
+        self._entry_session_context = None
+        self._post_exit_reconciliation_pending = False
+        self._disarm_after_flat = False
 
     def arm(self) -> dict[str, object]:
         with self._lock:
@@ -825,6 +989,115 @@ class LaneIIIPaperRuntime:
             return {
                 "armed": True, "reason_codes": ("PAPER_ARMED",), "state": self._state.value,
                 "session_armed_state": "ARMED_" + context.session_kind.value, "arm_grant": self._armed_session.payload(),
+            }
+
+    def commission_entry(self) -> dict[str, object]:
+        """Submit one sealed, non-strategy commissioning entry through normal safety gates.
+
+        This deliberately has no operator-supplied account, instrument, size, or
+        direction input.  It is a one-contract Sim101 long solely to prove the
+        authenticated execution lifecycle when Trader V0 has not naturally
+        emitted an admissible decision.  The decision provenance is marked as
+        commissioning-only and is excluded from strategy and scientific evidence.
+        """
+        with self._lock:
+            if self._state is not PaperRuntimeState.ARMED_FLAT or self._entries_paused:
+                return {"submitted": False, "reason_codes": ("PAPER_NOT_ARMED_FLAT",), "state": self._state.value}
+            context = self._session_context
+            now = _now()
+            current = self._session_resolver.resolve(now, generation=context.session_generation).context
+            if (
+                context.session_kind is PaperSessionKind.OFF_SESSION
+                or (current.session_kind, current.session_id, current.trade_date, current.session_profile_hash)
+                != (context.session_kind, context.session_id, context.trade_date, context.session_profile_hash)
+            ):
+                reasons = ("COMMISSIONING_SESSION_IDENTITY_MISMATCH",)
+                self.ledger.append(
+                    "RISK_EVENT_COMMISSIONING_PREFLIGHT",
+                    {**context.payload(), "commissioning": True, "strategy_generated": False,
+                     "scientific_evidence": False, "allowed": False, "reason_codes": reasons},
+                    execution_session_id=self._execution_session_id(),
+                )
+                return {"submitted": False, "reason_codes": reasons, "state": self._state.value}
+            if self._armed_session is None or not self._armed_session.valid_at(now):
+                reasons = ("SESSION_ARM_EXPIRED",)
+                self.ledger.append(
+                    "RISK_EVENT_COMMISSIONING_PREFLIGHT",
+                    {**context.payload(), "commissioning": True, "strategy_generated": False,
+                     "scientific_evidence": False, "allowed": False, "reason_codes": reasons},
+                    execution_session_id=self._execution_session_id(),
+                )
+                return {"submitted": False, "reason_codes": reasons, "state": self._state.value}
+            allowed, reasons = self.risk.preflight(self._snapshot, at=now)
+            self.ledger.append(
+                "RISK_EVENT_COMMISSIONING_PREFLIGHT",
+                {**context.payload(), "commissioning": True, "strategy_generated": False,
+                 "scientific_evidence": False, "allowed": allowed, "reason_codes": reasons},
+                execution_session_id=self._execution_session_id(),
+            )
+            if not allowed:
+                return {"submitted": False, "reason_codes": reasons, "state": self._state.value}
+            source = canonical_hash({"commissioning": True, "at": now, "session_id": context.session_id})
+            payload = {
+                "paper_policy_id": POLICY.policy_id,
+                "paper_policy_hash": POLICY.configuration_hash,
+                "decision": PaperDecisionKind.LONG.value,
+                "created_at": now,
+                "session_kind": context.session_kind.value,
+                "session_id": context.session_id,
+                "trade_date": context.trade_date,
+                "session_profile_hash": context.session_profile_hash,
+                "session_generation": context.session_generation,
+                "commissioning": True,
+                "strategy_generated": False,
+                "scientific_evidence": False,
+            }
+            decision = PaperDecision(
+                deterministic_id("l3g-pd-", payload), POLICY.policy_id, POLICY.configuration_hash,
+                PaperDecisionKind.LONG, now,
+                (datetime.fromisoformat(now.replace("Z", "+00:00")) + timedelta(seconds=POLICY.decision_ttl_seconds)).isoformat().replace("+00:00", "Z"),
+                None, PaperDirection.LONG, Decimal("0"), {"commissioning": True},
+                ("commissioning-operator-intent",),
+                (max(0, int(self.policy.status().get("last_local_sequence") or 0)),),
+                (source,), POLICY.sequence_authority, POLICY.book_completeness, False,
+                "COMMISSIONING_OPERATOR_ENTRY", context.session_kind, context.session_id,
+                context.trade_date, context.session_profile_hash, context.session_generation,
+                True, False, False,
+            )
+            self._last_decision = decision
+            self.ledger.append(
+                "DECISION", decision.payload(), identity=decision.paper_decision_id,
+                occurred_at=decision.created_at, execution_session_id=self._execution_session_id(),
+            )
+            self._request_entry(decision)
+            return {
+                "submitted": True,
+                "commissioning": True,
+                "strategy_generated": False,
+                "scientific_evidence": False,
+                "decision_id": decision.paper_decision_id,
+                "state": self._state.value,
+            }
+
+    def commission_exit(self) -> dict[str, object]:
+        """Close the active explicit commissioning position with a normal owned exit."""
+        with self._lock:
+            if (
+                self._state not in {PaperRuntimeState.LONG, PaperRuntimeState.SHORT}
+                or self._last_decision is None
+                or not self._last_decision.commissioning
+            ):
+                return {"submitted": False, "reason_codes": ("NO_ACTIVE_COMMISSIONING_POSITION",), "state": self._state.value}
+            self._entries_paused = True
+            self._armed_session = None
+            self._disarm_after_flat = True
+            self._request_exit("COMMISSIONING_OPERATOR_EXIT")
+            return {
+                "submitted": True,
+                "commissioning": True,
+                "strategy_generated": False,
+                "scientific_evidence": False,
+                "state": self._state.value,
             }
 
     def pause_entries(self) -> dict[str, object]:
@@ -977,6 +1250,13 @@ class LaneIIIPaperRuntime:
                 "family_entry_count": trade_risk.entry_count,
                 "combined_trade_date_loss_allowance_remaining": str(loss_remaining),
                 "trade_date_entry_count": trade_risk.entry_count,
+                "commissioning_lifecycle": {
+                    "classification": "EXPLICIT_PAPER_COMMISSIONING" if self._last_decision is not None and self._last_decision.commissioning else "STRATEGY_GENERATED_PAPER",
+                    "active": self._last_decision is not None and self._last_decision.commissioning and self._position is not PaperDirection.FLAT,
+                    "decision_id": None if self._last_decision is None or not self._last_decision.commissioning else self._last_decision.paper_decision_id,
+                    "strategy_generated": False if self._last_decision is not None and self._last_decision.commissioning else True,
+                    "scientific_evidence": False,
+                },
                 "last_paper_decision": None if self._last_decision is None else self._last_decision.payload(),
                 "last_risk_result": risk.get("last_risk_result"),
                 "last_command": None if self._last_command is None else self._last_command.payload(),

@@ -384,6 +384,9 @@ class PaperDecision:
     trade_date: str = UNSPECIFIED_OFF_SESSION_CONTEXT.trade_date
     session_profile_hash: str = UNSPECIFIED_OFF_SESSION_CONTEXT.session_profile_hash
     session_generation: int = UNSPECIFIED_OFF_SESSION_CONTEXT.session_generation
+    commissioning: bool = False
+    strategy_generated: bool = True
+    scientific_evidence: bool = False
 
     def __post_init__(self) -> None:
         if not self.paper_decision_id.startswith("l3g-pd-"):
@@ -394,10 +397,22 @@ class PaperDecision:
         _utc(self.expires_at, "Paper decision expiry")
         if self.scientific_eligibility or self.sequence_authority is not SequenceAuthority.LOCAL_CALLBACK_ORDER_ONLY or self.book_completeness is not BookCompleteness.UNVERIFIED:
             raise ValueError("Paper decisions are never scientifically eligible.")
-        if self.decision is PaperDecisionKind.LONG and (self.hypothesis_kind is not HypothesisKind.BULLISH_REVERSAL or self.direction is not PaperDirection.LONG):
-            raise ValueError("Only bullish reversal may create a long paper decision.")
-        if self.decision is PaperDecisionKind.SHORT and (self.hypothesis_kind is not HypothesisKind.BEARISH_CONTINUATION or self.direction is not PaperDirection.SHORT):
-            raise ValueError("Only bearish continuation may create a short paper decision.")
+        if self.commissioning:
+            if self.strategy_generated or self.scientific_evidence or self.hypothesis_kind is not None:
+                raise ValueError("Commissioning decisions must remain non-strategy and non-scientific.")
+            if self.decision in {PaperDecisionKind.LONG, PaperDecisionKind.SHORT}:
+                expected_direction = PaperDirection.LONG if self.decision is PaperDecisionKind.LONG else PaperDirection.SHORT
+                if self.direction is not expected_direction:
+                    raise ValueError("Commissioning decision direction must match its sealed entry action.")
+            elif self.decision is not PaperDecisionKind.EXIT or self.direction is not PaperDirection.FLAT:
+                raise ValueError("Commissioning decisions may only create a sealed entry or a flat closing exit.")
+        else:
+            if not self.strategy_generated or self.scientific_evidence:
+                raise ValueError("Strategy decisions cannot claim scientific evidence or lose their strategy provenance.")
+            if self.decision is PaperDecisionKind.LONG and (self.hypothesis_kind is not HypothesisKind.BULLISH_REVERSAL or self.direction is not PaperDirection.LONG):
+                raise ValueError("Only bullish reversal may create a long paper decision.")
+            if self.decision is PaperDecisionKind.SHORT and (self.hypothesis_kind is not HypothesisKind.BEARISH_CONTINUATION or self.direction is not PaperDirection.SHORT):
+                raise ValueError("Only bearish continuation may create a short paper decision.")
         if self.decision in {PaperDecisionKind.NO_TRADE, PaperDecisionKind.EXIT} and self.direction is not PaperDirection.FLAT:
             raise ValueError("NO_TRADE and EXIT have a flat target direction.")
         _validate_session_identity(self.session_kind, self.session_id, self.trade_date, self.session_profile_hash, self.session_generation)
@@ -428,6 +443,9 @@ class PaperExecutionIntent:
     trade_date: str = UNSPECIFIED_OFF_SESSION_CONTEXT.trade_date
     session_profile_hash: str = UNSPECIFIED_OFF_SESSION_CONTEXT.session_profile_hash
     session_generation: int = UNSPECIFIED_OFF_SESSION_CONTEXT.session_generation
+    commissioning: bool = False
+    strategy_generated: bool = True
+    scientific_evidence: bool = False
 
     def __post_init__(self) -> None:
         if not self.intent_id.startswith("l3g-pi-") or not self.paper_decision_id.startswith("l3g-pd-"):
@@ -438,6 +456,11 @@ class PaperExecutionIntent:
         _utc(self.expires_at, "Paper intent expiry")
         if self.target_position not in {PaperDirection.LONG, PaperDirection.SHORT, PaperDirection.FLAT}:
             raise ValueError("Unsupported target position.")
+        if self.commissioning:
+            if self.strategy_generated or self.scientific_evidence:
+                raise ValueError("Commissioning intents must remain non-strategy and non-scientific.")
+        elif not self.strategy_generated or self.scientific_evidence:
+            raise ValueError("Strategy intents must retain non-scientific strategy provenance.")
         _validate_session_identity(self.session_kind, self.session_id, self.trade_date, self.session_profile_hash, self.session_generation)
 
     def payload(self) -> dict[str, object]:
@@ -469,6 +492,9 @@ class PaperRiskGrant:
     trade_date: str = UNSPECIFIED_OFF_SESSION_CONTEXT.trade_date
     session_profile_hash: str = UNSPECIFIED_OFF_SESSION_CONTEXT.session_profile_hash
     session_generation: int = UNSPECIFIED_OFF_SESSION_CONTEXT.session_generation
+    commissioning: bool = False
+    strategy_generated: bool = True
+    scientific_evidence: bool = False
 
     def __post_init__(self) -> None:
         if not self.grant_id.startswith("l3g-pg-") or not self.intent_id.startswith("l3g-pi-"):
@@ -479,6 +505,11 @@ class PaperRiskGrant:
             raise ValueError("A risk grant must retain explicit paper-only reasons and authority.")
         if min(self.current_working_orders, self.session_entry_count, self.consecutive_losses) < 0:
             raise ValueError("Paper risk counters cannot be negative.")
+        if self.commissioning:
+            if self.strategy_generated or self.scientific_evidence:
+                raise ValueError("Commissioning grants must remain non-strategy and non-scientific.")
+        elif not self.strategy_generated or self.scientific_evidence:
+            raise ValueError("Strategy grants must retain non-scientific strategy provenance.")
         _validate_session_identity(self.session_kind, self.session_id, self.trade_date, self.session_profile_hash, self.session_generation)
 
     def payload(self) -> dict[str, object]:
@@ -547,6 +578,9 @@ class PaperExecutionCommand:
     session_profile_hash: str = UNSPECIFIED_OFF_SESSION_CONTEXT.session_profile_hash
     session_generation: int = UNSPECIFIED_OFF_SESSION_CONTEXT.session_generation
     execution_session_id: str = ""
+    commissioning: bool = False
+    strategy_generated: bool = True
+    scientific_evidence: bool = False
 
     def __post_init__(self) -> None:
         if not self.command_id.startswith("l3g-pc-") or type(self.command_sequence) is not int or self.command_sequence <= 0:
@@ -571,6 +605,11 @@ class PaperExecutionCommand:
             raise ValueError("Paper command action and target position do not match.")
         if not all((self.policy_hash, self.risk_profile_hash, self.account_binding_hash, self.reason_code)):
             raise ValueError("Paper command authority hashes and reason are required.")
+        if self.commissioning:
+            if self.strategy_generated or self.scientific_evidence:
+                raise ValueError("Commissioning commands must remain non-strategy and non-scientific.")
+        elif not self.strategy_generated or self.scientific_evidence:
+            raise ValueError("Strategy commands must retain non-scientific strategy provenance.")
         _utc(self.created_at, "Paper command time")
         _utc(self.expires_at, "Paper command expiry")
         # Version-G commands called session_id the authenticated bridge

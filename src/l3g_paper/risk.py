@@ -232,12 +232,16 @@ class PaperRiskAuthority:
             "trade_date": decision.trade_date,
             "session_profile_hash": decision.session_profile_hash,
             "session_generation": decision.session_generation,
+            "commissioning": decision.commissioning,
+            "strategy_generated": decision.strategy_generated,
+            "scientific_evidence": decision.scientific_evidence,
         }
         return PaperExecutionIntent(
             deterministic_id("l3g-pi-", payload), decision.paper_decision_id, target, 1,
             self.binding.instrument, decision.created_at, decision.expires_at, decision.paper_policy_hash,
             reference_bid, reference_ask, reference_last, decision.session_kind, decision.session_id,
             decision.trade_date, decision.session_profile_hash, decision.session_generation,
+            decision.commissioning, decision.strategy_generated, decision.scientific_evidence,
         )
 
     def evaluate(self, intent: PaperExecutionIntent, snapshot: PaperRiskSnapshot, *, at: str) -> PaperRiskGrant:
@@ -329,6 +333,9 @@ class PaperRiskAuthority:
                 "trade_date": context.trade_date,
                 "session_profile_hash": context.session_profile_hash,
                 "session_generation": context.session_generation,
+                "commissioning": intent.commissioning,
+                "strategy_generated": intent.strategy_generated,
+                "scientific_evidence": intent.scientific_evidence,
             }
             grant = PaperRiskGrant(
                 deterministic_id("l3g-pg-", payload), intent.intent_id, self.profile.configuration_hash,
@@ -338,6 +345,8 @@ class PaperRiskAuthority:
                 session_kind=context.session_kind, session_id=context.session_id,
                 trade_date=context.trade_date, session_profile_hash=context.session_profile_hash,
                 session_generation=context.session_generation,
+                commissioning=intent.commissioning, strategy_generated=intent.strategy_generated,
+                scientific_evidence=intent.scientific_evidence,
             )
             self._last_result = grant
             if granted:

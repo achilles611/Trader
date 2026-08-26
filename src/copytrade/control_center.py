@@ -16,7 +16,7 @@ import sqlite3
 from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Mapping
 
 from src.l3f_provider.ninjatrader_commission import NinjaTraderListenerWorker
 from src.l3f_provider.shadow_runtime import LaneIIIShadowRuntime
@@ -1821,8 +1821,53 @@ def create_control_center_app(
             raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
         bootstrap = ninjatrader_runtime.get("login_bootstrap")
         if bootstrap is not None and bootstrap.state is not NinjaTraderLoginState.AUTHENTICATED:
-            raise HTTPException(status_code=409, detail="NinjaTrader desktop authentication is not operational.")
+            # A BeezConsole-only restart can outlast the bounded desktop UI
+            # probe even though NinjaTrader remains authenticated.  Never
+            # trust the process probe alone in that case: accept only the
+            # stronger, fresh signed Sim101 execution handshake and complete
+            # position/order reconciliation already enforced by paper.arm().
+            transport = paper.status().get("transport")
+            if not isinstance(transport, Mapping) or (
+                transport.get("state"), transport.get("authenticated_client"),
+                transport.get("reconciled"), transport.get("account"),
+                transport.get("account_class"), transport.get("instrument"),
+            ) != ("AUTHENTICATED", True, True, "Sim101", "LOCAL_SIMULATION", "MNQ SEP26"):
+                raise HTTPException(status_code=409, detail="NinjaTrader desktop authentication is not operational.")
         return paper.arm()
+
+    @app.post("/api/lane-iii/paper/commission-entry")
+    async def api_lane_iii_paper_commission_entry() -> dict[str, object]:
+        """Run the closed Sim101 commissioning entry only through paper runtime gates."""
+        paper = ninjatrader_runtime.get("paper")
+        if paper is None:
+            raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
+        bootstrap = ninjatrader_runtime.get("login_bootstrap")
+        if bootstrap is not None and bootstrap.state is not NinjaTraderLoginState.AUTHENTICATED:
+            transport = paper.status().get("transport")
+            if not isinstance(transport, Mapping) or (
+                transport.get("state"), transport.get("authenticated_client"),
+                transport.get("reconciled"), transport.get("account"),
+                transport.get("account_class"), transport.get("instrument"),
+            ) != ("AUTHENTICATED", True, True, "Sim101", "LOCAL_SIMULATION", "MNQ SEP26"):
+                raise HTTPException(status_code=409, detail="NinjaTrader desktop authentication is not operational.")
+        return paper.commission_entry()
+
+    @app.post("/api/lane-iii/paper/commission-exit")
+    async def api_lane_iii_paper_commission_exit() -> dict[str, object]:
+        """Close only an active explicit commissioning position through normal paper gates."""
+        paper = ninjatrader_runtime.get("paper")
+        if paper is None:
+            raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
+        bootstrap = ninjatrader_runtime.get("login_bootstrap")
+        if bootstrap is not None and bootstrap.state is not NinjaTraderLoginState.AUTHENTICATED:
+            transport = paper.status().get("transport")
+            if not isinstance(transport, Mapping) or (
+                transport.get("state"), transport.get("authenticated_client"),
+                transport.get("reconciled"), transport.get("account"),
+                transport.get("account_class"), transport.get("instrument"),
+            ) != ("AUTHENTICATED", True, True, "Sim101", "LOCAL_SIMULATION", "MNQ SEP26"):
+                raise HTTPException(status_code=409, detail="NinjaTrader desktop authentication is not operational.")
+        return paper.commission_exit()
 
     @app.post("/api/lane-iii/paper/pause")
     async def api_lane_iii_paper_pause() -> dict[str, object]:

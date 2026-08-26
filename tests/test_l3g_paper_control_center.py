@@ -49,6 +49,7 @@ class PaperControlCenterTests(unittest.TestCase):
         expected = {
             "/api/lane-iii/paper/arm", "/api/lane-iii/paper/pause",
             "/api/lane-iii/paper/resume", "/api/lane-iii/paper/flatten-and-disarm",
+            "/api/lane-iii/paper/commission-entry", "/api/lane-iii/paper/commission-exit",
         }
         self.assertTrue(expected.issubset(routes))
         self.assertFalse(any("order" in path and path.startswith("/api/lane-iii/paper") for path in routes))
