@@ -37,7 +37,7 @@ _DOMAIN_TABLES = {
     "INCIDENT": "lane_iii_paper_incidents",
 }
 _HIGH_VOLUME_DOMAINS = frozenset({"OBSERVATION", "EVIDENCE", "DECISION"})
-COMMISSIONING_TAIL_POLICY_VERSION = "l3g-commissioning-passive-tail-v1"
+COMMISSIONING_TAIL_POLICY_VERSION = "l3g-commissioning-passive-tail-v2"
 COMMISSIONING_NO_AUTHORITY_EFFECT = "NONE"
 _COMMISSIONING_WATERMARK_METADATA_KEY = "commissioning_authority_watermark"
 _PASSIVE_MARKET_OBSERVATION_TYPES = frozenset({"QUOTE", "TRADE", "DEPTH"})
@@ -87,6 +87,23 @@ def commissioning_safe_tail_classification(
         required = (payload.get("observation_id"), payload.get("local_monotonic_sequence"), payload.get("source_payload_hash"))
         if observation_type in _PASSIVE_MARKET_OBSERVATION_TYPES and isinstance(required[0], str) and type(required[1]) is int and isinstance(required[2], str):
             return f"OBSERVATION:{kind}:{observation_type}"
+        if (
+            observation_type == "ACCOUNT"
+            and isinstance(required[0], str)
+            and type(required[1]) is int
+            and isinstance(required[2], str)
+            and payload.get("authority_effect") == COMMISSIONING_NO_AUTHORITY_EFFECT
+            and payload.get("observation_semantics") == "INFORMATIONAL_ACCOUNT_ITEM"
+            and payload.get("observation_payload_keys") == ["item", "value"]
+            and (
+                (payload.get("observation_account_alias"), payload.get("observation_account_class"))
+                in {
+                    ("Sim101", "LOCAL_SIMULATION"),
+                    ("Lucid25kflex01", "PROVIDER_EVALUATION"),
+                }
+            )
+        ):
+            return "OBSERVATION:OBSERVATION_ENVELOPE:ACCOUNT_ITEM_INFORMATIONAL:AUTHORITY_EFFECT_NONE"
         return None
     if domain == "EVIDENCE" and kind == "EVIDENCE":
         if (

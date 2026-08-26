@@ -27,6 +27,17 @@ def observation(number: int = 1, kind: str = "QUOTE") -> dict[str, object]:
     }
 
 
+def informational_account_observation(number: int = 1) -> dict[str, object]:
+    return {
+        **observation(number, "ACCOUNT"),
+        "authority_effect": COMMISSIONING_NO_AUTHORITY_EFFECT,
+        "observation_semantics": "INFORMATIONAL_ACCOUNT_ITEM",
+        "observation_payload_keys": ["item", "value"],
+        "observation_account_alias": "Sim101",
+        "observation_account_class": "LOCAL_SIMULATION",
+    }
+
+
 def evidence(number: int = 1) -> dict[str, object]:
     return {
         "evidence_id": f"l3g-pe-{number}",
@@ -130,15 +141,20 @@ class CommissioningLiveTailTests(unittest.TestCase):
             anchor = int(ledger.health_status()["highest_sequence"])
             for number, kind in enumerate(("QUOTE", "TRADE", "DEPTH"), start=1):
                 ledger.append("OBSERVATION_ENVELOPE", observation(number, kind))
+            ledger.append("OBSERVATION_ENVELOPE", informational_account_observation(4))
             ledger.append("EVIDENCE", evidence())
             for number, value in enumerate(("NO_TRADE", "LONG", "SHORT", "EXIT"), start=1):
                 ledger.append("DECISION", decision(number, value))
             result = self.evaluate(ledger, anchor)
             self.assertEqual(result["ledger_trust_state"], "VERIFIED_ANCHOR_WITH_PASSIVE_LIVE_TAIL")
             self.assertEqual(result["last_authority_mutation_sequence"], anchor)
-            self.assertEqual(result["unverified_tail_rows"], 8)
+            self.assertEqual(result["unverified_tail_rows"], 9)
             self.assertEqual(result["tail_authority_classification"], "PASSIVE_ONLY")
             self.assertIn("OBSERVATION:OBSERVATION_ENVELOPE:QUOTE", result["tail_record_kinds"])
+            self.assertIn(
+                "OBSERVATION:OBSERVATION_ENVELOPE:ACCOUNT_ITEM_INFORMATIONAL:AUTHORITY_EFFECT_NONE",
+                result["tail_record_kinds"],
+            )
             ledger.close()
 
     def test_unknown_decision_order_execution_risk_ownership_and_incident_tails_deny(self) -> None:
@@ -163,12 +179,14 @@ class CommissioningLiveTailTests(unittest.TestCase):
                 ledger.close()
 
     def test_account_or_order_observation_is_not_blanket_allowed_by_observation_domain(self) -> None:
-        record = {
-            "domain": "OBSERVATION",
-            "kind": "OBSERVATION_ENVELOPE",
-            "payload": observation(1, "ORDER"),
-        }
-        self.assertFalse(is_commissioning_safe_unverified_tail_record(record))
+        for payload in (observation(1, "ORDER"), observation(2, "ACCOUNT")):
+            with self.subTest(observation_type=payload["observation_type"]):
+                record = {
+                    "domain": "OBSERVATION",
+                    "kind": "OBSERVATION_ENVELOPE",
+                    "payload": payload,
+                }
+                self.assertFalse(is_commissioning_safe_unverified_tail_record(record))
 
     def test_mixed_fifty_thousand_passive_one_forbidden_fifty_thousand_passive_denies(self) -> None:
         passive = {"domain": "OBSERVATION", "kind": "OBSERVATION_ENVELOPE", "payload": observation()}

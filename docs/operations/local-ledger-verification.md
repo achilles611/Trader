@@ -100,10 +100,12 @@ ARM snapshot was classified, and the last authority-changing or unknown record
 is at or before the verified anchor.
 
 The fail-closed passive policy admits only exact QUOTE/TRADE/DEPTH
-`OBSERVATION_ENVELOPE` shapes, exact paper `EVIDENCE`, and strategy decisions
-that were persisted through the no-side-effect path with
+`OBSERVATION_ENVELOPE` shapes, validated read-only account-item updates stamped
+`INFORMATIONAL_ACCOUNT_ITEM` and `authority_effect=NONE`, exact paper
+`EVIDENCE`, and strategy decisions that were persisted through the no-side-effect path with
 `authority_effect=NONE`. Domain membership alone grants nothing. Unmarked or
-unknown decisions, account/order observations, intents, grants, commands,
+unknown decisions, unmarked or unknown account observations, order/position/
+execution observations, intents, grants, commands,
 receipts, order events, executions, position/reconciliation records, session
 or ARM/DISARM changes, commissioning ownership, risk events, incidents, and
 unknown future records advance the authority watermark and produce

@@ -7,6 +7,7 @@ from decimal import Decimal
 import unittest
 from unittest.mock import patch
 
+from src.l3f_provider.ninjatrader_observation import AccountClass, NinjaTraderObservation
 from src.l3f_provider.tradovate_observation import StreamHealth
 from src.l3g_paper.ledger import PaperLedger
 from src.l3g_paper.ninjatrader_transport import ADDON_PROTOCOL_VERSION, PaperExecutionTransport, expected_addon_source_fingerprint
@@ -48,6 +49,31 @@ class PaperRuntimeTests(unittest.TestCase):
             })
             self.assertEqual(runtime.state.value, "READY_DISARMED")
             self.assertFalse(runtime.arm()["armed"])
+            runtime.stop(); ledger.close()
+
+    def test_only_exact_read_only_account_items_receive_no_authority_marker(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            runtime = LaneIIIPaperRuntime(ledger)
+
+            def account(number: int, payload: dict[str, object]) -> NinjaTraderObservation:
+                at = f"2026-08-26T14:00:0{number}Z"
+                return NinjaTraderObservation(
+                    f"nt-account-{number}", "account-session", "ACCOUNT", at, number, payload,
+                    account_alias="Sim101", account_class=AccountClass.LOCAL_SIMULATION,
+                    provider_timestamp=at,
+                )
+
+            runtime.ingest(account(1, {"item": "RealizedProfitLoss", "value": "0"}))
+            runtime.ingest(account(2, {"item": "RealizedProfitLoss", "value": "0", "unknown": True}))
+            ledger.flush_deferred()
+            records = [record for record in ledger.recent(20, domain="OBSERVATION") if record["payload"]["observation_type"] == "ACCOUNT"]
+            self.assertEqual(len(records), 2)
+            marked = records[1]["payload"]
+            unmarked = records[0]["payload"]
+            self.assertEqual(marked["authority_effect"], "NONE")
+            self.assertEqual(marked["observation_semantics"], "INFORMATIONAL_ACCOUNT_ITEM")
+            self.assertNotIn("authority_effect", unmarked)
             runtime.stop(); ledger.close()
 
     def test_addon_provenance_denies_arm_but_not_observation_or_exit_safety(self) -> None:

@@ -561,6 +561,26 @@ class LaneIIIPaperRuntime:
                 "local_monotonic_sequence": observation.local_monotonic_sequence,
                 "source_payload_hash": canonical_hash(dict(observation.payload)),
             }
+            if (
+                observation.observation_type == "ACCOUNT"
+                and set(observation.payload) == {"item", "value"}
+                and isinstance(observation.payload.get("item"), str)
+                and self._decimal(observation.payload.get("value")) is not None
+                and observation.account_alias in {"Sim101", "Lucid25kflex01"}
+                and observation.account_class is not None
+                and (observation.account_alias, observation.account_class.value)
+                in {
+                    ("Sim101", "LOCAL_SIMULATION"),
+                    ("Lucid25kflex01", "PROVIDER_EVALUATION"),
+                }
+            ):
+                raw_payload.update({
+                    "authority_effect": COMMISSIONING_NO_AUTHORITY_EFFECT,
+                    "observation_semantics": "INFORMATIONAL_ACCOUNT_ITEM",
+                    "observation_payload_keys": ["item", "value"],
+                    "observation_account_alias": observation.account_alias,
+                    "observation_account_class": observation.account_class.value,
+                })
             self.ledger.append_deferred(
                 "OBSERVATION_ENVELOPE", raw_payload,
                 identity="l3g-paper-observation-" + canonical_hash(raw_payload),
