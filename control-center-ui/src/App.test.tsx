@@ -22,6 +22,8 @@ let filteredEmpty = false;
 let discoveryJobResponse: Record<string, unknown> | null = null;
 let discoveryJobDetailResponse: Record<string, unknown> | null = null;
 let shadowResponse: Record<string, unknown> = { configured: false, state: "NOT_CONFIGURED", freshness: "UNKNOWN" };
+let ledgerVerificationResponse: Record<string, unknown> = { status: "UNVERIFIED", full_scan_required: true, chain_valid: false, checkpoint_valid: false, errors: [{ code: "NO_VERIFICATION_ARTIFACT", message: "No completed local ledger verification exists." }] };
+let ledgerVerificationSchedule: Record<string, unknown> = { enabled: false, frequency: "DISABLED", local_time: "03:00", weekday: 0, mode: "auto" };
 
 function payload(path: string) {
   if (path.startsWith("/api/overview")) return { counts: { total_discovered: emptyUniverse ? 0 : 20, qualified: 2, shadow: 1, active: 0 }, funnel: [], top_candidates: [candidate], recent_activity: [] };
@@ -34,7 +36,10 @@ function payload(path: string) {
   if (path.startsWith("/api/discovery/jobs")) return discoveryJobResponse || { job_id: "discovery-1", status: "queued", stage: "queued", configuration: { preset: "standard", candidate_limit: 2500 } };
   if (path.startsWith("/api/execution/shadow/refresh")) return shadowResponse;
   if (path.startsWith("/api/execution")) return { shadow: shadowResponse };
-  if (path.startsWith("/api/lane-iii/paper")) return { state: "READY_DISARMED", ledger: { path: "E:\\BeelzebubData\\Hot\\LaneIII\\Epoch-002\\lane_iii_paper.sqlite3", epoch_id: "L3G-PAPER-EPOCH-002", file_size: 4096, free_bytes: 200000000000, quick_check_state: "ok", chain_valid: true, broken_identity: null, highest_sequence: 12, last_record_time: "2026-08-25T00:30:00Z", wal_size: 1024 } };
+  if (path.startsWith("/api/lane-iii/paper/ledger-verification/schedule")) return ledgerVerificationSchedule;
+  if (path.startsWith("/api/lane-iii/paper/ledger-verification/cancel")) return { ...ledgerVerificationResponse, cancellation_requested: true };
+  if (path.startsWith("/api/lane-iii/paper/ledger-verification")) return ledgerVerificationResponse;
+  if (path.startsWith("/api/lane-iii/paper")) return { state: "READY_DISARMED", ledger_verification: ledgerVerificationResponse, ledger: { path: "E:\\BeelzebubData\\Hot\\LaneIII\\Epoch-002\\lane_iii_paper.sqlite3", epoch_id: "L3G-PAPER-EPOCH-002", file_size: 4096, free_bytes: 200000000000, quick_check_state: "ok", chain_valid: true, broken_identity: null, highest_sequence: 12, last_record_time: "2026-08-25T00:30:00Z", wal_size: 1024 } };
   if (path.startsWith("/api/system")) return { health: { mode: "paper", paper_only: true, database: { connected: true }, websocket: { available: true }, watcher: { state: "NOT_ATTACHED", desired_target_count: 0, subscribed_target_count: 0, membership_in_sync: true }, recovery: { wallets: [{ wallet: candidate.wallet, state: "RECOVERY_INCOMPLETE" }] } }, risk: { limits: [] } };
   if (path.startsWith("/api/candidates?")) return { items: emptyUniverse || filteredEmpty ? [] : [candidate], page: path.includes("page=2") ? 2 : 1, page_size: 50, total: emptyUniverse ? 0 : filteredEmpty ? 1 : 51, pages: 2 };
   if (path.startsWith(`/api/candidates/${candidate.wallet}`)) return { identity: { wallet: candidate.wallet, operator_state: "shadow", research_state: "qualified" }, score: { total: 87.3, eligible: true, components: { consistency: 9 }, penalties: { drawdown: 1 }, reasons: ["fixture_reason"] }, phase_a_prefilter_reasons: ["phase_a_fixture"], phase_b_hard_gates: ["phase_b_fixture"], target_performance: {}, follower_performance: {}, latency: { status: "unavailable" }, analysis_window: {} };
@@ -49,6 +54,8 @@ beforeEach(() => {
   discoveryJobResponse = null;
   discoveryJobDetailResponse = null;
   shadowResponse = { configured: false, state: "NOT_CONFIGURED", freshness: "UNKNOWN" };
+  ledgerVerificationResponse = { status: "UNVERIFIED", full_scan_required: true, chain_valid: false, checkpoint_valid: false, errors: [{ code: "NO_VERIFICATION_ARTIFACT", message: "No completed local ledger verification exists." }] };
+  ledgerVerificationSchedule = { enabled: false, frequency: "DISABLED", local_time: "03:00", weekday: 0, mode: "auto" };
   vi.stubGlobal("WebSocket", WebSocketStub);
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => new Response(JSON.stringify(payload(String(input))), { status: 200, headers: { "Content-Type": "application/json" } })));
 });
@@ -128,6 +135,21 @@ describe("copy control center", () => {
     expect(panel).toHaveTextContent("VALID");
     expect(panel).toHaveTextContent("Highest sequence");
     expect(panel).toHaveTextContent("12");
+  });
+
+  it("starts a local ledger verifier and persists the local schedule controls", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Lane III Paper" }));
+    expect(await screen.findByText("Ledger Verification")).toBeInTheDocument();
+    expect(screen.getByText("FULL VERIFICATION REQUIRED")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Ledger verification mode"), { target: { value: "full" } });
+    fireEvent.click(screen.getByRole("button", { name: "Verify Ledger Now" }));
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/lane-iii/paper/ledger-verification", expect.objectContaining({ method: "POST", body: JSON.stringify({ mode: "full" }) })));
+    fireEvent.click(screen.getByLabelText("Enable ledger verification schedule"));
+    fireEvent.change(screen.getByLabelText("Ledger verification frequency"), { target: { value: "WEEKLY" } });
+    fireEvent.change(screen.getByLabelText("Scheduled ledger verification mode"), { target: { value: "incremental" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save Schedule" }));
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/lane-iii/paper/ledger-verification/schedule", expect.objectContaining({ method: "POST" })));
   });
 
   it("makes Discovery the clear fresh-install starting point with bounded presets", async () => {

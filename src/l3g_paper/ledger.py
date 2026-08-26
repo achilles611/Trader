@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import threading
 from typing import Iterator, Mapping
+from uuid import uuid4
 
 from src.lane_iii.contracts import canonical_hash, normalized_utc
 
@@ -55,22 +56,25 @@ def _assert_redacted(value: object) -> None:
             _assert_redacted(item)
 
 
-def _read_only_quick_check(path: Path) -> str:
-    """Validate an existing image without creating schema or SQLite sidecars."""
+def _read_only_accessibility_check(path: Path) -> str:
+    """Reject an unreadable image without starting a heavyweight validation scan.
+
+    Full and incremental hash-chain verification belongs to the independent
+    local verifier process.  Opening the paper runtime must not turn every
+    BeezConsole restart into a historical ledger scan.
+    """
     connection: sqlite3.Connection | None = None
     try:
         connection = sqlite3.connect(f"{path.as_uri()}?mode=ro&immutable=1", uri=True)
-        rows = connection.execute("PRAGMA quick_check").fetchall()
+        connection.execute("PRAGMA schema_version").fetchone()
     except sqlite3.Error as exc:
+        # Preserve the existing safe failure wording for callers and support
+        # tools while avoiding a full quick_check in the runtime constructor.
         raise RuntimeError(f"LANE_III_PAPER existing ledger quick_check failed for {path}: {exc}") from exc
     finally:
         if connection is not None:
             connection.close()
-    results = [str(row[0]) for row in rows]
-    if results != ["ok"]:
-        detail = "; ".join(results[:10]) or "no result"
-        raise RuntimeError(f"LANE_III_PAPER existing ledger quick_check failed for {path}: {detail}")
-    return "ok"
+    return "not_run_local_verifier_required"
 
 
 def _epoch_id(path: Path) -> str:
@@ -86,7 +90,7 @@ class PaperLedger:
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).resolve()
-        existing_quick_check = _read_only_quick_check(self.path) if self.path.exists() else None
+        existing_accessibility = _read_only_accessibility_check(self.path) if self.path.exists() else None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(str(self.path), check_same_thread=False, isolation_level=None)
@@ -106,8 +110,9 @@ class PaperLedger:
         self._connection.execute("PRAGMA foreign_keys=ON")
         self._current_session_context = UNSPECIFIED_OFF_SESSION_CONTEXT
         self._create_schema()
-        self._quick_check_state = existing_quick_check or str(self._connection.execute("PRAGMA quick_check").fetchone()[0])
-        self._chain_status = self._verify_chain_uncached()
+        # Do not execute PRAGMA quick_check or a full hash-chain walk here.
+        # The dedicated local verifier owns those potentially long operations.
+        self._quick_check_state = existing_accessibility or "not_run_local_verifier_required"
         rows = self._connection.execute("SELECT domain, COUNT(*) AS count FROM lane_iii_paper_audit GROUP BY domain").fetchall()
         self._counts_cache = {str(row["domain"]): int(row["count"]) for row in rows}
         latest = self._connection.execute(
@@ -116,6 +121,7 @@ class PaperLedger:
         self._highest_sequence = 0 if latest is None else int(latest["ledger_sequence"])
         self._last_record_time = None if latest is None else str(latest["occurred_at"])
         self._final_record_hash = None if latest is None else str(latest["record_hash"])
+        self._chain_status: tuple[bool | None, str | None] = (True, None) if self._highest_sequence == 0 else (None, None)
         self._ordering_lock = threading.RLock()
         self._deferred_condition = threading.Condition(threading.Lock())
         self._deferred: deque[dict[str, object]] = deque()
@@ -187,6 +193,28 @@ class PaperLedger:
                     """
                 )
             connection.execute("CREATE INDEX IF NOT EXISTS lane_iii_paper_audit_domain_time ON lane_iii_paper_audit(domain, occurred_at)")
+            # This metadata has no trading semantics.  It gives the local
+            # verifier a stable ledger identity and sealed epoch/schema facts
+            # without granting the verifier write access to the ledger.
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lane_iii_paper_ledger_metadata (
+                    metadata_key TEXT PRIMARY KEY,
+                    metadata_value TEXT NOT NULL
+                )
+                """
+            )
+            metadata = {
+                "ledger_uuid": "l3g-ledger-" + uuid4().hex,
+                "ledger_epoch": _epoch_id(self.path),
+                "schema_version": PAPER_RECORD_SCHEMA,
+                "created_at": _now(),
+            }
+            for key, value in metadata.items():
+                connection.execute(
+                    "INSERT OR IGNORE INTO lane_iii_paper_ledger_metadata(metadata_key, metadata_value) VALUES (?, ?)",
+                    (key, value),
+                )
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -475,7 +503,7 @@ class PaperLedger:
             self._chain_status = result
         return result
 
-    def chain_status(self) -> tuple[bool, str | None]:
+    def chain_status(self) -> tuple[bool | None, str | None]:
         with self._lock:
             return self._chain_status
 

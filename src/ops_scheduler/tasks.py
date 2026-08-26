@@ -9,6 +9,7 @@ import sqlite3
 from typing import Any, Mapping
 
 from src.l3g_paper.sessions import PaperSessionKind, PaperSessionResolver
+from src.l3g_paper.verification import LocalLedgerVerificationController
 
 from .models import AuthorityClassification, TaskBlocked, TaskInvariantFailure, TaskOutcome, sanitized, utc_now
 from .registry import TaskDefinition
@@ -63,6 +64,14 @@ def validate_session(configuration: Mapping[str, Any], *, freshness: bool = Fals
             raise ValueError("freshness_threshold_seconds must be between 1 and 3600.")
         result["freshness_threshold_seconds"] = float(threshold)
     return result
+
+
+def validate_ledger_verification(configuration: Mapping[str, Any]) -> dict[str, Any]:
+    data = _mapping(configuration, {"mode"})
+    mode = str(data.get("mode") or "auto").lower()
+    if mode not in {"auto", "incremental", "full"}:
+        raise ValueError("Ledger verification mode must be auto, incremental, or full.")
+    return {"mode": mode}
 
 
 def _dependency(context: Any, name: str, default: Any = None) -> Any:
@@ -256,6 +265,20 @@ def session_audit_export(context: Any) -> TaskOutcome:
     return TaskOutcome(result={"audit_export_path": str(target)}, message="Sanitized audit bundle exported to the project-managed directory.")
 
 
+def ledger_verification(context: Any) -> TaskOutcome:
+    """Start the independent local verifier; it never scans in the scheduler/API."""
+    controller = _dependency(context, "ledger_verification_controller")
+    if not isinstance(controller, LocalLedgerVerificationController):
+        raise TaskBlocked("The local ledger verifier controller is unavailable.")
+    context.progress(0, 1, "LAUNCH_LOCAL_VERIFIER", "Launching the local read-only ledger verifier process.")
+    status = controller.start(context.configuration["mode"])
+    context.progress(1, 1, "LAUNCH_LOCAL_VERIFIER", "Local ledger verifier launch was recorded.")
+    return TaskOutcome(
+        result=sanitized(status),
+        message="Existing verifier retained." if status.get("status") == "IN_PROGRESS" and status.get("requested_mode") != context.configuration["mode"] else "Local ledger verifier launched.",
+    )
+
+
 def production_task_definitions() -> tuple[TaskDefinition, ...]:
     return (
         TaskDefinition("operator.reminder", "Operator reminder", "Creates a durable local reminder.", "Operations", AuthorityClassification.OPERATOR_NOTIFICATION, validate_reminder, operator_reminder, 30),
@@ -265,4 +288,5 @@ def production_task_definitions() -> tuple[TaskDefinition, ...]:
         TaskDefinition("lane_iii.session_readiness", "Lane III session readiness", "Read-only readiness evaluation; it cannot arm any session.", "Lane III", AuthorityClassification.READ_ONLY, lambda item: validate_session(item, freshness=True), session_readiness, 60),
         TaskDefinition("lane_iii.session_close_audit", "Lane III close audit", "Read-only post-session audit; it never corrects state.", "Lane III", AuthorityClassification.READ_ONLY, validate_session, session_close_audit, 60),
         TaskDefinition("lane_iii.session_audit_export", "Lane III audit export", "Exports a sanitized audit bundle to a fixed local directory.", "Lane III", AuthorityClassification.LOCAL_AUDIT_WRITE, validate_session, session_audit_export, 60),
+        TaskDefinition("lane_iii.ledger_verification", "Lane III local ledger verification", "Launches an independent local read-only verifier process; no API/model loop scans rows.", "Lane III", AuthorityClassification.LOCAL_AUDIT_WRITE, validate_ledger_verification, ledger_verification, 30, required_resource_keys=("ledger_verification",)),
     )

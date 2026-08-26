@@ -58,6 +58,25 @@ class PaperControlCenterTests(unittest.TestCase):
             self.assertEqual(inspect.signature(routes[path].endpoint).parameters, {})
             self.assertNotIn("{", path)
 
+    def test_local_ledger_verification_routes_are_separate_from_execution_authority(self) -> None:
+        app = create_control_center_app(CopyTradeConfig())
+        routes = {route.path: route for route in app.routes if hasattr(route, "methods")}
+        expected = {
+            "/api/lane-iii/paper/ledger-verification",
+            "/api/lane-iii/paper/ledger-verification/cancel",
+            "/api/lane-iii/paper/ledger-verification/schedule",
+        }
+        self.assertTrue(expected.issubset(routes))
+        self.assertEqual(set(routes["/api/lane-iii/paper/ledger-verification"].methods), {"POST"})
+        self.assertEqual(set(routes["/api/lane-iii/paper/ledger-verification/cancel"].methods), {"POST"})
+        schedule_methods = set().union(*(set(route.methods) for route in app.routes if getattr(route, "path", None) == "/api/lane-iii/paper/ledger-verification/schedule"))
+        self.assertEqual(schedule_methods, {"POST", "GET"})
+        source = Path(__file__).resolve().parents[1] / "src" / "l3g_paper" / "verification.py"
+        verifier_source = source.read_text(encoding="utf-8")
+        self.assertNotIn("PaperExecutionTransport", verifier_source)
+        self.assertNotIn("commission_entry", verifier_source)
+        self.assertNotIn("live_capital", verifier_source)
+
 
 if __name__ == "__main__":
     unittest.main()

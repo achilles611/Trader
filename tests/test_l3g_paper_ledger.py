@@ -27,7 +27,7 @@ class PaperLedgerTests(unittest.TestCase):
             with PaperLedger(path) as ledger:
                 initial = ledger.health_status()
                 self.assertEqual(initial["epoch_id"], "L3G-PAPER-EPOCH-002")
-                self.assertEqual(initial["quick_check_state"], "ok")
+                self.assertEqual(initial["quick_check_state"], "not_run_local_verifier_required")
                 self.assertTrue(initial["chain_valid"])
                 self.assertEqual(initial["highest_sequence"], 0)
                 ledger.append("COMMAND", {"command_id": "l3g-health"}, identity="l3g-health")

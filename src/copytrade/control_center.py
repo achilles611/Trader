@@ -14,7 +14,7 @@ import logging
 import os
 import sqlite3
 from contextlib import asynccontextmanager, contextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
@@ -25,6 +25,7 @@ from src.l3g_paper.ledger import PaperLedger
 from src.l3g_paper.ninjatrader_login import NinjaTraderLoginBootstrap, NinjaTraderLoginState
 from src.l3g_paper.ninjatrader_transport import PaperExecutionTransport
 from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout
+from src.l3g_paper.verification import LocalLedgerVerificationController
 from src.ops_scheduler.api_models import PreviewRequest, RunNowRequest, ScheduleRequest, ScheduleUpdateRequest, TemplateRequest
 from src.ops_scheduler.engine import SchedulerEngine, SchedulerSettings
 from src.ops_scheduler.models import ScheduleLifecycle
@@ -52,6 +53,7 @@ CONTROL_STATES = {CONTROL_RUNNING, CONTROL_ENTRIES_PAUSED, CONTROL_EXITING, CONT
 OPERATOR_STATES = {"new", "approved", "shadow", "active", "muted", "rejected"}
 WATCHER_MAX_SUBSCRIPTIONS = 10
 NINJATRADER_RUNTIME_LOGGER = logging.getLogger("uvicorn.error")
+LEDGER_VERIFICATION_FRESHNESS_SECONDS = 15 * 60
 
 
 def _assert_hot_paper_ledger_path(paper_path: Path, cold_root: Path) -> None:
@@ -1345,6 +1347,14 @@ def create_control_center_app(
     job_runtime: dict[str, asyncio.Task[Any]] = {}
     source = discovery_source or HyperCoreSourceAcquisition(cache_directory(config.artifacts.database_path))
     discovery_orchestrator = CandidateDiscoveryOrchestrator(execution_service, center.store, source)
+    configured_paper_path = os.getenv("BEELZEBUB_L3G_PAPER_LEDGER")
+    paper_path = (
+        Path(configured_paper_path).expanduser().resolve()
+        if configured_paper_path
+        else Path(config.artifacts.database_path).resolve().with_name("lane_iii_paper.sqlite3")
+    )
+    audit_root = Path(os.getenv("BEELZEBUB_LEDGER_AUDIT_ROOT") or (Path(__file__).resolve().parents[2] / "runtime" / "audit")).resolve()
+    ledger_verifier = LocalLedgerVerificationController(paper_path, audit_root)
 
     def live_watcher_health() -> dict[str, Any] | None:
         supervisor = watcher_runtime.get("supervisor")
@@ -1422,8 +1432,11 @@ def create_control_center_app(
                 "market_instrument": "MNQ SEP26",
                 "maximum_quantity": 1,
                 "live_capital": "DENIED",
+                "ledger_verification": ledger_verifier.status(),
             }
-        return paper.status()
+        status = paper.status()
+        status["ledger_verification"] = ledger_verifier.status()
+        return status
 
     scheduler_path = config.scheduler.database_path or Path(config.artifacts.database_path).resolve().with_name("beelzebub_operations.sqlite3")
     scheduler_store = OperationsStore(scheduler_path, max_result_bytes=config.scheduler.max_result_bytes, max_event_bytes=config.scheduler.max_event_bytes)
@@ -1449,6 +1462,7 @@ def create_control_center_app(
             "watcher_health": live_watcher_health,
             "ninja_listener_health": ninja_listener_health,
             "lane_iii_paper_health": lane_iii_paper_health,
+            "ledger_verification_controller": lambda: ledger_verifier,
             "scheduler_status": lambda: scheduler_engine.status(),
             "database_paths": lambda: {"application": config.artifacts.database_path, "scheduler": scheduler_path},
             "scientific_worker": lambda: getattr(execution_service, "scientific_worker", None) or getattr(center._paper_service(), "scientific_worker", None),
@@ -1476,12 +1490,6 @@ def create_control_center_app(
                 raise RuntimeError("LANE_III_SHADOW factory must return the exact shadow runtime")
             ninjatrader_runtime["shadow"] = shadow
             app.state.lane_iii_shadow = shadow
-            configured_paper_path = os.getenv("BEELZEBUB_L3G_PAPER_LEDGER")
-            paper_path = (
-                Path(configured_paper_path).expanduser().resolve()
-                if configured_paper_path
-                else Path(config.artifacts.database_path).resolve().with_name("lane_iii_paper.sqlite3")
-            )
             _assert_hot_paper_ledger_path(paper_path, config.storage.cold_root)
             paper_ledger = paper_ledger_factory(paper_path) if paper_ledger_factory is not None else PaperLedger(paper_path)
             if type(paper_ledger) is not PaperLedger:
@@ -1515,6 +1523,7 @@ def create_control_center_app(
                 record_failure=paper_runtime.record_sink_failure,
             )
             ninjatrader_runtime["paper_ledger"] = paper_ledger
+            ninjatrader_runtime["ledger_verifier"] = ledger_verifier
             ninjatrader_runtime["paper"] = paper_runtime
             ninjatrader_runtime["paper_transport"] = paper_transport
             ninjatrader_runtime["fanout"] = fanout
@@ -1618,6 +1627,7 @@ def create_control_center_app(
     app.state.lane_iii_paper = None
     app.state.lane_iii_paper_transport = None
     app.state.ninjatrader_login_bootstrap = None
+    app.state.ledger_verifier = ledger_verifier
     app.state.scheduler_engine = None
     app.state.scheduler_service = scheduler_service
 
@@ -1629,6 +1639,120 @@ def create_control_center_app(
         if not wallet.startswith("0x") or len(wallet) != 42:
             raise HTTPException(status_code=400, detail="Invalid wallet address.")
         return wallet.lower()
+
+    def ledger_verification_status() -> dict[str, Any]:
+        return ledger_verifier.status()
+
+    def require_commissioning_ledger_verification() -> None:
+        """Fail closed on the compact local artifact; never scan in this route."""
+        status = ledger_verification_status()
+        current_status = str(status.get("status") or "UNVERIFIED")
+        if current_status == "IN_PROGRESS":
+            raise HTTPException(status_code=409, detail="Local ledger verification is in progress; commissioning remains denied until PASS.")
+        if current_status == "FAIL":
+            detail = "Local ledger verification failed"
+            if status.get("full_scan_required"):
+                detail += "; an explicit full verification is required"
+            raise HTTPException(status_code=409, detail=detail + ".")
+        if current_status not in {"PASS"}:
+            launched = ledger_verifier.start("auto")
+            raise HTTPException(
+                status_code=409,
+                detail=f"Local ledger verification is required and was launched ({launched.get('verification_id', 'local run')}). Commissioning remains denied until PASS.",
+            )
+        if (
+            status.get("chain_valid") is not True
+            or status.get("checkpoint_valid") is not True
+            or status.get("full_scan_required")
+            or not ledger_verifier.checkpoint_matches_report(status)
+        ):
+            raise HTTPException(status_code=409, detail="Latest local ledger verification is not a trusted PASS.")
+        completed = status.get("completed_at")
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(str(completed).replace("Z", "+00:00"))).total_seconds()
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=409, detail="Latest local ledger verification has no valid completion timestamp.")
+        if age < 0 or age > LEDGER_VERIFICATION_FRESHNESS_SECONDS:
+            launched = ledger_verifier.start("auto")
+            raise HTTPException(status_code=409, detail=f"Local ledger verification is stale and was launched ({launched.get('verification_id', 'local run')}). Commissioning remains denied until PASS.")
+        ledger = ninjatrader_runtime.get("paper_ledger")
+        current_tip = 0 if ledger is None else int(ledger.health_status().get("highest_sequence") or 0)
+        if int(status.get("verified_through_sequence") or -1) < current_tip:
+            launched = ledger_verifier.start("auto")
+            raise HTTPException(status_code=409, detail=f"Ledger has an unverified local tail and incremental verification was launched ({launched.get('verification_id', 'local run')}). Commissioning remains denied until PASS.")
+
+    def _ledger_schedule() -> dict[str, Any] | None:
+        schedules = scheduler_service.schedules(task_type="lane_iii.ledger_verification", page=1, page_size=10).get("items", [])
+        return schedules[0] if schedules else None
+
+    def ledger_verification_schedule_payload(schedule: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        current = dict(schedule or _ledger_schedule() or {})
+        if not current:
+            return {"enabled": False, "frequency": "DISABLED", "local_time": "03:00", "weekday": 0, "mode": "auto", "timezone": scheduler_settings.default_timezone, "schedule_id": None}
+        specification = dict(current.get("trigger_specification") or {})
+        configuration = dict(current.get("task_configuration") or {})
+        frequency = "DAILY" if current.get("trigger_kind") == "DAILY" else "WEEKLY"
+        weekdays = specification.get("weekdays") or [0]
+        return {
+            "enabled": current.get("lifecycle") == ScheduleLifecycle.ENABLED.value,
+            "frequency": frequency if current.get("lifecycle") == ScheduleLifecycle.ENABLED.value else "DISABLED",
+            "local_time": specification.get("local_time", "03:00"),
+            "weekday": int(weekdays[0]),
+            "mode": configuration.get("mode", "auto"),
+            "timezone": current.get("timezone", scheduler_settings.default_timezone),
+            "schedule_id": current.get("schedule_id"),
+            "revision": current.get("revision"),
+            "next_due_at": current.get("next_due_at"),
+            "last_result_status": current.get("last_result_status"),
+            "missed_run_policy": current.get("missed_run_policy", "SKIP"),
+        }
+
+    def update_ledger_verification_schedule(body: Mapping[str, Any]) -> dict[str, Any]:
+        allowed = {"enabled", "frequency", "local_time", "weekday", "mode"}
+        unexpected = sorted(set(body) - allowed)
+        if unexpected:
+            raise ValueError("Unsupported ledger verification schedule fields: " + ", ".join(unexpected))
+        enabled = bool(body.get("enabled", True))
+        frequency = str(body.get("frequency") or "DAILY").upper()
+        if not enabled or frequency == "DISABLED":
+            schedule = _ledger_schedule()
+            if schedule is not None and schedule.get("lifecycle") != ScheduleLifecycle.PAUSED.value:
+                schedule = scheduler_service.set_lifecycle(str(schedule["schedule_id"]), ScheduleLifecycle.PAUSED)
+            return ledger_verification_schedule_payload(schedule)
+        if frequency not in {"DAILY", "WEEKLY"}:
+            raise ValueError("Ledger verification frequency must be DAILY or WEEKLY.")
+        local_time = str(body.get("local_time") or "03:00")
+        weekday = body.get("weekday", 0)
+        if type(weekday) is not int or not 0 <= weekday <= 6:
+            raise ValueError("Weekly ledger verification weekday must be 0 (Monday) through 6 (Sunday).")
+        mode = str(body.get("mode") or "auto").lower()
+        if mode not in {"auto", "incremental", "full"}:
+            raise ValueError("Ledger verification mode must be auto, incremental, or full.")
+        trigger_kind = "DAILY" if frequency == "DAILY" else "WEEKDAYS"
+        trigger_specification: dict[str, Any] = {"local_time": local_time}
+        if frequency == "WEEKLY":
+            trigger_specification["weekdays"] = [weekday]
+        payload = {
+            "name": "Lane III ledger verification",
+            "description": "Starts a detached local read-only ledger verifier. Missed runs are skipped; no AI/API loop executes the scan.",
+            "task_type": "lane_iii.ledger_verification",
+            "task_configuration": {"mode": mode},
+            "trigger_kind": trigger_kind,
+            "trigger_specification": trigger_specification,
+            "timezone": scheduler_settings.default_timezone,
+            "missed_run_policy": "SKIP",
+            "max_lateness_seconds": scheduler_settings.default_max_lateness_seconds,
+            "retry_policy": {"max_attempts": 1},
+            "lifecycle": "ENABLED",
+        }
+        existing = _ledger_schedule()
+        if existing is None:
+            schedule = scheduler_service.create_schedule(payload)
+        else:
+            schedule = scheduler_service.update_schedule(str(existing["schedule_id"]), {**payload, "current_revision": int(existing["revision"])})
+            if schedule.get("lifecycle") != ScheduleLifecycle.ENABLED.value:
+                schedule = scheduler_service.set_lifecycle(str(schedule["schedule_id"]), ScheduleLifecycle.ENABLED)
+        return ledger_verification_schedule_payload(schedule)
 
     @app.get("/api/health")
     async def api_health() -> dict[str, Any]:
@@ -1797,6 +1921,39 @@ def create_control_center_app(
     async def api_lane_iii_paper() -> dict[str, object]:
         return lane_iii_paper_health()
 
+    @app.get("/api/lane-iii/paper/ledger-verification")
+    async def api_lane_iii_paper_ledger_verification() -> dict[str, Any]:
+        return ledger_verification_status()
+
+    @app.post("/api/lane-iii/paper/ledger-verification")
+    async def api_start_lane_iii_paper_ledger_verification(body: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        if ninjatrader_runtime.get("paper_ledger") is None:
+            raise HTTPException(status_code=503, detail="Lane III paper ledger is unavailable.")
+        payload = body or {}
+        if not isinstance(payload, dict) or set(payload) - {"mode"}:
+            raise HTTPException(status_code=400, detail="Ledger verification accepts only an optional mode.")
+        mode = str(payload.get("mode") or "auto").lower()
+        if mode not in {"auto", "incremental", "full"}:
+            raise HTTPException(status_code=400, detail="Verification mode must be auto, incremental, or full.")
+        return ledger_verifier.start(mode)
+
+    @app.post("/api/lane-iii/paper/ledger-verification/cancel")
+    async def api_cancel_lane_iii_paper_ledger_verification() -> dict[str, Any]:
+        return ledger_verifier.cancel()
+
+    @app.get("/api/lane-iii/paper/ledger-verification/schedule")
+    async def api_lane_iii_paper_ledger_verification_schedule() -> dict[str, Any]:
+        return ledger_verification_schedule_payload()
+
+    @app.post("/api/lane-iii/paper/ledger-verification/schedule")
+    async def api_update_lane_iii_paper_ledger_verification_schedule(body: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Ledger verification schedule body must be an object.")
+        try:
+            return update_ledger_verification_schedule(body)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.get("/api/lane-iii/paper/audit")
     async def api_lane_iii_paper_audit(
         limit: int = Query(100, ge=1, le=512),
@@ -1819,6 +1976,7 @@ def create_control_center_app(
         paper = ninjatrader_runtime.get("paper")
         if paper is None:
             raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
+        require_commissioning_ledger_verification()
         bootstrap = ninjatrader_runtime.get("login_bootstrap")
         if bootstrap is not None and bootstrap.state is not NinjaTraderLoginState.AUTHENTICATED:
             # A BeezConsole-only restart can outlast the bounded desktop UI
@@ -1841,6 +1999,7 @@ def create_control_center_app(
         paper = ninjatrader_runtime.get("paper")
         if paper is None:
             raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
+        require_commissioning_ledger_verification()
         bootstrap = ninjatrader_runtime.get("login_bootstrap")
         if bootstrap is not None and bootstrap.state is not NinjaTraderLoginState.AUTHENTICATED:
             transport = paper.status().get("transport")
