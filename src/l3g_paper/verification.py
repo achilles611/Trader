@@ -17,6 +17,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import time
 from typing import Any, Mapping
 from uuid import uuid4
 
@@ -25,10 +26,26 @@ from src.lane_iii.contracts import canonical_hash
 from .contracts import PAPER_RECORD_SCHEMA
 
 
-VERIFIER_VERSION = "l3g-local-ledger-verifier-v1"
-REPORT_SCHEMA = "beelzebub-ledger-verification-v1"
-CHECKPOINT_SCHEMA = "beelzebub-ledger-verification-checkpoint-v1"
+VERIFIER_VERSION = "l3g-local-ledger-verifier-v2"
+REPORT_SCHEMA = "beelzebub-ledger-verification-v2"
+CHECKPOINT_SCHEMA = "beelzebub-ledger-verification-checkpoint-v2"
+_V1_REPORT_SCHEMA = "beelzebub-ledger-verification-v1"
+_V1_CHECKPOINT_SCHEMA = "beelzebub-ledger-verification-checkpoint-v1"
 _MODES = frozenset({"auto", "incremental", "full"})
+_PROGRESS_ROWS = 65536
+_PROGRESS_SECONDS = 1.0
+
+
+def _environment_bytes(name: str, default: int) -> int:
+    """Read a non-negative byte threshold without making a bad env fatal."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
 
 
 def _utc_now() -> str:
@@ -59,7 +76,17 @@ def _atomic_json(path: Path, value: Mapping[str, Any], *, replace: bool = True) 
             os.fsync(stream.fileno())
         if not replace and path.exists():
             raise FileExistsError(path)
-        os.replace(temporary, path)
+        # A status reader can briefly hold the destination open on Windows.
+        # Retrying the rename preserves atomic publication and prevents a
+        # harmless browser refresh from failing the detached verifier.
+        for attempt in range(20):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                time.sleep(0.01)
     finally:
         try:
             temporary.unlink()
@@ -188,6 +215,17 @@ class LocalLedgerVerifier:
         self.verification_id = verification_id or f"lv-{uuid4().hex}"
         self.started_at = _utc_now()
         self._cancel_path = self.paths.cancel(self.verification_id)
+        # These are intentionally verifier-local controls.  The verifier only
+        # observes SQLite sidecars and free space; it never checkpoints,
+        # truncates, deletes, or otherwise mutates the trading database.
+        self._warning_free_bytes = _environment_bytes("BEELZEBUB_L3G_VERIFIER_WARNING_FREE_BYTES", 10 * 1024**3)
+        self._emergency_free_bytes = _environment_bytes("BEELZEBUB_L3G_VERIFIER_EMERGENCY_FREE_BYTES", 2 * 1024**3)
+        self._wal_growth_warning_bytes = _environment_bytes("BEELZEBUB_L3G_VERIFIER_WAL_GROWTH_WARNING_BYTES", 1024**3)
+        self._progress_rows = 0
+        self._progress_at = 0.0
+        self._storage_start: dict[str, int | None] | None = None
+        self._storage_max_wal = 0
+        self._storage_warnings: set[str] = set()
 
     @staticmethod
     def _mode(value: str) -> str:
@@ -255,11 +293,151 @@ class LocalLedgerVerifier:
 
     def _checkpoint(self) -> dict[str, Any] | None:
         data = _safe_read_json(self.paths.checkpoint)
-        return data if data and data.get("schema") == CHECKPOINT_SCHEMA else None
+        return data if data and data.get("schema") in {CHECKPOINT_SCHEMA, _V1_CHECKPOINT_SCHEMA} else None
+
+    def _storage(self) -> dict[str, int | None]:
+        def size(path: Path) -> int:
+            try:
+                return int(path.stat().st_size)
+            except OSError:
+                return 0
+        try:
+            free = int(os.statvfs(self.ledger_path.parent).f_bavail * os.statvfs(self.ledger_path.parent).f_frsize)
+        except (AttributeError, OSError):
+            try:
+                import shutil
+                free = int(shutil.disk_usage(self.ledger_path.parent).free)
+            except OSError:
+                free = None
+        database = size(self.ledger_path)
+        wal = size(Path(str(self.ledger_path) + "-wal"))
+        shm = size(Path(str(self.ledger_path) + "-shm"))
+        self._storage_max_wal = max(self._storage_max_wal, wal)
+        return {
+            "database_bytes": database,
+            "wal_bytes": wal,
+            "shm_bytes": shm,
+            "free_bytes": free,
+            "total_footprint_bytes": database + wal + shm,
+        }
+
+    def _observe_storage(self, report: dict[str, Any]) -> None:
+        storage = self._storage()
+        if self._storage_start is None:
+            self._storage_start = dict(storage)
+        free = storage["free_bytes"]
+        if isinstance(free, int) and free <= self._emergency_free_bytes:
+            raise VerificationFailure(
+                "STORAGE_PRESSURE_ABORT",
+                "Verifier aborted because free storage reached the emergency safety floor.",
+                full_scan_required=False,
+                detail={"storage": storage, "emergency_free_bytes": self._emergency_free_bytes},
+            )
+        if isinstance(free, int) and free <= self._warning_free_bytes:
+            self._storage_warnings.add("LOW_FREE_SPACE")
+        if self._storage_start is not None:
+            start_wal = self._storage_start.get("wal_bytes")
+            if isinstance(start_wal, int) and storage["wal_bytes"] - start_wal >= self._wal_growth_warning_bytes:
+                self._storage_warnings.add("WAL_GROWTH")
+        report["storage"] = storage
+        report["storage_warnings"] = sorted(self._storage_warnings)
+
+    def _publish_progress(self, report: dict[str, Any], *, stage: str, force: bool = False) -> None:
+        """Publish bounded, atomic, best-effort progress for detached clients."""
+        now = time.monotonic()
+        rows = report.get("rows_scanned")
+        measured_rows = rows if type(rows) is int else 0
+        if not force and measured_rows - self._progress_rows < _PROGRESS_ROWS and now - self._progress_at < _PROGRESS_SECONDS:
+            return
+        self._observe_storage(report)
+        report["stage"] = stage
+        report["status"] = "IN_PROGRESS"
+        total = report.get("rows_total")
+        chain_started = report.get("chain_scan_started_monotonic")
+        if type(measured_rows) is int and measured_rows > 0 and isinstance(chain_started, float):
+            elapsed = max(0.000001, now - chain_started)
+            rows_per_second = measured_rows / elapsed
+            report["throughput_rows_per_second"] = round(rows_per_second, 3)
+            report["throughput_mib_per_second"] = round((int(report.get("bytes_scanned") or 0) / 1024**2) / elapsed, 3)
+            if type(total) is int and total >= measured_rows and rows_per_second > 0:
+                report["eta_seconds"] = round((total - measured_rows) / rows_per_second, 3)
+        public = {key: value for key, value in report.items() if key != "chain_scan_started_monotonic"}
+        _atomic_json(self.paths.current, public)
+        self._progress_rows = measured_rows
+        self._progress_at = now
+
+    def _full_provenance_from_artifacts(
+        self, connection: sqlite3.Connection, checkpoint: Mapping[str, Any], metadata: Mapping[str, str],
+    ) -> dict[str, Any]:
+        """Recover v1 structural proof only from immutable successful Full reports.
+
+        The old checkpoint never claimed which Full run supplied its structural
+        proof.  We never guess: the recovered anchor must still be present in
+        the current chain and be no newer than the trusted v1 checkpoint.
+        """
+        checkpoint_sequence = checkpoint.get("last_verified_sequence")
+        if type(checkpoint_sequence) is not int:
+            raise VerificationFailure("CHECKPOINT_INVALID", "v1 checkpoint sequence is invalid.")
+        candidates: list[tuple[str, dict[str, Any]]] = []
+        for path in self.paths.reports.glob("*.json"):
+            report = _safe_read_json(path)
+            if not report or report.get("schema") not in {_V1_REPORT_SCHEMA, REPORT_SCHEMA}:
+                continue
+            if report.get("status") != "PASS" or report.get("verification_mode") != "full" or report.get("quick_check") != "ok":
+                continue
+            if report.get("ledger_path") != str(self.ledger_path):
+                continue
+            report_identity = report.get("ledger_identity")
+            if report_identity is not None and report_identity != metadata["ledger_uuid"]:
+                continue
+            report_schema_version = report.get("ledger_schema_version")
+            if report_schema_version is not None and report_schema_version != metadata["schema_version"]:
+                continue
+            if report.get("ledger_epoch") not in {None, _ledger_epoch(self.ledger_path, metadata)}:
+                continue
+            sequence, record_hash = report.get("verified_through_sequence"), report.get("tip_hash")
+            if type(sequence) is not int or not isinstance(record_hash, str) or sequence < 0 or sequence > checkpoint_sequence:
+                continue
+            if sequence:
+                row = connection.execute(
+                    "SELECT record_hash FROM lane_iii_paper_audit WHERE ledger_sequence=?", (sequence,)
+                ).fetchone()
+                if row is None or str(row["record_hash"]) != record_hash:
+                    continue
+            elif record_hash is not None:
+                continue
+            completed = str(report.get("completed_at") or "")
+            if not completed:
+                continue
+            candidates.append((completed, report))
+        if not candidates:
+            raise VerificationFailure(
+                "CHECKPOINT_FULL_PROVENANCE_MISSING",
+                "v1 checkpoint has no matching immutable Full PASS structural proof; run Full.",
+            )
+        _, full = max(candidates, key=lambda item: item[0])
+        return {
+            "last_full_verification_id": full.get("verification_id"),
+            "last_full_quick_check_at": full.get("completed_at"),
+            "last_full_verified_sequence": full["verified_through_sequence"],
+            "last_full_verified_hash": full["tip_hash"],
+        }
+
+    def _upgrade_v1_checkpoint(
+        self, connection: sqlite3.Connection, checkpoint: Mapping[str, Any], metadata: Mapping[str, str],
+    ) -> dict[str, Any]:
+        if checkpoint.get("schema") == CHECKPOINT_SCHEMA:
+            return dict(checkpoint)
+        if checkpoint.get("schema") != _V1_CHECKPOINT_SCHEMA:
+            raise VerificationFailure("CHECKPOINT_INVALID", "Checkpoint schema is not supported.")
+        full = self._full_provenance_from_artifacts(connection, checkpoint, metadata)
+        return {**dict(checkpoint), "schema": CHECKPOINT_SCHEMA, "verifier_version": VERIFIER_VERSION, **full}
 
     def _validate_checkpoint(
         self, connection: sqlite3.Connection, checkpoint: Mapping[str, Any], metadata: Mapping[str, str], tip_sequence: int,
     ) -> tuple[int, str | None]:
+        if checkpoint.get("schema") != CHECKPOINT_SCHEMA:
+            raise VerificationFailure("CHECKPOINT_INVALID", "Checkpoint was not upgraded to verifier v2.")
         if checkpoint.get("ledger_path") != str(self.ledger_path):
             raise VerificationFailure("CHECKPOINT_PATH_MISMATCH", "Checkpoint belongs to a different ledger path.")
         if checkpoint.get("ledger_identity") != metadata["ledger_uuid"]:
@@ -289,6 +467,26 @@ class LocalLedgerVerifier:
             ).fetchone()
             if row is None or str(row["record_hash"]) != record_hash:
                 raise VerificationFailure("CHECKPOINT_HASH_MISMATCH", "Checkpoint hash no longer matches its ledger record.")
+        full_sequence = checkpoint.get("last_full_verified_sequence")
+        full_hash = checkpoint.get("last_full_verified_hash")
+        if (
+            type(full_sequence) is not int or full_sequence < 0 or full_sequence > sequence
+            or not isinstance(checkpoint.get("last_full_verification_id"), str)
+            or not isinstance(checkpoint.get("last_full_quick_check_at"), str)
+        ):
+            raise VerificationFailure("CHECKPOINT_FULL_PROVENANCE_MISSING", "Checkpoint lacks trusted Full structural proof.")
+        if full_sequence == 0:
+            if full_hash is not None:
+                raise VerificationFailure("CHECKPOINT_FULL_PROVENANCE_MISSING", "Empty Full proof has a terminal hash.")
+        else:
+            row = connection.execute(
+                "SELECT record_hash FROM lane_iii_paper_audit WHERE ledger_sequence=?", (full_sequence,)
+            ).fetchone()
+            if row is None or str(row["record_hash"]) != full_hash:
+                raise VerificationFailure("CHECKPOINT_FULL_ANCESTRY_MISMATCH", "The retained Full proof no longer matches chain ancestry.")
+        return sequence, record_hash if isinstance(record_hash, str) else None
+
+    def _validate_sentinels(self, connection: sqlite3.Connection, checkpoint: Mapping[str, Any]) -> None:
         witnesses = checkpoint.get("prefix_sentinels")
         if not isinstance(witnesses, list):
             raise VerificationFailure("CHECKPOINT_INVALID", "Checkpoint has no trusted prefix witnesses.")
@@ -301,14 +499,13 @@ class LocalLedgerVerifier:
             ).fetchone()
             if row is None or _row_digest(row) != witness["digest"]:
                 raise VerificationFailure("HISTORICAL_MUTATION_DETECTED", "A trusted pre-checkpoint ledger witness diverged.")
-        return sequence, record_hash if isinstance(record_hash, str) else None
 
     def _check_cancelled(self) -> None:
         if self._cancel_path.exists():
             raise VerificationCancelled("Verification cancellation was requested locally.")
 
     def _scan_chain(
-        self, connection: sqlite3.Connection, *, start_sequence: int, previous_hash: str | None,
+        self, connection: sqlite3.Connection, *, start_sequence: int, previous_hash: str | None, report: dict[str, Any],
     ) -> tuple[int, str | None, int, int]:
         expected_sequence = start_sequence
         rows_scanned = 0
@@ -352,6 +549,14 @@ class LocalLedgerVerifier:
                 expected_sequence += 1
                 rows_scanned += 1
                 bytes_scanned += len(str(row["payload_json"]).encode("utf-8"))
+                report["rows_scanned"] = rows_scanned
+                report["bytes_scanned"] = bytes_scanned
+                report["verified_through_sequence"] = sequence
+                self._publish_progress(report, stage="CHAIN_SCAN")
+            # Cancellation and pressure are checked between bounded batches;
+            # this avoids a storage check or artifact write on every row.
+            self._check_cancelled()
+            self._publish_progress(report, stage="CHAIN_SCAN")
         return expected_sequence - 1, previous_hash, rows_scanned, bytes_scanned
 
     def _witnesses(self, connection: sqlite3.Connection, tip_sequence: int) -> list[dict[str, Any]]:
@@ -368,6 +573,7 @@ class LocalLedgerVerifier:
 
     def _checkpoint_payload(
         self, *, metadata: Mapping[str, str], verified_sequence: int, tip_hash: str | None, connection: sqlite3.Connection,
+        full_provenance: Mapping[str, Any],
     ) -> dict[str, Any]:
         completed = _utc_now()
         return {
@@ -384,6 +590,10 @@ class LocalLedgerVerifier:
             "current_chain_tip_sequence": verified_sequence,
             "current_chain_tip_hash": tip_hash,
             "prefix_sentinels": self._witnesses(connection, verified_sequence),
+            "last_full_verification_id": full_provenance["last_full_verification_id"],
+            "last_full_quick_check_at": full_provenance["last_full_quick_check_at"],
+            "last_full_verified_sequence": full_provenance["last_full_verified_sequence"],
+            "last_full_verified_hash": full_provenance["last_full_verified_hash"],
         }
 
     def _base_report(self, *, status: str, verification_mode: str | None = None) -> dict[str, Any]:
@@ -399,13 +609,30 @@ class LocalLedgerVerifier:
             "ledger_path": str(self.ledger_path),
             "ledger_epoch": None,
             "quick_check": "not_run",
-            "chain_valid": False,
-            "checkpoint_valid": False,
-            "checkpoint_start_sequence": 0,
-            "verified_through_sequence": 0,
+            "ledger_identity": None,
+            "ledger_schema_version": None,
+            "chain_valid": None,
+            "checkpoint_valid": None,
+            "checkpoint_start_sequence": None,
+            "verified_through_sequence": None,
             "tip_hash": None,
-            "rows_scanned": 0,
-            "bytes_scanned": 0,
+            "rows_scanned": None,
+            "rows_total": None,
+            "bytes_scanned": None,
+            "stage": "QUEUED",
+            "timings": {
+                "connect_seconds": 0.0,
+                "schema_seconds": 0.0,
+                "metadata_seconds": 0.0,
+                "quick_check_seconds": 0.0,
+                "tip_lookup_seconds": 0.0,
+                "checkpoint_validation_seconds": 0.0,
+                "sentinel_validation_seconds": 0.0,
+                "chain_scan_seconds": 0.0,
+                "checkpoint_build_seconds": 0.0,
+                "checkpoint_publish_seconds": 0.0,
+                "total_seconds": 0.0,
+            },
             "full_scan_required": False,
             "verifier_version": VERIFIER_VERSION,
             "errors": [],
@@ -415,6 +642,10 @@ class LocalLedgerVerifier:
         completed = _utc_now()
         report["completed_at"] = completed
         report["duration_seconds"] = round(max(0.0, (_parse_utc(completed) - _parse_utc(self.started_at)).total_seconds()), 6)
+        timings = report.get("timings")
+        if isinstance(timings, dict):
+            timings["total_seconds"] = report["duration_seconds"]
+        report.pop("chain_scan_started_monotonic", None)
         return report
 
     def _publish_terminal(self, report: dict[str, Any]) -> None:
@@ -438,36 +669,92 @@ class LocalLedgerVerifier:
         else:
             _create_lock(self.paths, self.verification_id, state="RUNNING")
         report = self._base_report(status="IN_PROGRESS")
-        _atomic_json(self.paths.current, report)
         connection: sqlite3.Connection | None = None
         try:
+            self._publish_progress(report, stage="QUEUED", force=True)
+            started = time.perf_counter()
             connection = self._connect()
+            report["timings"]["connect_seconds"] = round(time.perf_counter() - started, 6)
+            self._publish_progress(report, stage="CONNECTED", force=True)
+            started = time.perf_counter()
             self._schema(connection)
+            report["timings"]["schema_seconds"] = round(time.perf_counter() - started, 6)
+            self._publish_progress(report, stage="SCHEMA_VALIDATED", force=True)
+            started = time.perf_counter()
             metadata = self._metadata(connection)
+            report["timings"]["metadata_seconds"] = round(time.perf_counter() - started, 6)
             epoch = _ledger_epoch(self.ledger_path, metadata)
-            report["ledger_epoch"] = epoch
-            report["quick_check"] = self._quick_check(connection)
+            report.update({
+                "ledger_epoch": epoch,
+                "ledger_identity": metadata["ledger_uuid"],
+                "ledger_schema_version": metadata["schema_version"],
+            })
+            self._publish_progress(report, stage="METADATA_VALIDATED", force=True)
+            started = time.perf_counter()
             tip_sequence, _ = self._tip(connection)
+            report["timings"]["tip_lookup_seconds"] = round(time.perf_counter() - started, 6)
+            report["captured_tip_sequence"] = tip_sequence
             checkpoint = self._checkpoint()
             actual_mode = self.requested_mode
             if actual_mode == "auto":
                 actual_mode = "incremental" if checkpoint is not None else "full"
             report["verification_mode"] = actual_mode
             start_sequence, previous_hash = 1, None
+            full_provenance: dict[str, Any]
             if actual_mode == "incremental":
                 if checkpoint is None:
                     raise VerificationFailure("CHECKPOINT_MISSING", "Incremental verification requires a trusted checkpoint.")
+                started = time.perf_counter()
+                checkpoint = self._upgrade_v1_checkpoint(connection, checkpoint, metadata)
                 checkpoint_sequence, checkpoint_hash = self._validate_checkpoint(connection, checkpoint, metadata, tip_sequence)
+                report["timings"]["checkpoint_validation_seconds"] = round(time.perf_counter() - started, 6)
+                started = time.perf_counter()
+                self._validate_sentinels(connection, checkpoint)
+                report["timings"]["sentinel_validation_seconds"] = round(time.perf_counter() - started, 6)
                 report["checkpoint_valid"] = True
                 report["checkpoint_start_sequence"] = checkpoint_sequence
                 start_sequence, previous_hash = checkpoint_sequence + 1, checkpoint_hash
+                full_provenance = {
+                    key: checkpoint[key] for key in (
+                        "last_full_verification_id", "last_full_quick_check_at",
+                        "last_full_verified_sequence", "last_full_verified_hash",
+                    )
+                }
+                report.update({"quick_check": "inherited_from_full", **full_provenance})
+                self._publish_progress(report, stage="CHECKPOINT_VALIDATED", force=True)
+            else:
+                # Full is the sole forensic structural authority.  It is the
+                # only mode that invokes SQLite's database-wide quick_check.
+                started = time.perf_counter()
+                report["quick_check"] = self._quick_check(connection)
+                report["timings"]["quick_check_seconds"] = round(time.perf_counter() - started, 6)
+                full_provenance = {
+                    "last_full_verification_id": self.verification_id,
+                    "last_full_quick_check_at": None,
+                    "last_full_verified_sequence": tip_sequence,
+                    "last_full_verified_hash": None,
+                }
+                self._publish_progress(report, stage="QUICK_CHECK", force=True)
+            report["rows_scanned"] = 0
+            report["bytes_scanned"] = 0
+            report["rows_total"] = max(0, tip_sequence - start_sequence + 1)
+            report["verified_through_sequence"] = start_sequence - 1 if start_sequence > 1 else None
+            report["chain_scan_started_monotonic"] = time.monotonic()
+            self._publish_progress(report, stage="CHAIN_SCAN", force=True)
+            started = time.perf_counter()
             verified, tip_hash, rows_scanned, bytes_scanned = self._scan_chain(
-                connection, start_sequence=start_sequence, previous_hash=previous_hash,
+                connection, start_sequence=start_sequence, previous_hash=previous_hash, report=report,
             )
+            report["timings"]["chain_scan_seconds"] = round(time.perf_counter() - started, 6)
             if verified != tip_sequence:
                 raise VerificationFailure("TIP_DIVERGENCE", "Ledger snapshot tip changed during verification.")
             if actual_mode == "full":
                 report["checkpoint_valid"] = True
+                full_provenance.update({
+                    "last_full_quick_check_at": _utc_now(),
+                    "last_full_verified_sequence": verified,
+                    "last_full_verified_hash": tip_hash,
+                })
             report.update({
                 "status": "PASS",
                 "chain_valid": True,
@@ -476,13 +763,19 @@ class LocalLedgerVerifier:
                 "rows_scanned": rows_scanned,
                 "bytes_scanned": bytes_scanned,
                 "full_scan_required": False,
+                **full_provenance,
             })
+            started = time.perf_counter()
             checkpoint_payload = self._checkpoint_payload(
                 metadata=metadata, verified_sequence=verified, tip_hash=tip_hash, connection=connection,
+                full_provenance=full_provenance,
             )
+            report["timings"]["checkpoint_build_seconds"] = round(time.perf_counter() - started, 6)
             # A checkpoint is advanced only after every verifier invariant has
             # passed.  Atomic replacement prevents a partial trusted state.
+            started = time.perf_counter()
             _atomic_json(self.paths.checkpoint, checkpoint_payload)
+            report["timings"]["checkpoint_publish_seconds"] = round(time.perf_counter() - started, 6)
         except VerificationCancelled as exc:
             report.update({"status": "CANCELLED", "full_scan_required": False, "errors": [{"code": "CANCELLED", "message": str(exc)}]})
         except VerificationFailure as exc:
@@ -498,6 +791,16 @@ class LocalLedgerVerifier:
         finally:
             if connection is not None:
                 connection.close()
+            try:
+                self._observe_storage(report)
+            except VerificationFailure:
+                # Closing a completed read transaction must still publish its
+                # result even if the filesystem becomes unavailable after it.
+                pass
+            if self._storage_start is not None:
+                report["storage_start"] = self._storage_start
+                report["storage_max_wal_bytes"] = self._storage_max_wal
+                report["storage_end"] = report.get("storage")
             report = self._complete(report)
             self._publish_terminal(report)
             _release_lock(self.paths, self.verification_id)
@@ -577,6 +880,16 @@ class LocalLedgerVerificationController:
         lock = _safe_read_json(self.paths.lock)
         if not lock or _pid_is_running(lock.get("pid")):
             return
+        # Windows can report a just-created detached child as unavailable for
+        # a brief scheduling window.  A controller must never turn that race
+        # into an INTERRUPTED artifact before the child can adopt its lock.
+        if lock.get("state") == "LAUNCHING":
+            try:
+                launched_seconds = (datetime.now(timezone.utc) - _parse_utc(str(lock["started_at"]))).total_seconds()
+            except (KeyError, TypeError, ValueError):
+                launched_seconds = 10.0
+            if 0 <= launched_seconds < 10.0:
+                return
         current = _safe_read_json(self.paths.current)
         verification_id = str(lock.get("verification_id") or (current or {}).get("verification_id") or f"lv-{uuid4().hex}")
         if current and current.get("status") == "IN_PROGRESS":
@@ -711,6 +1024,53 @@ def run_local_verification(
     ).run(adopt_lock=adopt_lock)
 
 
+def profile_ledger_storage(ledger_path: str | Path) -> dict[str, Any]:
+    """Return a read-only SQLite storage profile; never changes the ledger."""
+    path = Path(ledger_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+    try:
+        tables = [str(row[0]) for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )]
+        counts: dict[str, int] = {}
+        for table in tables:
+            quoted = '"' + table.replace('"', '""') + '"'
+            counts[table] = int(connection.execute(f"SELECT COUNT(*) FROM {quoted}").fetchone()[0])
+        dbstat_available = True
+        try:
+            rows = connection.execute(
+                "SELECT name, COUNT(*) AS pages, SUM(pgsize) AS bytes, SUM(payload) AS payload_bytes FROM dbstat GROUP BY name ORDER BY name"
+            ).fetchall()
+            storage = {
+                str(row[0]): {"pages": int(row[1]), "bytes": int(row[2]), "payload_bytes": int(row[3])}
+                for row in rows
+            }
+        except sqlite3.Error:
+            dbstat_available = False
+            storage = {}
+        audit_domains = {
+            str(row[0]): int(row[1]) for row in connection.execute(
+                "SELECT domain, COUNT(*) FROM lane_iii_paper_audit GROUP BY domain"
+            )
+        }
+    finally:
+        connection.close()
+    sidecars = {suffix: Path(str(path) + suffix) for suffix in ("-wal", "-shm")}
+    return {
+        "schema": "beelzebub-l3g-storage-profile-v1",
+        "ledger_path": str(path),
+        "main_database_bytes": path.stat().st_size,
+        "wal_bytes": sidecars["-wal"].stat().st_size if sidecars["-wal"].exists() else 0,
+        "shm_bytes": sidecars["-shm"].stat().st_size if sidecars["-shm"].exists() else 0,
+        "dbstat_available": dbstat_available,
+        "tables": {name: {"row_count": count, **storage.get(name, {})} for name, count in counts.items()},
+        "indexes": {name: value for name, value in storage.items() if name.startswith("sqlite_autoindex") or name.endswith("_index")},
+        "domain_rows": audit_domains,
+    }
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run local read-only Lane III paper-ledger verification.")
     command = parser.add_subparsers(dest="command", required=True)
@@ -720,11 +1080,16 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--mode", choices=sorted(_MODES), default="auto")
     run.add_argument("--verification-id")
     run.add_argument("--adopt-lock", action="store_true")
+    profile = command.add_parser("profile-storage", help="produce a read-only SQLite storage profile")
+    profile.add_argument("--ledger", required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     options = _parser().parse_args(argv)
+    if options.command == "profile-storage":
+        print(json.dumps(profile_ledger_storage(options.ledger), indent=2, sort_keys=True))
+        return 0
     report = run_local_verification(
         options.ledger, options.audit_root, requested_mode=options.mode,
         verification_id=options.verification_id, adopt_lock=bool(options.adopt_lock),

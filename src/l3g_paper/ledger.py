@@ -6,6 +6,7 @@ from collections import deque
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -38,6 +39,7 @@ _DOMAIN_TABLES = {
 _HIGH_VOLUME_DOMAINS = frozenset({"OBSERVATION", "EVIDENCE", "DECISION"})
 _SECRET_KEYS = frozenset({"hmac_key", "password", "token", "connection_credentials", "private_key", "secret", "authorization"})
 _EPOCH_DIRECTORY = re.compile(r"^epoch-(\d+)$", re.IGNORECASE)
+_EPOCH_ID = re.compile(r"^L3G-PAPER-EPOCH-[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def _now() -> str:
@@ -85,11 +87,103 @@ def _epoch_id(path: Path) -> str:
     return "UNSPECIFIED"
 
 
+def resolve_ledger_epoch(path: Path, configured_epoch: str | None = None) -> str:
+    """Choose an explicit deployment epoch before a new ledger is created."""
+    explicit = (configured_epoch or "").strip()
+    if explicit:
+        if not _EPOCH_ID.fullmatch(explicit):
+            raise ValueError("Paper ledger epoch must use the L3G-PAPER-EPOCH-<id> form.")
+        return explicit
+    return _epoch_id(path)
+
+
+def adopt_legacy_epoch(
+    path: str | Path, audit_root: str | Path, *, target_epoch: str, operator_id: str, maintenance_window_confirmed: bool,
+) -> dict[str, object]:
+    """Perform the explicit, one-time metadata adoption for a legacy ledger.
+
+    This intentionally is not called by runtime startup.  It requires an
+    operator-confirmed maintenance window, a current verifier PASS carrying a
+    retained Full proof, and an immutable external receipt before metadata is
+    changed.  Ledger records and their chain are never rewritten.
+    """
+    if not maintenance_window_confirmed:
+        raise ValueError("Legacy epoch adoption requires an explicit maintenance-window confirmation.")
+    target = resolve_ledger_epoch(Path(path), target_epoch)
+    if not operator_id.strip():
+        raise ValueError("Legacy epoch adoption requires a non-empty operator identifier.")
+    ledger_path = Path(path).expanduser().resolve()
+    root = Path(audit_root).expanduser().resolve()
+    try:
+        latest = json.loads((root / "ledger-verification-latest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Legacy epoch adoption requires a readable local verifier artifact.") from exc
+    if (
+        not isinstance(latest, dict) or latest.get("status") != "PASS" or latest.get("chain_valid") is not True
+        or latest.get("checkpoint_valid") is not True or latest.get("errors") not in ([], None)
+        or latest.get("ledger_path") != str(ledger_path)
+        or type(latest.get("last_full_verified_sequence")) is not int
+        or not isinstance(latest.get("last_full_verified_hash"), str)
+        or not isinstance(latest.get("last_full_verification_id"), str)
+    ):
+        raise RuntimeError("Legacy epoch adoption requires a clean PASS with retained Full-chain proof.")
+    connection = sqlite3.connect(str(ledger_path))
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        metadata = {str(row["metadata_key"]): str(row["metadata_value"]) for row in connection.execute(
+            "SELECT metadata_key, metadata_value FROM lane_iii_paper_ledger_metadata"
+        )}
+        if metadata.get("ledger_epoch") != "UNSPECIFIED":
+            raise RuntimeError("Legacy epoch adoption is allowed only while ledger_epoch is UNSPECIFIED.")
+        full_row = connection.execute(
+            "SELECT record_hash FROM lane_iii_paper_audit WHERE ledger_sequence=?", (latest["last_full_verified_sequence"],)
+        ).fetchone()
+        if full_row is None or str(full_row["record_hash"]) != latest["last_full_verified_hash"]:
+            raise RuntimeError("Legacy epoch adoption refused because retained Full-chain ancestry no longer matches.")
+        receipt = {
+            "schema": "beelzebub-l3g-legacy-epoch-adoption-receipt-v1",
+            "created_at": _now(),
+            "operator_id": operator_id,
+            "ledger_path": str(ledger_path),
+            "ledger_uuid": metadata.get("ledger_uuid"),
+            "schema_version": metadata.get("schema_version"),
+            "before_epoch": "UNSPECIFIED",
+            "after_epoch": target,
+            "verification_id": latest["last_full_verification_id"],
+            "full_verified_sequence": latest["last_full_verified_sequence"],
+            "full_verified_hash": latest["last_full_verified_hash"],
+        }
+        receipts = root / "ledger-epoch-adoptions"
+        receipts.mkdir(parents=True, exist_ok=True)
+        receipt_path = receipts / f"{receipt['created_at'].replace(':', '').replace('-', '').replace('.', '')}-{uuid4().hex}.json"
+        descriptor = os.open(receipt_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(receipt, stream, sort_keys=True, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        connection.execute(
+            "UPDATE lane_iii_paper_ledger_metadata SET metadata_value=? WHERE metadata_key='ledger_epoch' AND metadata_value='UNSPECIFIED'",
+            (target,),
+        )
+        if connection.total_changes != 1:
+            raise RuntimeError("Legacy epoch adoption found a conflicting target epoch.")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return {"adopted": True, "ledger_path": str(ledger_path), "epoch": target, "receipt_path": str(receipt_path)}
+
+
 class PaperLedger:
     """Thread-safe append-only domain ledger with one global hash chain."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, epoch_id: str | None = None) -> None:
         self.path = Path(path).resolve()
+        self._creation_epoch = resolve_ledger_epoch(self.path, epoch_id)
         existing_accessibility = _read_only_accessibility_check(self.path) if self.path.exists() else None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -110,6 +204,10 @@ class PaperLedger:
         self._connection.execute("PRAGMA foreign_keys=ON")
         self._current_session_context = UNSPECIFIED_OFF_SESSION_CONTEXT
         self._create_schema()
+        row = self._connection.execute(
+            "SELECT metadata_value FROM lane_iii_paper_ledger_metadata WHERE metadata_key='ledger_epoch'"
+        ).fetchone()
+        self._ledger_epoch = self._creation_epoch if row is None else str(row["metadata_value"])
         # Do not execute PRAGMA quick_check or a full hash-chain walk here.
         # The dedicated local verifier owns those potentially long operations.
         self._quick_check_state = existing_accessibility or "not_run_local_verifier_required"
@@ -206,7 +304,7 @@ class PaperLedger:
             )
             metadata = {
                 "ledger_uuid": "l3g-ledger-" + uuid4().hex,
-                "ledger_epoch": _epoch_id(self.path),
+                "ledger_epoch": self._creation_epoch,
                 "schema_version": PAPER_RECORD_SCHEMA,
                 "created_at": _now(),
             }
@@ -534,7 +632,8 @@ class PaperLedger:
             free_bytes = None
         return {
             "path": str(self.path),
-            "epoch_id": _epoch_id(self.path),
+            "epoch_id": self._ledger_epoch,
+            "epoch_state": "LEGACY / UNSPECIFIED" if self._ledger_epoch == "UNSPECIFIED" else "EXPLICIT",
             "file_size": file_size,
             "free_bytes": free_bytes,
             "quick_check_state": quick_check_state,

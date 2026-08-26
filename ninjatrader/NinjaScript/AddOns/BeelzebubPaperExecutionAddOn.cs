@@ -21,6 +21,11 @@ namespace NinjaTrader.NinjaScript.AddOns
     public sealed class BeelzebubPaperExecutionAddOn : AddOnBase
     {
         private const string WireSchema = "lane-iii-phase-g-paper-execution-v1";
+        private const string AddonProtocolVersion = "l3g-paper-addon-provenance-v1";
+        // Updated from the checked-in source before a NinjaTrader build.  The
+        // Python bridge independently fingerprints the same source, so an old
+        // compiled AddOn cannot be armed merely because its DLL timestamp is new.
+        private const string AddonSourceFingerprint = "eee706f322b4f44ab82937bd231cc81ccaa484035c507d5c743a3249d1722879";
         private const string ExactAccountName = "Sim101";
         private const string ExactAccountClass = "LOCAL_SIMULATION";
         private const string ExactInstrumentName = "MNQ SEP26";
@@ -681,7 +686,10 @@ namespace NinjaTrader.NinjaScript.AddOns
             hello["message_type"] = "HELLO";
             hello["bridge_instance_id"] = bridgeInstanceId;
             hello["ninjatrader_session_id"] = ninjaTraderSessionId;
-            hello["addon_source_hash"] = AssemblyHash();
+            hello["addon_protocol_version"] = AddonProtocolVersion;
+            hello["addon_source_fingerprint"] = AddonSourceFingerprint;
+            hello["addon_build_fingerprint"] = AssemblyHash();
+            hello["addon_build_timestamp"] = AssemblyBuildTimestamp();
             hello["account_name"] = ExactAccountName;
             hello["account_class"] = ExactAccountClass;
             hello["instrument"] = ExactInstrumentName;
@@ -1170,6 +1178,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                     return BitConverter.ToString(sha.ComputeHash(File.ReadAllBytes(Assembly.GetExecutingAssembly().Location))).Replace("-", String.Empty).ToLowerInvariant();
             }
             catch { return new string('0', 64); }
+        }
+
+        private static string AssemblyBuildTimestamp()
+        {
+            try { return File.GetLastWriteTimeUtc(Assembly.GetExecutingAssembly().Location).ToString("o", CultureInfo.InvariantCulture); }
+            catch { return "UNKNOWN"; }
         }
 
         private void CloseTransport()

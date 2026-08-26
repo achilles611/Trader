@@ -5,7 +5,8 @@ from tempfile import TemporaryDirectory
 import sqlite3
 import unittest
 
-from src.l3g_paper.ledger import PaperLedger
+from src.l3g_paper.ledger import PaperLedger, adopt_legacy_epoch
+from src.l3g_paper.verification import run_local_verification
 
 
 class PaperLedgerTests(unittest.TestCase):
@@ -44,6 +45,20 @@ class PaperLedgerTests(unittest.TestCase):
             self.assertEqual(connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0], 32768)
             self.assertEqual(connection.execute("PRAGMA journal_size_limit").fetchone()[0], 134217728)
             self.assertEqual(connection.execute("PRAGMA temp_store").fetchone()[0], 2)
+
+    def test_legacy_epoch_adoption_requires_full_proof_and_explicit_maintenance_confirmation(self) -> None:
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "paper.sqlite3"; audit = Path(folder) / "audit"
+            with PaperLedger(path) as ledger:
+                ledger.append("COMMAND", {"command_id": "adopt"}, identity="adopt")
+            self.assertEqual(run_local_verification(path, audit, requested_mode="full")["status"], "PASS")
+            with self.assertRaisesRegex(ValueError, "maintenance-window"):
+                adopt_legacy_epoch(path, audit, target_epoch="L3G-PAPER-EPOCH-002", operator_id="operator", maintenance_window_confirmed=False)
+            adopted = adopt_legacy_epoch(path, audit, target_epoch="L3G-PAPER-EPOCH-002", operator_id="operator", maintenance_window_confirmed=True)
+            self.assertTrue(adopted["adopted"])
+            self.assertTrue(Path(str(adopted["receipt_path"])).is_file())
+            with PaperLedger(path) as ledger:
+                self.assertEqual(ledger.health_status()["epoch_id"], "L3G-PAPER-EPOCH-002")
 
     def test_deferred_records_commit_in_order_before_operational_record(self) -> None:
         with TemporaryDirectory() as folder, PaperLedger(Path(folder) / "paper.sqlite3") as ledger:

@@ -13,6 +13,8 @@ import json
 import logging
 import os
 import sqlite3
+import subprocess
+import sys
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,8 +22,8 @@ from typing import Any, Callable, Iterator, Mapping
 
 from src.l3f_provider.ninjatrader_commission import NinjaTraderListenerWorker
 from src.l3f_provider.shadow_runtime import LaneIIIShadowRuntime
-from src.l3g_paper.health import sanitized_paper_health
-from src.l3g_paper.ledger import PaperLedger
+from src.l3g_paper.health import ledger_health_projection, sanitized_paper_health
+from src.l3g_paper.ledger import PaperLedger, resolve_ledger_epoch
 from src.l3g_paper.ninjatrader_login import NinjaTraderLoginBootstrap, NinjaTraderLoginState
 from src.l3g_paper.ninjatrader_transport import PaperExecutionTransport
 from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout
@@ -66,6 +68,19 @@ def _assert_hot_paper_ledger_path(paper_path: Path, cold_root: Path) -> None:
     raise RuntimeError(
         f"LANE_III_PAPER active ledger path {resolved_path} may not reside under configured cold storage root {resolved_cold_root}"
     )
+
+
+def _runtime_git_sha() -> str:
+    supplied = os.getenv("BEELZEBUB_GIT_SHA")
+    if supplied:
+        return supplied
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else "unknown"
 
 
 def _load(value: str | None, default: Any) -> Any:
@@ -1353,8 +1368,18 @@ def create_control_center_app(
         if configured_paper_path
         else Path(config.artifacts.database_path).resolve().with_name("lane_iii_paper.sqlite3")
     )
-    audit_root = Path(os.getenv("BEELZEBUB_LEDGER_AUDIT_ROOT") or (Path(__file__).resolve().parents[2] / "runtime" / "audit")).resolve()
+    configured_paper_epoch = os.getenv("BEELZEBUB_L3G_PAPER_LEDGER_EPOCH")
+    derived_audit_root = paper_path.parent.parent / "audit" if paper_path.parent.name.lower() == "hot" else paper_path.parent / "audit"
+    audit_root = Path(os.getenv("BEELZEBUB_LEDGER_AUDIT_ROOT") or derived_audit_root).resolve()
     ledger_verifier = LocalLedgerVerificationController(paper_path, audit_root)
+    runtime_binding = {
+        "ledger": str(paper_path),
+        "audit": str(audit_root),
+        "control_center": "127.0.0.1:8090",
+        "python": sys.executable,
+        "pid": os.getpid(),
+        "git_sha": _runtime_git_sha(),
+    }
 
     def live_watcher_health() -> dict[str, Any] | None:
         supervisor = watcher_runtime.get("supervisor")
@@ -1435,7 +1460,11 @@ def create_control_center_app(
                 "ledger_verification": ledger_verifier.status(),
             }
         status = paper.status()
-        status["ledger_verification"] = ledger_verifier.status()
+        verification = ledger_verifier.status()
+        status["ledger_verification"] = verification
+        raw_ledger = status.get("ledger")
+        if isinstance(raw_ledger, Mapping):
+            status["ledger"] = ledger_health_projection(raw_ledger, verification)
         return status
 
     scheduler_path = config.scheduler.database_path or Path(config.artifacts.database_path).resolve().with_name("beelzebub_operations.sqlite3")
@@ -1491,7 +1520,11 @@ def create_control_center_app(
             ninjatrader_runtime["shadow"] = shadow
             app.state.lane_iii_shadow = shadow
             _assert_hot_paper_ledger_path(paper_path, config.storage.cold_root)
-            paper_ledger = paper_ledger_factory(paper_path) if paper_ledger_factory is not None else PaperLedger(paper_path)
+            if paper_ledger_factory is None and not paper_path.exists and configured_paper_path and resolve_ledger_epoch(paper_path, configured_paper_epoch) == "UNSPECIFIED":
+                raise RuntimeError(
+                    "New production paper ledger requires BEELZEBUB_L3G_PAPER_LEDGER_EPOCH or an epoch-N directory."
+                )
+            paper_ledger = paper_ledger_factory(paper_path) if paper_ledger_factory is not None else PaperLedger(paper_path, epoch_id=configured_paper_epoch)
             if type(paper_ledger) is not PaperLedger:
                 raise RuntimeError("LANE_III_PAPER ledger factory must return the exact durable ledger")
             paper_runtime = lane_iii_paper_factory(paper_ledger) if lane_iii_paper_factory is not None else LaneIIIPaperRuntime(paper_ledger)
@@ -1528,6 +1561,12 @@ def create_control_center_app(
             ninjatrader_runtime["paper_transport"] = paper_transport
             ninjatrader_runtime["fanout"] = fanout
             app.state.lane_iii_paper = paper_runtime
+            app.state.runtime_binding = runtime_binding
+            NINJATRADER_RUNTIME_LOGGER.info(
+                "BEELZEBUB_RUNTIME_BINDING ledger=%s audit=%s control_center=%s python=%s pid=%s git_sha=%s",
+                runtime_binding["ledger"], runtime_binding["audit"], runtime_binding["control_center"],
+                runtime_binding["python"], runtime_binding["pid"], runtime_binding["git_sha"],
+            )
             app.state.lane_iii_paper_transport = paper_transport
             listener = (
                 ninjatrader_listener_factory()
@@ -1764,6 +1803,7 @@ def create_control_center_app(
             "lane_iii_shadow": lane_iii_shadow_health(),
             "lane_iii_paper": sanitized_paper_health(lane_iii_paper_health()),
             "scheduler": scheduler_service.status(),
+            "runtime_binding": runtime_binding,
         }
 
     def scheduler_error(exc: Exception) -> None:
@@ -2244,8 +2284,14 @@ def create_control_center_app(
             "ninjatrader_observer": ninja_listener_health(),
             "lane_iii_shadow": lane_iii_shadow_health(),
             "lane_iii_paper": sanitized_paper_health(lane_iii_paper_health()),
+            "runtime_binding": runtime_binding,
             "paper_only": True,
         }
+
+    @app.get("/api/runtime-binding")
+    async def api_runtime_binding() -> dict[str, Any]:
+        """Expose non-secret deployment bindings without granting authority."""
+        return dict(runtime_binding)
 
     @app.get("/api/execution")
     async def api_execution() -> dict[str, Any]:

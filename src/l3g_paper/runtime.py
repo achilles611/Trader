@@ -968,6 +968,20 @@ class LaneIIIPaperRuntime:
         with self._lock:
             if self._state is not PaperRuntimeState.READY_DISARMED:
                 return {"armed": False, "reason_codes": ("STATE_NOT_READY_DISARMED",), "state": self._state.value}
+            transport = None if self._transport is None else self._transport.status()
+            if transport is None or not transport.addon_provenance_valid:
+                reasons = ("ADDON_BUILD_MISMATCH",)
+                self.ledger.append(
+                    "RISK_EVENT_ARM_ATTEMPT",
+                    {
+                        **self._session_context.payload(), "allowed": False, "reason_codes": reasons,
+                        "expected_addon_source_fingerprint": None if transport is None else transport.expected_addon_source_fingerprint,
+                        "runtime_addon_source_fingerprint": None if transport is None else transport.addon_source_fingerprint,
+                        "runtime_addon_protocol_version": None if transport is None else transport.addon_protocol_version,
+                    },
+                    execution_session_id=self._execution_session_id(),
+                )
+                return {"armed": False, "reason_codes": reasons, "state": self._state.value}
             context = self._session_context
             now = _now()
             current = PaperSessionResolver().resolve(now, generation=context.session_generation)

@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from src.l3f_provider.tradovate_observation import StreamHealth
 from src.l3g_paper.ledger import PaperLedger
-from src.l3g_paper.ninjatrader_transport import PaperExecutionTransport
+from src.l3g_paper.ninjatrader_transport import ADDON_PROTOCOL_VERSION, PaperExecutionTransport, expected_addon_source_fingerprint
 from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout
 from src.l3g_paper.contracts import PaperDirection, PaperRuntimeState, PaperSessionArmGrant
 from src.l3g_paper.risk import PaperRiskSnapshot
@@ -42,6 +42,21 @@ class PaperRuntimeTests(unittest.TestCase):
             self.assertEqual(runtime.state.value, "READY_DISARMED")
             self.assertFalse(runtime.arm()["armed"])
             runtime.stop(); ledger.close()
+
+    def test_addon_provenance_denies_arm_but_not_observation_or_exit_safety(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            transport = PaperExecutionTransport(ledger, port=48171)
+            runtime = LaneIIIPaperRuntime(ledger); runtime.bind_transport(transport)
+            runtime._state = PaperRuntimeState.READY_DISARMED
+            transport._addon_protocol_version = ADDON_PROTOCOL_VERSION
+            transport._addon_source_fingerprint = "stale"
+            self.assertEqual(runtime.arm()["reason_codes"], ("ADDON_BUILD_MISMATCH",))
+            transport._addon_source_fingerprint = expected_addon_source_fingerprint()
+            # The provenance gate is now clear; an off-session fence, not the
+            # AddOn, is the reason this fixture cannot arm.
+            self.assertEqual(runtime.arm()["reason_codes"], ("NO_CURRENT_EVENT_SESSION",))
+            ledger.close()
 
     def test_backward_provider_timestamp_does_not_close_the_current_paper_session(self) -> None:
         with TemporaryDirectory() as directory:

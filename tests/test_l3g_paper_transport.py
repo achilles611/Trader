@@ -11,7 +11,7 @@ import unittest
 
 from src.l3g_paper.ledger import PaperLedger
 from src.l3g_paper.ninjatrader_transport import (
-    EXECUTION_SCHEMA, LocalPaperSecretProvider, PaperExecutionTransport,
+    ADDON_PROTOCOL_VERSION, EXECUTION_SCHEMA, LocalPaperSecretProvider, PaperExecutionTransport, expected_addon_source_fingerprint,
     sign_payload, verify_signature,
 )
 from src.l3g_paper.contracts import (
@@ -49,7 +49,9 @@ class PaperTransportTests(unittest.TestCase):
             transport.start(); client = socket.create_connection(("127.0.0.1", port), timeout=2)
             hello = {
                 "schema": EXECUTION_SCHEMA, "message_type": "HELLO", "bridge_instance_id": "bridge",
-                "ninjatrader_session_id": "nt", "addon_source_hash": "0" * 64,
+                "ninjatrader_session_id": "nt", "addon_protocol_version": ADDON_PROTOCOL_VERSION,
+                "addon_source_fingerprint": expected_addon_source_fingerprint(), "addon_build_fingerprint": "0" * 64,
+                "addon_build_timestamp": "2026-08-25T00:00:00Z",
                 "account_name": "Sim101", "account_class": "LOCAL_SIMULATION", "instrument": "MNQ SEP26",
                 "capability": "PAPER_ONLY", "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "nonce": "nonce",
@@ -60,7 +62,39 @@ class PaperTransportTests(unittest.TestCase):
             self.assertEqual(grant["mode"], "PAPER_SIM101")
             self.assertFalse(grant["live_capital"])
             self.assertTrue(transport.status().authenticated_client)
+            self.assertTrue(transport.status().addon_provenance_valid)
             client.close(); transport.stop(); ledger.close()
+
+    def test_addon_provenance_mismatch_is_visible_without_hiding_observation_transport(self) -> None:
+        with TemporaryDirectory() as directory:
+            key_path = Path(directory) / "key"; key_path.write_bytes(bytes(range(32)))
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            transport = PaperExecutionTransport(
+                ledger, secret_provider=LocalPaperSecretProvider(key_path), port=free_port(), expected_source_fingerprint="a" * 64,
+            )
+            transport._send_signed = lambda _: None  # type: ignore[method-assign]
+            transport._handle_hello({
+                "schema": EXECUTION_SCHEMA, "message_type": "HELLO", "bridge_instance_id": "bridge", "ninjatrader_session_id": "nt",
+                "addon_protocol_version": ADDON_PROTOCOL_VERSION, "addon_source_fingerprint": "b" * 64,
+                "addon_build_fingerprint": "c" * 64, "addon_build_timestamp": "2026-08-25T00:00:00Z",
+                "account_name": "Sim101", "account_class": "LOCAL_SIMULATION", "instrument": "MNQ SEP26", "capability": "PAPER_ONLY",
+                "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), "nonce": "nonce", "signature": "unused",
+            })
+            state = transport.status()
+            self.assertTrue(state.authenticated_client)
+            self.assertFalse(state.addon_provenance_valid)
+            self.assertEqual(state.addon_source_fingerprint, "b" * 64)
+            ledger.close()
+
+    def test_missing_addon_provenance_is_rejected(self) -> None:
+        with TemporaryDirectory() as directory:
+            key_path = Path(directory) / "key"; key_path.write_bytes(bytes(range(32)))
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            transport = PaperExecutionTransport(ledger, secret_provider=LocalPaperSecretProvider(key_path), port=free_port())
+            transport._handle_hello({"schema": EXECUTION_SCHEMA, "message_type": "HELLO"})
+            self.assertFalse(transport.status().authenticated_client)
+            self.assertGreaterEqual(transport.status().rejected_frames, 1)
+            ledger.close()
 
     def test_bad_signature_malformed_duplicate_key_and_oversized_frames_are_rejected(self) -> None:
         with TemporaryDirectory() as directory:

@@ -24,10 +24,10 @@ from urllib.request import Request, urlopen
 HOST = "127.0.0.1"
 PORT = 8090
 URL = f"http://{HOST}:{PORT}"
-# Startup includes a complete verification of the append-only paper audit
-# chain before any listener or execution authority is exposed. The ledger can
-# legitimately take longer than the old 30-second UI watchdog as it grows.
-# Keep this above the separate 90-second NinjaTrader authentication budget.
+# Startup is intentionally lightweight: runtime accessibility checks and
+# NinjaTrader authentication may take time, but historical ledger verification
+# is a detached, explicit local operation.  Keep this above the separate
+# 90-second NinjaTrader authentication budget.
 STARTUP_TIMEOUT_SECONDS = 120.0
 
 

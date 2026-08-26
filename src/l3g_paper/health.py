@@ -5,6 +5,40 @@ from __future__ import annotations
 from typing import Mapping
 
 
+def ledger_health_projection(runtime: Mapping[str, object], verification: Mapping[str, object]) -> dict[str, object]:
+    """Join inexpensive writer state with the verifier's durable authority."""
+    value = dict(runtime)
+    current = int(value.get("highest_sequence") or 0)
+    verified_raw = verification.get("verified_through_sequence")
+    verified = verified_raw if type(verified_raw) is int and verified_raw >= 0 else None
+    status = str(verification.get("status") or "UNVERIFIED")
+    verification_pass = status == "PASS" and verification.get("chain_valid") is True
+    tail = None if verified is None else max(0, current - verified)
+    value.update({
+        "main_database_bytes": value.get("file_size"),
+        "total_footprint_bytes": sum(int(value.get(name) or 0) for name in ("file_size", "wal_size")),
+        "verification_status": status,
+        "verification_mode": verification.get("verification_mode"),
+        "verified_through_sequence": verified,
+        "verified_tip_hash": verification.get("tip_hash"),
+        "unverified_tail_rows": tail,
+        "last_full_quick_check_at": verification.get("last_full_quick_check_at"),
+        "last_full_verification_id": verification.get("last_full_verification_id"),
+        "last_full_verified_sequence": verification.get("last_full_verified_sequence"),
+        "last_incremental_at": verification.get("completed_at") if verification.get("verification_mode") == "incremental" and verification_pass else None,
+        "quick_check_state": (
+            "PASS" if verification_pass and verification.get("quick_check") in {"ok", "inherited_from_full"}
+            else value.get("quick_check_state", "UNKNOWN")
+        ),
+        "hash_chain_state": (
+            f"VERIFIED THROUGH #{verified}" + (f"; TAIL PENDING: {tail} ROWS" if tail else "")
+            if verification_pass and verified is not None else "PENDING" if status == "IN_PROGRESS" else "UNKNOWN"
+        ),
+        "epoch_warning": value.get("epoch_id") == "UNSPECIFIED",
+    })
+    return value
+
+
 def sanitized_paper_health(status: Mapping[str, object]) -> dict[str, object]:
     """Return an API-safe authority/status view with no key or credential fields."""
     return {

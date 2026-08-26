@@ -1,5 +1,41 @@
 # Local ledger verification
 
+## Verifier v2 operations
+
+Full is the forensic authority: schema and identity checks, SQLite `PRAGMA quick_check`, full chain walk, sentinels, and checkpoint generation. Incremental validates read-only access, schema/identity/epoch/file binding, retained Full proof, checkpoint hash, bounded sentinels, and only the chain tail. Incremental deliberately reports `quick_check: inherited_from_full`; it never runs SQLite `quick_check` itself.
+
+Old v1 checkpoints are upgraded only when an immutable matching Full PASS artifact is found and its full-tip hash is still in current ancestry. Otherwise verification fails closed and requires Full. Historical result artifacts are never rewritten.
+
+The detached current artifact is atomically refreshed at stage transitions, every 64K rows, or about once per second. It includes counters, captured total, throughput, optional ETA, stage timings, and read-only DB/WAL/SHM/free-space telemetry. The verifier never checkpoints, truncates, deletes, or mutates the trading ledger. Local controls are `BEELZEBUB_L3G_VERIFIER_WARNING_FREE_BYTES` (10 GiB default), `BEELZEBUB_L3G_VERIFIER_EMERGENCY_FREE_BYTES` (2 GiB), and `BEELZEBUB_L3G_VERIFIER_WAL_GROWTH_WARNING_BYTES` (1 GiB). The emergency floor aborts only the verifier with `STORAGE_PRESSURE_ABORT`.
+
+## Bindings, epoch adoption, and profiling
+
+Production binds the ledger with `BEELZEBUB_L3G_PAPER_LEDGER`, audit root with `BEELZEBUB_LEDGER_AUDIT_ROOT`, and new-ledger epoch with `BEELZEBUB_L3G_PAPER_LEDGER_EPOCH`. A `hot` ledger defaults to a sibling runtime `audit` directory. Backend startup logs and exposes a non-secret `BEELZEBUB_RUNTIME_BINDING` record.
+
+Before switching an existing deployment from the historical C: audit root to N:, copy and SHA-256 verify its immutable artifacts without deleting the source:
+
+```powershell
+scripts\migrate_ledger_audit.ps1
+```
+
+An existing `UNSPECIFIED` ledger is displayed as **LEGACY / UNSPECIFIED** and is never silently relabelled. In a confirmed maintenance window only, following a clean PASS with retained Full proof, run:
+
+```powershell
+scripts\adopt_l3g_legacy_epoch.ps1 -TargetEpoch L3G-PAPER-EPOCH-002 -OperatorId <operator-id>
+```
+
+It verifies the current Full anchor and creates a write-once external adoption receipt before changing only ledger epoch metadata; rows and the hash chain are untouched.
+
+For a read-only storage profile after a benchmark:
+
+```powershell
+.venv312\Scripts\python.exe -m src.l3g_paper.verification profile-storage --ledger N:\Beelzebub\runtime\hot\lane_iii_paper.sqlite3
+```
+
+The report includes global/domain rows, table and index pages/bytes/payload where SQLite `dbstat` is available, main DB, WAL, and SHM. Do not VACUUM or rewrite the current epoch. If duplicated large JSON is confirmed as the main amplifier, the next clean epoch should use one authoritative payload/chain table plus domain reference indexes.
+
+No writer-owned `PRAGMA wal_checkpoint(PASSIVE)` was added in this hotfix. It needs a dedicated concurrent writer benchmark that proves it cannot delay safety/order paths after the verifier releases its snapshot. Until then, retain telemetry only.
+
 Lane III paper-ledger verification is a deterministic local service. It has no
 LLM, API, broker, order, account, or live-capital dependency. The verifier is
 started as a detached `python -m src.l3g_paper.verification run` process and

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
@@ -65,6 +66,69 @@ class LocalLedgerVerificationTests(unittest.TestCase):
             report = run_local_verification(path, root / "runtime" / "audit", requested_mode="auto")
             self.assertEqual(report["status"], "PASS")
             self.assertEqual(report["verification_mode"], "full")
+
+    def test_incremental_inherits_full_structural_proof_without_running_quick_check(self) -> None:
+        with TemporaryDirectory() as folder:
+            root = Path(folder); path = self.make_ledger(root, rows=2)
+            full = self.full(path, root)
+            with PaperLedger(path) as ledger:
+                ledger.append("DECISION", {"paper_decision_id": "tail"}, identity="tail")
+            with patch.object(LocalLedgerVerifier, "_quick_check", side_effect=AssertionError("incremental must not quick_check")) as quick_check:
+                report = run_local_verification(path, root / "runtime" / "audit", requested_mode="incremental")
+            self.assertEqual(report["status"], "PASS")
+            self.assertEqual(report["quick_check"], "inherited_from_full")
+            self.assertEqual(report["last_full_verification_id"], full["verification_id"])
+            self.assertEqual(report["timings"]["quick_check_seconds"], 0.0)
+            quick_check.assert_not_called()
+
+    def test_v1_checkpoint_upgrades_only_with_current_immutable_full_proof(self) -> None:
+        with TemporaryDirectory() as folder:
+            root = Path(folder); path = self.make_ledger(root, rows=2)
+            full = self.full(path, root)
+            checkpoint = VerificationPaths(root / "runtime" / "audit").checkpoint
+            v1 = json.loads(checkpoint.read_text(encoding="utf-8"))
+            v1["schema"] = "beelzebub-ledger-verification-checkpoint-v1"
+            for key in ("last_full_verification_id", "last_full_quick_check_at", "last_full_verified_sequence", "last_full_verified_hash"):
+                v1.pop(key)
+            checkpoint.write_text(json.dumps(v1), encoding="utf-8")
+            with PaperLedger(path) as ledger:
+                ledger.append("DECISION", {"paper_decision_id": "tail"}, identity="tail")
+            report = run_local_verification(path, root / "runtime" / "audit", requested_mode="incremental")
+            upgraded = json.loads(checkpoint.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "PASS")
+            self.assertEqual(report["last_full_verification_id"], full["verification_id"])
+            self.assertEqual(upgraded["schema"], "beelzebub-ledger-verification-checkpoint-v2")
+
+    def test_v1_checkpoint_without_immutable_full_proof_fails_closed(self) -> None:
+        with TemporaryDirectory() as folder:
+            root = Path(folder); path = self.make_ledger(root, rows=2)
+            self.full(path, root)
+            audit = VerificationPaths(root / "runtime" / "audit")
+            checkpoint = json.loads(audit.checkpoint.read_text(encoding="utf-8"))
+            checkpoint["schema"] = "beelzebub-ledger-verification-checkpoint-v1"
+            for key in ("last_full_verification_id", "last_full_quick_check_at", "last_full_verified_sequence", "last_full_verified_hash"):
+                checkpoint.pop(key)
+            audit.checkpoint.write_text(json.dumps(checkpoint), encoding="utf-8")
+            for artifact in audit.reports.glob("*.json"):
+                artifact.unlink()
+            report = run_local_verification(path, root / "runtime" / "audit", requested_mode="incremental")
+            self.assertEqual(report["status"], "FAIL")
+            self.assertTrue(report["full_scan_required"])
+            self.assertEqual(report["errors"][0]["code"], "CHECKPOINT_FULL_PROVENANCE_MISSING")
+
+    def test_storage_pressure_aborts_only_verifier_and_keeps_checkpoint(self) -> None:
+        with TemporaryDirectory() as folder:
+            root = Path(folder); path = self.make_ledger(root, rows=2)
+            self.full(path, root)
+            checkpoint = VerificationPaths(root / "runtime" / "audit").checkpoint
+            before = checkpoint.read_text(encoding="utf-8")
+            with patch.dict(os.environ, {"BEELZEBUB_L3G_VERIFIER_EMERGENCY_FREE_BYTES": str(10**18)}):
+                report = run_local_verification(path, root / "runtime" / "audit", requested_mode="incremental")
+            self.assertEqual(report["status"], "FAIL")
+            self.assertEqual(report["errors"][0]["code"], "STORAGE_PRESSURE_ABORT")
+            self.assertEqual(checkpoint.read_text(encoding="utf-8"), before)
+            with PaperLedger(path) as ledger:
+                ledger.append("DECISION", {"paper_decision_id": "writer-still-runs"}, identity="writer-still-runs")
 
     def test_historical_mutation_invalidates_checkpoint_before_incremental_tail_scan(self) -> None:
         with TemporaryDirectory() as folder:

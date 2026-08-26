@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 from pathlib import Path
+import re
 import select
 import socket
 import threading
@@ -36,12 +37,35 @@ from .sessions import PaperSessionKind, PaperSessionResolver, UNSPECIFIED_OFF_SE
 EXECUTION_HOST = "127.0.0.1"
 EXECUTION_PORT = 48136
 EXECUTION_SCHEMA = "lane-iii-phase-g-paper-execution-v1"
+ADDON_PROTOCOL_VERSION = "l3g-paper-addon-provenance-v1"
+EXPECTED_ADDON_SOURCE_FINGERPRINT = "eee706f322b4f44ab82937bd231cc81ccaa484035c507d5c743a3249d1722879"
 MAXIMUM_FRAME_BYTES = 65536
 HELLO_MAXIMUM_AGE_SECONDS = 10
 FUTURE_TOLERANCE_SECONDS = 1
 HEARTBEAT_INTERVAL_SECONDS = 1
 HEARTBEAT_WATCHDOG_SECONDS = 5
 COMMAND_ACKNOWLEDGEMENT_TIMEOUT_SECONDS = 3
+
+
+def expected_addon_source_fingerprint() -> str:
+    """Fingerprint the checked-in AddOn while excluding its embedded value.
+
+    The AddOn carries the resulting constant into the compiled DLL.  A stale
+    DLL therefore reports the old source value even when its file timestamp is
+    misleading, and arm preflight can fail closed without compiling anything.
+    """
+    source = Path(__file__).resolve().parents[2] / "ninjatrader" / "NinjaScript" / "AddOns" / "BeelzebubPaperExecutionAddOn.cs"
+    try:
+        text = source.read_text(encoding="utf-8").replace("\r\n", "\n")
+    except OSError:
+        # Packaged BeezConsole releases need the checked-in expectation even
+        # though NinjaScript source is not bundled beside the executable.
+        return EXPECTED_ADDON_SOURCE_FINGERPRINT
+    normalized = re.sub(
+        r'(private const string AddonSourceFingerprint = ")[0-9a-f]{64}(";)',
+        r"\1<SOURCE_FINGERPRINT>\2", text,
+    )
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _now() -> str:
@@ -100,6 +124,12 @@ class ExecutionTransportStatus:
     acknowledgements: int
     command_rejections: int
     duplicate_receipts: int
+    addon_protocol_version: str | None
+    addon_source_fingerprint: str | None
+    addon_build_fingerprint: str | None
+    addon_build_timestamp: str | None
+    expected_addon_source_fingerprint: str
+    addon_provenance_valid: bool
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -112,6 +142,14 @@ class ExecutionTransportStatus:
             "scientific_eligibility": False,
             "paper_only": True,
             "live_capital": "DENIED",
+            "addon_provenance": {
+                "protocol_version": self.addon_protocol_version,
+                "source_fingerprint": self.addon_source_fingerprint,
+                "build_fingerprint": self.addon_build_fingerprint,
+                "build_timestamp": self.addon_build_timestamp,
+                "expected_source_fingerprint": self.expected_addon_source_fingerprint,
+                "status": "MATCH" if self.addon_provenance_valid else "COMPILE REQUIRED",
+            },
         }
 
 
@@ -131,6 +169,7 @@ class PaperExecutionTransport:
         maximum_frame_bytes: int = MAXIMUM_FRAME_BYTES,
         on_message: Callable[[Mapping[str, object]], None] | None = None,
         on_bridge_state: Callable[[str], None] | None = None,
+        expected_source_fingerprint: str | None = None,
     ) -> None:
         if type(ledger) is not PaperLedger:
             raise ValueError("Execution transport requires the durable paper ledger.")
@@ -174,6 +213,11 @@ class PaperExecutionTransport:
         self._acknowledgements = 0
         self._command_rejections = 0
         self._duplicate_receipts = 0
+        self._expected_addon_source_fingerprint = expected_source_fingerprint or expected_addon_source_fingerprint()
+        self._addon_protocol_version: str | None = None
+        self._addon_source_fingerprint: str | None = None
+        self._addon_build_fingerprint: str | None = None
+        self._addon_build_timestamp: str | None = None
 
     def status(self) -> ExecutionTransportStatus:
         with self._lock:
@@ -183,6 +227,10 @@ class PaperExecutionTransport:
                 self._reconciled, self._error, self._start_attempts, self._duplicate_start_attempts,
                 self._rejected_clients, self._received_frames, self._rejected_frames,
                 self._commands_sent, self._acknowledgements, self._command_rejections, self._duplicate_receipts,
+                self._addon_protocol_version, self._addon_source_fingerprint, self._addon_build_fingerprint,
+                self._addon_build_timestamp, self._expected_addon_source_fingerprint,
+                self._addon_protocol_version == ADDON_PROTOCOL_VERSION
+                and self._addon_source_fingerprint == self._expected_addon_source_fingerprint,
             )
 
     def start(self, *, timeout_seconds: float = _START_TIMEOUT_SECONDS) -> ExecutionTransportStatus:
@@ -261,6 +309,10 @@ class PaperExecutionTransport:
                             self._authenticated = False
                             self._reconciled = False
                             self._execution_session_id = None
+                            self._addon_protocol_version = None
+                            self._addon_source_fingerprint = None
+                            self._addon_build_fingerprint = None
+                            self._addon_build_timestamp = None
                         self._notify_bridge("CONNECTED")
                         continue
                     try:
@@ -323,6 +375,10 @@ class PaperExecutionTransport:
             self._authenticated = False
             self._reconciled = False
             self._execution_session_id = None
+            self._addon_protocol_version = None
+            self._addon_source_fingerprint = None
+            self._addon_build_fingerprint = None
+            self._addon_build_timestamp = None
             self._pending_acknowledgements.clear()
             if self._state not in {"STOPPING", "STOPPED", "FAULTED"}:
                 self._state = "LISTENING"
@@ -414,7 +470,8 @@ class PaperExecutionTransport:
 
     def _handle_hello(self, payload: Mapping[str, object]) -> None:
         required = {
-            "schema", "message_type", "bridge_instance_id", "ninjatrader_session_id", "addon_source_hash",
+            "schema", "message_type", "bridge_instance_id", "ninjatrader_session_id", "addon_protocol_version",
+            "addon_source_fingerprint", "addon_build_fingerprint", "addon_build_timestamp",
             "account_name", "account_class", "instrument", "capability", "timestamp", "nonce", "signature",
         }
         if set(payload) != required:
@@ -434,7 +491,10 @@ class PaperExecutionTransport:
         ) != ("Sim101", "LOCAL_SIMULATION", "MNQ SEP26", "PAPER_ONLY"):
             self._reject_frame("HELLO_CAPABILITY_MISMATCH")
             return
-        if not all(isinstance(payload.get(key), str) and str(payload[key]).strip() for key in ("bridge_instance_id", "ninjatrader_session_id", "addon_source_hash", "nonce")):
+        if not all(isinstance(payload.get(key), str) and str(payload[key]).strip() for key in (
+            "bridge_instance_id", "ninjatrader_session_id", "addon_protocol_version", "addon_source_fingerprint",
+            "addon_build_fingerprint", "addon_build_timestamp", "nonce",
+        )):
             self._reject_frame("HELLO_IDENTITY_MISSING")
             return
         session_id = "l3g-es-" + uuid.uuid4().hex
@@ -445,6 +505,10 @@ class PaperExecutionTransport:
             self._reconciled = False
             self._state = "AUTHENTICATED"
             self._last_sent_sequence = 0
+            self._addon_protocol_version = str(payload["addon_protocol_version"])
+            self._addon_source_fingerprint = str(payload["addon_source_fingerprint"])
+            self._addon_build_fingerprint = str(payload["addon_build_fingerprint"])
+            self._addon_build_timestamp = str(payload["addon_build_timestamp"])
         self.ledger.append("SESSION_HANDSHAKE", {key: value for key, value in payload.items() if key != "signature"}, identity=session_id, execution_session_id=session_id)
         response: dict[str, object] = {
             "schema": EXECUTION_SCHEMA,
