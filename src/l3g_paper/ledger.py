@@ -289,8 +289,12 @@ class PaperLedger:
                         record_hash TEXT NOT NULL UNIQUE
                     )
                     """
-                )
+            )
             connection.execute("CREATE INDEX IF NOT EXISTS lane_iii_paper_audit_domain_time ON lane_iii_paper_audit(domain, occurred_at)")
+            # Restart recovery reads only the rare commissioning-ownership
+            # records.  Index that narrow operational slice so opening a large
+            # observation ledger never devolves into a historical table scan.
+            connection.execute("CREATE INDEX IF NOT EXISTS lane_iii_paper_audit_kind_sequence ON lane_iii_paper_audit(kind, ledger_sequence DESC)")
             # This metadata has no trading semantics.  It gives the local
             # verifier a stable ledger identity and sealed epoch/schema facts
             # without granting the verifier write access to the ledger.
