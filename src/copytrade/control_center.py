@@ -2034,7 +2034,7 @@ def create_control_center_app(
         return paper.arm()
 
     @app.post("/api/lane-iii/paper/commission-entry")
-    async def api_lane_iii_paper_commission_entry() -> dict[str, object]:
+    async def api_lane_iii_paper_commission_entry(body: dict[str, Any] | None = Body(default=None)) -> dict[str, object]:
         """Run the closed Sim101 commissioning entry only through paper runtime gates."""
         paper = ninjatrader_runtime.get("paper")
         if paper is None:
@@ -2049,7 +2049,31 @@ def create_control_center_app(
                 transport.get("account_class"), transport.get("instrument"),
             ) != ("AUTHENTICATED", True, True, "Sim101", "LOCAL_SIMULATION", "MNQ SEP26"):
                 raise HTTPException(status_code=409, detail="NinjaTrader desktop authentication is not operational.")
-        return paper.commission_entry()
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Commissioning entry requires its active lifecycle credential.")
+        commissioning_id = body.get("commissioning_id")
+        commissioning_token = body.get("commissioning_token")
+        if not isinstance(commissioning_id, str) or not isinstance(commissioning_token, str):
+            raise HTTPException(status_code=400, detail="Commissioning entry lifecycle credential is invalid.")
+        return paper.commission_entry(commissioning_id, commissioning_token)
+
+    @app.post("/api/lane-iii/paper/commissioning-arm")
+    async def api_lane_iii_paper_commissioning_arm() -> dict[str, object]:
+        """Atomically reserve the sole commissioning entry before paper arms."""
+        paper = ninjatrader_runtime.get("paper")
+        if paper is None:
+            raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
+        require_commissioning_ledger_verification()
+        bootstrap = ninjatrader_runtime.get("login_bootstrap")
+        if bootstrap is not None and bootstrap.state is not NinjaTraderLoginState.AUTHENTICATED:
+            transport = paper.status().get("transport")
+            if not isinstance(transport, Mapping) or (
+                transport.get("state"), transport.get("authenticated_client"),
+                transport.get("reconciled"), transport.get("account"),
+                transport.get("account_class"), transport.get("instrument"),
+            ) != ("AUTHENTICATED", True, True, "Sim101", "LOCAL_SIMULATION", "MNQ SEP26"):
+                raise HTTPException(status_code=409, detail="NinjaTrader desktop authentication is not operational.")
+        return paper.commissioning_arm()
 
     @app.post("/api/lane-iii/paper/commission-exit")
     async def api_lane_iii_paper_commission_exit() -> dict[str, object]:

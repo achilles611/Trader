@@ -581,6 +581,28 @@ class PaperLedger:
             ).fetchall()
             return [json.loads(str(row["payload_json"])) for row in rows]
 
+    def recent_kinds(self, kinds: tuple[str, ...], limit: int = 100) -> list[dict[str, object]]:
+        """Return a bounded reverse-chronological audit slice for exact kinds.
+
+        Runtime restart recovery needs a narrow operational query, not a scan of
+        high-volume observation history.  The records remain normal hash-chain
+        entries; this is only a read convenience for fail-closed recovery.
+        """
+        if not kinds or not all(isinstance(kind, str) and kind for kind in kinds):
+            raise ValueError("Paper ledger record kinds must be non-empty strings.")
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("Paper ledger query limit is invalid.")
+        with self._ordering_lock:
+            self.flush_deferred()
+        placeholders = ", ".join("?" for _ in kinds)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT payload_json FROM lane_iii_paper_audit WHERE kind IN (" + placeholders
+                + ") ORDER BY ledger_sequence DESC LIMIT ?",
+                (*kinds, limit),
+            ).fetchall()
+            return [json.loads(str(row["payload_json"])) for row in rows]
+
     def _verify_chain_uncached(self) -> tuple[bool, str | None]:
         with self._lock:
             rows = self._connection.execute("SELECT * FROM lane_iii_paper_audit ORDER BY ledger_sequence").fetchall()

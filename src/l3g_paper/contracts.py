@@ -56,6 +56,14 @@ class PaperDirection(StrEnum):
     FLAT = "FLAT"
 
 
+class PaperEntryOwner(StrEnum):
+    """Authority currently reserved at the one paper-entry admission boundary."""
+
+    NONE = "NONE"
+    STRATEGY = "STRATEGY"
+    COMMISSIONING = "COMMISSIONING"
+
+
 class PaperSourceQuality(StrEnum):
     PROVISIONAL_CONTIGUOUS_LOCAL_CALLBACKS = "PROVISIONAL_CONTIGUOUS_LOCAL_CALLBACKS"
     UNUSABLE = "UNUSABLE"

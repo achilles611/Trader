@@ -43,20 +43,22 @@ class PaperControlCenterTests(unittest.TestCase):
                 self.assertIn(str(paper_path.resolve()), str(raised.exception))
             self.assertEqual(called, [])
 
-    def test_only_closed_parameterless_paper_post_controls_exist(self) -> None:
+    def test_paper_controls_are_closed_and_commission_entry_requires_only_its_lifecycle_credential(self) -> None:
         app = create_control_center_app(CopyTradeConfig())
         routes = {route.path: route for route in app.routes if hasattr(route, "methods")}
         expected = {
             "/api/lane-iii/paper/arm", "/api/lane-iii/paper/pause",
             "/api/lane-iii/paper/resume", "/api/lane-iii/paper/flatten-and-disarm",
-            "/api/lane-iii/paper/commission-entry", "/api/lane-iii/paper/commission-exit",
+            "/api/lane-iii/paper/commissioning-arm", "/api/lane-iii/paper/commission-entry", "/api/lane-iii/paper/commission-exit",
         }
         self.assertTrue(expected.issubset(routes))
         self.assertFalse(any("order" in path and path.startswith("/api/lane-iii/paper") for path in routes))
         for path in expected:
             self.assertEqual(set(routes[path].methods), {"POST"})
-            self.assertEqual(inspect.signature(routes[path].endpoint).parameters, {})
             self.assertNotIn("{", path)
+        for path in expected - {"/api/lane-iii/paper/commission-entry"}:
+            self.assertEqual(inspect.signature(routes[path].endpoint).parameters, {})
+        self.assertEqual(tuple(inspect.signature(routes["/api/lane-iii/paper/commission-entry"].endpoint).parameters), ("body",))
 
     def test_local_ledger_verification_routes_are_separate_from_execution_authority(self) -> None:
         app = create_control_center_app(CopyTradeConfig())

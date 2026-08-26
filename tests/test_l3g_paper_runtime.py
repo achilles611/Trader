@@ -10,14 +10,21 @@ from unittest.mock import patch
 from src.l3f_provider.tradovate_observation import StreamHealth
 from src.l3g_paper.ledger import PaperLedger
 from src.l3g_paper.ninjatrader_transport import ADDON_PROTOCOL_VERSION, PaperExecutionTransport, expected_addon_source_fingerprint
-from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout
-from src.l3g_paper.contracts import PaperDirection, PaperRuntimeState, PaperSessionArmGrant
+from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout, _CommissioningOwnership
+from src.l3g_paper.contracts import PaperDirection, PaperEntryOwner, PaperRuntimeState, PaperSessionArmGrant
 from src.l3g_paper.risk import PaperRiskSnapshot
 from src.l3g_paper.sessions import PaperSessionResolver
 from .l3g_helpers import ObservationFactory, warmed_bullish_policy
 
 
 class PaperRuntimeTests(unittest.TestCase):
+    @staticmethod
+    def reserve_commissioning(runtime: LaneIIIPaperRuntime, context: object, now: str) -> tuple[str, str]:
+        ownership = _CommissioningOwnership("l3g-commissioning-test", "l3g-commissioning-token-test", context, now)  # type: ignore[arg-type]
+        runtime._commissioning_ownership = ownership
+        runtime._entry_owner = PaperEntryOwner.COMMISSIONING
+        return ownership.commissioning_id, ownership.commissioning_token
+
     @staticmethod
     def reconcile_flat(runtime: LaneIIIPaperRuntime) -> None:
         runtime.on_execution_bridge_state("AUTHENTICATED")
@@ -174,8 +181,9 @@ class PaperRuntimeTests(unittest.TestCase):
             submitted: list[object] = []
             runtime._persist_and_send = lambda command, grant: submitted.append((command, grant))  # type: ignore[method-assign]
             runtime._execution_session_id = lambda: "l3g-es-test"  # type: ignore[method-assign]
+            commissioning_id, commissioning_token = self.reserve_commissioning(runtime, context, now)
             with patch("src.l3g_paper.runtime._now", return_value=now):
-                result = runtime.commission_entry()
+                result = runtime.commission_entry(commissioning_id, commissioning_token)
             self.assertTrue(result["submitted"])
             self.assertEqual(runtime.state, PaperRuntimeState.ENTRY_PENDING)
             command, grant = submitted[0]
@@ -257,8 +265,10 @@ class PaperRuntimeTests(unittest.TestCase):
             runtime._execution_session_id = lambda: "l3g-es-test"  # type: ignore[method-assign]
             runtime._persist_and_send = lambda command, grant: submitted.append((command, grant))  # type: ignore[method-assign]
             runtime._last_quote = (Decimal("100"), Decimal("100.25"), now)
+            commissioning_id, commissioning_token = self.reserve_commissioning(runtime, context, now)
             with patch("src.l3g_paper.runtime._now", return_value=now):
-                self.assertTrue(runtime.commission_entry()["submitted"])
+                self.assertTrue(runtime.commission_entry(commissioning_id, commissioning_token)["submitted"])
+                self.assertEqual(runtime.status()["entry_owner"], PaperEntryOwner.COMMISSIONING.value)
                 runtime.on_execution_message({
                     "message_type": "EXECUTION_EVENT", "order_role": "ENTRY", "price": "100.25", "quantity": 1,
                     "direction": "LONG", "command_id": submitted[0][0].command_id, "decision_id": submitted[0][0].decision_id,
@@ -291,6 +301,7 @@ class PaperRuntimeTests(unittest.TestCase):
             self.assertEqual(closure["exit_order_id"], "exit-order")
             self.assertEqual(closure["realized_pnl"], "1.50")
             self.assertEqual(closure["final_working_order_count"], 0)
+            self.assertEqual(runtime.status()["entry_owner"], PaperEntryOwner.NONE.value)
             runtime.stop(); ledger.close()
 
     def test_ambiguous_restarts_and_unexpected_fills_lock_out(self) -> None:
