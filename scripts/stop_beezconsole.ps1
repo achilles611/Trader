@@ -20,7 +20,7 @@ if ($command -notmatch '(?i)(beezconsole|beez_console|copy-control-center)') {
     throw "Refusing to kill unrelated port $Port owner. PID $ownerProcessId command: $command"
 }
 
-Write-Output "Stopping BeezConsole listener PID $ownerProcessId: $command"
+Write-Output "Stopping BeezConsole listener PID ${ownerProcessId}: $command"
 & "$env:SystemRoot\System32\taskkill.exe" /PID $ownerProcessId /T /F | Out-Host
 for ($attempt = 0; $attempt -lt 40; $attempt++) {
     if (-not (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)) {
