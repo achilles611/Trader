@@ -22,7 +22,11 @@ from typing import Any, Callable, Iterator, Mapping
 
 from src.l3f_provider.ninjatrader_commission import NinjaTraderListenerWorker
 from src.l3f_provider.shadow_runtime import LaneIIIShadowRuntime
-from src.l3g_paper.commissioning import CommissioningLedgerGateError, evaluate_commissioning_ledger_gate
+from src.l3g_paper.commissioning import (
+    CommissioningLedgerGateError,
+    evaluate_commissioning_ledger_gate,
+    evaluate_commissioning_post_run_verification,
+)
 from src.l3g_paper.health import ledger_health_projection, sanitized_paper_health
 from src.l3g_paper.ledger import PaperLedger, resolve_ledger_epoch
 from src.l3g_paper.ninjatrader_login import NinjaTraderLoginBootstrap, NinjaTraderLoginState
@@ -1489,6 +1493,13 @@ def create_control_center_app(
             }
         status = paper.status()
         verification = ledger_verifier.status()
+        closure = status.get("last_commissioning_closure")
+        if isinstance(closure, Mapping):
+            status["commissioning_post_run_verification"] = evaluate_commissioning_post_run_verification(
+                closure,
+                verification,
+                checkpoint_matches_report=ledger_verifier.checkpoint_matches_report(verification),
+            )
         status["market_observer"] = ninja_listener_health()
         status["ledger_verification"] = verification
         raw_ledger = status.get("ledger")
@@ -1559,6 +1570,7 @@ def create_control_center_app(
             paper_runtime = lane_iii_paper_factory(paper_ledger) if lane_iii_paper_factory is not None else LaneIIIPaperRuntime(paper_ledger)
             if type(paper_runtime) is not LaneIIIPaperRuntime:
                 raise RuntimeError("LANE_III_PAPER factory must return the exact paper runtime")
+            paper_runtime.bind_runtime_identity(runtime_binding)
             paper_transport = (
                 paper_execution_transport_factory(paper_ledger, paper_runtime.on_execution_message, paper_runtime.on_execution_bridge_state)
                 if paper_execution_transport_factory is not None
@@ -1713,10 +1725,13 @@ def create_control_center_app(
 
     def require_commissioning_ledger_verification(
         commissioning_id: str, runtime_snapshot: Mapping[str, object],
+        *,
+        launch_auto_on_failure: bool = True,
+        enforce_observer: bool = True,
     ) -> dict[str, object]:
         """Evaluate one immutable verified-anchor/live-tail snapshot under the runtime lock."""
         observer = ninja_listener_health()
-        if observer.get("state") == "LISTENING" and observer.get("market_observer_active") is not True:
+        if enforce_observer and observer.get("market_observer_active") is not True:
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -1749,7 +1764,7 @@ def create_control_center_app(
             )
         except CommissioningLedgerGateError as exc:
             launch_detail = ""
-            if exc.launch_auto:
+            if exc.launch_auto and launch_auto_on_failure:
                 launched = ledger_verifier.start("auto")
                 launch_detail = f" Auto verification launched ({launched.get('verification_id', 'local run')})."
             raise HTTPException(status_code=409, detail=f"{exc.code}: {exc}.{launch_detail}") from exc
@@ -2105,6 +2120,71 @@ def create_control_center_app(
             ) != ("AUTHENTICATED", True, True, "Sim101", "LOCAL_SIMULATION", "MNQ SEP26"):
                 raise HTTPException(status_code=409, detail="NinjaTrader desktop authentication is not operational.")
         return paper.commissioning_arm(require_commissioning_ledger_verification)
+
+    @app.post("/api/lane-iii/paper/commissioning-rehearsal")
+    async def api_lane_iii_paper_commissioning_rehearsal() -> dict[str, object]:
+        """Run production commissioning validators without acquiring authority."""
+        paper = ninjatrader_runtime.get("paper")
+        if paper is None:
+            raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
+        result = paper.commissioning_rehearsal(
+            lambda commissioning_id, runtime_snapshot: require_commissioning_ledger_verification(
+                commissioning_id, runtime_snapshot,
+                launch_auto_on_failure=False,
+                enforce_observer=False,
+            )
+        )
+        observer = ninja_listener_health()
+        observer_active = observer.get("market_observer_state") == "ACTIVE"
+        runtime_observer = result.get("observer")
+        result["observer"] = {
+            **(dict(runtime_observer) if isinstance(runtime_observer, Mapping) else {}),
+            "status": observer.get("market_observer_state", "NOT_ACTIVE"),
+            "listener_state": observer.get("state", "UNSTARTED"),
+            "last_level_one_at": observer.get("last_level_one_at"),
+            "last_depth_at": observer.get("last_depth_at"),
+            "freshness": observer.get("market_observer_freshness"),
+            "operator_guidance": None if observer_active else (
+                "Open the MNQ SEP26 chart, attach BeelzebubReadOnlyMarketObserver, and wait for ACTIVE."
+            ),
+        }
+        reasons = [str(value) for value in result.get("blocking_reasons", [])]
+        if not observer_active:
+            reasons.append("MARKET_OBSERVER_NOT_ACTIVE")
+        result["blocking_reasons"] = list(dict.fromkeys(reasons))
+        result["result"] = "READY" if not result["blocking_reasons"] else "BLOCKED"
+        hash_payload = dict(result)
+        hash_payload.pop("snapshot_hash", None)
+        result["snapshot_hash"] = hashlib.sha256(
+            json.dumps(hash_payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        ).hexdigest()
+        return result
+
+    @app.post("/api/lane-iii/paper/commissioning-start")
+    async def api_lane_iii_paper_commissioning_start(
+        body: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, object]:
+        """Canonical one-request production commissioning authority path."""
+        paper = ninjatrader_runtime.get("paper")
+        if paper is None:
+            raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
+        if not isinstance(body, dict) or set(body) != {"request_id"} or not isinstance(body.get("request_id"), str):
+            raise HTTPException(status_code=400, detail="Commissioning start accepts only a request_id.")
+        bootstrap = ninjatrader_runtime.get("login_bootstrap")
+        if bootstrap is not None and bootstrap.state is not NinjaTraderLoginState.AUTHENTICATED:
+            transport = paper.status().get("transport")
+            if not isinstance(transport, Mapping) or (
+                transport.get("state"), transport.get("authenticated_client"),
+                transport.get("reconciled"), transport.get("account"),
+                transport.get("account_class"), transport.get("instrument"),
+            ) != ("AUTHENTICATED", True, True, "Sim101", "LOCAL_SIMULATION", "MNQ SEP26"):
+                raise HTTPException(status_code=409, detail="NinjaTrader desktop authentication is not operational.")
+        try:
+            return paper.commissioning_start(
+                str(body["request_id"]), require_commissioning_ledger_verification,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/lane-iii/paper/commission-exit")
     async def api_lane_iii_paper_commission_exit() -> dict[str, object]:

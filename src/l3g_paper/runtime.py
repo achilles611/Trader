@@ -18,6 +18,7 @@ from .contracts import (
     AUTHORITY,
     POLICY,
     RISK_PROFILE,
+    EvidenceFamily,
     ExecutionAction,
     HypothesisKind,
     PaperDecision,
@@ -66,6 +67,29 @@ class _CommissioningOwnership:
     entry_consumed: bool = False
     entry_decision_id: str | None = None
     recovered_after_restart: bool = False
+    request_id: str | None = None
+    ledger_preflight: Mapping[str, object] | None = None
+
+
+class _CommissioningAuthorizationExpired(RuntimeError):
+    """A sealed commissioning authorization expired before transport admission."""
+
+
+_COMMISSIONING_REQUIRED_FAMILIES = (
+    EvidenceFamily.STRUCTURAL_CONTEXT,
+    EvidenceFamily.ORDER_FLOW,
+    EvidenceFamily.RESTING_LIQUIDITY,
+)
+_COMMISSIONING_WARMUP_POLICY = {
+    "version": "l3g-commissioning-session-warmup-v1",
+    "required_families": tuple(family.value for family in _COMMISSIONING_REQUIRED_FAMILIES),
+    "binding": (
+        "session_kind", "session_id", "trade_date", "session_profile_hash", "session_generation",
+    ),
+    "natural_evidence_expiration_clears_latch": False,
+    "runtime_restart_clears_latch": True,
+}
+_COMMISSIONING_WARMUP_POLICY_HASH = canonical_hash(_COMMISSIONING_WARMUP_POLICY)
 
 
 class ObservationFanout:
@@ -180,13 +204,26 @@ class LaneIIIPaperRuntime:
         self._last_trade: tuple[Decimal, str] | None = None
         self._last_depth_at: str | None = None
         self._recorded_evidence: set[str] = set()
+        # Commissioning warmup is deliberately process-local and starts cold.
+        # It is never recovered from the ledger after restart.
+        self._commissioning_warmup_seen: dict[str, dict[str, object]] = {}
+        self._commissioning_warmup_warmed_at: str | None = None
+        self._commissioning_warmup_context = UNSPECIFIED_OFF_SESSION_CONTEXT
+        self._last_policy_reset_count = self.policy.reset_count()
+        self._last_commissioning_closure: dict[str, object] | None = None
+        self._runtime_identity: dict[str, object] = {
+            "git_sha": "UNKNOWN", "ledger": str(self.ledger.path), "audit": "UNKNOWN",
+        }
         self._pending_intent: object | None = None
         self._pending_grant: object | None = None
         self._entry_fill_price: Decimal | None = None
         self._entry_fill_quantity = 0
         self._entry_direction = PaperDirection.FLAT
         self._entry_execution: dict[str, object] | None = None
+        self._entry_authority_artifact: dict[str, object] | None = None
         self._exit_execution: dict[str, object] | None = None
+        self._seen_native_execution_ids: set[str] = set()
+        self._protective_order_id: str | None = None
         self._lifecycle_realized_pnl = Decimal("0")
         self._post_exit_reconciliation_pending = False
         self._command_sequence = 0
@@ -213,6 +250,8 @@ class LaneIIIPaperRuntime:
             "commissioning_id": ownership.commissioning_id,
             "entry_owner": PaperEntryOwner.COMMISSIONING.value,
             "entry_consumed": ownership.entry_consumed,
+            "entry_decision_id": ownership.entry_decision_id,
+            "request_id": ownership.request_id,
             "account": ACCOUNT_BINDING.account_name,
             "account_class": ACCOUNT_BINDING.account_class,
             "instrument": ACCOUNT_BINDING.instrument,
@@ -271,6 +310,89 @@ class LaneIIIPaperRuntime:
         return _CommissioningOwnership(
             str(payload["commissioning_id"]), "RECOVERY_TOKEN_UNAVAILABLE", context,
             str(payload.get("occurred_at", _now())), consumed, None, True,
+            str(payload["request_id"]) if isinstance(payload.get("request_id"), str) else None,
+            dict(payload["ledger_preflight"]) if isinstance(payload.get("ledger_preflight"), Mapping) else None,
+        )
+
+    @staticmethod
+    def _context_identity(context: PaperSessionContext) -> tuple[object, ...]:
+        return (
+            context.session_kind, context.session_id, context.trade_date,
+            context.session_profile_hash, context.session_generation,
+        )
+
+    def _reset_commissioning_warmup(self, reason: str) -> None:
+        """Clear only the session-latched commissioning readiness domain."""
+        seen = dict(self._commissioning_warmup_seen)
+        warmed_at = self._commissioning_warmup_warmed_at
+        prior = self._commissioning_warmup_context
+        changed = bool(seen) or warmed_at is not None or self._snapshot.commissioning_session_warmed
+        self._commissioning_warmup_seen.clear()
+        self._commissioning_warmup_warmed_at = None
+        self._commissioning_warmup_context = self._session_context
+        self._snapshot = replace(
+            self._snapshot, observed_at=_now(), commissioning_session_warmed=False,
+        )
+        if changed:
+            self.ledger.append(
+                "COMMISSIONING_SESSION_WARMUP_RESET",
+                {
+                    **prior.payload(),
+                    "reset_at": _now(),
+                    "reason": reason,
+                    "required_families": list(_COMMISSIONING_WARMUP_POLICY["required_families"]),
+                    "seen_families": sorted(seen),
+                    "warmed_at": warmed_at,
+                    "policy_hash": _COMMISSIONING_WARMUP_POLICY_HASH,
+                },
+                execution_session_id=self._execution_session_id(),
+            )
+
+    def _observe_commissioning_warmup(self, at: str) -> None:
+        """Latch once every required evidence family has appeared in this exact context."""
+        context = self._session_context
+        if context.session_kind is PaperSessionKind.OFF_SESSION:
+            return
+        if self._context_identity(self._commissioning_warmup_context) != self._context_identity(context):
+            self._reset_commissioning_warmup("SESSION_IDENTITY_CHANGED")
+            self._commissioning_warmup_context = context
+        if self._commissioning_warmup_warmed_at is not None:
+            return
+        for evidence in self.policy.active_evidence(at):
+            if (
+                evidence.family not in _COMMISSIONING_REQUIRED_FAMILIES
+                or evidence.session_kind is not context.session_kind
+                or evidence.session_id != context.session_id
+                or evidence.trade_date != context.trade_date
+                or evidence.session_profile_hash != context.session_profile_hash
+                or evidence.session_generation != context.session_generation
+            ):
+                continue
+            self._commissioning_warmup_seen.setdefault(evidence.family.value, {
+                "evidence_id": evidence.evidence_id,
+                "observed_at": evidence.observed_at,
+                "source_observation_ids": list(evidence.source_observation_ids),
+                "source_local_sequences": list(evidence.source_local_sequences),
+            })
+        required = set(_COMMISSIONING_WARMUP_POLICY["required_families"])
+        if set(self._commissioning_warmup_seen) != required:
+            return
+        warmed_at = normalized_utc(at, "Commissioning warmup time")
+        self._commissioning_warmup_warmed_at = warmed_at
+        self._snapshot = replace(
+            self._snapshot, observed_at=_now(), commissioning_session_warmed=True,
+        )
+        self.ledger.append(
+            "COMMISSIONING_SESSION_WARMED",
+            {
+                **context.payload(),
+                "warmed_at": warmed_at,
+                "required_families": list(_COMMISSIONING_WARMUP_POLICY["required_families"]),
+                "evidence_provenance": dict(self._commissioning_warmup_seen),
+                "reason": "ALL_REQUIRED_FAMILIES_GENUINELY_OBSERVED",
+                "policy_hash": _COMMISSIONING_WARMUP_POLICY_HASH,
+            },
+            execution_session_id=self._execution_session_id(),
         )
 
     def _release_commissioning_ownership(self, reason: str) -> None:
@@ -340,11 +462,13 @@ class LaneIIIPaperRuntime:
 
     def _set_session_context(self, context: PaperSessionContext, *, reason: str) -> None:
         prior = self._session_context
-        if (prior.session_id, prior.session_generation) == (context.session_id, context.session_generation):
+        if self._context_identity(prior) == self._context_identity(context):
             return
+        self._reset_commissioning_warmup("SESSION_CHANGED:" + reason)
         if prior.session_kind is not PaperSessionKind.OFF_SESSION:
             self._close_session(prior, reason)
         self._session_context = context
+        self._commissioning_warmup_context = context
         self.ledger.set_session_context(context)
         if context.session_kind is not PaperSessionKind.OFF_SESSION:
             trade_risk = self._family_risk.setdefault((context.trade_date, context.session_family), _TradeDateRisk())
@@ -355,7 +479,7 @@ class LaneIIIPaperRuntime:
                 session_entry_count=0, daily_realized_pnl=trade_risk.realized_pnl,
                 daily_unrealized_pnl=trade_risk.unrealized_pnl,
                 trade_date_entry_count=trade_risk.entry_count, consecutive_losses=trade_risk.consecutive_losses,
-                evidence_warmed=False, depth_reset_recovery=True,
+                evidence_warmed=False, commissioning_session_warmed=False, depth_reset_recovery=True,
             )
             self.ledger.append("SESSION_OPENED", {**context.payload(), "reason": reason}, identity="l3g-paper-session-open-" + canonical_hash(context.payload()))
         else:
@@ -363,7 +487,8 @@ class LaneIIIPaperRuntime:
                 self._snapshot, observed_at=_now(), session_kind=context.session_kind,
                 session_id=context.session_id, trade_date=context.trade_date,
                 session_profile_hash=context.session_profile_hash, session_generation=context.session_generation,
-                session_entry_count=0, evidence_warmed=False, depth_reset_recovery=True,
+                session_entry_count=0, evidence_warmed=False,
+                commissioning_session_warmed=False, depth_reset_recovery=True,
             )
 
     def _close_session(self, context: PaperSessionContext, reason: str) -> None:
@@ -438,6 +563,15 @@ class LaneIIIPaperRuntime:
             self._transport = transport
             self._adapter = NinjaTraderSim101PaperAdapter(transport)
 
+    def bind_runtime_identity(self, identity: Mapping[str, object]) -> None:
+        """Bind non-authoritative deployment provenance before runtime start."""
+        with self._lock:
+            if self._state is not PaperRuntimeState.DISABLED:
+                raise RuntimeError("Runtime identity must be bound before Lane III startup.")
+            self._runtime_identity = {
+                key: identity.get(key) for key in ("git_sha", "ledger", "audit", "control_center", "python", "pid")
+            }
+
     @property
     def state(self) -> PaperRuntimeState:
         with self._lock:
@@ -505,6 +639,11 @@ class LaneIIIPaperRuntime:
     def on_execution_bridge_state(self, state: str) -> None:
         with self._lock:
             healthy = state == "AUTHENTICATED"
+            was_healthy = self._snapshot.execution_bridge_healthy
+            if state == "DISCONNECTED":
+                self._reset_commissioning_warmup("EXECUTION_BRIDGE_DISCONNECTED")
+            elif healthy and not was_healthy:
+                self._reset_commissioning_warmup("EXECUTION_BRIDGE_RECONNECTED")
             self._snapshot = replace(self._snapshot, observed_at=_now(), execution_bridge_healthy=healthy, reconciliation_current=False if state in {"CONNECTED", "DISCONNECTED", "AUTHENTICATED"} else self._snapshot.reconciliation_current)
             if state == "AUTHENTICATED":
                 self._command_sequence = 0
@@ -524,16 +663,28 @@ class LaneIIIPaperRuntime:
                         self._transition(PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, "EXECUTION_BRIDGE_DISCONNECTED")
 
     def on_observation_transport_state(self, state: StreamHealth) -> None:
-        self.policy.on_transport_state(state)
         with self._lock:
+            reset_before = self.policy.reset_count()
+            self.policy.on_transport_state(state)
+            reset_after = self.policy.reset_count()
+            if reset_after != reset_before:
+                self._reset_commissioning_warmup(
+                    "LOCAL_BRIDGE_DISCONNECTED" if state is StreamHealth.DISCONNECTED else "LOCAL_BRIDGE_RECONNECTED"
+                )
+            self._last_policy_reset_count = reset_after
             self._snapshot = replace(self._snapshot, observed_at=_now(), local_bridge_healthy=state is StreamHealth.HEALTHY, local_sequence_gap=state is StreamHealth.DISCONNECTED or self._snapshot.local_sequence_gap)
             if state is StreamHealth.DISCONNECTED and self._position is not PaperDirection.FLAT:
                 self._request_exit("LOCAL_OBSERVATION_BRIDGE_DISCONNECTED", emergency=True)
 
     def on_observation_rejection(self, error: NinjaTraderObservationError) -> None:
-        self.policy.on_rejection(error)
         with self._lock:
-            self._snapshot = replace(self._snapshot, observed_at=_now(), local_sequence_gap=True, evidence_warmed=False)
+            self.policy.on_rejection(error)
+            self._reset_commissioning_warmup("OBSERVATION_REJECTED:" + error.code.value)
+            self._last_policy_reset_count = self.policy.reset_count()
+            self._snapshot = replace(
+                self._snapshot, observed_at=_now(), local_sequence_gap=True,
+                evidence_warmed=False, commissioning_session_warmed=False,
+            )
             self.ledger.append("INCIDENT_OBSERVATION_REJECTION", {"code": error.code.value, "detail": error.detail or "unspecified"})
             if self._position is not PaperDirection.FLAT:
                 self._request_exit("MALFORMED_OBSERVATION", emergency=True)
@@ -587,6 +738,7 @@ class LaneIIIPaperRuntime:
                 occurred_at=observation.ninja_receipt_time,
             )
             if session_reason == "EVENT_TIMESTAMP_MOVED_BACKWARD":
+                self._reset_commissioning_warmup(session_reason)
                 self.ledger.append(
                     "INCIDENT_STALE_CALLBACK_REFUSED",
                     {
@@ -602,11 +754,18 @@ class LaneIIIPaperRuntime:
                 )
                 return
             before_classified = self.policy.classified_trade_count() if observation.observation_type == "TRADE" else 0
+            reset_before = self.policy.reset_count()
             decision = self.policy.ingest_runtime(
                 observation, current_position=self._position,
                 pending_order=self._state in {PaperRuntimeState.ENTRY_PENDING, PaperRuntimeState.EXIT_PENDING},
                 session_context=context,
             )
+            reset_after = self.policy.reset_count()
+            if reset_after != reset_before:
+                self._reset_commissioning_warmup(
+                    decision.reason_code if decision is not None else "PROVISIONAL_OBSERVATION_DOMAIN_RESET"
+                )
+            self._last_policy_reset_count = reset_after
             after_classified, warmed, depth_recovering = self.policy.runtime_gate_state()
             # Paper freshness follows the declared local callback authority.
             # Provider timestamps remain source provenance but independent
@@ -637,6 +796,7 @@ class LaneIIIPaperRuntime:
             if warmed:
                 update["local_sequence_gap"] = False
             self._snapshot = replace(self._snapshot, **update)
+            self._observe_commissioning_warmup(event_at)
             if decision is None:
                 self._evaluate_risk_exit(observation.ninja_receipt_time)
                 return
@@ -745,7 +905,10 @@ class LaneIIIPaperRuntime:
     def _request_entry_locked(self, decision: PaperDecision) -> bool:
         if decision.commissioning:
             ownership = self._commissioning_ownership
-            if ownership is None or self._entry_owner is not PaperEntryOwner.COMMISSIONING or not ownership.entry_consumed:
+            if (
+                ownership is None or self._entry_owner is not PaperEntryOwner.COMMISSIONING
+                or ownership.entry_consumed
+            ):
                 return False
         elif self._entry_owner is PaperEntryOwner.COMMISSIONING:
             self._record_strategy_suppression(decision, self._session_context)
@@ -767,14 +930,45 @@ class LaneIIIPaperRuntime:
             strategy_generated=decision.strategy_generated,
             scientific_evidence=decision.scientific_evidence,
         )
-        if not decision.commissioning:
+        self._entry_authority_artifact = {
+            "decision": decision.payload(),
+            "intent": intent.payload(),
+            "risk_grant": grant.payload(),
+            "command": command.payload(),
+        }
+        if decision.commissioning:
+            # The authorization becomes single-use only after its exact
+            # decision, intent, grant, and command exist and remain current at
+            # the transport boundary.
+            admission_at = _now()
+            if not grant.valid_at(admission_at) or datetime.fromisoformat(
+                normalized_utc(decision.expires_at, "Commissioning authorization expiry").replace("Z", "+00:00")
+            ) < datetime.fromisoformat(
+                normalized_utc(admission_at, "Commissioning transport admission time").replace("Z", "+00:00")
+            ):
+                raise _CommissioningAuthorizationExpired("COMMISSIONING_ENTRY_AUTHORIZATION_EXPIRED")
+            assert ownership is not None
+            ownership = replace(
+                ownership, entry_consumed=True, entry_decision_id=decision.paper_decision_id,
+            )
+            self._commissioning_ownership = ownership
+            self.ledger.append(
+                "COMMISSIONING_ENTRY_CONSUMED",
+                self._ownership_payload(ownership, reason="EXPLICIT_COMMISSIONING_ENTRY"),
+                identity="l3g-commissioning-entry-consumed-" + ownership.commissioning_id,
+                execution_session_id=self._execution_session_id(),
+            )
+        else:
             self._entry_owner = PaperEntryOwner.STRATEGY
-        self._persist_and_send(command, grant)
         self._pending_intent = intent
         self._pending_grant = grant
         if not decision.commissioning:
             self.policy.mark_entry_used(decision)
-        self._transition(PaperRuntimeState.ENTRY_PENDING, "ENTRY_COMMAND_SENT")
+        # Install every callback-visible authority fact before transport.  A
+        # synchronous AddOn acknowledgement or fill can safely re-enter this
+        # runtime through the RLock without observing an unowned command.
+        self._transition(PaperRuntimeState.ENTRY_PENDING, "ENTRY_COMMAND_AUTHORIZED")
+        self._persist_and_send(command, grant)
         return True
 
     def _request_exit(self, reason: str, *, emergency: bool = False) -> None:
@@ -905,10 +1099,35 @@ class LaneIIIPaperRuntime:
                 if message_type == "COMMAND_REJECTED":
                     self._fault_reason = "EXECUTION_COMMAND_REJECTED:" + str(message.get("reason_code", "UNKNOWN"))
                     self.risk.lock_out(self._fault_reason)
-                    if self._state not in {PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.STOPPING, PaperRuntimeState.STOPPED}:
+                    # Preserve the owned safety-exit path while a position is
+                    # open; role-specific handling below initiates or audits it.
+                    if self._position is PaperDirection.FLAT and self._state not in {PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.STOPPING, PaperRuntimeState.STOPPED}:
                         self._transition(PaperRuntimeState.LOCKED_OUT, self._fault_reason)
                 role = str(message.get("order_role", "")).upper()
                 order_state = str(message.get("order_state", "")).upper()
+                if role == "PROTECTIVE" and self._position is not PaperDirection.FLAT:
+                    protective_reason: str | None = None
+                    account = message.get("account_name")
+                    instrument = message.get("instrument")
+                    quantity = message.get("quantity")
+                    native_order_id = message.get("native_order_id")
+                    if account is not None and account != ACCOUNT_BINDING.account_name:
+                        protective_reason = "PROTECTIVE_STOP_WRONG_ACCOUNT"
+                    elif instrument is not None and instrument != ACCOUNT_BINDING.instrument:
+                        protective_reason = "PROTECTIVE_STOP_WRONG_INSTRUMENT"
+                    elif quantity is not None and quantity != self._position_quantity:
+                        protective_reason = "PROTECTIVE_STOP_WRONG_QUANTITY"
+                    elif (
+                        isinstance(native_order_id, str) and self._protective_order_id is not None
+                        and native_order_id != self._protective_order_id
+                    ):
+                        protective_reason = "DUPLICATE_PROTECTIVE_STOP"
+                    if protective_reason is not None:
+                        self._fault_reason = protective_reason
+                        self.risk.lock_out(protective_reason)
+                        self._request_exit(protective_reason, emergency=True)
+                    elif isinstance(native_order_id, str) and native_order_id:
+                        self._protective_order_id = native_order_id
                 expected_protective_cancellation = (
                     role == "PROTECTIVE"
                     and order_state in {"CANCELLED", "CANCELED"}
@@ -923,6 +1142,14 @@ class LaneIIIPaperRuntime:
                     self._fault_reason = "MARKET_ENTRY_ORDER_" + order_state
                     self.risk.lock_out(self._fault_reason)
                     self._transition(PaperRuntimeState.LOCKED_OUT, self._fault_reason)
+                if (
+                    message_type == "COMMAND_REJECTED"
+                    and str(message.get("reason_code", "")).upper() in {"COMMAND_ACK_TIMEOUT", "ACKNOWLEDGEMENT_MISSING"}
+                    and self._position is not PaperDirection.FLAT
+                ):
+                    self._fault_reason = "PROTECTIVE_STOP_ACKNOWLEDGEMENT_MISSING"
+                    self.risk.lock_out(self._fault_reason)
+                    self._request_exit(self._fault_reason, emergency=True)
                 if role == "EXIT" and order_state in {"REJECTED", "CANCELLED", "CANCELED"} and self._state is PaperRuntimeState.EXIT_PENDING:
                     self._fault_reason = "EXIT_ORDER_" + order_state
                     self.risk.lock_out(self._fault_reason)
@@ -986,6 +1213,29 @@ class LaneIIIPaperRuntime:
 
     def _apply_execution(self, message: Mapping[str, object]) -> None:
         role = str(message.get("order_role", ""))
+        native_execution_id = message.get("native_execution_id")
+        if isinstance(native_execution_id, str) and native_execution_id:
+            if native_execution_id in self._seen_native_execution_ids:
+                self.ledger.append(
+                    "INCIDENT_DUPLICATE_EXECUTION_CALLBACK",
+                    {"native_execution_id": native_execution_id, "effect": "IDEMPOTENT_NO_STATE_CHANGE"},
+                    identity="l3g-duplicate-execution-" + native_execution_id,
+                    execution_session_id=self._execution_session_id(),
+                )
+                return
+            self._seen_native_execution_ids.add(native_execution_id)
+        supplied_account = message.get("account_name")
+        supplied_instrument = message.get("instrument")
+        if (
+            (supplied_account is not None and supplied_account != ACCOUNT_BINDING.account_name)
+            or (supplied_instrument is not None and supplied_instrument != ACCOUNT_BINDING.instrument)
+        ):
+            self._fault_reason = "FOREIGN_EXECUTION_CLASSIFICATION"
+            self._snapshot = replace(self._snapshot, foreign_activity=True, observed_at=_now())
+            self.risk.lock_out(self._fault_reason)
+            if self._state not in {PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.STOPPING, PaperRuntimeState.STOPPED}:
+                self._transition(PaperRuntimeState.LOCKED_OUT, self._fault_reason)
+            return
         price = self._decimal(message.get("price"))
         quantity = message.get("quantity")
         if price is None or type(quantity) is not int or quantity <= 0:
@@ -993,6 +1243,12 @@ class LaneIIIPaperRuntime:
             self.risk.lock_out(self._fault_reason)
             return
         if role == "ENTRY":
+            if self._state is not PaperRuntimeState.ENTRY_PENDING:
+                self._fault_reason = "UNEXPECTED_ENTRY_EXECUTION_STATE"
+                self.risk.lock_out(self._fault_reason)
+                if self._state not in {PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.STOPPING, PaperRuntimeState.STOPPED}:
+                    self._transition(PaperRuntimeState.LOCKED_OUT, self._fault_reason)
+                return
             expected = PaperDirection.LONG if str(message.get("direction")) == "LONG" else PaperDirection.SHORT
             intent = self._pending_intent
             if intent is None:
@@ -1028,6 +1284,15 @@ class LaneIIIPaperRuntime:
             if not fill_ok:
                 self._request_exit(reason, emergency=True)
         elif role in {"EXIT", "PROTECTIVE"}:
+            if (
+                self._position is PaperDirection.FLAT or self._entry_fill_price is None
+                or self._entry_fill_quantity <= 0
+            ):
+                self._fault_reason = "UNEXPECTED_EXIT_EXECUTION_STATE"
+                self.risk.lock_out(self._fault_reason)
+                if self._state not in {PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.STOPPING, PaperRuntimeState.STOPPED}:
+                    self._transition(PaperRuntimeState.LOCKED_OUT, self._fault_reason)
+                return
             # Final flat truth still requires a position event/reconciliation.
             realized = Decimal("0")
             if self._entry_fill_price is not None and self._entry_fill_quantity > 0:
@@ -1135,19 +1400,46 @@ class LaneIIIPaperRuntime:
         self.policy.confirm_flat(str(reconciliation.get("timestamp", _now())))
         self._pending_intent = None
         self._pending_grant = None
+        self._entry_authority_artifact = None
         target = PaperRuntimeState.READY_DISARMED if self._disarm_after_flat or commissioning else PaperRuntimeState.PAUSED if self._entries_paused else PaperRuntimeState.ARMED_FLAT
         self._transition(target, "POST_EXIT_FLAT_RECONCILIATION_COMPLETE")
         if commissioning:
             entry = self._entry_execution or {}
             exit_fill = self._exit_execution or {}
-            self.ledger.append(
-                "COMMISSIONING_CLOSURE",
-                {
+            transport = None if self._transport is None else self._transport.status().as_dict()
+            ledger_health = self.ledger.health_status()
+            closure = {
                     "commissioning": True,
                     "commissioning_id": None if ownership is None else ownership.commissioning_id,
+                    "request_id": None if ownership is None else ownership.request_id,
                     "strategy_generated": False,
                     "scientific_evidence": False,
                     "classification": "EXPLICIT_PAPER_COMMISSIONING",
+                    "git_sha": self._runtime_identity.get("git_sha"),
+                    "runtime_binding": {
+                        "ledger_path": ledger_health.get("path"),
+                        "ledger_epoch": ledger_health.get("epoch_id"),
+                        "audit_root": self._runtime_identity.get("audit"),
+                        "control_center": self._runtime_identity.get("control_center"),
+                        "python": self._runtime_identity.get("python"),
+                        "pid": self._runtime_identity.get("pid"),
+                    },
+                    "addon_provenance": None if transport is None else transport.get("addon_provenance"),
+                    "session_identity": (self._entry_session_context or self._session_context).payload(),
+                    "observer_status": {
+                        "local_bridge_healthy": self._snapshot.local_bridge_healthy,
+                        "market_price_connected": self._snapshot.market_price_connected,
+                    },
+                    "commissioning_warmup": {
+                        "warmed": self._snapshot.commissioning_session_warmed,
+                        "warmed_at": self._commissioning_warmup_warmed_at,
+                        "policy_hash": _COMMISSIONING_WARMUP_POLICY_HASH,
+                    },
+                    "strategy_evidence_state": "ACTIVE" if self._snapshot.evidence_warmed else "INCOMPLETE",
+                    "ledger_preflight": None if ownership is None else ownership.ledger_preflight,
+                    "entry_owner": PaperEntryOwner.COMMISSIONING.value,
+                    "entry_authority": self._entry_authority_artifact,
+                    "entry_direction": self._entry_direction.value,
                     "entry_decision_id": entry.get("decision_id"),
                     "entry_command_id": entry.get("command_id"),
                     "entry_order_id": entry.get("native_order_id"),
@@ -1159,6 +1451,10 @@ class LaneIIIPaperRuntime:
                     "exit_execution_id": exit_fill.get("native_execution_id"),
                     "exit_price": exit_fill.get("price"),
                     "exit_quantity": exit_fill.get("quantity"),
+                    "protective_stop": {
+                        "native_order_id": self._protective_order_id,
+                        "state": self._snapshot.protective_stop_state,
+                    },
                     "contract_value_per_point": "2",
                     "simulated_fees": "0",
                     "realized_pnl": str(self._lifecycle_realized_pnl),
@@ -1167,12 +1463,29 @@ class LaneIIIPaperRuntime:
                     "final_working_order_count": 0,
                     "foreign_activity": False,
                     "reconciliation_state": "CLEAN",
+                    "final_reconciliation": dict(reconciliation),
                     "lock_disarm_state": target.value,
                     "ledger_hash_chain_required": True,
-                },
+                    "post_run_verification": {
+                        "required": True,
+                        "status": "PENDING",
+                        "verification_id": None,
+                        "verified_through_sequence": None,
+                    },
+                    "lucid_mutation_count": 0,
+                    "incidents": [],
+                    "final_judgment": "COMMISSIONING_INCOMPLETE_PENDING_POST_RUN_VERIFICATION",
+                }
+            self.ledger.append(
+                "COMMISSIONING_CLOSURE",
+                closure,
                 identity="l3g-commissioning-closure-" + str(exit_fill.get("native_execution_id", canonical_hash(dict(reconciliation)))),
                 execution_session_id=self._execution_session_id(),
             )
+            self._last_commissioning_closure = {
+                **closure,
+                "closure_ledger_sequence": int(self.ledger.health_status()["highest_sequence"]),
+            }
             self._release_commissioning_ownership("CLEAN_COMMISSIONING_LIFECYCLE_COMPLETED")
         elif self._entry_owner is PaperEntryOwner.STRATEGY:
             self._entry_owner = PaperEntryOwner.NONE
@@ -1180,7 +1493,9 @@ class LaneIIIPaperRuntime:
         self._entry_fill_quantity = 0
         self._entry_direction = PaperDirection.FLAT
         self._entry_execution = None
+        self._entry_authority_artifact = None
         self._exit_execution = None
+        self._protective_order_id = None
         self._lifecycle_realized_pnl = Decimal("0")
         self._entry_session_context = None
         self._post_exit_reconciliation_pending = False
@@ -1215,9 +1530,167 @@ class LaneIIIPaperRuntime:
         self._entries_paused = True
         self._armed_session = None
         self._disarm_after_flat = False
-        if self._state in {PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.PAUSED}:
+        self._pending_intent = None
+        self._pending_grant = None
+        if self._state in {PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.PAUSED, PaperRuntimeState.ENTRY_PENDING}:
             self._transition(PaperRuntimeState.READY_DISARMED, "COMMISSIONING_ENTRY_REJECTED_BEFORE_COMMAND")
         self._release_commissioning_ownership(reason)
+
+    @staticmethod
+    def _freshness_gate(source: str | None, maximum_seconds: int, at: str) -> dict[str, object]:
+        if source is None:
+            return {
+                "observed_at": None, "age_seconds": None, "maximum_age_seconds": maximum_seconds,
+                "fresh": False,
+            }
+        moment = datetime.fromisoformat(normalized_utc(at, "Commissioning readiness time").replace("Z", "+00:00"))
+        observed = datetime.fromisoformat(normalized_utc(source, "Commissioning freshness time").replace("Z", "+00:00"))
+        age = (moment - observed).total_seconds()
+        return {
+            "observed_at": normalized_utc(source, "Commissioning freshness time"),
+            "age_seconds": round(age, 6),
+            "maximum_age_seconds": maximum_seconds,
+            "fresh": 0 <= age <= maximum_seconds,
+        }
+
+    def _commissioning_readiness_locked(
+        self,
+        *,
+        at: str,
+        commissioning_id: str,
+        ledger_preflight: Callable[[str, Mapping[str, object]], Mapping[str, object]] | None,
+    ) -> dict[str, object]:
+        """One pure validator graph shared by rehearsal, ARM, and atomic start."""
+        context = self._session_context
+        transport_status = None if self._transport is None else self._transport.status()
+        blocking: list[str] = []
+        if self._state is not PaperRuntimeState.READY_DISARMED:
+            blocking.append("STATE_NOT_READY_DISARMED")
+        if self._entry_owner is not PaperEntryOwner.NONE or self._commissioning_ownership is not None:
+            blocking.append("COMMISSIONING_OWNERSHIP_ACTIVE")
+        addon_match = transport_status is not None and transport_status.addon_provenance_valid
+        if not addon_match:
+            blocking.append("ADDON_BUILD_MISMATCH")
+        current = PaperSessionResolver().resolve(at, generation=context.session_generation).context
+        session_current = (
+            context.session_kind is not PaperSessionKind.OFF_SESSION
+            and self._ownership_context_matches(context, current)
+        )
+        if not session_current:
+            blocking.append("NO_CURRENT_EVENT_SESSION")
+        risk_reasons = self.risk.preflight_reasons(self._snapshot, at=at, commissioning=True)
+        blocking.extend(risk_reasons)
+        ledger_evidence: dict[str, object] | None = None
+        ledger_blocker: str | None = None
+        if ledger_preflight is None:
+            ledger_blocker = "COMMISSIONING_LEDGER_STATUS_UNKNOWN"
+            blocking.append(ledger_blocker)
+        else:
+            try:
+                result = ledger_preflight(
+                    commissioning_id, self._commissioning_runtime_snapshot(commissioning_id),
+                )
+                if not isinstance(result, Mapping):
+                    raise RuntimeError("Commissioning ledger preflight returned an invalid result.")
+                ledger_evidence = dict(result)
+            except Exception as exc:
+                detail = str(getattr(exc, "detail", None) or exc or type(exc).__name__)
+                prefix = detail.split(":", 1)[0].strip()
+                ledger_blocker = prefix if prefix.startswith("COMMISSIONING_") else "COMMISSIONING_LEDGER_PREFLIGHT_FAILED"
+                blocking.append(ledger_blocker)
+                ledger_evidence = {"status": "BLOCKED", "detail": detail}
+        freshness = {
+            "quote": self._freshness_gate(
+                self._snapshot.quote_observed_at, RISK_PROFILE.quote_maximum_age_seconds, at,
+            ),
+            "classified_trade": self._freshness_gate(
+                self._snapshot.classified_trade_observed_at,
+                RISK_PROFILE.classified_trade_maximum_age_seconds, at,
+            ),
+            "depth_mutation": self._freshness_gate(
+                self._snapshot.depth_mutation_observed_at,
+                RISK_PROFILE.depth_mutation_maximum_age_seconds, at,
+            ),
+        }
+        family_progress = {
+            family.value: {
+                "seen": family.value in self._commissioning_warmup_seen,
+                "provenance": self._commissioning_warmup_seen.get(family.value),
+            }
+            for family in _COMMISSIONING_REQUIRED_FAMILIES
+        }
+        reasons = tuple(dict.fromkeys(blocking))
+        payload: dict[str, object] = {
+            "schema": "lane-iii-phase-g-commissioning-readiness-v1",
+            "result": "READY" if not reasons else "BLOCKED",
+            "generated_at": normalized_utc(at, "Commissioning readiness time"),
+            "commissioning_id": commissioning_id,
+            "session": {
+                **context.payload(),
+                "current": session_current,
+                "entry_window": "OPEN" if context.entry_permitted_at(
+                    datetime.fromisoformat(normalized_utc(at, "Commissioning readiness time").replace("Z", "+00:00"))
+                ) else "CLOSED",
+            },
+            "observer": {
+                "status": "ACTIVE" if self._snapshot.local_bridge_healthy else "NOT_ACTIVE",
+                "continuity_healthy": not self._snapshot.local_sequence_gap and not self._snapshot.depth_reset_recovery,
+                "local_bridge_healthy": self._snapshot.local_bridge_healthy,
+                "market_price_connected": self._snapshot.market_price_connected,
+            },
+            "market_freshness": freshness,
+            "commissioning_warmup": {
+                "status": "WARMED" if self._snapshot.commissioning_session_warmed else "NOT_WARMED",
+                "warmed_at": self._commissioning_warmup_warmed_at,
+                "policy_hash": _COMMISSIONING_WARMUP_POLICY_HASH,
+                "required_families": family_progress,
+            },
+            "strategy_evidence": {
+                "status": "ACTIVE" if self._snapshot.evidence_warmed else "INCOMPLETE",
+                "current_transient_evidence_required_for_strategy": True,
+            },
+            "ledger": ledger_evidence or {"status": "UNKNOWN"},
+            "broker": {
+                "account": self._snapshot.account_name,
+                "account_class": self._snapshot.account_class,
+                "instrument": self._snapshot.instrument,
+                "position": self._position.value,
+                "quantity": self._position_quantity,
+                "owned_orders": self._snapshot.working_owned_orders,
+                "working_entry_orders": self._snapshot.working_entry_orders,
+                "reconciliation_current": self._snapshot.reconciliation_current,
+            },
+            "addon": {
+                "status": "MATCH" if addon_match else "MISMATCH",
+                "expected_source_fingerprint": None if transport_status is None else transport_status.expected_addon_source_fingerprint,
+                "source_fingerprint": None if transport_status is None else transport_status.addon_source_fingerprint,
+                "build_fingerprint": None if transport_status is None else transport_status.addon_build_fingerprint,
+                "protocol_version": None if transport_status is None else transport_status.addon_protocol_version,
+            },
+            "ownership": {
+                "entry_owner": self._entry_owner.value,
+                "commissioning_active": self._commissioning_ownership is not None,
+            },
+            "live_capital": "DENIED",
+            "blocking_reasons": list(reasons),
+        }
+        payload["snapshot_hash"] = canonical_hash(payload)
+        return payload
+
+    def commissioning_rehearsal(
+        self,
+        ledger_preflight: Callable[[str, Mapping[str, object]], Mapping[str, object]] | None = None,
+    ) -> dict[str, object]:
+        """Return a hash-bound, authority-free rehearsal of production validators."""
+        with self._lock:
+            at = _now()
+            commissioning_id = "l3g-commissioning-rehearsal-" + canonical_hash({
+                "at": at, "session_id": self._session_context.session_id,
+                "session_generation": self._session_context.session_generation,
+            })[:32]
+            return self._commissioning_readiness_locked(
+                at=at, commissioning_id=commissioning_id, ledger_preflight=ledger_preflight,
+            )
 
     def arm(self) -> dict[str, object]:
         with self._lock:
@@ -1265,51 +1738,55 @@ class LaneIIIPaperRuntime:
     def commissioning_arm(
         self,
         ledger_preflight: Callable[[str, Mapping[str, object]], Mapping[str, object]] | None = None,
+        *,
+        commissioning_id: str | None = None,
+        request_id: str | None = None,
     ) -> dict[str, object]:
         """Atomically reserve commissioning ownership before exposing ARMED_FLAT."""
         with self._lock:
-            if self._entry_owner is not PaperEntryOwner.NONE or self._commissioning_ownership is not None:
-                return {"armed": False, "reason_codes": ("COMMISSIONING_OWNERSHIP_ACTIVE",), "state": self._state.value}
-            if self._state is not PaperRuntimeState.READY_DISARMED:
-                return {"armed": False, "reason_codes": ("STATE_NOT_READY_DISARMED",), "state": self._state.value}
-            transport = None if self._transport is None else self._transport.status()
-            if transport is None or not transport.addon_provenance_valid:
-                reasons = ("ADDON_BUILD_MISMATCH",)
-                self.ledger.append(
-                    "RISK_EVENT_COMMISSIONING_ARM_ATTEMPT",
-                    {
-                        **self._session_context.payload(), "allowed": False, "reason_codes": reasons,
-                        "expected_addon_source_fingerprint": None if transport is None else transport.expected_addon_source_fingerprint,
-                        "runtime_addon_source_fingerprint": None if transport is None else transport.addon_source_fingerprint,
-                        "runtime_addon_protocol_version": None if transport is None else transport.addon_protocol_version,
-                    },
-                    execution_session_id=self._execution_session_id(),
-                )
-                return {"armed": False, "reason_codes": reasons, "state": self._state.value}
             context = self._session_context
             now = _now()
-            current = PaperSessionResolver().resolve(now, generation=context.session_generation).context
-            if context.session_kind is PaperSessionKind.OFF_SESSION or not self._ownership_context_matches(context, current):
-                reasons = ("NO_CURRENT_EVENT_SESSION",)
-                self.ledger.append("RISK_EVENT_COMMISSIONING_ARM_ATTEMPT", {**context.payload(), "allowed": False, "reason_codes": reasons, "authority_hash": canonical_hash(AUTHORITY.authority_payload())})
-                return {"armed": False, "reason_codes": reasons, "state": self._state.value}
-            commissioning_id = "l3g-commissioning-" + uuid4().hex
-            ledger_evidence: dict[str, object] | None = None
-            if ledger_preflight is not None:
-                preflight_result = ledger_preflight(
-                    commissioning_id, self._commissioning_runtime_snapshot(commissioning_id)
-                )
-                if not isinstance(preflight_result, Mapping):
-                    raise RuntimeError("Commissioning ledger preflight returned an invalid result.")
-                ledger_evidence = dict(preflight_result)
-            allowed, reasons = self.risk.preflight(self._snapshot, at=now)
-            self.ledger.append("RISK_EVENT_COMMISSIONING_ARM_ATTEMPT", {**context.payload(), "allowed": allowed, "reason_codes": reasons, "authority_hash": canonical_hash(AUTHORITY.authority_payload())})
+            identity = commissioning_id or "l3g-commissioning-" + uuid4().hex
+            readiness = self._commissioning_readiness_locked(
+                at=now, commissioning_id=identity, ledger_preflight=ledger_preflight,
+            )
+            reasons = tuple(str(value) for value in readiness["blocking_reasons"])
+            allowed = not reasons
+            # Count the same pure risk predicates only for a real authority attempt.
+            risk_allowed, risk_reasons = self.risk.preflight(
+                self._snapshot, at=now, commissioning=True,
+            )
+            if not risk_allowed:
+                reasons = tuple(dict.fromkeys((*reasons, *risk_reasons)))
+                allowed = False
+            self.ledger.append(
+                "RISK_EVENT_COMMISSIONING_ARM_ATTEMPT",
+                {
+                    **context.payload(), "allowed": allowed, "reason_codes": reasons,
+                    "authority_hash": canonical_hash(AUTHORITY.authority_payload()),
+                    "readiness_snapshot_hash": readiness["snapshot_hash"],
+                },
+                execution_session_id=self._execution_session_id(),
+            )
             if not allowed:
                 return {"armed": False, "reason_codes": reasons, "state": self._state.value}
+            ledger_evidence = dict(readiness["ledger"])  # type: ignore[arg-type]
+            self.ledger.append(
+                "COMMISSIONING_PREFLIGHT_ACCEPTED",
+                {
+                    **context.payload(), "commissioning_id": identity,
+                    "request_id": request_id,
+                    "readiness_snapshot_hash": readiness["snapshot_hash"],
+                    "commissioning_warmup_policy_hash": _COMMISSIONING_WARMUP_POLICY_HASH,
+                    "reason": "ALL_PRODUCTION_COMMISSIONING_VALIDATORS_ACCEPTED",
+                },
+                identity="l3g-commissioning-preflight-accepted-" + identity,
+                execution_session_id=self._execution_session_id(),
+            )
             ownership = _CommissioningOwnership(
-                commissioning_id,
+                identity,
                 "l3g-commissioning-token-" + uuid4().hex,
-                context, now,
+                context, now, request_id=request_id, ledger_preflight=ledger_evidence,
             )
             # This assignment occurs while READY_DISARMED is still true.  No
             # strategy thread can observe an entry-capable state without the
@@ -1337,6 +1814,54 @@ class LaneIIIPaperRuntime:
                 "commissioning_token": ownership.commissioning_token,
                 "session_armed_state": "ARMED_" + context.session_kind.value, "arm_grant": self._armed_session.payload(),
                 "ledger_preflight": ledger_evidence,
+            }
+
+    def commissioning_start(
+        self,
+        request_id: str,
+        ledger_preflight: Callable[[str, Mapping[str, object]], Mapping[str, object]] | None = None,
+    ) -> dict[str, object]:
+        """Atomically preflight, reserve, arm, authorize, and submit exactly once."""
+        if (
+            not isinstance(request_id, str) or not 8 <= len(request_id) <= 128
+            or any(not (character.isalnum() or character in "-_.:") for character in request_id)
+        ):
+            raise ValueError("Commissioning start requires an 8-128 character idempotency request ID.")
+        commissioning_id = "l3g-commissioning-" + canonical_hash({"request_id": request_id})[:32]
+        with self._lock:
+            prior = self.ledger.commissioning_ownership(commissioning_id)
+            if prior is not None:
+                record, consumed, released = prior
+                payload = record.get("payload") if isinstance(record, Mapping) else None
+                return {
+                    "submitted": consumed,
+                    "commissioning": True,
+                    "commissioning_id": commissioning_id,
+                    "request_id": request_id,
+                    "idempotent_replay": True,
+                    "entry_consumed": consumed,
+                    "ownership_released": released,
+                    "decision_id": payload.get("entry_decision_id") if isinstance(payload, Mapping) else None,
+                    "state": self._state.value,
+                    "reason_codes": ("COMMISSIONING_START_ALREADY_ACCEPTED",),
+                }
+            armed = self.commissioning_arm(
+                ledger_preflight, commissioning_id=commissioning_id, request_id=request_id,
+            )
+            if not armed.get("armed"):
+                return {
+                    **armed, "submitted": False, "commissioning": True,
+                    "commissioning_id": commissioning_id, "request_id": request_id,
+                }
+            submitted = self.commission_entry(
+                str(armed["commissioning_id"]), str(armed["commissioning_token"]),
+            )
+            return {
+                **submitted,
+                "armed": True,
+                "atomic_start": True,
+                "request_id": request_id,
+                "ledger_preflight": armed.get("ledger_preflight"),
             }
 
     def commission_entry(self, commissioning_id: str, commissioning_token: str) -> dict[str, object]:
@@ -1399,7 +1924,9 @@ class LaneIIIPaperRuntime:
                 or self._snapshot.instrument != ACCOUNT_BINDING.instrument
             ):
                 explicit_identity_reasons.append("COMMISSIONING_ACCOUNT_INSTRUMENT_MISMATCH")
-            allowed, preflight_reasons = self.risk.preflight(self._snapshot, at=now)
+            allowed, preflight_reasons = self.risk.preflight(
+                self._snapshot, at=now, commissioning=True,
+            )
             reasons = tuple(dict.fromkeys((*explicit_identity_reasons, *preflight_reasons)))
             allowed = allowed and not explicit_identity_reasons
             self.ledger.append(
@@ -1438,11 +1965,26 @@ class LaneIIIPaperRuntime:
                 context.trade_date, context.session_profile_hash, context.session_generation,
                 True, False, False,
             )
-            ownership = replace(ownership, entry_consumed=True, entry_decision_id=decision.paper_decision_id)
-            self._commissioning_ownership = ownership
             self.ledger.append(
-                "COMMISSIONING_ENTRY_CONSUMED", self._ownership_payload(ownership, reason="EXPLICIT_COMMISSIONING_ENTRY"),
-                identity="l3g-commissioning-entry-consumed-" + ownership.commissioning_id,
+                "COMMISSIONING_ENTRY_AUTHORIZED",
+                {
+                    **self._ownership_payload(ownership, reason="SINGLE_USE_ENTRY_AUTHORIZED"),
+                    "decision_id": decision.paper_decision_id,
+                    "direction": PaperDirection.LONG.value,
+                    "quantity": 1,
+                    "reference_market_snapshot": {
+                        "bid": None if self._last_quote is None else str(self._last_quote[0]),
+                        "ask": None if self._last_quote is None else str(self._last_quote[1]),
+                        "last": None if self._last_trade is None else str(self._last_trade[0]),
+                    },
+                    "risk_snapshot_hash": canonical_hash({
+                        key: str(value) for key, value in self._snapshot.__dict__.items()
+                    }),
+                    "created_at": now,
+                    "expires_at": decision.expires_at,
+                    "single_use": True,
+                },
+                identity="l3g-commissioning-entry-authorized-" + ownership.commissioning_id,
                 execution_session_id=self._execution_session_id(),
             )
             self._last_decision = decision
@@ -1452,6 +1994,21 @@ class LaneIIIPaperRuntime:
             )
             try:
                 submitted = self._request_entry(decision)
+            except _CommissioningAuthorizationExpired:
+                self.ledger.append(
+                    "INCIDENT_COMMISSIONING_ENTRY_AUTHORIZATION_EXPIRED",
+                    self._ownership_payload(ownership, reason="COMMISSIONING_ENTRY_AUTHORIZATION_EXPIRED"),
+                    identity="l3g-commissioning-entry-authorization-expired-" + ownership.commissioning_id,
+                    execution_session_id=self._execution_session_id(),
+                )
+                self._abort_unsubmitted_commissioning("COMMISSIONING_ENTRY_AUTHORIZATION_EXPIRED")
+                return {
+                    "submitted": False,
+                    "commissioning": True,
+                    "commissioning_id": ownership.commissioning_id,
+                    "reason_codes": ("COMMISSIONING_ENTRY_AUTHORIZATION_EXPIRED",),
+                    "state": self._state.value,
+                }
             except Exception:
                 self.ledger.append(
                     "INCIDENT_COMMISSIONING_ENTRY_AMBIGUOUS",
@@ -1463,6 +2020,19 @@ class LaneIIIPaperRuntime:
             if not submitted:
                 self._abort_unsubmitted_commissioning("COMMISSIONING_ENTRY_REJECTED_BEFORE_COMMAND")
                 return {"submitted": False, "reason_codes": ("COMMISSIONING_ENTRY_REJECTED_BEFORE_COMMAND",), "state": self._state.value}
+            self.ledger.append(
+                "COMMISSIONING_ENTRY_SUBMITTED",
+                {
+                    **self._ownership_payload(
+                        self._commissioning_ownership or ownership,
+                        reason="SINGLE_USE_ENTRY_SUBMITTED",
+                    ),
+                    "decision_id": decision.paper_decision_id,
+                    "command_id": None if self._last_command is None else self._last_command.command_id,
+                },
+                identity="l3g-commissioning-entry-submitted-" + ownership.commissioning_id,
+                execution_session_id=self._execution_session_id(),
+            )
             return {
                 "submitted": True,
                 "commissioning": True,
@@ -1591,10 +2161,24 @@ class LaneIIIPaperRuntime:
             transport = None if self._transport is None else self._transport.status().as_dict()
             context = self._session_context
             trade_risk = self._family_risk.get((context.trade_date, context.session_family), _TradeDateRisk())
-            arm_valid = self._armed_session is not None and self._armed_session.valid_at(_now())
+            status_now = _now()
+            arm_valid = self._armed_session is not None and self._armed_session.valid_at(status_now)
             ownership = self._commissioning_ownership
             loss_remaining = max(Decimal("0"), RISK_PROFILE.daily_loss_limit_dollars + min(Decimal("0"), trade_risk.realized_pnl + trade_risk.unrealized_pnl))
-            next_context = PaperSessionResolver().next_valid_session(_now(), generation=context.session_generation)
+            next_context = PaperSessionResolver().next_valid_session(status_now, generation=context.session_generation)
+            market_freshness = {
+                "quote": self._freshness_gate(
+                    self._snapshot.quote_observed_at, RISK_PROFILE.quote_maximum_age_seconds, status_now,
+                ),
+                "classified_trade": self._freshness_gate(
+                    self._snapshot.classified_trade_observed_at,
+                    RISK_PROFILE.classified_trade_maximum_age_seconds, status_now,
+                ),
+                "depth_mutation": self._freshness_gate(
+                    self._snapshot.depth_mutation_observed_at,
+                    RISK_PROFILE.depth_mutation_maximum_age_seconds, status_now,
+                ),
+            }
             return {
                 "schema": "lane-iii-phase-g-paper-runtime-status-v1",
                 "mode": "PAPER_SIM101",
@@ -1638,6 +2222,29 @@ class LaneIIIPaperRuntime:
                     "trade_date": next_context.trade_date,
                 },
                 "session_evidence_warmup": bool(self._snapshot.evidence_warmed),
+                "strategy_evidence_warmed": bool(self._snapshot.evidence_warmed),
+                "strategy_evidence_status": "ACTIVE" if self._snapshot.evidence_warmed else "INCOMPLETE",
+                "commissioning_session_warmed": bool(self._snapshot.commissioning_session_warmed),
+                "commissioning_warmup": {
+                    "status": "WARMED" if self._snapshot.commissioning_session_warmed else "NOT_WARMED",
+                    "warmed_at": self._commissioning_warmup_warmed_at,
+                    "policy_hash": _COMMISSIONING_WARMUP_POLICY_HASH,
+                    "required_families": {
+                        family.value: {
+                            "seen": family.value in self._commissioning_warmup_seen,
+                            "provenance": self._commissioning_warmup_seen.get(family.value),
+                        }
+                        for family in _COMMISSIONING_REQUIRED_FAMILIES
+                    },
+                },
+                "market_freshness": market_freshness,
+                "continuity": {
+                    "healthy": not self._snapshot.local_sequence_gap and not self._snapshot.depth_reset_recovery,
+                    "local_sequence_gap": self._snapshot.local_sequence_gap,
+                    "depth_reset_recovery": self._snapshot.depth_reset_recovery,
+                    "local_bridge_healthy": self._snapshot.local_bridge_healthy,
+                    "market_price_connected": self._snapshot.market_price_connected,
+                },
                 "session_support_scores": {
                     "bullish": str(self.policy.score(_now(), HypothesisKind.BULLISH_REVERSAL)[0]),
                     "bearish": str(self.policy.score(_now(), HypothesisKind.BEARISH_CONTINUATION)[0]),
@@ -1658,6 +2265,7 @@ class LaneIIIPaperRuntime:
                     "entry_consumed": False if ownership is None else ownership.entry_consumed,
                     "recovered_after_restart": False if ownership is None else ownership.recovered_after_restart,
                     "decision_id": None if ownership is None else ownership.entry_decision_id,
+                    "request_id": None if ownership is None else ownership.request_id,
                     "strategy_generated": ownership is None,
                     "scientific_evidence": False,
                 },
@@ -1668,6 +2276,7 @@ class LaneIIIPaperRuntime:
                 "last_execution": self._last_execution,
                 "last_reconciliation": self._last_reconciliation,
                 "lockout_or_fault_reason": self._fault_reason or risk.get("lockout_reason"),
+                "last_commissioning_closure": self._last_commissioning_closure,
                 "authority": AUTHORITY.authority_payload(),
                 "policy": policy,
                 "risk": risk,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Mapping
 
 from .ledger import COMMISSIONING_TAIL_POLICY_VERSION
@@ -204,4 +205,72 @@ def evaluate_commissioning_ledger_gate(
                 "commissioning_ownership_active", "live_capital",
             )
         },
+    }
+
+
+def evaluate_commissioning_post_run_verification(
+    closure: Mapping[str, object],
+    verification: Mapping[str, object],
+    *,
+    checkpoint_matches_report: bool,
+) -> dict[str, object]:
+    """Adjudicate closure only when broker, economics, and verifier all agree."""
+    reasons: list[str] = []
+    if closure.get("classification") != "EXPLICIT_PAPER_COMMISSIONING":
+        reasons.append("COMMISSIONING_CLOSURE_IDENTITY_INVALID")
+    if (
+        closure.get("final_position") != "FLAT"
+        or closure.get("final_quantity") != 0
+        or closure.get("final_working_order_count") != 0
+        or closure.get("reconciliation_state") != "CLEAN"
+        or closure.get("lock_disarm_state") != "READY_DISARMED"
+    ):
+        reasons.append("COMMISSIONING_FINAL_BROKER_STATE_INVALID")
+    if closure.get("lucid_mutation_count") != 0:
+        reasons.append("COMMISSIONING_LIVE_CAPITAL_MUTATION_DETECTED")
+    if closure.get("incidents") not in ([], ()):  # an absent field is not a clean assertion
+        reasons.append("COMMISSIONING_INCIDENTS_PRESENT")
+    try:
+        entry = Decimal(str(closure["entry_price"]))
+        exit_fill = Decimal(str(closure["exit_price"]))
+        quantity = int(closure["entry_quantity"])
+        reported = Decimal(str(closure["realized_pnl"]))
+        direction = str(closure["entry_direction"])
+        points = exit_fill - entry if direction == "LONG" else entry - exit_fill if direction == "SHORT" else None
+        if points is None or quantity != closure.get("exit_quantity") or quantity != 1:
+            raise ValueError("invalid pairing")
+        expected = points * Decimal(str(closure.get("contract_value_per_point"))) * quantity
+        if expected != reported:
+            reasons.append("COMMISSIONING_REALIZED_PNL_MISMATCH")
+    except (KeyError, TypeError, ValueError, InvalidOperation):
+        reasons.append("COMMISSIONING_EXECUTION_PAIRING_INVALID")
+
+    if (
+        verification.get("status") != "PASS"
+        or verification.get("chain_valid") is not True
+        or verification.get("checkpoint_valid") is not True
+        or verification.get("full_scan_required") is True
+        or verification.get("errors") not in ([], None)
+        or not checkpoint_matches_report
+    ):
+        reasons.append("COMMISSIONING_POST_RUN_VERIFIER_NOT_TRUSTED")
+    if verification.get("verification_mode") != "incremental":
+        reasons.append("COMMISSIONING_POST_RUN_INCREMENTAL_REQUIRED")
+    closure_sequence = closure.get("closure_ledger_sequence")
+    verified_sequence = verification.get("verified_through_sequence")
+    if (
+        type(closure_sequence) is not int or type(verified_sequence) is not int
+        or verified_sequence < closure_sequence
+    ):
+        reasons.append("COMMISSIONING_LIFECYCLE_NOT_COVERED_BY_VERIFIER")
+    unique = list(dict.fromkeys(reasons))
+    return {
+        "schema": "lane-iii-phase-g-commissioning-post-run-verification-v1",
+        "result": "PASS" if not unique else "COMMISSIONING_INCOMPLETE",
+        "commissioning_id": closure.get("commissioning_id"),
+        "closure_ledger_sequence": closure_sequence,
+        "verification_id": verification.get("verification_id"),
+        "verification_mode": verification.get("verification_mode"),
+        "verified_through_sequence": verified_sequence,
+        "blocking_reasons": unique,
     }

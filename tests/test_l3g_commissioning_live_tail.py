@@ -6,7 +6,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from src.l3g_paper.commissioning import CommissioningLedgerGateError, evaluate_commissioning_ledger_gate
+from src.l3g_paper.commissioning import (
+    CommissioningLedgerGateError,
+    evaluate_commissioning_ledger_gate,
+    evaluate_commissioning_post_run_verification,
+)
 from src.l3g_paper.health import ledger_health_projection
 from src.l3g_paper.ledger import (
     COMMISSIONING_NO_AUTHORITY_EFFECT,
@@ -272,6 +276,51 @@ class CommissioningLiveTailTests(unittest.TestCase):
             verification,
         )
         self.assertEqual(authority["commissioning_ledger_state"], "UNVERIFIED_AUTHORITY_TAIL")
+
+    def test_post_run_pass_requires_clean_disarmed_economics_and_incremental_coverage(self) -> None:
+        closure = {
+            "classification": "EXPLICIT_PAPER_COMMISSIONING",
+            "commissioning_id": "l3g-commissioning-post-run",
+            "entry_direction": "LONG",
+            "entry_price": "100.25",
+            "entry_quantity": 1,
+            "exit_price": "101",
+            "exit_quantity": 1,
+            "contract_value_per_point": "2",
+            "realized_pnl": "1.50",
+            "final_position": "FLAT",
+            "final_quantity": 0,
+            "final_working_order_count": 0,
+            "reconciliation_state": "CLEAN",
+            "lock_disarm_state": "READY_DISARMED",
+            "closure_ledger_sequence": 120,
+            "lucid_mutation_count": 0,
+            "incidents": [],
+        }
+        verification = {
+            "status": "PASS", "chain_valid": True, "checkpoint_valid": True,
+            "full_scan_required": False, "errors": [], "verification_mode": "incremental",
+            "verification_id": "lv-post-run", "verified_through_sequence": 125,
+        }
+        passed = evaluate_commissioning_post_run_verification(
+            closure, verification, checkpoint_matches_report=True,
+        )
+        self.assertEqual(passed["result"], "PASS")
+        attacks = {
+            "flat alone is insufficient": ({**closure, "lock_disarm_state": "ARMED_FLAT"}, verification, True),
+            "pnl mismatch": ({**closure, "realized_pnl": "1.00"}, verification, True),
+            "verifier failure": (closure, {**verification, "status": "FAIL"}, True),
+            "wrong mode": (closure, {**verification, "verification_mode": "full"}, True),
+            "lifecycle uncovered": (closure, {**verification, "verified_through_sequence": 119}, True),
+            "checkpoint mismatch": (closure, verification, False),
+        }
+        for name, (candidate, report, checkpoint) in attacks.items():
+            with self.subTest(name=name):
+                result = evaluate_commissioning_post_run_verification(
+                    candidate, report, checkpoint_matches_report=checkpoint,
+                )
+                self.assertEqual(result["result"], "COMMISSIONING_INCOMPLETE")
+                self.assertTrue(result["blocking_reasons"])
 
 
 if __name__ == "__main__":

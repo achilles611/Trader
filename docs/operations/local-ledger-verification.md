@@ -131,6 +131,10 @@ Full-required result also denies commissioning. After a lifecycle completes,
 Auto Incremental must cryptographically verify the passive tail and all
 commissioning records before closure can claim PASS.
 
+The complete operator sequence, warmup semantics, atomic start boundary, and
+post-run closure contract are documented in
+[`lane-iii-commissioning-runbook.md`](lane-iii-commissioning-runbook.md).
+
 ## Performance capture
 
 Full-scan and incremental performance are recorded in every result artifact:

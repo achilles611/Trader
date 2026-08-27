@@ -696,6 +696,11 @@ class ExperimentalPaperPolicy:
         with self._lock:
             return self._counters["classified_buy"] + self._counters["classified_sell"]
 
+    def reset_count(self) -> int:
+        """Expose the canonical provisional-domain generation counter."""
+        with self._lock:
+            return self._reset_count
+
     def runtime_gate_state(self) -> tuple[int, bool, bool]:
         """Return minimal preflight state without building public status."""
         with self._lock:

@@ -199,6 +199,7 @@ class PaperRuntimeTests(unittest.TestCase):
                 now, position_snapshot_complete=True, order_snapshot_complete=True,
                 reconciliation_current=True, local_bridge_healthy=True,
                 market_price_connected=True, execution_bridge_healthy=True, evidence_warmed=True,
+                commissioning_session_warmed=True,
                 depth_reset_recovery=False, quote_observed_at=now, classified_trade_observed_at=now,
                 depth_mutation_observed_at=now, session_kind=context.session_kind,
                 session_id=context.session_id, trade_date=context.trade_date,
@@ -282,6 +283,7 @@ class PaperRuntimeTests(unittest.TestCase):
                 now, position_snapshot_complete=True, order_snapshot_complete=True,
                 reconciliation_current=True, local_bridge_healthy=True,
                 market_price_connected=True, execution_bridge_healthy=True, evidence_warmed=True,
+                commissioning_session_warmed=True,
                 depth_reset_recovery=False, quote_observed_at=now, classified_trade_observed_at=now,
                 depth_mutation_observed_at=now, session_kind=context.session_kind,
                 session_id=context.session_id, trade_date=context.trade_date,
@@ -327,7 +329,167 @@ class PaperRuntimeTests(unittest.TestCase):
             self.assertEqual(closure["exit_order_id"], "exit-order")
             self.assertEqual(closure["realized_pnl"], "1.50")
             self.assertEqual(closure["final_working_order_count"], 0)
+            self.assertEqual(closure["post_run_verification"]["status"], "PENDING")
+            self.assertEqual(closure["final_judgment"], "COMMISSIONING_INCOMPLETE_PENDING_POST_RUN_VERIFICATION")
             self.assertEqual(runtime.status()["entry_owner"], PaperEntryOwner.NONE.value)
+            runtime.stop(); ledger.close()
+
+    def test_protective_stop_acceptance_and_failure_matrix_is_fail_closed(self) -> None:
+        now = "2026-08-26T14:00:00Z"
+        context = PaperSessionResolver().resolve(now, generation=1).context
+
+        def positioned(directory: str) -> tuple[PaperLedger, LaneIIIPaperRuntime, list[object]]:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            runtime = LaneIIIPaperRuntime(ledger)
+            runtime._state = PaperRuntimeState.LONG
+            runtime._position = PaperDirection.LONG
+            runtime._position_quantity = 1
+            runtime._entry_fill_price = Decimal("100")
+            runtime._entry_fill_quantity = 1
+            runtime._entry_direction = PaperDirection.LONG
+            runtime._session_context = context
+            runtime._snapshot = PaperRiskSnapshot(
+                now, current_position=PaperDirection.LONG, current_position_quantity=1,
+                position_snapshot_complete=True, order_snapshot_complete=True,
+                reconciliation_current=True, execution_bridge_healthy=True,
+                session_kind=context.session_kind, session_id=context.session_id,
+                trade_date=context.trade_date, session_profile_hash=context.session_profile_hash,
+                session_generation=context.session_generation,
+            )
+            runtime._execution_session_id = lambda: "l3g-es-protective-test"  # type: ignore[method-assign]
+            commands: list[object] = []
+            runtime._persist_and_send = lambda command, grant: commands.append(command)  # type: ignore[method-assign]
+            return ledger, runtime, commands
+
+        with TemporaryDirectory() as directory:
+            ledger, runtime, commands = positioned(directory)
+            runtime.on_execution_message({
+                "message_type": "ORDER_EVENT", "order_role": "PROTECTIVE", "order_state": "WORKING",
+                "account_name": "Sim101", "instrument": "MNQ SEP26", "quantity": 1,
+                "native_order_id": "protective-1",
+            })
+            self.assertEqual(runtime.state, PaperRuntimeState.LONG)
+            self.assertEqual(runtime.status()["protective_stop_state"], "WORKING")
+            self.assertEqual(commands, [])
+            runtime.stop(); ledger.close()
+
+        failures = {
+            "rejected": {"message_type": "ORDER_EVENT", "order_role": "PROTECTIVE", "order_state": "REJECTED"},
+            "cancelled": {"message_type": "ORDER_EVENT", "order_role": "PROTECTIVE", "order_state": "CANCELLED"},
+            "wrong quantity": {"message_type": "ORDER_EVENT", "order_role": "PROTECTIVE", "order_state": "WORKING", "quantity": 2},
+            "wrong account": {"message_type": "ORDER_EVENT", "order_role": "PROTECTIVE", "order_state": "WORKING", "account_name": "Lucid25kflex01"},
+            "wrong instrument": {"message_type": "ORDER_EVENT", "order_role": "PROTECTIVE", "order_state": "WORKING", "instrument": "NQ SEP26"},
+            "missing acknowledgement": {"message_type": "COMMAND_REJECTED", "order_role": "PROTECTIVE", "reason_code": "ACKNOWLEDGEMENT_MISSING"},
+        }
+        for name, event in failures.items():
+            with self.subTest(name=name), TemporaryDirectory() as directory:
+                ledger, runtime, commands = positioned(directory)
+                with patch("src.l3g_paper.runtime._now", return_value=now):
+                    runtime.on_execution_message(event)
+                self.assertEqual(runtime.state, PaperRuntimeState.EXIT_PENDING)
+                self.assertEqual(len(commands), 1)
+                self.assertEqual(commands[0].action.value, "EMERGENCY_FLATTEN")  # type: ignore[attr-defined]
+                self.assertTrue(runtime.risk.status()["locked_out"])
+                runtime._request_entry(warmed_bullish_policy()[2])
+                self.assertEqual(len(commands), 1)
+                runtime.stop(); ledger.close()
+
+        with TemporaryDirectory() as directory:
+            ledger, runtime, commands = positioned(directory)
+            first = {
+                "message_type": "ORDER_EVENT", "order_role": "PROTECTIVE", "order_state": "WORKING",
+                "account_name": "Sim101", "instrument": "MNQ SEP26", "quantity": 1,
+                "native_order_id": "protective-1",
+            }
+            runtime.on_execution_message(first)
+            with patch("src.l3g_paper.runtime._now", return_value=now):
+                runtime.on_execution_message({**first, "native_order_id": "protective-2"})
+            self.assertEqual(runtime.state, PaperRuntimeState.EXIT_PENDING)
+            self.assertEqual(len(commands), 1)
+            self.assertEqual(runtime.status()["lockout_or_fault_reason"], "DUPLICATE_PROTECTIVE_STOP")
+            runtime.stop(); ledger.close()
+
+    def test_short_exit_pnl_duplicate_and_execution_classification_matrix(self) -> None:
+        now = "2026-08-26T14:00:00Z"
+        context = PaperSessionResolver().resolve(now, generation=1).context
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            runtime = LaneIIIPaperRuntime(ledger)
+            runtime._state = PaperRuntimeState.EXIT_PENDING
+            runtime._position = PaperDirection.SHORT
+            runtime._position_quantity = 1
+            runtime._entry_fill_price = Decimal("100")
+            runtime._entry_fill_quantity = 1
+            runtime._entry_direction = PaperDirection.SHORT
+            runtime._entry_session_context = context
+            runtime._entry_execution = {
+                "decision_id": "short-decision", "command_id": "short-entry-command",
+                "native_order_id": "short-entry-order", "native_execution_id": "short-entry-fill",
+                "price": "100", "quantity": 1, "timestamp": now,
+            }
+            runtime._session_context = context
+            runtime._snapshot = PaperRiskSnapshot(
+                now, current_position=PaperDirection.SHORT, current_position_quantity=1,
+                position_snapshot_complete=True, order_snapshot_complete=True,
+                reconciliation_current=True, execution_bridge_healthy=True,
+                session_kind=context.session_kind, session_id=context.session_id,
+                trade_date=context.trade_date, session_profile_hash=context.session_profile_hash,
+                session_generation=context.session_generation,
+            )
+            runtime._execution_session_id = lambda: "l3g-es-short-test"  # type: ignore[method-assign]
+            commands: list[object] = []
+            runtime._persist_and_send = lambda command, grant: commands.append(command)  # type: ignore[method-assign]
+            exit_fill = {
+                "message_type": "EXECUTION_EVENT", "order_role": "EXIT", "price": "98", "quantity": 1,
+                "account_name": "Sim101", "instrument": "MNQ SEP26", "command_id": "short-exit-command",
+                "native_order_id": "short-exit-order", "native_execution_id": "short-exit-fill", "timestamp": now,
+            }
+            with patch("src.l3g_paper.runtime._now", return_value=now):
+                runtime.on_execution_message(exit_fill)
+                runtime.on_execution_message(exit_fill)
+                runtime.on_execution_message({"message_type": "POSITION_EVENT", "quantity": 0, "timestamp": now})
+                runtime.on_execution_message({
+                    "message_type": "RECONCILIATION", "receipt_id": "short-flat", "account_name": "Sim101",
+                    "account_class": "LOCAL_SIMULATION", "instrument": "MNQ SEP26", "position_quantity": 0,
+                    "working_order_count": 0, "working_entry_count": 0, "position_snapshot_complete": True,
+                    "order_snapshot_complete": True, "foreign_activity": False, "timestamp": now,
+                })
+            self.assertEqual(runtime.status()["daily_realized_pnl"], "4")
+            self.assertEqual(runtime.status()["current_position"], "FLAT")
+            self.assertEqual(runtime.status()["working_owned_orders"], 0)
+            self.assertEqual(len(ledger.recent_kinds(("EXECUTION_REALIZED_PNL",))), 1)
+            self.assertEqual(len(ledger.recent_kinds(("INCIDENT_DUPLICATE_EXECUTION_CALLBACK",))), 1)
+            runtime.stop(); ledger.close()
+
+        classifications = {
+            "foreign account": {"account_name": "Lucid25kflex01", "instrument": "MNQ SEP26"},
+            "foreign instrument": {"account_name": "Sim101", "instrument": "NQ SEP26"},
+        }
+        for name, identity in classifications.items():
+            with self.subTest(name=name), TemporaryDirectory() as directory:
+                ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+                runtime = LaneIIIPaperRuntime(ledger)
+                runtime._state = PaperRuntimeState.ENTRY_PENDING
+                runtime.on_execution_message({
+                    "message_type": "EXECUTION_EVENT", "order_role": "ENTRY", "price": "100",
+                    "quantity": 1, "direction": "LONG", "native_execution_id": name,
+                    **identity,
+                })
+                self.assertEqual(runtime.state, PaperRuntimeState.LOCKED_OUT)
+                self.assertTrue(runtime._snapshot.foreign_activity)
+                runtime.stop(); ledger.close()
+
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            runtime = LaneIIIPaperRuntime(ledger)
+            runtime._state = PaperRuntimeState.ARMED_FLAT
+            runtime.on_execution_message({
+                "message_type": "EXECUTION_EVENT", "order_role": "ENTRY", "price": "100",
+                "quantity": 1, "direction": "LONG", "native_execution_id": "out-of-order-entry",
+                "account_name": "Sim101", "instrument": "MNQ SEP26",
+            })
+            self.assertEqual(runtime.state, PaperRuntimeState.LOCKED_OUT)
+            self.assertEqual(runtime.status()["lockout_or_fault_reason"], "UNEXPECTED_ENTRY_EXECUTION_STATE")
             runtime.stop(); ledger.close()
 
     def test_ambiguous_restarts_and_unexpected_fills_lock_out(self) -> None:

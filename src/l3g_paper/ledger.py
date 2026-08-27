@@ -405,11 +405,21 @@ class PaperLedger:
                     commissioning_id TEXT PRIMARY KEY,
                     reservation_record_json TEXT NOT NULL,
                     entry_consumed INTEGER NOT NULL,
+                    entry_decision_id TEXT,
                     released INTEGER NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
+            ownership_columns = {
+                str(row[1]) for row in connection.execute(
+                    "PRAGMA table_info(lane_iii_paper_commissioning_ownership)"
+                )
+            }
+            if "entry_decision_id" not in ownership_columns:
+                connection.execute(
+                    "ALTER TABLE lane_iii_paper_commissioning_ownership ADD COLUMN entry_decision_id TEXT"
+                )
             # This metadata has no trading semantics.  It gives the local
             # verifier a stable ledger identity and sealed epoch/schema facts
             # without granting the verifier write access to the ledger.
@@ -726,7 +736,8 @@ class PaperLedger:
                             VALUES (?, ?, 0, 0, ?)
                             ON CONFLICT(commissioning_id) DO UPDATE SET
                                 reservation_record_json=excluded.reservation_record_json,
-                                entry_consumed=0, released=0, updated_at=excluded.updated_at
+                                entry_consumed=0, entry_decision_id=NULL,
+                                released=0, updated_at=excluded.updated_at
                             """,
                             (commissioning_id, serialized, at),
                         )
@@ -736,12 +747,13 @@ class PaperLedger:
                         connection.execute(
                             """
                             INSERT INTO lane_iii_paper_commissioning_ownership
-                                (commissioning_id, reservation_record_json, entry_consumed, released, updated_at)
-                            VALUES (?, ?, 1, 0, ?)
+                                (commissioning_id, reservation_record_json, entry_consumed, entry_decision_id, released, updated_at)
+                            VALUES (?, ?, 1, ?, 0, ?)
                             ON CONFLICT(commissioning_id) DO UPDATE SET
-                                entry_consumed=1, released=0, updated_at=excluded.updated_at
+                                entry_consumed=1, entry_decision_id=excluded.entry_decision_id,
+                                released=0, updated_at=excluded.updated_at
                             """,
-                            (commissioning_id, serialized, at),
+                            (commissioning_id, serialized, ownership_payload.get("entry_decision_id"), at),
                         )
                 elif kind == "COMMISSIONING_OWNERSHIP_RELEASED" and isinstance(ownership_payload, Mapping):
                     commissioning_id = ownership_payload.get("commissioning_id")
@@ -932,6 +944,31 @@ class PaperLedger:
             if row is None:
                 return None
             return json.loads(str(row["reservation_record_json"])), bool(row["entry_consumed"])
+
+    def commissioning_ownership(
+        self, commissioning_id: str,
+    ) -> tuple[dict[str, object], bool, bool] | None:
+        """Resolve one deterministic commissioning request without replaying it."""
+        if not isinstance(commissioning_id, str) or not commissioning_id:
+            raise ValueError("Commissioning identity is required.")
+        with self._ordering_lock:
+            self.flush_deferred()
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT reservation_record_json, entry_consumed, entry_decision_id, released
+                FROM lane_iii_paper_commissioning_ownership
+                WHERE commissioning_id=?
+                """,
+                (commissioning_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            record = json.loads(str(row["reservation_record_json"]))
+            payload = record.get("payload") if isinstance(record, dict) else None
+            if isinstance(payload, dict) and isinstance(row["entry_decision_id"], str):
+                payload["entry_decision_id"] = str(row["entry_decision_id"])
+            return record, bool(row["entry_consumed"]), bool(row["released"])
 
     def _verify_chain_uncached(self) -> tuple[bool, str | None]:
         with self._lock:

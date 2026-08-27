@@ -55,6 +55,7 @@ class PaperRiskSnapshot:
     market_price_connected: bool = False
     execution_bridge_healthy: bool = False
     evidence_warmed: bool = False
+    commissioning_session_warmed: bool = False
     local_sequence_gap: bool = False
     depth_reset_recovery: bool = True
     quote_observed_at: str | None = None
@@ -157,11 +158,17 @@ class PaperRiskAuthority:
         age = at - source
         return reason if age < timedelta(0) or age > timedelta(seconds=maximum_seconds) else None
 
-    def preflight(self, snapshot: PaperRiskSnapshot, *, at: str) -> tuple[bool, tuple[str, ...]]:
+    def preflight_reasons(
+        self,
+        snapshot: PaperRiskSnapshot,
+        *,
+        at: str,
+        commissioning: bool = False,
+    ) -> tuple[str, ...]:
+        """Evaluate entry predicates without changing risk-authority counters."""
         if type(snapshot) is not PaperRiskSnapshot:
             raise ValueError("Preflight requires an exact paper risk snapshot.")
         with self._lock:
-            self._arm_attempts += 1
             moment = self._time(at)
             reasons = self._identity_reasons(snapshot)
             if snapshot.current_position is not PaperDirection.FLAT or snapshot.current_position_quantity != 0:
@@ -176,10 +183,20 @@ class PaperRiskAuthority:
                 reasons.append("MARKET_OBSERVER_UNHEALTHY")
             if not snapshot.execution_bridge_healthy:
                 reasons.append("EXECUTION_BRIDGE_UNHEALTHY")
-            if not snapshot.evidence_warmed:
+            if commissioning:
+                if not snapshot.commissioning_session_warmed:
+                    reasons.append("COMMISSIONING_SESSION_NOT_WARMED")
+            elif not snapshot.evidence_warmed:
                 reasons.append("PAPER_EVIDENCE_NOT_WARMED")
             if snapshot.local_sequence_gap or snapshot.depth_reset_recovery:
                 reasons.append("PAPER_CONTINUITY_UNUSABLE")
+            if commissioning:
+                freshness = (
+                    self._age_reason(moment, snapshot.quote_observed_at, self.profile.quote_maximum_age_seconds, "QUOTE_STALE"),
+                    self._age_reason(moment, snapshot.classified_trade_observed_at, self.profile.classified_trade_maximum_age_seconds, "CLASSIFIED_TRADE_STALE"),
+                    self._age_reason(moment, snapshot.depth_mutation_observed_at, self.profile.depth_mutation_maximum_age_seconds, "DEPTH_MUTATION_STALE"),
+                )
+                reasons.extend(reason for reason in freshness if reason is not None)
             context = self._context(snapshot, at)
             if context.session_kind is PaperSessionKind.OFF_SESSION:
                 reasons.append("OFF_SESSION")
@@ -197,6 +214,19 @@ class PaperRiskAuthority:
                 reasons.append("TRADE_DATE_ENTRY_CAP")
             if snapshot.consecutive_losses >= self.profile.maximum_consecutive_losses:
                 reasons.append("CONSECUTIVE_LOSS_LOCKOUT")
+            return tuple(dict.fromkeys(reasons))
+
+    def preflight(
+        self,
+        snapshot: PaperRiskSnapshot,
+        *,
+        at: str,
+        commissioning: bool = False,
+    ) -> tuple[bool, tuple[str, ...]]:
+        """Count one authoritative ARM/start attempt after pure validation."""
+        reasons = self.preflight_reasons(snapshot, at=at, commissioning=commissioning)
+        with self._lock:
+            self._arm_attempts += 1
             if reasons:
                 self._arm_denials += 1
             return not reasons, tuple(dict.fromkeys(reasons))
@@ -310,7 +340,10 @@ class PaperRiskAuthority:
                     reasons.append("LOCAL_SEQUENCE_GAP")
                 if snapshot.depth_reset_recovery:
                     reasons.append("DEPTH_RESET_RECOVERY")
-                if not snapshot.evidence_warmed:
+                if intent.commissioning:
+                    if not snapshot.commissioning_session_warmed:
+                        reasons.append("COMMISSIONING_SESSION_NOT_WARMED")
+                elif not snapshot.evidence_warmed:
                     reasons.append("PAPER_EVIDENCE_NOT_WARMED")
                 freshness = (
                     self._age_reason(moment, snapshot.quote_observed_at, self.profile.quote_maximum_age_seconds, "QUOTE_STALE"),

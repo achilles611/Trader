@@ -96,6 +96,39 @@ class PaperRiskTests(unittest.TestCase):
         self.assertTrue(grant.valid_at("2026-08-24T14:00:05Z"))
         self.assertFalse(grant.valid_at("2026-08-24T14:00:05.000001Z"))
 
+    def test_commissioning_warmup_and_strategy_evidence_are_distinct_authorities(self) -> None:
+        authority = PaperRiskAuthority()
+        commissioning_ready = replace(
+            healthy_snapshot(), evidence_warmed=False, commissioning_session_warmed=True,
+        )
+        allowed, reasons = authority.preflight(commissioning_ready, at=AT, commissioning=True)
+        self.assertTrue(allowed, reasons)
+        strategy_allowed, strategy_reasons = authority.preflight(commissioning_ready, at=AT)
+        self.assertFalse(strategy_allowed)
+        self.assertIn("PAPER_EVIDENCE_NOT_WARMED", strategy_reasons)
+
+        commissioning_cold = replace(
+            healthy_snapshot(), evidence_warmed=True, commissioning_session_warmed=False,
+        )
+        allowed, reasons = authority.preflight(commissioning_cold, at=AT, commissioning=True)
+        self.assertFalse(allowed)
+        self.assertIn("COMMISSIONING_SESSION_NOT_WARMED", reasons)
+        self.assertNotIn("PAPER_EVIDENCE_NOT_WARMED", reasons)
+
+    def test_commissioning_freshness_thresholds_are_exact_and_independent_of_latch(self) -> None:
+        authority = PaperRiskAuthority()
+        boundary = replace(
+            healthy_snapshot(), commissioning_session_warmed=True,
+            quote_observed_at="2026-08-24T13:59:58Z",
+            classified_trade_observed_at="2026-08-24T13:59:55Z",
+            depth_mutation_observed_at="2026-08-24T13:59:55Z",
+        )
+        self.assertTrue(authority.preflight(boundary, at=AT, commissioning=True)[0])
+        stale = replace(boundary, quote_observed_at="2026-08-24T13:59:57.999999Z")
+        allowed, reasons = authority.preflight(stale, at=AT, commissioning=True)
+        self.assertFalse(allowed)
+        self.assertIn("QUOTE_STALE", reasons)
+
 
 if __name__ == "__main__":
     unittest.main()

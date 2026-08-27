@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -36,7 +36,8 @@ class CommissioningOwnershipTests(unittest.TestCase):
         runtime._snapshot = PaperRiskSnapshot(
             observed_at, position_snapshot_complete=True, order_snapshot_complete=True,
             reconciliation_current=True, local_bridge_healthy=True, market_price_connected=True,
-            execution_bridge_healthy=True, evidence_warmed=True, depth_reset_recovery=False,
+            execution_bridge_healthy=True, evidence_warmed=True,
+            commissioning_session_warmed=True, depth_reset_recovery=False,
             quote_observed_at=observed_at, classified_trade_observed_at=observed_at,
             depth_mutation_observed_at=observed_at, session_kind=context.session_kind,
             session_id=context.session_id, trade_date=context.trade_date,
@@ -56,7 +57,12 @@ class CommissioningOwnershipTests(unittest.TestCase):
 
     def commissioning_arm(self, runtime: LaneIIIPaperRuntime, now: str | None = None) -> dict[str, object]:
         with patch("src.l3g_paper.runtime._now", return_value=now or self.now):
-            result = runtime.commissioning_arm()
+            result = runtime.commissioning_arm(
+                lambda commissioning_id, runtime_snapshot: {
+                    "ledger_trust_state": "TEST_VERIFIED_ANCHOR",
+                    "commissioning_id": commissioning_id,
+                }
+            )
         self.assertTrue(result["armed"], result)
         return result
 
@@ -127,7 +133,12 @@ class CommissioningOwnershipTests(unittest.TestCase):
 
             def arm() -> None:
                 with patch("src.l3g_paper.runtime._now", return_value=self.now):
-                    arm_result.update(runtime.commissioning_arm())
+                    arm_result.update(runtime.commissioning_arm(
+                        lambda commissioning_id, runtime_snapshot: {
+                            "ledger_trust_state": "TEST_VERIFIED_ANCHOR",
+                            "commissioning_id": commissioning_id,
+                        }
+                    ))
 
             def strategy() -> None:
                 self.assertTrue(reserved.wait(2))
@@ -262,14 +273,195 @@ class CommissioningOwnershipTests(unittest.TestCase):
             self.assertEqual(sum(result.get("reason_codes") == ("COMMISSIONING_ENTRY_ALREADY_CONSUMED",) for result in entries), 1)
             self.close(runtime, ledger)
 
-    def test_pre_command_commissioning_failure_disarms_and_releases_but_exit_and_flatten_remain_available(self) -> None:
+    def test_atomic_start_is_idempotent_for_duplicate_and_timeout_retry_requests(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger, runtime, _ = self.ready_runtime(directory)
+            commands: list[object] = []
+            runtime._persist_and_send = lambda command, grant: commands.append(command)  # type: ignore[method-assign]
+            ledger_preflight = lambda commissioning_id, snapshot: {
+                "ledger_trust_state": "TEST_VERIFIED_ANCHOR",
+                "commissioning_id": commissioning_id,
+            }
+            request_id = "http-timeout-retry-0001"
+            with patch("src.l3g_paper.runtime._now", return_value=self.now):
+                accepted = runtime.commissioning_start(request_id, ledger_preflight)
+                retry = runtime.commissioning_start(request_id, ledger_preflight)
+            self.assertTrue(accepted["submitted"])
+            self.assertFalse(accepted.get("idempotent_replay", False))
+            self.assertTrue(retry["submitted"])
+            self.assertTrue(retry["idempotent_replay"])
+            self.assertEqual(accepted["commissioning_id"], retry["commissioning_id"])
+            self.assertEqual(accepted["decision_id"], retry["decision_id"])
+            self.assertEqual(len(commands), 1)
+            kinds = {record["kind"] for record in ledger.recent(50)}
+            self.assertTrue({
+                "COMMISSIONING_PREFLIGHT_ACCEPTED", "COMMISSIONING_OWNERSHIP_RESERVED",
+                "COMMISSIONING_ENTRY_AUTHORIZED", "COMMISSIONING_ENTRY_SUBMITTED",
+            }.issubset(kinds))
+            self.close(runtime, ledger)
+
+    def test_concurrent_duplicate_atomic_starts_emit_at_most_one_entry_command(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger, runtime, _ = self.ready_runtime(directory)
+            commands: list[object] = []
+            runtime._persist_and_send = lambda command, grant: commands.append(command)  # type: ignore[method-assign]
+            barrier = threading.Barrier(2)
+            results: list[dict[str, object]] = []
+
+            def start() -> None:
+                barrier.wait()
+                with patch("src.l3g_paper.runtime._now", return_value=self.now):
+                    results.append(runtime.commissioning_start(
+                        "concurrent-request-0001",
+                        lambda commissioning_id, snapshot: {"ledger_trust_state": "TEST_VERIFIED_ANCHOR"},
+                    ))
+
+            first = threading.Thread(target=start); second = threading.Thread(target=start)
+            first.start(); second.start(); first.join(2); second.join(2)
+            self.assertFalse(first.is_alive()); self.assertFalse(second.is_alive())
+            self.assertEqual(len(commands), 1)
+            self.assertEqual(sum(bool(result.get("idempotent_replay")) for result in results), 1)
+            self.assertEqual({str(result["commissioning_id"]) for result in results}, {str(results[0]["commissioning_id"])})
+            self.close(runtime, ledger)
+
+    def test_synchronous_fill_callback_during_atomic_submit_is_reentrant_and_owned(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger, runtime, _ = self.ready_runtime(directory)
+            commands: list[object] = []
+
+            def submit(command: object, grant: object) -> None:
+                commands.append(command)
+                runtime.on_execution_message({
+                    "message_type": "EXECUTION_EVENT", "order_role": "ENTRY",
+                    "account_name": "Sim101", "instrument": "MNQ SEP26",
+                    "price": "100.25", "quantity": 1, "direction": "LONG",
+                    "command_id": command.command_id, "decision_id": command.decision_id,  # type: ignore[attr-defined]
+                    "native_order_id": "sync-entry-order", "native_execution_id": "sync-entry-fill",
+                    "timestamp": self.now,
+                })
+
+            runtime._persist_and_send = submit  # type: ignore[method-assign]
+            with patch("src.l3g_paper.runtime._now", return_value=self.now):
+                result = runtime.commissioning_start(
+                    "synchronous-callback-0001",
+                    lambda commissioning_id, snapshot: {"ledger_trust_state": "TEST_VERIFIED_ANCHOR"},
+                )
+            self.assertTrue(result["submitted"])
+            self.assertEqual(len(commands), 1)
+            self.assertEqual(runtime.state, PaperRuntimeState.LONG)
+            self.assertEqual(runtime.status()["entry_owner"], PaperEntryOwner.COMMISSIONING.value)
+            self.assertEqual(runtime.status()["last_execution"]["native_order_id"], "sync-entry-order")
+            self.close(runtime, ledger)
+
+    def test_commissioning_authorization_short_delay_succeeds_and_expiry_disarms(self) -> None:
+        def clock(delay_seconds: int):
+            calls = 0
+            base = datetime.fromisoformat(self.now.replace("Z", "+00:00"))
+
+            def current() -> str:
+                nonlocal calls
+                calls += 1
+                delay = delay_seconds if calls >= 5 else 0
+                return (base + timedelta(seconds=delay)).isoformat().replace("+00:00", "Z")
+
+            return current
+
+        with TemporaryDirectory() as directory:
+            ledger, runtime, _ = self.ready_runtime(directory)
+            lifecycle = self.commissioning_arm(runtime)
+            commands: list[object] = []
+            runtime._persist_and_send = lambda command, grant: commands.append(command)  # type: ignore[method-assign]
+            with patch("src.l3g_paper.runtime._now", side_effect=clock(1)):
+                result = runtime.commission_entry(
+                    str(lifecycle["commissioning_id"]), str(lifecycle["commissioning_token"]),
+                )
+            self.assertTrue(result["submitted"])
+            self.assertEqual(len(commands), 1)
+            self.close(runtime, ledger)
+
+        with TemporaryDirectory() as directory:
+            ledger, runtime, _ = self.ready_runtime(directory)
+            lifecycle = self.commissioning_arm(runtime)
+            commands = []
+            runtime._persist_and_send = lambda command, grant: commands.append(command)  # type: ignore[method-assign]
+            with patch("src.l3g_paper.runtime._now", side_effect=clock(6)):
+                result = runtime.commission_entry(
+                    str(lifecycle["commissioning_id"]), str(lifecycle["commissioning_token"]),
+                )
+            self.assertFalse(result["submitted"])
+            self.assertEqual(result["reason_codes"], ("COMMISSIONING_ENTRY_AUTHORIZATION_EXPIRED",))
+            self.assertEqual(commands, [])
+            self.assertEqual(runtime.state, PaperRuntimeState.READY_DISARMED)
+            self.assertEqual(runtime.status()["entry_owner"], PaperEntryOwner.NONE.value)
+            ownership = ledger.commissioning_ownership(str(lifecycle["commissioning_id"]))
+            self.assertIsNotNone(ownership)
+            self.assertFalse(ownership[1])  # type: ignore[index]
+            self.assertTrue(ownership[2])  # type: ignore[index]
+            self.close(runtime, ledger)
+
+    def test_transport_delay_holds_single_atomic_authority_boundary_against_strategy(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger, runtime, _ = self.ready_runtime(directory)
+            transport_entered = threading.Event()
+            release_transport = threading.Event()
+            commands: list[object] = []
+            start_result: list[dict[str, object]] = []
+            strategy_result: list[bool] = []
+
+            def submit(command: object, grant: object) -> None:
+                commands.append(command)
+                transport_entered.set()
+                self.assertTrue(release_transport.wait(2))
+
+            runtime._persist_and_send = submit  # type: ignore[method-assign]
+
+            def start() -> None:
+                with patch("src.l3g_paper.runtime._now", return_value=self.now):
+                    start_result.append(runtime.commissioning_start(
+                        "transport-delay-0001",
+                        lambda commissioning_id, snapshot: {"ledger_trust_state": "TEST_VERIFIED_ANCHOR"},
+                    ))
+
+            def strategy() -> None:
+                self.assertTrue(transport_entered.wait(2))
+                strategy_result.append(runtime._request_entry(self.strategy_decision()))  # type: ignore[arg-type]
+
+            start_thread = threading.Thread(target=start); strategy_thread = threading.Thread(target=strategy)
+            start_thread.start(); strategy_thread.start()
+            self.assertTrue(transport_entered.wait(2))
+            self.assertTrue(strategy_thread.is_alive())
+            release_transport.set()
+            start_thread.join(2); strategy_thread.join(2)
+            self.assertTrue(start_result[0]["submitted"])
+            self.assertEqual(strategy_result, [False])
+            self.assertEqual(len(commands), 1)
+            self.assertTrue(commands[0].commissioning)  # type: ignore[attr-defined]
+            self.close(runtime, ledger)
+
+    def test_natural_alpha_expiry_does_not_clear_commissioning_authority(self) -> None:
         with TemporaryDirectory() as directory:
             ledger, runtime, _ = self.ready_runtime(directory)
             lifecycle = self.commissioning_arm(runtime)
             runtime._snapshot = replace(runtime._snapshot, evidence_warmed=False)
+            commands: list[object] = []
+            runtime._persist_and_send = lambda command, grant: commands.append(command)  # type: ignore[method-assign]
+            with patch("src.l3g_paper.runtime._now", return_value=self.now):
+                result = runtime.commission_entry(str(lifecycle["commissioning_id"]), str(lifecycle["commissioning_token"]))
+            self.assertTrue(result["submitted"])
+            self.assertEqual(len(commands), 1)
+            self.assertTrue(commands[0].commissioning)  # type: ignore[attr-defined]
+            self.assertEqual(runtime.state, PaperRuntimeState.ENTRY_PENDING)
+            self.close(runtime, ledger)
+
+    def test_commissioning_warmup_reset_denies_entry_disarms_and_releases(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger, runtime, _ = self.ready_runtime(directory)
+            lifecycle = self.commissioning_arm(runtime)
+            runtime._snapshot = replace(runtime._snapshot, commissioning_session_warmed=False)
             with patch("src.l3g_paper.runtime._now", return_value=self.now):
                 failed = runtime.commission_entry(str(lifecycle["commissioning_id"]), str(lifecycle["commissioning_token"]))
             self.assertFalse(failed["submitted"])
+            self.assertIn("COMMISSIONING_SESSION_NOT_WARMED", failed["reason_codes"])
             self.assertEqual(runtime.state, PaperRuntimeState.READY_DISARMED)
             self.assertEqual(runtime.status()["entry_owner"], PaperEntryOwner.NONE.value)
             kinds = {item["kind"] for item in ledger.recent_kinds(("COMMISSIONING_OWNERSHIP_RELEASED", "INCIDENT_COMMISSIONING_ENTRY_REJECTED"))}
