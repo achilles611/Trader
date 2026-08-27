@@ -6,11 +6,16 @@ from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from src.l3f_provider.ninjatrader_observation import NinjaTraderObservationError
 from src.l3f_provider.tradovate_observation import ProviderErrorCode, StreamHealth
 from src.l3g_paper.contracts import PaperRuntimeState
-from src.l3g_paper.ledger import PaperLedger
+from src.l3g_paper.ledger import (
+    CommissioningTailCategory,
+    PaperLedger,
+    commissioning_tail_classification,
+)
 from src.l3g_paper.runtime import LaneIIIPaperRuntime
 from src.l3g_paper.sessions import UNSPECIFIED_OFF_SESSION_CONTEXT
 
@@ -46,6 +51,19 @@ class CommissioningWarmupTests(unittest.TestCase):
             self.assertTrue(all(value["seen"] for value in progress.values()))
             warmed_records = ledger.recent_kinds(("COMMISSIONING_SESSION_WARMED",))
             self.assertEqual(len(warmed_records), 1)
+            self.assertEqual(warmed_records[0]["payload"]["authority_effect"], "NONE")
+            self.assertEqual(
+                warmed_records[0]["payload"]["record_semantics"],
+                "COMMISSIONING_READINESS_STATE_ATTESTATION",
+            )
+            self.assertEqual(warmed_records[0]["payload"]["record_semantics_version"], 1)
+            self.assertEqual(warmed_records[0]["payload"]["commissioning_warmup_state"], "WARMED")
+            self.assertEqual(
+                commissioning_tail_classification(
+                    "INCIDENT", warmed_records[0]["kind"], warmed_records[0]["payload"],
+                ).category,
+                CommissioningTailCategory.AUTHORITY_OBSERVATION,
+            )
 
             after_expiry = (factory.start + timedelta(minutes=3)).isoformat().replace("+00:00", "Z")
             self.assertEqual(runtime.policy.active_evidence(after_expiry), ())
@@ -117,7 +135,21 @@ class CommissioningWarmupTests(unittest.TestCase):
                 self.assertTrue(runtime.status()["commissioning_session_warmed"])
                 action(runtime, factory)
                 self.assertFalse(runtime.status()["commissioning_session_warmed"])
-                self.assertEqual(len(ledger.recent_kinds(("COMMISSIONING_SESSION_WARMUP_RESET",), limit=20)), 1)
+                reset_records = ledger.recent_kinds(("COMMISSIONING_SESSION_WARMUP_RESET",), limit=20)
+                self.assertEqual(len(reset_records), 1)
+                self.assertEqual(reset_records[0]["payload"]["authority_effect"], "NONE")
+                self.assertEqual(
+                    reset_records[0]["payload"]["record_semantics"],
+                    "COMMISSIONING_READINESS_STATE_ATTESTATION",
+                )
+                self.assertEqual(reset_records[0]["payload"]["record_semantics_version"], 1)
+                self.assertEqual(reset_records[0]["payload"]["commissioning_warmup_state"], "NOT_WARMED")
+                self.assertEqual(
+                    commissioning_tail_classification(
+                        "INCIDENT", reset_records[0]["kind"], reset_records[0]["payload"],
+                    ).category,
+                    CommissioningTailCategory.AUTHORITY_OBSERVATION,
+                )
                 runtime.stop(); ledger.close()
 
     def test_session_generation_off_session_reconnect_and_restart_start_cold(self) -> None:
@@ -166,7 +198,7 @@ class CommissioningWarmupTests(unittest.TestCase):
             before = ledger.health_status()["highest_sequence"]
             risk_before = runtime.risk.status()["arm_attempts"]
             at = "2026-08-26T14:00:00Z"
-            with unittest.mock.patch("src.l3g_paper.runtime._now", return_value=at):
+            with patch("src.l3g_paper.runtime._now", return_value=at):
                 result = runtime.commissioning_rehearsal(lambda commissioning_id, snapshot: {
                     "ledger_trust_state": "TEST_VERIFIED_ANCHOR",
                     "verified_anchor": 10,
@@ -180,7 +212,9 @@ class CommissioningWarmupTests(unittest.TestCase):
             self.assertIn("broker", result)
             self.assertIn("addon", result)
             self.assertIn("ownership", result)
+            ledger.flush_deferred()
             self.assertEqual(runtime.state, PaperRuntimeState.READY_DISARMED)
+            self.assertEqual(runtime.status()["entry_owner"], "NONE")
             self.assertEqual(runtime.risk.status()["arm_attempts"], risk_before)
             self.assertEqual(ledger.health_status()["highest_sequence"], before)
             runtime.stop(); ledger.close()

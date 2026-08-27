@@ -30,7 +30,12 @@ from .contracts import (
     PaperSessionArmGrant,
     deterministic_id,
 )
-from .ledger import COMMISSIONING_NO_AUTHORITY_EFFECT, PaperLedger
+from .ledger import (
+    COMMISSIONING_NO_AUTHORITY_EFFECT,
+    COMMISSIONING_READINESS_RECORD_SEMANTICS,
+    COMMISSIONING_READINESS_RECORD_SEMANTICS_VERSION,
+    PaperLedger,
+)
 from .ninjatrader_transport import NinjaTraderSim101PaperAdapter, PaperExecutionTransport
 from .policy import ExperimentalPaperPolicy
 from .risk import PaperRiskAuthority, PaperRiskSnapshot
@@ -90,6 +95,11 @@ _COMMISSIONING_WARMUP_POLICY = {
     "runtime_restart_clears_latch": True,
 }
 _COMMISSIONING_WARMUP_POLICY_HASH = canonical_hash(_COMMISSIONING_WARMUP_POLICY)
+_COMMISSIONING_WARMUP_RECORD_MARKERS = {
+    "authority_effect": COMMISSIONING_NO_AUTHORITY_EFFECT,
+    "record_semantics": COMMISSIONING_READINESS_RECORD_SEMANTICS,
+    "record_semantics_version": COMMISSIONING_READINESS_RECORD_SEMANTICS_VERSION,
+}
 
 
 class ObservationFanout:
@@ -338,6 +348,8 @@ class LaneIIIPaperRuntime:
                 "COMMISSIONING_SESSION_WARMUP_RESET",
                 {
                     **prior.payload(),
+                    **_COMMISSIONING_WARMUP_RECORD_MARKERS,
+                    "commissioning_warmup_state": "NOT_WARMED",
                     "reset_at": _now(),
                     "reason": reason,
                     "required_families": list(_COMMISSIONING_WARMUP_POLICY["required_families"]),
@@ -386,6 +398,8 @@ class LaneIIIPaperRuntime:
             "COMMISSIONING_SESSION_WARMED",
             {
                 **context.payload(),
+                **_COMMISSIONING_WARMUP_RECORD_MARKERS,
+                "commissioning_warmup_state": "WARMED",
                 "warmed_at": warmed_at,
                 "required_families": list(_COMMISSIONING_WARMUP_POLICY["required_families"]),
                 "evidence_provenance": dict(self._commissioning_warmup_seen),

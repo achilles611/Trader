@@ -90,45 +90,67 @@ rows in the scheduler, UI, HTTP request, or WebSocket task. The missed-run
 policy is `SKIP`: one missed time creates a durable missed record and the next
 normal occurrence runs; there is no surprise catch-up scan.
 
-Commissioning ARM consumes the compact verifier artifact plus the writer's
-transactional authority watermark. It requires a fresh PASS, trusted
+Commissioning admission consumes the compact verifier artifact plus the writer's
+transactional v3 tail watermark. It requires a fresh PASS, trusted
 checkpoint, valid ledger identity/ancestry, retained Full provenance, and an
 anchor record hash that still matches the ledger. Exact equality with the live
-tip is ideal but not required. When the tip has moved, ARM accepts only
-`VERIFIED_ANCHOR_WITH_PASSIVE_LIVE_TAIL`: every append through the captured
-ARM snapshot was classified, and the last authority-changing or unknown record
-is at or before the verified anchor.
+tip is ideal but not required. When the tip has moved, admission accepts an
+exactly classified live tail only when both the last authority mutation and the
+last unknown record are at or before the verified anchor. A tail containing an
+exact authority observation may report
+`VERIFIED_ANCHOR_WITH_ACCEPTED_LIVE_TAIL`; a passive-only tail retains
+`VERIFIED_ANCHOR_WITH_PASSIVE_LIVE_TAIL`.
 
-The fail-closed passive policy admits only exact QUOTE/TRADE/DEPTH
-`OBSERVATION_ENVELOPE` shapes, validated read-only account-item updates stamped
-`INFORMATIONAL_ACCOUNT_ITEM` and `authority_effect=NONE`, exact paper
-`EVIDENCE`, and strategy decisions that were persisted through the no-side-effect path with
-`authority_effect=NONE`. Domain membership alone grants nothing. Unmarked or
-unknown decisions, unmarked or unknown account observations, order/position/
-execution observations, intents, grants, commands,
-receipts, order events, executions, position/reconciliation records, session
-or ARM/DISARM changes, commissioning ownership, risk events, incidents, and
-unknown future records advance the authority watermark and produce
-`COMMISSIONING_LEDGER_TAIL_UNTRUSTED` until Auto verifies them.
+Policy `l3g-commissioning-passive-tail-v3` assigns every record to one explicit
+class. `PASSIVE_DATA` contains only exact QUOTE/TRADE/DEPTH observation
+envelopes, exact paper `EVIDENCE`, and exact no-side-effect strategy decisions.
+`AUTHORITY_OBSERVATION` contains exact informational account items and the
+version-1 commissioning-readiness attestations whose payloads carry
+`authority_effect=NONE`,
+`record_semantics=COMMISSIONING_READINESS_STATE_ATTESTATION`, the exact
+semantics version, and the exact `WARMED` or `NOT_WARMED` state. These records
+describe runtime or authority-relevant state but cannot grant or consume
+execution authority. Exact key sets, session identity, policy hash, provenance,
+and semantic values are required; domain membership alone grants nothing.
 
-The watermark and a classification cursor are updated in the same SQLite
-transaction as each append; passive deferred records update the compact cursor
-once per batch, not once per market event. ARM captures the verifier anchor,
-authority watermark, live tip, tail kinds, current broker reconciliation,
-session, and entry ownership while holding the runtime admission lock. The
-accepted evidence is embedded in `COMMISSIONING_OWNERSHIP_RESERVED`. New
-passive observations after that snapshot do not revoke the reservation, while
-other authority paths cannot cross the same lock before ownership is reserved.
-Commissioning entry therefore does not rerun the pre-ARM ledger gate against
-its own ARM/ownership records. Exit and flatten safety paths remain available.
+Known commands, receipts, intents, risk grants/events, orders, fills,
+commissioning ownership, session authority changes, and other side-effect
+records are `AUTHORITY_MUTATION`. `POSITION_SNAPSHOT` is not blanket-allowed;
+it remains mutation-classified until an exact, independently justified
+observation schema exists. Any unrecognized kind, extra or missing field,
+malformed marker, old unmarked warmup row, or future shape is `UNKNOWN` and
+fails closed. Both mutation and unknown watermarks must be covered by the
+verified anchor or admission returns `COMMISSIONING_LEDGER_TAIL_UNTRUSTED`.
+
+Separate mutation, observation, and unknown watermarks plus a classification
+cursor are updated in the same SQLite transaction and ledger-sequence order as
+each append; deferred batches use that same ordered update. Migration from v2
+is bounded: previously safe classifications are retained, the old overloaded
+unsafe watermark becomes unknown, and only the suffix is classified under v3.
+Historical rows are never silently reinterpreted or scanned wholesale during a
+hot-ledger restart.
+
+Admission captures the verifier anchor, all three watermarks, live tip, tail
+kinds/categories, current broker reconciliation, session, and entry ownership
+while holding the runtime admission lock. Accepted unverified observations are
+never authority for current state: the validator independently requires exact
+Sim101/MNQ binding, FLAT quantity zero, complete position and order snapshots,
+zero owned/entry orders, no unresolved command/native order/execution, clean
+current transport reconciliation, ownership `NONE`, `READY_DISARMED`, and live
+capital `DENIED`. Therefore corruption of an observational row cannot create
+execution authority or substitute for current broker facts. The accepted
+evidence is embedded in `COMMISSIONING_OWNERSHIP_RESERVED`; later safe records
+do not revoke the reservation, while other authority paths cannot cross the
+same lock before ownership is reserved. Exit and flatten safety paths remain
+available.
 
 The existing 15-minute commissioning freshness bound is retained. Current
 incremental evidence shows a roughly one-to-two-second verifier over tens of
 thousands of rows, so the established bound is operationally ample without
-allowing a day-old anchor. Stale or authority-bearing tails launch Auto and
-deny ARM. A FAIL, IN_PROGRESS, identity mismatch, unknown classification, or
+allowing a day-old anchor. Stale, mutation-bearing, or unknown tails launch Auto
+and deny admission. A FAIL, IN_PROGRESS, identity mismatch, incomplete classification, or
 Full-required result also denies commissioning. After a lifecycle completes,
-Auto Incremental must cryptographically verify the passive tail and all
+Auto Incremental must cryptographically verify the accepted tail and all
 commissioning records before closure can claim PASS.
 
 The complete operator sequence, warmup semantics, atomic start boundary, and

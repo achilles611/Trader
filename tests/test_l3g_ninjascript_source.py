@@ -50,6 +50,11 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertIn("TrimBook(book)", source)
         self.assertIn("mutationPrice = book.ElementAt(e.Position).Key", source)
         self.assertIn("MARKET_OBSERVER_UNRESOLVED_DEPTH_REMOVE", source)
+        self.assertIn("bidAtTrade < askAtTrade", source)
+        self.assertIn("bestBid < bestAsk", source)
+        self.assertIn("MARKET_OBSERVER_REALTIME_STRICT_SPREAD_V1", source)
+        self.assertNotIn("bidAtTrade <= askAtTrade", source)
+        self.assertNotIn("bestBid <= bestAsk", source)
         for forbidden in ("CreateOrder(", ".Submit(", ".Cancel(", ".Flatten(", "NetworkStream.Read"):
             self.assertNotIn(forbidden, source)
 

@@ -31,6 +31,20 @@ may return **Strategy evidence** to `INCOMPLETE`; it does not clear the
 commissioning latch. Fresh quote, classified trade, and depth callbacks remain
 mandatory at actual admission.
 
+The NinjaTrader observer publishes a level-one quote only for a strict positive
+spread (`bestBid < bestAsk`). A transient locked book is ignored at that
+producer boundary and cannot refresh quote freshness. A malformed, locked, or
+crossed quote that nevertheless reaches the Python boundary still clears
+provisional evidence and the commissioning latch; that fail-closed reset was
+not weakened.
+
+Warmup `WARMED` and reset rows are output-only, version-1 readiness
+attestations. They carry `authority_effect=NONE` and exact commissioning
+readiness semantics, but are never replayed to recreate the process-local
+latch. New exact attestations are authority observations under tail policy v3,
+not passive market data and not authority mutations. Old unmarked or malformed
+attestations remain unknown until a verifier PASS covers them.
+
 Wait until BeezConsole shows the exact current session entry window as open and
 all three warmup-family rows as `SEEN`. Then select **Run Read-Only Commissioning
 Rehearsal**. Rehearsal invokes the production validation graph but cannot reserve
@@ -42,6 +56,13 @@ and every individual gate agrees. Resolve exact blocker codes rather than
 repeating start attempts. Storage warnings, a stale/failed verifier, an
 untrusted authority tail, observer inactivity, stale market inputs, or any
 ambiguous broker fact are hard blockers.
+
+The **Ledger health** panel exposes the verified anchor, captured tail tip and
+row count, trust state, last mutation/observation/unknown sequence-domain-kind
+tuples, and the latest blocking classification without exposing record
+payloads. For a nonempty accepted tail, confirm that every mutation and unknown
+watermark is at or before the verified anchor and that current independent
+broker/runtime reconciliation is clean.
 
 ## Canonical commissioning start
 

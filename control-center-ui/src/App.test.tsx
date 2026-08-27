@@ -24,6 +24,10 @@ let discoveryJobDetailResponse: Record<string, unknown> | null = null;
 let shadowResponse: Record<string, unknown> = { configured: false, state: "NOT_CONFIGURED", freshness: "UNKNOWN" };
 let ledgerVerificationResponse: Record<string, unknown> = { status: "UNVERIFIED", full_scan_required: true, chain_valid: false, checkpoint_valid: false, errors: [{ code: "NO_VERIFICATION_ARTIFACT", message: "No completed local ledger verification exists." }] };
 let ledgerVerificationSchedule: Record<string, unknown> = { enabled: false, frequency: "DISABLED", local_time: "03:00", weekday: 0, mode: "auto" };
+let laneIIIPaperOverrides: Record<string, unknown> = {};
+let laneIIILedgerOverrides: Record<string, unknown> = {};
+let commissioningRehearsalResponse: Record<string, unknown> | null = null;
+let commissioningRehearsalSideEffect: (() => void) | null = null;
 
 function payload(path: string) {
   if (path.startsWith("/api/overview")) return { counts: { total_discovered: emptyUniverse ? 0 : 20, qualified: 2, shadow: 1, active: 0 }, funnel: [], top_candidates: [candidate], recent_activity: [] };
@@ -39,11 +43,91 @@ function payload(path: string) {
   if (path.startsWith("/api/lane-iii/paper/ledger-verification/schedule")) return ledgerVerificationSchedule;
   if (path.startsWith("/api/lane-iii/paper/ledger-verification/cancel")) return { ...ledgerVerificationResponse, cancellation_requested: true };
   if (path.startsWith("/api/lane-iii/paper/ledger-verification")) return ledgerVerificationResponse;
-  if (path.startsWith("/api/lane-iii/paper")) return { state: "READY_DISARMED", ledger_verification: ledgerVerificationResponse, ledger: { path: "E:\\BeelzebubData\\Hot\\LaneIII\\Epoch-002\\lane_iii_paper.sqlite3", epoch_id: "L3G-PAPER-EPOCH-002", file_size: 4096, free_bytes: 200000000000, quick_check_state: "ok", chain_valid: true, broken_identity: null, highest_sequence: 12, last_record_time: "2026-08-25T00:30:00Z", wal_size: 1024 } };
+  if (path.startsWith("/api/lane-iii/paper/commissioning-rehearsal")) {
+    commissioningRehearsalSideEffect?.();
+    return commissioningRehearsalResponse || { result: "BLOCKED", blocking_reasons: ["FIXTURE_BLOCKED"] };
+  }
+  if (path.startsWith("/api/lane-iii/paper")) return {
+    state: "READY_DISARMED",
+    ledger_verification: ledgerVerificationResponse,
+    ledger: {
+      path: "E:\\BeelzebubData\\Hot\\LaneIII\\Epoch-002\\lane_iii_paper.sqlite3",
+      epoch_id: "L3G-PAPER-EPOCH-002",
+      file_size: 4096,
+      free_bytes: 200000000000,
+      quick_check_state: "ok",
+      chain_valid: true,
+      broken_identity: null,
+      highest_sequence: 125,
+      verified_through_sequence: 100,
+      unverified_tail_rows: 25,
+      commissioning_ledger_state: "UNVERIFIED_AUTHORITY_TAIL",
+      last_authority_mutation_sequence: 120,
+      last_authority_mutation_domain: "RISK_EVENT",
+      last_authority_mutation_kind: "RISK_LOCKOUT",
+      last_authority_observation_sequence: 124,
+      last_authority_observation_domain: "POSITION_SNAPSHOT",
+      last_authority_observation_kind: "BROKER_STATE_OBSERVED",
+      last_unknown_sequence: 125,
+      last_unknown_domain: "FUTURE_DOMAIN",
+      last_unknown_kind: "FUTURE_KIND",
+      last_blocking_classification: "UNKNOWN",
+      last_blocking_sequence: 125,
+      last_blocking_domain: "FUTURE_DOMAIN",
+      last_blocking_kind: "FUTURE_KIND",
+      last_blocking_payload: "DO_NOT_RENDER_TAIL_PAYLOAD",
+      last_record_time: "2026-08-25T00:30:00Z",
+      wal_size: 1024,
+      ...laneIIILedgerOverrides,
+    },
+    ...laneIIIPaperOverrides,
+  };
   if (path.startsWith("/api/system")) return { health: { mode: "paper", paper_only: true, database: { connected: true }, websocket: { available: true }, watcher: { state: "NOT_ATTACHED", desired_target_count: 0, subscribed_target_count: 0, membership_in_sync: true }, recovery: { wallets: [{ wallet: candidate.wallet, state: "RECOVERY_INCOMPLETE" }] } }, risk: { limits: [] } };
   if (path.startsWith("/api/candidates?")) return { items: emptyUniverse || filteredEmpty ? [] : [candidate], page: path.includes("page=2") ? 2 : 1, page_size: 50, total: emptyUniverse ? 0 : filteredEmpty ? 1 : 51, pages: 2 };
   if (path.startsWith(`/api/candidates/${candidate.wallet}`)) return { identity: { wallet: candidate.wallet, operator_state: "shadow", research_state: "qualified" }, score: { total: 87.3, eligible: true, components: { consistency: 9 }, penalties: { drawdown: 1 }, reasons: ["fixture_reason"] }, phase_a_prefilter_reasons: ["phase_a_fixture"], phase_b_hard_gates: ["phase_b_fixture"], target_performance: {}, follower_performance: {}, latency: { status: "unavailable" }, analysis_window: {} };
   return { items: [] };
+}
+
+function configureReadyLaneIIIUiFixture() {
+  const sessionId = "MNQU6:ASIA_GLOBEX:2026-08-26";
+  ledgerVerificationResponse = {
+    status: "PASS", verification_id: "lv-current", verified_through_sequence: 100,
+    chain_valid: true, checkpoint_valid: true, full_scan_required: false,
+  };
+  laneIIIPaperOverrides = {
+    current_session_id: sessionId, session_generation: 7,
+    current_position: "FLAT", current_quantity: 0, working_owned_orders: 0,
+    entry_owner: "NONE", live_capital: "DENIED", commissioning_lifecycle: { active: false },
+    market_observer: { market_observer_state: "ACTIVE" },
+    commissioning_warmup: { status: "WARMED" },
+    continuity: { healthy: true, local_bridge_healthy: true, market_price_connected: true },
+    market_freshness: {
+      quote: { fresh: true }, classified_trade: { fresh: true }, depth_mutation: { fresh: true },
+    },
+    transport: {
+      state: "AUTHENTICATED", authenticated_client: true, reconciled: true,
+      addon_provenance: { status: "MATCH" },
+    },
+  };
+  laneIIILedgerOverrides = {
+    highest_sequence: 125, verified_through_sequence: 100, unverified_tail_rows: 25,
+    commissioning_ledger_state: "VERIFIED_ANCHOR_WITH_ACCEPTED_LIVE_TAIL",
+    last_authority_mutation_sequence: 99, last_authority_mutation_domain: "SESSION",
+    last_authority_mutation_kind: "SESSION_AUTHORITY", last_unknown_sequence: 0,
+    last_unknown_domain: null, last_unknown_kind: null, last_blocking_sequence: 99,
+    last_blocking_classification: "AUTHORITY_MUTATION", last_blocking_domain: "SESSION",
+    last_blocking_kind: "SESSION_AUTHORITY",
+  };
+  commissioningRehearsalResponse = {
+    result: "READY", generated_at: new Date().toISOString(), blocking_reasons: [],
+    session: { session_id: sessionId, session_generation: 7 },
+    ledger: {
+      verification_id: "lv-current", verified_through_sequence: 100,
+      arm_snapshot_tip: 125, unverified_tail_rows: 25,
+      ledger_trust_state: "VERIFIED_ANCHOR_WITH_ACCEPTED_LIVE_TAIL",
+      last_authority_mutation_sequence: 99, last_unknown_sequence: 0,
+    },
+  };
 }
 
 beforeEach(() => {
@@ -56,6 +140,10 @@ beforeEach(() => {
   shadowResponse = { configured: false, state: "NOT_CONFIGURED", freshness: "UNKNOWN" };
   ledgerVerificationResponse = { status: "UNVERIFIED", full_scan_required: true, chain_valid: false, checkpoint_valid: false, errors: [{ code: "NO_VERIFICATION_ARTIFACT", message: "No completed local ledger verification exists." }] };
   ledgerVerificationSchedule = { enabled: false, frequency: "DISABLED", local_time: "03:00", weekday: 0, mode: "auto" };
+  laneIIIPaperOverrides = {};
+  laneIIILedgerOverrides = {};
+  commissioningRehearsalResponse = null;
+  commissioningRehearsalSideEffect = null;
   vi.stubGlobal("WebSocket", WebSocketStub);
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => new Response(JSON.stringify(payload(String(input))), { status: 200, headers: { "Content-Type": "application/json" } })));
 });
@@ -131,10 +219,82 @@ describe("copy control center", () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Lane III Paper" }));
     const panel = (await screen.findByText("Ledger health")).closest("section");
+    const valueFor = (label: string) => within(panel as HTMLElement).getByText(label).nextElementSibling?.textContent;
     expect(panel).toHaveTextContent("L3G-PAPER-EPOCH-002");
     expect(panel).toHaveTextContent("VALID");
-    expect(panel).toHaveTextContent("Highest sequence");
-    expect(panel).toHaveTextContent("12");
+    expect(valueFor("Highest sequence")).toBe("125");
+    expect(valueFor("Verified anchor")).toBe("100");
+    expect(valueFor("Tail snapshot tip")).toBe("125");
+    expect(valueFor("Tail rows")).toBe("25 rows");
+    expect(valueFor("Tail trust state")).toBe("UNVERIFIED_AUTHORITY_TAIL");
+    expect(valueFor("Last authority mutation sequence")).toBe("120");
+    expect(valueFor("Last authority mutation domain")).toBe("RISK_EVENT");
+    expect(valueFor("Last authority mutation kind")).toBe("RISK_LOCKOUT");
+    expect(valueFor("Last authority observation sequence")).toBe("124");
+    expect(valueFor("Last authority observation domain")).toBe("POSITION_SNAPSHOT");
+    expect(valueFor("Last authority observation kind")).toBe("BROKER_STATE_OBSERVED");
+    expect(valueFor("Last unknown sequence")).toBe("125");
+    expect(valueFor("Last unknown domain")).toBe("FUTURE_DOMAIN");
+    expect(valueFor("Last unknown kind")).toBe("FUTURE_KIND");
+    expect(valueFor("Latest blocking classification")).toBe("UNKNOWN");
+    expect(valueFor("Latest blocking sequence")).toBe("125");
+    expect(valueFor("Latest blocking domain")).toBe("FUTURE_DOMAIN");
+    expect(valueFor("Latest blocking kind")).toBe("FUTURE_KIND");
+    expect(screen.queryByText(/DO_NOT_RENDER_TAIL_PAYLOAD/)).not.toBeInTheDocument();
+  });
+
+  it("enables atomic start only for a fresh rehearsal that still matches live readiness", async () => {
+    configureReadyLaneIIIUiFixture();
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Lane III Paper" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Run Read-Only Commissioning Rehearsal" }));
+    expect(await screen.findByText("READY FOR COMMISSIONING")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Atomic Commissioning Start" })).toBeEnabled();
+  });
+
+  it("invalidates a READY rehearsal when live warmup or freshness is lost", async () => {
+    configureReadyLaneIIIUiFixture();
+    commissioningRehearsalSideEffect = () => {
+      laneIIIPaperOverrides = {
+        ...laneIIIPaperOverrides,
+        commissioning_warmup: { status: "NOT_WARMED" },
+        market_freshness: {
+          quote: { fresh: false }, classified_trade: { fresh: true }, depth_mutation: { fresh: true },
+        },
+      };
+    };
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Lane III Paper" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Run Read-Only Commissioning Rehearsal" }));
+    expect(await screen.findByText("REHEARSAL STALE")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Atomic Commissioning Start" })).toBeDisabled();
+  });
+
+  it("supersedes a READY rehearsal with newer live ledger blockers", async () => {
+    configureReadyLaneIIIUiFixture();
+    commissioningRehearsalSideEffect = () => {
+      laneIIILedgerOverrides = {
+        ...laneIIILedgerOverrides,
+        highest_sequence: 126, unverified_tail_rows: 26,
+        commissioning_ledger_state: "UNVERIFIED_UNKNOWN_TAIL",
+        last_unknown_sequence: 126, last_unknown_domain: "FUTURE_DOMAIN",
+        last_unknown_kind: "FUTURE_KIND", last_blocking_sequence: 126,
+        last_blocking_classification: "UNKNOWN", last_blocking_domain: "FUTURE_DOMAIN",
+        last_blocking_kind: "FUTURE_KIND",
+      };
+    };
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Lane III Paper" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Run Read-Only Commissioning Rehearsal" }));
+    expect(await screen.findByText("REHEARSAL STALE")).toBeInTheDocument();
+    const panel = screen.getByText("Ledger health").closest("section") as HTMLElement;
+    const valueFor = (label: string) => within(panel).getByText(label).nextElementSibling?.textContent;
+    expect(valueFor("Highest sequence")).toBe("126");
+    expect(valueFor("Tail trust state")).toBe("UNVERIFIED_UNKNOWN_TAIL");
+    expect(valueFor("Latest blocking sequence")).toBe("126");
+    expect(valueFor("Latest blocking kind")).toBe("FUTURE_KIND");
+    expect(screen.getByRole("button", { name: "Atomic Commissioning Start" })).toBeDisabled();
   });
 
   it("starts a local ledger verifier and persists the local schedule controls", async () => {

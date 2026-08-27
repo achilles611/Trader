@@ -40,7 +40,10 @@ namespace NinjaTrader.NinjaScript.Indicators
                 Calculate = Calculate.OnEachTick;
             }
             else if (State == State.Realtime)
+            {
                 BeelzebubReadOnlyOutbound.Diagnostic("MARKET_OBSERVER_REALTIME");
+                BeelzebubReadOnlyOutbound.Diagnostic("MARKET_OBSERVER_REALTIME_STRICT_SPREAD_V1");
+            }
         }
 
         protected override void OnMarketData(MarketDataEventArgs e)
@@ -98,7 +101,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 bestAskSize = e.Volume;
                 bestAskTime = e.Time;
             }
-            if (!Double.IsNaN(bestBid) && !Double.IsNaN(bestAsk) && bestBid <= bestAsk && bestBidSize > 0 && bestAskSize > 0)
+            if (!Double.IsNaN(bestBid) && !Double.IsNaN(bestAsk) && bestBid < bestAsk && bestBidSize > 0 && bestAskSize > 0)
                 BeelzebubReadOnlyOutbound.Publish("QUOTE", null, null, "{\"contract_id\":\"" + contract + "\",\"bid\":" + bestBid.ToString(CultureInfo.InvariantCulture) + ",\"ask\":" + bestAsk.ToString(CultureInfo.InvariantCulture) + ",\"bid_size\":" + bestBidSize + ",\"ask_size\":" + bestAskSize + "}", e.Time);
         }
 

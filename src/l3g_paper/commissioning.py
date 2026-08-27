@@ -60,7 +60,12 @@ def evaluate_commissioning_ledger_gate(
     freshness_seconds: int,
     now: datetime | None = None,
 ) -> dict[str, object]:
-    """Return immutable ARM audit evidence or fail with a stable blocker code."""
+    """Return immutable ARM evidence under the v3 tail-trust invariant.
+
+    Every mutation and unknown shape must be covered by the verified anchor.
+    Exact observations may follow it only because they cannot grant authority;
+    the current broker/runtime state is still reconciled independently below.
+    """
     status = str(verification.get("status") or "UNVERIFIED")
     if status == "IN_PROGRESS":
         _gate_error("COMMISSIONING_LEDGER_VERIFICATION_IN_PROGRESS", "Local ledger verification is in progress.")
@@ -133,32 +138,88 @@ def evaluate_commissioning_ledger_gate(
     tip = tail.get("arm_snapshot_tip")
     classified = tail.get("classified_through_sequence")
     last_authority = tail.get("last_authority_mutation_sequence")
+    last_observation = tail.get("last_authority_observation_sequence")
+    last_unknown = tail.get("last_unknown_sequence")
     tail_rows = tail.get("unverified_tail_rows")
     tail_kinds = tail.get("tail_record_kinds")
+    tail_categories = tail.get("tail_record_categories")
     if (
         type(tip) is not int
         or type(classified) is not int
         or type(last_authority) is not int
+        or type(last_observation) is not int
+        or type(last_unknown) is not int
         or type(tail_rows) is not int
         or not isinstance(tail_kinds, list)
         or not all(isinstance(kind, str) for kind in tail_kinds)
+        or not isinstance(tail_categories, list)
+        or not all(isinstance(category, str) and category in {
+            "PASSIVE_DATA", "AUTHORITY_OBSERVATION", "AUTHORITY_MUTATION", "UNKNOWN",
+        } for category in tail_categories)
+        or len(tail_categories) != len(set(tail_categories))
         or verified > tip
         or classified != tip
+        or tail.get("classified_through_hash") != tail.get("arm_snapshot_tip_hash")
         or tail_rows != tip - verified
+        or not all(0 <= sequence <= tip for sequence in (last_authority, last_observation, last_unknown))
     ):
         _gate_error("COMMISSIONING_LEDGER_TAIL_UNCLASSIFIED", "Live ledger tail classification is incomplete.")
-    if last_authority > verified:
+    blocking_sequence = max(last_authority, last_unknown)
+    blocking_prefix = "last_unknown" if last_unknown >= last_authority else "last_authority_mutation"
+    blocking_classification = (
+        None if blocking_sequence == 0 else "UNKNOWN" if blocking_prefix == "last_unknown" else "AUTHORITY_MUTATION"
+    )
+    if (
+        tail.get("last_blocking_sequence") != blocking_sequence
+        or tail.get("last_blocking_kind") != (
+            None if blocking_sequence == 0 else tail.get(f"{blocking_prefix}_kind")
+        )
+        or tail.get("last_blocking_domain") != (
+            None if blocking_sequence == 0 else tail.get(f"{blocking_prefix}_domain")
+        )
+        or tail.get("last_blocking_hash") != (
+            None if blocking_sequence == 0 else tail.get(f"{blocking_prefix}_hash")
+        )
+        or tail.get("last_blocking_classification") != blocking_classification
+    ):
+        _gate_error("COMMISSIONING_LEDGER_TAIL_UNCLASSIFIED", "Live ledger blocking watermark is inconsistent.")
+    if last_authority > verified or last_unknown > verified:
         _gate_error(
             "COMMISSIONING_LEDGER_TAIL_UNTRUSTED",
             "The unverified live tail contains an authority-changing or unknown record.",
             launch_auto=True,
         )
-    if tail_rows > 0 and not tail_kinds:
-        _gate_error("COMMISSIONING_LEDGER_TAIL_UNCLASSIFIED", "Live ledger tail kinds are unavailable.")
+    expected_categories = {
+        category
+        for category, present in (
+            ("PASSIVE_DATA", any(
+                not kind.startswith("AUTHORITY_OBSERVATION:")
+                and kind != "OBSERVATION:OBSERVATION_ENVELOPE:ACCOUNT_ITEM_INFORMATIONAL:AUTHORITY_EFFECT_NONE"
+                for kind in tail_kinds
+            )),
+            ("AUTHORITY_OBSERVATION", last_observation > verified),
+            ("AUTHORITY_MUTATION", last_authority > verified),
+            ("UNKNOWN", last_unknown > verified),
+        )
+        if present
+    }
+    if set(tail_categories) != expected_categories or (tail_rows > 0 and not tail_categories):
+        _gate_error("COMMISSIONING_LEDGER_TAIL_UNCLASSIFIED", "Live ledger tail categories are inconsistent.")
     if not _runtime_reconciled(runtime):
         _gate_error("COMMISSIONING_RUNTIME_NOT_RECONCILED", "Current Sim101 broker/runtime authority is not cleanly reconciled.")
 
-    trust_state = "VERIFIED_TO_ARM_SNAPSHOT_TIP" if tail_rows == 0 else "VERIFIED_ANCHOR_WITH_PASSIVE_LIVE_TAIL"
+    if tail_rows == 0:
+        trust_state = "VERIFIED_TO_ARM_SNAPSHOT_TIP"
+        tail_classification = "EMPTY"
+    elif last_observation > verified:
+        trust_state = "VERIFIED_ANCHOR_WITH_ACCEPTED_LIVE_TAIL"
+        tail_classification = (
+            "PASSIVE_AND_AUTHORITY_OBSERVATIONS"
+            if "PASSIVE_DATA" in tail_categories else "AUTHORITY_OBSERVATIONS_ONLY"
+        )
+    else:
+        trust_state = "VERIFIED_ANCHOR_WITH_PASSIVE_LIVE_TAIL"
+        tail_classification = "PASSIVE_ONLY"
     return {
         "ledger_trust_state": trust_state,
         "verification_id": verification_id,
@@ -175,14 +236,31 @@ def evaluate_commissioning_ledger_gate(
         },
         "arm_snapshot_tip": tip,
         "arm_snapshot_tip_hash": tail.get("arm_snapshot_tip_hash"),
+        "classified_through_sequence": classified,
+        "classified_through_hash": tail.get("classified_through_hash"),
         "unverified_tail_rows": tail_rows,
         "tail_start_sequence": tail.get("tail_start_sequence"),
         "tail_end_sequence": tail.get("tail_end_sequence"),
         "tail_record_kinds": list(tail_kinds),
-        "tail_authority_classification": "EMPTY" if tail_rows == 0 else "PASSIVE_ONLY",
+        "tail_record_categories": list(tail_categories),
+        "tail_authority_classification": tail_classification,
         "last_authority_mutation_sequence": last_authority,
         "last_authority_mutation_kind": tail.get("last_authority_mutation_kind"),
         "last_authority_mutation_domain": tail.get("last_authority_mutation_domain"),
+        "last_authority_mutation_hash": tail.get("last_authority_mutation_hash"),
+        "last_authority_observation_sequence": last_observation,
+        "last_authority_observation_kind": tail.get("last_authority_observation_kind"),
+        "last_authority_observation_domain": tail.get("last_authority_observation_domain"),
+        "last_authority_observation_hash": tail.get("last_authority_observation_hash"),
+        "last_unknown_sequence": last_unknown,
+        "last_unknown_kind": tail.get("last_unknown_kind"),
+        "last_unknown_domain": tail.get("last_unknown_domain"),
+        "last_unknown_hash": tail.get("last_unknown_hash"),
+        "last_blocking_sequence": blocking_sequence,
+        "last_blocking_kind": tail.get("last_blocking_kind"),
+        "last_blocking_domain": tail.get("last_blocking_domain"),
+        "last_blocking_hash": tail.get("last_blocking_hash"),
+        "last_blocking_classification": blocking_classification,
         "commissioning_id": runtime.get("commissioning_id"),
         "session_identity": {
             key: runtime.get(key)

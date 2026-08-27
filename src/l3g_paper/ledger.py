@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections import deque
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from enum import StrEnum
 import json
 import os
 from pathlib import Path
@@ -18,7 +20,10 @@ from uuid import uuid4
 from src.lane_iii.contracts import canonical_hash, normalized_utc
 
 from .contracts import ACCOUNT_BINDING, PAPER_RECORD_SCHEMA, POLICY, RISK_PROFILE
-from .sessions import PaperSessionContext, PaperSessionKind, UNSPECIFIED_OFF_SESSION_CONTEXT, context_from_identity
+from .sessions import (
+    PaperCalendarState, PaperSessionContext, PaperSessionKind,
+    UNSPECIFIED_OFF_SESSION_CONTEXT, context_from_identity,
+)
 
 
 _DOMAIN_TABLES = {
@@ -37,9 +42,25 @@ _DOMAIN_TABLES = {
     "INCIDENT": "lane_iii_paper_incidents",
 }
 _HIGH_VOLUME_DOMAINS = frozenset({"OBSERVATION", "EVIDENCE", "DECISION"})
-COMMISSIONING_TAIL_POLICY_VERSION = "l3g-commissioning-passive-tail-v2"
+COMMISSIONING_TAIL_POLICY_VERSION = "l3g-commissioning-passive-tail-v3"
+_COMMISSIONING_TAIL_PREVIOUS_POLICY_VERSION = "l3g-commissioning-passive-tail-v2"
 COMMISSIONING_NO_AUTHORITY_EFFECT = "NONE"
+COMMISSIONING_READINESS_RECORD_SEMANTICS = "COMMISSIONING_READINESS_STATE_ATTESTATION"
+COMMISSIONING_READINESS_RECORD_SEMANTICS_VERSION = 1
+COMMISSIONING_WARMUP_REQUIRED_FAMILIES = (
+    "STRUCTURAL_CONTEXT", "ORDER_FLOW", "RESTING_LIQUIDITY",
+)
+COMMISSIONING_WARMUP_POLICY_HASH = canonical_hash({
+    "version": "l3g-commissioning-session-warmup-v1",
+    "required_families": COMMISSIONING_WARMUP_REQUIRED_FAMILIES,
+    "binding": (
+        "session_kind", "session_id", "trade_date", "session_profile_hash", "session_generation",
+    ),
+    "natural_evidence_expiration_clears_latch": False,
+    "runtime_restart_clears_latch": True,
+})
 _COMMISSIONING_WATERMARK_METADATA_KEY = "commissioning_authority_watermark"
+_COMMISSIONING_WATERMARK_SCAN_LIMIT = 4096
 _PASSIVE_MARKET_OBSERVATION_TYPES = frozenset({"QUOTE", "TRADE", "DEPTH"})
 _PASSIVE_EVIDENCE_FAMILIES = frozenset({
     "STRUCTURAL_CONTEXT", "ORDER_FLOW", "RESTING_LIQUIDITY", "VOLATILITY_CONTEXT", "MARKET_REGIME",
@@ -48,6 +69,82 @@ _PASSIVE_DECISIONS = frozenset({"NO_TRADE", "LONG", "SHORT", "EXIT"})
 _AUTHORITY_SHAPED_PAYLOAD_KEYS = frozenset({
     "command_id", "grant_id", "intent_id", "order_id", "execution_id", "commissioning_id",
     "working_order_count", "position_quantity", "risk_authority", "arm_grant", "lockout_reason",
+})
+_SESSION_CONTEXT_KEYS = frozenset({
+    "session_kind", "session_family", "session_id", "trade_date", "timezone",
+    "observation_start", "entry_start", "entry_cutoff", "hard_flat_deadline",
+    "session_end", "session_profile_hash", "session_generation", "calendar_state",
+})
+_SESSION_IDENTITY_KEYS = frozenset({
+    "session_kind", "session_family", "session_id", "trade_date",
+    "session_profile_hash", "session_generation",
+})
+_OBSERVATION_ENVELOPE_KEYS = _SESSION_CONTEXT_KEYS | frozenset({
+    "observation_id", "observation_type", "observed_at", "ninja_receipt_time",
+    "provider_timestamp", "exchange_timestamp", "local_monotonic_sequence", "source_payload_hash",
+})
+_ACCOUNT_OBSERVATION_KEYS = _OBSERVATION_ENVELOPE_KEYS | frozenset({
+    "authority_effect", "observation_semantics", "observation_payload_keys",
+    "observation_account_alias", "observation_account_class",
+})
+_EVIDENCE_KEYS = frozenset({
+    "evidence_id", "hypothesis_kind", "family", "label", "strength", "supports",
+    "observed_at", "expires_at", "source_observation_ids", "source_local_sequences",
+    "source_payload_hashes", "quality", "sequence_authority", "book_completeness",
+    "scientific_eligibility", "blocking", "session_kind", "session_id", "trade_date",
+    "session_profile_hash", "session_generation", "source_session_ids", "session_family",
+})
+_DECISION_KEYS = frozenset({
+    "paper_decision_id", "paper_policy_id", "paper_policy_hash", "decision", "created_at",
+    "expires_at", "hypothesis_kind", "direction", "relative_support", "family_summary",
+    "source_observation_ids", "source_local_sequences", "source_payload_hashes",
+    "sequence_authority", "book_completeness", "scientific_eligibility", "reason_code",
+    "session_kind", "session_id", "trade_date", "session_profile_hash", "session_generation",
+    "commissioning", "strategy_generated", "scientific_evidence", "session_family",
+    "authority_effect",
+})
+_DECISION_WITH_EFFECT_KEYS = _DECISION_KEYS - {"authority_effect"}
+_WARMUP_ATTESTATION_KEYS = _SESSION_CONTEXT_KEYS | frozenset({
+    "authority_effect", "record_semantics", "record_semantics_version",
+    "commissioning_warmup_state", "policy_hash", "required_families", "reason",
+})
+_WARMED_ATTESTATION_KEYS = _WARMUP_ATTESTATION_KEYS | frozenset({
+    "warmed_at", "evidence_provenance",
+})
+_RESET_ATTESTATION_KEYS = _WARMUP_ATTESTATION_KEYS | frozenset({
+    "reset_at", "seen_families", "warmed_at",
+})
+_KNOWN_AUTHORITY_MUTATION_DOMAINS = frozenset({
+    "SESSION", "INTENT", "RISK_GRANT", "COMMAND", "COMMAND_RECEIPT",
+    "ORDER_EVENT", "EXECUTION", "POSITION_SNAPSHOT", "RISK_EVENT",
+})
+_KNOWN_COMMISSIONING_MUTATION_PREFIXES = (
+    "COMMISSIONING_OWNERSHIP_", "COMMISSIONING_ENTRY_", "COMMISSIONING_PREFLIGHT_",
+    "COMMISSIONING_CLOSURE",
+)
+_WATERMARK_EVENT_PREFIXES = (
+    "last_authority_mutation", "last_authority_observation", "last_unknown",
+)
+_V3_WATERMARK_KEYS = frozenset({
+    "policy_version", "classified_through_sequence", "classified_through_hash",
+    "last_authority_mutation_sequence", "last_authority_mutation_kind",
+    "last_authority_mutation_domain", "last_authority_mutation_hash",
+    "last_authority_observation_sequence", "last_authority_observation_kind",
+    "last_authority_observation_domain", "last_authority_observation_hash",
+    "last_unknown_sequence", "last_unknown_kind", "last_unknown_domain", "last_unknown_hash",
+    "safe_classification_last_sequences", "updated_at",
+})
+_V2_WATERMARK_KEYS = frozenset({
+    "policy_version", "classified_through_sequence",
+    "last_authority_mutation_sequence", "last_authority_mutation_kind",
+    "last_authority_mutation_domain", "last_authority_mutation_hash",
+    "safe_classification_last_sequences", "updated_at",
+})
+_V2_SAFE_CLASSIFICATIONS = frozenset({
+    *(f"OBSERVATION:OBSERVATION_ENVELOPE:{kind}" for kind in _PASSIVE_MARKET_OBSERVATION_TYPES),
+    "OBSERVATION:OBSERVATION_ENVELOPE:ACCOUNT_ITEM_INFORMATIONAL:AUTHORITY_EFFECT_NONE",
+    "EVIDENCE:EVIDENCE",
+    *(f"DECISION:DECISION:{kind}:AUTHORITY_EFFECT_NONE" for kind in _PASSIVE_DECISIONS),
 })
 _SECRET_KEYS = frozenset({"hmac_key", "password", "token", "connection_credentials", "private_key", "secret", "authorization"})
 _EPOCH_DIRECTORY = re.compile(r"^epoch-(\d+)$", re.IGNORECASE)
@@ -70,68 +167,360 @@ def _assert_redacted(value: object) -> None:
             _assert_redacted(item)
 
 
+class CommissioningTailCategory(StrEnum):
+    PASSIVE_DATA = "PASSIVE_DATA"
+    AUTHORITY_OBSERVATION = "AUTHORITY_OBSERVATION"
+    AUTHORITY_MUTATION = "AUTHORITY_MUTATION"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class CommissioningTailClassification:
+    category: CommissioningTailCategory
+    shape: str
+
+    @property
+    def accepted_without_verification(self) -> bool:
+        return self.category in {
+            CommissioningTailCategory.PASSIVE_DATA,
+            CommissioningTailCategory.AUTHORITY_OBSERVATION,
+        }
+
+
+def _exact_keys(payload: Mapping[str, object], expected: frozenset[str]) -> bool:
+    return set(payload) == expected
+
+
+def _is_hash(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _is_utc(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        normalized_utc(value, "Commissioning tail record time")
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _session_context_matches(payload: Mapping[str, object]) -> bool:
+    if type(payload.get("session_generation")) is not int:
+        return False
+    try:
+        context = context_from_identity(
+            PaperSessionKind(str(payload["session_kind"])),
+            str(payload["session_id"]),
+            str(payload["trade_date"]),
+            str(payload["session_profile_hash"]),
+            int(payload["session_generation"]),
+            calendar_state=PaperCalendarState(str(payload["calendar_state"])),
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    return all(payload.get(key) == value for key, value in context.payload().items())
+
+
+def _session_identity_matches(payload: Mapping[str, object]) -> bool:
+    if type(payload.get("session_generation")) is not int:
+        return False
+    try:
+        context = context_from_identity(
+            PaperSessionKind(str(payload["session_kind"])),
+            str(payload["session_id"]),
+            str(payload["trade_date"]),
+            str(payload["session_profile_hash"]),
+            int(payload["session_generation"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    return payload.get("session_family") == context.session_family.value
+
+
+def _aligned_provenance(
+    identifiers: object, sequences: object, hashes: object, *, sessions: object | None = None,
+) -> bool:
+    if (
+        not isinstance(identifiers, list) or not identifiers
+        or not isinstance(sequences, list) or not isinstance(hashes, list)
+        or len(identifiers) != len(sequences) or len(identifiers) != len(hashes)
+        or not all(isinstance(value, str) and value for value in identifiers)
+        or not all(type(value) is int and value >= 0 for value in sequences)
+        or not all(_is_hash(value) for value in hashes)
+    ):
+        return False
+    return sessions is None or (
+        isinstance(sessions, list)
+        and len(sessions) == len(identifiers)
+        and all(isinstance(value, str) and value for value in sessions)
+    )
+
+
+def _market_observation_shape(payload: Mapping[str, object]) -> str | None:
+    observation_type = payload.get("observation_type")
+    if (
+        not isinstance(observation_type, str)
+        or observation_type not in _PASSIVE_MARKET_OBSERVATION_TYPES
+        or not _exact_keys(payload, _OBSERVATION_ENVELOPE_KEYS)
+        or not _session_context_matches(payload)
+        or not isinstance(payload.get("observation_id"), str)
+        or not payload.get("observation_id")
+        or type(payload.get("local_monotonic_sequence")) is not int
+        or int(payload["local_monotonic_sequence"]) < 0
+        or not _is_hash(payload.get("source_payload_hash"))
+        or not _is_utc(payload.get("observed_at"))
+        or not _is_utc(payload.get("ninja_receipt_time"))
+        or not all(value is None or _is_utc(value) for value in (
+            payload.get("provider_timestamp"), payload.get("exchange_timestamp"),
+        ))
+    ):
+        return None
+    return f"OBSERVATION:OBSERVATION_ENVELOPE:{observation_type}"
+
+
+def _informational_account_shape(payload: Mapping[str, object]) -> str | None:
+    account_alias = payload.get("observation_account_alias")
+    account_class = payload.get("observation_account_class")
+    if (
+        payload.get("observation_type") != "ACCOUNT"
+        or not _exact_keys(payload, _ACCOUNT_OBSERVATION_KEYS)
+        or not _session_context_matches(payload)
+        or not isinstance(payload.get("observation_id"), str)
+        or not payload.get("observation_id")
+        or type(payload.get("local_monotonic_sequence")) is not int
+        or int(payload["local_monotonic_sequence"]) < 0
+        or not _is_hash(payload.get("source_payload_hash"))
+        or not _is_utc(payload.get("observed_at"))
+        or not _is_utc(payload.get("ninja_receipt_time"))
+        or not all(value is None or _is_utc(value) for value in (
+            payload.get("provider_timestamp"), payload.get("exchange_timestamp"),
+        ))
+        or payload.get("authority_effect") != COMMISSIONING_NO_AUTHORITY_EFFECT
+        or payload.get("observation_semantics") != "INFORMATIONAL_ACCOUNT_ITEM"
+        or payload.get("observation_payload_keys") != ["item", "value"]
+        or not isinstance(account_alias, str)
+        or not isinstance(account_class, str)
+        or (account_alias, account_class) not in {
+            ("Sim101", "LOCAL_SIMULATION"),
+            ("Lucid25kflex01", "PROVIDER_EVALUATION"),
+        }
+    ):
+        return None
+    return "OBSERVATION:OBSERVATION_ENVELOPE:ACCOUNT_ITEM_INFORMATIONAL:AUTHORITY_EFFECT_NONE"
+
+
+def _evidence_shape(payload: Mapping[str, object]) -> str | None:
+    family = payload.get("family")
+    if (
+        not _exact_keys(payload, _EVIDENCE_KEYS)
+        or not _session_identity_matches(payload)
+        or not isinstance(payload.get("evidence_id"), str)
+        or not str(payload["evidence_id"]).startswith("l3g-pe-")
+        or not isinstance(family, str)
+        or family not in _PASSIVE_EVIDENCE_FAMILIES
+        or payload.get("scientific_eligibility") is not False
+        or payload.get("book_completeness") != "UNVERIFIED"
+        or payload.get("sequence_authority") != "LOCAL_CALLBACK_ORDER_ONLY"
+        or payload.get("quality") != "PROVISIONAL_CONTIGUOUS_LOCAL_CALLBACKS"
+        or type(payload.get("supports")) is not bool
+        or type(payload.get("blocking")) is not bool
+        or not isinstance(payload.get("label"), str)
+        or not _is_utc(payload.get("observed_at"))
+        or not _is_utc(payload.get("expires_at"))
+        or not _aligned_provenance(
+            payload.get("source_observation_ids"), payload.get("source_local_sequences"),
+            payload.get("source_payload_hashes"), sessions=payload.get("source_session_ids"),
+        )
+        or set(payload.get("source_session_ids") or ()) != {payload.get("session_id")}
+    ):
+        return None
+    return "EVIDENCE:EVIDENCE"
+
+
+def _passive_decision_shape(payload: Mapping[str, object]) -> str | None:
+    decision = payload.get("decision")
+    expected_direction = {
+        "NO_TRADE": "FLAT", "LONG": "LONG", "SHORT": "SHORT", "EXIT": "FLAT",
+    }.get(str(decision))
+    if (
+        not isinstance(decision, str)
+        or decision not in _PASSIVE_DECISIONS
+        or not _exact_keys(payload, _DECISION_KEYS)
+        or not _session_identity_matches(payload)
+        or payload.get("direction") != expected_direction
+        or payload.get("authority_effect") != COMMISSIONING_NO_AUTHORITY_EFFECT
+        or payload.get("commissioning") is not False
+        or payload.get("strategy_generated") is not True
+        or payload.get("scientific_evidence") is not False
+        or payload.get("scientific_eligibility") is not False
+        or payload.get("sequence_authority") != "LOCAL_CALLBACK_ORDER_ONLY"
+        or payload.get("book_completeness") != "UNVERIFIED"
+        or not isinstance(payload.get("paper_decision_id"), str)
+        or not str(payload["paper_decision_id"]).startswith("l3g-pd-")
+        or payload.get("paper_policy_id") != POLICY.policy_id
+        or payload.get("paper_policy_hash") != POLICY.configuration_hash
+        or not isinstance(payload.get("family_summary"), Mapping)
+        or not isinstance(payload.get("reason_code"), str)
+        or not _is_utc(payload.get("created_at"))
+        or not _is_utc(payload.get("expires_at"))
+        or not _aligned_provenance(
+            payload.get("source_observation_ids"), payload.get("source_local_sequences"),
+            payload.get("source_payload_hashes"),
+        )
+    ):
+        return None
+    return f"DECISION:DECISION:{decision}:AUTHORITY_EFFECT_NONE"
+
+
+def _authority_decision_shape(payload: Mapping[str, object]) -> bool:
+    """Recognize the producer's exact effect-capable decision shape."""
+    decision = payload.get("decision")
+    expected_direction = {
+        "NO_TRADE": "FLAT", "LONG": "LONG", "SHORT": "SHORT", "EXIT": "FLAT",
+    }.get(str(decision))
+    return (
+        isinstance(decision, str)
+        and decision in _PASSIVE_DECISIONS
+        and _exact_keys(payload, _DECISION_WITH_EFFECT_KEYS)
+        and _session_identity_matches(payload)
+        and payload.get("direction") == expected_direction
+        and payload.get("scientific_eligibility") is False
+        and payload.get("sequence_authority") == "LOCAL_CALLBACK_ORDER_ONLY"
+        and payload.get("book_completeness") == "UNVERIFIED"
+        and isinstance(payload.get("paper_decision_id"), str)
+        and str(payload["paper_decision_id"]).startswith("l3g-pd-")
+        and payload.get("paper_policy_id") == POLICY.policy_id
+        and payload.get("paper_policy_hash") == POLICY.configuration_hash
+        and isinstance(payload.get("family_summary"), Mapping)
+        and isinstance(payload.get("reason_code"), str)
+        and type(payload.get("commissioning")) is bool
+        and type(payload.get("strategy_generated")) is bool
+        and payload.get("strategy_generated") is (not payload.get("commissioning"))
+        and payload.get("scientific_evidence") is False
+        and _is_utc(payload.get("created_at"))
+        and _is_utc(payload.get("expires_at"))
+        and _aligned_provenance(
+            payload.get("source_observation_ids"), payload.get("source_local_sequences"),
+            payload.get("source_payload_hashes"),
+        )
+    )
+
+
+def _warmup_provenance_valid(value: object) -> bool:
+    if not isinstance(value, Mapping) or set(value) != set(COMMISSIONING_WARMUP_REQUIRED_FAMILIES):
+        return False
+    for item in value.values():
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != {"evidence_id", "observed_at", "source_observation_ids", "source_local_sequences"}
+            or not isinstance(item.get("evidence_id"), str)
+            or not str(item["evidence_id"]).startswith("l3g-pe-")
+            or not _is_utc(item.get("observed_at"))
+            or not isinstance(item.get("source_observation_ids"), list)
+            or not item.get("source_observation_ids")
+            or not all(isinstance(identifier, str) and identifier for identifier in item["source_observation_ids"])
+            or not isinstance(item.get("source_local_sequences"), list)
+            or len(item["source_observation_ids"]) != len(item["source_local_sequences"])
+            or not all(type(sequence) is int and sequence >= 0 for sequence in item["source_local_sequences"])
+        ):
+            return False
+    return True
+
+
+def _warmup_attestation_shape(kind: str, payload: Mapping[str, object]) -> str | None:
+    seen_families = payload.get("seen_families")
+    common = (
+        _session_context_matches(payload)
+        and payload.get("authority_effect") == COMMISSIONING_NO_AUTHORITY_EFFECT
+        and payload.get("record_semantics") == COMMISSIONING_READINESS_RECORD_SEMANTICS
+        and type(payload.get("record_semantics_version")) is int
+        and payload.get("record_semantics_version") == COMMISSIONING_READINESS_RECORD_SEMANTICS_VERSION
+        and payload.get("policy_hash") == COMMISSIONING_WARMUP_POLICY_HASH
+        and payload.get("required_families") == list(COMMISSIONING_WARMUP_REQUIRED_FAMILIES)
+        and isinstance(payload.get("reason"), str)
+        and bool(payload.get("reason"))
+    )
+    if (
+        kind == "COMMISSIONING_SESSION_WARMED"
+        and common
+        and _exact_keys(payload, _WARMED_ATTESTATION_KEYS)
+        and payload.get("commissioning_warmup_state") == "WARMED"
+        and payload.get("reason") == "ALL_REQUIRED_FAMILIES_GENUINELY_OBSERVED"
+        and _is_utc(payload.get("warmed_at"))
+        and _warmup_provenance_valid(payload.get("evidence_provenance"))
+    ):
+        return "AUTHORITY_OBSERVATION:COMMISSIONING_SESSION_WARMED:AUTHORITY_EFFECT_NONE"
+    if (
+        kind == "COMMISSIONING_SESSION_WARMUP_RESET"
+        and common
+        and _exact_keys(payload, _RESET_ATTESTATION_KEYS)
+        and payload.get("commissioning_warmup_state") == "NOT_WARMED"
+        and _is_utc(payload.get("reset_at"))
+        and (payload.get("warmed_at") is None or _is_utc(payload.get("warmed_at")))
+        and isinstance(seen_families, list)
+        and all(isinstance(family, str) for family in seen_families)
+        and seen_families == sorted(set(seen_families))
+        and set(seen_families).issubset(COMMISSIONING_WARMUP_REQUIRED_FAMILIES)
+    ):
+        return "AUTHORITY_OBSERVATION:COMMISSIONING_SESSION_WARMUP_RESET:AUTHORITY_EFFECT_NONE"
+    return None
+
+
+def commissioning_tail_classification(
+    domain: str, kind: str, payload: Mapping[str, object],
+) -> CommissioningTailClassification:
+    """Return the explicit v3 authority category for one exact stored shape."""
+    if not isinstance(domain, str) or not isinstance(kind, str) or not isinstance(payload, Mapping):
+        return CommissioningTailClassification(
+            CommissioningTailCategory.UNKNOWN, "UNKNOWN:MALFORMED_RECORD_ENVELOPE",
+        )
+    if domain == "OBSERVATION" and kind == "OBSERVATION_ENVELOPE":
+        passive_shape = _market_observation_shape(payload)
+        if passive_shape is not None:
+            return CommissioningTailClassification(CommissioningTailCategory.PASSIVE_DATA, passive_shape)
+        account_shape = _informational_account_shape(payload)
+        if account_shape is not None:
+            return CommissioningTailClassification(CommissioningTailCategory.AUTHORITY_OBSERVATION, account_shape)
+        return CommissioningTailClassification(CommissioningTailCategory.UNKNOWN, f"UNKNOWN:{domain}:{kind}")
+    if domain == "EVIDENCE" and kind == "EVIDENCE":
+        evidence_shape = _evidence_shape(payload)
+        if evidence_shape is not None:
+            return CommissioningTailClassification(CommissioningTailCategory.PASSIVE_DATA, evidence_shape)
+        return CommissioningTailClassification(CommissioningTailCategory.UNKNOWN, f"UNKNOWN:{domain}:{kind}")
+    if domain == "DECISION" and kind == "DECISION":
+        decision_shape = _passive_decision_shape(payload)
+        if decision_shape is not None:
+            return CommissioningTailClassification(CommissioningTailCategory.PASSIVE_DATA, decision_shape)
+        if _authority_decision_shape(payload):
+            return CommissioningTailClassification(
+                CommissioningTailCategory.AUTHORITY_MUTATION, f"AUTHORITY_MUTATION:{domain}:{kind}",
+            )
+        return CommissioningTailClassification(CommissioningTailCategory.UNKNOWN, f"UNKNOWN:{domain}:{kind}")
+    if domain == "INCIDENT" and kind in {
+        "COMMISSIONING_SESSION_WARMED", "COMMISSIONING_SESSION_WARMUP_RESET",
+    }:
+        observation_shape = _warmup_attestation_shape(kind, payload)
+        if observation_shape is not None:
+            return CommissioningTailClassification(
+                CommissioningTailCategory.AUTHORITY_OBSERVATION, observation_shape,
+            )
+        return CommissioningTailClassification(CommissioningTailCategory.UNKNOWN, f"UNKNOWN:{domain}:{kind}")
+    if domain in _KNOWN_AUTHORITY_MUTATION_DOMAINS or any(
+        kind.startswith(prefix) for prefix in _KNOWN_COMMISSIONING_MUTATION_PREFIXES
+    ):
+        return CommissioningTailClassification(
+            CommissioningTailCategory.AUTHORITY_MUTATION, f"AUTHORITY_MUTATION:{domain}:{kind}",
+        )
+    return CommissioningTailClassification(CommissioningTailCategory.UNKNOWN, f"UNKNOWN:{domain}:{kind}")
+
+
 def commissioning_safe_tail_classification(
     domain: str, kind: str, payload: Mapping[str, object],
 ) -> str | None:
-    """Classify only exact, demonstrably no-side-effect live-tail records.
-
-    Returning ``None`` is intentionally fail-closed.  In particular, the
-    high-volume domain name is never sufficient: account/order observations,
-    unmarked decisions, incidents, and all unknown future shapes advance the
-    authority watermark.
-    """
-    if any(key in payload for key in _AUTHORITY_SHAPED_PAYLOAD_KEYS):
-        return None
-    if domain == "OBSERVATION" and kind == "OBSERVATION_ENVELOPE":
-        observation_type = payload.get("observation_type")
-        required = (payload.get("observation_id"), payload.get("local_monotonic_sequence"), payload.get("source_payload_hash"))
-        if observation_type in _PASSIVE_MARKET_OBSERVATION_TYPES and isinstance(required[0], str) and type(required[1]) is int and isinstance(required[2], str):
-            return f"OBSERVATION:{kind}:{observation_type}"
-        if (
-            observation_type == "ACCOUNT"
-            and isinstance(required[0], str)
-            and type(required[1]) is int
-            and isinstance(required[2], str)
-            and payload.get("authority_effect") == COMMISSIONING_NO_AUTHORITY_EFFECT
-            and payload.get("observation_semantics") == "INFORMATIONAL_ACCOUNT_ITEM"
-            and payload.get("observation_payload_keys") == ["item", "value"]
-            and (
-                (payload.get("observation_account_alias"), payload.get("observation_account_class"))
-                in {
-                    ("Sim101", "LOCAL_SIMULATION"),
-                    ("Lucid25kflex01", "PROVIDER_EVALUATION"),
-                }
-            )
-        ):
-            return "OBSERVATION:OBSERVATION_ENVELOPE:ACCOUNT_ITEM_INFORMATIONAL:AUTHORITY_EFFECT_NONE"
-        return None
-    if domain == "EVIDENCE" and kind == "EVIDENCE":
-        if (
-            isinstance(payload.get("evidence_id"), str)
-            and payload.get("family") in _PASSIVE_EVIDENCE_FAMILIES
-            and payload.get("scientific_eligibility") is False
-            and payload.get("book_completeness") == "UNVERIFIED"
-            and payload.get("sequence_authority") == "LOCAL_CALLBACK_ORDER_ONLY"
-        ):
-            return "EVIDENCE:EVIDENCE"
-        return None
-    if domain == "DECISION" and kind == "DECISION":
-        decision = payload.get("decision")
-        direction = payload.get("direction")
-        expected_direction = {"NO_TRADE": "FLAT", "LONG": "LONG", "SHORT": "SHORT", "EXIT": "FLAT"}.get(str(decision))
-        if (
-            decision in _PASSIVE_DECISIONS
-            and direction == expected_direction
-            and payload.get("authority_effect") == COMMISSIONING_NO_AUTHORITY_EFFECT
-            and payload.get("commissioning") is False
-            and payload.get("strategy_generated") is True
-            and payload.get("scientific_evidence") is False
-            and payload.get("scientific_eligibility") is False
-            and isinstance(payload.get("paper_decision_id"), str)
-        ):
-            return f"DECISION:DECISION:{decision}:AUTHORITY_EFFECT_NONE"
-        return None
-    return None
+    """Backward-compatible accepted-tail shape helper."""
+    classification = commissioning_tail_classification(domain, kind, payload)
+    return classification.shape if classification.accepted_without_verification else None
 
 
 def is_commissioning_safe_unverified_tail_record(record: Mapping[str, object]) -> bool:
@@ -150,7 +539,7 @@ def is_commissioning_safe_unverified_tail_record(record: Mapping[str, object]) -
         isinstance(domain, str)
         and isinstance(kind, str)
         and isinstance(payload, Mapping)
-        and commissioning_safe_tail_classification(domain, kind, payload) is not None
+        and commissioning_tail_classification(domain, kind, payload).accepted_without_verification
     )
 
 
@@ -447,34 +836,314 @@ class PaperLedger:
     def _watermark_payload(
         *,
         classified_through_sequence: int,
-        last_authority_mutation_sequence: int,
-        last_authority_mutation_kind: str | None,
-        last_authority_mutation_domain: str | None,
-        last_authority_mutation_hash: str | None,
-        safe_classification_last_sequences: Mapping[str, int],
+        classified_through_hash: str | None,
+        last_authority_mutation: tuple[int, str | None, str | None, str | None] = (0, None, None, None),
+        last_authority_observation: tuple[int, str | None, str | None, str | None] = (0, None, None, None),
+        last_unknown: tuple[int, str | None, str | None, str | None] = (0, None, None, None),
+        safe_classification_last_sequences: Mapping[str, int] | None = None,
         updated_at: str,
     ) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "policy_version": COMMISSIONING_TAIL_POLICY_VERSION,
             "classified_through_sequence": classified_through_sequence,
-            "last_authority_mutation_sequence": last_authority_mutation_sequence,
-            "last_authority_mutation_kind": last_authority_mutation_kind,
-            "last_authority_mutation_domain": last_authority_mutation_domain,
-            "last_authority_mutation_hash": last_authority_mutation_hash,
-            "safe_classification_last_sequences": dict(sorted(safe_classification_last_sequences.items())),
+            "classified_through_hash": classified_through_hash,
+            "safe_classification_last_sequences": dict(sorted((safe_classification_last_sequences or {}).items())),
             "updated_at": updated_at,
         }
+        for prefix, values in zip(
+            _WATERMARK_EVENT_PREFIXES,
+            (last_authority_mutation, last_authority_observation, last_unknown),
+            strict=True,
+        ):
+            sequence, kind, domain, record_hash = values
+            payload.update({
+                f"{prefix}_sequence": sequence,
+                f"{prefix}_kind": kind,
+                f"{prefix}_domain": domain,
+                f"{prefix}_hash": record_hash,
+            })
+        return payload
 
     @staticmethod
-    def _stored_record_classification(row: sqlite3.Row) -> str | None:
+    def _stored_record_classification(row: sqlite3.Row) -> CommissioningTailClassification:
+        try:
+            document = json.loads(str(row["payload_json"]))
+        except json.JSONDecodeError:
+            return CommissioningTailClassification(
+                CommissioningTailCategory.UNKNOWN, "UNKNOWN:MALFORMED_STORED_PAYLOAD",
+            )
+        payload = document.get("payload") if isinstance(document, Mapping) else None
+        if not isinstance(payload, Mapping):
+            return CommissioningTailClassification(
+                CommissioningTailCategory.UNKNOWN, "UNKNOWN:MALFORMED_STORED_PAYLOAD",
+            )
+        return commissioning_tail_classification(str(row["domain"]), str(row["kind"]), payload)
+
+    @staticmethod
+    def _event_tuple(watermark: Mapping[str, object], prefix: str) -> tuple[int, str | None, str | None, str | None]:
+        return (
+            int(watermark.get(f"{prefix}_sequence") or 0),
+            watermark.get(f"{prefix}_kind") if isinstance(watermark.get(f"{prefix}_kind"), str) else None,
+            watermark.get(f"{prefix}_domain") if isinstance(watermark.get(f"{prefix}_domain"), str) else None,
+            watermark.get(f"{prefix}_hash") if isinstance(watermark.get(f"{prefix}_hash"), str) else None,
+        )
+
+    @staticmethod
+    def _set_event(
+        watermark: dict[str, object], prefix: str, row: sqlite3.Row | Mapping[str, object],
+    ) -> None:
+        watermark.update({
+            f"{prefix}_sequence": int(row["ledger_sequence"]),
+            f"{prefix}_kind": str(row["kind"]),
+            f"{prefix}_domain": str(row["domain"]),
+            f"{prefix}_hash": str(row["record_hash"]),
+        })
+
+    @classmethod
+    def _apply_stored_classification(
+        cls,
+        watermark: dict[str, object],
+        row: sqlite3.Row | Mapping[str, object],
+        classification: CommissioningTailClassification,
+    ) -> None:
+        sequence = int(row["ledger_sequence"])
+        if classification.accepted_without_verification:
+            safe_last = dict(watermark.get("safe_classification_last_sequences") or {})
+            safe_last[classification.shape] = sequence
+            watermark["safe_classification_last_sequences"] = safe_last
+        if classification.category is CommissioningTailCategory.AUTHORITY_OBSERVATION:
+            cls._set_event(watermark, "last_authority_observation", row)
+        elif classification.category is CommissioningTailCategory.AUTHORITY_MUTATION:
+            cls._set_event(watermark, "last_authority_mutation", row)
+        elif classification.category is CommissioningTailCategory.UNKNOWN:
+            cls._set_event(watermark, "last_unknown", row)
+
+    def _row_matches_event(self, candidate: Mapping[str, object], prefix: str, classified: int) -> bool:
+        sequence = candidate.get(f"{prefix}_sequence")
+        kind = candidate.get(f"{prefix}_kind")
+        domain = candidate.get(f"{prefix}_domain")
+        record_hash = candidate.get(f"{prefix}_hash")
+        if type(sequence) is not int or not 0 <= sequence <= classified:
+            return False
+        if sequence == 0:
+            return kind is None and domain is None and record_hash is None
+        if not all(isinstance(value, str) and value for value in (kind, domain, record_hash)):
+            return False
+        row = self._connection.execute(
+            "SELECT kind, domain, record_hash FROM lane_iii_paper_audit WHERE ledger_sequence=?",
+            (sequence,),
+        ).fetchone()
+        return row is not None and (
+            str(row["kind"]), str(row["domain"]), str(row["record_hash"]),
+        ) == (kind, domain, record_hash)
+
+    @staticmethod
+    def _legacy_v2_safe_classification(row: sqlite3.Row) -> str | None:
         try:
             document = json.loads(str(row["payload_json"]))
         except json.JSONDecodeError:
             return None
         payload = document.get("payload") if isinstance(document, Mapping) else None
-        if not isinstance(payload, Mapping):
+        if not isinstance(payload, Mapping) or any(key in payload for key in _AUTHORITY_SHAPED_PAYLOAD_KEYS):
             return None
-        return commissioning_safe_tail_classification(str(row["domain"]), str(row["kind"]), payload)
+        domain, kind = str(row["domain"]), str(row["kind"])
+        if domain == "OBSERVATION" and kind == "OBSERVATION_ENVELOPE":
+            observation_type = payload.get("observation_type")
+            required = (
+                payload.get("observation_id"), payload.get("local_monotonic_sequence"),
+                payload.get("source_payload_hash"),
+            )
+            if (
+                isinstance(observation_type, str)
+                and observation_type in _PASSIVE_MARKET_OBSERVATION_TYPES
+                and isinstance(required[0], str) and type(required[1]) is int
+                and isinstance(required[2], str)
+            ):
+                return f"OBSERVATION:{kind}:{observation_type}"
+            if (
+                observation_type == "ACCOUNT"
+                and isinstance(required[0], str) and type(required[1]) is int
+                and isinstance(required[2], str)
+                and payload.get("authority_effect") == COMMISSIONING_NO_AUTHORITY_EFFECT
+                and payload.get("observation_semantics") == "INFORMATIONAL_ACCOUNT_ITEM"
+                and payload.get("observation_payload_keys") == ["item", "value"]
+                and isinstance(payload.get("observation_account_alias"), str)
+                and isinstance(payload.get("observation_account_class"), str)
+                and (
+                    payload.get("observation_account_alias"), payload.get("observation_account_class"),
+                ) in {
+                    ("Sim101", "LOCAL_SIMULATION"),
+                    ("Lucid25kflex01", "PROVIDER_EVALUATION"),
+                }
+            ):
+                return "OBSERVATION:OBSERVATION_ENVELOPE:ACCOUNT_ITEM_INFORMATIONAL:AUTHORITY_EFFECT_NONE"
+        elif domain == "EVIDENCE" and kind == "EVIDENCE" and (
+            isinstance(payload.get("evidence_id"), str)
+            and isinstance(payload.get("family"), str)
+            and payload.get("family") in _PASSIVE_EVIDENCE_FAMILIES
+            and payload.get("scientific_eligibility") is False
+            and payload.get("book_completeness") == "UNVERIFIED"
+            and payload.get("sequence_authority") == "LOCAL_CALLBACK_ORDER_ONLY"
+        ):
+            return "EVIDENCE:EVIDENCE"
+        elif domain == "DECISION" and kind == "DECISION":
+            decision = payload.get("decision")
+            if (
+                isinstance(decision, str)
+                and decision in _PASSIVE_DECISIONS
+                and payload.get("direction") == {
+                    "NO_TRADE": "FLAT", "LONG": "LONG", "SHORT": "SHORT", "EXIT": "FLAT",
+                }.get(str(decision))
+                and payload.get("authority_effect") == COMMISSIONING_NO_AUTHORITY_EFFECT
+                and payload.get("commissioning") is False
+                and payload.get("strategy_generated") is True
+                and payload.get("scientific_evidence") is False
+                and payload.get("scientific_eligibility") is False
+                and isinstance(payload.get("paper_decision_id"), str)
+            ):
+                return f"DECISION:DECISION:{decision}:AUTHORITY_EFFECT_NONE"
+        return None
+
+    def _safe_map_is_valid(
+        self, safe_last: object, classified: int, *, legacy_v2: bool,
+    ) -> bool:
+        if not isinstance(safe_last, dict) or not all(
+            isinstance(key, str)
+            and key in _V2_SAFE_CLASSIFICATIONS | {
+                "AUTHORITY_OBSERVATION:COMMISSIONING_SESSION_WARMED:AUTHORITY_EFFECT_NONE",
+                "AUTHORITY_OBSERVATION:COMMISSIONING_SESSION_WARMUP_RESET:AUTHORITY_EFFECT_NONE",
+            }
+            and type(value) is int and 0 < value <= classified
+            for key, value in safe_last.items()
+        ):
+            return False
+        for shape, sequence in safe_last.items():
+            row = self._connection.execute(
+                "SELECT ledger_sequence, domain, kind, payload_json, record_hash "
+                "FROM lane_iii_paper_audit WHERE ledger_sequence=?",
+                (sequence,),
+            ).fetchone()
+            if row is None:
+                return False
+            if legacy_v2:
+                if self._legacy_v2_safe_classification(row) != shape:
+                    return False
+            else:
+                classification = self._stored_record_classification(row)
+                if classification.shape != shape and self._legacy_v2_safe_classification(row) != shape:
+                    return False
+        return True
+
+    def _legacy_only_safe_boundary(self, safe_last: object) -> int:
+        """Return the newest v2-subset-safe row not accepted by exact v3."""
+        if not isinstance(safe_last, dict):
+            return 0
+        boundary = 0
+        for shape, sequence in safe_last.items():
+            row = self._connection.execute(
+                "SELECT ledger_sequence, domain, kind, payload_json, record_hash "
+                "FROM lane_iii_paper_audit WHERE ledger_sequence=?",
+                (sequence,),
+            ).fetchone()
+            if row is None:
+                continue
+            classification = self._stored_record_classification(row)
+            if not classification.accepted_without_verification or classification.shape != shape:
+                boundary = max(boundary, int(sequence))
+        return boundary
+
+    def _v3_watermark_is_valid(self, candidate: object) -> bool:
+        if (
+            not isinstance(candidate, dict)
+            or set(candidate) != _V3_WATERMARK_KEYS
+            or candidate.get("policy_version") != COMMISSIONING_TAIL_POLICY_VERSION
+            or not _is_utc(candidate.get("updated_at"))
+        ):
+            return False
+        classified = candidate.get("classified_through_sequence")
+        classified_hash = candidate.get("classified_through_hash")
+        if type(classified) is not int or not 0 <= classified <= self._highest_sequence:
+            return False
+        if classified == 0:
+            if classified_hash is not None:
+                return False
+        else:
+            row = self._connection.execute(
+                "SELECT record_hash FROM lane_iii_paper_audit WHERE ledger_sequence=?", (classified,),
+            ).fetchone()
+            if row is None or str(row["record_hash"]) != classified_hash:
+                return False
+        safe_last = candidate.get("safe_classification_last_sequences")
+        return (
+            all(self._row_matches_event(candidate, prefix, classified) for prefix in _WATERMARK_EVENT_PREFIXES)
+            and self._safe_map_is_valid(safe_last, classified, legacy_v2=False)
+            and int(candidate["last_unknown_sequence"]) >= self._legacy_only_safe_boundary(safe_last)
+        )
+
+    def _v2_watermark_is_valid(self, candidate: object) -> bool:
+        if (
+            not isinstance(candidate, dict)
+            or set(candidate) != _V2_WATERMARK_KEYS
+            or candidate.get("policy_version") != _COMMISSIONING_TAIL_PREVIOUS_POLICY_VERSION
+            or not _is_utc(candidate.get("updated_at"))
+        ):
+            return False
+        classified = candidate.get("classified_through_sequence")
+        return (
+            type(classified) is int
+            and 0 <= classified <= self._highest_sequence
+            and self._row_matches_event(candidate, "last_authority_mutation", classified)
+            and self._safe_map_is_valid(
+                candidate.get("safe_classification_last_sequences"), classified, legacy_v2=True,
+            )
+        )
+
+    def _migrate_v2_watermark(self, candidate: Mapping[str, object]) -> dict[str, object]:
+        classified = int(candidate["classified_through_sequence"])
+        classified_hash: str | None = None
+        migration_boundary: tuple[int, str | None, str | None, str | None] = (
+            0, None, None, None,
+        )
+        if classified:
+            row = self._connection.execute(
+                "SELECT ledger_sequence, kind, domain, record_hash "
+                "FROM lane_iii_paper_audit WHERE ledger_sequence=?", (classified,),
+            ).fetchone()
+            classified_hash = None if row is None else str(row["record_hash"])
+            if row is not None:
+                migration_boundary = (
+                    int(row["ledger_sequence"]), str(row["kind"]),
+                    str(row["domain"]), str(row["record_hash"]),
+                )
+        safe_last = dict(candidate.get("safe_classification_last_sequences") or {})
+        observation: tuple[int, str | None, str | None, str | None] = (0, None, None, None)
+        account_shape = "OBSERVATION:OBSERVATION_ENVELOPE:ACCOUNT_ITEM_INFORMATIONAL:AUTHORITY_EFFECT_NONE"
+        account_sequence = safe_last.get(account_shape)
+        if type(account_sequence) is int and account_sequence > 0:
+            row = self._connection.execute(
+                "SELECT ledger_sequence, kind, domain, record_hash FROM lane_iii_paper_audit WHERE ledger_sequence=?",
+                (account_sequence,),
+            ).fetchone()
+            if row is not None:
+                observation = (
+                    int(row["ledger_sequence"]), str(row["kind"]), str(row["domain"]), str(row["record_hash"]),
+                )
+        # v2 intentionally collapsed every rejected record into one mutation
+        # watermark and accepted record subsets that are weaker than v3's
+        # exact shapes. The classified v2 cursor is therefore one conservative
+        # UNKNOWN umbrella: it retains and dominates the old unsafe boundary
+        # until Auto verifies the entire inherited region.
+        legacy_unsafe = self._event_tuple(candidate, "last_authority_mutation")
+        if migration_boundary[0] < legacy_unsafe[0]:
+            migration_boundary = legacy_unsafe
+        return self._watermark_payload(
+            classified_through_sequence=classified,
+            classified_through_hash=classified_hash,
+            last_authority_observation=observation,
+            last_unknown=migration_boundary,
+            safe_classification_last_sequences=safe_last,
+            updated_at=_now(),
+        )
 
     def _store_authority_watermark(self, connection: sqlite3.Connection, watermark: Mapping[str, object]) -> None:
         connection.execute(
@@ -488,85 +1157,88 @@ class PaperLedger:
             ),
         )
 
-    def _rebuild_authority_watermark(self) -> dict[str, object]:
-        """Find the newest unsafe row by scanning backward from the live tip."""
-        cursor = self._highest_sequence
-        safe_last: dict[str, int] = {}
-        last_sequence = 0
-        last_kind: str | None = None
-        last_domain: str | None = None
-        last_hash: str | None = None
-        while cursor > 0 and last_sequence == 0:
+    def _advance_authority_watermark(self, watermark: dict[str, object]) -> dict[str, object]:
+        classified = int(watermark["classified_through_sequence"])
+        if classified == self._highest_sequence:
+            return watermark
+        if self._highest_sequence - classified > _COMMISSIONING_WATERMARK_SCAN_LIMIT:
+            # A stale writer may have left an arbitrarily large suffix. One
+            # exact tip lookup is enough to deny commissioning conservatively;
+            # startup must never walk a 13M-row production ledger.
+            row = self._connection.execute(
+                "SELECT ledger_sequence, domain, kind, payload_json, record_hash "
+                "FROM lane_iii_paper_audit ORDER BY ledger_sequence DESC LIMIT 1"
+            ).fetchone()
+            if row is not None:
+                self._set_event(watermark, "last_unknown", row)
+        else:
             rows = self._connection.execute(
-                """
-                SELECT ledger_sequence, domain, kind, payload_json, record_hash
-                FROM lane_iii_paper_audit WHERE ledger_sequence <= ?
-                ORDER BY ledger_sequence DESC LIMIT 4096
-                """,
-                (cursor,),
+                "SELECT ledger_sequence, domain, kind, payload_json, record_hash "
+                "FROM lane_iii_paper_audit WHERE ledger_sequence > ? ORDER BY ledger_sequence ASC",
+                (classified,),
             ).fetchall()
-            if not rows:
-                break
             for row in rows:
-                sequence = int(row["ledger_sequence"])
-                classification = self._stored_record_classification(row)
-                if classification is None:
-                    last_sequence = sequence
-                    last_kind = str(row["kind"])
-                    last_domain = str(row["domain"])
-                    last_hash = str(row["record_hash"])
-                    break
-                safe_last[classification] = max(sequence, safe_last.get(classification, 0))
-            cursor = int(rows[-1]["ledger_sequence"]) - 1
-        return self._watermark_payload(
-            classified_through_sequence=self._highest_sequence,
-            last_authority_mutation_sequence=last_sequence,
-            last_authority_mutation_kind=last_kind,
-            last_authority_mutation_domain=last_domain,
-            last_authority_mutation_hash=last_hash,
-            safe_classification_last_sequences=safe_last,
+                self._apply_stored_classification(watermark, row, self._stored_record_classification(row))
+        watermark.update({
+            "policy_version": COMMISSIONING_TAIL_POLICY_VERSION,
+            "classified_through_sequence": self._highest_sequence,
+            "classified_through_hash": self._final_record_hash,
+            "safe_classification_last_sequences": dict(sorted(
+                dict(watermark.get("safe_classification_last_sequences") or {}).items()
+            )),
+            "updated_at": _now(),
+        })
+        return watermark
+
+    def _rebuild_authority_watermark(self) -> dict[str, object]:
+        """Bounded fail-closed recovery for absent or invalid metadata."""
+        watermark = self._watermark_payload(
+            classified_through_sequence=0,
+            classified_through_hash=None,
             updated_at=_now(),
         )
+        rows = self._connection.execute(
+            "SELECT ledger_sequence, domain, kind, payload_json, record_hash "
+            "FROM lane_iii_paper_audit ORDER BY ledger_sequence DESC LIMIT ?",
+            (_COMMISSIONING_WATERMARK_SCAN_LIMIT,),
+        ).fetchall()
+        if rows:
+            oldest_scanned = int(rows[-1]["ledger_sequence"])
+            predecessor = self._connection.execute(
+                "SELECT ledger_sequence, domain, kind, payload_json, record_hash "
+                "FROM lane_iii_paper_audit WHERE ledger_sequence < ? "
+                "ORDER BY ledger_sequence DESC LIMIT 1",
+                (oldest_scanned,),
+            ).fetchone()
+            if predecessor is not None:
+                self._set_event(watermark, "last_unknown", predecessor)
+            for row in reversed(rows):
+                self._apply_stored_classification(watermark, row, self._stored_record_classification(row))
+        watermark.update({
+            "classified_through_sequence": self._highest_sequence,
+            "classified_through_hash": self._final_record_hash,
+            "safe_classification_last_sequences": dict(sorted(
+                dict(watermark.get("safe_classification_last_sequences") or {}).items()
+            )),
+            "updated_at": _now(),
+        })
+        return watermark
 
     def _load_or_rebuild_authority_watermark(self, serialized: str | None) -> dict[str, object]:
-        watermark: dict[str, object] | None = None
+        candidate: object = None
         if serialized:
             try:
                 candidate = json.loads(serialized)
             except json.JSONDecodeError:
                 candidate = None
-            if isinstance(candidate, dict) and candidate.get("policy_version") == COMMISSIONING_TAIL_POLICY_VERSION:
-                classified = candidate.get("classified_through_sequence")
-                authority = candidate.get("last_authority_mutation_sequence")
-                safe_last = candidate.get("safe_classification_last_sequences")
-                if (
-                    type(classified) is int
-                    and 0 <= classified <= self._highest_sequence
-                    and type(authority) is int
-                    and 0 <= authority <= classified
-                    and isinstance(safe_last, dict)
-                    and all(
-                        isinstance(key, str) and type(value) is int and 0 <= value <= classified
-                        for key, value in safe_last.items()
-                    )
-                ):
-                    watermark = candidate
-                    if authority:
-                        row = self._connection.execute(
-                            "SELECT kind, domain, record_hash FROM lane_iii_paper_audit WHERE ledger_sequence=?",
-                            (authority,),
-                        ).fetchone()
-                        expected = (
-                            candidate.get("last_authority_mutation_kind"),
-                            candidate.get("last_authority_mutation_domain"),
-                            candidate.get("last_authority_mutation_hash"),
-                        )
-                        if row is None or (str(row["kind"]), str(row["domain"]), str(row["record_hash"])) != expected:
-                            watermark = None
-        if watermark is None or int(watermark["classified_through_sequence"]) != self._highest_sequence:
-            # A missing/old policy or an image appended by an older runtime is
-            # never trusted. Rebuild the safe suffix before commissioning.
+        if self._v3_watermark_is_valid(candidate):
+            watermark = dict(candidate)  # type: ignore[arg-type]
+        elif self._v2_watermark_is_valid(candidate):
+            watermark = self._migrate_v2_watermark(candidate)  # type: ignore[arg-type]
+        else:
             watermark = self._rebuild_authority_watermark()
+        watermark = self._advance_authority_watermark(watermark)
+        if candidate != watermark:
             with self._transaction() as connection:
                 self._store_authority_watermark(connection, watermark)
         return watermark
@@ -687,7 +1359,9 @@ class PaperLedger:
         synchronous_domain = "DECISION" if all(str(record["domain"]) in _HIGH_VOLUME_DOMAINS for record in records) else "INCIDENT"
         hashes: list[str] = []
         watermark = dict(self._authority_watermark)
-        safe_last = dict(watermark.get("safe_classification_last_sequences") or {})
+        watermark["safe_classification_last_sequences"] = dict(
+            watermark.get("safe_classification_last_sequences") or {}
+        )
         inserted = False
         with self._domain_transaction(synchronous_domain) as connection:
             prior = connection.execute(
@@ -766,24 +1440,25 @@ class PaperLedger:
                 hashes.append(record_hash)
                 inserted = True
                 inner_payload = common.get("payload")
-                classification = (
-                    commissioning_safe_tail_classification(domain, kind, inner_payload)
-                    if isinstance(inner_payload, Mapping)
-                    else None
+                classification = commissioning_tail_classification(domain, kind, inner_payload) if isinstance(
+                    inner_payload, Mapping
+                ) else CommissioningTailClassification(
+                    CommissioningTailCategory.UNKNOWN, "UNKNOWN:MALFORMED_STORED_PAYLOAD",
                 )
-                if classification is None:
-                    watermark.update({
-                        "last_authority_mutation_sequence": sequence,
-                        "last_authority_mutation_kind": kind,
-                        "last_authority_mutation_domain": domain,
-                        "last_authority_mutation_hash": record_hash,
-                    })
-                else:
-                    safe_last[classification] = sequence
+                self._apply_stored_classification(
+                    watermark,
+                    {
+                        "ledger_sequence": sequence,
+                        "kind": kind,
+                        "domain": domain,
+                        "record_hash": record_hash,
+                    },
+                    classification,
+                )
                 watermark.update({
                     "policy_version": COMMISSIONING_TAIL_POLICY_VERSION,
                     "classified_through_sequence": sequence,
-                    "safe_classification_last_sequences": safe_last,
+                    "classified_through_hash": record_hash,
                     "updated_at": at,
                 })
                 self._counts_cache[domain] = self._counts_cache.get(domain, 0) + 1
@@ -1038,6 +1713,34 @@ class PaperLedger:
                     for classification, sequence in safe_last.items()
                     if type(sequence) is int and verified_through_sequence < sequence <= tip
                 )
+                passive_shapes = _V2_SAFE_CLASSIFICATIONS - {
+                    "OBSERVATION:OBSERVATION_ENVELOPE:ACCOUNT_ITEM_INFORMATIONAL:AUTHORITY_EFFECT_NONE",
+                }
+                tail_categories: list[str] = []
+                if any(
+                    shape in passive_shapes and verified_through_sequence < sequence <= tip
+                    for shape, sequence in safe_last.items()
+                    if type(sequence) is int
+                ):
+                    tail_categories.append(CommissioningTailCategory.PASSIVE_DATA.value)
+                for prefix, category in (
+                    ("last_authority_observation", CommissioningTailCategory.AUTHORITY_OBSERVATION),
+                    ("last_authority_mutation", CommissioningTailCategory.AUTHORITY_MUTATION),
+                    ("last_unknown", CommissioningTailCategory.UNKNOWN),
+                ):
+                    sequence = watermark.get(f"{prefix}_sequence")
+                    if type(sequence) is int and verified_through_sequence < sequence <= tip:
+                        tail_categories.append(category.value)
+                mutation_sequence = int(watermark.get("last_authority_mutation_sequence") or 0)
+                unknown_sequence = int(watermark.get("last_unknown_sequence") or 0)
+                blocking_prefix = "last_unknown" if unknown_sequence >= mutation_sequence else "last_authority_mutation"
+                blocking_sequence = max(mutation_sequence, unknown_sequence)
+                blocking_classification = (
+                    None if blocking_sequence == 0
+                    else CommissioningTailCategory.UNKNOWN.value
+                    if blocking_prefix == "last_unknown"
+                    else CommissioningTailCategory.AUTHORITY_MUTATION.value
+                )
                 return {
                     "policy_version": COMMISSIONING_TAIL_POLICY_VERSION,
                     "ledger_identity": self._ledger_uuid,
@@ -1055,6 +1758,18 @@ class PaperLedger:
                     "tail_start_sequence": verified_through_sequence + 1 if tip > verified_through_sequence else None,
                     "tail_end_sequence": tip if tip > verified_through_sequence else None,
                     "tail_record_kinds": tail_kinds,
+                    "tail_record_categories": tail_categories,
+                    "last_blocking_sequence": blocking_sequence,
+                    "last_blocking_kind": (
+                        None if blocking_sequence == 0 else watermark.get(f"{blocking_prefix}_kind")
+                    ),
+                    "last_blocking_domain": (
+                        None if blocking_sequence == 0 else watermark.get(f"{blocking_prefix}_domain")
+                    ),
+                    "last_blocking_hash": (
+                        None if blocking_sequence == 0 else watermark.get(f"{blocking_prefix}_hash")
+                    ),
+                    "last_blocking_classification": blocking_classification,
                     **watermark,
                 }
 
