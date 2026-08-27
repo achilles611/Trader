@@ -104,8 +104,13 @@ exact authority observation may report
 Policy `l3g-commissioning-passive-tail-v3` assigns every record to one explicit
 class. `PASSIVE_DATA` contains only exact QUOTE/TRADE/DEPTH observation
 envelopes, exact paper `EVIDENCE`, and exact no-side-effect strategy decisions.
-`AUTHORITY_OBSERVATION` contains exact informational account items and the
-version-1 commissioning-readiness attestations whose payloads carry
+`AUTHORITY_OBSERVATION` contains exact informational account items, exact
+read-only `ORDER`/`EXECUTION`/`POSITION` account callbacks, and the version-1
+commissioning-readiness attestations. The account callbacks must carry
+`authority_effect=NONE`,
+`observation_semantics=READ_ONLY_ACCOUNT_AUTHORITY_OBSERVATION`, their exact
+source payload-key attestation, and a valid `Sim101`/`LOCAL_SIMULATION` or
+`Lucid25kflex01`/`PROVIDER_EVALUATION` pairing. The readiness payloads carry
 `authority_effect=NONE`,
 `record_semantics=COMMISSIONING_READINESS_STATE_ATTESTATION`, the exact
 semantics version, and the exact `WARMED` or `NOT_WARMED` state. These records

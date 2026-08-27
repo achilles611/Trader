@@ -31,6 +31,8 @@ from .contracts import (
     deterministic_id,
 )
 from .ledger import (
+    COMMISSIONING_ACCOUNT_AUTHORITY_OBSERVATION_PAYLOAD_KEYS,
+    COMMISSIONING_ACCOUNT_AUTHORITY_OBSERVATION_SEMANTICS,
     COMMISSIONING_NO_AUTHORITY_EFFECT,
     COMMISSIONING_READINESS_RECORD_SEMANTICS,
     COMMISSIONING_READINESS_RECORD_SEMANTICS_VERSION,
@@ -743,6 +745,27 @@ class LaneIIIPaperRuntime:
                     "authority_effect": COMMISSIONING_NO_AUTHORITY_EFFECT,
                     "observation_semantics": "INFORMATIONAL_ACCOUNT_ITEM",
                     "observation_payload_keys": ["item", "value"],
+                    "observation_account_alias": observation.account_alias,
+                    "observation_account_class": observation.account_class.value,
+                })
+            expected_authority_payload_keys = COMMISSIONING_ACCOUNT_AUTHORITY_OBSERVATION_PAYLOAD_KEYS.get(
+                observation.observation_type
+            )
+            if (
+                expected_authority_payload_keys is not None
+                and set(observation.payload) == expected_authority_payload_keys
+                and observation.account_alias in {"Sim101", "Lucid25kflex01"}
+                and observation.account_class is not None
+                and (observation.account_alias, observation.account_class.value)
+                in {
+                    ("Sim101", "LOCAL_SIMULATION"),
+                    ("Lucid25kflex01", "PROVIDER_EVALUATION"),
+                }
+            ):
+                raw_payload.update({
+                    "authority_effect": COMMISSIONING_NO_AUTHORITY_EFFECT,
+                    "observation_semantics": COMMISSIONING_ACCOUNT_AUTHORITY_OBSERVATION_SEMANTICS,
+                    "observation_payload_keys": sorted(expected_authority_payload_keys),
                     "observation_account_alias": observation.account_alias,
                     "observation_account_class": observation.account_class.value,
                 })

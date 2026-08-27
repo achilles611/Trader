@@ -45,6 +45,12 @@ _HIGH_VOLUME_DOMAINS = frozenset({"OBSERVATION", "EVIDENCE", "DECISION"})
 COMMISSIONING_TAIL_POLICY_VERSION = "l3g-commissioning-passive-tail-v3"
 _COMMISSIONING_TAIL_PREVIOUS_POLICY_VERSION = "l3g-commissioning-passive-tail-v2"
 COMMISSIONING_NO_AUTHORITY_EFFECT = "NONE"
+COMMISSIONING_ACCOUNT_AUTHORITY_OBSERVATION_SEMANTICS = "READ_ONLY_ACCOUNT_AUTHORITY_OBSERVATION"
+COMMISSIONING_ACCOUNT_AUTHORITY_OBSERVATION_PAYLOAD_KEYS = {
+    "ORDER": frozenset({"native_order_id", "status", "quantity", "filled_quantity"}),
+    "EXECUTION": frozenset({"native_execution_id", "price", "quantity"}),
+    "POSITION": frozenset({"quantity", "direction", "average_price"}),
+}
 COMMISSIONING_READINESS_RECORD_SEMANTICS = "COMMISSIONING_READINESS_STATE_ATTESTATION"
 COMMISSIONING_READINESS_RECORD_SEMANTICS_VERSION = 1
 COMMISSIONING_WARMUP_REQUIRED_FAMILIES = (
@@ -145,6 +151,15 @@ _V2_SAFE_CLASSIFICATIONS = frozenset({
     "OBSERVATION:OBSERVATION_ENVELOPE:ACCOUNT_ITEM_INFORMATIONAL:AUTHORITY_EFFECT_NONE",
     "EVIDENCE:EVIDENCE",
     *(f"DECISION:DECISION:{kind}:AUTHORITY_EFFECT_NONE" for kind in _PASSIVE_DECISIONS),
+})
+_V3_AUTHORITY_OBSERVATION_CLASSIFICATIONS = frozenset({
+    "OBSERVATION:OBSERVATION_ENVELOPE:ACCOUNT_ITEM_INFORMATIONAL:AUTHORITY_EFFECT_NONE",
+    *(
+        f"AUTHORITY_OBSERVATION:OBSERVATION_ENVELOPE:{kind}:AUTHORITY_EFFECT_NONE"
+        for kind in COMMISSIONING_ACCOUNT_AUTHORITY_OBSERVATION_PAYLOAD_KEYS
+    ),
+    "AUTHORITY_OBSERVATION:COMMISSIONING_SESSION_WARMED:AUTHORITY_EFFECT_NONE",
+    "AUTHORITY_OBSERVATION:COMMISSIONING_SESSION_WARMUP_RESET:AUTHORITY_EFFECT_NONE",
 })
 _SECRET_KEYS = frozenset({"hmac_key", "password", "token", "connection_credentials", "private_key", "secret", "authorization"})
 _EPOCH_DIRECTORY = re.compile(r"^epoch-(\d+)$", re.IGNORECASE)
@@ -308,6 +323,47 @@ def _informational_account_shape(payload: Mapping[str, object]) -> str | None:
     ):
         return None
     return "OBSERVATION:OBSERVATION_ENVELOPE:ACCOUNT_ITEM_INFORMATIONAL:AUTHORITY_EFFECT_NONE"
+
+
+def _account_authority_observation_shape(payload: Mapping[str, object]) -> str | None:
+    observation_type = payload.get("observation_type")
+    account_alias = payload.get("observation_account_alias")
+    account_class = payload.get("observation_account_class")
+    payload_keys = payload.get("observation_payload_keys")
+    expected_payload_keys = (
+        COMMISSIONING_ACCOUNT_AUTHORITY_OBSERVATION_PAYLOAD_KEYS.get(observation_type)
+        if isinstance(observation_type, str) else None
+    )
+    if (
+        expected_payload_keys is None
+        or not _exact_keys(payload, _ACCOUNT_OBSERVATION_KEYS)
+        or not _session_context_matches(payload)
+        or not isinstance(payload.get("observation_id"), str)
+        or not payload.get("observation_id")
+        or type(payload.get("local_monotonic_sequence")) is not int
+        or int(payload["local_monotonic_sequence"]) < 0
+        or not _is_hash(payload.get("source_payload_hash"))
+        or not _is_utc(payload.get("observed_at"))
+        or not _is_utc(payload.get("ninja_receipt_time"))
+        or not all(value is None or _is_utc(value) for value in (
+            payload.get("provider_timestamp"), payload.get("exchange_timestamp"),
+        ))
+        or payload.get("authority_effect") != COMMISSIONING_NO_AUTHORITY_EFFECT
+        or payload.get("observation_semantics") != COMMISSIONING_ACCOUNT_AUTHORITY_OBSERVATION_SEMANTICS
+        or not isinstance(payload_keys, list)
+        or payload_keys != sorted(expected_payload_keys)
+        or not isinstance(account_alias, str)
+        or not isinstance(account_class, str)
+        or (account_alias, account_class) not in {
+            ("Sim101", "LOCAL_SIMULATION"),
+            ("Lucid25kflex01", "PROVIDER_EVALUATION"),
+        }
+    ):
+        return None
+    return (
+        f"AUTHORITY_OBSERVATION:OBSERVATION_ENVELOPE:{observation_type}:"
+        "AUTHORITY_EFFECT_NONE"
+    )
 
 
 def _evidence_shape(payload: Mapping[str, object]) -> str | None:
@@ -482,6 +538,11 @@ def commissioning_tail_classification(
         account_shape = _informational_account_shape(payload)
         if account_shape is not None:
             return CommissioningTailClassification(CommissioningTailCategory.AUTHORITY_OBSERVATION, account_shape)
+        authority_observation_shape = _account_authority_observation_shape(payload)
+        if authority_observation_shape is not None:
+            return CommissioningTailClassification(
+                CommissioningTailCategory.AUTHORITY_OBSERVATION, authority_observation_shape,
+            )
         return CommissioningTailClassification(CommissioningTailCategory.UNKNOWN, f"UNKNOWN:{domain}:{kind}")
     if domain == "EVIDENCE" and kind == "EVIDENCE":
         evidence_shape = _evidence_shape(payload)
@@ -1009,10 +1070,7 @@ class PaperLedger:
     ) -> bool:
         if not isinstance(safe_last, dict) or not all(
             isinstance(key, str)
-            and key in _V2_SAFE_CLASSIFICATIONS | {
-                "AUTHORITY_OBSERVATION:COMMISSIONING_SESSION_WARMED:AUTHORITY_EFFECT_NONE",
-                "AUTHORITY_OBSERVATION:COMMISSIONING_SESSION_WARMUP_RESET:AUTHORITY_EFFECT_NONE",
-            }
+            and key in _V2_SAFE_CLASSIFICATIONS | _V3_AUTHORITY_OBSERVATION_CLASSIFICATIONS
             and type(value) is int and 0 < value <= classified
             for key, value in safe_last.items()
         ):

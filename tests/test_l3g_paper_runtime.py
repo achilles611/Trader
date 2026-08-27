@@ -9,7 +9,12 @@ from unittest.mock import patch
 
 from src.l3f_provider.ninjatrader_observation import AccountClass, NinjaTraderObservation
 from src.l3f_provider.tradovate_observation import StreamHealth
-from src.l3g_paper.ledger import PaperLedger
+from src.l3g_paper.ledger import (
+    COMMISSIONING_ACCOUNT_AUTHORITY_OBSERVATION_SEMANTICS,
+    PaperLedger,
+    CommissioningTailCategory,
+    commissioning_tail_classification,
+)
 from src.l3g_paper.ninjatrader_transport import ADDON_PROTOCOL_VERSION, PaperExecutionTransport, expected_addon_source_fingerprint
 from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout, _CommissioningOwnership
 from src.l3g_paper.contracts import PaperDirection, PaperEntryOwner, PaperRuntimeState, PaperSessionArmGrant
@@ -74,6 +79,58 @@ class PaperRuntimeTests(unittest.TestCase):
             self.assertEqual(marked["authority_effect"], "NONE")
             self.assertEqual(marked["observation_semantics"], "INFORMATIONAL_ACCOUNT_ITEM")
             self.assertNotIn("authority_effect", unmarked)
+            runtime.stop(); ledger.close()
+
+    def test_only_exact_account_authority_observations_receive_no_effect_marker(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            runtime = LaneIIIPaperRuntime(ledger)
+
+            def authority(number: int, kind: str, payload: dict[str, object]) -> NinjaTraderObservation:
+                at = f"2026-08-26T14:00:{number:02d}Z"
+                return NinjaTraderObservation(
+                    f"nt-authority-{number}", "authority-session", kind, at, number, payload,
+                    account_alias="Sim101", account_class=AccountClass.LOCAL_SIMULATION,
+                    provider_timestamp=at,
+                )
+
+            runtime.ingest(authority(1, "ORDER", {
+                "native_order_id": "order-1", "status": "Filled", "quantity": 1,
+                "filled_quantity": 1,
+            }))
+            runtime.ingest(authority(2, "EXECUTION", {
+                "native_execution_id": "execution-1", "price": 23000.25, "quantity": 1,
+            }))
+            runtime.ingest(authority(3, "POSITION", {
+                "quantity": 0, "direction": "Flat", "average_price": 0.0,
+            }))
+            runtime.ingest(authority(4, "ORDER", {
+                "native_order_id": "order-2", "status": "Filled", "quantity": 1,
+                "filled_quantity": 1, "future": True,
+            }))
+            ledger.flush_deferred()
+            records = sorted(
+                (
+                    record for record in ledger.recent(20, domain="OBSERVATION")
+                    if record["payload"]["observation_type"] in {"ORDER", "EXECUTION", "POSITION"}
+                ),
+                key=lambda record: record["payload"]["local_monotonic_sequence"],
+            )
+            self.assertEqual(len(records), 4)
+            for record in records[:3]:
+                payload = record["payload"]
+                self.assertEqual(
+                    payload["observation_semantics"],
+                    COMMISSIONING_ACCOUNT_AUTHORITY_OBSERVATION_SEMANTICS,
+                )
+                self.assertEqual(payload["authority_effect"], "NONE")
+                self.assertEqual(
+                    commissioning_tail_classification(
+                        "OBSERVATION", "OBSERVATION_ENVELOPE", payload,
+                    ).category,
+                    CommissioningTailCategory.AUTHORITY_OBSERVATION,
+                )
+            self.assertNotIn("authority_effect", records[3]["payload"])
             runtime.stop(); ledger.close()
 
     def test_addon_provenance_denies_arm_but_not_observation_or_exit_safety(self) -> None:

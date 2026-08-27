@@ -20,6 +20,7 @@ from src.l3g_paper.commissioning import (
 from src.l3g_paper.contracts import POLICY, PaperRuntimeState
 from src.l3g_paper.health import ledger_health_projection
 from src.l3g_paper.ledger import (
+    COMMISSIONING_ACCOUNT_AUTHORITY_OBSERVATION_SEMANTICS,
     COMMISSIONING_NO_AUTHORITY_EFFECT,
     COMMISSIONING_READINESS_RECORD_SEMANTICS,
     COMMISSIONING_READINESS_RECORD_SEMANTICS_VERSION,
@@ -61,6 +62,22 @@ def informational_account_observation(number: int = 1) -> dict[str, object]:
         "authority_effect": COMMISSIONING_NO_AUTHORITY_EFFECT,
         "observation_semantics": "INFORMATIONAL_ACCOUNT_ITEM",
         "observation_payload_keys": ["item", "value"],
+        "observation_account_alias": "Sim101",
+        "observation_account_class": "LOCAL_SIMULATION",
+    }
+
+
+def account_authority_observation(number: int = 1, kind: str = "ORDER") -> dict[str, object]:
+    payload_keys = {
+        "ORDER": ["filled_quantity", "native_order_id", "quantity", "status"],
+        "EXECUTION": ["native_execution_id", "price", "quantity"],
+        "POSITION": ["average_price", "direction", "quantity"],
+    }[kind]
+    return {
+        **observation(number, kind),
+        "authority_effect": COMMISSIONING_NO_AUTHORITY_EFFECT,
+        "observation_semantics": COMMISSIONING_ACCOUNT_AUTHORITY_OBSERVATION_SEMANTICS,
+        "observation_payload_keys": payload_keys,
         "observation_account_alias": "Sim101",
         "observation_account_class": "LOCAL_SIMULATION",
     }
@@ -276,6 +293,7 @@ class CommissioningLiveTailTests(unittest.TestCase):
         cases = (
             ("OBSERVATION", "OBSERVATION_ENVELOPE", observation(), CommissioningTailCategory.PASSIVE_DATA),
             ("OBSERVATION", "OBSERVATION_ENVELOPE", informational_account_observation(), CommissioningTailCategory.AUTHORITY_OBSERVATION),
+            ("OBSERVATION", "OBSERVATION_ENVELOPE", account_authority_observation(), CommissioningTailCategory.AUTHORITY_OBSERVATION),
             ("EVIDENCE", "EVIDENCE", evidence(), CommissioningTailCategory.PASSIVE_DATA),
             ("DECISION", "DECISION", decision(), CommissioningTailCategory.PASSIVE_DATA),
             ("DECISION", "DECISION", decision(authority_effect=False), CommissioningTailCategory.AUTHORITY_MUTATION),
@@ -293,6 +311,7 @@ class CommissioningLiveTailTests(unittest.TestCase):
         for domain, kind, payload in (
             ("OBSERVATION", "OBSERVATION_ENVELOPE", {**observation(), "future": True}),
             ("OBSERVATION", "OBSERVATION_ENVELOPE", {**informational_account_observation(), "future": True}),
+            ("OBSERVATION", "OBSERVATION_ENVELOPE", {**account_authority_observation(), "future": True}),
             ("EVIDENCE", "EVIDENCE", {**evidence(), "future": True}),
             ("DECISION", "DECISION", {**decision(), "future": True}),
             ("OBSERVATION", "OBSERVATION_ENVELOPE", {**observation(), "session_generation": True}),
@@ -309,6 +328,10 @@ class CommissioningLiveTailTests(unittest.TestCase):
             (
                 "OBSERVATION", "OBSERVATION_ENVELOPE",
                 {**informational_account_observation(), "observation_account_alias": []},
+            ),
+            (
+                "OBSERVATION", "OBSERVATION_ENVELOPE",
+                {**account_authority_observation(), "observation_payload_keys": []},
             ),
             ("EVIDENCE", "EVIDENCE", {**evidence(), "family": {}}),
             ("DECISION", "DECISION", {**decision(), "decision": []}),
@@ -379,6 +402,48 @@ class CommissioningLiveTailTests(unittest.TestCase):
             self.assertEqual(result["last_unknown_sequence"], 0)
             self.assertEqual(result["tail_record_categories"], ["AUTHORITY_OBSERVATION"])
 
+    def test_exact_account_authority_observations_are_accepted(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "paper.sqlite3"
+            with PaperLedger(path) as ledger:
+                ledger.append("SESSION_AUTHORITY", {"reason": "verified anchor"})
+                anchor = int(ledger.health_status()["highest_sequence"])
+                for number, kind in enumerate(("ORDER", "EXECUTION", "POSITION"), start=1):
+                    ledger.append("OBSERVATION_ENVELOPE", account_authority_observation(number, kind))
+                result = self.evaluate(ledger, anchor)
+                self.assertEqual(result["ledger_trust_state"], "VERIFIED_ANCHOR_WITH_ACCEPTED_LIVE_TAIL")
+                self.assertEqual(result["tail_authority_classification"], "AUTHORITY_OBSERVATIONS_ONLY")
+                self.assertEqual(result["last_authority_observation_sequence"], anchor + 3)
+                self.assertEqual(result["last_unknown_sequence"], 0)
+            with PaperLedger(path) as reopened:
+                result = self.evaluate(reopened, anchor)
+                self.assertEqual(result["tail_authority_classification"], "AUTHORITY_OBSERVATIONS_ONLY")
+                self.assertEqual(result["last_authority_observation_sequence"], anchor + 3)
+                self.assertEqual(result["last_unknown_sequence"], 0)
+
+    def test_account_authority_observations_fail_closed_without_exact_provenance(self) -> None:
+        exact = account_authority_observation()
+        adversarial = (
+            observation(1, "ORDER"),
+            {**exact, "observation_type": "SNAPSHOT_COMPLETE"},
+            {**exact, "observation_payload_keys": ["native_order_id", "status", "quantity"]},
+            {**exact, "observation_payload_keys": ["filled_quantity", "native_order_id", "quantity", "status", "future"]},
+            {**exact, "observation_semantics": "READ_WRITE_ACCOUNT_AUTHORITY_OBSERVATION"},
+            {**exact, "authority_effect": "MUTATES"},
+            {**exact, "observation_account_alias": "Lucid25kflex01"},
+            {**exact, "observation_account_class": "PROVIDER_EVALUATION"},
+            {**exact, "local_monotonic_sequence": True},
+            {**exact, "future": True},
+        )
+        for payload in adversarial:
+            with self.subTest(payload=payload):
+                self.assertEqual(
+                    commissioning_tail_classification(
+                        "OBSERVATION", "OBSERVATION_ENVELOPE", payload,
+                    ).category,
+                    CommissioningTailCategory.UNKNOWN,
+                )
+
     def test_mutation_and_unknown_tails_both_deny(self) -> None:
         forbidden = (
             ("DECISION", decision(authority_effect=False), "AUTHORITY_MUTATION"),
@@ -404,6 +469,7 @@ class CommissioningLiveTailTests(unittest.TestCase):
         for payload in (
             {**observation(1), "observation_type": "ORDER"},
             {**observation(2), "observation_type": "ACCOUNT"},
+            {**observation(3), "observation_type": "SNAPSHOT_COMPLETE"},
         ):
             record = {"domain": "OBSERVATION", "kind": "OBSERVATION_ENVELOPE", "payload": payload}
             self.assertFalse(is_commissioning_safe_unverified_tail_record(record))
