@@ -15,6 +15,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -62,6 +63,11 @@ WATCHER_MAX_SUBSCRIPTIONS = 10
 NINJATRADER_RUNTIME_LOGGER = logging.getLogger("uvicorn.error")
 LEDGER_VERIFICATION_FRESHNESS_SECONDS = 15 * 60
 MARKET_OBSERVER_ACTIVE_FRESHNESS_SECONDS = 15.0
+LEDGER_VERIFIER_SHUTDOWN_WAIT_SECONDS = 30.0
+
+
+class UnsafePaperExecutionShutdown(RuntimeError):
+    """Normal process teardown was refused while exact execution is unproven."""
 
 
 def _assert_hot_paper_ledger_path(paper_path: Path, cold_root: Path) -> None:
@@ -1365,6 +1371,7 @@ def create_control_center_app(
     center = CopyControlCenter(config, execution_service.database, execution_service=execution_service)
     watcher_runtime: dict[str, Any] = {}
     ninjatrader_runtime: dict[str, Any] = {}
+    paper_ledger_shutdown_receipt: dict[str, object] | None = None
     job_runtime: dict[str, asyncio.Task[Any]] = {}
     source = discovery_source or HyperCoreSourceAcquisition(cache_directory(config.artifacts.database_path))
     discovery_orchestrator = CandidateDiscoveryOrchestrator(execution_service, center.store, source)
@@ -1490,6 +1497,7 @@ def create_control_center_app(
                 "live_capital": "DENIED",
                 "market_observer": ninja_listener_health(),
                 "ledger_verification": ledger_verifier.status(),
+                "ledger_shutdown": paper_ledger_shutdown_receipt,
             }
         status = paper.status()
         verification = ledger_verifier.status()
@@ -1502,10 +1510,51 @@ def create_control_center_app(
             )
         status["market_observer"] = ninja_listener_health()
         status["ledger_verification"] = verification
+        status["ledger_shutdown"] = paper_ledger_shutdown_receipt
         raw_ledger = status.get("ledger")
         if isinstance(raw_ledger, Mapping):
             status["ledger"] = ledger_health_projection(raw_ledger, verification)
         return status
+
+    async def quiesce_ledger_verifier_for_shutdown() -> dict[str, object]:
+        """Release a read-only verifier snapshot before the writer truncates WAL.
+
+        The verifier intentionally owns a consistent read transaction for an
+        entire scan.  A controlled writer shutdown must request its bounded
+        cancellation and wait for its reader to close rather than treating a
+        checkpoint ``busy`` result as a mysterious ledger failure.
+        """
+        initial = ledger_verifier.status()
+        result: dict[str, object] = {
+            "was_running": initial.get("status") == "IN_PROGRESS",
+            "initial_verification_id": initial.get("verification_id"),
+            "cancellation_requested": False,
+            "completed": initial.get("status") != "IN_PROGRESS",
+        }
+        if initial.get("status") != "IN_PROGRESS":
+            result["final_status"] = initial.get("status")
+            return result
+        try:
+            ledger_verifier.cancel()
+            result["cancellation_requested"] = True
+        except Exception as error:
+            result["error"] = f"{type(error).__name__}: {error}"
+            result["final_status"] = ledger_verifier.status().get("status")
+            return result
+        deadline = asyncio.get_running_loop().time() + LEDGER_VERIFIER_SHUTDOWN_WAIT_SECONDS
+        while True:
+            current = ledger_verifier.status()
+            if current.get("status") != "IN_PROGRESS":
+                result["completed"] = True
+                result["final_status"] = current.get("status")
+                result["final_verification_id"] = current.get("verification_id")
+                return result
+            if asyncio.get_running_loop().time() >= deadline:
+                result["completed"] = False
+                result["final_status"] = current.get("status")
+                result["error"] = "Verifier reader did not stop before the controlled-shutdown deadline."
+                return result
+            await asyncio.sleep(0.1)
 
     scheduler_path = config.scheduler.database_path or Path(config.artifacts.database_path).resolve().with_name("beelzebub_operations.sqlite3")
     scheduler_store = OperationsStore(scheduler_path, max_result_bytes=config.scheduler.max_result_bytes, max_event_bytes=config.scheduler.max_event_bytes)
@@ -1545,6 +1594,7 @@ def create_control_center_app(
         # The Control Center application owns this worker for its entire
         # lifespan. It is deliberately outside routes, views, and websocket
         # connections so refreshes/remounts cannot create another listener.
+        nonlocal paper_ledger_shutdown_receipt
         if ninjatrader_runtime.get("active"):
             raise RuntimeError("NINJATRADER_OBSERVER duplicate FastAPI lifespan refused")
         ninjatrader_runtime["active"] = True
@@ -1553,6 +1603,45 @@ def create_control_center_app(
         paper_runtime: LaneIIIPaperRuntime | None = None
         paper_ledger: PaperLedger | None = None
         login_bootstrap: NinjaTraderLoginBootstrap | None = None
+        verifier_shutdown: dict[str, object] | None = None
+        runtime_watchdog_shutdown: dict[str, object] = {
+            "required": False,
+            "completed": True,
+            "reason": None,
+        }
+        watchdog_shutdown_incomplete = False
+
+        async def retain_execution_transport_for_watchdog() -> dict[str, object]:
+            """Keep the signed AddOn connected through a bounded failsafe window."""
+            if paper_runtime is None:
+                return {"required": False, "completed": True, "reason": "RUNTIME_UNAVAILABLE"}
+            current = paper_runtime.watchdog_shutdown_status()
+            if current.get("flat_confirmed") is True:
+                # A physical flat state received through the transport's
+                # ledger-outage fallback is useful safety truth, but it is
+                # not durable closing evidence. Never promote it into a
+                # clean controlled-shutdown receipt after the ledger recovers.
+                return {
+                    **current,
+                    "completed": current.get("durable_confirmation") is not False,
+                }
+            if current.get("required") is not True:
+                return {**current, "completed": False}
+            deadline = time.monotonic() + max(0.0, float(current.get("remaining_seconds") or 0.0))
+            while True:
+                current = paper_runtime.watchdog_shutdown_status()
+                if current.get("flat_confirmed") is True:
+                    return {
+                        **current,
+                        "completed": current.get("durable_confirmation") is not False,
+                    }
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    # The grace exceeds the AddOn watchdog interval.  Never
+                    # claim a confirmed flat state merely because the
+                    # independently owned action was requested.
+                    return {**current, "completed": False}
+                await asyncio.sleep(min(0.1, remaining))
         try:
             shadow = lane_iii_shadow_factory() if lane_iii_shadow_factory is not None else LaneIIIShadowRuntime()
             if type(shadow) is not LaneIIIShadowRuntime:
@@ -1680,25 +1769,138 @@ def create_control_center_app(
             finally:
                 try:
                     if paper_runtime is not None:
-                        paper_runtime.stop()
-                    if paper_transport is not None:
-                        paper_transport.stop()
-                    if supervisor is not None:
-                        await supervisor.stop()
-                    if task is not None:
-                        await asyncio.gather(task, return_exceptions=True)
+                        try:
+                            runtime_watchdog_shutdown = paper_runtime.stop()
+                            runtime_watchdog_shutdown = await retain_execution_transport_for_watchdog()
+                            watchdog_shutdown_incomplete = runtime_watchdog_shutdown.get("completed") is not True
+                        except Exception as error:
+                            # If Python cannot even obtain the independent
+                            # watchdog result, it has no basis to tear down
+                            # the signed callback path. Treat status failure
+                            # exactly like an unresolved watchdog.
+                            watchdog_shutdown_incomplete = True
+                            runtime_watchdog_shutdown = {
+                                "required": True,
+                                "completed": False,
+                                "flat_confirmed": False,
+                                "reason": "WATCHDOG_SHUTDOWN_STATUS_UNAVAILABLE",
+                                "error": f"{type(error).__name__}: {error}",
+                            }
+                            NINJATRADER_RUNTIME_LOGGER.exception(
+                                "Could not confirm L3G independent AddOn watchdog shutdown state."
+                            )
+                        if watchdog_shutdown_incomplete:
+                            NINJATRADER_RUNTIME_LOGGER.error(
+                                "L3G independent AddOn watchdog grace elapsed without flat confirmation: %s",
+                                runtime_watchdog_shutdown,
+                            )
                 finally:
-                    watcher_runtime.clear()
-                    ninjatrader_runtime.clear()
-                    app.state.ninjatrader_observer = None
-                    app.state.lane_iii_shadow = None
-                    app.state.lane_iii_paper = None
-                    app.state.lane_iii_paper_transport = None
-                    app.state.ninjatrader_login_bootstrap = None
-                    app.state.scheduler_engine = None
-                    app.state.scheduler_service = scheduler_service
-                    if paper_ledger is not None:
-                        paper_ledger.close()
+                    if watchdog_shutdown_incomplete:
+                        # Do not complete a normal FastAPI lifespan teardown
+                        # while exact execution lacks a correlated, durable
+                        # flat/order proof.  In particular, merely skipping
+                        # transport.stop() and returning would orphan daemon
+                        # threads and let the host kill the only watchdog
+                        # path. Preserve singleton ownership and refuse the
+                        # normal shutdown instead.
+                        verifier_shutdown = {
+                            "was_running": None,
+                            "completed": False,
+                            "skipped": True,
+                            "reason": "INDEPENDENT_WATCHDOG_UNRESOLVED",
+                        }
+                        paper_ledger_shutdown_receipt = {
+                            "schema": "l3g-ledger-controlled-shutdown-v1",
+                            "closed_at": None,
+                            "clean_shutdown": False,
+                            "admission_sealed": False,
+                            "writer_stopped": False,
+                            "checkpoint": None,
+                            "error": (
+                                "WATCHDOG_FLAT_UNCONFIRMED_OR_NON_DURABLE: normal process shutdown "
+                                "was refused; manual intervention is required."
+                            ),
+                            "transport_stop_skipped": True,
+                            "ledger_close_deferred": True,
+                            "lifecycle_shutdown_aborted": True,
+                            "manual_intervention_required": True,
+                            "verifier_shutdown": verifier_shutdown,
+                            "runtime_watchdog_shutdown": runtime_watchdog_shutdown,
+                        }
+                        ninjatrader_runtime["unsafe_shutdown"] = paper_ledger_shutdown_receipt
+                        NINJATRADER_RUNTIME_LOGGER.critical(
+                            "L3G paper shutdown refused: %s", paper_ledger_shutdown_receipt,
+                        )
+                        raise UnsafePaperExecutionShutdown(
+                            "L3G exact execution watchdog has no durable correlated flat confirmation."
+                        )
+                    try:
+                        # A process-local shutdown must not sever the signed
+                        # AddOn callback path while its independent watchdog
+                        # is still the only available flatting authority.
+                        # Leave both transport and writer running and publish
+                        # an explicit failed/deferred receipt instead.
+                        if paper_transport is not None:
+                            paper_transport.stop()
+                    finally:
+                        try:
+                            if supervisor is not None:
+                                await supervisor.stop()
+                        finally:
+                            try:
+                                if task is not None:
+                                    await asyncio.gather(task, return_exceptions=True)
+                            finally:
+                                try:
+                                    verifier_shutdown = await quiesce_ledger_verifier_for_shutdown()
+                                except Exception as error:
+                                    verifier_shutdown = {
+                                        "was_running": None,
+                                        "completed": False,
+                                        "error": f"{type(error).__name__}: {error}",
+                                    }
+                                    NINJATRADER_RUNTIME_LOGGER.exception(
+                                        "Could not quiesce L3G verifier before ledger shutdown."
+                                    )
+                                watcher_runtime.clear()
+                                ninjatrader_runtime.clear()
+                                app.state.ninjatrader_observer = None
+                                app.state.lane_iii_shadow = None
+                                app.state.lane_iii_paper = None
+                                app.state.lane_iii_paper_transport = None
+                                app.state.ninjatrader_login_bootstrap = None
+                                app.state.scheduler_engine = None
+                                app.state.scheduler_service = scheduler_service
+                                if paper_ledger is not None:
+                                    try:
+                                        paper_ledger_shutdown_receipt = {
+                                            **paper_ledger.close(),
+                                            "verifier_shutdown": verifier_shutdown,
+                                            "runtime_watchdog_shutdown": runtime_watchdog_shutdown,
+                                        }
+                                    except Exception as error:
+                                        shutdown_status = paper_ledger.shutdown_status()
+                                        paper_ledger_shutdown_receipt = {
+                                            **(
+                                                {
+                                                    "schema": "l3g-ledger-controlled-shutdown-v1",
+                                                    "clean_shutdown": False,
+                                                    "error": f"{type(error).__name__}: {error}",
+                                                }
+                                                if shutdown_status is None else shutdown_status
+                                            ),
+                                            "verifier_shutdown": verifier_shutdown,
+                                            "runtime_watchdog_shutdown": runtime_watchdog_shutdown,
+                                        }
+                                        NINJATRADER_RUNTIME_LOGGER.exception(
+                                            "L3G paper ledger controlled shutdown failed: %s",
+                                            paper_ledger_shutdown_receipt,
+                                        )
+                                        raise
+                                    NINJATRADER_RUNTIME_LOGGER.info(
+                                        "L3G paper ledger controlled shutdown: %s",
+                                        paper_ledger_shutdown_receipt,
+                                    )
 
     app = FastAPI(title="Trader Copy Control Center", version="1.0", docs_url=None, redoc_url=None,
                   lifespan=lifespan)

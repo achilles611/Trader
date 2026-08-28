@@ -25,7 +25,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         // Updated from the checked-in source before a NinjaTrader build.  The
         // Python bridge independently fingerprints the same source, so an old
         // compiled AddOn cannot be armed merely because its DLL timestamp is new.
-        private const string AddonSourceFingerprint = "eee706f322b4f44ab82937bd231cc81ccaa484035c507d5c743a3249d1722879";
+        private const string AddonSourceFingerprint = "b91b91b651d312768e2bbfbf4206de9d133303e31597ef364691e4f5c7728bf9";
         private const string ExactAccountName = "Sim101";
         private const string ExactAccountClass = "LOCAL_SIMULATION";
         private const string ExactInstrumentName = "MNQ SEP26";
@@ -36,6 +36,8 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const double ExactTickSize = 0.25;
         private const double ProtectiveStopDistance = 25.0;
         private const int ProtectiveAcceptanceSeconds = 3;
+        private const int WatchdogSettlementSeconds = 1;
+        private const int MaximumWatchdogFinalProofAttempts = 3;
         private const string PaperTimezone = "America/New_York";
         private const string AsiaProfileHash = "55225b35ccdb289d179bb23afd7f3fdb2c5ab193d53aba21603f17ff9f6d43aa";
         private const string NewYorkProfileHash = "8b8560a08ff41963a7a78d09bc977fbc1faf10f4a11ce58d05f47cacd89e0814";
@@ -81,6 +83,29 @@ namespace NinjaTrader.NinjaScript.AddOns
         private string pendingFlattenCommandId;
         private string pendingFlattenIntentId;
         private string pendingFlattenDecisionId;
+        // A watchdog safety event is not complete until the AddOn publishes a
+        // matching, exact-account/instrument reconciliation that proves both
+        // position and owned working orders are flat.  Python uses this id to
+        // reject stale pre-watchdog snapshots during controlled shutdown.
+        private string pendingWatchdogSafetyEventId;
+        private string pendingWatchdogSafetyReason;
+        private DateTime pendingWatchdogSafetyActivatedUtc = DateTime.MinValue;
+        private bool pendingWatchdogSafetyEventPublished;
+        private long pendingWatchdogSafetySettlementSequence;
+        private int pendingWatchdogSafetyFinalProofAttempts;
+        // A final proof is only counted after its exact-flat receipt has
+        // actually been written.  Keep one reservation per authenticated
+        // socket generation so an in-flight write on a dead connection cannot
+        // consume a later session's bounded retry budget.
+        private bool pendingWatchdogSafetyFinalProofInFlight;
+        private long authenticatedSessionGeneration;
+        // ``lockedOut`` also represents foreign-account activity. Keep the
+        // independently owned watchdog action separate so that a pre-existing
+        // foreign lockout cannot suppress cancellation of a still-working
+        // owned entry after Python heartbeats stop.
+        private bool watchdogSafetyDispatchStarted;
+        private bool watchdogSafetyActionInFlight;
+        private DateTime watchdogSafetyLastActionUtc = DateTime.MinValue;
         private Order protectiveOrder;
         private string pendingProtectionCommandId;
         private readonly string bridgeInstanceId = Guid.NewGuid().ToString("N");
@@ -131,6 +156,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                 paperAccount.AccountItemUpdate += OnAccountItemUpdate;
                 stopping = false;
                 lockedOut = false;
+                foreignActivity = false;
+                watchdogSafetyDispatchStarted = false;
+                watchdogSafetyActionInFlight = false;
+                watchdogSafetyLastActionUtc = DateTime.MinValue;
                 connectionThread = NewThread(ConnectionLoop, "BeelzebubPaperConnection");
                 commandThread = NewThread(CommandLoop, "BeelzebubPaperCommands");
                 watchdogThread = NewThread(WatchdogLoop, "BeelzebubPaperWatchdog");
@@ -148,6 +177,17 @@ namespace NinjaTrader.NinjaScript.AddOns
                 stopping = true;
                 authenticated = false;
                 reconciled = false;
+                pendingWatchdogSafetyEventId = null;
+                pendingWatchdogSafetyReason = null;
+                pendingWatchdogSafetyActivatedUtc = DateTime.MinValue;
+                pendingWatchdogSafetyEventPublished = false;
+                pendingWatchdogSafetySettlementSequence = 0;
+                pendingWatchdogSafetyFinalProofAttempts = 0;
+                pendingWatchdogSafetyFinalProofInFlight = false;
+                authenticatedSessionGeneration = 0;
+                watchdogSafetyDispatchStarted = false;
+                watchdogSafetyActionInFlight = false;
+                watchdogSafetyLastActionUtc = DateTime.MinValue;
                 Monitor.PulseAll(queueLock);
                 CloseTransport();
                 if (paperAccount != null)
@@ -334,6 +374,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                 Reject(grant, "SESSION_AUTHORITY_MISSING", null);
                 return;
             }
+            // An AddOn reload can leave a previously submitted BZ-L3G order
+            // working without producing another OrderUpdate for this instance.
+            // Restore only its local cancel/watchdog identity before this
+            // authenticated session can evaluate commands or missed heartbeats.
+            RehydrateOwnedWorkingOrders();
             lock (stateLock)
             {
                 executionSessionId = session;
@@ -344,7 +389,15 @@ namespace NinjaTrader.NinjaScript.AddOns
                 reconciled = false;
                 lastCommandSequence = 0;
                 lastHeartbeatUtc = DateTime.UtcNow;
+                // A reconnect may have lost receipts that were successfully
+                // written only to the prior local socket.  Retain the event
+                // correlation and monotonic settlement sequence, but give the
+                // newly authenticated connection its own bounded proof budget.
+                authenticatedSessionGeneration++;
+                pendingWatchdogSafetyFinalProofAttempts = 0;
+                pendingWatchdogSafetyFinalProofInFlight = false;
             }
+            RepublishPendingWatchdogSafetyCorrelation();
             SendReconciliation();
         }
 
@@ -618,13 +671,17 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void FlattenOwnedInstrument(Dictionary<string, object> command, bool emergency)
         {
-            if (foreignActivity && !emergency)
-            {
-                Reject(command, "FOREIGN_ACTIVITY_LOCKOUT", Text(command, "command_id"));
-                return;
-            }
+            bool shutdownWatchdogCorrelation = emergency
+                && String.Equals(Text(command, "reason_code"), "PROCESS_STOP_OPEN_POSITION", StringComparison.Ordinal);
+            bool foreign;
             lock (stateLock)
             {
+                foreign = foreignActivity;
+                if (foreign)
+                {
+                    lockedOut = true;
+                    reconciled = false;
+                }
                 flattenInProgress = true;
                 flattenDeadlineUtc = DateTime.UtcNow.AddSeconds(ProtectiveAcceptanceSeconds);
                 protectiveDeadlineUtc = DateTime.MaxValue;
@@ -632,10 +689,37 @@ namespace NinjaTrader.NinjaScript.AddOns
                 pendingFlattenIntentId = Text(command, "intent_id");
                 pendingFlattenDecisionId = Text(command, "decision_id");
             }
+            if (foreign && !emergency)
+            {
+                Reject(command, "FOREIGN_ACTIVITY_LOCKOUT", Text(command, "command_id"));
+                return;
+            }
+            // Process shutdown submits a durable EMERGENCY_FLATTEN before
+            // heartbeats stop. It may settle before the heartbeat watchdog
+            // observes activity, so give that path the same correlated final
+            // reconciliation proof as the independent watchdog. Other
+            // operator/risk emergency flattens retain their normal lifecycle
+            // semantics and are not mislabeled as process-stop watchdogs.
+            if (shutdownWatchdogCorrelation)
+                BeginWatchdogSafetyCorrelation("EMERGENCY_FLATTEN_ACCEPTED");
             CancelOwnedOrders();
+            if (foreign)
+            {
+                // An exact-instrument foreign order/position is ambiguous:
+                // cancelling our own work is safe, but Account.Flatten could
+                // close someone else's Sim101 exposure. Retain the safety
+                // correlation and fail the shutdown proof closed instead.
+                Diagnostic("FOREIGN_ACTIVITY_EMERGENCY_FLATTEN_REFUSED");
+                if (shutdownWatchdogCorrelation)
+                    TryPublishWatchdogSafetyReconciliation();
+                return;
+            }
             // This exact-instrument Account API call cannot touch any other
-            // account or instrument. Preflight refuses foreign MNQ activity.
+            // account or instrument; the foreign-activity guard above keeps
+            // it away from an ambiguously owned MNQ position.
             paperAccount.Flatten(new[] { paperInstrument });
+            if (shutdownWatchdogCorrelation)
+                TryPublishWatchdogSafetyReconciliation();
         }
 
         private void CancelOwnedOrders()
@@ -649,6 +733,45 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             lock (stateLock)
                 return ownedByName.Values.Where(value => (role == null || value.Role == role) && value.Order != null && Working(value.Order.OrderState)).Select(value => value.Order).Distinct().ToList();
+        }
+
+        private void RehydrateOwnedWorkingOrders()
+        {
+            if (paperAccount == null || paperInstrument == null) return;
+            // Do not hold the account collection lock while updating AddOn
+            // state: NinjaTrader can deliver OrderUpdate concurrently. The
+            // snapshot is used only to restore names this instance already
+            // owns; it never submits, changes, or flattens an order.
+            List<Order> restored;
+            lock (paperAccount.Orders)
+            {
+                restored = paperAccount.Orders
+                    .Where(order => order != null
+                        && Working(order.OrderState)
+                        && order.Instrument != null
+                        && String.Equals(order.Instrument.FullName, ExactInstrumentName, StringComparison.Ordinal)
+                        && IsOwnedName(order.Name))
+                    .ToList();
+            }
+            if (restored.Count == 0) return;
+            lock (stateLock)
+            {
+                foreach (Order order in restored)
+                {
+                    string name = order.Name ?? String.Empty;
+                    OwnedOrder owner;
+                    if (!ownedByName.TryGetValue(name, out owner))
+                    {
+                        owner = OwnedOrder.Restored(order);
+                        ownedByName[name] = owner;
+                    }
+                    else
+                    {
+                        owner.Order = order;
+                        owner.Terminal = false;
+                    }
+                }
+            }
         }
 
         private static bool Working(OrderState state)
@@ -699,7 +822,9 @@ namespace NinjaTrader.NinjaScript.AddOns
             SendSigned(hello);
         }
 
-        private void SendReconciliation()
+        private bool SendReconciliation(
+            string safetyEventId = null, bool requireWatchdogFlat = false,
+            bool safetySettlementFinal = false, long safetySettlementSequence = 0)
         {
             Position position = CurrentPosition();
             int quantity = 0;
@@ -727,12 +852,26 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
             lock (paperAccount.Positions)
                 if (paperAccount.Positions.Any(item => item.Quantity != 0 && (item.Instrument == null || !String.Equals(item.Instrument.FullName, ExactInstrumentName, StringComparison.Ordinal)))) foreign = true;
+            // Position and order collections have separate account locks. A
+            // fill can arrive while the order scan runs, so a safety proof
+            // must reject a mixed-time snapshot rather than calling it whole.
+            Position stablePosition = CurrentPosition();
+            int stableQuantity = 0;
+            if (stablePosition != null)
+            {
+                if (stablePosition.MarketPosition == MarketPosition.Long) stableQuantity = stablePosition.Quantity;
+                else if (stablePosition.MarketPosition == MarketPosition.Short) stableQuantity = -stablePosition.Quantity;
+            }
+            if (requireWatchdogFlat && stableQuantity != quantity)
+                return false;
             lock (stateLock)
             {
                 foreignActivity = foreign;
                 reconciled = !foreign && Math.Abs(quantity) <= MaximumQuantity;
                 if (foreign) lockedOut = true;
             }
+            if (requireWatchdogFlat && (quantity != 0 || working != 0 || entryWorking != 0 || foreign))
+                return false;
             Dictionary<string, object> message = SessionMessage("RECONCILIATION");
             message["receipt_id"] = "l3g-reconcile-" + Guid.NewGuid().ToString("N");
             message["account_name"] = ExactAccountName;
@@ -745,7 +884,146 @@ namespace NinjaTrader.NinjaScript.AddOns
             message["order_snapshot_complete"] = true;
             message["foreign_activity"] = foreign;
             message["protective_stop_state"] = protectiveOrder == null ? "NONE" : protectiveOrder.OrderState.ToString().ToUpperInvariant();
-            SendSigned(message);
+            if (!String.IsNullOrWhiteSpace(safetyEventId))
+                message["safety_event_id"] = safetyEventId;
+            if (safetySettlementFinal)
+            {
+                message["safety_settlement_final"] = true;
+                message["safety_settlement_sequence"] = safetySettlementSequence;
+            }
+            return SendSigned(message);
+        }
+
+        private void TryPublishWatchdogSafetyReconciliation()
+        {
+            string safetyEventId;
+            DateTime activatedAt;
+            bool eventPublished;
+            long sessionGeneration;
+            lock (stateLock)
+            {
+                safetyEventId = pendingWatchdogSafetyEventId;
+                activatedAt = pendingWatchdogSafetyActivatedUtc;
+                eventPublished = pendingWatchdogSafetyEventPublished;
+                sessionGeneration = authenticatedSessionGeneration;
+            }
+            if (String.IsNullOrWhiteSpace(safetyEventId) || !authenticated || !eventPublished) return;
+            bool finalProofReserved = false;
+            bool sent = false;
+            long settlementSequence = 0;
+            try
+            {
+                bool settlementFinal = DateTime.UtcNow - activatedAt >= TimeSpan.FromSeconds(WatchdogSettlementSeconds);
+                lock (stateLock)
+                {
+                    if (!String.Equals(pendingWatchdogSafetyEventId, safetyEventId, StringComparison.Ordinal)
+                        || authenticatedSessionGeneration != sessionGeneration)
+                        return;
+                    if (settlementFinal)
+                    {
+                        if (pendingWatchdogSafetyFinalProofAttempts >= MaximumWatchdogFinalProofAttempts
+                            || pendingWatchdogSafetyFinalProofInFlight)
+                            return;
+                        // Reserve the next sequence without consuming the
+                        // bounded attempt. SendReconciliation returns false
+                        // for nonflat/mixed snapshots and failed writes.
+                        settlementSequence = pendingWatchdogSafetySettlementSequence + 1;
+                        pendingWatchdogSafetyFinalProofInFlight = true;
+                        finalProofReserved = true;
+                    }
+                }
+                // Keep the correlation pending after a clean snapshot. The
+                // watchdog loop emits a bounded set of stable proofs, while
+                // the runtime rejects a one-shot snapshot that could straddle
+                // a late fill/cancel callback. Bounded attempts prevent a
+                // locked-out AddOn from creating an unbounded ledger stream.
+                sent = SendReconciliation(safetyEventId, true, settlementFinal, settlementSequence);
+            }
+            catch (Exception error)
+            {
+                // Keep the id pending.  A later terminal order/position
+                // callback will retry the signed exact-flat proof.
+                Diagnostic("WATCHDOG_RECONCILIATION_FAILED_" + error.GetType().Name);
+            }
+            finally
+            {
+                if (finalProofReserved) lock (stateLock)
+                {
+                    // An old socket may finish a write after a re-auth or a
+                    // newer safety correlation. It must not mutate the new
+                    // connection's proof budget or sequence.
+                    if (String.Equals(pendingWatchdogSafetyEventId, safetyEventId, StringComparison.Ordinal)
+                        && authenticatedSessionGeneration == sessionGeneration)
+                    {
+                        if (sent)
+                        {
+                            pendingWatchdogSafetySettlementSequence = settlementSequence;
+                            pendingWatchdogSafetyFinalProofAttempts++;
+                        }
+                        pendingWatchdogSafetyFinalProofInFlight = false;
+                    }
+                }
+            }
+        }
+
+        private void BeginWatchdogSafetyCorrelation(string reason)
+        {
+            string safetyEventId = "l3g-safety-" + Guid.NewGuid().ToString("N");
+            lock (stateLock)
+            {
+                watchdogSafetyDispatchStarted = true;
+                pendingWatchdogSafetyEventId = safetyEventId;
+                pendingWatchdogSafetyReason = reason;
+                pendingWatchdogSafetyActivatedUtc = DateTime.UtcNow;
+                pendingWatchdogSafetyEventPublished = false;
+                pendingWatchdogSafetySettlementSequence = 0;
+                pendingWatchdogSafetyFinalProofAttempts = 0;
+                pendingWatchdogSafetyFinalProofInFlight = false;
+            }
+            // Publish the correlation first. TCP ordering ensures a terminal
+            // reconciliation emitted by dispatcher callbacks cannot overtake
+            // its watchdog safety event at Python.
+            PublishWatchdogSafetyEvent(safetyEventId, reason);
+        }
+
+        private bool PublishWatchdogSafetyEvent(string safetyEventId, string reason)
+        {
+            if (String.IsNullOrWhiteSpace(safetyEventId) || !authenticated) return false;
+            try
+            {
+                Dictionary<string, object> incident = SessionMessage("SAFETY_EVENT");
+                incident["receipt_id"] = safetyEventId;
+                incident["safety_event_id"] = safetyEventId;
+                incident["reason_code"] = reason;
+                bool sent = SendSigned(incident);
+                if (sent)
+                {
+                    lock (stateLock)
+                        if (String.Equals(pendingWatchdogSafetyEventId, safetyEventId, StringComparison.Ordinal))
+                            pendingWatchdogSafetyEventPublished = true;
+                }
+                return sent;
+            }
+            catch (Exception error)
+            {
+                // Keep the correlation pending. Later order/position events
+                // can still publish the settlement proof if the socket heals.
+                Diagnostic("SAFETY_EVENT_SEND_FAILED_" + error.GetType().Name);
+                return false;
+            }
+        }
+
+        private void RepublishPendingWatchdogSafetyCorrelation()
+        {
+            string safetyEventId;
+            string reason;
+            lock (stateLock)
+            {
+                safetyEventId = pendingWatchdogSafetyEventId;
+                reason = pendingWatchdogSafetyReason;
+            }
+            if (!PublishWatchdogSafetyEvent(safetyEventId, reason)) return;
+            TryPublishWatchdogSafetyReconciliation();
         }
 
         private void OnOrderUpdate(object sender, OrderEventArgs e)
@@ -801,6 +1079,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             message["filled_quantity"] = order.Filled;
             message["command_id"] = owner == null ? null : owner.CommandId;
             SendSigned(message);
+            TryPublishWatchdogSafetyReconciliation();
         }
 
         private void OnExecutionUpdate(object sender, ExecutionEventArgs e)
@@ -866,6 +1145,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             message["average_price"] = position.AveragePrice;
             message["timestamp"] = UtcNow();
             SendSigned(message);
+            TryPublishWatchdogSafetyReconciliation();
         }
 
         private void OnAccountItemUpdate(object sender, AccountItemEventArgs e)
@@ -879,6 +1159,10 @@ namespace NinjaTrader.NinjaScript.AddOns
             while (!stopping)
             {
                 Thread.Sleep(250);
+                // Do not rely on a post-reload OrderUpdate to discover an
+                // already-working BZ-L3G order before deciding whether missed
+                // heartbeats require the independent cancel/flatten action.
+                RehydrateOwnedWorkingOrders();
                 bool heartbeatLost;
                 bool protectionFailed;
                 bool flattenFailed;
@@ -904,14 +1188,16 @@ namespace NinjaTrader.NinjaScript.AddOns
                 if (heartbeatLost) LockAndProtect("HEARTBEAT_WATCHDOG");
                 if (protectionFailed) LockAndProtect("PROTECTIVE_STOP_ACCEPTANCE_TIMEOUT");
                 if (flattenFailed) LockAndProtect("FLATTEN_ACCEPTANCE_TIMEOUT");
+                TryPublishWatchdogSafetyReconciliation();
             }
         }
 
         private void LockAndProtect(string reason)
         {
+            bool beginCorrelation;
+            bool dispatchSafetyAction;
             lock (stateLock)
             {
-                if (lockedOut && reason == "HEARTBEAT_WATCHDOG") return;
                 lockedOut = true;
                 reconciled = false;
                 protectiveDeadlineUtc = DateTime.MaxValue;
@@ -920,7 +1206,24 @@ namespace NinjaTrader.NinjaScript.AddOns
                 pendingFlattenCommandId = null;
                 pendingFlattenIntentId = null;
                 pendingFlattenDecisionId = null;
+                // Generic lockout can already be true because foreign activity
+                // was observed. It is not evidence that this AddOn has begun
+                // its independently owned cancel/flatten response.
+                beginCorrelation = !watchdogSafetyDispatchStarted;
+                if (beginCorrelation)
+                    watchdogSafetyDispatchStarted = true;
+                DateTime now = DateTime.UtcNow;
+                dispatchSafetyAction = !watchdogSafetyActionInFlight
+                    && now - watchdogSafetyLastActionUtc >= TimeSpan.FromSeconds(1);
+                if (dispatchSafetyAction)
+                {
+                    watchdogSafetyActionInFlight = true;
+                    watchdogSafetyLastActionUtc = now;
+                }
             }
+            if (beginCorrelation)
+                BeginWatchdogSafetyCorrelation(reason);
+            if (!dispatchSafetyAction) return;
             try
             {
                 NinjaTrader.Core.Globals.RandomDispatcher.BeginInvoke(new Action(delegate
@@ -928,20 +1231,28 @@ namespace NinjaTrader.NinjaScript.AddOns
                     try
                     {
                         CancelOwnedOrders();
+                        bool foreign;
+                        lock (stateLock) foreign = foreignActivity;
                         Position position = CurrentPosition();
-                        if (position != null && position.Quantity != 0)
+                        // Foreign activity may include an exact-instrument
+                        // order/position. Never use Account.Flatten while its
+                        // ownership is ambiguous; retry owned cancellation and
+                        // keep the correlated shutdown proof unresolved.
+                        if (!foreign && position != null && position.Quantity != 0)
                             paperAccount.Flatten(new[] { paperInstrument });
+                        TryPublishWatchdogSafetyReconciliation();
                     }
                     catch (Exception error) { Diagnostic("SAFETY_ACTION_FAILED_" + error.GetType().Name); }
+                    finally
+                    {
+                        lock (stateLock) watchdogSafetyActionInFlight = false;
+                    }
                 }));
             }
-            catch (Exception error) { Diagnostic("SAFETY_DISPATCH_FAILED_" + error.GetType().Name); }
-            if (authenticated)
+            catch (Exception error)
             {
-                Dictionary<string, object> incident = SessionMessage("SAFETY_EVENT");
-                incident["receipt_id"] = "l3g-safety-" + Guid.NewGuid().ToString("N");
-                incident["reason_code"] = reason;
-                SendSigned(incident);
+                lock (stateLock) watchdogSafetyActionInFlight = false;
+                Diagnostic("SAFETY_DISPATCH_FAILED_" + error.GetType().Name);
             }
         }
 
@@ -1009,22 +1320,28 @@ namespace NinjaTrader.NinjaScript.AddOns
             return message;
         }
 
-        private void SendSigned(Dictionary<string, object> message)
+        private bool SendSigned(Dictionary<string, object> message)
         {
-            if (message == null || signingKey == null) return;
+            if (message == null || signingKey == null) return false;
             message.Remove("signature");
             message["signature"] = Sign(message);
             byte[] bytes = Encoding.UTF8.GetBytes(Canonical(message) + "\n");
+            bool sent = false;
             lock (sendLock)
             {
                 try
                 {
                     NetworkStream current = stream;
-                    if (current != null) current.Write(bytes, 0, bytes.Length);
+                    if (current != null)
+                    {
+                        current.Write(bytes, 0, bytes.Length);
+                        sent = true;
+                    }
                 }
                 catch (IOException) { CloseTransport(); }
                 catch (ObjectDisposedException) { CloseTransport(); }
             }
+            return sent;
         }
 
         private bool Verify(Dictionary<string, object> message)

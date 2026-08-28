@@ -7,8 +7,11 @@ from pathlib import Path
 import socket
 import threading
 import time
+from typing import Callable, Mapping
+import uuid
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from src.l3g_paper.ledger import PaperLedger
 from src.l3g_paper.ninjatrader_transport import (
@@ -26,6 +29,37 @@ def free_port() -> int:
 
 
 class PaperTransportTests(unittest.TestCase):
+    @staticmethod
+    def _authenticated_ingress_transport(
+        directory: str, key: bytes, callback: Callable[[Mapping[str, object]], None],
+    ) -> tuple[PaperLedger, PaperExecutionTransport, str]:
+        ledger = PaperLedger(Path(directory) / ("paper-" + uuid.uuid4().hex + ".sqlite3"))
+        transport = PaperExecutionTransport(ledger, port=free_port(), on_message=callback)
+        session_id = "l3g-es-transport-safety-fallback"
+        with transport._lock:
+            transport._key = key
+            transport._client = object()  # type: ignore[assignment]
+            transport._state = "AUTHENTICATED"
+            transport._authenticated = True
+            transport._reconciled = True
+            transport._execution_session_id = session_id
+        return ledger, transport, session_id
+
+    @staticmethod
+    def _signed_inbound_receipt(
+        key: bytes, session_id: str, message_type: str, receipt_id: str, **fields: object,
+    ) -> bytes:
+        payload: dict[str, object] = {
+            "schema": EXECUTION_SCHEMA,
+            "message_type": message_type,
+            "execution_session_id": session_id,
+            "receipt_id": receipt_id,
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            **fields,
+        }
+        payload["signature"] = sign_payload(key, payload)
+        return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
     def test_hmac_is_canonical_and_detects_tampering(self) -> None:
         key = bytes(range(32)); payload = {"b": 2, "a": 1}
         signature = sign_payload(key, payload)
@@ -226,6 +260,7 @@ class PaperTransportTests(unittest.TestCase):
                 "instrument": "MNQ SEP26",
                 "position_quantity": 0,
                 "working_order_count": 0,
+                "working_entry_count": 0,
                 "position_snapshot_complete": True,
                 "order_snapshot_complete": True,
             }
@@ -268,6 +303,228 @@ class PaperTransportTests(unittest.TestCase):
                 release_ingress.set()
                 receipt_thread.join(1)
                 send_thread.join(1)
+                ledger.close()
+
+    def test_verified_safety_receipts_reach_runtime_once_when_durable_audit_fails(self) -> None:
+        key = bytes(range(32))
+        message_fields = {
+            "SAFETY_EVENT": {"reason_code": "HEARTBEAT_TIMEOUT"},
+            "POSITION_EVENT": {"quantity": 0},
+            "RECONCILIATION": {
+                "account_name": "Sim101", "account_class": "LOCAL_SIMULATION", "instrument": "MNQ SEP26",
+                "position_quantity": 0, "working_order_count": 0, "working_entry_count": 0,
+                "position_snapshot_complete": True, "order_snapshot_complete": True,
+            },
+        }
+        with TemporaryDirectory() as directory:
+            for message_type, fields in message_fields.items():
+                with self.subTest(message_type=message_type):
+                    delivered: list[dict[str, object]] = []
+                    ledger, transport, session_id = self._authenticated_ingress_transport(
+                        directory, key, lambda payload: delivered.append(dict(payload)),
+                    )
+                    frame = self._signed_inbound_receipt(
+                        key, session_id, message_type, "l3g-safety-fallback-" + message_type.lower(), **fields,
+                    )
+                    try:
+                        with patch.object(ledger, "append", side_effect=RuntimeError("ledger unavailable")) as append:
+                            transport._receive_frame(frame)
+                            transport._receive_frame(frame)
+                        self.assertEqual(append.call_count, 1, "fallback must not retry the failed durable receipt")
+                        self.assertEqual(len(delivered), 1, "receipt-id dedupe must remain in force")
+                        self.assertEqual(delivered[0]["message_type"], message_type)
+                        self.assertTrue(delivered[0].get("_l3g_durable_receipt_unavailable"))
+                        status = transport.status()
+                        self.assertTrue(status.authenticated_client)
+                        self.assertEqual(status.client_count, 1)
+                        self.assertEqual(status.duplicate_receipts, 1)
+                    finally:
+                        ledger.close()
+
+    def test_safety_audit_failure_does_not_disconnect_a_real_signed_client(self) -> None:
+        with TemporaryDirectory() as directory:
+            key = bytes(range(32)); key_path = Path(directory) / "key"; key_path.write_bytes(key)
+            delivered: list[dict[str, object]] = []
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3"); port = free_port()
+            transport = PaperExecutionTransport(
+                ledger, secret_provider=LocalPaperSecretProvider(key_path), port=port,
+                on_message=lambda payload: delivered.append(dict(payload)),
+            )
+            client: socket.socket | None = None
+            original_append = ledger.append
+            try:
+                self.assertEqual(transport.start().state, "LISTENING")
+                client = socket.create_connection(("127.0.0.1", port), timeout=2)
+                hello = {
+                    "schema": EXECUTION_SCHEMA, "message_type": "HELLO", "bridge_instance_id": "bridge",
+                    "ninjatrader_session_id": "nt", "addon_protocol_version": ADDON_PROTOCOL_VERSION,
+                    "addon_source_fingerprint": expected_addon_source_fingerprint(), "addon_build_fingerprint": "0" * 64,
+                    "addon_build_timestamp": "2026-08-25T00:00:00Z",
+                    "account_name": "Sim101", "account_class": "LOCAL_SIMULATION", "instrument": "MNQ SEP26",
+                    "capability": "PAPER_ONLY", "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "nonce": "safety-fallback",
+                }
+                hello["signature"] = sign_payload(key, hello)
+                client.sendall(json.dumps(hello, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n")
+                grant = json.loads(client.makefile("rb").readline())
+
+                def append(kind: str, payload: object, **kwargs: object) -> object:
+                    if kind == "INCIDENT_SAFETY_EVENT":
+                        raise RuntimeError("ledger unavailable")
+                    return original_append(kind, payload, **kwargs)  # type: ignore[arg-type]
+
+                ledger.append = append  # type: ignore[method-assign]
+                safety = {
+                    "schema": EXECUTION_SCHEMA, "message_type": "SAFETY_EVENT",
+                    "execution_session_id": grant["execution_session_id"], "receipt_id": "l3g-live-safety-fallback",
+                    "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "reason_code": "HEARTBEAT_TIMEOUT",
+                }
+                safety["signature"] = sign_payload(key, safety)
+                client.sendall(json.dumps(safety, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n")
+                deadline = time.monotonic() + 2.0
+                while not delivered and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(len(delivered), 1)
+                self.assertTrue(delivered[0].get("_l3g_durable_receipt_unavailable"))
+                self.assertTrue(transport.status().authenticated_client)
+                self.assertEqual(transport.status().client_count, 1)
+            finally:
+                ledger.append = original_append  # type: ignore[method-assign]
+                if client is not None:
+                    client.close()
+                transport.stop()
+                ledger.close()
+
+    def test_fallback_safety_callback_failure_is_swallowed_without_another_ledger_append(self) -> None:
+        key = bytes(range(32))
+        delivered: list[dict[str, object]] = []
+
+        def fail_after_receiving(payload: object) -> None:
+            delivered.append(dict(payload))  # type: ignore[arg-type]
+            raise RuntimeError("runtime unavailable")
+
+        with TemporaryDirectory() as directory:
+            ledger, transport, session_id = self._authenticated_ingress_transport(directory, key, fail_after_receiving)
+            frame = self._signed_inbound_receipt(
+                key, session_id, "SAFETY_EVENT", "l3g-safety-callback-failure", reason_code="HEARTBEAT_TIMEOUT",
+            )
+            try:
+                with patch.object(ledger, "append", side_effect=RuntimeError("ledger unavailable")) as append:
+                    transport._receive_frame(frame)
+                self.assertEqual(append.call_count, 1)
+                self.assertEqual(len(delivered), 1)
+                self.assertTrue(delivered[0].get("_l3g_durable_receipt_unavailable"))
+                self.assertTrue(transport.status().authenticated_client)
+            finally:
+                ledger.close()
+
+    def test_verified_safety_receipt_falls_back_when_authority_fence_is_unavailable(self) -> None:
+        key = bytes(range(32))
+        delivered: list[dict[str, object]] = []
+        with TemporaryDirectory() as directory:
+            ledger, transport, session_id = self._authenticated_ingress_transport(
+                directory, key, lambda payload: delivered.append(dict(payload)),
+            )
+            frame = self._signed_inbound_receipt(
+                key, session_id, "RECONCILIATION", "l3g-safety-fence-failure",
+                account_name="Sim101", account_class="LOCAL_SIMULATION", instrument="MNQ SEP26",
+                position_quantity=0, working_order_count=0, working_entry_count=0,
+                position_snapshot_complete=True, order_snapshot_complete=True,
+            )
+            try:
+                with (
+                    patch.object(ledger, "commissioning_authority_fence", side_effect=RuntimeError("fence unavailable")),
+                    patch.object(ledger, "append", wraps=ledger.append) as append,
+                ):
+                    transport._receive_frame(frame)
+                    transport._receive_frame(frame)
+                self.assertEqual(append.call_count, 0)
+                self.assertEqual(len(delivered), 1)
+                self.assertTrue(delivered[0].get("_l3g_durable_receipt_unavailable"))
+                self.assertTrue(transport.status().authenticated_client)
+                self.assertEqual(transport.status().duplicate_receipts, 1)
+            finally:
+                ledger.close()
+
+    def test_non_safety_receipt_remains_strict_when_durable_audit_fails(self) -> None:
+        key = bytes(range(32))
+        delivered: list[dict[str, object]] = []
+        with TemporaryDirectory() as directory:
+            ledger, transport, session_id = self._authenticated_ingress_transport(
+                directory, key, lambda payload: delivered.append(dict(payload)),
+            )
+            frame = self._signed_inbound_receipt(key, session_id, "ORDER_EVENT", "l3g-order-no-fallback", order_id="order-1")
+            try:
+                with patch.object(ledger, "append", side_effect=RuntimeError("ledger unavailable")) as append:
+                    with self.assertRaisesRegex(RuntimeError, "ledger unavailable"):
+                        transport._receive_frame(frame)
+                self.assertEqual(append.call_count, 1)
+                self.assertEqual(delivered, [])
+            finally:
+                ledger.close()
+
+    def test_non_safety_receipt_never_bypasses_an_unavailable_authority_fence(self) -> None:
+        key = bytes(range(32))
+        delivered: list[dict[str, object]] = []
+        with TemporaryDirectory() as directory:
+            ledger, transport, session_id = self._authenticated_ingress_transport(
+                directory, key, lambda payload: delivered.append(dict(payload)),
+            )
+            frame = self._signed_inbound_receipt(key, session_id, "ORDER_EVENT", "l3g-order-fence-strict", order_id="order-1")
+            try:
+                with patch.object(ledger, "commissioning_authority_fence", side_effect=RuntimeError("fence unavailable")):
+                    with self.assertRaisesRegex(RuntimeError, "fence unavailable"):
+                        transport._receive_frame(frame)
+                self.assertEqual(delivered, [])
+            finally:
+                ledger.close()
+
+    def test_normal_callback_cannot_receive_the_internal_fallback_marker(self) -> None:
+        key = bytes(range(32))
+        delivered: list[dict[str, object]] = []
+        with TemporaryDirectory() as directory:
+            ledger, transport, session_id = self._authenticated_ingress_transport(
+                directory, key, lambda payload: delivered.append(dict(payload)),
+            )
+            frame = self._signed_inbound_receipt(
+                key, session_id, "SAFETY_EVENT", "l3g-normal-safety-marker",
+                reason_code="HEARTBEAT_TIMEOUT", _l3g_durable_receipt_unavailable=True,
+            )
+            try:
+                transport._receive_frame(frame)
+                self.assertEqual(len(delivered), 1)
+                self.assertNotIn("_l3g_durable_receipt_unavailable", delivered[0])
+            finally:
+                ledger.close()
+
+    def test_reconciliation_rejects_negative_or_inconsistent_order_counts(self) -> None:
+        key = bytes(range(32))
+        invalid_counts = (
+            {"working_order_count": -1, "working_entry_count": 0},
+            {"working_order_count": 0, "working_entry_count": -1},
+            {"working_order_count": 1, "working_entry_count": 2},
+        )
+        with TemporaryDirectory() as directory:
+            delivered: list[dict[str, object]] = []
+            ledger, transport, session_id = self._authenticated_ingress_transport(
+                directory, key, lambda payload: delivered.append(dict(payload)),
+            )
+            try:
+                for index, counts in enumerate(invalid_counts):
+                    with self.subTest(counts=counts):
+                        frame = self._signed_inbound_receipt(
+                            key, session_id, "RECONCILIATION", "l3g-invalid-count-" + str(index),
+                            account_name="Sim101", account_class="LOCAL_SIMULATION", instrument="MNQ SEP26",
+                            position_quantity=0, position_snapshot_complete=True, order_snapshot_complete=True,
+                            **counts,
+                        )
+                        rejected_before = transport.status().rejected_frames
+                        transport._receive_frame(frame)
+                        self.assertEqual(delivered, [])
+                        self.assertFalse(transport.status().reconciled)
+                        self.assertEqual(transport.status().rejected_frames, rejected_before + 1)
+            finally:
                 ledger.close()
 
 

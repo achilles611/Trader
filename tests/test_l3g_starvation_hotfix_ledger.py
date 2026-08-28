@@ -284,7 +284,7 @@ class LedgerBarrierStarvationHotfixTests(unittest.TestCase):
                 # The active identity remains admitted until its batch commits;
                 # an exact duplicate must not create another queue entry or row.
                 ledger.append_deferred(
-                    "OBSERVATION_ENVELOPE", observation(101, "prefix-1-duplicate"),
+                    "OBSERVATION_ENVELOPE", observation(1, "prefix-1"),
                     identity="prefix-1", occurred_at=NOW,
                 )
                 ledger.append_deferred(

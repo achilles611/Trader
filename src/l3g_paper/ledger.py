@@ -8,7 +8,9 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from enum import StrEnum
+from functools import lru_cache
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -170,6 +172,101 @@ _V3_AUTHORITY_OBSERVATION_CLASSIFICATIONS = frozenset({
 _SECRET_KEYS = frozenset({"hmac_key", "password", "token", "connection_credentials", "private_key", "secret", "authorization"})
 _EPOCH_DIRECTORY = re.compile(r"^epoch-(\d+)$", re.IGNORECASE)
 _EPOCH_ID = re.compile(r"^L3G-PAPER-EPOCH-[A-Za-z0-9][A-Za-z0-9._-]*$")
+# These three artifacts are module-level frozen contracts.  Retain their
+# exact computed values once, rather than canonicalizing their static payloads
+# for every admitted market callback.  The values remain part of every record
+# envelope and hash-chain document exactly as before.
+_PAPER_POLICY_HASH = POLICY.configuration_hash
+_RISK_PROFILE_HASH = RISK_PROFILE.configuration_hash
+_ACCOUNT_BINDING_HASH = ACCOUNT_BINDING.binding_hash
+
+# Deferred records are still strictly ordered.  These bounds merely prevent a
+# failed or under-provisioned writer from turning the observer process into an
+# unbounded in-memory spool.
+_DEFERRED_NORMAL_BATCH_SIZE = 512
+_DEFERRED_MAX_COALESCE_SECONDS = 0.010
+# Preserve the 512-record normal latency batch, but let only an established
+# backlog use the measured recovery ceiling. This makes the production default
+# match the recovery benchmark without enlarging an ordinary low-latency write.
+_DEFERRED_CATCH_UP_BATCH_SIZE = 2_048
+_DEFERRED_CATCH_UP_THRESHOLD = 1024
+_DEFERRED_MAX_RECORDS = 16384
+_DEFERRED_DEGRADED_RECORDS = 4096
+# Checkpoints are queue items too.  Bound their independently admitted control
+# work so a blocked writer cannot turn concurrent commissioning/status callers
+# into an unbounded in-memory queue even when market-record admission is idle.
+_DEFERRED_MAX_PENDING_BARRIERS = 128
+_DEFERRED_HEADROOM_GRACE_SECONDS = 5.0
+_WRITER_TELEMETRY_WINDOW_SECONDS = 30.0
+_WRITER_TELEMETRY_HISTORY = 120
+_WRITER_TELEMETRY_SAMPLE_INTERVAL = 8
+_SQLITE_IN_LOOKUP_CHUNK = 900
+# Keep checkpoint I/O off the sole FIFO writer.  SQLite's automatic
+# checkpoints run inside the committing writer transaction and were measured
+# to create multi-second stalls once a warm ledger crossed its WAL window.
+# The dedicated maintenance connection below uses only PASSIVE checkpoints:
+# it never blocks or rolls back a writer and the final TRUNCATE proof remains
+# the sole clean-shutdown checkpoint claim.
+_WAL_AUTOCHECKPOINT_PAGES = 0
+_WAL_JOURNAL_SIZE_LIMIT_BYTES = 134_217_728
+_WAL_PASSIVE_CHECKPOINT_TRIGGER_RECORDS = 8_192
+_WAL_PASSIVE_CHECKPOINT_TRIGGER_BYTES = _WAL_JOURNAL_SIZE_LIMIT_BYTES
+_WAL_PASSIVE_CHECKPOINT_MIN_INTERVAL_SECONDS = 0.025
+_WAL_PASSIVE_CHECKPOINT_START_DELAY_SECONDS = 5.0
+# ``journal_size_limit`` is a post-checkpoint retention target, not a hard
+# ceiling while an external reader pins a WAL snapshot. A PASSIVE-complete WAL
+# may also retain its already allocated file bytes harmlessly. Gate authority
+# on uncheckpointed frames (the meaningful pinned growth), while retaining a
+# separate 1 GiB absolute allocation ceiling as a final disk-growth backstop.
+# This deliberately leaves headroom above the largest observed healthy retained
+# allocation (~453 MiB) so a complete PASSIVE checkpoint cannot spuriously
+# exhaust admission solely because SQLite kept reusable WAL space allocated.
+_WAL_UNCHECKPOINTED_CAPACITY_CEILING_BYTES = 134_217_728
+_WAL_FILE_CAPACITY_CEILING_BYTES = 1_073_741_824
+
+
+class LedgerCapacityError(RuntimeError):
+    """A deferred writer work item was refused before it became durable."""
+
+    def __init__(self, message: str, capacity: Mapping[str, object] | None = None) -> None:
+        super().__init__(message)
+        self.capacity = {} if capacity is None else dict(capacity)
+
+
+def deferred_capacity_allows_authority(capacity: Mapping[str, object]) -> bool:
+    """Return the one fail-closed predicate used by every authority gate.
+
+    Capacity snapshots are deliberately lightweight condition-lock state.  The
+    predicate is kept outside ``PaperLedger`` so the commissioning gate and
+    runtime cannot accidentally drift from the writer's own admission rule.
+    """
+    growth = capacity.get("queue_growth_records_per_second")
+    return (
+        capacity.get("schema") == "l3g-ledger-writer-capacity-v1"
+        and capacity.get("state") == "HEALTHY"
+        and capacity.get("admission_open") is True
+        and capacity.get("negative_headroom_sustained") is False
+        and capacity.get("writer_error") is None
+        and type(growth) in {int, float}
+        and math.isfinite(float(growth))
+        and float(growth) <= 0.0
+    )
+
+
+def _idempotency_fingerprint(
+    common: Mapping[str, object], *, ignore_occurred_at: bool = False,
+) -> str:
+    """Fingerprint immutable caller content, optionally omitting generated time.
+
+    An explicitly supplied occurrence time is part of a record's content and
+    must therefore conflict when reused with the same external identity.  A
+    caller which omitted the time is allowed to retry after the ledger creates
+    a fresh envelope timestamp.
+    """
+    return canonical_hash({
+        key: value for key, value in common.items()
+        if not (ignore_occurred_at and key == "occurred_at")
+    })
 
 
 def _now() -> str:
@@ -226,37 +323,92 @@ def _is_utc(value: object) -> bool:
     return True
 
 
+@lru_cache(maxsize=256)
+def _cached_session_context(
+    session_kind: str,
+    session_id: str,
+    trade_date: str,
+    session_profile_hash: str,
+    session_generation: int,
+    calendar_state: str,
+) -> PaperSessionContext:
+    """Rehydrate one immutable context without repeating compiled-profile work."""
+    return context_from_identity(
+        PaperSessionKind(session_kind), session_id, trade_date, session_profile_hash,
+        session_generation, calendar_state=PaperCalendarState(calendar_state),
+    )
+
+
+@lru_cache(maxsize=256)
+def _cached_session_context_payload(
+    session_kind: str,
+    session_id: str,
+    trade_date: str,
+    session_profile_hash: str,
+    session_generation: int,
+    calendar_state: str,
+) -> tuple[tuple[str, object], ...] | None:
+    """Cache the immutable context reconstruction used by every market row.
+
+    This is deliberately a cache of the existing validator's result rather
+    than a looser validation path.  It therefore preserves the exact tail
+    classification contract while avoiding thousands of identical calendar
+    reconstructions per writer batch.
+    """
+    try:
+        context = _cached_session_context(
+            session_kind, session_id, trade_date, session_profile_hash,
+            session_generation, calendar_state,
+        )
+    except (TypeError, ValueError):
+        return None
+    return tuple(context.payload().items())
+
+
+@lru_cache(maxsize=256)
+def _cached_session_family(
+    session_kind: str,
+    session_id: str,
+    trade_date: str,
+    session_profile_hash: str,
+    session_generation: int,
+) -> str | None:
+    """Return the exact family produced by the existing identity validator."""
+    try:
+        return _cached_session_context(
+            session_kind, session_id, trade_date, session_profile_hash,
+            session_generation, PaperCalendarState.NORMAL.value,
+        ).session_family.value
+    except (TypeError, ValueError):
+        return None
+
+
 def _session_context_matches(payload: Mapping[str, object]) -> bool:
     if type(payload.get("session_generation")) is not int:
         return False
     try:
-        context = context_from_identity(
-            PaperSessionKind(str(payload["session_kind"])),
-            str(payload["session_id"]),
-            str(payload["trade_date"]),
-            str(payload["session_profile_hash"]),
-            int(payload["session_generation"]),
-            calendar_state=PaperCalendarState(str(payload["calendar_state"])),
+        expected = _cached_session_context_payload(
+            str(payload["session_kind"]), str(payload["session_id"]),
+            str(payload["trade_date"]), str(payload["session_profile_hash"]),
+            int(payload["session_generation"]), str(payload["calendar_state"]),
         )
-    except (KeyError, TypeError, ValueError):
+    except KeyError:
         return False
-    return all(payload.get(key) == value for key, value in context.payload().items())
+    return expected is not None and all(payload.get(key) == value for key, value in expected)
 
 
 def _session_identity_matches(payload: Mapping[str, object]) -> bool:
     if type(payload.get("session_generation")) is not int:
         return False
     try:
-        context = context_from_identity(
-            PaperSessionKind(str(payload["session_kind"])),
-            str(payload["session_id"]),
-            str(payload["trade_date"]),
-            str(payload["session_profile_hash"]),
+        family = _cached_session_family(
+            str(payload["session_kind"]), str(payload["session_id"]),
+            str(payload["trade_date"]), str(payload["session_profile_hash"]),
             int(payload["session_generation"]),
         )
-    except (KeyError, TypeError, ValueError):
+    except KeyError:
         return False
-    return payload.get("session_family") == context.session_family.value
+    return family is not None and payload.get("session_family") == family
 
 
 def _aligned_provenance(
@@ -421,7 +573,7 @@ def _passive_decision_shape(payload: Mapping[str, object]) -> str | None:
         or not isinstance(payload.get("paper_decision_id"), str)
         or not str(payload["paper_decision_id"]).startswith("l3g-pd-")
         or payload.get("paper_policy_id") != POLICY.policy_id
-        or payload.get("paper_policy_hash") != POLICY.configuration_hash
+        or payload.get("paper_policy_hash") != _PAPER_POLICY_HASH
         or not isinstance(payload.get("family_summary"), Mapping)
         or not isinstance(payload.get("reason_code"), str)
         or not _is_utc(payload.get("created_at"))
@@ -453,7 +605,7 @@ def _authority_decision_shape(payload: Mapping[str, object]) -> bool:
         and isinstance(payload.get("paper_decision_id"), str)
         and str(payload["paper_decision_id"]).startswith("l3g-pd-")
         and payload.get("paper_policy_id") == POLICY.policy_id
-        and payload.get("paper_policy_hash") == POLICY.configuration_hash
+        and payload.get("paper_policy_hash") == _PAPER_POLICY_HASH
         and isinstance(payload.get("family_summary"), Mapping)
         and isinstance(payload.get("reason_code"), str)
         and type(payload.get("commissioning")) is bool
@@ -744,13 +896,41 @@ class _DeferredLedgerBarrier:
     authority_watermark: dict[str, object] | None = None
     external_authority_sequence: int = 0
     external_authority_hash: str | None = None
+    deferred_capacity: dict[str, object] | None = None
     wait_seconds: float | None = None
 
 
 class PaperLedger:
     """Thread-safe append-only domain ledger with one global hash chain."""
 
-    def __init__(self, path: str | Path, *, epoch_id: str | None = None) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        epoch_id: str | None = None,
+        max_deferred_records: int = _DEFERRED_MAX_RECORDS,
+        catch_up_batch_size: int = _DEFERRED_CATCH_UP_BATCH_SIZE,
+        catch_up_threshold: int = _DEFERRED_CATCH_UP_THRESHOLD,
+        degraded_queue_depth: int | None = None,
+        max_pending_barriers: int | None = None,
+    ) -> None:
+        if type(max_deferred_records) is not int or max_deferred_records < 1:
+            raise ValueError("Paper ledger deferred capacity must be a positive integer.")
+        if type(catch_up_batch_size) is not int or catch_up_batch_size < 1:
+            raise ValueError("Paper ledger catch-up batch size must be a positive integer.")
+        if type(catch_up_threshold) is not int or catch_up_threshold < 1:
+            raise ValueError("Paper ledger catch-up threshold must be a positive integer.")
+        if degraded_queue_depth is not None and (
+            type(degraded_queue_depth) is not int or degraded_queue_depth < 1
+        ):
+            raise ValueError("Paper ledger degraded queue depth must be a positive integer.")
+        if max_pending_barriers is not None and (
+            type(max_pending_barriers) is not int
+            or not 1 <= max_pending_barriers <= max_deferred_records
+        ):
+            raise ValueError(
+                "Paper ledger pending barrier capacity must be a positive integer within deferred capacity."
+            )
         self.path = Path(path).resolve()
         self._creation_epoch = resolve_ledger_epoch(self.path, epoch_id)
         existing_accessibility = _read_only_accessibility_check(self.path) if self.path.exists() else None
@@ -759,12 +939,12 @@ class PaperLedger:
         self._connection = sqlite3.connect(str(self.path), check_same_thread=False, isolation_level=None)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA journal_mode=WAL")
-        # The default 1,000-page auto-checkpoint repeatedly stalls the single
-        # authenticated observation consumer under MNQ depth load.  A bounded
-        # 128 MiB WAL window lets the checkpoint copy amortize naturally while
-        # every record remains committed before the next policy side effect.
-        self._connection.execute("PRAGMA wal_autocheckpoint=32768")
-        self._connection.execute("PRAGMA journal_size_limit=134217728")
+        # Do not let SQLite run a checkpoint inside this sole FIFO writer.
+        # A separate maintenance connection performs bounded PASSIVE work;
+        # its activity cannot make a committed record disappear or reorder
+        # the hash chain, while final shutdown still performs TRUNCATE proof.
+        self._connection.execute(f"PRAGMA wal_autocheckpoint={_WAL_AUTOCHECKPOINT_PAGES}")
+        self._connection.execute(f"PRAGMA journal_size_limit={_WAL_JOURNAL_SIZE_LIMIT_BYTES}")
         self._connection.execute("PRAGMA cache_size=-65536")
         self._connection.execute("PRAGMA temp_store=MEMORY")
         self._connection.execute("PRAGMA mmap_size=268435456")
@@ -808,12 +988,68 @@ class PaperLedger:
         self._deferred_condition = threading.Condition(threading.Lock())
         self._deferred: deque[dict[str, object] | _DeferredLedgerBarrier] = deque()
         self._deferred_identities: set[str] = set()
+        self._deferred_identity_fingerprints: dict[str, tuple[str, str, bool]] = {}
+        self._deferred_pending_admitted_at: deque[float] = deque()
         self._deferred_record_count = 0
+        self._deferred_inflight_record_count = 0
+        self._deferred_inflight_oldest_admitted_at: float | None = None
         self._deferred_queue_high_water = 0
         self._deferred_barrier_count = 0
+        self._deferred_barrier_high_water = 0
         self._deferred_active = False
         self._deferred_error: BaseException | None = None
         self._deferred_stopping = False
+        self._deferred_flush_requested = False
+        self._admission_open = True
+        self._closing = False
+        self._closed = False
+        self._max_deferred_records = max_deferred_records
+        self._max_pending_barriers = (
+            min(_DEFERRED_MAX_PENDING_BARRIERS, max_deferred_records)
+            if max_pending_barriers is None else max_pending_barriers
+        )
+        self._catch_up_batch_size = max(_DEFERRED_NORMAL_BATCH_SIZE, catch_up_batch_size)
+        self._catch_up_threshold = catch_up_threshold
+        self._degraded_queue_depth = min(
+            max_deferred_records,
+            degraded_queue_depth if degraded_queue_depth is not None
+            else min(_DEFERRED_DEGRADED_RECORDS, max_deferred_records),
+        )
+        self._capacity_fault_latched = False
+        self._capacity_degraded_since: float | None = None
+        self._negative_headroom_since: float | None = None
+        self._admitted_records_total = 0
+        self._durable_records_total = 0
+        self._admission_rejections_total = 0
+        self._barrier_rejections_total = 0
+        self._admission_rate_buckets: deque[tuple[int, int]] = deque()
+        self._durable_rate_buckets: deque[tuple[int, int]] = deque()
+        self._queue_depth_samples: deque[tuple[float, int]] = deque(maxlen=_WRITER_TELEMETRY_HISTORY)
+        self._writer_batches: deque[dict[str, object]] = deque(maxlen=_WRITER_TELEMETRY_HISTORY)
+        self._writer_batch_counter = 0
+        self._last_checkpoint: dict[str, object] | None = None
+        self._checkpoint_condition = threading.Condition(threading.Lock())
+        self._checkpoint_started_at = time.perf_counter()
+        self._checkpoint_requested = False
+        self._checkpoint_stopping = False
+        self._checkpoint_active = False
+        self._checkpoint_last_requested_durable_total = 0
+        self._checkpoint_last_completed_durable_total = 0
+        self._checkpoint_durable_total = 0
+        self._last_passive_checkpoint: dict[str, object] | None = None
+        self._checkpoint_worker_error: str | None = None
+        self._checkpoint_wal_size_bytes = 0
+        self._checkpoint_uncheckpointed_bytes = 0
+        self._wal_capacity_fault_latched = False
+        # The writer's hot admission path reads this immutable replacement
+        # snapshot without acquiring the maintenance condition. The worker
+        # never mutates a published mapping; it replaces it while holding its
+        # own condition, so capacity telemetry cannot convoy every callback
+        # behind checkpoint bookkeeping.
+        self._checkpoint_state_snapshot: dict[str, object] = {}
+        with self._checkpoint_condition:
+            self._publish_passive_checkpoint_state_locked()
+        self._shutdown_receipt: dict[str, object] | None = None
         self._next_barrier_token = 0
         self._last_barrier_token: int | None = None
         self._last_barrier_sequence: int | None = None
@@ -823,7 +1059,13 @@ class PaperLedger:
             name="LaneIIIPaperLedgerWriter",
             daemon=True,
         )
+        self._checkpoint_thread = threading.Thread(
+            target=self._passive_checkpoint_worker,
+            name="LaneIIIPaperLedgerCheckpoint",
+            daemon=True,
+        )
         self._deferred_thread.start()
+        self._checkpoint_thread.start()
 
     def set_session_context(self, context: PaperSessionContext) -> None:
         """Set the default envelope for asynchronous paper-path records."""
@@ -831,6 +1073,226 @@ class PaperLedger:
             raise ValueError("Paper ledger session context must be immutable and exact.")
         with self._session_context_lock:
             self._current_session_context = context
+
+    def _deferred_backlog_depth_locked(self) -> int:
+        return self._deferred_record_count + self._deferred_inflight_record_count
+
+    def _deferred_work_item_depth_locked(self) -> int:
+        """Return every bounded item held by the writer, including barriers."""
+        return self._deferred_backlog_depth_locked() + self._deferred_barrier_count
+
+    @staticmethod
+    def _trim_rate_buckets_locked(buckets: deque[tuple[int, int]], now: float) -> None:
+        cutoff = int(now - _WRITER_TELEMETRY_WINDOW_SECONDS) - 1
+        while buckets and buckets[0][0] < cutoff:
+            buckets.popleft()
+
+    def _record_rate_locked(self, buckets: deque[tuple[int, int]], now: float, count: int) -> None:
+        if count <= 0:
+            return
+        second = int(now)
+        if buckets and buckets[-1][0] == second:
+            buckets[-1] = (second, buckets[-1][1] + count)
+        else:
+            buckets.append((second, count))
+        self._trim_rate_buckets_locked(buckets, now)
+
+    def _rate_locked(self, buckets: deque[tuple[int, int]], now: float) -> tuple[float, float]:
+        self._trim_rate_buckets_locked(buckets, now)
+        if not buckets:
+            return 0.0, 0.0
+        elapsed = max(1.0, min(_WRITER_TELEMETRY_WINDOW_SECONDS, now - buckets[0][0]))
+        return sum(count for _, count in buckets) / elapsed, elapsed
+
+    def _record_queue_depth_locked(self, now: float) -> None:
+        depth = self._deferred_backlog_depth_locked()
+        if (
+            not self._queue_depth_samples
+            or now - self._queue_depth_samples[-1][0] >= 0.25
+            or depth == 0
+        ):
+            self._queue_depth_samples.append((now, depth))
+        cutoff = now - _WRITER_TELEMETRY_WINDOW_SECONDS
+        while len(self._queue_depth_samples) > 1 and self._queue_depth_samples[0][0] < cutoff:
+            self._queue_depth_samples.popleft()
+
+    def _queue_growth_rate_locked(self, now: float) -> float:
+        self._record_queue_depth_locked(now)
+        if len(self._queue_depth_samples) < 2:
+            return 0.0
+        first_at, first_depth = self._queue_depth_samples[0]
+        last_at, last_depth = self._queue_depth_samples[-1]
+        elapsed = last_at - first_at
+        return 0.0 if elapsed <= 0 else (last_depth - first_depth) / elapsed
+
+    def _oldest_deferred_admitted_at_locked(self) -> float | None:
+        oldest = self._deferred_inflight_oldest_admitted_at
+        pending = self._deferred_pending_admitted_at[0] if self._deferred_pending_admitted_at else None
+        if oldest is None:
+            return pending
+        return oldest if pending is None else min(oldest, pending)
+
+    def _capacity_snapshot_locked(self, now: float) -> dict[str, object]:
+        """Return bounded O(1) writer capacity facts while the queue is stable."""
+        checkpoint_state = self._passive_checkpoint_snapshot()
+        checkpoint_error = checkpoint_state["passive_checkpoint_worker_error"]
+        wal_capacity_fault = checkpoint_state["wal_capacity_fault_latched"] is True
+        backlog = self._deferred_backlog_depth_locked()
+        pending_barriers = self._deferred_barrier_count
+        barrier_capacity_exhausted = pending_barriers >= self._max_pending_barriers
+        admitted_rate, admitted_window = self._rate_locked(self._admission_rate_buckets, now)
+        durable_rate, durable_window = self._rate_locked(self._durable_rate_buckets, now)
+        measurement_window = max(admitted_window, durable_window)
+        headroom = durable_rate - admitted_rate
+        queue_growth = self._queue_growth_rate_locked(now)
+        oldest = self._oldest_deferred_admitted_at_locked()
+        oldest_age = None if oldest is None else max(0.0, now - oldest)
+        enough_history = measurement_window >= _DEFERRED_HEADROOM_GRACE_SECONDS
+        negative_now = backlog > 0 and enough_history and headroom < 0
+        if negative_now:
+            if self._negative_headroom_since is None:
+                self._negative_headroom_since = now
+        else:
+            self._negative_headroom_since = None
+        negative_sustained = (
+            self._negative_headroom_since is not None
+            and now - self._negative_headroom_since >= _DEFERRED_HEADROOM_GRACE_SECONDS
+        )
+        if backlog >= self._max_deferred_records:
+            self._capacity_fault_latched = True
+        if self._deferred_error is not None:
+            state = "FAILED"
+        elif self._deferred_stopping or not self._admission_open:
+            state = "SHUTTING_DOWN"
+        elif self._capacity_fault_latched or wal_capacity_fault:
+            state = "EXHAUSTED"
+        elif (
+            backlog >= self._degraded_queue_depth
+            or barrier_capacity_exhausted
+            or negative_sustained
+            or checkpoint_error is not None
+        ):
+            state = "DEGRADED"
+        else:
+            state = "HEALTHY"
+        if state == "HEALTHY":
+            self._capacity_degraded_since = None
+        elif self._capacity_degraded_since is None:
+            self._capacity_degraded_since = now
+        admission_open = (
+            self._admission_open
+            and self._deferred_error is None
+            and not self._deferred_stopping
+            and not self._capacity_fault_latched
+            and not wal_capacity_fault
+        )
+        return {
+            "schema": "l3g-ledger-writer-capacity-v1",
+            "state": state,
+            "admission_open": admission_open,
+            "capacity_fault_latched": self._capacity_fault_latched,
+            "wal_capacity_fault_latched": wal_capacity_fault,
+            "wal_size_bytes": checkpoint_state["wal_size_bytes"],
+            "wal_uncheckpointed_bytes": checkpoint_state["wal_uncheckpointed_bytes"],
+            "wal_uncheckpointed_capacity_ceiling_bytes": checkpoint_state[
+                "wal_uncheckpointed_capacity_ceiling_bytes"
+            ],
+            "wal_file_capacity_ceiling_bytes": checkpoint_state["wal_file_capacity_ceiling_bytes"],
+            "negative_headroom_sustained": negative_sustained,
+            "admitted_records_per_second": round(admitted_rate, 3),
+            "durable_records_per_second": round(durable_rate, 3),
+            "headroom_records_per_second": round(headroom, 3),
+            "measurement_window_seconds": round(measurement_window, 3),
+            "queue_depth": backlog,
+            "pending_queue_depth": self._deferred_record_count,
+            "inflight_queue_depth": self._deferred_inflight_record_count,
+            "deferred_work_item_depth": self._deferred_work_item_depth_locked(),
+            "pending_barrier_count": pending_barriers,
+            "max_pending_barriers": self._max_pending_barriers,
+            "barrier_capacity_exhausted": barrier_capacity_exhausted,
+            "barrier_rejections_total": self._barrier_rejections_total,
+            "barrier_queue_high_water": self._deferred_barrier_high_water,
+            "passive_checkpoint_active": checkpoint_state["passive_checkpoint_active"],
+            "passive_checkpoint_pending": checkpoint_state["passive_checkpoint_pending"],
+            "passive_checkpoint_worker_error": checkpoint_error,
+            "queue_growth_records_per_second": round(queue_growth, 3),
+            "oldest_queued_record_age_seconds": None if oldest_age is None else round(oldest_age, 6),
+            "max_deferred_records": self._max_deferred_records,
+            "degraded_queue_depth": self._degraded_queue_depth,
+            "admitted_records_total": self._admitted_records_total,
+            "durable_records_total": self._durable_records_total,
+            "admission_rejections_total": self._admission_rejections_total,
+            "writer_error": None if self._deferred_error is None else type(self._deferred_error).__name__,
+            "degraded_since_seconds": (
+                None if self._capacity_degraded_since is None
+                else round(max(0.0, now - self._capacity_degraded_since), 6)
+            ),
+        }
+
+    @staticmethod
+    def _percentile(values: list[float], percentile: float) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        index = min(len(ordered) - 1, max(0, int((len(ordered) * percentile + 0.999999) - 1)))
+        return ordered[index]
+
+    def _writer_telemetry_locked(self, now: float) -> dict[str, object]:
+        capacity = self._capacity_snapshot_locked(now)
+        checkpoint_state = self._passive_checkpoint_snapshot()
+        batches = [dict(batch) for batch in self._writer_batches]
+        batch_sizes = [float(batch["batch_size"]) for batch in batches if isinstance(batch.get("batch_size"), int)]
+        transaction_seconds = [
+            float(batch["transaction_seconds"])
+            for batch in batches if isinstance(batch.get("transaction_seconds"), (int, float))
+        ]
+        return {
+            **capacity,
+            "capacity_state": capacity["state"],
+            "sampled_batches": len(batches),
+            "average_batch_size": None if not batch_sizes else round(sum(batch_sizes) / len(batch_sizes), 3),
+            "p95_batch_size": self._percentile(batch_sizes, 0.95),
+            "average_transaction_seconds": (
+                None if not transaction_seconds else round(sum(transaction_seconds) / len(transaction_seconds), 6)
+            ),
+            "p95_transaction_seconds": self._percentile(transaction_seconds, 0.95),
+            "last_checkpoint": None if self._last_checkpoint is None else dict(self._last_checkpoint),
+            "last_passive_checkpoint": checkpoint_state["last_passive_checkpoint"],
+            "recent_batches": batches,
+        }
+
+    def deferred_capacity(self) -> dict[str, object]:
+        """Return an atomic capacity snapshot without touching SQLite or runtime locks."""
+        with self._deferred_condition:
+            return self._capacity_snapshot_locked(time.perf_counter())
+
+    def capacity_allows_authority(self) -> bool:
+        """Fail closed for new authority when durable writer headroom is inadequate."""
+        with self._deferred_condition:
+            capacity = self._capacity_snapshot_locked(time.perf_counter())
+            return deferred_capacity_allows_authority(capacity)
+
+    @contextmanager
+    def authority_capacity_fence(self) -> Iterator[dict[str, object]]:
+        """Keep a healthy capacity observation and authority writes in one order.
+
+        The fence never touches SQLite while it checks capacity.  It merely
+        prevents a deferred producer from racing a just-approved authority
+        sequence into a saturated queue before that authority sequence is
+        durably recorded.
+        """
+        with self._ordering_lock:
+            with self._deferred_condition:
+                capacity = self._capacity_snapshot_locked(time.perf_counter())
+                if not deferred_capacity_allows_authority(capacity):
+                    raise LedgerCapacityError(
+                        "Ledger writer capacity is inadequate for authority operations.", capacity,
+                    )
+            yield capacity
+
+    def shutdown_status(self) -> dict[str, object] | None:
+        with self._deferred_condition:
+            return None if self._shutdown_receipt is None else dict(self._shutdown_receipt)
 
     def _set_synchronous_mode(self, domain: str) -> None:
         # A separate committed transaction is retained for every record. WAL
@@ -845,9 +1307,11 @@ class PaperLedger:
         self._synchronous_mode = requested
 
     @contextmanager
-    def _domain_transaction(self, domain: str) -> Iterator[sqlite3.Connection]:
+    def _domain_transaction(
+        self, domain: str, metrics: dict[str, float] | None = None,
+    ) -> Iterator[sqlite3.Connection]:
         self._set_synchronous_mode(domain)
-        with self._transaction() as connection:
+        with self._transaction(metrics) as connection:
             yield connection
 
     def _create_schema(self) -> None:
@@ -880,8 +1344,20 @@ class PaperLedger:
                         record_hash TEXT NOT NULL UNIQUE
                     )
                     """
-            )
+                )
             connection.execute("CREATE INDEX IF NOT EXISTS lane_iii_paper_audit_domain_time ON lane_iii_paper_audit(domain, occurred_at)")
+            # This additive side table keeps generated-vs-explicit timestamp
+            # provenance out of the immutable audit payload/hash contract.
+            # Historical rows without a provenance row are treated
+            # conservatively as exact-content-only for idempotency purposes.
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lane_iii_paper_idempotency_origin (
+                    identity TEXT PRIMARY KEY,
+                    generated_occurred_at INTEGER NOT NULL CHECK (generated_occurred_at IN (0, 1))
+                )
+                """
+            )
             # This compact operational index is updated in the same transaction
             # as each immutable audit record below.  It avoids a historical
             # table scan during restart recovery on a high-volume ledger.
@@ -1338,15 +1814,27 @@ class PaperLedger:
         return watermark
 
     @contextmanager
-    def _transaction(self) -> Iterator[sqlite3.Connection]:
+    def _transaction(self, metrics: dict[str, float] | None = None) -> Iterator[sqlite3.Connection]:
+        transaction_started = time.perf_counter() if metrics is not None else 0.0
+        begin_started = time.perf_counter() if metrics is not None else 0.0
         self._connection.execute("BEGIN IMMEDIATE")
+        if metrics is not None:
+            metrics["begin_seconds"] = time.perf_counter() - begin_started
         try:
             yield self._connection
         except Exception:
             self._connection.rollback()
             raise
         else:
-            self._connection.commit()
+            commit_started = time.perf_counter() if metrics is not None else 0.0
+            try:
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+            if metrics is not None:
+                metrics["commit_seconds"] = time.perf_counter() - commit_started
+                metrics["transaction_seconds"] = time.perf_counter() - transaction_started
 
     @staticmethod
     def _domain(kind: str) -> str:
@@ -1372,7 +1860,10 @@ class PaperLedger:
     ) -> str:
         prepared = self._prepare(kind, payload, identity, occurred_at, execution_session_id)
         with self._ordering_lock:
-            self.flush_deferred()
+            with self._deferred_condition:
+                if not self._admission_open or self._deferred_stopping:
+                    raise RuntimeError("Paper ledger admission is sealed for controlled shutdown.")
+            self.flush_deferred(timeout_seconds=30.0)
             with self._lock:
                 return self._append_prepared((prepared,))[0]
 
@@ -1412,7 +1903,10 @@ class PaperLedger:
             trade_date = UNSPECIFIED_OFF_SESSION_CONTEXT.trade_date
             profile_hash = UNSPECIFIED_OFF_SESSION_CONTEXT.session_profile_hash
             generation = UNSPECIFIED_OFF_SESSION_CONTEXT.session_generation
-        context = context_from_identity(session_kind, session_id, trade_date, profile_hash, generation)
+        context = _cached_session_context(
+            session_kind.value, session_id, trade_date, profile_hash,
+            generation, PaperCalendarState.NORMAL.value,
+        )
         session_family = context.session_family.value
         supplied_family = identity_payload.get("session_family")
         if supplied_family is not None and supplied_family != session_family:
@@ -1423,9 +1917,9 @@ class PaperLedger:
             "kind": kind,
             "occurred_at": at,
             "execution_session_id": execution_session_id,
-            "paper_policy_hash": POLICY.configuration_hash,
-            "risk_profile_hash": RISK_PROFILE.configuration_hash,
-            "account_binding_hash": ACCOUNT_BINDING.binding_hash,
+            "paper_policy_hash": _PAPER_POLICY_HASH,
+            "risk_profile_hash": _RISK_PROFILE_HASH,
+            "account_binding_hash": _ACCOUNT_BINDING_HASH,
             "scientific_eligibility": False,
             "paper_only": True,
             "live_capital": False,
@@ -1437,6 +1931,13 @@ class PaperLedger:
             "session_generation": generation,
             "payload": identity_payload,
         }
+        # Retain both exact and generated-time retry fingerprints. An explicit
+        # event time remains part of identity-conflict detection; only a
+        # caller which omitted it can retry with a fresh ledger envelope time.
+        idempotency_fingerprint = _idempotency_fingerprint(common)
+        retry_fingerprint = _idempotency_fingerprint(common, ignore_occurred_at=True)
+        # Preserve the historical automatic identity contract byte-for-byte;
+        # only retry comparison intentionally ignores a fresh envelope time.
         record_identity = identity or "l3g-ledger-" + canonical_hash(common)
         return {
             "kind": kind,
@@ -1444,43 +1945,327 @@ class PaperLedger:
             "domain": domain,
             "common": common,
             "identity": record_identity,
+            "idempotency_fingerprint": idempotency_fingerprint,
+            "idempotency_retry_fingerprint": retry_fingerprint,
+            "idempotency_generated_occurred_at": occurred_at is None,
             "execution_session_id": execution_session_id,
         }
 
+    @staticmethod
+    def _stored_idempotency_fingerprint(
+        serialized: str, *, ignore_occurred_at: bool = False,
+    ) -> str:
+        """Recreate the pre-chain document fingerprint from an immutable row."""
+        try:
+            stored = json.loads(serialized)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Existing ledger identity has malformed immutable content.") from exc
+        if not isinstance(stored, Mapping):
+            raise ValueError("Existing ledger identity has malformed immutable content.")
+        common = {
+            key: value for key, value in stored.items()
+            if key not in {"identity", "previous_record_hash", "record_hash"}
+        }
+        return _idempotency_fingerprint(common, ignore_occurred_at=ignore_occurred_at)
+
+    def _publish_passive_checkpoint_state_locked(self) -> None:
+        """Publish a replace-only maintenance snapshot while its condition is held."""
+        self._checkpoint_state_snapshot = {
+            "passive_checkpoint_active": self._checkpoint_active,
+            "passive_checkpoint_pending": self._checkpoint_requested,
+            "passive_checkpoint_worker_error": self._checkpoint_worker_error,
+            "wal_size_bytes": self._checkpoint_wal_size_bytes,
+            "wal_uncheckpointed_bytes": self._checkpoint_uncheckpointed_bytes,
+            "wal_uncheckpointed_capacity_ceiling_bytes": _WAL_UNCHECKPOINTED_CAPACITY_CEILING_BYTES,
+            "wal_file_capacity_ceiling_bytes": _WAL_FILE_CAPACITY_CEILING_BYTES,
+            "wal_capacity_fault_latched": self._wal_capacity_fault_latched,
+            "last_passive_checkpoint": (
+                None if self._last_passive_checkpoint is None
+                else dict(self._last_passive_checkpoint)
+            ),
+        }
+
+    def _passive_checkpoint_snapshot(self) -> dict[str, object]:
+        """Return a stable, replace-only maintenance snapshot without writer contention."""
+        snapshot = self._checkpoint_state_snapshot
+        result = dict(snapshot)
+        checkpoint = result.get("last_passive_checkpoint")
+        if isinstance(checkpoint, Mapping):
+            result["last_passive_checkpoint"] = dict(checkpoint)
+        return result
+
+    def _current_wal_size_bytes(self) -> int:
+        try:
+            return Path(str(self.path) + "-wal").stat().st_size
+        except OSError:
+            return 0
+
+    def _schedule_passive_checkpoint_locked(self) -> None:
+        """Request bounded maintenance after enough newly durable rows.
+
+        The deferred condition owns ``_durable_records_total``.  This method
+        deliberately only signals the independent worker; it never executes
+        SQLite maintenance while the FIFO writer owns the chain lock.
+        """
+        wal_size = self._current_wal_size_bytes()
+        checkpoint_age = time.perf_counter() - self._checkpoint_started_at
+        with self._checkpoint_condition:
+            self._checkpoint_durable_total = self._durable_records_total
+            self._checkpoint_wal_size_bytes = wal_size
+            if self._checkpoint_stopping:
+                self._publish_passive_checkpoint_state_locked()
+                return
+            # Let the authenticated observation stream establish its initial
+            # normal batch cadence before competing background copy work is
+            # eligible. This is a bounded bootstrap delay, not a suppression:
+            # the next committed batch after it expires schedules maintenance.
+            if checkpoint_age < _WAL_PASSIVE_CHECKPOINT_START_DELAY_SECONDS:
+                self._publish_passive_checkpoint_state_locked()
+                return
+            # Trigger once the WAL has enough new work to amortize its copy,
+            # or before the retention target is reached for the first pass.
+            # After a complete PASSIVE pass the physical WAL file may retain
+            # its allocated size, so size alone is intentionally not used to
+            # requeue no-op maintenance forever.
+            due_to_records = (
+                self._durable_records_total - self._checkpoint_last_requested_durable_total
+                >= _WAL_PASSIVE_CHECKPOINT_TRIGGER_RECORDS
+            )
+            due_to_initial_wal_size = (
+                self._checkpoint_last_completed_durable_total == 0
+                and wal_size >= _WAL_PASSIVE_CHECKPOINT_TRIGGER_BYTES
+            )
+            if not due_to_records and not due_to_initial_wal_size:
+                self._publish_passive_checkpoint_state_locked()
+                return
+            self._checkpoint_last_requested_durable_total = self._durable_records_total
+            self._checkpoint_requested = True
+            self._publish_passive_checkpoint_state_locked()
+            self._checkpoint_condition.notify_all()
+
+    def _passive_checkpoint_worker(self) -> None:
+        """Run non-blocking WAL copy work on a connection the writer never uses."""
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(str(self.path), isolation_level=None)
+            # PASSIVE checkpointing must return a truthful busy result rather
+            # than waiting behind an external reader or competing writer.
+            connection.execute("PRAGMA busy_timeout=0")
+            page_size_row = connection.execute("PRAGMA page_size").fetchone()
+            page_size = 4096 if page_size_row is None else int(page_size_row[0])
+            last_started = 0.0
+            while True:
+                with self._checkpoint_condition:
+                    while not self._checkpoint_requested and not self._checkpoint_stopping:
+                        self._checkpoint_condition.wait()
+                    if self._checkpoint_stopping:
+                        return
+                    # The request bit coalesces writer notifications, while
+                    # this short minimum interval prevents a busy stream from
+                    # turning maintenance into an unbounded checkpoint loop.
+                    while not self._checkpoint_stopping:
+                        remaining = (
+                            last_started + _WAL_PASSIVE_CHECKPOINT_MIN_INTERVAL_SECONDS
+                            - time.perf_counter()
+                        )
+                        if remaining <= 0:
+                            break
+                        self._checkpoint_condition.wait(timeout=remaining)
+                    if self._checkpoint_stopping:
+                        return
+                    self._checkpoint_requested = False
+                    self._checkpoint_active = True
+                    checkpoint_target_durable_total = self._checkpoint_durable_total
+                    self._publish_passive_checkpoint_state_locked()
+                started = time.perf_counter()
+                last_started = started
+                result: dict[str, object]
+                error: str | None = None
+                try:
+                    row = connection.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                    if row is None:
+                        raise RuntimeError("SQLite passive checkpoint returned no status row.")
+                    busy, log_frames, checkpointed_frames = (int(row[index]) for index in range(3))
+                    uncheckpointed_frames = max(0, log_frames - checkpointed_frames)
+                    result = {
+                        "mode": "PASSIVE",
+                        "busy": busy,
+                        "log_frames": log_frames,
+                        "checkpointed_frames": checkpointed_frames,
+                        "uncheckpointed_frames": uncheckpointed_frames,
+                        "uncheckpointed_bytes": uncheckpointed_frames * page_size,
+                        "duration_seconds": round(time.perf_counter() - started, 6),
+                        "complete": busy == 0 and log_frames == checkpointed_frames,
+                    }
+                except BaseException as exc:  # keep data admission separate from maintenance telemetry
+                    error = f"{type(exc).__name__}: {exc}"
+                    result = {
+                        "mode": "PASSIVE",
+                        "busy": None,
+                        "log_frames": None,
+                        "checkpointed_frames": None,
+                        "uncheckpointed_frames": None,
+                        "uncheckpointed_bytes": None,
+                        "duration_seconds": round(time.perf_counter() - started, 6),
+                        "complete": False,
+                        "error": error,
+                    }
+                wal_size = self._current_wal_size_bytes()
+                result["wal_size_bytes"] = wal_size
+                result["wal_uncheckpointed_capacity_ceiling_bytes"] = _WAL_UNCHECKPOINTED_CAPACITY_CEILING_BYTES
+                result["wal_file_capacity_ceiling_bytes"] = _WAL_FILE_CAPACITY_CEILING_BYTES
+                with self._checkpoint_condition:
+                    self._checkpoint_active = False
+                    self._last_passive_checkpoint = result
+                    self._checkpoint_worker_error = error
+                    self._checkpoint_wal_size_bytes = wal_size
+                    uncheckpointed_bytes = result.get("uncheckpointed_bytes")
+                    self._checkpoint_uncheckpointed_bytes = (
+                        int(uncheckpointed_bytes)
+                        if isinstance(uncheckpointed_bytes, int) else 0
+                    )
+                    if result.get("complete") is True:
+                        self._checkpoint_last_completed_durable_total = max(
+                            self._checkpoint_last_completed_durable_total,
+                            checkpoint_target_durable_total,
+                        )
+                    if (
+                        self._checkpoint_uncheckpointed_bytes
+                        > _WAL_UNCHECKPOINTED_CAPACITY_CEILING_BYTES
+                    ) or wal_size > _WAL_FILE_CAPACITY_CEILING_BYTES:
+                        self._wal_capacity_fault_latched = True
+                    self._publish_passive_checkpoint_state_locked()
+                    self._checkpoint_condition.notify_all()
+        except BaseException as exc:  # pragma: no cover - host-level SQLite failure
+            with self._checkpoint_condition:
+                self._checkpoint_active = False
+                self._checkpoint_worker_error = f"{type(exc).__name__}: {exc}"
+                self._publish_passive_checkpoint_state_locked()
+                self._checkpoint_condition.notify_all()
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except BaseException:
+                    pass
+
+    def _stop_passive_checkpoint_worker(self, *, timeout_seconds: float = 30.0) -> bool:
+        """Stop the maintenance connection before final TRUNCATE proof."""
+        with self._checkpoint_condition:
+            self._checkpoint_stopping = True
+            self._checkpoint_requested = False
+            self._publish_passive_checkpoint_state_locked()
+            self._checkpoint_condition.notify_all()
+        self._checkpoint_thread.join(timeout=timeout_seconds)
+        return not self._checkpoint_thread.is_alive()
+
     def _append_prepared(self, records: tuple[dict[str, object], ...]) -> list[str]:
+        """Commit one ordered batch and publish its durable tip only after commit."""
         if not records:
             return []
-        synchronous_domain = "DECISION" if all(str(record["domain"]) in _HIGH_VOLUME_DOMAINS for record in records) else "INCIDENT"
+        self._writer_batch_counter += 1
+        sampled = self._writer_batch_counter % _WRITER_TELEMETRY_SAMPLE_INTERVAL == 1
+        metrics: dict[str, float] | None = {} if sampled else None
+        batch_started = time.perf_counter() if sampled else 0.0
+        synchronous_domain = (
+            "DECISION" if all(self._uses_normal_deferred_durability(record) for record in records)
+            else "INCIDENT"
+        )
         hashes: list[str] = []
         watermark = dict(self._authority_watermark)
         watermark["safe_classification_last_sequences"] = dict(
             watermark.get("safe_classification_last_sequences") or {}
         )
+        pending_counts = dict(self._counts_cache)
+        pending_highest_sequence = self._highest_sequence
+        pending_last_record_time = self._last_record_time
+        pending_final_record_hash = self._final_record_hash
         inserted = False
+        inserted_count = 0
         last_external_authority: tuple[int, str] | None = None
-        with self._domain_transaction(synchronous_domain) as connection:
+        with self._domain_transaction(synchronous_domain, metrics) as connection:
+            duplicate_started = time.perf_counter() if metrics is not None else 0.0
+            # The side table preserves whether a stored envelope timestamp was
+            # generated by the ledger.  That provenance is required to keep
+            # an externally supplied timestamp conflict-significant while
+            # retaining the historic convenience retry contract for callers
+            # that omitted it.  Pre-hotfix rows have no provenance and are
+            # therefore treated as exact-content-only.
+            existing: dict[str, tuple[str, str, bool]] = {}
+            identities = list(dict.fromkeys(str(record["identity"]) for record in records))
+            for start in range(0, len(identities), _SQLITE_IN_LOOKUP_CHUNK):
+                chunk = identities[start:start + _SQLITE_IN_LOOKUP_CHUNK]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(
+                    """
+                    SELECT audit.identity, audit.record_hash, audit.payload_json,
+                           origin.generated_occurred_at
+                    FROM lane_iii_paper_audit AS audit
+                    LEFT JOIN lane_iii_paper_idempotency_origin AS origin
+                      ON origin.identity = audit.identity
+                    """
+                    + f"WHERE audit.identity IN ({placeholders})",
+                    tuple(chunk),
+                ).fetchall()
+                for row in rows:
+                    existing[str(row["identity"])] = (
+                        str(row["record_hash"]),
+                        str(row["payload_json"]),
+                        row["generated_occurred_at"] == 1,
+                    )
+            if metrics is not None:
+                metrics["duplicate_lookup_seconds"] = time.perf_counter() - duplicate_started
             prior = connection.execute(
                 "SELECT record_hash FROM lane_iii_paper_audit ORDER BY ledger_sequence DESC LIMIT 1"
             ).fetchone()
             previous_hash = None if prior is None else str(prior["record_hash"])
+            local_fingerprints: dict[tuple[str, bool], str] = {}
             for record in records:
                 record_identity = str(record["identity"])
-                duplicate = connection.execute(
-                    "SELECT record_hash FROM lane_iii_paper_audit WHERE identity = ?",
-                    (record_identity,),
-                ).fetchone()
+                incoming_generated_occurred_at = (
+                    record.get("idempotency_generated_occurred_at") is True
+                )
+                duplicate = existing.get(record_identity)
                 if duplicate is not None:
-                    hashes.append(str(duplicate["record_hash"]))
+                    # Ignore the envelope timestamp only when *both* sides
+                    # were automatic.  In particular, an omitted timestamp
+                    # must never turn a retry of an explicitly timestamped
+                    # external event into a false idempotent match.
+                    ignore_occurred_at = (
+                        incoming_generated_occurred_at and duplicate[2]
+                    )
+                    fingerprint = str(
+                        record["idempotency_retry_fingerprint"]
+                        if ignore_occurred_at else record["idempotency_fingerprint"]
+                    )
+                    fingerprint_key = (record_identity, ignore_occurred_at)
+                    known_fingerprint = local_fingerprints.get(fingerprint_key)
+                    if known_fingerprint is None:
+                        known_fingerprint = self._stored_idempotency_fingerprint(
+                            duplicate[1], ignore_occurred_at=ignore_occurred_at,
+                        )
+                        local_fingerprints[fingerprint_key] = known_fingerprint
+                    if known_fingerprint != fingerprint:
+                        raise ValueError(
+                            "Paper ledger identity conflicts with an existing immutable record."
+                        )
+                    hashes.append(duplicate[0])
                     continue
                 domain = str(record["domain"])
                 kind = str(record["kind"])
                 at = str(record["at"])
                 execution_session_id = record["execution_session_id"]
+                hashing_started = time.perf_counter() if metrics is not None else 0.0
                 common = dict(record["common"])  # type: ignore[arg-type]
                 chained = {**common, "identity": record_identity, "previous_record_hash": previous_hash}
                 record_hash = canonical_hash(chained)
                 final = {**chained, "record_hash": record_hash}
                 serialized = json.dumps(final, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
+                if metrics is not None:
+                    metrics["hash_serialization_seconds"] = metrics.get(
+                        "hash_serialization_seconds", 0.0,
+                    ) + time.perf_counter() - hashing_started
+                audit_started = time.perf_counter() if metrics is not None else 0.0
                 cursor = connection.execute(
                     """
                     INSERT INTO lane_iii_paper_audit
@@ -1489,11 +2274,24 @@ class PaperLedger:
                     """,
                     (record_identity, domain, kind, at, execution_session_id, serialized, previous_hash, record_hash),
                 )
+                connection.execute(
+                    """
+                    INSERT INTO lane_iii_paper_idempotency_origin
+                        (identity, generated_occurred_at)
+                    VALUES (?, ?)
+                    """,
+                    (record_identity, 1 if incoming_generated_occurred_at else 0),
+                )
+                if metrics is not None:
+                    metrics["audit_insert_seconds"] = metrics.get("audit_insert_seconds", 0.0) + time.perf_counter() - audit_started
                 sequence = int(cursor.lastrowid)
+                domain_started = time.perf_counter() if metrics is not None else 0.0
                 connection.execute(
                     f"INSERT INTO {_DOMAIN_TABLES[domain]} (identity, kind, occurred_at, execution_session_id, payload_json, record_hash) VALUES (?, ?, ?, ?, ?, ?)",
                     (record_identity, kind, at, execution_session_id, serialized, record_hash),
                 )
+                if metrics is not None:
+                    metrics["domain_insert_seconds"] = metrics.get("domain_insert_seconds", 0.0) + time.perf_counter() - domain_started
                 ownership_payload = common.get("payload")
                 if kind == "COMMISSIONING_OWNERSHIP_RESERVED" and isinstance(ownership_payload, Mapping):
                     commissioning_id = ownership_payload.get("commissioning_id")
@@ -1531,9 +2329,7 @@ class PaperLedger:
                             "UPDATE lane_iii_paper_commissioning_ownership SET released=1, updated_at=? WHERE commissioning_id=?",
                             (at, commissioning_id),
                         )
-                previous_hash = record_hash
-                hashes.append(record_hash)
-                inserted = True
+                watermark_started = time.perf_counter() if metrics is not None else 0.0
                 inner_payload = common.get("payload")
                 classification = commissioning_tail_classification(domain, kind, inner_payload) if isinstance(
                     inner_payload, Mapping
@@ -1550,6 +2346,8 @@ class PaperLedger:
                     },
                     classification,
                 )
+                if metrics is not None:
+                    metrics["watermark_seconds"] = metrics.get("watermark_seconds", 0.0) + time.perf_counter() - watermark_started
                 if domain in {"COMMAND_RECEIPT", "ORDER_EVENT", "EXECUTION", "POSITION_SNAPSHOT"} or (
                     domain == "INCIDENT" and kind == "INCIDENT_SAFETY_EVENT"
                 ) or (
@@ -1562,18 +2360,71 @@ class PaperLedger:
                     "classified_through_hash": record_hash,
                     "updated_at": at,
                 })
-                self._counts_cache[domain] = self._counts_cache.get(domain, 0) + 1
-                self._highest_sequence = sequence
-                self._last_record_time = at
-                self._final_record_hash = record_hash
+                pending_counts[domain] = pending_counts.get(domain, 0) + 1
+                pending_highest_sequence = sequence
+                pending_last_record_time = at
+                pending_final_record_hash = record_hash
+                previous_hash = record_hash
+                existing[record_identity] = (
+                    record_hash, serialized, incoming_generated_occurred_at,
+                )
+                local_fingerprints[(record_identity, False)] = str(
+                    record["idempotency_fingerprint"]
+                )
+                if incoming_generated_occurred_at:
+                    local_fingerprints[(record_identity, True)] = str(
+                        record["idempotency_retry_fingerprint"]
+                    )
+                hashes.append(record_hash)
+                inserted = True
+                inserted_count += 1
             if inserted:
+                watermark_started = time.perf_counter() if metrics is not None else 0.0
                 self._store_authority_watermark(connection, watermark)
+                if metrics is not None:
+                    metrics["watermark_seconds"] = metrics.get("watermark_seconds", 0.0) + time.perf_counter() - watermark_started
+        # Do not claim a new tip until SQLite has committed every row and its
+        # watermark.  A failing commit must leave all process-local durable
+        # state at the previous proven sequence.
         if inserted:
+            self._counts_cache = pending_counts
+            self._highest_sequence = pending_highest_sequence
+            self._last_record_time = pending_last_record_time
+            self._final_record_hash = pending_final_record_hash
             self._authority_watermark = watermark
         if last_external_authority is not None:
-            self._last_external_authority_sequence, self._last_external_authority_hash = (
-                last_external_authority
-            )
+            self._last_external_authority_sequence, self._last_external_authority_hash = last_external_authority
+        now = time.perf_counter()
+        with self._deferred_condition:
+            if inserted_count:
+                self._durable_records_total += inserted_count
+                self._record_rate_locked(self._durable_rate_buckets, now, inserted_count)
+                self._record_queue_depth_locked(now)
+            batch_telemetry: dict[str, object] = {
+                "recorded_at_monotonic": round(now, 6),
+                "batch_size": len(records),
+                "inserted_records": inserted_count,
+                "duplicate_records": len(records) - inserted_count,
+                "durability_mode": self._synchronous_mode,
+                "sampled": metrics is not None,
+                # Automatic checkpoints are disabled on the writer. The
+                # separate PASSIVE connection reports its own measured result
+                # in writer telemetry, so this commit has no hidden automatic
+                # checkpoint interval to attribute here.
+                "wal_checkpoint_seconds": None,
+                "wal_checkpoint_activity": "PASSIVE_DEDICATED_CONNECTION",
+            }
+            if metrics is not None:
+                metrics["batch_processing_seconds"] = time.perf_counter() - batch_started
+                metrics["wal_checkpoint_stall_upper_bound_seconds"] = 0.0
+                try:
+                    metrics["wal_size_bytes"] = float(Path(str(self.path) + "-wal").stat().st_size)
+                except OSError:
+                    metrics["wal_size_bytes"] = 0.0
+                batch_telemetry.update({key: round(value, 6) for key, value in metrics.items()})
+            self._writer_batches.append(batch_telemetry)
+            if inserted_count:
+                self._schedule_passive_checkpoint_locked()
         return hashes
 
     def append_deferred(
@@ -1584,11 +2435,19 @@ class PaperLedger:
         identity: str | None = None,
         occurred_at: str | None = None,
         execution_session_id: str | None = None,
-    ) -> None:
+    ) -> dict[str, object]:
         prepared = self._prepare(kind, payload, identity, occurred_at, execution_session_id)
         if str(prepared["domain"]) not in _HIGH_VOLUME_DOMAINS:
             raise ValueError("Only raw observations, evidence, and no-side-effect decisions may use deferred persistence.")
-        self._enqueue_deferred_prepared(prepared)
+        if str(prepared["domain"]) == "DECISION":
+            common = prepared.get("common")
+            stored_payload = common.get("payload") if isinstance(common, Mapping) else None
+            classification = commissioning_tail_classification(
+                "DECISION", kind, stored_payload if isinstance(stored_payload, Mapping) else {},
+            )
+            if classification.category is CommissioningTailCategory.AUTHORITY_MUTATION:
+                raise ValueError("Authority-capable decisions may not use deferred persistence.")
+        return self._enqueue_deferred_prepared(prepared)
 
     def append_commissioning_attestation_deferred(
         self,
@@ -1598,7 +2457,7 @@ class PaperLedger:
         identity: str | None = None,
         occurred_at: str | None = None,
         execution_session_id: str | None = None,
-    ) -> None:
+    ) -> dict[str, object]:
         """Defer only an exact no-authority commissioning readiness attestation."""
         # The writer runs later on another thread.  Detach nested caller-owned
         # containers before redaction, identity, and whitelist validation so
@@ -1619,42 +2478,117 @@ class PaperLedger:
             raise ValueError(
                 "Only exact no-authority commissioning readiness attestations may use this deferred path."
             )
-        self._enqueue_deferred_prepared(prepared)
+        # Preserve the existing FULL-durability classification for the
+        # commissioning-relevant attestation itself.  The writer segments this
+        # ordered singleton from its NORMAL market-record neighbours, so it
+        # cannot silently downgrade their durability or force them all into
+        # one expensive FULL transaction.
+        return self._enqueue_deferred_prepared(prepared)
 
-    def _enqueue_deferred_prepared(self, prepared: dict[str, object]) -> None:
+    def _enqueue_deferred_prepared(self, prepared: dict[str, object]) -> dict[str, object]:
         with self._ordering_lock, self._deferred_condition:
             if self._deferred_error is not None:
-                raise RuntimeError("Deferred paper ledger writer failed.") from self._deferred_error
-            if self._deferred_stopping:
-                raise RuntimeError("Deferred paper ledger writer is stopping.")
+                raise LedgerCapacityError(
+                    "Deferred paper ledger writer failed; record was not admitted.",
+                    self._capacity_snapshot_locked(time.perf_counter()),
+                ) from self._deferred_error
+            if self._deferred_stopping or not self._admission_open:
+                raise LedgerCapacityError(
+                    "Deferred paper ledger admission is sealed; record was not admitted.",
+                    self._capacity_snapshot_locked(time.perf_counter()),
+                )
             record_identity = str(prepared["identity"])
+            generated_occurred_at = prepared.get("idempotency_generated_occurred_at") is True
+            fingerprint = str(prepared["idempotency_fingerprint"])
+            retry_fingerprint = str(prepared["idempotency_retry_fingerprint"])
             if record_identity in self._deferred_identities:
-                return
+                known_fingerprints = self._deferred_identity_fingerprints.get(record_identity)
+                ignore_occurred_at = (
+                    known_fingerprints is not None
+                    and generated_occurred_at
+                    and known_fingerprints[2]
+                )
+                known_fingerprint = (
+                    None if known_fingerprints is None
+                    else known_fingerprints[1] if ignore_occurred_at else known_fingerprints[0]
+                )
+                submitted_fingerprint = retry_fingerprint if ignore_occurred_at else fingerprint
+                if known_fingerprint != submitted_fingerprint:
+                    raise ValueError("Paper ledger identity conflicts with an already admitted deferred record.")
+                return self._capacity_snapshot_locked(time.perf_counter())
+            now = time.perf_counter()
+            capacity = self._capacity_snapshot_locked(now)
+            if capacity["wal_capacity_fault_latched"] is True:
+                self._admission_rejections_total += 1
+                raise LedgerCapacityError(
+                    "Deferred paper ledger WAL capacity is exhausted; record was not admitted.",
+                    capacity,
+                )
+            if self._deferred_backlog_depth_locked() >= self._max_deferred_records:
+                self._capacity_fault_latched = True
+                self._admission_rejections_total += 1
+                raise LedgerCapacityError(
+                    "Deferred paper ledger capacity is exhausted; record was not admitted.",
+                    self._capacity_snapshot_locked(now),
+                )
+            prepared["_admitted_monotonic"] = now
             self._deferred.append(prepared)
             self._deferred_identities.add(record_identity)
-            self._deferred_record_count += 1
-            self._deferred_queue_high_water = max(
-                self._deferred_queue_high_water, self._deferred_record_count,
+            self._deferred_identity_fingerprints[record_identity] = (
+                fingerprint, retry_fingerprint, generated_occurred_at,
             )
+            self._deferred_pending_admitted_at.append(now)
+            self._deferred_record_count += 1
+            self._admitted_records_total += 1
+            self._record_rate_locked(self._admission_rate_buckets, now, 1)
+            self._deferred_queue_high_water = max(
+                self._deferred_queue_high_water, self._deferred_backlog_depth_locked(),
+            )
+            self._record_queue_depth_locked(now)
+            capacity = self._capacity_snapshot_locked(now)
             self._deferred_condition.notify()
+            return capacity
 
     def _commissioning_deferred_barrier(
-        self, requested_sequences: tuple[int, ...],
+        self,
+        requested_sequences: tuple[int, ...],
+        *,
+        timeout_seconds: float = 30.0,
+        allow_sealed_admission: bool = False,
+        allow_pending_barrier_overflow: bool = False,
     ) -> _DeferredLedgerBarrier:
         """Wait only for records admitted before an ordered commissioning fence."""
+        if not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
+            raise ValueError("Deferred barrier timeout must be positive.")
         with self._ordering_lock, self._deferred_condition:
             if self._deferred_error is not None:
                 raise RuntimeError("Deferred paper ledger writer failed.") from self._deferred_error
-            if self._deferred_stopping:
-                raise RuntimeError("Deferred paper ledger writer is stopping.")
+            if self._deferred_stopping or (not self._admission_open and not allow_sealed_admission):
+                raise RuntimeError("Deferred paper ledger admission is sealed.")
+            if (
+                self._deferred_barrier_count >= self._max_pending_barriers
+                and not allow_pending_barrier_overflow
+            ):
+                self._barrier_rejections_total += 1
+                raise LedgerCapacityError(
+                    "Deferred paper ledger checkpoint capacity is exhausted; barrier was not admitted.",
+                    self._capacity_snapshot_locked(time.perf_counter()),
+                )
             self._next_barrier_token += 1
             barrier = _DeferredLedgerBarrier(self._next_barrier_token, requested_sequences)
             self._deferred.append(barrier)
             self._deferred_barrier_count += 1
-            self._deferred_condition.notify()
+            self._deferred_barrier_high_water = max(
+                self._deferred_barrier_high_water, self._deferred_barrier_count,
+            )
+            self._deferred_condition.notify_all()
+        deadline = time.monotonic() + float(timeout_seconds)
         with self._deferred_condition:
             while not barrier.completed and self._deferred_error is None:
-                self._deferred_condition.wait(timeout=1.0)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Deferred paper ledger barrier exceeded its bounded authority wait.")
+                self._deferred_condition.wait(timeout=min(1.0, remaining))
             if self._deferred_error is not None:
                 raise RuntimeError("Deferred paper ledger writer failed.") from self._deferred_error
             if not barrier.completed or barrier.ledger_sequence is None or barrier.authority_watermark is None:
@@ -1668,8 +2602,8 @@ class PaperLedger:
             with self._deferred_condition:
                 if self._deferred_error is not None:
                     raise RuntimeError("Deferred paper ledger writer failed.") from self._deferred_error
-                if self._deferred_stopping:
-                    raise RuntimeError("Deferred paper ledger writer is stopping.")
+                if self._deferred_stopping or not self._admission_open:
+                    raise RuntimeError("Deferred paper ledger admission is sealed.")
             yield
 
     def commissioning_authority_checkpoint(self) -> dict[str, object]:
@@ -1693,7 +2627,35 @@ class PaperLedger:
             "last_external_authority_hash": barrier.external_authority_hash,
             "deferred_barrier_token": barrier.token,
             "deferred_barrier_wait_seconds": round(float(barrier.wait_seconds or 0.0), 6),
+            "deferred_capacity": dict(barrier.deferred_capacity or {}),
         }
+
+    @staticmethod
+    def _uses_normal_deferred_durability(record: Mapping[str, object]) -> bool:
+        return (
+            str(record.get("domain")) in _HIGH_VOLUME_DOMAINS
+            or record.get("_normal_deferred_durability") is True
+        )
+
+    def _append_deferred_durability_segments(self, batch: tuple[dict[str, object], ...]) -> None:
+        """Commit contiguous NORMAL/FULL spans without changing FIFO order.
+
+        A readiness attestation is an ordered FULL record, but it must not
+        downgrade unrelated market observations already adjacent in the queue.
+        Each span commits independently, preserving the global hash tip and
+        authority watermark before the following span starts.
+        """
+        segment: list[dict[str, object]] = []
+        segment_is_high_volume: bool | None = None
+        for record in batch:
+            is_high_volume = self._uses_normal_deferred_durability(record)
+            if segment and is_high_volume != segment_is_high_volume:
+                self._append_prepared(tuple(segment))
+                segment = []
+            segment.append(record)
+            segment_is_high_volume = is_high_volume
+        if segment:
+            self._append_prepared(tuple(segment))
 
     def _deferred_writer(self) -> None:
         while True:
@@ -1702,11 +2664,35 @@ class PaperLedger:
                     self._deferred_condition.wait()
                 if self._deferred_stopping and not self._deferred:
                     return
-                if self._deferred_record_count < 512 and not self._deferred_barrier_count and not self._deferred_stopping:
-                    self._deferred_condition.wait(timeout=0.01)
+                batch_limit = (
+                    self._catch_up_batch_size
+                    if self._deferred_backlog_depth_locked() >= self._catch_up_threshold
+                    else _DEFERRED_NORMAL_BATCH_SIZE
+                )
+                # A plain enqueue notification must not defeat the small-queue
+                # coalescing deadline.  It only wakes this loop to re-check
+                # barriers, shutdown, explicit drains, and the batch target.
+                # Bound latency from the oldest admission, rather than adding
+                # a fresh 10 ms sleep after every completed transaction. At a
+                # steady stream the latter creates an avoidable processing+
+                # sleep sawtooth that can leave writer capacity below ingress.
+                deadline = (
+                    self._deferred_pending_admitted_at[0] + _DEFERRED_MAX_COALESCE_SECONDS
+                    if self._deferred_pending_admitted_at else time.perf_counter()
+                )
+                while (
+                    self._deferred_record_count < batch_limit
+                    and not self._deferred_barrier_count
+                    and not self._deferred_stopping
+                    and not self._deferred_flush_requested
+                ):
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0:
+                        break
+                    self._deferred_condition.wait(timeout=remaining)
                 records: list[dict[str, object]] = []
                 barrier: _DeferredLedgerBarrier | None = None
-                while self._deferred and len(records) < 512:
+                while self._deferred and len(records) < batch_limit:
                     item = self._deferred.popleft()
                     if isinstance(item, _DeferredLedgerBarrier):
                         barrier = item
@@ -1714,12 +2700,22 @@ class PaperLedger:
                         break
                     records.append(item)
                     self._deferred_record_count -= 1
+                    if not self._deferred_pending_admitted_at:
+                        raise RuntimeError("Deferred ledger admission timestamps lost queue alignment.")
+                    self._deferred_pending_admitted_at.popleft()
                 batch = tuple(records)
+                self._deferred_inflight_record_count = len(batch)
+                admitted_times = [
+                    float(record["_admitted_monotonic"])
+                    for record in batch if isinstance(record.get("_admitted_monotonic"), float)
+                ]
+                self._deferred_inflight_oldest_admitted_at = min(admitted_times) if admitted_times else None
                 self._deferred_active = True
+                self._record_queue_depth_locked(time.perf_counter())
             try:
                 with self._lock:
                     if batch:
-                        self._append_prepared(batch)
+                        self._append_deferred_durability_segments(batch)
                     if barrier is not None:
                         barrier.ledger_sequence = self._highest_sequence
                         barrier.record_hash = self._final_record_hash
@@ -1743,27 +2739,44 @@ class PaperLedger:
                 with self._deferred_condition:
                     self._deferred_error = error
                     self._deferred_active = False
+                    self._deferred_flush_requested = False
                     self._deferred_condition.notify_all()
                 return
             with self._deferred_condition:
                 for record in batch:
-                    self._deferred_identities.discard(str(record["identity"]))
+                    identity = str(record["identity"])
+                    self._deferred_identities.discard(identity)
+                    self._deferred_identity_fingerprints.pop(identity, None)
+                self._deferred_inflight_record_count = 0
+                self._deferred_inflight_oldest_admitted_at = None
                 if barrier is not None:
+                    barrier.deferred_capacity = self._capacity_snapshot_locked(time.perf_counter())
                     barrier.completed = True
                     if self._last_barrier_token is None or barrier.token >= self._last_barrier_token:
                         self._last_barrier_token = barrier.token
                         self._last_barrier_sequence = barrier.ledger_sequence
                         self._last_barrier_wait_seconds = barrier.wait_seconds
                 self._deferred_active = False
+                self._record_queue_depth_locked(time.perf_counter())
+                if not self._deferred:
+                    self._deferred_flush_requested = False
                 self._deferred_condition.notify_all()
 
-    def flush_deferred(self) -> None:
+    def flush_deferred(self, *, timeout_seconds: float | None = None) -> None:
+        if timeout_seconds is not None and (not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0):
+            raise ValueError("Deferred flush timeout must be positive when supplied.")
+        deadline = None if timeout_seconds is None else time.monotonic() + float(timeout_seconds)
         with self._deferred_condition:
-            self._deferred_condition.notify()
+            self._deferred_flush_requested = True
+            self._deferred_condition.notify_all()
             while (self._deferred or self._deferred_active) and self._deferred_error is None:
-                self._deferred_condition.wait(timeout=1.0)
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError("Deferred paper ledger drain exceeded its bounded authority wait.")
+                self._deferred_condition.wait(timeout=1.0 if remaining is None else min(1.0, remaining))
             if self._deferred_error is not None:
                 raise RuntimeError("Deferred paper ledger writer failed.") from self._deferred_error
+            self._deferred_flush_requested = False
 
     def contains(self, identity: str) -> bool:
         with self._ordering_lock:
@@ -1983,6 +2996,7 @@ class PaperLedger:
             "deferred_barrier_token": barrier.token,
             "deferred_barrier_ledger_sequence": tip,
             "deferred_barrier_wait_seconds": round(float(barrier.wait_seconds or 0.0), 6),
+            "deferred_capacity": dict(barrier.deferred_capacity or {}),
             "unverified_tail_rows": tip - verified_through_sequence,
             "tail_start_sequence": verified_through_sequence + 1 if tip > verified_through_sequence else None,
             "tail_end_sequence": tip if tip > verified_through_sequence else None,
@@ -2012,7 +3026,14 @@ class PaperLedger:
             quick_check_state = self._quick_check_state
             authority_watermark = dict(self._authority_watermark)
         with self._deferred_condition:
-            deferred_queue_depth = self._deferred_record_count
+            now = time.perf_counter()
+            writer_telemetry = self._writer_telemetry_locked(now)
+            deferred_queue_depth = self._deferred_backlog_depth_locked()
+            deferred_pending_depth = self._deferred_record_count
+            deferred_inflight_depth = self._deferred_inflight_record_count
+            deferred_pending_barriers = self._deferred_barrier_count
+            deferred_work_item_depth = self._deferred_work_item_depth_locked()
+            deferred_barrier_high_water = self._deferred_barrier_high_water
             deferred_writer_active = self._deferred_active
             deferred_queue_high_water = self._deferred_queue_high_water
             deferred_writer_error = None if self._deferred_error is None else type(self._deferred_error).__name__
@@ -2028,6 +3049,9 @@ class PaperLedger:
             wal_size = wal_path.stat().st_size
         except OSError:
             wal_size = 0
+        writer_telemetry["wal_size_bytes"] = wal_size
+        writer_telemetry["wal_autocheckpoint_pages"] = _WAL_AUTOCHECKPOINT_PAGES
+        writer_telemetry["wal_passive_checkpoint_trigger_records"] = _WAL_PASSIVE_CHECKPOINT_TRIGGER_RECORDS
         try:
             free_bytes: int | None = shutil.disk_usage(self.path.parent).free
         except OSError:
@@ -2048,25 +3072,199 @@ class PaperLedger:
             "counts": self.counts(),
             "authority_watermark": authority_watermark,
             "deferred_queue_depth": deferred_queue_depth,
+            "deferred_pending_queue_depth": deferred_pending_depth,
+            "deferred_inflight_queue_depth": deferred_inflight_depth,
+            "deferred_pending_barrier_count": deferred_pending_barriers,
+            "deferred_work_item_depth": deferred_work_item_depth,
+            "deferred_barrier_high_water": deferred_barrier_high_water,
             "deferred_writer_active": deferred_writer_active,
             "deferred_queue_high_water": deferred_queue_high_water,
             "deferred_writer_error": deferred_writer_error,
             "last_deferred_barrier_token": last_barrier_token,
             "last_deferred_barrier_ledger_sequence": last_barrier_sequence,
             "last_deferred_barrier_wait_seconds": last_barrier_wait_seconds,
+            "writer_telemetry": writer_telemetry,
+            "deferred_capacity": {
+                key: value for key, value in writer_telemetry.items()
+                if key not in {"recent_batches", "last_checkpoint", "last_passive_checkpoint"}
+            },
         }
 
-    def close(self) -> None:
-        with self._ordering_lock:
-            self.flush_deferred()
+    def _durable_tip_locked(self) -> tuple[int, str | None]:
+        row = self._connection.execute(
+            "SELECT ledger_sequence, record_hash FROM lane_iii_paper_audit "
+            "ORDER BY ledger_sequence DESC LIMIT 1"
+        ).fetchone()
+        return (0, None) if row is None else (int(row["ledger_sequence"]), str(row["record_hash"]))
+
+    def _checkpoint_for_shutdown_locked(self) -> dict[str, object]:
+        started = time.perf_counter()
+        row = self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        elapsed = time.perf_counter() - started
+        if row is None:
+            raise RuntimeError("SQLite shutdown checkpoint returned no status row.")
+        busy, log_frames, checkpointed_frames = (int(row[index]) for index in range(3))
+        checkpoint = {
+            "mode": "TRUNCATE",
+            "busy": busy,
+            "log_frames": log_frames,
+            "checkpointed_frames": checkpointed_frames,
+            "duration_seconds": round(elapsed, 6),
+            "complete": busy == 0 and log_frames == checkpointed_frames,
+        }
+        if not checkpoint["complete"]:
+            raise RuntimeError("SQLite shutdown checkpoint did not complete.")
+        return checkpoint
+
+    def close(self) -> dict[str, object]:
+        """Seal, drain, prove, checkpoint, and close the admitted writer prefix.
+
+        A returned receipt is the only clean-shutdown claim. If any stage
+        fails, admission remains sealed and the receipt records the failure;
+        callers receive an exception instead of an ambiguous clean result.
+        """
+        failure: BaseException | None = None
+        expected_tip: tuple[int, str | None] = (0, None)
+        durable_tip: tuple[int, str | None] = (0, None)
+        checkpoint: dict[str, object] | None = None
+        writer_stopped = False
+        checkpoint_worker_stopped = False
+        admitted_prefix_records = 0
+        receipt: dict[str, object]
+
+        # Seal admission under the ordering lock, then release it before the
+        # potentially long drain. Producers which arrive after the seal must
+        # reject promptly rather than queue behind shutdown's barrier wait.
+        while True:
+            owns_shutdown = False
+            with self._ordering_lock:
+                with self._deferred_condition:
+                    if self._shutdown_receipt is not None:
+                        return dict(self._shutdown_receipt)
+                    if not self._closing:
+                        self._closing = True
+                        self._admission_open = False
+                        self._deferred_flush_requested = True
+                        admitted_prefix_records = self._deferred_backlog_depth_locked()
+                        self._record_queue_depth_locked(time.perf_counter())
+                        self._deferred_condition.notify_all()
+                        owns_shutdown = True
+            if owns_shutdown:
+                break
+            with self._deferred_condition:
+                while self._shutdown_receipt is None:
+                    self._deferred_condition.wait(timeout=1.0)
+                return dict(self._shutdown_receipt)
+
+        try:
+            try:
+                barrier = self._commissioning_deferred_barrier(
+                    (), timeout_seconds=30.0, allow_sealed_admission=True,
+                    # Admission is sealed, so this one terminal fence cannot
+                    # be amplified by new callers.  Reserve it even when the
+                    # bounded pre-shutdown barrier queue was already full.
+                    allow_pending_barrier_overflow=True,
+                )
+                expected_tip = (int(barrier.ledger_sequence), barrier.record_hash)
+                with self._lock:
+                    durable_tip = self._durable_tip_locked()
+                if durable_tip != expected_tip:
+                    raise RuntimeError(
+                        "Deferred paper ledger shutdown tip differs from its sealed admitted prefix."
+                    )
+            except BaseException as error:
+                failure = error
+
             with self._deferred_condition:
                 self._deferred_stopping = True
+                self._deferred_flush_requested = True
                 self._deferred_condition.notify_all()
-            self._deferred_thread.join(timeout=30.0)
-            if self._deferred_thread.is_alive():
-                raise RuntimeError("Deferred paper ledger writer did not stop.")
-        with self._lock:
-            self._connection.close()
+            try:
+                self._deferred_thread.join(timeout=30.0)
+                writer_stopped = not self._deferred_thread.is_alive()
+                if not writer_stopped and failure is None:
+                    failure = RuntimeError("Deferred paper ledger writer did not stop during controlled shutdown.")
+            except BaseException as error:
+                if failure is None:
+                    failure = error
+                writer_stopped = False
+
+            # The maintenance connection can otherwise race a final TRUNCATE
+            # checkpoint or retain a WAL read mark. Stop and join it before
+            # either shutdown proof or main-connection close.
+            try:
+                checkpoint_worker_stopped = self._stop_passive_checkpoint_worker()
+                if not checkpoint_worker_stopped and failure is None:
+                    failure = RuntimeError(
+                        "Passive paper ledger checkpoint worker did not stop during controlled shutdown."
+                    )
+            except BaseException as error:
+                if failure is None:
+                    failure = error
+                checkpoint_worker_stopped = False
+
+            if writer_stopped and checkpoint_worker_stopped:
+                try:
+                    with self._lock:
+                        durable_tip = self._durable_tip_locked()
+                        if failure is None and durable_tip != expected_tip:
+                            raise RuntimeError(
+                                "Deferred paper ledger durable tip changed after its shutdown fence."
+                            )
+                        if failure is None:
+                            checkpoint = self._checkpoint_for_shutdown_locked()
+                    if checkpoint is not None:
+                        with self._deferred_condition:
+                            self._last_checkpoint = dict(checkpoint)
+                except BaseException as error:
+                    if failure is None:
+                        failure = error
+
+                try:
+                    with self._lock:
+                        self._connection.close()
+                    self._closed = True
+                except BaseException as error:
+                    if failure is None:
+                        failure = error
+        except BaseException as error:
+            if failure is None:
+                failure = error
+        finally:
+            # Publish even if an unexpected lifecycle primitive failed. A
+            # waiting concurrent closer must receive an exact failed receipt,
+            # never block forever behind an abandoned ``_closing`` marker.
+            try:
+                closed_at = _now()
+            except BaseException as error:  # pragma: no cover - clock failure is defensive
+                if failure is None:
+                    failure = error
+                closed_at = None
+            with self._ordering_lock:
+                receipt = {
+                    "schema": "l3g-ledger-controlled-shutdown-v1",
+                    "closed_at": closed_at,
+                    "clean_shutdown": failure is None and writer_stopped and checkpoint is not None,
+                    "admission_sealed": True,
+                    "admitted_prefix_records": admitted_prefix_records,
+                    "expected_tip_sequence": expected_tip[0],
+                    "expected_tip_hash": expected_tip[1],
+                    "durable_tip_sequence": durable_tip[0],
+                    "durable_tip_hash": durable_tip[1],
+                    "writer_stopped": writer_stopped,
+                    "checkpoint_worker_stopped": checkpoint_worker_stopped,
+                    "last_passive_checkpoint": self._passive_checkpoint_snapshot()["last_passive_checkpoint"],
+                    "checkpoint_worker_error": self._passive_checkpoint_snapshot()["passive_checkpoint_worker_error"],
+                    "checkpoint": checkpoint,
+                    "error": None if failure is None else f"{type(failure).__name__}: {failure}",
+                }
+                with self._deferred_condition:
+                    self._shutdown_receipt = receipt
+                    self._closing = False
+                    self._deferred_condition.notify_all()
+        if failure is not None:
+            raise RuntimeError("Controlled paper ledger shutdown failed; see shutdown_status().") from failure
+        return dict(receipt)
 
     def __enter__(self) -> "PaperLedger":
         return self

@@ -16,7 +16,12 @@ from src.l3g_paper.ledger import (
     commissioning_tail_classification,
 )
 from src.l3g_paper.ninjatrader_transport import ADDON_PROTOCOL_VERSION, PaperExecutionTransport, expected_addon_source_fingerprint
-from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout, _CommissioningOwnership
+from src.l3g_paper.runtime import (
+    LaneIIIPaperRuntime,
+    ObservationFanout,
+    _CommissioningOwnership,
+    _DURABILITY_UNAVAILABLE_MARKER,
+)
 from src.l3g_paper.contracts import PaperDirection, PaperEntryOwner, PaperRuntimeState, PaperSessionArmGrant
 from src.l3g_paper.risk import PaperRiskSnapshot
 from src.l3g_paper.sessions import PaperSessionResolver
@@ -45,6 +50,53 @@ class PaperRuntimeTests(unittest.TestCase):
             "working_order_count": 0, "working_entry_count": 0, "position_snapshot_complete": True,
             "order_snapshot_complete": True, "foreign_activity": False, "timestamp": "2026-08-24T14:00:00Z",
         })
+
+    @staticmethod
+    def watchdog_runtime(directory: str) -> tuple[PaperLedger, LaneIIIPaperRuntime]:
+        """Create an authenticated-looking AddOn boundary without listening or sending."""
+        ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+        runtime = LaneIIIPaperRuntime(ledger)
+        transport = PaperExecutionTransport(ledger, port=48174)
+        runtime.bind_transport(transport)
+        with transport._lock:
+            transport._state = "AUTHENTICATED"
+            transport._authenticated = True
+            transport._client = object()  # type: ignore[assignment]
+            transport._execution_session_id = "l3g-es-watchdog-test"
+            transport._addon_protocol_version = ADDON_PROTOCOL_VERSION
+            transport._addon_source_fingerprint = expected_addon_source_fingerprint()
+        runtime._state = PaperRuntimeState.ENTRY_PENDING
+        return ledger, runtime
+
+    @staticmethod
+    def watchdog_flat_reconciliation(
+        receipt_id: str,
+        *,
+        safety_event_id: str | None = None,
+        safety_settlement_final: bool | None = None,
+        safety_settlement_sequence: int | None = None,
+    ) -> dict[str, object]:
+        message: dict[str, object] = {
+            "message_type": "RECONCILIATION",
+            "receipt_id": receipt_id,
+            "account_name": "Sim101",
+            "account_class": "LOCAL_SIMULATION",
+            "instrument": "MNQ SEP26",
+            "position_quantity": 0,
+            "working_order_count": 0,
+            "working_entry_count": 0,
+            "position_snapshot_complete": True,
+            "order_snapshot_complete": True,
+            "foreign_activity": False,
+            "timestamp": "2026-08-28T14:00:00Z",
+        }
+        if safety_event_id is not None:
+            message["safety_event_id"] = safety_event_id
+        if safety_settlement_final is not None:
+            message["safety_settlement_final"] = safety_settlement_final
+        if safety_settlement_sequence is not None:
+            message["safety_settlement_sequence"] = safety_settlement_sequence
+        return message
 
     def test_restart_reconciliation_returns_ready_disarmed_and_never_auto_arms(self) -> None:
         with TemporaryDirectory() as directory:
@@ -317,6 +369,289 @@ class PaperRuntimeTests(unittest.TestCase):
             self.assertEqual(len(submitted), 1)
             self.assertEqual(runtime.state, PaperRuntimeState.EXIT_PENDING)
             runtime.stop(); ledger.close()
+
+    def test_ledger_failure_during_stop_still_stops_heartbeat_and_reaches_stopped(self) -> None:
+        """A sealed/unavailable audit writer must not trap process shutdown."""
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            try:
+                runtime = LaneIIIPaperRuntime(ledger)
+                # Model an active paper position without starting a transport
+                # or sending a command. This forces the shutdown safety-audit
+                # path.
+                runtime._state = PaperRuntimeState.LONG
+                runtime._position = PaperDirection.LONG
+                runtime._position_quantity = 1
+
+                with patch.object(ledger, "append", side_effect=RuntimeError("ledger unavailable")):
+                    runtime.stop()
+
+                self.assertTrue(runtime._heartbeat_stop.is_set())
+                self.assertEqual(runtime.state, PaperRuntimeState.STOPPED)
+                # A second request is a no-op, not a retry loop against a
+                # failed ledger or a resurrection of the heartbeat.
+                runtime.stop()
+                self.assertEqual(runtime.state, PaperRuntimeState.STOPPED)
+                self.assertTrue(runtime._heartbeat_stop.is_set())
+            finally:
+                ledger.close()
+
+    def test_pending_entry_shutdown_keeps_watchdog_when_ledger_is_unavailable(self) -> None:
+        """An owned pending order is active even when the position is flat."""
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            try:
+                runtime = LaneIIIPaperRuntime(ledger)
+                runtime._state = PaperRuntimeState.ENTRY_PENDING
+                runtime._snapshot = PaperRiskSnapshot(
+                    runtime._snapshot.observed_at,
+                    working_owned_orders=1,
+                    working_entry_orders=1,
+                )
+                submitted: list[object] = []
+                runtime._persist_and_send = lambda command, grant: submitted.append((command, grant))  # type: ignore[method-assign]
+
+                with patch.object(ledger, "append", side_effect=RuntimeError("ledger unavailable")):
+                    watchdog = runtime.stop()
+
+                self.assertEqual(runtime.state, PaperRuntimeState.STOPPED)
+                self.assertTrue(runtime._heartbeat_stop.is_set())
+                self.assertTrue(watchdog["required"])
+                self.assertFalse(watchdog["flat_confirmed"])
+                self.assertEqual(submitted, [])
+            finally:
+                ledger.close()
+
+    def test_pending_entry_stop_without_transport_reports_unavailable_unconfirmed_watchdog(self) -> None:
+        """ENTRY_PENDING is unresolved activity, even before an order snapshot reports it."""
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            try:
+                runtime = LaneIIIPaperRuntime(ledger)
+                runtime._state = PaperRuntimeState.ENTRY_PENDING
+                self.assertEqual(runtime._position, PaperDirection.FLAT)
+                self.assertEqual(runtime._snapshot.working_owned_orders, 0)
+
+                watchdog = runtime.stop()
+
+                self.assertEqual(runtime.state, PaperRuntimeState.STOPPED)
+                self.assertTrue(runtime._heartbeat_stop.is_set())
+                self.assertTrue(watchdog["required"])
+                self.assertFalse(watchdog["flat_confirmed"])
+                self.assertFalse(watchdog["watchdog_available"])
+                self.assertIsNone(watchdog["durable_confirmation"])
+            finally:
+                ledger.close()
+
+    def test_foreign_lockout_with_owned_pending_entry_retains_watchdog_callback_path(self) -> None:
+        """Foreign activity never makes a still-working owned entry safe to tear down."""
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.watchdog_runtime(directory)
+            try:
+                runtime._state = PaperRuntimeState.LOCKED_OUT
+                foreign_pending = self.watchdog_flat_reconciliation("foreign-owned-entry-pending")
+                foreign_pending.update({
+                    "working_order_count": 1,
+                    "working_entry_count": 1,
+                    "foreign_activity": True,
+                })
+                runtime.on_execution_message(foreign_pending)
+
+                watchdog = runtime.stop()
+
+                self.assertEqual(runtime.state, PaperRuntimeState.STOPPED)
+                self.assertTrue(runtime._heartbeat_stop.is_set())
+                self.assertTrue(watchdog["required"])
+                self.assertFalse(watchdog["flat_confirmed"])
+                self.assertIsNone(watchdog["durable_confirmation"])
+                self.assertTrue(runtime._snapshot.foreign_activity)
+                self.assertEqual(runtime._snapshot.working_entry_orders, 1)
+            finally:
+                ledger.close()
+
+    def test_stop_arms_watchdog_before_fast_emergency_flatten_safety_event(self) -> None:
+        """A synchronous AddOn SAFETY_EVENT must not race ahead of the latch."""
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.watchdog_runtime(directory)
+            try:
+                runtime._state = PaperRuntimeState.LONG
+                runtime._position = PaperDirection.LONG
+                runtime._position_quantity = 1
+                safety_event_id = "safety-process-stop-fast"
+
+                def immediate_emergency_exit(reason: str, *, emergency: bool = False) -> None:
+                    self.assertEqual(reason, "PROCESS_STOP_OPEN_POSITION")
+                    self.assertTrue(emergency)
+                    # This emulates the signed AddOn callback delivered
+                    # synchronously while the command is submitted.
+                    self.assertTrue(runtime.watchdog_shutdown_status()["required"])
+                    runtime.on_execution_message({
+                        "message_type": "SAFETY_EVENT",
+                        "receipt_id": safety_event_id,
+                        "safety_event_id": safety_event_id,
+                        "reason_code": "EMERGENCY_FLATTEN_ACCEPTED",
+                        "timestamp": "2026-08-28T14:00:01Z",
+                    })
+
+                runtime._request_exit = immediate_emergency_exit  # type: ignore[method-assign]
+                watchdog = runtime.stop()
+
+                self.assertTrue(watchdog["required"])
+                self.assertEqual(watchdog["safety_event_id"], safety_event_id)
+            finally:
+                ledger.close()
+
+    def test_generic_post_stop_reconciliation_cannot_clear_watchdog(self) -> None:
+        """A pre-watchdog or ordinary flat snapshot is not a shutdown confirmation."""
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.watchdog_runtime(directory)
+            try:
+                started = runtime.stop()
+                self.assertTrue(started["required"])
+                self.assertTrue(started["watchdog_available"])
+
+                runtime.on_execution_message(
+                    self.watchdog_flat_reconciliation("generic-post-stop-flat"),
+                )
+
+                watchdog = runtime.watchdog_shutdown_status()
+                self.assertTrue(watchdog["required"])
+                self.assertFalse(watchdog["flat_confirmed"])
+                self.assertIsNone(watchdog["safety_event_id"])
+                self.assertIsNone(watchdog["durable_confirmation"])
+            finally:
+                ledger.close()
+
+    def test_correlated_safety_event_and_full_reconciliation_clear_watchdog(self) -> None:
+        """Only two increasing AddOn final snapshots release the watchdog."""
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.watchdog_runtime(directory)
+            try:
+                runtime.stop()
+                safety_event_id = "safety-watchdog-1"
+                runtime.on_execution_message({
+                    "message_type": "SAFETY_EVENT",
+                    "receipt_id": safety_event_id,
+                    "safety_event_id": safety_event_id,
+                    "reason_code": "HEARTBEAT_TIMEOUT",
+                    "timestamp": "2026-08-28T14:00:01Z",
+                })
+                runtime.on_execution_message(self.watchdog_flat_reconciliation(
+                    "safety-correlated-flat-1",
+                    safety_event_id=safety_event_id,
+                    safety_settlement_final=True,
+                    safety_settlement_sequence=1,
+                ))
+
+                after_first = runtime.watchdog_shutdown_status()
+                self.assertTrue(after_first["required"])
+                self.assertFalse(after_first["flat_confirmed"])
+                self.assertEqual(after_first["settled_reconciliation_count"], 1)
+                runtime.on_execution_message(self.watchdog_flat_reconciliation(
+                    "safety-correlated-flat-2",
+                    safety_event_id=safety_event_id,
+                    safety_settlement_final=True,
+                    safety_settlement_sequence=2,
+                ))
+
+                watchdog = runtime.watchdog_shutdown_status()
+                self.assertFalse(watchdog["required"])
+                self.assertTrue(watchdog["flat_confirmed"])
+                self.assertTrue(watchdog["durable_confirmation"])
+                self.assertEqual(watchdog["safety_event_id"], safety_event_id)
+                self.assertEqual(watchdog["settled_reconciliation_count"], 2)
+            finally:
+                ledger.close()
+
+    def test_correlated_nonfinal_reconciliation_cannot_clear_watchdog(self) -> None:
+        """A clean correlation is insufficient until the AddOn marks it settled."""
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.watchdog_runtime(directory)
+            try:
+                runtime.stop()
+                safety_event_id = "safety-watchdog-nonfinal-1"
+                runtime.on_execution_message({
+                    "message_type": "SAFETY_EVENT",
+                    "receipt_id": safety_event_id,
+                    "safety_event_id": safety_event_id,
+                    "reason_code": "HEARTBEAT_TIMEOUT",
+                    "timestamp": "2026-08-28T14:00:01Z",
+                })
+                runtime.on_execution_message(self.watchdog_flat_reconciliation(
+                    "safety-correlated-nonfinal",
+                    safety_event_id=safety_event_id,
+                    safety_settlement_final=False,
+                    safety_settlement_sequence=1,
+                ))
+
+                watchdog = runtime.watchdog_shutdown_status()
+                self.assertTrue(watchdog["required"])
+                self.assertFalse(watchdog["flat_confirmed"])
+                self.assertIsNone(watchdog["durable_confirmation"])
+                self.assertEqual(watchdog["settled_reconciliation_count"], 0)
+            finally:
+                ledger.close()
+
+    def test_safety_fallback_flat_confirmation_is_not_claimed_durable(self) -> None:
+        """Authenticated fallback truth may clear the watchdog, never its durable proof."""
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.watchdog_runtime(directory)
+            try:
+                runtime.stop()
+                safety_event_id = "safety-watchdog-fallback-1"
+                runtime.on_execution_message({
+                    "message_type": "SAFETY_EVENT",
+                    "receipt_id": safety_event_id,
+                    "safety_event_id": safety_event_id,
+                    "reason_code": "HEARTBEAT_TIMEOUT",
+                    "timestamp": "2026-08-28T14:00:01Z",
+                    _DURABILITY_UNAVAILABLE_MARKER: True,
+                })
+                runtime.on_execution_message(self.watchdog_flat_reconciliation(
+                    "safety-fallback-durable-flat-1",
+                    safety_event_id=safety_event_id,
+                    safety_settlement_final=True,
+                    safety_settlement_sequence=1,
+                ))
+                runtime.on_execution_message(self.watchdog_flat_reconciliation(
+                    "safety-fallback-durable-flat-2",
+                    safety_event_id=safety_event_id,
+                    safety_settlement_final=True,
+                    safety_settlement_sequence=2,
+                ))
+
+                watchdog = runtime.watchdog_shutdown_status()
+                self.assertFalse(watchdog["required"])
+                self.assertTrue(watchdog["flat_confirmed"])
+                self.assertFalse(watchdog["durable_confirmation"])
+                self.assertEqual(watchdog["safety_event_id"], safety_event_id)
+                self.assertTrue(watchdog["reconciliation_durable"])
+            finally:
+                ledger.close()
+
+    def test_exit_ledger_failure_fails_closed_without_phantom_exit_pending(self) -> None:
+        """Never send an unrecorded exit when durable exit authority is gone."""
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            try:
+                runtime = LaneIIIPaperRuntime(ledger)
+                runtime._state = PaperRuntimeState.LONG
+                runtime._position = PaperDirection.LONG
+                runtime._position_quantity = 1
+                submitted: list[object] = []
+                runtime._persist_and_send = lambda command, grant: submitted.append((command, grant))  # type: ignore[method-assign]
+
+                with patch.object(ledger, "append", side_effect=RuntimeError("ledger unavailable")):
+                    runtime._request_exit("LEDGER_UNAVAILABLE_SAFETY_EXIT", emergency=True)
+
+                self.assertEqual(runtime.state, PaperRuntimeState.FAULTED)
+                self.assertNotEqual(runtime.state, PaperRuntimeState.EXIT_PENDING)
+                self.assertFalse(runtime._exit_submission_in_progress)
+                self.assertTrue(runtime._heartbeat_stop.is_set())
+                self.assertEqual(submitted, [])
+                self.assertEqual(runtime._fault_reason, "EXIT_DURABLE_AUTHORITY_UNAVAILABLE:RuntimeError")
+            finally:
+                ledger.close()
 
     def test_expected_protective_cancellation_during_owned_exit_does_not_lock_authority(self) -> None:
         with TemporaryDirectory() as directory:

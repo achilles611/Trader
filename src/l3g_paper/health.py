@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Mapping
 
+from .ledger import deferred_capacity_allows_authority
+
 
 def ledger_health_projection(runtime: Mapping[str, object], verification: Mapping[str, object]) -> dict[str, object]:
     """Join inexpensive writer state with the verifier's durable authority."""
@@ -16,6 +18,9 @@ def ledger_health_projection(runtime: Mapping[str, object], verification: Mappin
     tail = None if verified is None else max(0, current - verified)
     watermark = value.get("authority_watermark")
     authority = watermark if isinstance(watermark, Mapping) else {}
+    capacity_raw = value.get("deferred_capacity")
+    capacity = capacity_raw if isinstance(capacity_raw, Mapping) else {}
+    writer_capacity_healthy = deferred_capacity_allows_authority(capacity)
     authority_sequence = authority.get("last_authority_mutation_sequence")
     observation_sequence = authority.get("last_authority_observation_sequence")
     unknown_sequence = authority.get("last_unknown_sequence")
@@ -33,7 +38,9 @@ def ledger_health_projection(runtime: Mapping[str, object], verification: Mappin
         else "UNKNOWN" if blocking_prefix == "last_unknown"
         else "AUTHORITY_MUTATION"
     )
-    if (
+    if not writer_capacity_healthy:
+        commissioning_state = "WRITER_CAPACITY_INADEQUATE"
+    elif (
         verification_pass and verified is not None and tail == 0
         and verification.get("tip_hash") == value.get("final_record_hash")
         and classified_sequence == current
@@ -112,6 +119,8 @@ def ledger_health_projection(runtime: Mapping[str, object], verification: Mappin
             if verification_pass and verified is not None else "PENDING" if status == "IN_PROGRESS" else "UNKNOWN"
         ),
         "epoch_warning": value.get("epoch_id") == "UNSPECIFIED",
+        "deferred_capacity": dict(capacity),
+        "writer_capacity_healthy": writer_capacity_healthy,
     })
     return value
 

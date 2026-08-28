@@ -111,6 +111,11 @@ function configureReadyLaneIIIUiFixture() {
   };
   laneIIILedgerOverrides = {
     highest_sequence: 125, verified_through_sequence: 100, unverified_tail_rows: 25,
+    deferred_capacity: {
+      schema: "l3g-ledger-writer-capacity-v1", state: "HEALTHY", admission_open: true,
+      capacity_fault_latched: false, negative_headroom_sustained: false,
+      writer_error: null, queue_growth_records_per_second: 0,
+    },
     commissioning_ledger_state: "VERIFIED_ANCHOR_WITH_ACCEPTED_LIVE_TAIL",
     last_authority_mutation_sequence: 99, last_authority_mutation_domain: "SESSION",
     last_authority_mutation_kind: "SESSION_AUTHORITY", last_unknown_sequence: 0,
@@ -260,6 +265,25 @@ describe("copy control center", () => {
         commissioning_warmup: { status: "NOT_WARMED" },
         market_freshness: {
           quote: { fresh: false }, classified_trade: { fresh: true }, depth_mutation: { fresh: true },
+        },
+      };
+    };
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Lane III Paper" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Run Read-Only Commissioning Rehearsal" }));
+    expect(await screen.findByText("REHEARSAL STALE")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Atomic Commissioning Start" })).toBeDisabled();
+  });
+
+  it("keeps an otherwise ready rehearsal blocked when writer capacity is no longer healthy", async () => {
+    configureReadyLaneIIIUiFixture();
+    commissioningRehearsalSideEffect = () => {
+      laneIIILedgerOverrides = {
+        ...laneIIILedgerOverrides,
+        deferred_capacity: {
+          schema: "l3g-ledger-writer-capacity-v1", state: "DEGRADED", admission_open: true,
+          capacity_fault_latched: false, negative_headroom_sustained: true,
+          writer_error: null, queue_growth_records_per_second: 7.5,
         },
       };
     };

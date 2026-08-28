@@ -37,9 +37,16 @@ from .ledger import (
     COMMISSIONING_NO_AUTHORITY_EFFECT,
     COMMISSIONING_READINESS_RECORD_SEMANTICS,
     COMMISSIONING_READINESS_RECORD_SEMANTICS_VERSION,
+    deferred_capacity_allows_authority,
+    LedgerCapacityError,
     PaperLedger,
 )
-from .ninjatrader_transport import ExecutionTransportStatus, NinjaTraderSim101PaperAdapter, PaperExecutionTransport
+from .ninjatrader_transport import (
+    HEARTBEAT_WATCHDOG_SECONDS,
+    ExecutionTransportStatus,
+    NinjaTraderSim101PaperAdapter,
+    PaperExecutionTransport,
+)
 from .policy import ExperimentalPaperPolicy
 from .risk import PaperRiskAuthority, PaperRiskSnapshot
 from .sessions import (
@@ -122,6 +129,14 @@ _COMMISSIONING_WARMUP_RECORD_MARKERS = {
     "record_semantics_version": COMMISSIONING_READINESS_RECORD_SEMANTICS_VERSION,
 }
 
+# The AddOn has an independent exact-instrument watchdog which acts after it
+# stops receiving authenticated heartbeats.  Keep its transport connected long
+# enough for its 250 ms poll plus dispatcher hand-off when Python has lost its
+# own durable-command path.
+_INDEPENDENT_WATCHDOG_GRACE_SECONDS = HEARTBEAT_WATCHDOG_SECONDS + 2.0
+_DURABILITY_UNAVAILABLE_MARKER = "_l3g_durable_receipt_unavailable"
+_WATCHDOG_SETTLED_RECONCILIATIONS_REQUIRED = 2
+
 
 class ObservationFanout:
     """Ordered independent sinks behind the one existing observation owner."""
@@ -163,11 +178,19 @@ class ObservationFanout:
             try:
                 shadow(*args)
             except Exception as exc:
-                self._record_failure("SHADOW", event, type(exc).__name__)
+                try:
+                    self._record_failure("SHADOW", event, type(exc).__name__)
+                except Exception:
+                    # A failed/sealed ledger cannot be allowed to turn an
+                    # already-isolated listener failure into a fan-out crash.
+                    pass
             try:
                 paper(*args)
             except Exception as exc:
-                self._record_failure("EXPERIMENTAL_PAPER", event, type(exc).__name__)
+                try:
+                    self._record_failure("EXPERIMENTAL_PAPER", event, type(exc).__name__)
+                except Exception:
+                    pass
 
     def on_observation(self, observation: NinjaTraderObservation) -> None:
         self._deliver("OBSERVATION", self._shadow_observation, self._paper_observation, observation)
@@ -265,6 +288,24 @@ class LaneIIIPaperRuntime:
         self._fault_reason: str | None = None
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
+        self._watchdog_failsafe_reason: str | None = None
+        self._watchdog_failsafe_deadline_monotonic: float | None = None
+        # A pre-stop flat snapshot cannot prove that a durably submitted
+        # command will not materialize after Python stops heartbeating.  Keep
+        # this latch until a *post-failsafe*, signed AddOn reconciliation
+        # proves exact flat/no-owned-orders.  It deliberately survives the
+        # runtime's terminal STOPPED state.
+        self._watchdog_failsafe_requires_flat_confirmation = False
+        self._watchdog_failsafe_activation_message_sequence: int | None = None
+        self._watchdog_failsafe_safety_event_id: str | None = None
+        self._watchdog_failsafe_flat_confirmation: dict[str, object] | None = None
+        self._watchdog_failsafe_durable_confirmation: bool | None = None
+        self._watchdog_failsafe_safety_event_durable: bool | None = None
+        self._watchdog_failsafe_reconciliation_durable: bool | None = None
+        self._watchdog_failsafe_last_settlement_sequence = 0
+        self._watchdog_failsafe_settled_reconciliation_count = 0
+        self._watchdog_failsafe_available: bool | None = None
+        self._execution_message_sequence = 0
         self._transitions = 0
         self._commissioning_readiness_generation = 0
         self._commissioning_authority_epoch = 0
@@ -295,7 +336,10 @@ class LaneIIIPaperRuntime:
             "account": ACCOUNT_BINDING.account_name,
             "account_class": ACCOUNT_BINDING.account_class,
             "instrument": ACCOUNT_BINDING.instrument,
-            "occurred_at": _now(),
+            # The record envelope owns its event timestamp. Keeping this
+            # lifecycle value stable makes a same-identity retry exact rather
+            # than fabricating a conflict solely because wall time advanced.
+            "reserved_at": ownership.reserved_at,
             "reason": reason,
         }
 
@@ -464,21 +508,27 @@ class LaneIIIPaperRuntime:
             # a continuity reset cannot globally drain that same live stream.
             # Commissioning barriers persist and classify it before any
             # readiness or authority decision is allowed to use the tail.
-            self.ledger.append_commissioning_attestation_deferred(
-                "COMMISSIONING_SESSION_WARMUP_RESET",
-                {
-                    **prior.payload(),
-                    **_COMMISSIONING_WARMUP_RECORD_MARKERS,
-                    "commissioning_warmup_state": "NOT_WARMED",
-                    "reset_at": _now(),
-                    "reason": reason,
-                    "required_families": list(_COMMISSIONING_WARMUP_POLICY["required_families"]),
-                    "seen_families": sorted(seen),
-                    "warmed_at": warmed_at,
-                    "policy_hash": _COMMISSIONING_WARMUP_POLICY_HASH,
-                },
-                execution_session_id=self._execution_session_id(),
-            )
+            try:
+                receipt = self.ledger.append_commissioning_attestation_deferred(
+                    "COMMISSIONING_SESSION_WARMUP_RESET",
+                    {
+                        **prior.payload(),
+                        **_COMMISSIONING_WARMUP_RECORD_MARKERS,
+                        "commissioning_warmup_state": "NOT_WARMED",
+                        "reset_at": _now(),
+                        "reason": reason,
+                        "required_families": list(_COMMISSIONING_WARMUP_POLICY["required_families"]),
+                        "seen_families": sorted(seen),
+                        "warmed_at": warmed_at,
+                        "policy_hash": _COMMISSIONING_WARMUP_POLICY_HASH,
+                    },
+                    execution_session_id=self._execution_session_id(),
+                )
+            except LedgerCapacityError as error:
+                self._pause_for_ledger_capacity_locked(error.capacity)
+            else:
+                if not self._deferred_capacity_healthy_locked(receipt):
+                    self._pause_for_ledger_capacity_locked(receipt)
 
     def _observe_commissioning_warmup(self, at: str) -> None:
         """Latch once every required evidence family has appeared in this exact context."""
@@ -520,20 +570,26 @@ class LaneIIIPaperRuntime:
         # Like the reset marker, this is a no-authority observation
         # attestation on the market callback path.  The commissioning barrier
         # provides its durability boundary without stalling socket receive.
-        self.ledger.append_commissioning_attestation_deferred(
-            "COMMISSIONING_SESSION_WARMED",
-            {
-                **context.payload(),
-                **_COMMISSIONING_WARMUP_RECORD_MARKERS,
-                "commissioning_warmup_state": "WARMED",
-                "warmed_at": warmed_at,
-                "required_families": list(_COMMISSIONING_WARMUP_POLICY["required_families"]),
-                "evidence_provenance": dict(self._commissioning_warmup_seen),
-                "reason": "ALL_REQUIRED_FAMILIES_GENUINELY_OBSERVED",
-                "policy_hash": _COMMISSIONING_WARMUP_POLICY_HASH,
-            },
-            execution_session_id=self._execution_session_id(),
-        )
+        try:
+            receipt = self.ledger.append_commissioning_attestation_deferred(
+                "COMMISSIONING_SESSION_WARMED",
+                {
+                    **context.payload(),
+                    **_COMMISSIONING_WARMUP_RECORD_MARKERS,
+                    "commissioning_warmup_state": "WARMED",
+                    "warmed_at": warmed_at,
+                    "required_families": list(_COMMISSIONING_WARMUP_POLICY["required_families"]),
+                    "evidence_provenance": dict(self._commissioning_warmup_seen),
+                    "reason": "ALL_REQUIRED_FAMILIES_GENUINELY_OBSERVED",
+                    "policy_hash": _COMMISSIONING_WARMUP_POLICY_HASH,
+                },
+                execution_session_id=self._execution_session_id(),
+            )
+        except LedgerCapacityError as error:
+            self._pause_for_ledger_capacity_locked(error.capacity)
+        else:
+            if not self._deferred_capacity_healthy_locked(receipt):
+                self._pause_for_ledger_capacity_locked(receipt)
 
     def _release_commissioning_ownership(self, reason: str) -> None:
         ownership = self._commissioning_ownership
@@ -831,21 +887,278 @@ class LaneIIIPaperRuntime:
                 self._snapshot, observed_at=_now(), local_sequence_gap=True,
                 evidence_warmed=False, commissioning_session_warmed=False,
             )
-            self.ledger.append("INCIDENT_OBSERVATION_REJECTION", {"code": error.code.value, "detail": error.detail or "unspecified"})
             if self._position is not PaperDirection.FLAT:
                 self._request_exit("MALFORMED_OBSERVATION", emergency=True)
+            self._append_best_effort_safety_audit_locked(
+                "INCIDENT_OBSERVATION_REJECTION",
+                {"code": error.code.value, "detail": error.detail or "unspecified"},
+            )
 
     def on_observation_duplicate(self) -> None:
         with self._lock:
             self.policy.on_duplicate()
             self.ledger.append("INCIDENT_DUPLICATE_OBSERVATION", {"effect": "NO_NEW_PAPER_EVIDENCE"})
 
+    def _pause_for_ledger_capacity_locked(self, capacity: Mapping[str, object] | None = None) -> None:
+        """Deny new entry authority without making a congested writer drain again."""
+        state = "UNKNOWN" if capacity is None else str(capacity.get("state") or "UNKNOWN")
+        reason = "LEDGER_CAPACITY_INADEQUATE:" + state
+        self._entries_paused = True
+        self._armed_session = None
+        self._fault_reason = reason
+        self.risk.lock_out(reason)
+        self._advance_commissioning_authority_epoch()
+
+    def _append_best_effort_safety_audit_locked(
+        self, kind: str, payload: Mapping[str, object],
+    ) -> None:
+        """Audit a safety transition without making audit availability a safety gate."""
+        try:
+            self.ledger.append(kind, payload, execution_session_id=self._execution_session_id())
+        except LedgerCapacityError as error:
+            self._pause_for_ledger_capacity_locked(error.capacity)
+        except Exception:
+            # The ledger is already sealed, failed, or unavailable. The caller
+            # has performed its state/exit safety action first; do not recurse
+            # through another synchronous audit append.
+            self._pause_for_ledger_capacity_locked()
+
+    def _has_unresolved_execution_activity_locked(self) -> bool:
+        """Return whether an AddOn command may still alter the exact account."""
+        return (
+            self._position is not PaperDirection.FLAT
+            or self._snapshot.working_owned_orders > 0
+            or self._snapshot.working_entry_orders > 0
+            or self._state in {PaperRuntimeState.ENTRY_PENDING, PaperRuntimeState.EXIT_PENDING}
+            or self._exit_submission_in_progress
+        )
+
+    def _watchdog_transport_available_locked(self) -> bool:
+        """Check the exact condition required by the independently owned watchdog."""
+        transport = self._transport
+        if transport is None:
+            return False
+        try:
+            status = transport.status()
+        except Exception:
+            return False
+        return bool(
+            getattr(status, "authenticated_client", False)
+            and getattr(status, "addon_provenance_valid", False)
+        )
+
+    def _activate_independent_watchdog_locked(self, reason: str, *, force: bool = False) -> None:
+        """Stop Python heartbeats so the independently owned AddOn fails flat.
+
+        This deliberately emits no unrecorded command.  The signed AddOn owns
+        an exact-account/instrument watchdog which cancels owned work and
+        flattens if authenticated activity survives a missed-heartbeat window.
+        The control-center shutdown path retains that transport for the bounded
+        grace interval exposed by :meth:`watchdog_shutdown_status`.
+        """
+        self._heartbeat_stop.set()
+        if not force and not self._has_unresolved_execution_activity_locked():
+            return
+        # Do not reset a pending correlation on a retry.  A later exact
+        # reconciliation must remain tied to the same watchdog event.
+        if not self._watchdog_failsafe_requires_flat_confirmation:
+            self._watchdog_failsafe_requires_flat_confirmation = True
+            self._watchdog_failsafe_activation_message_sequence = self._execution_message_sequence
+            self._watchdog_failsafe_safety_event_id = None
+            self._watchdog_failsafe_flat_confirmation = None
+            self._watchdog_failsafe_durable_confirmation = None
+            self._watchdog_failsafe_safety_event_durable = None
+            self._watchdog_failsafe_reconciliation_durable = None
+            self._watchdog_failsafe_last_settlement_sequence = 0
+            self._watchdog_failsafe_settled_reconciliation_count = 0
+            self._watchdog_failsafe_available = self._watchdog_transport_available_locked()
+        self._watchdog_failsafe_reason = reason
+        # A disconnected or unproven bridge cannot execute the C# watchdog.
+        # Report it immediately as unsafe rather than pretending a grace
+        # window has an independent safety owner.
+        deadline = time.monotonic() + (
+            _INDEPENDENT_WATCHDOG_GRACE_SECONDS
+            if self._watchdog_failsafe_available is True else 0.0
+        )
+        previous = self._watchdog_failsafe_deadline_monotonic
+        self._watchdog_failsafe_deadline_monotonic = (
+            deadline if previous is None else max(previous, deadline)
+        )
+
+    def _fail_closed_without_ledger_locked(self, reason: str) -> None:
+        """Preserve a live safety fallback when durable command authority fails."""
+        self._entries_paused = True
+        self._armed_session = None
+        self._disarm_after_flat = True
+        self._fault_reason = reason
+        self.risk.lock_out(reason)
+        self._activate_independent_watchdog_locked(reason)
+        # _transition() writes the in-memory state before it records its audit
+        # row.  On a sealed/failed ledger that can leave a phantom pending
+        # state.  Replace it with an explicit unarmed fault state without
+        # attempting another ledger write.
+        if self._state not in {PaperRuntimeState.STOPPING, PaperRuntimeState.STOPPED}:
+            self._state = PaperRuntimeState.FAULTED
+        self._advance_commissioning_authority_epoch()
+
+    def _force_shutdown_state_without_ledger_locked(
+        self, target: PaperRuntimeState, reason: str,
+    ) -> None:
+        """Finish a terminal lifecycle transition even if its audit append failed."""
+        if target not in {PaperRuntimeState.STOPPING, PaperRuntimeState.STOPPED}:
+            raise ValueError("Only terminal shutdown states may bypass a failed ledger audit.")
+        self._entries_paused = True
+        self._armed_session = None
+        self._disarm_after_flat = self._has_unresolved_execution_activity_locked()
+        self._fault_reason = reason
+        self.risk.lock_out(reason)
+        self._state = target
+        self._advance_commissioning_authority_epoch()
+
+    def watchdog_shutdown_status(self) -> dict[str, object]:
+        """Return the bounded transport-retention requirement for a safety stop."""
+        with self._lock:
+            deadline = self._watchdog_failsafe_deadline_monotonic
+            remaining = 0.0 if deadline is None else max(0.0, deadline - time.monotonic())
+            awaiting_confirmation = self._watchdog_failsafe_requires_flat_confirmation
+            confirmed = self._watchdog_failsafe_flat_confirmation is not None
+            return {
+                "required": deadline is not None and awaiting_confirmation,
+                "reason": self._watchdog_failsafe_reason,
+                "remaining_seconds": round(remaining, 3),
+                "flat_confirmed": confirmed or not awaiting_confirmation,
+                "durable_confirmation": self._watchdog_failsafe_durable_confirmation,
+                "watchdog_available": self._watchdog_failsafe_available,
+                "safety_event_id": self._watchdog_failsafe_safety_event_id,
+                "safety_event_durable": self._watchdog_failsafe_safety_event_durable,
+                "reconciliation_durable": self._watchdog_failsafe_reconciliation_durable,
+                "settled_reconciliation_count": self._watchdog_failsafe_settled_reconciliation_count,
+            }
+
+    def _record_watchdog_reconciliation_locked(
+        self,
+        message: Mapping[str, object],
+        *,
+        quantity: int,
+        orders: int,
+        entry_orders: int,
+        foreign: bool,
+        durable_receipt_unavailable: bool,
+    ) -> None:
+        """Accept only a settled, correlated, post-failsafe flat proof.
+
+        A snapshot cached before heartbeats stopped is specifically not enough:
+        a submitted entry can become working after that snapshot.  The AddOn
+        sends ``SAFETY_EVENT`` before the correlated safety reconciliation, so
+        TCP ordering plus the event id prevents an earlier snapshot from
+        completing a shutdown.
+        """
+        if not self._watchdog_failsafe_requires_flat_confirmation:
+            return
+        activation = self._watchdog_failsafe_activation_message_sequence
+        if activation is None or self._execution_message_sequence <= activation:
+            return
+        expected_safety_event_id = self._watchdog_failsafe_safety_event_id
+        supplied_safety_event_id = message.get("safety_event_id")
+        # A generic reconciliation may have been queued before Python stopped
+        # heartbeating.  Only the AddOn's safety-correlated snapshot can prove
+        # the independently owned watchdog has observed and settled activity.
+        if expected_safety_event_id is None or supplied_safety_event_id != expected_safety_event_id:
+            return
+        settlement_final = message.get("safety_settlement_final") is True
+        settlement_sequence = message.get("safety_settlement_sequence")
+        if (
+            not settlement_final
+            or type(settlement_sequence) is not int
+            or settlement_sequence <= self._watchdog_failsafe_last_settlement_sequence
+        ):
+            return
+        complete = (
+            message.get("position_snapshot_complete") is True
+            and message.get("order_snapshot_complete") is True
+        )
+        if not (
+            complete
+            and not foreign
+            and quantity == 0
+            and orders == 0
+            and entry_orders == 0
+        ):
+            return
+        self._watchdog_failsafe_last_settlement_sequence = settlement_sequence
+        self._watchdog_failsafe_settled_reconciliation_count += 1
+        # A persisted safety event and its persisted final reconciliation are
+        # one indivisible audit pair. Once either arrived through the
+        # ledger-outage fallback, a later row cannot upgrade this shutdown to
+        # a durable clean result.
+        self._watchdog_failsafe_reconciliation_durable = (
+            self._watchdog_failsafe_reconciliation_durable is not False
+            and not durable_receipt_unavailable
+        )
+        if self._watchdog_failsafe_settled_reconciliation_count < _WATCHDOG_SETTLED_RECONCILIATIONS_REQUIRED:
+            return
+        self._watchdog_failsafe_requires_flat_confirmation = False
+        self._watchdog_failsafe_flat_confirmation = {
+            "receipt_id": message.get("receipt_id"),
+            "safety_event_id": supplied_safety_event_id,
+            "message_sequence": self._execution_message_sequence,
+            "safety_settlement_sequence": settlement_sequence,
+            "settled_reconciliation_count": self._watchdog_failsafe_settled_reconciliation_count,
+            "position_quantity": quantity,
+            "working_order_count": orders,
+        }
+        self._watchdog_failsafe_durable_confirmation = (
+            self._watchdog_failsafe_safety_event_durable is True
+            and self._watchdog_failsafe_reconciliation_durable is True
+        )
+
+    def _deferred_capacity_healthy_locked(self, receipt: Mapping[str, object]) -> bool:
+        return deferred_capacity_allows_authority(receipt)
+
+    def _append_deferred_or_pause_locked(
+        self,
+        kind: str,
+        payload: Mapping[str, object],
+        *,
+        identity: str | None = None,
+        occurred_at: str | None = None,
+        execution_session_id: str | None = None,
+    ) -> bool:
+        try:
+            receipt = self.ledger.append_deferred(
+                kind, payload, identity=identity, occurred_at=occurred_at,
+                execution_session_id=execution_session_id,
+            )
+        except LedgerCapacityError as error:
+            self._pause_for_ledger_capacity_locked(error.capacity)
+            return False
+        if not self._deferred_capacity_healthy_locked(receipt):
+            self._pause_for_ledger_capacity_locked(receipt)
+            return False
+        return True
+
     def record_sink_failure(self, sink: str, event: str, error_type: str) -> None:
         with self._lock:
-            self.ledger.append("INCIDENT_OBSERVATION_SINK_FAILURE", {"sink": sink, "event": event, "error_type": error_type})
+            if error_type == "LedgerCapacityError":
+                self._pause_for_ledger_capacity_locked()
+                return
+            if self._state in {PaperRuntimeState.STOPPING, PaperRuntimeState.STOPPED}:
+                return
+            try:
+                self.ledger.append(
+                    "INCIDENT_OBSERVATION_SINK_FAILURE",
+                    {"sink": sink, "event": event, "error_type": error_type},
+                )
+            except (LedgerCapacityError, RuntimeError):
+                # Failure recording is best-effort once persistence itself is
+                # unavailable. Preserve the listener boundary and pause new
+                # authority rather than synchronously trying to drain it.
+                self._pause_for_ledger_capacity_locked()
 
     def ingest(self, observation: NinjaTraderObservation) -> None:
         with self._lock:
+            if self._state in {PaperRuntimeState.STOPPING, PaperRuntimeState.STOPPED}:
+                return
             context, session_reason = self._resolve_observation_session(observation)
             raw_payload = {
                 **context.payload(),
@@ -899,11 +1212,12 @@ class LaneIIIPaperRuntime:
                     "observation_account_alias": observation.account_alias,
                     "observation_account_class": observation.account_class.value,
                 })
-            self.ledger.append_deferred(
+            if not self._append_deferred_or_pause_locked(
                 "OBSERVATION_ENVELOPE", raw_payload,
                 identity="l3g-paper-observation-" + canonical_hash(raw_payload),
                 occurred_at=observation.ninja_receipt_time,
-            )
+            ):
+                return
             if session_reason == "EVENT_TIMESTAMP_MOVED_BACKWARD":
                 self._reset_commissioning_warmup(session_reason)
                 self.ledger.append(
@@ -980,7 +1294,11 @@ class LaneIIIPaperRuntime:
             self._last_decision = decision
             for evidence in self.policy.active_evidence(event_at):
                 if evidence.evidence_id not in self._recorded_evidence:
-                    self.ledger.append_deferred("EVIDENCE", evidence.payload(), identity=evidence.evidence_id, occurred_at=evidence.observed_at, execution_session_id=self._execution_session_id())
+                    if not self._append_deferred_or_pause_locked(
+                        "EVIDENCE", evidence.payload(), identity=evidence.evidence_id,
+                        occurred_at=evidence.observed_at, execution_session_id=self._execution_session_id(),
+                    ):
+                        return
                     self._recorded_evidence.add(evidence.evidence_id)
             can_cause_side_effect = (
                 decision.decision in {PaperDecisionKind.LONG, PaperDecisionKind.SHORT}
@@ -995,13 +1313,14 @@ class LaneIIIPaperRuntime:
                 and self._position is not PaperDirection.FLAT
             )
             if not can_cause_side_effect:
-                self.ledger.append_deferred(
+                if not self._append_deferred_or_pause_locked(
                     "DECISION",
                     {**decision.payload(), "authority_effect": COMMISSIONING_NO_AUTHORITY_EFFECT},
                     identity=decision.paper_decision_id,
                     occurred_at=decision.created_at,
                     execution_session_id=self._execution_session_id(),
-                )
+                ):
+                    return
             else:
                 # append() first flushes every prior evidence/NO_TRADE batch;
                 # a decision eligible to mutate paper state is then committed
@@ -1080,6 +1399,14 @@ class LaneIIIPaperRuntime:
             return self._request_entry_locked(decision)
 
     def _request_entry_locked(self, decision: PaperDecision) -> bool:
+        try:
+            with self.ledger.authority_capacity_fence():
+                return self._request_entry_with_capacity_fence_locked(decision)
+        except LedgerCapacityError as error:
+            self._pause_for_ledger_capacity_locked(error.capacity)
+            return False
+
+    def _request_entry_with_capacity_fence_locked(self, decision: PaperDecision) -> bool:
         if decision.commissioning:
             ownership = self._commissioning_ownership
             if (
@@ -1179,28 +1506,37 @@ class LaneIIIPaperRuntime:
             self._session_context.session_generation,
             commissioning, not commissioning, False,
         )
-        self.ledger.append("DECISION", pseudo.payload(), identity=pseudo.paper_decision_id, occurred_at=pseudo.created_at, execution_session_id=self._execution_session_id())
-        bid, ask, last = self._references()
-        intent = self.risk.make_intent(pseudo, reference_bid=bid, reference_ask=ask, reference_last=last)
-        self.ledger.append("INTENT", intent.payload(), identity=intent.intent_id, occurred_at=intent.created_at, execution_session_id=self._execution_session_id())
-        grant = self.risk.evaluate(intent, self._snapshot, at=_now())
-        self.ledger.append("RISK_GRANT", grant.payload(), identity=grant.grant_id, occurred_at=grant.evaluated_at, execution_session_id=self._execution_session_id())
-        if not grant.granted:
-            self._fault_reason = "EXIT_RISK_AUTHORITY_UNAVAILABLE:" + ",".join(grant.reason_codes)
-            if self._state not in {PaperRuntimeState.FAULTED, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.STOPPING, PaperRuntimeState.STOPPED}:
-                self._transition(PaperRuntimeState.FAULTED, self._fault_reason)
-            return
-        action = ExecutionAction.EMERGENCY_FLATTEN if emergency else ExecutionAction.EXIT
-        command = self._make_command(
-            intent.intent_id, pseudo.paper_decision_id, grant.grant_id, action, PaperDirection.FLAT, reason,
-            commissioning=commissioning, strategy_generated=not commissioning, scientific_evidence=False,
-        )
-        self._exit_submission_in_progress = True
         try:
-            self._transition(PaperRuntimeState.EXIT_PENDING, reason)
-            self._persist_and_send(command, grant)
-        finally:
-            self._exit_submission_in_progress = False
+            self.ledger.append("DECISION", pseudo.payload(), identity=pseudo.paper_decision_id, occurred_at=pseudo.created_at, execution_session_id=self._execution_session_id())
+            bid, ask, last = self._references()
+            intent = self.risk.make_intent(pseudo, reference_bid=bid, reference_ask=ask, reference_last=last)
+            self.ledger.append("INTENT", intent.payload(), identity=intent.intent_id, occurred_at=intent.created_at, execution_session_id=self._execution_session_id())
+            grant = self.risk.evaluate(intent, self._snapshot, at=_now())
+            self.ledger.append("RISK_GRANT", grant.payload(), identity=grant.grant_id, occurred_at=grant.evaluated_at, execution_session_id=self._execution_session_id())
+            if not grant.granted:
+                self._fail_closed_without_ledger_locked(
+                    "EXIT_RISK_AUTHORITY_UNAVAILABLE:" + ",".join(grant.reason_codes),
+                )
+                return
+            action = ExecutionAction.EMERGENCY_FLATTEN if emergency else ExecutionAction.EXIT
+            command = self._make_command(
+                intent.intent_id, pseudo.paper_decision_id, grant.grant_id, action, PaperDirection.FLAT, reason,
+                commissioning=commissioning, strategy_generated=not commissioning, scientific_evidence=False,
+            )
+            self._exit_submission_in_progress = True
+            try:
+                self._transition(PaperRuntimeState.EXIT_PENDING, reason)
+                self._persist_and_send(command, grant)
+            finally:
+                self._exit_submission_in_progress = False
+        except Exception as error:
+            # Never leave an open position behind a phantom EXIT_PENDING state
+            # merely because its durable exit evidence could not be written.
+            # The independently owned AddOn watchdog is the only safe action
+            # available without fabricating an unrecorded command.
+            self._fail_closed_without_ledger_locked(
+                "EXIT_DURABLE_AUTHORITY_UNAVAILABLE:" + type(error).__name__,
+            )
 
     def _make_command(
         self,
@@ -1269,26 +1605,36 @@ class LaneIIIPaperRuntime:
     def on_execution_message(self, message: Mapping[str, object]) -> None:
         with self._lock:
             self._advance_commissioning_authority_epoch()
-            message_type = str(message.get("message_type", ""))
+            # The transport attaches this internal marker only after a frame
+            # has passed HMAC/schema/session validation but its audit row
+            # could not be persisted.  Preserve authenticated account truth
+            # for the safety watchdog without inventing durable evidence.
+            durable_receipt_unavailable = message.get(_DURABILITY_UNAVAILABLE_MARKER) is True
+            inbound = (
+                {key: value for key, value in message.items() if key != _DURABILITY_UNAVAILABLE_MARKER}
+                if durable_receipt_unavailable else message
+            )
+            self._execution_message_sequence += 1
+            message_type = str(inbound.get("message_type", ""))
             if message_type == "RECONCILIATION":
-                self._apply_reconciliation(message)
+                self._apply_reconciliation(inbound, durable_receipt_unavailable=durable_receipt_unavailable)
             elif message_type in {"ORDER_EVENT", "COMMAND_ACK", "COMMAND_REJECTED"}:
-                self._last_order_state = dict(message)
+                self._last_order_state = dict(inbound)
                 if message_type == "COMMAND_REJECTED":
-                    self._fault_reason = "EXECUTION_COMMAND_REJECTED:" + str(message.get("reason_code", "UNKNOWN"))
+                    self._fault_reason = "EXECUTION_COMMAND_REJECTED:" + str(inbound.get("reason_code", "UNKNOWN"))
                     self.risk.lock_out(self._fault_reason)
                     # Preserve the owned safety-exit path while a position is
                     # open; role-specific handling below initiates or audits it.
                     if self._position is PaperDirection.FLAT and self._state not in {PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.STOPPING, PaperRuntimeState.STOPPED}:
                         self._transition(PaperRuntimeState.LOCKED_OUT, self._fault_reason)
-                role = str(message.get("order_role", "")).upper()
-                order_state = str(message.get("order_state", "")).upper()
+                role = str(inbound.get("order_role", "")).upper()
+                order_state = str(inbound.get("order_state", "")).upper()
                 if role == "PROTECTIVE" and self._position is not PaperDirection.FLAT:
                     protective_reason: str | None = None
-                    account = message.get("account_name")
-                    instrument = message.get("instrument")
-                    quantity = message.get("quantity")
-                    native_order_id = message.get("native_order_id")
+                    account = inbound.get("account_name")
+                    instrument = inbound.get("instrument")
+                    quantity = inbound.get("quantity")
+                    native_order_id = inbound.get("native_order_id")
                     if account is not None and account != ACCOUNT_BINDING.account_name:
                         protective_reason = "PROTECTIVE_STOP_WRONG_ACCOUNT"
                     elif instrument is not None and instrument != ACCOUNT_BINDING.instrument:
@@ -1322,7 +1668,7 @@ class LaneIIIPaperRuntime:
                     self._transition(PaperRuntimeState.LOCKED_OUT, self._fault_reason)
                 if (
                     message_type == "COMMAND_REJECTED"
-                    and str(message.get("reason_code", "")).upper() in {"COMMAND_ACK_TIMEOUT", "ACKNOWLEDGEMENT_MISSING"}
+                    and str(inbound.get("reason_code", "")).upper() in {"COMMAND_ACK_TIMEOUT", "ACKNOWLEDGEMENT_MISSING"}
                     and self._position is not PaperDirection.FLAT
                 ):
                     self._fault_reason = "PROTECTIVE_STOP_ACKNOWLEDGEMENT_MISSING"
@@ -1333,24 +1679,64 @@ class LaneIIIPaperRuntime:
                     self.risk.lock_out(self._fault_reason)
                     self._transition(PaperRuntimeState.LOCKED_OUT, self._fault_reason)
             elif message_type == "EXECUTION_EVENT":
-                self._last_execution = dict(message)
-                self._apply_execution(message)
+                self._last_execution = dict(inbound)
+                self._apply_execution(inbound)
             elif message_type == "POSITION_EVENT":
-                self._apply_position(message)
+                self._apply_position(inbound, durable_receipt_unavailable=durable_receipt_unavailable)
             elif message_type == "SAFETY_EVENT":
-                self._fault_reason = "NINJATRADER_SAFETY_EVENT:" + str(message.get("reason_code", "UNKNOWN"))
+                safety_event_id = inbound.get("safety_event_id", inbound.get("receipt_id"))
+                if (
+                    self._watchdog_failsafe_requires_flat_confirmation
+                    and isinstance(safety_event_id, str)
+                    and safety_event_id
+                    and self._execution_message_sequence > (self._watchdog_failsafe_activation_message_sequence or 0)
+                ):
+                    if self._watchdog_failsafe_safety_event_id != safety_event_id:
+                        # A newer independently owned safety action starts a
+                        # fresh correlated proof pair. It may supersede an
+                        # earlier failed pair only with its own durable event.
+                        self._watchdog_failsafe_safety_event_id = safety_event_id
+                        self._watchdog_failsafe_safety_event_durable = not durable_receipt_unavailable
+                        self._watchdog_failsafe_reconciliation_durable = None
+                        self._watchdog_failsafe_last_settlement_sequence = 0
+                        self._watchdog_failsafe_settled_reconciliation_count = 0
+                        self._watchdog_failsafe_flat_confirmation = None
+                        self._watchdog_failsafe_durable_confirmation = None
+                    else:
+                        self._watchdog_failsafe_safety_event_durable = (
+                            self._watchdog_failsafe_safety_event_durable is not False
+                            and not durable_receipt_unavailable
+                        )
+                self._fault_reason = "NINJATRADER_SAFETY_EVENT:" + str(inbound.get("reason_code", "UNKNOWN"))
                 self.risk.lock_out(self._fault_reason)
                 if self._state not in {PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.STOPPING, PaperRuntimeState.STOPPED}:
-                    self._transition(PaperRuntimeState.LOCKED_OUT, self._fault_reason)
+                    if durable_receipt_unavailable:
+                        # No durable audit is available.  Lock in-memory
+                        # authority without retrying the failed ledger path.
+                        self._state = PaperRuntimeState.LOCKED_OUT
+                    else:
+                        self._transition(PaperRuntimeState.LOCKED_OUT, self._fault_reason)
 
-    def _apply_reconciliation(self, message: Mapping[str, object]) -> None:
+    def _apply_reconciliation(
+        self, message: Mapping[str, object], *, durable_receipt_unavailable: bool = False,
+    ) -> None:
         quantity = message.get("position_quantity")
         orders = message.get("working_order_count")
-        if type(quantity) is not int or type(orders) is not int:
+        entry_orders = message.get("working_entry_count", 0)
+        if (
+            type(quantity) is not int
+            or type(orders) is not int
+            or type(entry_orders) is not int
+            or orders < 0
+            or entry_orders < 0
+            or entry_orders > orders
+        ):
             self._fault_reason = "RECONCILIATION_MALFORMED"
             self.risk.lock_out(self._fault_reason)
-            if self._state is PaperRuntimeState.RECONCILING:
+            if self._state is PaperRuntimeState.RECONCILING and not durable_receipt_unavailable:
                 self._transition(PaperRuntimeState.LOCKED_OUT, self._fault_reason)
+            elif durable_receipt_unavailable and self._state not in {PaperRuntimeState.STOPPING, PaperRuntimeState.STOPPED}:
+                self._state = PaperRuntimeState.LOCKED_OUT
             return
         direction = PaperDirection.FLAT if quantity == 0 else PaperDirection.LONG if quantity > 0 else PaperDirection.SHORT
         foreign = bool(message.get("foreign_activity", False)) or abs(quantity) > 1
@@ -1361,12 +1747,22 @@ class LaneIIIPaperRuntime:
             self._snapshot, observed_at=_now(), account_name=str(message.get("account_name", "")),
             account_class=str(message.get("account_class", "")), instrument=str(message.get("instrument", "")),
             current_position=direction, current_position_quantity=abs(quantity), working_owned_orders=orders,
-            working_entry_orders=int(message.get("working_entry_count", 0)), foreign_activity=foreign,
+            working_entry_orders=entry_orders, foreign_activity=foreign,
             position_snapshot_complete=message.get("position_snapshot_complete") is True,
             order_snapshot_complete=message.get("order_snapshot_complete") is True,
             reconciliation_current=True, execution_bridge_healthy=True,
             protective_stop_state=str(message.get("protective_stop_state", "NONE")),
         )
+        self._record_watchdog_reconciliation_locked(
+            message, quantity=quantity, orders=orders, entry_orders=entry_orders,
+            foreign=foreign, durable_receipt_unavailable=durable_receipt_unavailable,
+        )
+        if durable_receipt_unavailable:
+            # The transport has already established that this callback is
+            # authentic, but its durable ingress record failed.  Its physical
+            # truth can release the watchdog transport only; it can never
+            # produce a clean ledger receipt or normal lifecycle transition.
+            return
         self.ledger.append("POSITION_SNAPSHOT_RECONCILIATION", dict(message), identity=str(message.get("receipt_id", "l3g-reconcile-" + canonical_hash(dict(message)))), execution_session_id=self._execution_session_id())
         if foreign or (quantity != 0 or orders != 0):
             ownership = self._commissioning_ownership
@@ -1519,7 +1915,9 @@ class LaneIIIPaperRuntime:
                 execution_session_id=self._execution_session_id(),
             )
 
-    def _apply_position(self, message: Mapping[str, object]) -> None:
+    def _apply_position(
+        self, message: Mapping[str, object], *, durable_receipt_unavailable: bool = False,
+    ) -> None:
         quantity = message.get("quantity")
         if type(quantity) is not int or abs(quantity) > 1:
             self._fault_reason = "POSITION_UPDATE_MISMATCH"
@@ -1531,6 +1929,14 @@ class LaneIIIPaperRuntime:
         self._position_quantity = abs(quantity)
         self._snapshot = replace(self._snapshot, observed_at=_now(), current_position=self._position, current_position_quantity=abs(quantity), position_opened_at=None if quantity == 0 else self._snapshot.position_opened_at)
         if quantity == 0 and self._state is PaperRuntimeState.EXIT_PENDING:
+            if durable_receipt_unavailable:
+                # Do not manufacture a reconciliation command after inbound
+                # durable evidence has failed.  The correlated AddOn snapshot
+                # will still update the watchdog latch if it arrives.
+                self._state = PaperRuntimeState.LOCKED_OUT
+                self._fault_reason = "POSITION_RECEIPT_DURABILITY_UNAVAILABLE"
+                self.risk.lock_out(self._fault_reason)
+                return
             self._post_exit_reconciliation_pending = True
             self._transition(PaperRuntimeState.RECONCILING, "FLAT_POSITION_PENDING_RECONCILIATION")
             self._request_reconciliation_after_exit()
@@ -1907,46 +2313,59 @@ class LaneIIIPaperRuntime:
 
     def arm(self) -> dict[str, object]:
         with self._lock:
-            if self._entry_owner is not PaperEntryOwner.NONE:
-                return {"armed": False, "reason_codes": ("COMMISSIONING_OWNERSHIP_ACTIVE",), "state": self._state.value}
-            if self._state is not PaperRuntimeState.READY_DISARMED:
-                return {"armed": False, "reason_codes": ("STATE_NOT_READY_DISARMED",), "state": self._state.value}
-            transport = None if self._transport is None else self._transport.status()
-            if transport is None or not transport.addon_provenance_valid:
-                reasons = ("ADDON_BUILD_MISMATCH",)
-                self.ledger.append(
-                    "RISK_EVENT_ARM_ATTEMPT",
-                    {
-                        **self._session_context.payload(), "allowed": False, "reason_codes": reasons,
-                        "expected_addon_source_fingerprint": None if transport is None else transport.expected_addon_source_fingerprint,
-                        "runtime_addon_source_fingerprint": None if transport is None else transport.addon_source_fingerprint,
-                        "runtime_addon_protocol_version": None if transport is None else transport.addon_protocol_version,
-                    },
-                    execution_session_id=self._execution_session_id(),
-                )
-                return {"armed": False, "reason_codes": reasons, "state": self._state.value}
-            context = self._session_context
-            now = _now()
-            current = PaperSessionResolver().resolve(now, generation=context.session_generation)
-            if context.session_kind is PaperSessionKind.OFF_SESSION or current.context.session_id != context.session_id:
-                reasons = ("NO_CURRENT_EVENT_SESSION",)
-                self.ledger.append("RISK_EVENT_ARM_ATTEMPT", {**context.payload(), "allowed": False, "reason_codes": reasons, "authority_hash": canonical_hash(AUTHORITY.authority_payload())})
-                return {"armed": False, "reason_codes": reasons, "state": self._state.value}
-            allowed, reasons = self.risk.preflight(self._snapshot, at=now)
-            self.ledger.append("RISK_EVENT_ARM_ATTEMPT", {**context.payload(), "allowed": allowed, "reason_codes": reasons, "authority_hash": canonical_hash(AUTHORITY.authority_payload())})
-            if not allowed:
-                return {"armed": False, "reason_codes": reasons, "state": self._state.value}
-            self._armed_session = PaperSessionArmGrant(
-                context.session_kind, context.session_id, context.trade_date, context.session_profile_hash,
-                context.session_generation, now,
-                context.boundary_at("entry_cutoff").isoformat().replace("+00:00", "Z"),
+            try:
+                with self.ledger.authority_capacity_fence():
+                    return self._arm_with_capacity_fence_locked()
+            except LedgerCapacityError as error:
+                self._pause_for_ledger_capacity_locked(error.capacity)
+                return {
+                    "armed": False,
+                    "reason_codes": ("LEDGER_CAPACITY_INADEQUATE",),
+                    "state": self._state.value,
+                }
+
+    def _arm_with_capacity_fence_locked(self) -> dict[str, object]:
+        """Persist an arm outcome while the ledger capacity/order fence is held."""
+        if self._entry_owner is not PaperEntryOwner.NONE:
+            return {"armed": False, "reason_codes": ("COMMISSIONING_OWNERSHIP_ACTIVE",), "state": self._state.value}
+        if self._state is not PaperRuntimeState.READY_DISARMED:
+            return {"armed": False, "reason_codes": ("STATE_NOT_READY_DISARMED",), "state": self._state.value}
+        transport = None if self._transport is None else self._transport.status()
+        if transport is None or not transport.addon_provenance_valid:
+            reasons = ("ADDON_BUILD_MISMATCH",)
+            self.ledger.append(
+                "RISK_EVENT_ARM_ATTEMPT",
+                {
+                    **self._session_context.payload(), "allowed": False, "reason_codes": reasons,
+                    "expected_addon_source_fingerprint": None if transport is None else transport.expected_addon_source_fingerprint,
+                    "runtime_addon_source_fingerprint": None if transport is None else transport.addon_source_fingerprint,
+                    "runtime_addon_protocol_version": None if transport is None else transport.addon_protocol_version,
+                },
+                execution_session_id=self._execution_session_id(),
             )
-            self._entries_paused = False
-            self._transition(PaperRuntimeState.ARMED_FLAT, "OPERATOR_ARM_AFTER_PREFLIGHT")
-            return {
-                "armed": True, "reason_codes": ("PAPER_ARMED",), "state": self._state.value,
-                "session_armed_state": "ARMED_" + context.session_kind.value, "arm_grant": self._armed_session.payload(),
-            }
+            return {"armed": False, "reason_codes": reasons, "state": self._state.value}
+        context = self._session_context
+        now = _now()
+        current = PaperSessionResolver().resolve(now, generation=context.session_generation)
+        if context.session_kind is PaperSessionKind.OFF_SESSION or current.context.session_id != context.session_id:
+            reasons = ("NO_CURRENT_EVENT_SESSION",)
+            self.ledger.append("RISK_EVENT_ARM_ATTEMPT", {**context.payload(), "allowed": False, "reason_codes": reasons, "authority_hash": canonical_hash(AUTHORITY.authority_payload())})
+            return {"armed": False, "reason_codes": reasons, "state": self._state.value}
+        allowed, reasons = self.risk.preflight(self._snapshot, at=now)
+        self.ledger.append("RISK_EVENT_ARM_ATTEMPT", {**context.payload(), "allowed": allowed, "reason_codes": reasons, "authority_hash": canonical_hash(AUTHORITY.authority_payload())})
+        if not allowed:
+            return {"armed": False, "reason_codes": reasons, "state": self._state.value}
+        self._armed_session = PaperSessionArmGrant(
+            context.session_kind, context.session_id, context.trade_date, context.session_profile_hash,
+            context.session_generation, now,
+            context.boundary_at("entry_cutoff").isoformat().replace("+00:00", "Z"),
+        )
+        self._entries_paused = False
+        self._transition(PaperRuntimeState.ARMED_FLAT, "OPERATOR_ARM_AFTER_PREFLIGHT")
+        return {
+            "armed": True, "reason_codes": ("PAPER_ARMED",), "state": self._state.value,
+            "session_armed_state": "ARMED_" + context.session_kind.value, "arm_grant": self._armed_session.payload(),
+        }
 
     def commissioning_arm(
         self,
@@ -1963,11 +2382,20 @@ class LaneIIIPaperRuntime:
             identity, capture, ledger_preflight,
         )
         with self._lock:
-            return self._commit_commissioning_arm_locked(
-                identity=identity, request_id=request_id, capture=capture,
-                ledger_evidence=ledger_evidence, ledger_blocker=ledger_blocker,
-                preflight_duration_seconds=duration, ledger_preflight=ledger_preflight,
-            )
+            try:
+                with self.ledger.authority_capacity_fence():
+                    return self._commit_commissioning_arm_locked(
+                        identity=identity, request_id=request_id, capture=capture,
+                        ledger_evidence=ledger_evidence, ledger_blocker=ledger_blocker,
+                        preflight_duration_seconds=duration, ledger_preflight=ledger_preflight,
+                    )
+            except LedgerCapacityError as error:
+                self._pause_for_ledger_capacity_locked(error.capacity)
+                return {
+                    "armed": False,
+                    "reason_codes": ("LEDGER_CAPACITY_INADEQUATE",),
+                    "state": self._state.value,
+                }
 
     def _commit_commissioning_arm_locked(
         self,
@@ -2155,26 +2583,38 @@ class LaneIIIPaperRuntime:
             concurrent_replay = self._active_commissioning_replay_locked(commissioning_id, request_id)
             if concurrent_replay is not None:
                 return concurrent_replay
-            with self.ledger.commissioning_authority_fence():
-                armed = self._commit_commissioning_arm_locked(
-                    identity=commissioning_id, request_id=request_id, capture=capture,
-                    ledger_evidence=ledger_evidence, ledger_blocker=ledger_blocker,
-                    preflight_duration_seconds=duration, ledger_preflight=ledger_preflight,
-                )
-                if not armed.get("armed"):
+            try:
+                with self.ledger.authority_capacity_fence(), self.ledger.commissioning_authority_fence():
+                    armed = self._commit_commissioning_arm_locked(
+                        identity=commissioning_id, request_id=request_id, capture=capture,
+                        ledger_evidence=ledger_evidence, ledger_blocker=ledger_blocker,
+                        preflight_duration_seconds=duration, ledger_preflight=ledger_preflight,
+                    )
+                    if not armed.get("armed"):
+                        return {
+                            **armed, "submitted": False, "commissioning": True,
+                            "commissioning_id": commissioning_id, "request_id": request_id,
+                        }
+                    submitted = self.commission_entry(
+                        str(armed["commissioning_id"]), str(armed["commissioning_token"]),
+                    )
                     return {
-                        **armed, "submitted": False, "commissioning": True,
-                        "commissioning_id": commissioning_id, "request_id": request_id,
+                        **submitted,
+                        "armed": True,
+                        "atomic_start": True,
+                        "request_id": request_id,
+                        "ledger_preflight": armed.get("ledger_preflight"),
                     }
-                submitted = self.commission_entry(
-                    str(armed["commissioning_id"]), str(armed["commissioning_token"]),
-                )
+            except LedgerCapacityError as error:
+                self._pause_for_ledger_capacity_locked(error.capacity)
                 return {
-                    **submitted,
-                    "armed": True,
-                    "atomic_start": True,
+                    "submitted": False,
+                    "commissioning": True,
+                    "armed": False,
+                    "reason_codes": ("LEDGER_CAPACITY_INADEQUATE",),
+                    "state": self._state.value,
+                    "commissioning_id": commissioning_id,
                     "request_id": request_id,
-                    "ledger_preflight": armed.get("ledger_preflight"),
                 }
 
     def commission_entry(self, commissioning_id: str, commissioning_token: str) -> dict[str, object]:
@@ -2206,6 +2646,18 @@ class LaneIIIPaperRuntime:
                 if isinstance(ownership.ledger_preflight, Mapping) else None
             )
             current_checkpoint = self.ledger.commissioning_authority_checkpoint()
+            checkpoint_capacity = current_checkpoint.get("deferred_capacity")
+            if not isinstance(checkpoint_capacity, Mapping) or not self._deferred_capacity_healthy_locked(
+                checkpoint_capacity
+            ):
+                self._pause_for_ledger_capacity_locked(
+                    checkpoint_capacity if isinstance(checkpoint_capacity, Mapping) else None
+                )
+                return {
+                    "submitted": False,
+                    "reason_codes": ("LEDGER_CAPACITY_INADEQUATE",),
+                    "state": self._state.value,
+                }
             checkpoint_keys = (
                 "policy_version", "ledger_identity", "ledger_epoch", "ledger_schema_version",
                 "last_external_authority_sequence", "last_external_authority_hash",
@@ -2428,22 +2880,31 @@ class LaneIIIPaperRuntime:
             self._entries_paused = True
             self._armed_session = None
             self._disarm_after_flat = True
-            self.ledger.append("RISK_EVENT_FLATTEN_AND_DISARM", {"position": self._position.value, "state": self._state.value})
+            audit_payload = {"position": self._position.value, "state": self._state.value}
             if self._position is PaperDirection.FLAT and (self._state is PaperRuntimeState.ENTRY_PENDING or self._snapshot.working_owned_orders > 0):
                 self._cancel_pending_and_reconcile()
-                return {"initiated": True, "flat_confirmed": False, "state": self._state.value}
-            if self._position is PaperDirection.FLAT:
+                result = {"initiated": True, "flat_confirmed": False, "state": self._state.value}
+            elif self._position is PaperDirection.FLAT:
                 if self._state in {PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.PAUSED}:
-                    self._transition(PaperRuntimeState.READY_DISARMED, "FLAT_CONFIRMED_DISARM")
-                self._disarm_after_flat = False
+                    try:
+                        self._transition(PaperRuntimeState.READY_DISARMED, "FLAT_CONFIRMED_DISARM")
+                    except Exception as error:
+                        self._fail_closed_without_ledger_locked(
+                            "FLAT_DISARM_DURABLE_AUTHORITY_UNAVAILABLE:" + type(error).__name__,
+                        )
+                if self._state is not PaperRuntimeState.FAULTED:
+                    self._disarm_after_flat = False
                 ownership = self._commissioning_ownership
                 if ownership is not None and not ownership.entry_consumed and self._snapshot.working_owned_orders == 0:
                     self._release_commissioning_ownership("OPERATOR_FLATTEN_DISARM_BEFORE_COMMISSIONING_ENTRY")
                 elif self._entry_owner is PaperEntryOwner.STRATEGY:
                     self._entry_owner = PaperEntryOwner.NONE
-                return {"initiated": True, "flat_confirmed": True, "state": self._state.value}
-            self._request_exit("OPERATOR_FLATTEN_AND_DISARM", emergency=True)
-            return {"initiated": True, "flat_confirmed": False, "state": self._state.value}
+                result = {"initiated": True, "flat_confirmed": True, "state": self._state.value}
+            else:
+                self._request_exit("OPERATOR_FLATTEN_AND_DISARM", emergency=True)
+                result = {"initiated": True, "flat_confirmed": False, "state": self._state.value}
+            self._append_best_effort_safety_audit_locked("RISK_EVENT_FLATTEN_AND_DISARM", audit_payload)
+            return result
 
     def _cancel_pending_and_reconcile(self) -> None:
         created = _now()
@@ -2459,39 +2920,114 @@ class LaneIIIPaperRuntime:
             self._session_context.trade_date, self._session_context.session_profile_hash,
             self._session_context.session_generation,
         )
-        self.ledger.append("DECISION", decision.payload(), identity=decision.paper_decision_id, occurred_at=decision.created_at, execution_session_id=self._execution_session_id())
-        bid, ask, last = self._references()
-        intent = self.risk.make_intent(decision, reference_bid=bid, reference_ask=ask, reference_last=last)
-        self.ledger.append("INTENT", intent.payload(), identity=intent.intent_id, occurred_at=intent.created_at, execution_session_id=self._execution_session_id())
-        grant = self.risk.evaluate(intent, self._snapshot, at=created)
-        self.ledger.append("RISK_GRANT", grant.payload(), identity=grant.grant_id, occurred_at=grant.evaluated_at, execution_session_id=self._execution_session_id())
-        if not grant.granted:
-            self._fault_reason = "CANCEL_RISK_AUTHORITY_UNAVAILABLE:" + ",".join(grant.reason_codes)
-            self.risk.lock_out(self._fault_reason)
-            self._transition(PaperRuntimeState.LOCKED_OUT, self._fault_reason)
-            return
-        cancel = self._make_command(intent.intent_id, decision.paper_decision_id, grant.grant_id, ExecutionAction.CANCEL_OWNED_ORDERS, PaperDirection.FLAT, "OPERATOR_FLATTEN_AND_DISARM")
-        self._persist_and_send(cancel, grant)
-        self._transition(PaperRuntimeState.RECONCILING, "PENDING_ENTRY_CANCEL_SENT")
-        reconcile = self._make_command(intent.intent_id, decision.paper_decision_id, grant.grant_id, ExecutionAction.RECONCILE, PaperDirection.FLAT, "POST_CANCEL_RECONCILIATION")
-        self._persist_and_send(reconcile, grant)
+        try:
+            self.ledger.append("DECISION", decision.payload(), identity=decision.paper_decision_id, occurred_at=decision.created_at, execution_session_id=self._execution_session_id())
+            bid, ask, last = self._references()
+            intent = self.risk.make_intent(decision, reference_bid=bid, reference_ask=ask, reference_last=last)
+            self.ledger.append("INTENT", intent.payload(), identity=intent.intent_id, occurred_at=intent.created_at, execution_session_id=self._execution_session_id())
+            grant = self.risk.evaluate(intent, self._snapshot, at=created)
+            self.ledger.append("RISK_GRANT", grant.payload(), identity=grant.grant_id, occurred_at=grant.evaluated_at, execution_session_id=self._execution_session_id())
+            if not grant.granted:
+                self._fail_closed_without_ledger_locked(
+                    "CANCEL_RISK_AUTHORITY_UNAVAILABLE:" + ",".join(grant.reason_codes),
+                )
+                return
+            cancel = self._make_command(intent.intent_id, decision.paper_decision_id, grant.grant_id, ExecutionAction.CANCEL_OWNED_ORDERS, PaperDirection.FLAT, "OPERATOR_FLATTEN_AND_DISARM")
+            self._persist_and_send(cancel, grant)
+            self._transition(PaperRuntimeState.RECONCILING, "PENDING_ENTRY_CANCEL_SENT")
+            reconcile = self._make_command(intent.intent_id, decision.paper_decision_id, grant.grant_id, ExecutionAction.RECONCILE, PaperDirection.FLAT, "POST_CANCEL_RECONCILIATION")
+            self._persist_and_send(reconcile, grant)
+        except Exception as error:
+            # A still-working entry order is activity for the AddOn watchdog;
+            # do not leave it live merely because Python cannot prove its
+            # cancel/reconcile command durably.
+            self._fail_closed_without_ledger_locked(
+                "CANCEL_DURABLE_AUTHORITY_UNAVAILABLE:" + type(error).__name__,
+            )
 
-    def stop(self) -> None:
+    def stop(self) -> dict[str, object]:
+        """Disarm safely and return any AddOn watchdog transport-retention need."""
+        thread: threading.Thread | None = None
         with self._lock:
-            if self._state in {PaperRuntimeState.STOPPING, PaperRuntimeState.STOPPED}:
-                return
+            if self._state is PaperRuntimeState.STOPPED:
+                return self.watchdog_shutdown_status()
             if self._state is PaperRuntimeState.DISABLED:
+                self._heartbeat_stop.set()
                 self._state = PaperRuntimeState.STOPPED
-                return
-            if self._position is not PaperDirection.FLAT:
-                self.ledger.append("INCIDENT_SHUTDOWN_WITH_POSITION", {"position": self._position.value, "watchdog": "INDEPENDENT_CSHARP_FLATTEN_REQUIRED"})
-            self._transition(PaperRuntimeState.STOPPING, "PROCESS_STOP")
-            self._heartbeat_stop.set()
+                return self.watchdog_shutdown_status()
+            position_at_shutdown = self._position
+            working_orders_at_shutdown = self._snapshot.working_owned_orders
+            working_entry_orders_at_shutdown = self._snapshot.working_entry_orders
+            state_at_shutdown = self._state
+            activity_at_shutdown = self._has_unresolved_execution_activity_locked()
+            if self._state is not PaperRuntimeState.STOPPING:
+                # Arm the independently owned watchdog *before* dispatching
+                # PROCESS_STOP_OPEN_POSITION. The AddOn publishes its signed
+                # SAFETY_EVENT before flattening; on a low-latency bridge that
+                # callback can re-enter this RLock synchronously. Recording
+                # the activation sequence first prevents the event from being
+                # discarded as pre-watchdog evidence.
+                if activity_at_shutdown:
+                    self._activate_independent_watchdog_locked(
+                        "PROCESS_STOP_OPEN_ACTIVITY",
+                        force=True,
+                    )
+                else:
+                    self._heartbeat_stop.set()
+                # A normal, durable emergency exit remains preferred for an
+                # open position. The already-armed AddOn watchdog is the
+                # independently owned fallback if that path cannot settle.
+                if position_at_shutdown is not PaperDirection.FLAT:
+                    self._request_exit("PROCESS_STOP_OPEN_POSITION", emergency=True)
+                try:
+                    self._transition(PaperRuntimeState.STOPPING, "PROCESS_STOP")
+                except Exception as error:
+                    # _transition has already changed state before its ledger
+                    # append.  Make this terminal state explicit so a retry
+                    # cannot return early and leave heartbeats alive.
+                    self._force_shutdown_state_without_ledger_locked(
+                        PaperRuntimeState.STOPPING,
+                        "PROCESS_STOP_DURABLE_AUDIT_UNAVAILABLE:" + type(error).__name__,
+                    )
+            else:
+                # Recover safely from a historical/state-before-audit stop
+                # failure on a later caller rather than treating it as done.
+                if activity_at_shutdown:
+                    self._activate_independent_watchdog_locked(
+                        "PROCESS_STOP_RETRY_OPEN_ACTIVITY",
+                        force=True,
+                    )
+                else:
+                    self._heartbeat_stop.set()
             thread = self._heartbeat_thread
+            if activity_at_shutdown:
+                self._append_best_effort_safety_audit_locked(
+                    "INCIDENT_SHUTDOWN_WITH_POSITION",
+                    {
+                        "position": position_at_shutdown.value,
+                        "working_owned_orders": working_orders_at_shutdown,
+                        "working_entry_orders": working_entry_orders_at_shutdown,
+                        "state_at_shutdown": state_at_shutdown.value,
+                        "watchdog": "INDEPENDENT_CSHARP_FLATTEN_REQUIRED",
+                    },
+                )
         if thread is not None:
             thread.join(timeout=2.0)
         with self._lock:
-            self._transition(PaperRuntimeState.STOPPED, "PROCESS_STOPPED")
+            if self._state is not PaperRuntimeState.STOPPED:
+                try:
+                    if self._state is not PaperRuntimeState.STOPPING:
+                        self._force_shutdown_state_without_ledger_locked(
+                            PaperRuntimeState.STOPPING,
+                            "PROCESS_STOP_FINAL_STATE_REPAIR",
+                        )
+                    self._transition(PaperRuntimeState.STOPPED, "PROCESS_STOPPED")
+                except Exception as error:
+                    self._force_shutdown_state_without_ledger_locked(
+                        PaperRuntimeState.STOPPED,
+                        "PROCESS_STOPPED_DURABLE_AUDIT_UNAVAILABLE:" + type(error).__name__,
+                    )
+            return self.watchdog_shutdown_status()
 
     def status(self) -> dict[str, object]:
         with self._lock:
@@ -2621,6 +3157,29 @@ class LaneIIIPaperRuntime:
                 "last_reconciliation": self._last_reconciliation,
                 "lockout_or_fault_reason": self._fault_reason or risk.get("lockout_reason"),
                 "last_commissioning_closure": self._last_commissioning_closure,
+                "watchdog_failsafe": {
+                    "reason": self._watchdog_failsafe_reason,
+                    "required": (
+                        self._watchdog_failsafe_deadline_monotonic is not None
+                        and self._watchdog_failsafe_requires_flat_confirmation
+                    ),
+                    "flat_confirmed": (
+                        self._watchdog_failsafe_flat_confirmation is not None
+                        or not self._watchdog_failsafe_requires_flat_confirmation
+                    ),
+                    "durable_confirmation": self._watchdog_failsafe_durable_confirmation,
+                    "watchdog_available": self._watchdog_failsafe_available,
+                    "safety_event_id": self._watchdog_failsafe_safety_event_id,
+                    "safety_event_durable": self._watchdog_failsafe_safety_event_durable,
+                    "reconciliation_durable": self._watchdog_failsafe_reconciliation_durable,
+                    "settled_reconciliation_count": self._watchdog_failsafe_settled_reconciliation_count,
+                    "remaining_seconds": round(
+                        0.0 if self._watchdog_failsafe_deadline_monotonic is None else max(
+                            0.0, self._watchdog_failsafe_deadline_monotonic - time.monotonic(),
+                        ),
+                        3,
+                    ),
+                },
                 "authority": AUTHORITY.authority_payload(),
                 "policy": policy,
                 "risk": risk,

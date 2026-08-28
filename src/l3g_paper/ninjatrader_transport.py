@@ -38,13 +38,18 @@ EXECUTION_HOST = "127.0.0.1"
 EXECUTION_PORT = 48136
 EXECUTION_SCHEMA = "lane-iii-phase-g-paper-execution-v1"
 ADDON_PROTOCOL_VERSION = "l3g-paper-addon-provenance-v1"
-EXPECTED_ADDON_SOURCE_FINGERPRINT = "eee706f322b4f44ab82937bd231cc81ccaa484035c507d5c743a3249d1722879"
+EXPECTED_ADDON_SOURCE_FINGERPRINT = "b91b91b651d312768e2bbfbf4206de9d133303e31597ef364691e4f5c7728bf9"
 MAXIMUM_FRAME_BYTES = 65536
 HELLO_MAXIMUM_AGE_SECONDS = 10
 FUTURE_TOLERANCE_SECONDS = 1
 HEARTBEAT_INTERVAL_SECONDS = 1
 HEARTBEAT_WATCHDOG_SECONDS = 5
 COMMAND_ACKNOWLEDGEMENT_TIMEOUT_SECONDS = 3
+# This marker is transport-local metadata, never a wire-protocol field.  It
+# lets the runtime prioritize an authenticated safety callback when its normal
+# durable receipt cannot be written during a ledger outage.
+_DURABLE_RECEIPT_UNAVAILABLE_MARKER = "_l3g_durable_receipt_unavailable"
+_FALLBACK_SAFETY_MESSAGE_TYPES = frozenset({"SAFETY_EVENT", "POSITION_EVENT", "RECONCILIATION"})
 
 
 def expected_addon_source_fingerprint() -> str:
@@ -400,6 +405,38 @@ class PaperExecutionTransport:
             return None
         return value if isinstance(value, dict) else None
 
+    def _claim_receipt_id(self, receipt_id: str) -> bool:
+        """Claim a receipt exactly once, including a ledger-fence outage."""
+        if not receipt_id:
+            return True
+        with self._lock:
+            if receipt_id in self._seen_receipts:
+                self._duplicate_receipts += 1
+                return False
+            self._seen_receipts.add(receipt_id)
+            return True
+
+    def _deliver_inbound_callback(
+        self,
+        payload: Mapping[str, object],
+        session_id: str | None,
+        *,
+        durable_receipt_unavailable: bool,
+    ) -> None:
+        callback = self._on_message
+        if callback is None:
+            return
+        # Never allow a wire payload to impersonate the local fallback marker.
+        callback_payload = dict(payload)
+        callback_payload.pop(_DURABLE_RECEIPT_UNAVAILABLE_MARKER, None)
+        if durable_receipt_unavailable:
+            callback_payload[_DURABLE_RECEIPT_UNAVAILABLE_MARKER] = True
+        try:
+            callback(callback_payload)
+        except Exception as exc:
+            if not durable_receipt_unavailable:
+                self.ledger.append("INCIDENT_CALLBACK_FAILURE", {"sink": "execution_message", "error_type": type(exc).__name__}, execution_session_id=session_id)
+
     def _receive_frame(self, frame: bytes) -> None:
         with self._lock:
             self._received_frames += 1
@@ -412,6 +449,7 @@ class PaperExecutionTransport:
             self._reject_frame("INVALID_OR_MISSING_SIGNATURE")
             return
         message_type = payload.get("message_type")
+        message_type_text = str(message_type)
         if message_type == "HELLO":
             self._handle_hello(payload)
             return
@@ -432,47 +470,72 @@ class PaperExecutionTransport:
             self._reject_frame("STALE_OR_FUTURE_TIMESTAMP")
             return
         receipt_id = str(payload.get("receipt_id", ""))
+        # Keep the pure shape check available if the authority fence itself is
+        # unavailable. The normal path repeats it under that fence before
+        # mutating reconciliation state.
+        fallback_reconciliation_valid = (
+            message_type != "RECONCILIATION" or PaperExecutionTransport._validate_reconciliation(payload)
+        )
+        fallback_safety_message = message_type_text in _FALLBACK_SAFETY_MESSAGE_TYPES
+        receipt_claimed = False
+        durable_receipt_unavailable = False
+        identity = receipt_id or "l3g-receipt-" + hashlib.sha256(canonical_json(payload)).hexdigest()
+        kind = {
+            "ORDER_EVENT": "ORDER_EVENT",
+            "EXECUTION_EVENT": "EXECUTION",
+            "POSITION_EVENT": "POSITION_SNAPSHOT_EVENT",
+            "SAFETY_EVENT": "INCIDENT_SAFETY_EVENT",
+        }.get(message_type_text, "COMMAND_RECEIPT_" + message_type_text)
         # Linearize accepted broker input against commissioning authority before
         # mutating receipt/reconciliation state. Runtime authority holds the
         # same ledger fence from its final proof through command admission.
         # Release it before the runtime callback to preserve runtime->ledger
         # lock order and avoid a ledger->runtime deadlock.
-        with self.ledger.commissioning_authority_fence():
-            if receipt_id:
-                with self._lock:
-                    if receipt_id in self._seen_receipts:
-                        self._duplicate_receipts += 1
-                        return
-                    self._seen_receipts.add(receipt_id)
-            if message_type == "RECONCILIATION":
-                valid = self._validate_reconciliation(payload)
-                with self._lock:
-                    self._reconciled = valid
-                if not valid:
-                    self._reject_frame("RECONCILIATION_MISMATCH")
+        try:
+            with self.ledger.commissioning_authority_fence():
+                if not self._claim_receipt_id(receipt_id):
                     return
-            if message_type == "COMMAND_ACK":
-                with self._lock:
-                    self._acknowledgements += 1
-                    self._pending_acknowledgements.pop(str(payload.get("command_id", "")), None)
-            elif message_type == "COMMAND_REJECTED":
-                with self._lock:
-                    self._command_rejections += 1
-                    self._pending_acknowledgements.pop(str(payload.get("command_id", "")), None)
-            identity = receipt_id or "l3g-receipt-" + hashlib.sha256(canonical_json(payload)).hexdigest()
-            kind = {
-                "ORDER_EVENT": "ORDER_EVENT",
-                "EXECUTION_EVENT": "EXECUTION",
-                "POSITION_EVENT": "POSITION_SNAPSHOT_EVENT",
-                "SAFETY_EVENT": "INCIDENT_SAFETY_EVENT",
-            }.get(str(message_type), "COMMAND_RECEIPT_" + str(message_type))
-            self.ledger.append(kind, dict(payload), identity=identity, execution_session_id=session_id)
-        callback = self._on_message
-        if callback is not None:
-            try:
-                callback(payload)
-            except Exception as exc:
-                self.ledger.append("INCIDENT_CALLBACK_FAILURE", {"sink": "execution_message", "error_type": type(exc).__name__}, execution_session_id=session_id)
+                receipt_claimed = bool(receipt_id)
+                if message_type == "RECONCILIATION":
+                    reconciliation_valid = self._validate_reconciliation(payload)
+                    with self._lock:
+                        self._reconciled = reconciliation_valid
+                    if not reconciliation_valid:
+                        self._reject_frame("RECONCILIATION_MISMATCH")
+                        return
+                if message_type == "COMMAND_ACK":
+                    with self._lock:
+                        self._acknowledgements += 1
+                        self._pending_acknowledgements.pop(str(payload.get("command_id", "")), None)
+                elif message_type == "COMMAND_REJECTED":
+                    with self._lock:
+                        self._command_rejections += 1
+                        self._pending_acknowledgements.pop(str(payload.get("command_id", "")), None)
+                try:
+                    self.ledger.append(kind, dict(payload), identity=identity, execution_session_id=session_id)
+                except Exception:
+                    # A verified flat/reconciliation or safety signal is the
+                    # last fail-safe input when ledger persistence is
+                    # unavailable.  It must reach the runtime without closing
+                    # the signed client. Other receipt classes remain strict.
+                    if not fallback_safety_message:
+                        raise
+                    durable_receipt_unavailable = True
+        except Exception:
+            # The authority fence is normally the linearization point. If the
+            # ledger cannot even establish it, the verified safety channel is
+            # still more important than tearing down its signed connection.
+            # Invalid reconciliations and every non-safety receipt remain
+            # strict and are never delivered through this path.
+            if not fallback_safety_message or not fallback_reconciliation_valid:
+                raise
+            if receipt_id:
+                if not receipt_claimed and not self._claim_receipt_id(receipt_id):
+                    return
+            durable_receipt_unavailable = True
+        self._deliver_inbound_callback(
+            payload, session_id, durable_receipt_unavailable=durable_receipt_unavailable,
+        )
 
     def _handle_hello(self, payload: Mapping[str, object]) -> None:
         required = {
@@ -542,12 +605,18 @@ class PaperExecutionTransport:
 
     @staticmethod
     def _validate_reconciliation(payload: Mapping[str, object]) -> bool:
+        working_order_count = payload.get("working_order_count")
+        working_entry_count = payload.get("working_entry_count")
         return (
             payload.get("account_name") == "Sim101"
             and payload.get("account_class") == "LOCAL_SIMULATION"
             and payload.get("instrument") == "MNQ SEP26"
             and type(payload.get("position_quantity")) is int
-            and type(payload.get("working_order_count")) is int
+            and type(working_order_count) is int
+            and type(working_entry_count) is int
+            and working_order_count >= 0
+            and working_entry_count >= 0
+            and working_entry_count <= working_order_count
             and payload.get("position_snapshot_complete") is True
             and payload.get("order_snapshot_complete") is True
         )

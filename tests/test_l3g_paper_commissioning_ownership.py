@@ -361,7 +361,11 @@ class CommissioningOwnershipTests(unittest.TestCase):
             def current() -> str:
                 nonlocal calls
                 calls += 1
-                delay = delay_seconds if calls >= 5 else 0
+                # The authorization boundary is the third runtime clock read:
+                # creation, risk evaluation, then transport admission. Ledger
+                # record payloads no longer fabricate an extra wall-clock
+                # value solely for retry identity.
+                delay = delay_seconds if calls >= 3 else 0
                 return (base + timedelta(seconds=delay)).isoformat().replace("+00:00", "Z")
 
             return current

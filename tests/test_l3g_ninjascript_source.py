@@ -39,6 +39,63 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertIn('"Close", "EXIT", order', source)
         self.assertIn("flattenFailed) LockAndProtect(\"FLATTEN_ACCEPTANCE_TIMEOUT\")", source)
 
+    def test_watchdog_requires_a_correlated_settled_reconciliation(self) -> None:
+        source = (Path(__file__).parents[1] / "ninjatrader" / "NinjaScript" / "AddOns" / "BeelzebubPaperExecutionAddOn.cs").read_text(encoding="utf-8")
+        self.assertIn("pendingWatchdogSafetyEventId", source)
+        self.assertIn('incident["safety_event_id"] = safetyEventId', source)
+        self.assertIn('message["safety_event_id"] = safetyEventId', source)
+        self.assertIn("TryPublishWatchdogSafetyReconciliation()", source)
+        self.assertIn("requireWatchdogFlat", source)
+        self.assertIn("safety_settlement_final", source)
+        self.assertIn("safety_settlement_sequence", source)
+        self.assertIn("WatchdogSettlementSeconds", source)
+        self.assertIn("MaximumWatchdogFinalProofAttempts", source)
+        self.assertIn("pendingWatchdogSafetyFinalProofInFlight", source)
+        self.assertIn("authenticatedSessionGeneration", source)
+        self.assertIn("settlementSequence = pendingWatchdogSafetySettlementSequence + 1", source)
+        self.assertIn("if (sent)", source)
+        self.assertIn('"PROCESS_STOP_OPEN_POSITION"', source)
+        self.assertIn('BeginWatchdogSafetyCorrelation("EMERGENCY_FLATTEN_ACCEPTED")', source)
+        self.assertIn("RepublishPendingWatchdogSafetyCorrelation()", source)
+        self.assertIn("private bool SendSigned", source)
+
+    def test_foreign_lockout_cannot_disable_owned_entry_watchdog_cancellation(self) -> None:
+        """Foreign Sim101 activity must not turn heartbeat loss into a no-op."""
+        source = (Path(__file__).parents[1] / "ninjatrader" / "NinjaScript" / "AddOns" / "BeelzebubPaperExecutionAddOn.cs").read_text(encoding="utf-8")
+        watchdog = source[source.index("        private void LockAndProtect"):source.index("        private void Acknowledge")]
+        self.assertNotIn('if (lockedOut && reason == "HEARTBEAT_WATCHDOG") return;', watchdog)
+        self.assertIn("watchdogSafetyDispatchStarted", watchdog)
+        self.assertIn("watchdogSafetyActionInFlight", watchdog)
+        self.assertIn("CancelOwnedOrders();", watchdog)
+        self.assertIn("if (!foreign && position != null && position.Quantity != 0)", watchdog)
+        self.assertIn("FOREIGN_ACTIVITY_EMERGENCY_FLATTEN_REFUSED", source)
+
+    def test_restart_rehydrates_exact_owned_work_before_session_and_watchdog(self) -> None:
+        """A reload must not lose cancellation ownership of a working BZ-L3G order."""
+        source = (Path(__file__).parents[1] / "ninjatrader" / "NinjaScript" / "AddOns" / "BeelzebubPaperExecutionAddOn.cs").read_text(encoding="utf-8")
+        helper = source[
+            source.index("        private void RehydrateOwnedWorkingOrders"):
+            source.index("        private static bool Working")
+        ]
+        self.assertIn("lock (paperAccount.Orders)", helper)
+        self.assertIn("Working(order.OrderState)", helper)
+        self.assertIn("ExactInstrumentName", helper)
+        self.assertIn("IsOwnedName(order.Name)", helper)
+        self.assertIn("OwnedOrder.Restored(order)", helper)
+        self.assertNotIn(".Submit(", helper)
+        self.assertNotIn(".Flatten(", helper)
+        self.assertNotIn(".Cancel(", helper)
+        accept = source[
+            source.index("        private void AcceptSession"):
+            source.index("        private static bool HashText")
+        ]
+        self.assertLess(accept.index("RehydrateOwnedWorkingOrders();"), accept.index("authenticated = true"))
+        watchdog = source[
+            source.index("        private void WatchdogLoop"):
+            source.index("        private void LockAndProtect")
+        ]
+        self.assertLess(watchdog.index("RehydrateOwnedWorkingOrders();"), watchdog.index("lock (stateLock)"))
+
     def test_read_only_addon_remains_without_order_or_inbound_authority(self) -> None:
         source = (Path(__file__).parents[1] / "ninjatrader" / "NinjaScript" / "AddOns" / "BeelzebubReadOnlyAddOn.cs").read_text(encoding="utf-8")
         for forbidden in ("CreateOrder(", ".Submit(", ".Cancel(", ".Flatten(", "Stream.Read"):

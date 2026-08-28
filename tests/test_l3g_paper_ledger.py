@@ -42,7 +42,7 @@ class PaperLedgerTests(unittest.TestCase):
     def test_high_volume_wal_window_is_bounded_above_default_checkpoint(self) -> None:
         with TemporaryDirectory() as folder, PaperLedger(Path(folder) / "paper.sqlite3") as ledger:
             connection = ledger._connection
-            self.assertEqual(connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0], 32768)
+            self.assertEqual(connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0], 0)
             self.assertEqual(connection.execute("PRAGMA journal_size_limit").fetchone()[0], 134217728)
             self.assertEqual(connection.execute("PRAGMA temp_store").fetchone()[0], 2)
 
@@ -92,13 +92,17 @@ class PaperLedgerTests(unittest.TestCase):
     def test_all_domain_tables_hash_chain_and_idempotence(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "paper.sqlite3"
-            ledger = PaperLedger(path)
-            first = ledger.append("DECISION", {"paper_decision_id": "l3g-pd-a"}, identity="l3g-pd-a")
-            self.assertEqual(first, ledger.append("DECISION", {"different": True}, identity="l3g-pd-a"))
-            ledger.append("COMMAND", {"command_id": "l3g-pc-a"}, identity="l3g-pc-a")
-            self.assertEqual(ledger.chain_status(), (True, None))
-            self.assertEqual(ledger.verify_chain(), (True, None))
-            ledger.close()
+            with PaperLedger(path) as ledger:
+                first = ledger.append("DECISION", {"paper_decision_id": "l3g-pd-a"}, identity="l3g-pd-a")
+                self.assertEqual(
+                    first,
+                    ledger.append("DECISION", {"paper_decision_id": "l3g-pd-a"}, identity="l3g-pd-a"),
+                )
+                with self.assertRaisesRegex(ValueError, "identity conflicts"):
+                    ledger.append("DECISION", {"different": True}, identity="l3g-pd-a")
+                ledger.append("COMMAND", {"command_id": "l3g-pc-a"}, identity="l3g-pc-a")
+                self.assertEqual(ledger.chain_status(), (True, None))
+                self.assertEqual(ledger.verify_chain(), (True, None))
             connection = sqlite3.connect(path)
             tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             connection.close()

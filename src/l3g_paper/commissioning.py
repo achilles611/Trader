@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Mapping
 
-from .ledger import COMMISSIONING_TAIL_POLICY_VERSION
+from .ledger import COMMISSIONING_TAIL_POLICY_VERSION, deferred_capacity_allows_authority
 
 
 class CommissioningLedgerGateError(RuntimeError):
@@ -135,6 +135,18 @@ def evaluate_commissioning_ledger_gate(
     ):
         _gate_error("COMMISSIONING_LEDGER_IDENTITY_MISMATCH", "Ledger/checkpoint identity or ancestry changed after verification.")
 
+    capacity = tail.get("deferred_capacity")
+    if not isinstance(capacity, Mapping):
+        _gate_error(
+            "COMMISSIONING_LEDGER_CAPACITY_INADEQUATE",
+            "The ordered ledger fence did not capture writer capacity evidence.",
+        )
+    if not deferred_capacity_allows_authority(capacity):
+        _gate_error(
+            "COMMISSIONING_LEDGER_CAPACITY_INADEQUATE",
+            "Ledger writer capacity is not demonstrably healthy at the ordered authority fence.",
+        )
+
     tip = tail.get("arm_snapshot_tip")
     classified = tail.get("classified_through_sequence")
     last_authority = tail.get("last_authority_mutation_sequence")
@@ -244,6 +256,7 @@ def evaluate_commissioning_ledger_gate(
         "tail_record_kinds": list(tail_kinds),
         "tail_record_categories": list(tail_categories),
         "tail_authority_classification": tail_classification,
+        "deferred_capacity": dict(capacity),
         "last_authority_mutation_sequence": last_authority,
         "last_authority_mutation_kind": tail.get("last_authority_mutation_kind"),
         "last_authority_mutation_domain": tail.get("last_authority_mutation_domain"),

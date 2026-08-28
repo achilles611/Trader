@@ -40,6 +40,14 @@ NOW = "2026-08-26T17:30:00Z"
 HASH = canonical_hash({"fixture": "commissioning-live-tail"})
 OFF_CONTEXT = UNSPECIFIED_OFF_SESSION_CONTEXT.payload()
 RTH_CONTEXT = PaperSessionResolver().resolve("2026-08-26T17:00:00Z", generation=1).context.payload()
+HEALTHY_DEFERRED_CAPACITY = {
+    "schema": "l3g-ledger-writer-capacity-v1",
+    "state": "HEALTHY",
+    "admission_open": True,
+    "negative_headroom_sustained": False,
+    "writer_error": None,
+    "queue_growth_records_per_second": 0.0,
+}
 
 
 def observation(number: int = 1, kind: str = "QUOTE") -> dict[str, object]:
@@ -388,6 +396,48 @@ class CommissioningLiveTailTests(unittest.TestCase):
             self.assertEqual(result["last_unknown_sequence"], 0)
             self.assertEqual(result["unverified_tail_rows"], 8)
 
+    def test_writer_capacity_evidence_is_required_and_fail_closed(self) -> None:
+        with TemporaryDirectory() as directory, PaperLedger(Path(directory) / "paper.sqlite3") as ledger:
+            ledger.append("SESSION_AUTHORITY", {"reason": "verified anchor"})
+            anchor = int(ledger.health_status()["highest_sequence"])
+            verification, tail = self.prepared_gate(ledger, anchor)
+            healthy = dict(HEALTHY_DEFERRED_CAPACITY)
+            cases: tuple[tuple[str, object], ...] = (
+                ("missing", None),
+                ("degraded", {**healthy, "state": "DEGRADED"}),
+                ("exhausted", {**healthy, "state": "EXHAUSTED"}),
+                ("failed", {**healthy, "state": "FAILED", "writer_error": "RuntimeError"}),
+                ("shutting_down", {**healthy, "state": "SHUTTING_DOWN", "admission_open": False}),
+                ("closed", {**healthy, "admission_open": False}),
+                ("negative_headroom", {**healthy, "negative_headroom_sustained": True}),
+                ("positive_growth", {**healthy, "queue_growth_records_per_second": 0.001}),
+                ("nan_growth", {**healthy, "queue_growth_records_per_second": float("nan")}),
+            )
+            for label, capacity in cases:
+                with self.subTest(label=label):
+                    candidate = dict(tail)
+                    if capacity is None:
+                        candidate.pop("deferred_capacity", None)
+                    else:
+                        candidate["deferred_capacity"] = capacity
+                    with self.assertRaises(CommissioningLedgerGateError) as raised:
+                        evaluate_commissioning_ledger_gate(
+                            verification, candidate, runtime_snapshot(),
+                            checkpoint_matches_report=True, freshness_seconds=900,
+                            now=datetime.fromisoformat(NOW.replace("Z", "+00:00")),
+                        )
+                    self.assertEqual(raised.exception.code, "COMMISSIONING_LEDGER_CAPACITY_INADEQUATE")
+            healthy_tail = dict(tail)
+            healthy_tail["deferred_capacity"] = healthy
+            self.assertEqual(
+                evaluate_commissioning_ledger_gate(
+                    verification, healthy_tail, runtime_snapshot(),
+                    checkpoint_matches_report=True, freshness_seconds=900,
+                    now=datetime.fromisoformat(NOW.replace("Z", "+00:00")),
+                )["ledger_trust_state"],
+                "VERIFIED_TO_ARM_SNAPSHOT_TIP",
+            )
+
     def test_account_and_exact_warmup_attestations_are_accepted_observations(self) -> None:
         with TemporaryDirectory() as directory, PaperLedger(Path(directory) / "paper.sqlite3") as ledger:
             ledger.append("SESSION_AUTHORITY", {"reason": "verified anchor"})
@@ -592,6 +642,7 @@ class CommissioningLiveTailTests(unittest.TestCase):
             "last_blocking_kind": "ORDER_EVENT_ACCEPTED",
             "last_blocking_domain": "ORDER_EVENT", "last_blocking_hash": HASH,
             "last_blocking_classification": "AUTHORITY_MUTATION",
+            "deferred_capacity": dict(HEALTHY_DEFERRED_CAPACITY),
         }
         with self.assertRaises(CommissioningLedgerGateError) as raised:
             evaluate_commissioning_ledger_gate(
@@ -871,6 +922,7 @@ class CommissioningLiveTailTests(unittest.TestCase):
                 {
                     "highest_sequence": 150,
                     "final_record_hash": HASH,
+                    "deferred_capacity": dict(HEALTHY_DEFERRED_CAPACITY),
                     "authority_watermark": {
                         "last_authority_mutation_sequence": mutation,
                         "last_authority_observation_sequence": observation,
@@ -898,6 +950,7 @@ class CommissioningLiveTailTests(unittest.TestCase):
             {
                 "highest_sequence": 150,
                 "final_record_hash": canonical_hash({"different": True}),
+                "deferred_capacity": dict(HEALTHY_DEFERRED_CAPACITY),
                 "authority_watermark": {
                     "last_authority_mutation_sequence": 99,
                     "last_authority_observation_sequence": 125,
