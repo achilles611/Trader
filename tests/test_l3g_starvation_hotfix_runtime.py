@@ -10,6 +10,8 @@ import threading
 import unittest
 from unittest.mock import patch
 
+from src.lane_iii.contracts import canonical_hash
+from src.l3f_provider.tradovate_observation import StreamHealth
 from src.l3g_paper.contracts import PaperEntryOwner, PaperRuntimeState
 from src.l3g_paper.ledger import PaperLedger
 from src.l3g_paper.ninjatrader_transport import (
@@ -23,7 +25,7 @@ from src.l3g_paper.risk import PaperRiskSnapshot
 from src.l3g_paper.runtime import LaneIIIPaperRuntime
 from src.l3g_paper.sessions import PaperSessionResolver
 
-from .l3g_helpers import warmed_bullish_policy
+from .l3g_helpers import ObservationFactory, warmed_bullish_policy
 
 
 NOW = "2026-08-26T14:00:00Z"
@@ -98,6 +100,172 @@ class LaneIIIStarvationHotfixRuntimeTests(unittest.TestCase):
             "COMMISSIONING_ENTRY_SUBMITTED",
             "COMMAND",
         }.isdisjoint(kinds), kinds)
+
+    def test_warmup_attestations_never_globally_drain_the_observer_callback(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.ready_runtime(directory)
+            provenance = {
+                family: {
+                    "evidence_id": f"l3g-pe-{index:032x}",
+                    "observed_at": NOW,
+                    "source_observation_ids": [f"nt-warmup-{index}"],
+                    "source_local_sequences": [index],
+                }
+                for index, family in enumerate(
+                    ("STRUCTURAL_CONTEXT", "ORDER_FLOW", "RESTING_LIQUIDITY"),
+                    start=1,
+                )
+            }
+            runtime._commissioning_warmup_seen = {
+                "STRUCTURAL_CONTEXT": provenance["STRUCTURAL_CONTEXT"],
+            }
+
+            try:
+                # The former synchronous append() path calls flush_deferred().
+                # Refusing that call makes this a deterministic regression for
+                # the production gap -> reset -> global drain feedback loop.
+                with patch.object(
+                    ledger,
+                    "flush_deferred",
+                    side_effect=AssertionError("observer callback attempted a global ledger drain"),
+                ):
+                    with runtime._lock:
+                        runtime._reset_commissioning_warmup("LOCAL_SEQUENCE_GAP")
+                        runtime._commissioning_warmup_seen = dict(provenance)
+                        runtime._commissioning_warmup_warmed_at = None
+                        runtime._snapshot = replace(
+                            runtime._snapshot, commissioning_session_warmed=False,
+                        )
+                        runtime._observe_commissioning_warmup(NOW)
+
+                self.assertTrue(runtime._snapshot.commissioning_session_warmed)
+                ledger.flush_deferred()
+                with ledger._lock:
+                    attestations = ledger._connection.execute(
+                        "SELECT kind FROM lane_iii_paper_audit "
+                        "WHERE kind IN (?, ?) ORDER BY ledger_sequence",
+                        (
+                            "COMMISSIONING_SESSION_WARMUP_RESET",
+                            "COMMISSIONING_SESSION_WARMED",
+                        ),
+                    ).fetchall()
+                self.assertEqual(
+                    [str(record["kind"]) for record in attestations],
+                    ["COMMISSIONING_SESSION_WARMUP_RESET", "COMMISSIONING_SESSION_WARMED"],
+                )
+                self.assertEqual(ledger.verify_chain(), (True, None))
+            finally:
+                self.close(runtime, ledger)
+
+    def test_sequence_gap_reset_returns_while_the_deferred_writer_is_blocked(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            runtime = LaneIIIPaperRuntime(ledger)
+            factory = ObservationFactory(
+                start=datetime.fromisoformat(NOW.replace("Z", "+00:00")),
+            )
+            writer_started = threading.Event()
+            release_writer = threading.Event()
+            ingest_done = threading.Event()
+            ingest_errors: list[BaseException] = []
+            ingest_thread: threading.Thread | None = None
+            original_append_prepared = ledger._append_prepared
+
+            try:
+                runtime.on_observation_transport_state(StreamHealth.HEALTHY)
+                runtime.ingest(factory.make(
+                    "CONNECTION", {"scope": "MARKET_DATA", "price_status": "Connected"},
+                ))
+                for price in (100, 99, 100):
+                    quote = factory.quote(price)
+                    runtime.ingest(quote)
+                    runtime.ingest(factory.trade(quote, price))
+                for operation, volume in (
+                    ("ADD", 10), ("UPDATE", 5), ("UPDATE", 10),
+                    ("UPDATE", 5), ("UPDATE", 11),
+                ):
+                    runtime.ingest(factory.depth(operation, volume))
+                self.assertTrue(runtime.status()["commissioning_session_warmed"])
+                ledger.flush_deferred()
+                baseline = int(ledger.health_status()["highest_sequence"])
+
+                def gated_append(records: tuple[dict[str, object], ...]) -> list[str]:
+                    if any(str(record["identity"]) == "blocked-writer-prefix" for record in records):
+                        writer_started.set()
+                        if not release_writer.wait(10):
+                            raise AssertionError("Timed out releasing the blocked deferred writer.")
+                    return original_append_prepared(records)
+
+                ledger._append_prepared = gated_append  # type: ignore[method-assign]
+                context = runtime._session_context
+                blocker = {
+                    **context.payload(),
+                    "observation_id": "nt-blocked-writer-prefix",
+                    "observation_type": "QUOTE",
+                    "observed_at": NOW,
+                    "ninja_receipt_time": NOW,
+                    "provider_timestamp": None,
+                    "exchange_timestamp": None,
+                    "local_monotonic_sequence": 0,
+                    "source_payload_hash": canonical_hash({"blocker": True}),
+                }
+                ledger.append_deferred(
+                    "OBSERVATION_ENVELOPE", blocker,
+                    identity="blocked-writer-prefix", occurred_at=NOW,
+                )
+                self.assertTrue(writer_started.wait(2))
+
+                # Manufacture one authentic continuity gap.  The old RESET
+                # append() waited for the blocked writer/global drain here.
+                factory.sequence += 1
+                gap = factory.quote(100)
+
+                def ingest_gap() -> None:
+                    try:
+                        runtime.ingest(gap)
+                    except BaseException as exc:  # pragma: no cover - surfaced below
+                        ingest_errors.append(exc)
+                    finally:
+                        ingest_done.set()
+
+                ingest_thread = threading.Thread(target=ingest_gap, name="GapWhileWriterBlocked")
+                ingest_thread.start()
+                self.assertTrue(
+                    ingest_done.wait(1),
+                    "sequence-gap callback waited for a global deferred drain",
+                )
+                self.assertEqual(ingest_errors, [])
+                with runtime._lock:
+                    self.assertFalse(runtime._snapshot.commissioning_session_warmed)
+
+                release_writer.set()
+                ingest_thread.join(3)
+                self.assertFalse(ingest_thread.is_alive())
+                snapshot = ledger.commissioning_tail_snapshot(
+                    baseline, last_full_verified_sequence=baseline,
+                )
+                with ledger._lock:
+                    rows = ledger._connection.execute(
+                        "SELECT kind, identity FROM lane_iii_paper_audit "
+                        "WHERE ledger_sequence > ? ORDER BY ledger_sequence",
+                        (baseline,),
+                    ).fetchall()
+                kinds = [str(row["kind"]) for row in rows]
+                self.assertEqual(kinds[:4], [
+                    "OBSERVATION_ENVELOPE",
+                    "OBSERVATION_ENVELOPE",
+                    "COMMISSIONING_SESSION_WARMUP_RESET",
+                    "DECISION",
+                ])
+                self.assertEqual(sum(kind == "COMMISSIONING_SESSION_WARMUP_RESET" for kind in kinds), 1)
+                self.assertEqual(snapshot["last_authority_observation_kind"], "COMMISSIONING_SESSION_WARMUP_RESET")
+                self.assertEqual(ledger.verify_chain(), (True, None))
+            finally:
+                release_writer.set()
+                if ingest_thread is not None:
+                    ingest_thread.join(2)
+                ledger._append_prepared = original_append_prepared  # type: ignore[method-assign]
+                self.close(runtime, ledger)
 
     def test_rehearsal_callback_does_not_hold_runtime_lock(self) -> None:
         with TemporaryDirectory() as directory:

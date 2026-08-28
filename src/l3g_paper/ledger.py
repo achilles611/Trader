@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from enum import StrEnum
@@ -43,6 +44,10 @@ _DOMAIN_TABLES = {
     "INCIDENT": "lane_iii_paper_incidents",
 }
 _HIGH_VOLUME_DOMAINS = frozenset({"OBSERVATION", "EVIDENCE", "DECISION"})
+_DEFERRED_READINESS_ATTESTATION_KINDS = frozenset({
+    "COMMISSIONING_SESSION_WARMED",
+    "COMMISSIONING_SESSION_WARMUP_RESET",
+})
 COMMISSIONING_TAIL_POLICY_VERSION = "l3g-commissioning-passive-tail-v3"
 _COMMISSIONING_TAIL_PREVIOUS_POLICY_VERSION = "l3g-commissioning-passive-tail-v2"
 COMMISSIONING_NO_AUTHORITY_EFFECT = "NONE"
@@ -1583,6 +1588,40 @@ class PaperLedger:
         prepared = self._prepare(kind, payload, identity, occurred_at, execution_session_id)
         if str(prepared["domain"]) not in _HIGH_VOLUME_DOMAINS:
             raise ValueError("Only raw observations, evidence, and no-side-effect decisions may use deferred persistence.")
+        self._enqueue_deferred_prepared(prepared)
+
+    def append_commissioning_attestation_deferred(
+        self,
+        kind: str,
+        payload: Mapping[str, object],
+        *,
+        identity: str | None = None,
+        occurred_at: str | None = None,
+        execution_session_id: str | None = None,
+    ) -> None:
+        """Defer only an exact no-authority commissioning readiness attestation."""
+        # The writer runs later on another thread.  Detach nested caller-owned
+        # containers before redaction, identity, and whitelist validation so
+        # post-admission mutation cannot alter the durable record.
+        payload_snapshot = deepcopy(dict(payload))
+        prepared = self._prepare(kind, payload_snapshot, identity, occurred_at, execution_session_id)
+        common = prepared.get("common")
+        stored_payload = common.get("payload") if isinstance(common, Mapping) else None
+        classification = commissioning_tail_classification(
+            str(prepared["domain"]), kind,
+            stored_payload if isinstance(stored_payload, Mapping) else {},
+        )
+        if (
+            kind not in _DEFERRED_READINESS_ATTESTATION_KINDS
+            or str(prepared["domain"]) != "INCIDENT"
+            or classification.category is not CommissioningTailCategory.AUTHORITY_OBSERVATION
+        ):
+            raise ValueError(
+                "Only exact no-authority commissioning readiness attestations may use this deferred path."
+            )
+        self._enqueue_deferred_prepared(prepared)
+
+    def _enqueue_deferred_prepared(self, prepared: dict[str, object]) -> None:
         with self._ordering_lock, self._deferred_condition:
             if self._deferred_error is not None:
                 raise RuntimeError("Deferred paper ledger writer failed.") from self._deferred_error

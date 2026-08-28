@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import closing
+import json
 from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
@@ -8,7 +9,14 @@ import threading
 import unittest
 
 from src.lane_iii.contracts import canonical_hash
-from src.l3g_paper.ledger import PaperLedger
+from src.l3g_paper.ledger import (
+    COMMISSIONING_NO_AUTHORITY_EFFECT,
+    COMMISSIONING_READINESS_RECORD_SEMANTICS,
+    COMMISSIONING_READINESS_RECORD_SEMANTICS_VERSION,
+    COMMISSIONING_WARMUP_POLICY_HASH,
+    COMMISSIONING_WARMUP_REQUIRED_FAMILIES,
+    PaperLedger,
+)
 from src.l3g_paper.sessions import UNSPECIFIED_OFF_SESSION_CONTEXT
 
 
@@ -27,6 +35,45 @@ def observation(number: int, label: str) -> dict[str, object]:
         "local_monotonic_sequence": number,
         "source_payload_hash": canonical_hash({"number": number, "label": label}),
     }
+
+
+def readiness_attestation(kind: str) -> dict[str, object]:
+    common = {
+        **UNSPECIFIED_OFF_SESSION_CONTEXT.payload(),
+        "authority_effect": COMMISSIONING_NO_AUTHORITY_EFFECT,
+        "record_semantics": COMMISSIONING_READINESS_RECORD_SEMANTICS,
+        "record_semantics_version": COMMISSIONING_READINESS_RECORD_SEMANTICS_VERSION,
+        "policy_hash": COMMISSIONING_WARMUP_POLICY_HASH,
+        "required_families": list(COMMISSIONING_WARMUP_REQUIRED_FAMILIES),
+    }
+    if kind == "COMMISSIONING_SESSION_WARMUP_RESET":
+        return {
+            **common,
+            "commissioning_warmup_state": "NOT_WARMED",
+            "reset_at": NOW,
+            "reason": "LOCAL_SEQUENCE_GAP",
+            "seen_families": ["STRUCTURAL_CONTEXT"],
+            "warmed_at": NOW,
+        }
+    if kind == "COMMISSIONING_SESSION_WARMED":
+        return {
+            **common,
+            "commissioning_warmup_state": "WARMED",
+            "warmed_at": NOW,
+            "reason": "ALL_REQUIRED_FAMILIES_GENUINELY_OBSERVED",
+            "evidence_provenance": {
+                family: {
+                    "evidence_id": f"l3g-pe-{index:032x}",
+                    "observed_at": NOW,
+                    "source_observation_ids": [f"nt-attestation-{index}"],
+                    "source_local_sequences": [index],
+                }
+                for index, family in enumerate(
+                    COMMISSIONING_WARMUP_REQUIRED_FAMILIES, start=1,
+                )
+            },
+        }
+    raise ValueError(kind)
 
 
 class LedgerBarrierStarvationHotfixTests(unittest.TestCase):
@@ -51,6 +98,146 @@ class LedgerBarrierStarvationHotfixTests(unittest.TestCase):
                     "SELECT identity FROM lane_iii_paper_audit ORDER BY ledger_sequence"
                 ).fetchall()
             ]
+
+    def test_deferred_readiness_attestation_whitelist_is_exact_and_fail_closed(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            reset = readiness_attestation("COMMISSIONING_SESSION_WARMUP_RESET")
+            warmed = readiness_attestation("COMMISSIONING_SESSION_WARMED")
+            try:
+                ledger.append(
+                    "SESSION_AUTHORITY", {"reason": "attestation whitelist anchor"},
+                    identity="verified-anchor", occurred_at=NOW,
+                )
+                anchor = int(ledger.health_status()["highest_sequence"])
+
+                with self.assertRaises(ValueError):
+                    ledger.append_deferred(
+                        "COMMISSIONING_SESSION_WARMUP_RESET", reset,
+                        identity="generic-incident-deferral-must-fail", occurred_at=NOW,
+                    )
+                with self.assertRaises(ValueError):
+                    ledger.append_commissioning_attestation_deferred(
+                        "INCIDENT_SAFETY_EVENT", reset,
+                        identity="arbitrary-incident-must-fail", occurred_at=NOW,
+                    )
+                malformed = dict(reset)
+                malformed.pop("authority_effect")
+                with self.assertRaises(ValueError):
+                    ledger.append_commissioning_attestation_deferred(
+                        "COMMISSIONING_SESSION_WARMUP_RESET", malformed,
+                        identity="malformed-attestation-must-fail", occurred_at=NOW,
+                    )
+
+                ledger.append_commissioning_attestation_deferred(
+                    "COMMISSIONING_SESSION_WARMUP_RESET", reset,
+                    identity="exact-reset", occurred_at=NOW,
+                )
+                ledger.append_commissioning_attestation_deferred(
+                    "COMMISSIONING_SESSION_WARMED", warmed,
+                    identity="exact-warmed", occurred_at=NOW,
+                )
+                snapshot = ledger.commissioning_tail_snapshot(
+                    anchor, last_full_verified_sequence=anchor,
+                )
+
+                self.assertEqual(snapshot["arm_snapshot_tip"], anchor + 2)
+                self.assertEqual(snapshot["deferred_barrier_ledger_sequence"], anchor + 2)
+                self.assertEqual(snapshot["last_authority_observation_kind"], "COMMISSIONING_SESSION_WARMED")
+                self.assertEqual(
+                    snapshot["tail_record_categories"], ["AUTHORITY_OBSERVATION"],
+                )
+                self.assertEqual(
+                    self.identities(ledger.path),
+                    ["verified-anchor", "exact-reset", "exact-warmed"],
+                )
+                self.assertEqual(ledger.verify_chain(), (True, None))
+            finally:
+                ledger.close()
+
+    def test_deferred_readiness_attestation_is_a_deep_immutable_snapshot(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "paper.sqlite3"
+            ledger = PaperLedger(path)
+            prefix_release = threading.Event()
+            prefix_started = threading.Event()
+            original_append_prepared = ledger._append_prepared
+
+            try:
+                ledger.append(
+                    "SESSION_AUTHORITY", {"reason": "immutable attestation anchor"},
+                    identity="verified-anchor", occurred_at=NOW,
+                )
+                anchor = int(ledger.health_status()["highest_sequence"])
+
+                def gated_append(records: tuple[dict[str, object], ...]) -> list[str]:
+                    if any(str(record["identity"]) == "blocked-prefix" for record in records):
+                        prefix_started.set()
+                        if not prefix_release.wait(self.timeout_seconds):
+                            raise AssertionError("Timed out releasing the immutable-snapshot prefix.")
+                    return original_append_prepared(records)
+
+                ledger._append_prepared = gated_append  # type: ignore[method-assign]
+                ledger.append_deferred(
+                    "OBSERVATION_ENVELOPE", observation(1, "blocked-prefix"),
+                    identity="blocked-prefix", occurred_at=NOW,
+                )
+                self.assertTrue(prefix_started.wait(self.timeout_seconds))
+
+                warmed = readiness_attestation("COMMISSIONING_SESSION_WARMED")
+                expected_payload_hash = canonical_hash(warmed)
+                ledger.append_commissioning_attestation_deferred(
+                    "COMMISSIONING_SESSION_WARMED", warmed, occurred_at=NOW,
+                )
+
+                # Retain and mutate every nested container after admission but
+                # before the blocked writer can serialize the attestation.
+                required_families = warmed["required_families"]
+                self.assertIsInstance(required_families, list)
+                required_families.append("CALLER_MUTATION")
+                evidence_provenance = warmed["evidence_provenance"]
+                self.assertIsInstance(evidence_provenance, dict)
+                first_family = COMMISSIONING_WARMUP_REQUIRED_FAMILIES[0]
+                first_provenance = evidence_provenance[first_family]
+                self.assertIsInstance(first_provenance, dict)
+                source_ids = first_provenance["source_observation_ids"]
+                self.assertIsInstance(source_ids, list)
+                source_ids.append("nt-post-admission-mutation")
+                first_provenance["secret"] = "must-never-enter-the-ledger"
+
+                prefix_release.set()
+                ledger.flush_deferred()
+
+                with closing(sqlite3.connect(path)) as connection:
+                    identity, serialized = connection.execute(
+                        "SELECT identity, payload_json FROM lane_iii_paper_audit "
+                        "WHERE kind = 'COMMISSIONING_SESSION_WARMED'",
+                    ).fetchone()
+                stored = json.loads(str(serialized))
+                stored_payload = stored["payload"]
+                self.assertEqual(canonical_hash(stored_payload), expected_payload_hash)
+                self.assertNotIn("CALLER_MUTATION", stored_payload["required_families"])
+                self.assertNotIn("nt-post-admission-mutation", json.dumps(stored_payload))
+                self.assertNotIn("must-never-enter-the-ledger", json.dumps(stored_payload))
+
+                common = {
+                    key: value for key, value in stored.items()
+                    if key not in {"identity", "previous_record_hash", "record_hash"}
+                }
+                self.assertEqual(identity, "l3g-ledger-" + canonical_hash(common))
+                snapshot = ledger.commissioning_tail_snapshot(
+                    anchor, last_full_verified_sequence=anchor,
+                )
+                self.assertEqual(snapshot["last_authority_observation_kind"], "COMMISSIONING_SESSION_WARMED")
+                self.assertEqual(
+                    snapshot["tail_record_categories"],
+                    ["PASSIVE_DATA", "AUTHORITY_OBSERVATION"],
+                )
+                self.assertEqual(ledger.verify_chain(), (True, None))
+            finally:
+                prefix_release.set()
+                ledger._append_prepared = original_append_prepared  # type: ignore[method-assign]
+                ledger.close()
 
     def test_prefix_barrier_completes_without_draining_blocked_suffix(self) -> None:
         with TemporaryDirectory() as directory:

@@ -459,7 +459,12 @@ class LaneIIIPaperRuntime:
         )
         if changed:
             self._advance_commissioning_authority_epoch()
-            self.ledger.append(
+            # This is a no-authority observation attestation emitted from the
+            # market callback path.  Keep it in the ordered deferred stream so
+            # a continuity reset cannot globally drain that same live stream.
+            # Commissioning barriers persist and classify it before any
+            # readiness or authority decision is allowed to use the tail.
+            self.ledger.append_commissioning_attestation_deferred(
                 "COMMISSIONING_SESSION_WARMUP_RESET",
                 {
                     **prior.payload(),
@@ -512,7 +517,10 @@ class LaneIIIPaperRuntime:
         self._snapshot = replace(
             self._snapshot, observed_at=_now(), commissioning_session_warmed=True,
         )
-        self.ledger.append(
+        # Like the reset marker, this is a no-authority observation
+        # attestation on the market callback path.  The commissioning barrier
+        # provides its durability boundary without stalling socket receive.
+        self.ledger.append_commissioning_attestation_deferred(
             "COMMISSIONING_SESSION_WARMED",
             {
                 **context.payload(),
