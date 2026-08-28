@@ -2518,7 +2518,7 @@ class LaneIIIPaperRuntime:
                     RISK_PROFILE.depth_mutation_maximum_age_seconds, status_now,
                 ),
             }
-            return {
+            status = {
                 "schema": "lane-iii-phase-g-paper-runtime-status-v1",
                 "mode": "PAPER_SIM101",
                 "display_mode": "EXPERIMENTAL PAPER",
@@ -2625,5 +2625,9 @@ class LaneIIIPaperRuntime:
                 "policy": policy,
                 "risk": risk,
                 "transport": transport,
-                "ledger": self.ledger.health_status(),
             }
+        # Ledger telemetry can wait behind an active hash-chain batch or slow
+        # filesystem metadata.  It is informational and must never hold the
+        # runtime authority/ingest lock while the UI polls status.
+        status["ledger"] = self.ledger.health_status()
+        return status

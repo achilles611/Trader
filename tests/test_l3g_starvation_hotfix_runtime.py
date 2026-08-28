@@ -157,6 +157,78 @@ class LaneIIIStarvationHotfixRuntimeTests(unittest.TestCase):
             finally:
                 self.close(runtime, ledger)
 
+    def test_status_never_holds_the_runtime_lock_while_ledger_health_waits(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.ready_runtime(directory)
+            health_started = threading.Event()
+            health_release = threading.Event()
+            status_done = threading.Event()
+            ingest_done = threading.Event()
+            errors: list[BaseException] = []
+            status_result: dict[str, object] = {}
+            original_health_status = ledger.health_status
+            factory = ObservationFactory(
+                start=datetime.fromisoformat(NOW.replace("Z", "+00:00")),
+            )
+
+            def blocked_health_status() -> dict[str, object]:
+                health_started.set()
+                if not health_release.wait(5):
+                    raise AssertionError("Timed out releasing blocked ledger telemetry.")
+                return original_health_status()
+
+            def read_status() -> None:
+                try:
+                    status_result.update(runtime.status())
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    status_done.set()
+
+            def ingest_quote() -> None:
+                try:
+                    runtime.ingest(factory.quote(100))
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    ingest_done.set()
+
+            status_thread = threading.Thread(target=read_status, name="BlockedLedgerStatus")
+            ingest_thread = threading.Thread(target=ingest_quote, name="IngestDuringLedgerStatus")
+            try:
+                with patch.object(ledger, "health_status", side_effect=blocked_health_status):
+                    status_thread.start()
+                    self.assertTrue(health_started.wait(2))
+
+                    # This acquisition and the real callback both failed under
+                    # the former status -> runtime lock -> ledger lock order.
+                    self.assertTrue(runtime._lock.acquire(timeout=1))
+                    runtime._lock.release()
+                    ingest_thread.start()
+                    self.assertTrue(
+                        ingest_done.wait(1),
+                        "live ingest waited behind informational ledger telemetry",
+                    )
+
+                    health_release.set()
+                    status_thread.join(3)
+                    ingest_thread.join(3)
+                    self.assertFalse(status_thread.is_alive())
+                    self.assertFalse(ingest_thread.is_alive())
+                    self.assertTrue(status_done.is_set())
+                    self.assertEqual(errors, [])
+                    self.assertIn("ledger", status_result)
+                    self.assertGreaterEqual(
+                        int(status_result["ledger"]["highest_sequence"]), 1,
+                    )
+            finally:
+                health_release.set()
+                if status_thread.ident is not None:
+                    status_thread.join(2)
+                if ingest_thread.ident is not None:
+                    ingest_thread.join(2)
+                self.close(runtime, ledger)
+
     def test_sequence_gap_reset_returns_while_the_deferred_writer_is_blocked(self) -> None:
         with TemporaryDirectory() as directory:
             ledger = PaperLedger(Path(directory) / "paper.sqlite3")
