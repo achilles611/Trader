@@ -1729,7 +1729,7 @@ def create_control_center_app(
         launch_auto_on_failure: bool = True,
         enforce_observer: bool = True,
     ) -> dict[str, object]:
-        """Evaluate one immutable verified-anchor/live-tail snapshot under the runtime lock."""
+        """Evaluate one immutable verified-anchor/live-tail snapshot at an ordered ledger fence."""
         observer = ninja_listener_health()
         if enforce_observer and observer.get("market_observer_active") is not True:
             raise HTTPException(

@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import threading
+import time
 from typing import Callable, Mapping
 from uuid import uuid4
 
@@ -38,7 +39,7 @@ from .ledger import (
     COMMISSIONING_READINESS_RECORD_SEMANTICS_VERSION,
     PaperLedger,
 )
-from .ninjatrader_transport import NinjaTraderSim101PaperAdapter, PaperExecutionTransport
+from .ninjatrader_transport import ExecutionTransportStatus, NinjaTraderSim101PaperAdapter, PaperExecutionTransport
 from .policy import ExperimentalPaperPolicy
 from .risk import PaperRiskAuthority, PaperRiskSnapshot
 from .sessions import (
@@ -76,6 +77,24 @@ class _CommissioningOwnership:
     recovered_after_restart: bool = False
     request_id: str | None = None
     ledger_preflight: Mapping[str, object] | None = None
+
+
+@dataclass(frozen=True)
+class _CommissioningReadinessCapture:
+    """Immutable runtime facts released to the blocking ledger validator."""
+
+    generation: int
+    guard_token: str
+    context: PaperSessionContext
+    risk_snapshot: PaperRiskSnapshot
+    state: PaperRuntimeState
+    position: PaperDirection
+    position_quantity: int
+    entry_owner: PaperEntryOwner
+    commissioning_ownership: _CommissioningOwnership | None
+    transport_status: ExecutionTransportStatus | None
+    commissioning_warmup_seen: Mapping[str, Mapping[str, object]]
+    commissioning_warmup_warmed_at: str | None
 
 
 class _CommissioningAuthorizationExpired(RuntimeError):
@@ -247,6 +266,11 @@ class LaneIIIPaperRuntime:
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
         self._transitions = 0
+        self._commissioning_readiness_generation = 0
+        self._commissioning_authority_epoch = 0
+        self._commissioning_stale_snapshot_refusals = 0
+        self._last_commissioning_preflight_duration_seconds: float | None = None
+        self._last_commissioning_snapshot_token: str | None = None
 
     @staticmethod
     def _ownership_context_matches(left: PaperSessionContext, right: PaperSessionContext) -> bool:
@@ -255,6 +279,10 @@ class LaneIIIPaperRuntime:
         ) == (
             right.session_kind, right.session_id, right.trade_date, right.session_profile_hash, right.session_generation,
         )
+
+    def _advance_commissioning_authority_epoch(self) -> None:
+        """Record an authority-relevant mutation; market timestamp advances are excluded."""
+        self._commissioning_authority_epoch += 1
 
     def _ownership_payload(self, ownership: _CommissioningOwnership, *, reason: str) -> dict[str, object]:
         return {
@@ -271,18 +299,102 @@ class LaneIIIPaperRuntime:
             "reason": reason,
         }
 
-    def _commissioning_runtime_snapshot(self, commissioning_id: str) -> dict[str, object]:
-        """Capture broker/runtime authority facts while the admission lock is held."""
-        snapshot = self._snapshot
-        transport = None if self._transport is None else self._transport.status().as_dict()
+    @staticmethod
+    def _commissioning_transport_guard(status: ExecutionTransportStatus | None) -> dict[str, object] | None:
+        if status is None:
+            return None
         return {
-            **self._session_context.payload(),
+            key: getattr(status, key)
+            for key in (
+                "state", "listener_ready", "authenticated_client", "client_count",
+                "execution_session_id", "reconciled", "error", "addon_protocol_version",
+                "addon_source_fingerprint", "addon_build_fingerprint",
+                "expected_addon_source_fingerprint", "addon_provenance_valid",
+            )
+        }
+
+    def _commissioning_guard_payload_locked(
+        self, transport_status: ExecutionTransportStatus | None,
+    ) -> dict[str, object]:
+        ignored_snapshot_fields = {
+            "observed_at", "quote_observed_at", "classified_trade_observed_at", "depth_mutation_observed_at",
+        }
+        ownership = self._commissioning_ownership
+        risk_status = self.risk.status()
+        return {
+            "authority_epoch": self._commissioning_authority_epoch,
+            "state_transitions": self._transitions,
+            "policy_reset_count": self._last_policy_reset_count,
+            "state": self._state.value,
+            "position": self._position.value,
+            "position_quantity": self._position_quantity,
+            "entries_paused": self._entries_paused,
+            "disarm_after_flat": self._disarm_after_flat,
+            "entry_owner": self._entry_owner.value,
+            "session": self._session_context.payload(),
+            "risk_snapshot": {
+                key: str(value)
+                for key, value in self._snapshot.__dict__.items()
+                if key not in ignored_snapshot_fields
+            },
+            "risk_lockout": {
+                "locked_out": risk_status.get("locked_out"),
+                "lockout_reason": risk_status.get("lockout_reason"),
+            },
+            "armed_session": None if self._armed_session is None else self._armed_session.payload(),
+            "commissioning_ownership": None if ownership is None else {
+                "commissioning_id": ownership.commissioning_id,
+                "context": ownership.context.payload(),
+                "entry_consumed": ownership.entry_consumed,
+                "entry_decision_id": ownership.entry_decision_id,
+                "recovered_after_restart": ownership.recovered_after_restart,
+                "request_id": ownership.request_id,
+            },
+            "commissioning_warmup": {
+                "context": self._commissioning_warmup_context.payload(),
+                "seen": {key: dict(value) for key, value in self._commissioning_warmup_seen.items()},
+                "warmed_at": self._commissioning_warmup_warmed_at,
+            },
+            "transport": self._commissioning_transport_guard(transport_status),
+        }
+
+    def _capture_commissioning_readiness_locked(self) -> _CommissioningReadinessCapture:
+        transport_status = None if self._transport is None else self._transport.status()
+        guard_token = canonical_hash(self._commissioning_guard_payload_locked(transport_status))
+        self._commissioning_readiness_generation += 1
+        self._last_commissioning_snapshot_token = guard_token
+        return _CommissioningReadinessCapture(
+            generation=self._commissioning_readiness_generation,
+            guard_token=guard_token,
+            context=self._session_context,
+            risk_snapshot=self._snapshot,
+            state=self._state,
+            position=self._position,
+            position_quantity=self._position_quantity,
+            entry_owner=self._entry_owner,
+            commissioning_ownership=self._commissioning_ownership,
+            transport_status=transport_status,
+            commissioning_warmup_seen={
+                key: dict(value) for key, value in self._commissioning_warmup_seen.items()
+            },
+            commissioning_warmup_warmed_at=self._commissioning_warmup_warmed_at,
+        )
+
+    @staticmethod
+    def _commissioning_runtime_snapshot(
+        commissioning_id: str, capture: _CommissioningReadinessCapture,
+    ) -> dict[str, object]:
+        snapshot = capture.risk_snapshot
+        return {
+            **capture.context.payload(),
             "commissioning_id": commissioning_id,
+            "runtime_snapshot_generation": capture.generation,
+            "runtime_snapshot_token": capture.guard_token,
             "account": snapshot.account_name,
             "account_class": snapshot.account_class,
             "instrument": snapshot.instrument,
-            "current_position": self._position.value,
-            "current_position_quantity": self._position_quantity,
+            "current_position": capture.position.value,
+            "current_position_quantity": capture.position_quantity,
             "broker_snapshot_position": snapshot.current_position.value,
             "broker_snapshot_position_quantity": snapshot.current_position_quantity,
             "working_owned_orders": snapshot.working_owned_orders,
@@ -293,11 +405,11 @@ class LaneIIIPaperRuntime:
             "unresolved_command": snapshot.unresolved_command,
             "unresolved_native_order": snapshot.unresolved_native_order,
             "unresolved_execution": snapshot.unresolved_execution,
-            "entry_owner": self._entry_owner.value,
-            "commissioning_ownership_active": self._commissioning_ownership is not None,
+            "entry_owner": capture.entry_owner.value,
+            "commissioning_ownership_active": capture.commissioning_ownership is not None,
             "live_capital": "DENIED",
-            "runtime_state": self._state.value,
-            "transport": transport,
+            "runtime_state": capture.state.value,
+            "transport": None if capture.transport_status is None else capture.transport_status.as_dict(),
         }
 
     def _load_unresolved_commissioning_ownership(self) -> _CommissioningOwnership | None:
@@ -346,6 +458,7 @@ class LaneIIIPaperRuntime:
             self._snapshot, observed_at=_now(), commissioning_session_warmed=False,
         )
         if changed:
+            self._advance_commissioning_authority_epoch()
             self.ledger.append(
                 "COMMISSIONING_SESSION_WARMUP_RESET",
                 {
@@ -372,6 +485,7 @@ class LaneIIIPaperRuntime:
             self._commissioning_warmup_context = context
         if self._commissioning_warmup_warmed_at is not None:
             return
+        prior_families = set(self._commissioning_warmup_seen)
         for evidence in self.policy.active_evidence(at):
             if (
                 evidence.family not in _COMMISSIONING_REQUIRED_FAMILIES
@@ -388,6 +502,8 @@ class LaneIIIPaperRuntime:
                 "source_observation_ids": list(evidence.source_observation_ids),
                 "source_local_sequences": list(evidence.source_local_sequences),
             })
+        if set(self._commissioning_warmup_seen) != prior_families:
+            self._advance_commissioning_authority_epoch()
         required = set(_COMMISSIONING_WARMUP_POLICY["required_families"])
         if set(self._commissioning_warmup_seen) != required:
             return
@@ -422,6 +538,7 @@ class LaneIIIPaperRuntime:
         )
         self._commissioning_ownership = None
         self._entry_owner = PaperEntryOwner.NONE
+        self._advance_commissioning_authority_epoch()
 
     def _record_strategy_suppression(self, decision: PaperDecision, context: PaperSessionContext) -> None:
         ownership = self._commissioning_ownership
@@ -480,6 +597,7 @@ class LaneIIIPaperRuntime:
         prior = self._session_context
         if self._context_identity(prior) == self._context_identity(context):
             return
+        self._advance_commissioning_authority_epoch()
         self._reset_commissioning_warmup("SESSION_CHANGED:" + reason)
         if prior.session_kind is not PaperSessionKind.OFF_SESSION:
             self._close_session(prior, reason)
@@ -616,6 +734,7 @@ class LaneIIIPaperRuntime:
             raise RuntimeError(f"Illegal paper state transition {prior.value} -> {target.value}.")
         self._state = target
         self._transitions += 1
+        self._advance_commissioning_authority_epoch()
         transition_identity = "l3g-transition-" + canonical_hash({"number": self._transitions, "prior": prior.value, "target": target.value, "reason": reason, "process_session": id(self)})
         self.ledger.append("SESSION_TRANSITION", {"prior_state": prior.value, "state": target.value, "reason": reason}, identity=transition_identity, execution_session_id=self._execution_session_id())
 
@@ -654,6 +773,7 @@ class LaneIIIPaperRuntime:
 
     def on_execution_bridge_state(self, state: str) -> None:
         with self._lock:
+            self._advance_commissioning_authority_epoch()
             healthy = state == "AUTHENTICATED"
             was_healthy = self._snapshot.execution_bridge_healthy
             if state == "DISCONNECTED":
@@ -680,6 +800,7 @@ class LaneIIIPaperRuntime:
 
     def on_observation_transport_state(self, state: StreamHealth) -> None:
         with self._lock:
+            self._advance_commissioning_authority_epoch()
             reset_before = self.policy.reset_count()
             self.policy.on_transport_state(state)
             reset_after = self.policy.reset_count()
@@ -694,6 +815,7 @@ class LaneIIIPaperRuntime:
 
     def on_observation_rejection(self, error: NinjaTraderObservationError) -> None:
         with self._lock:
+            self._advance_commissioning_authority_epoch()
             self.policy.on_rejection(error)
             self._reset_commissioning_warmup("OBSERVATION_REJECTED:" + error.code.value)
             self._last_policy_reset_count = self.policy.reset_count()
@@ -832,7 +954,17 @@ class LaneIIIPaperRuntime:
             update["depth_reset_recovery"] = depth_recovering
             if warmed:
                 update["local_sequence_gap"] = False
+            prior_snapshot = self._snapshot
             self._snapshot = replace(self._snapshot, **update)
+            commissioning_guard_fields = (
+                "market_price_connected", "evidence_warmed", "commissioning_session_warmed",
+                "local_sequence_gap", "depth_reset_recovery",
+            )
+            if any(
+                getattr(prior_snapshot, field) != getattr(self._snapshot, field)
+                for field in commissioning_guard_fields
+            ):
+                self._advance_commissioning_authority_epoch()
             self._observe_commissioning_warmup(event_at)
             if decision is None:
                 self._evaluate_risk_exit(observation.ninja_receipt_time)
@@ -1128,6 +1260,7 @@ class LaneIIIPaperRuntime:
 
     def on_execution_message(self, message: Mapping[str, object]) -> None:
         with self._lock:
+            self._advance_commissioning_authority_epoch()
             message_type = str(message.get("message_type", ""))
             if message_type == "RECONCILIATION":
                 self._apply_reconciliation(message)
@@ -1590,17 +1723,55 @@ class LaneIIIPaperRuntime:
             "fresh": 0 <= age <= maximum_seconds,
         }
 
+    def _run_commissioning_ledger_preflight(
+        self,
+        commissioning_id: str,
+        capture: _CommissioningReadinessCapture,
+        ledger_preflight: Callable[[str, Mapping[str, object]], Mapping[str, object]] | None,
+    ) -> tuple[dict[str, object] | None, str | None, float]:
+        """Run a ledger validator; callers keep the live pass outside the runtime lock."""
+        started = time.perf_counter()
+        ledger_evidence: dict[str, object] | None = None
+        ledger_blocker: str | None = None
+        if ledger_preflight is None:
+            ledger_blocker = "COMMISSIONING_LEDGER_STATUS_UNKNOWN"
+        else:
+            try:
+                result = ledger_preflight(
+                    commissioning_id, self._commissioning_runtime_snapshot(commissioning_id, capture),
+                )
+                if not isinstance(result, Mapping):
+                    raise RuntimeError("Commissioning ledger preflight returned an invalid result.")
+                ledger_evidence = dict(result)
+            except Exception as exc:
+                detail = str(getattr(exc, "detail", None) or exc or type(exc).__name__)
+                prefix = detail.split(":", 1)[0].strip()
+                ledger_blocker = (
+                    prefix if prefix.startswith("COMMISSIONING_")
+                    else "COMMISSIONING_LEDGER_PREFLIGHT_FAILED"
+                )
+                ledger_evidence = {"status": "BLOCKED", "detail": detail}
+        return ledger_evidence, ledger_blocker, time.perf_counter() - started
+
     def _commissioning_readiness_locked(
         self,
         *,
         at: str,
         commissioning_id: str,
-        ledger_preflight: Callable[[str, Mapping[str, object]], Mapping[str, object]] | None,
+        capture: _CommissioningReadinessCapture,
+        ledger_evidence: dict[str, object] | None,
+        ledger_blocker: str | None,
+        preflight_duration_seconds: float,
     ) -> dict[str, object]:
-        """One pure validator graph shared by rehearsal, ARM, and atomic start."""
+        """Revalidate a completed ledger preflight against current authority facts."""
         context = self._session_context
         transport_status = None if self._transport is None else self._transport.status()
+        current_guard_token = canonical_hash(self._commissioning_guard_payload_locked(transport_status))
+        stale_snapshot = current_guard_token != capture.guard_token
         blocking: list[str] = []
+        if stale_snapshot:
+            blocking.append("COMMISSIONING_READINESS_SNAPSHOT_STALE")
+            self._commissioning_stale_snapshot_refusals += 1
         if self._state is not PaperRuntimeState.READY_DISARMED:
             blocking.append("STATE_NOT_READY_DISARMED")
         if self._entry_owner is not PaperEntryOwner.NONE or self._commissioning_ownership is not None:
@@ -1615,27 +1786,9 @@ class LaneIIIPaperRuntime:
         )
         if not session_current:
             blocking.append("NO_CURRENT_EVENT_SESSION")
-        risk_reasons = self.risk.preflight_reasons(self._snapshot, at=at, commissioning=True)
-        blocking.extend(risk_reasons)
-        ledger_evidence: dict[str, object] | None = None
-        ledger_blocker: str | None = None
-        if ledger_preflight is None:
-            ledger_blocker = "COMMISSIONING_LEDGER_STATUS_UNKNOWN"
+        blocking.extend(self.risk.preflight_reasons(self._snapshot, at=at, commissioning=True))
+        if ledger_blocker is not None:
             blocking.append(ledger_blocker)
-        else:
-            try:
-                result = ledger_preflight(
-                    commissioning_id, self._commissioning_runtime_snapshot(commissioning_id),
-                )
-                if not isinstance(result, Mapping):
-                    raise RuntimeError("Commissioning ledger preflight returned an invalid result.")
-                ledger_evidence = dict(result)
-            except Exception as exc:
-                detail = str(getattr(exc, "detail", None) or exc or type(exc).__name__)
-                prefix = detail.split(":", 1)[0].strip()
-                ledger_blocker = prefix if prefix.startswith("COMMISSIONING_") else "COMMISSIONING_LEDGER_PREFLIGHT_FAILED"
-                blocking.append(ledger_blocker)
-                ledger_evidence = {"status": "BLOCKED", "detail": detail}
         freshness = {
             "quote": self._freshness_gate(
                 self._snapshot.quote_observed_at, RISK_PROFILE.quote_maximum_age_seconds, at,
@@ -1657,11 +1810,19 @@ class LaneIIIPaperRuntime:
             for family in _COMMISSIONING_REQUIRED_FAMILIES
         }
         reasons = tuple(dict.fromkeys(blocking))
+        self._last_commissioning_preflight_duration_seconds = preflight_duration_seconds
         payload: dict[str, object] = {
             "schema": "lane-iii-phase-g-commissioning-readiness-v1",
             "result": "READY" if not reasons else "BLOCKED",
             "generated_at": normalized_utc(at, "Commissioning readiness time"),
             "commissioning_id": commissioning_id,
+            "runtime_snapshot": {
+                "generation": capture.generation,
+                "token": capture.guard_token,
+                "current_token": current_guard_token,
+                "stale": stale_snapshot,
+            },
+            "commissioning_preflight_duration_seconds": round(preflight_duration_seconds, 6),
             "session": {
                 **context.payload(),
                 "current": session_current,
@@ -1720,13 +1881,20 @@ class LaneIIIPaperRuntime:
     ) -> dict[str, object]:
         """Return a hash-bound, authority-free rehearsal of production validators."""
         with self._lock:
-            at = _now()
+            started_at = _now()
             commissioning_id = "l3g-commissioning-rehearsal-" + canonical_hash({
-                "at": at, "session_id": self._session_context.session_id,
+                "at": started_at, "session_id": self._session_context.session_id,
                 "session_generation": self._session_context.session_generation,
             })[:32]
+            capture = self._capture_commissioning_readiness_locked()
+        ledger_evidence, ledger_blocker, duration = self._run_commissioning_ledger_preflight(
+            commissioning_id, capture, ledger_preflight,
+        )
+        with self._lock:
             return self._commissioning_readiness_locked(
-                at=at, commissioning_id=commissioning_id, ledger_preflight=ledger_preflight,
+                at=_now(), commissioning_id=commissioning_id, capture=capture,
+                ledger_evidence=ledger_evidence, ledger_blocker=ledger_blocker,
+                preflight_duration_seconds=duration,
             )
 
     def arm(self) -> dict[str, object]:
@@ -1780,78 +1948,161 @@ class LaneIIIPaperRuntime:
         request_id: str | None = None,
     ) -> dict[str, object]:
         """Atomically reserve commissioning ownership before exposing ARMED_FLAT."""
+        identity = commissioning_id or "l3g-commissioning-" + uuid4().hex
         with self._lock:
-            context = self._session_context
+            capture = self._capture_commissioning_readiness_locked()
+        ledger_evidence, ledger_blocker, duration = self._run_commissioning_ledger_preflight(
+            identity, capture, ledger_preflight,
+        )
+        with self._lock:
+            return self._commit_commissioning_arm_locked(
+                identity=identity, request_id=request_id, capture=capture,
+                ledger_evidence=ledger_evidence, ledger_blocker=ledger_blocker,
+                preflight_duration_seconds=duration, ledger_preflight=ledger_preflight,
+            )
+
+    def _commit_commissioning_arm_locked(
+        self,
+        *,
+        identity: str,
+        request_id: str | None,
+        capture: _CommissioningReadinessCapture,
+        ledger_evidence: dict[str, object] | None,
+        ledger_blocker: str | None,
+        preflight_duration_seconds: float,
+        ledger_preflight: Callable[[str, Mapping[str, object]], Mapping[str, object]] | None,
+    ) -> dict[str, object]:
+        """Revalidate and reserve while holding the sole entry-admission lock."""
+        now = _now()
+        readiness = self._commissioning_readiness_locked(
+            at=now, commissioning_id=identity, capture=capture,
+            ledger_evidence=ledger_evidence, ledger_blocker=ledger_blocker,
+            preflight_duration_seconds=preflight_duration_seconds,
+        )
+        reasons = tuple(str(value) for value in readiness["blocking_reasons"])
+        if reasons or ledger_preflight is None:
+            return self._finalize_commissioning_arm_locked(
+                identity=identity, request_id=request_id, now=now,
+                readiness=readiness, reasons=reasons,
+            )
+        # Seal ledger admission as well as runtime admission across the final
+        # proof and durable reservation.  The callback's barrier is reentrant
+        # on the ledger ordering lock, while external receipts and observations
+        # must order strictly after the reservation.
+        with self.ledger.commissioning_authority_fence():
+            final_capture = self._capture_commissioning_readiness_locked()
+            final_evidence, final_blocker, final_duration = self._run_commissioning_ledger_preflight(
+                identity, final_capture, ledger_preflight,
+            )
+            preflight_duration_seconds += final_duration
             now = _now()
-            identity = commissioning_id or "l3g-commissioning-" + uuid4().hex
             readiness = self._commissioning_readiness_locked(
-                at=now, commissioning_id=identity, ledger_preflight=ledger_preflight,
+                at=now, commissioning_id=identity, capture=final_capture,
+                ledger_evidence=final_evidence, ledger_blocker=final_blocker,
+                preflight_duration_seconds=preflight_duration_seconds,
             )
             reasons = tuple(str(value) for value in readiness["blocking_reasons"])
-            allowed = not reasons
-            # Count the same pure risk predicates only for a real authority attempt.
-            risk_allowed, risk_reasons = self.risk.preflight(
-                self._snapshot, at=now, commissioning=True,
+            return self._finalize_commissioning_arm_locked(
+                identity=identity, request_id=request_id, now=now,
+                readiness=readiness, reasons=reasons,
             )
-            if not risk_allowed:
-                reasons = tuple(dict.fromkeys((*reasons, *risk_reasons)))
-                allowed = False
-            self.ledger.append(
-                "RISK_EVENT_COMMISSIONING_ARM_ATTEMPT",
-                {
-                    **context.payload(), "allowed": allowed, "reason_codes": reasons,
-                    "authority_hash": canonical_hash(AUTHORITY.authority_payload()),
-                    "readiness_snapshot_hash": readiness["snapshot_hash"],
-                },
-                execution_session_id=self._execution_session_id(),
-            )
-            if not allowed:
-                return {"armed": False, "reason_codes": reasons, "state": self._state.value}
-            ledger_evidence = dict(readiness["ledger"])  # type: ignore[arg-type]
-            self.ledger.append(
-                "COMMISSIONING_PREFLIGHT_ACCEPTED",
-                {
-                    **context.payload(), "commissioning_id": identity,
-                    "request_id": request_id,
-                    "readiness_snapshot_hash": readiness["snapshot_hash"],
-                    "commissioning_warmup_policy_hash": _COMMISSIONING_WARMUP_POLICY_HASH,
-                    "reason": "ALL_PRODUCTION_COMMISSIONING_VALIDATORS_ACCEPTED",
-                },
-                identity="l3g-commissioning-preflight-accepted-" + identity,
-                execution_session_id=self._execution_session_id(),
-            )
-            ownership = _CommissioningOwnership(
-                identity,
-                "l3g-commissioning-token-" + uuid4().hex,
-                context, now, request_id=request_id, ledger_preflight=ledger_evidence,
-            )
-            # This assignment occurs while READY_DISARMED is still true.  No
-            # strategy thread can observe an entry-capable state without the
-            # reservation because the same lock guards admission and transition.
-            self._commissioning_ownership = ownership
-            self._entry_owner = PaperEntryOwner.COMMISSIONING
-            self._armed_session = PaperSessionArmGrant(
-                context.session_kind, context.session_id, context.trade_date, context.session_profile_hash,
-                context.session_generation, now,
-                context.boundary_at("entry_cutoff").isoformat().replace("+00:00", "Z"),
-            )
-            self._entries_paused = False
-            reservation_payload = self._ownership_payload(ownership, reason="COMMISSIONING_ARM_AFTER_PREFLIGHT")
-            if ledger_evidence is not None:
-                reservation_payload["ledger_preflight"] = ledger_evidence
-            self.ledger.append(
-                "COMMISSIONING_OWNERSHIP_RESERVED", reservation_payload,
-                identity="l3g-commissioning-ownership-reserved-" + ownership.commissioning_id,
-                execution_session_id=self._execution_session_id(),
-            )
-            self._transition(PaperRuntimeState.ARMED_FLAT, "COMMISSIONING_OWNERSHIP_RESERVED")
-            return {
-                "armed": True, "commissioning": True, "reason_codes": ("COMMISSIONING_OWNERSHIP_RESERVED",),
-                "state": self._state.value, "commissioning_id": ownership.commissioning_id,
-                "commissioning_token": ownership.commissioning_token,
-                "session_armed_state": "ARMED_" + context.session_kind.value, "arm_grant": self._armed_session.payload(),
-                "ledger_preflight": ledger_evidence,
-            }
+
+    def _finalize_commissioning_arm_locked(
+        self,
+        *,
+        identity: str,
+        request_id: str | None,
+        now: str,
+        readiness: Mapping[str, object],
+        reasons: tuple[str, ...],
+    ) -> dict[str, object]:
+        """Record the final decision and reserve while caller-owned fences hold."""
+        allowed = not reasons
+        risk_allowed, risk_reasons = self.risk.preflight(
+            self._snapshot, at=now, commissioning=True,
+        )
+        if not risk_allowed:
+            reasons = tuple(dict.fromkeys((*reasons, *risk_reasons)))
+            allowed = False
+        context = self._session_context
+        self.ledger.append(
+            "RISK_EVENT_COMMISSIONING_ARM_ATTEMPT",
+            {
+                **context.payload(), "allowed": allowed, "reason_codes": reasons,
+                "authority_hash": canonical_hash(AUTHORITY.authority_payload()),
+                "readiness_snapshot_hash": readiness["snapshot_hash"],
+            },
+            execution_session_id=self._execution_session_id(),
+        )
+        if not allowed:
+            return {"armed": False, "reason_codes": reasons, "state": self._state.value}
+        accepted_ledger_evidence = dict(readiness["ledger"])  # type: ignore[arg-type]
+        self.ledger.append(
+            "COMMISSIONING_PREFLIGHT_ACCEPTED",
+            {
+                **context.payload(), "commissioning_id": identity,
+                "request_id": request_id,
+                "readiness_snapshot_hash": readiness["snapshot_hash"],
+                "commissioning_warmup_policy_hash": _COMMISSIONING_WARMUP_POLICY_HASH,
+                "reason": "ALL_PRODUCTION_COMMISSIONING_VALIDATORS_ACCEPTED",
+            },
+            identity="l3g-commissioning-preflight-accepted-" + identity,
+            execution_session_id=self._execution_session_id(),
+        )
+        ownership = _CommissioningOwnership(
+            identity,
+            "l3g-commissioning-token-" + uuid4().hex,
+            context, now, request_id=request_id, ledger_preflight=accepted_ledger_evidence,
+        )
+        self._commissioning_ownership = ownership
+        self._entry_owner = PaperEntryOwner.COMMISSIONING
+        self._advance_commissioning_authority_epoch()
+        self._armed_session = PaperSessionArmGrant(
+            context.session_kind, context.session_id, context.trade_date, context.session_profile_hash,
+            context.session_generation, now,
+            context.boundary_at("entry_cutoff").isoformat().replace("+00:00", "Z"),
+        )
+        self._entries_paused = False
+        reservation_payload = self._ownership_payload(ownership, reason="COMMISSIONING_ARM_AFTER_PREFLIGHT")
+        reservation_payload["ledger_preflight"] = accepted_ledger_evidence
+        self.ledger.append(
+            "COMMISSIONING_OWNERSHIP_RESERVED", reservation_payload,
+            identity="l3g-commissioning-ownership-reserved-" + ownership.commissioning_id,
+            execution_session_id=self._execution_session_id(),
+        )
+        self._transition(PaperRuntimeState.ARMED_FLAT, "COMMISSIONING_OWNERSHIP_RESERVED")
+        accepted_ledger_evidence["authority_commit_checkpoint"] = (
+            self.ledger.commissioning_authority_checkpoint()
+        )
+        ownership = replace(ownership, ledger_preflight=accepted_ledger_evidence)
+        self._commissioning_ownership = ownership
+        return {
+            "armed": True, "commissioning": True, "reason_codes": ("COMMISSIONING_OWNERSHIP_RESERVED",),
+            "state": self._state.value, "commissioning_id": ownership.commissioning_id,
+            "commissioning_token": ownership.commissioning_token,
+            "session_armed_state": "ARMED_" + context.session_kind.value,
+            "arm_grant": self._armed_session.payload(),
+            "ledger_preflight": accepted_ledger_evidence,
+        }
+
+    def _active_commissioning_replay_locked(
+        self, commissioning_id: str, request_id: str,
+    ) -> dict[str, object] | None:
+        ownership = self._commissioning_ownership
+        if ownership is None or ownership.commissioning_id != commissioning_id:
+            return None
+        return {
+            "submitted": ownership.entry_consumed,
+            "commissioning": True,
+            "commissioning_id": commissioning_id,
+            "request_id": request_id,
+            "idempotent_replay": True,
+            "entry_consumed": ownership.entry_consumed,
+            "ownership_released": False,
+            "decision_id": ownership.entry_decision_id,
+            "state": self._state.value,
+            "reason_codes": ("COMMISSIONING_START_ALREADY_ACCEPTED",),
+        }
 
     def commissioning_start(
         self,
@@ -1866,40 +2117,57 @@ class LaneIIIPaperRuntime:
             raise ValueError("Commissioning start requires an 8-128 character idempotency request ID.")
         commissioning_id = "l3g-commissioning-" + canonical_hash({"request_id": request_id})[:32]
         with self._lock:
-            prior = self.ledger.commissioning_ownership(commissioning_id)
-            if prior is not None:
-                record, consumed, released = prior
-                payload = record.get("payload") if isinstance(record, Mapping) else None
-                return {
-                    "submitted": consumed,
-                    "commissioning": True,
-                    "commissioning_id": commissioning_id,
-                    "request_id": request_id,
-                    "idempotent_replay": True,
-                    "entry_consumed": consumed,
-                    "ownership_released": released,
-                    "decision_id": payload.get("entry_decision_id") if isinstance(payload, Mapping) else None,
-                    "state": self._state.value,
-                    "reason_codes": ("COMMISSIONING_START_ALREADY_ACCEPTED",),
-                }
-            armed = self.commissioning_arm(
-                ledger_preflight, commissioning_id=commissioning_id, request_id=request_id,
-            )
-            if not armed.get("armed"):
-                return {
-                    **armed, "submitted": False, "commissioning": True,
-                    "commissioning_id": commissioning_id, "request_id": request_id,
-                }
-            submitted = self.commission_entry(
-                str(armed["commissioning_id"]), str(armed["commissioning_token"]),
-            )
+            active_replay = self._active_commissioning_replay_locked(commissioning_id, request_id)
+        if active_replay is not None:
+            return active_replay
+        prior = self.ledger.commissioning_ownership(commissioning_id)
+        if prior is not None:
+            record, consumed, released = prior
+            payload = record.get("payload") if isinstance(record, Mapping) else None
+            with self._lock:
+                state = self._state.value
             return {
-                **submitted,
-                "armed": True,
-                "atomic_start": True,
+                "submitted": consumed,
+                "commissioning": True,
+                "commissioning_id": commissioning_id,
                 "request_id": request_id,
-                "ledger_preflight": armed.get("ledger_preflight"),
+                "idempotent_replay": True,
+                "entry_consumed": consumed,
+                "ownership_released": released,
+                "decision_id": payload.get("entry_decision_id") if isinstance(payload, Mapping) else None,
+                "state": state,
+                "reason_codes": ("COMMISSIONING_START_ALREADY_ACCEPTED",),
             }
+        with self._lock:
+            capture = self._capture_commissioning_readiness_locked()
+        ledger_evidence, ledger_blocker, duration = self._run_commissioning_ledger_preflight(
+            commissioning_id, capture, ledger_preflight,
+        )
+        with self._lock:
+            concurrent_replay = self._active_commissioning_replay_locked(commissioning_id, request_id)
+            if concurrent_replay is not None:
+                return concurrent_replay
+            with self.ledger.commissioning_authority_fence():
+                armed = self._commit_commissioning_arm_locked(
+                    identity=commissioning_id, request_id=request_id, capture=capture,
+                    ledger_evidence=ledger_evidence, ledger_blocker=ledger_blocker,
+                    preflight_duration_seconds=duration, ledger_preflight=ledger_preflight,
+                )
+                if not armed.get("armed"):
+                    return {
+                        **armed, "submitted": False, "commissioning": True,
+                        "commissioning_id": commissioning_id, "request_id": request_id,
+                    }
+                submitted = self.commission_entry(
+                    str(armed["commissioning_id"]), str(armed["commissioning_token"]),
+                )
+                return {
+                    **submitted,
+                    "armed": True,
+                    "atomic_start": True,
+                    "request_id": request_id,
+                    "ledger_preflight": armed.get("ledger_preflight"),
+                }
 
     def commission_entry(self, commissioning_id: str, commissioning_token: str) -> dict[str, object]:
         """Submit one sealed, non-strategy commissioning entry through normal safety gates.
@@ -1910,7 +2178,7 @@ class LaneIIIPaperRuntime:
         emitted an admissible decision.  The decision provenance is marked as
         commissioning-only and is excluded from strategy and scientific evidence.
         """
-        with self._lock:
+        with self._lock, self.ledger.commissioning_authority_fence():
             ownership = self._commissioning_ownership
             if ownership is None or self._entry_owner is not PaperEntryOwner.COMMISSIONING:
                 return {"submitted": False, "reason_codes": ("COMMISSIONING_OWNERSHIP_REQUIRED",), "state": self._state.value}
@@ -1925,6 +2193,32 @@ class LaneIIIPaperRuntime:
                 }
             if self._state is not PaperRuntimeState.ARMED_FLAT or self._entries_paused:
                 return {"submitted": False, "reason_codes": ("PAPER_NOT_ARMED_FLAT",), "state": self._state.value}
+            expected_checkpoint = (
+                ownership.ledger_preflight.get("authority_commit_checkpoint")
+                if isinstance(ownership.ledger_preflight, Mapping) else None
+            )
+            current_checkpoint = self.ledger.commissioning_authority_checkpoint()
+            checkpoint_keys = (
+                "policy_version", "ledger_identity", "ledger_epoch", "ledger_schema_version",
+                "last_external_authority_sequence", "last_external_authority_hash",
+            )
+            if not isinstance(expected_checkpoint, Mapping) or any(
+                expected_checkpoint.get(key) != current_checkpoint.get(key)
+                for key in checkpoint_keys
+            ):
+                reasons = ("COMMISSIONING_LEDGER_AUTHORITY_CHANGED_AFTER_ARM",)
+                self.ledger.append(
+                    "RISK_EVENT_COMMISSIONING_PREFLIGHT",
+                    {
+                        **self._ownership_payload(ownership, reason=reasons[0]),
+                        "commissioning": True, "strategy_generated": False,
+                        "scientific_evidence": False, "allowed": False,
+                        "reason_codes": reasons,
+                    },
+                    execution_session_id=self._execution_session_id(),
+                )
+                self._abort_unsubmitted_commissioning(reasons[0])
+                return {"submitted": False, "reason_codes": reasons, "state": self._state.value}
             context = self._session_context
             now = _now()
             current = self._session_resolver.resolve(now, generation=context.session_generation).context
@@ -2232,6 +2526,11 @@ class LaneIIIPaperRuntime:
                 "account_class": "LOCAL_SIMULATION",
                 "maximum_quantity": 1,
                 "live_capital": "DENIED",
+                "commissioning_readiness_snapshot_generation": self._commissioning_readiness_generation,
+                "commissioning_authority_epoch": self._commissioning_authority_epoch,
+                "commissioning_readiness_snapshot_token": self._last_commissioning_snapshot_token,
+                "commissioning_preflight_duration_seconds": self._last_commissioning_preflight_duration_seconds,
+                "commissioning_stale_snapshot_refusal_count": self._commissioning_stale_snapshot_refusals,
                 "warning": "EXPERIMENTAL PAPER EXECUTION / NOT SCIENTIFICALLY COMMISSIONED / SIM101 ONLY / LIVE CAPITAL DENIED",
                 "current_position": self._position.value,
                 "current_quantity": self._position_quantity,

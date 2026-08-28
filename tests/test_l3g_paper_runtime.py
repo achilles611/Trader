@@ -26,7 +26,12 @@ from .l3g_helpers import ObservationFactory, warmed_bullish_policy
 class PaperRuntimeTests(unittest.TestCase):
     @staticmethod
     def reserve_commissioning(runtime: LaneIIIPaperRuntime, context: object, now: str) -> tuple[str, str]:
-        ownership = _CommissioningOwnership("l3g-commissioning-test", "l3g-commissioning-token-test", context, now)  # type: ignore[arg-type]
+        ownership = _CommissioningOwnership(
+            "l3g-commissioning-test", "l3g-commissioning-token-test", context, now,
+            ledger_preflight={
+                "authority_commit_checkpoint": runtime.ledger.commissioning_authority_checkpoint(),
+            },
+        )  # type: ignore[arg-type]
         runtime._commissioning_ownership = ownership
         runtime._entry_owner = PaperEntryOwner.COMMISSIONING
         return ownership.commissioning_id, ownership.commissioning_token

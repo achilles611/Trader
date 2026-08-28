@@ -5,6 +5,7 @@ from decimal import Decimal
 import json
 from pathlib import Path
 import socket
+import threading
 import time
 from tempfile import TemporaryDirectory
 import unittest
@@ -162,6 +163,112 @@ class PaperTransportTests(unittest.TestCase):
             self.assertEqual(captured[0]["session_id"], session)
             self.assertTrue(verify_signature(key, captured[0]))
             ledger.close()
+
+    def test_receipt_ingress_and_ordinary_send_have_one_deadlock_free_lock_order(self) -> None:
+        with TemporaryDirectory() as directory:
+            key = bytes(range(32))
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            transport = PaperExecutionTransport(ledger, port=free_port())
+            session = "l3g-es-lock-order-test"
+            created = datetime.now(timezone.utc)
+            created_text = created.isoformat().replace("+00:00", "Z")
+            expiry = (created + timedelta(seconds=5)).isoformat().replace("+00:00", "Z")
+            grant = PaperRiskGrant(
+                "l3g-pg-" + "e" * 32, "l3g-pi-" + "f" * 32,
+                RISK_PROFILE.configuration_hash, ACCOUNT_BINDING.binding_hash, True,
+                ("PAPER_RISK_GRANTED",), created_text, expiry, PaperDirection.FLAT,
+                0, Decimal("0"), Decimal("0"), 0, 0,
+            )
+            command = PaperExecutionCommand(
+                "l3g-pc-" + "1" * 32, 1, session, grant.intent_id,
+                "l3g-pd-" + "2" * 32, ExecutionAction.RECONCILE, "Sim101",
+                "LOCAL_SIMULATION", "MNQ SEP26", 0, PaperDirection.FLAT,
+                created_text, expiry, POLICY.configuration_hash,
+                RISK_PROFILE.configuration_hash, ACCOUNT_BINDING.binding_hash,
+                "LOCK_ORDER_TEST", grant.grant_id,
+            )
+            ledger.append("COMMAND", command.payload(), identity=command.command_id)
+            with transport._lock:
+                transport._key = key
+                transport._state = "AUTHENTICATED"
+                transport._authenticated = True
+                transport._reconciled = True
+                transport._execution_session_id = session
+            captured: list[dict[str, object]] = []
+            transport._send_pre_signed = lambda payload: captured.append(dict(payload))  # type: ignore[method-assign]
+            ingress_has_ledger_fence = threading.Event()
+            release_ingress = threading.Event()
+            original_validate = transport._validate_reconciliation
+
+            def validate(payload: object) -> bool:
+                ingress_has_ledger_fence.set()
+                if not release_ingress.wait(5):
+                    raise TimeoutError("receipt ingress was not released")
+                return original_validate(payload)  # type: ignore[arg-type]
+
+            transport._validate_reconciliation = validate  # type: ignore[method-assign]
+            send_reached_ledger = threading.Event()
+            original_contains = ledger.contains
+
+            def contains(identity: str) -> bool:
+                send_reached_ledger.set()
+                return original_contains(identity)
+
+            ledger.contains = contains  # type: ignore[method-assign]
+            receipt: dict[str, object] = {
+                "schema": EXECUTION_SCHEMA,
+                "message_type": "RECONCILIATION",
+                "execution_session_id": session,
+                "receipt_id": "l3g-lock-order-reconciliation",
+                "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "account_name": "Sim101",
+                "account_class": "LOCAL_SIMULATION",
+                "instrument": "MNQ SEP26",
+                "position_quantity": 0,
+                "working_order_count": 0,
+                "position_snapshot_complete": True,
+                "order_snapshot_complete": True,
+            }
+            receipt["signature"] = sign_payload(key, receipt)
+            frame = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            errors: list[BaseException] = []
+
+            def receive() -> None:
+                try:
+                    transport._receive_frame(frame)
+                except BaseException as exc:  # pragma: no cover - surfaced below
+                    errors.append(exc)
+
+            def send() -> None:
+                try:
+                    transport.send_command(command, grant)
+                except BaseException as exc:  # pragma: no cover - surfaced below
+                    errors.append(exc)
+
+            receipt_thread = threading.Thread(target=receive)
+            send_thread = threading.Thread(target=send)
+            try:
+                receipt_thread.start()
+                self.assertTrue(ingress_has_ledger_fence.wait(2))
+                send_thread.start()
+                self.assertTrue(send_reached_ledger.wait(2))
+                acquired = transport._lock.acquire(timeout=0.5)
+                self.assertTrue(acquired, "ordinary send held transport lock while waiting for ledger")
+                if acquired:
+                    transport._lock.release()
+                release_ingress.set()
+                receipt_thread.join(3)
+                send_thread.join(3)
+
+                self.assertFalse(receipt_thread.is_alive())
+                self.assertFalse(send_thread.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(len(captured), 1)
+            finally:
+                release_ingress.set()
+                receipt_thread.join(1)
+                send_thread.join(1)
+                ledger.close()
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from enum import StrEnum
 import json
@@ -14,6 +14,7 @@ import re
 import shutil
 import sqlite3
 import threading
+import time
 from typing import Iterator, Mapping
 from uuid import uuid4
 
@@ -724,6 +725,23 @@ def adopt_legacy_epoch(
     return {"adopted": True, "ledger_path": str(ledger_path), "epoch": target, "receipt_path": str(receipt_path)}
 
 
+@dataclass
+class _DeferredLedgerBarrier:
+    """An in-order fence captured by the sole deferred writer."""
+
+    token: int
+    requested_sequences: tuple[int, ...]
+    admitted_at: float = field(default_factory=time.perf_counter)
+    completed: bool = False
+    ledger_sequence: int | None = None
+    record_hash: str | None = None
+    requested_record_hashes: dict[int, str | None] | None = None
+    authority_watermark: dict[str, object] | None = None
+    external_authority_sequence: int = 0
+    external_authority_hash: str | None = None
+    wait_seconds: float | None = None
+
+
 class PaperLedger:
     """Thread-safe append-only domain ledger with one global hash chain."""
 
@@ -748,6 +766,7 @@ class PaperLedger:
         self._connection.execute("PRAGMA synchronous=FULL")
         self._synchronous_mode = "FULL"
         self._connection.execute("PRAGMA foreign_keys=ON")
+        self._session_context_lock = threading.Lock()
         self._current_session_context = UNSPECIFIED_OFF_SESSION_CONTEXT
         self._create_schema()
         row = self._connection.execute(
@@ -774,14 +793,26 @@ class PaperLedger:
         self._authority_watermark = self._load_or_rebuild_authority_watermark(
             metadata.get(_COMMISSIONING_WATERMARK_METADATA_KEY)
         )
+        # Process-local execution-input generation. Active commissioning
+        # ownership is never restored across restart, so this cursor only needs
+        # to distinguish new bridge receipts within this process lifetime.
+        self._last_external_authority_sequence = 0
+        self._last_external_authority_hash: str | None = None
         self._chain_status: tuple[bool | None, str | None] = (True, None) if self._highest_sequence == 0 else (None, None)
         self._ordering_lock = threading.RLock()
         self._deferred_condition = threading.Condition(threading.Lock())
-        self._deferred: deque[dict[str, object]] = deque()
+        self._deferred: deque[dict[str, object] | _DeferredLedgerBarrier] = deque()
         self._deferred_identities: set[str] = set()
+        self._deferred_record_count = 0
+        self._deferred_queue_high_water = 0
+        self._deferred_barrier_count = 0
         self._deferred_active = False
         self._deferred_error: BaseException | None = None
         self._deferred_stopping = False
+        self._next_barrier_token = 0
+        self._last_barrier_token: int | None = None
+        self._last_barrier_sequence: int | None = None
+        self._last_barrier_wait_seconds: float | None = None
         self._deferred_thread = threading.Thread(
             target=self._deferred_writer,
             name="LaneIIIPaperLedgerWriter",
@@ -793,7 +824,7 @@ class PaperLedger:
         """Set the default envelope for asynchronous paper-path records."""
         if type(context) is not PaperSessionContext:
             raise ValueError("Paper ledger session context must be immutable and exact.")
-        with self._lock:
+        with self._session_context_lock:
             self._current_session_context = context
 
     def _set_synchronous_mode(self, domain: str) -> None:
@@ -1354,7 +1385,7 @@ class PaperLedger:
         at = normalized_utc(occurred_at or _now(), "Paper ledger occurrence time")
         domain = self._domain(kind)
         identity_payload = dict(payload)
-        with self._lock:
+        with self._session_context_lock:
             default_context = self._current_session_context
         session_kind_text = identity_payload.get("session_kind", default_context.session_kind.value)
         try:
@@ -1421,6 +1452,7 @@ class PaperLedger:
             watermark.get("safe_classification_last_sequences") or {}
         )
         inserted = False
+        last_external_authority: tuple[int, str] | None = None
         with self._domain_transaction(synchronous_domain) as connection:
             prior = connection.execute(
                 "SELECT record_hash FROM lane_iii_paper_audit ORDER BY ledger_sequence DESC LIMIT 1"
@@ -1513,6 +1545,12 @@ class PaperLedger:
                     },
                     classification,
                 )
+                if domain in {"COMMAND_RECEIPT", "ORDER_EVENT", "EXECUTION", "POSITION_SNAPSHOT"} or (
+                    domain == "INCIDENT" and kind == "INCIDENT_SAFETY_EVENT"
+                ) or (
+                    domain == "SESSION" and kind == "SESSION_HANDSHAKE"
+                ):
+                    last_external_authority = (sequence, record_hash)
                 watermark.update({
                     "policy_version": COMMISSIONING_TAIL_POLICY_VERSION,
                     "classified_through_sequence": sequence,
@@ -1527,6 +1565,10 @@ class PaperLedger:
                 self._store_authority_watermark(connection, watermark)
         if inserted:
             self._authority_watermark = watermark
+        if last_external_authority is not None:
+            self._last_external_authority_sequence, self._last_external_authority_hash = (
+                last_external_authority
+            )
         return hashes
 
     def append_deferred(
@@ -1544,12 +1586,75 @@ class PaperLedger:
         with self._ordering_lock, self._deferred_condition:
             if self._deferred_error is not None:
                 raise RuntimeError("Deferred paper ledger writer failed.") from self._deferred_error
+            if self._deferred_stopping:
+                raise RuntimeError("Deferred paper ledger writer is stopping.")
             record_identity = str(prepared["identity"])
             if record_identity in self._deferred_identities:
                 return
             self._deferred.append(prepared)
             self._deferred_identities.add(record_identity)
+            self._deferred_record_count += 1
+            self._deferred_queue_high_water = max(
+                self._deferred_queue_high_water, self._deferred_record_count,
+            )
             self._deferred_condition.notify()
+
+    def _commissioning_deferred_barrier(
+        self, requested_sequences: tuple[int, ...],
+    ) -> _DeferredLedgerBarrier:
+        """Wait only for records admitted before an ordered commissioning fence."""
+        with self._ordering_lock, self._deferred_condition:
+            if self._deferred_error is not None:
+                raise RuntimeError("Deferred paper ledger writer failed.") from self._deferred_error
+            if self._deferred_stopping:
+                raise RuntimeError("Deferred paper ledger writer is stopping.")
+            self._next_barrier_token += 1
+            barrier = _DeferredLedgerBarrier(self._next_barrier_token, requested_sequences)
+            self._deferred.append(barrier)
+            self._deferred_barrier_count += 1
+            self._deferred_condition.notify()
+        with self._deferred_condition:
+            while not barrier.completed and self._deferred_error is None:
+                self._deferred_condition.wait(timeout=1.0)
+            if self._deferred_error is not None:
+                raise RuntimeError("Deferred paper ledger writer failed.") from self._deferred_error
+            if not barrier.completed or barrier.ledger_sequence is None or barrier.authority_watermark is None:
+                raise RuntimeError("Deferred paper ledger barrier did not produce a complete snapshot.")
+            return barrier
+
+    @contextmanager
+    def commissioning_authority_fence(self) -> Iterator[None]:
+        """Seal ledger admission across the final authority proof and reserve."""
+        with self._ordering_lock:
+            with self._deferred_condition:
+                if self._deferred_error is not None:
+                    raise RuntimeError("Deferred paper ledger writer failed.") from self._deferred_error
+                if self._deferred_stopping:
+                    raise RuntimeError("Deferred paper ledger writer is stopping.")
+            yield
+
+    def commissioning_authority_checkpoint(self) -> dict[str, object]:
+        """Capture the exact authority/unknown watermark at an ordered fence."""
+        barrier = self._commissioning_deferred_barrier(())
+        watermark = dict(barrier.authority_watermark or {})
+        return {
+            "policy_version": COMMISSIONING_TAIL_POLICY_VERSION,
+            "ledger_identity": self._ledger_uuid,
+            "ledger_epoch": self._ledger_epoch,
+            "ledger_schema_version": self._schema_version,
+            "ledger_sequence": int(barrier.ledger_sequence),
+            "ledger_record_hash": barrier.record_hash,
+            "last_authority_mutation_sequence": int(
+                watermark.get("last_authority_mutation_sequence") or 0
+            ),
+            "last_authority_mutation_hash": watermark.get("last_authority_mutation_hash"),
+            "last_unknown_sequence": int(watermark.get("last_unknown_sequence") or 0),
+            "last_unknown_hash": watermark.get("last_unknown_hash"),
+            "last_external_authority_sequence": barrier.external_authority_sequence,
+            "last_external_authority_hash": barrier.external_authority_hash,
+            "deferred_barrier_token": barrier.token,
+            "deferred_barrier_wait_seconds": round(float(barrier.wait_seconds or 0.0), 6),
+        }
 
     def _deferred_writer(self) -> None:
         while True:
@@ -1558,13 +1663,43 @@ class PaperLedger:
                     self._deferred_condition.wait()
                 if self._deferred_stopping and not self._deferred:
                     return
-                if len(self._deferred) < 512 and not self._deferred_stopping:
+                if self._deferred_record_count < 512 and not self._deferred_barrier_count and not self._deferred_stopping:
                     self._deferred_condition.wait(timeout=0.01)
-                batch = tuple(self._deferred.popleft() for _ in range(min(512, len(self._deferred))))
+                records: list[dict[str, object]] = []
+                barrier: _DeferredLedgerBarrier | None = None
+                while self._deferred and len(records) < 512:
+                    item = self._deferred.popleft()
+                    if isinstance(item, _DeferredLedgerBarrier):
+                        barrier = item
+                        self._deferred_barrier_count -= 1
+                        break
+                    records.append(item)
+                    self._deferred_record_count -= 1
+                batch = tuple(records)
                 self._deferred_active = True
             try:
                 with self._lock:
-                    self._append_prepared(batch)
+                    if batch:
+                        self._append_prepared(batch)
+                    if barrier is not None:
+                        barrier.ledger_sequence = self._highest_sequence
+                        barrier.record_hash = self._final_record_hash
+                        barrier.requested_record_hashes = {}
+                        for sequence in barrier.requested_sequences:
+                            if sequence == 0:
+                                barrier.requested_record_hashes[sequence] = None
+                                continue
+                            row = self._connection.execute(
+                                "SELECT record_hash FROM lane_iii_paper_audit WHERE ledger_sequence=?", (sequence,)
+                            ).fetchone()
+                            barrier.requested_record_hashes[sequence] = None if row is None else str(row["record_hash"])
+                        barrier.authority_watermark = dict(self._authority_watermark)
+                        barrier.authority_watermark["safe_classification_last_sequences"] = dict(
+                            self._authority_watermark.get("safe_classification_last_sequences") or {}
+                        )
+                        barrier.external_authority_sequence = self._last_external_authority_sequence
+                        barrier.external_authority_hash = self._last_external_authority_hash
+                        barrier.wait_seconds = time.perf_counter() - barrier.admitted_at
             except BaseException as error:
                 with self._deferred_condition:
                     self._deferred_error = error
@@ -1574,6 +1709,12 @@ class PaperLedger:
             with self._deferred_condition:
                 for record in batch:
                     self._deferred_identities.discard(str(record["identity"]))
+                if barrier is not None:
+                    barrier.completed = True
+                    if self._last_barrier_token is None or barrier.token >= self._last_barrier_token:
+                        self._last_barrier_token = barrier.token
+                        self._last_barrier_sequence = barrier.ledger_sequence
+                        self._last_barrier_wait_seconds = barrier.wait_seconds
                 self._deferred_active = False
                 self._deferred_condition.notify_all()
 
@@ -1662,8 +1803,7 @@ class PaperLedger:
 
     def unresolved_commissioning_ownership(self) -> tuple[dict[str, object], bool] | None:
         """Read the transactional recovery marker without scanning audit history."""
-        with self._ordering_lock:
-            self.flush_deferred()
+        self._commissioning_deferred_barrier(())
         with self._lock:
             row = self._connection.execute(
                 """
@@ -1684,8 +1824,7 @@ class PaperLedger:
         """Resolve one deterministic commissioning request without replaying it."""
         if not isinstance(commissioning_id, str) or not commissioning_id:
             raise ValueError("Commissioning identity is required.")
-        with self._ordering_lock:
-            self.flush_deferred()
+        self._commissioning_deferred_barrier(())
         with self._lock:
             row = self._connection.execute(
                 """
@@ -1744,92 +1883,85 @@ class PaperLedger:
             type(last_full_verified_sequence) is not int or last_full_verified_sequence < 0
         ):
             raise ValueError("Commissioning Full verified sequence is invalid.")
-        with self._ordering_lock:
-            self.flush_deferred()
-            with self._lock:
-                tip = self._highest_sequence
-                if verified_through_sequence > tip:
-                    raise RuntimeError("Commissioning verified anchor is beyond the current ledger tip.")
-                watermark = dict(self._authority_watermark)
-                if int(watermark.get("classified_through_sequence") or -1) != tip:
-                    raise RuntimeError("Commissioning authority classification does not reach the captured ledger tip.")
-                hashes: dict[int, str | None] = {}
-                requested = {verified_through_sequence}
-                if last_full_verified_sequence is not None:
-                    requested.add(last_full_verified_sequence)
-                for sequence in requested:
-                    if sequence == 0:
-                        hashes[sequence] = None
-                        continue
-                    row = self._connection.execute(
-                        "SELECT record_hash FROM lane_iii_paper_audit WHERE ledger_sequence=?", (sequence,)
-                    ).fetchone()
-                    hashes[sequence] = None if row is None else str(row["record_hash"])
-                safe_last = dict(watermark.get("safe_classification_last_sequences") or {})
-                tail_kinds = sorted(
-                    classification
-                    for classification, sequence in safe_last.items()
-                    if type(sequence) is int and verified_through_sequence < sequence <= tip
-                )
-                passive_shapes = _V2_SAFE_CLASSIFICATIONS - {
-                    "OBSERVATION:OBSERVATION_ENVELOPE:ACCOUNT_ITEM_INFORMATIONAL:AUTHORITY_EFFECT_NONE",
-                }
-                tail_categories: list[str] = []
-                if any(
-                    shape in passive_shapes and verified_through_sequence < sequence <= tip
-                    for shape, sequence in safe_last.items()
-                    if type(sequence) is int
-                ):
-                    tail_categories.append(CommissioningTailCategory.PASSIVE_DATA.value)
-                for prefix, category in (
-                    ("last_authority_observation", CommissioningTailCategory.AUTHORITY_OBSERVATION),
-                    ("last_authority_mutation", CommissioningTailCategory.AUTHORITY_MUTATION),
-                    ("last_unknown", CommissioningTailCategory.UNKNOWN),
-                ):
-                    sequence = watermark.get(f"{prefix}_sequence")
-                    if type(sequence) is int and verified_through_sequence < sequence <= tip:
-                        tail_categories.append(category.value)
-                mutation_sequence = int(watermark.get("last_authority_mutation_sequence") or 0)
-                unknown_sequence = int(watermark.get("last_unknown_sequence") or 0)
-                blocking_prefix = "last_unknown" if unknown_sequence >= mutation_sequence else "last_authority_mutation"
-                blocking_sequence = max(mutation_sequence, unknown_sequence)
-                blocking_classification = (
-                    None if blocking_sequence == 0
-                    else CommissioningTailCategory.UNKNOWN.value
-                    if blocking_prefix == "last_unknown"
-                    else CommissioningTailCategory.AUTHORITY_MUTATION.value
-                )
-                return {
-                    "policy_version": COMMISSIONING_TAIL_POLICY_VERSION,
-                    "ledger_identity": self._ledger_uuid,
-                    "ledger_epoch": self._ledger_epoch,
-                    "ledger_schema_version": self._schema_version,
-                    "verified_through_sequence": verified_through_sequence,
-                    "verified_anchor_record_hash": hashes.get(verified_through_sequence),
-                    "last_full_verified_sequence": last_full_verified_sequence,
-                    "last_full_anchor_record_hash": (
-                        None if last_full_verified_sequence is None else hashes.get(last_full_verified_sequence)
-                    ),
-                    "arm_snapshot_tip": tip,
-                    "arm_snapshot_tip_hash": self._final_record_hash,
-                    "unverified_tail_rows": tip - verified_through_sequence,
-                    "tail_start_sequence": verified_through_sequence + 1 if tip > verified_through_sequence else None,
-                    "tail_end_sequence": tip if tip > verified_through_sequence else None,
-                    "tail_record_kinds": tail_kinds,
-                    "tail_record_categories": tail_categories,
-                    "last_blocking_sequence": blocking_sequence,
-                    "last_blocking_kind": (
-                        None if blocking_sequence == 0 else watermark.get(f"{blocking_prefix}_kind")
-                    ),
-                    "last_blocking_domain": (
-                        None if blocking_sequence == 0 else watermark.get(f"{blocking_prefix}_domain")
-                    ),
-                    "last_blocking_hash": (
-                        None if blocking_sequence == 0 else watermark.get(f"{blocking_prefix}_hash")
-                    ),
-                    "last_blocking_classification": blocking_classification,
-                    **watermark,
-                }
+        requested = {verified_through_sequence}
+        if last_full_verified_sequence is not None:
+            requested.add(last_full_verified_sequence)
+        barrier = self._commissioning_deferred_barrier(tuple(sorted(requested)))
+        tip = int(barrier.ledger_sequence)
+        if verified_through_sequence > tip:
+            raise RuntimeError("Commissioning verified anchor is beyond the current ledger tip.")
+        watermark = dict(barrier.authority_watermark or {})
+        if int(watermark.get("classified_through_sequence") or -1) != tip:
+            raise RuntimeError("Commissioning authority classification does not reach the captured ledger tip.")
+        hashes = dict(barrier.requested_record_hashes or {})
+        safe_last = dict(watermark.get("safe_classification_last_sequences") or {})
+        tail_kinds = sorted(
+            classification
+            for classification, sequence in safe_last.items()
+            if type(sequence) is int and verified_through_sequence < sequence <= tip
+        )
+        passive_shapes = _V2_SAFE_CLASSIFICATIONS - {
+            "OBSERVATION:OBSERVATION_ENVELOPE:ACCOUNT_ITEM_INFORMATIONAL:AUTHORITY_EFFECT_NONE",
+        }
+        tail_categories: list[str] = []
+        if any(
+            shape in passive_shapes and verified_through_sequence < sequence <= tip
+            for shape, sequence in safe_last.items()
+            if type(sequence) is int
+        ):
+            tail_categories.append(CommissioningTailCategory.PASSIVE_DATA.value)
+        for prefix, category in (
+            ("last_authority_observation", CommissioningTailCategory.AUTHORITY_OBSERVATION),
+            ("last_authority_mutation", CommissioningTailCategory.AUTHORITY_MUTATION),
+            ("last_unknown", CommissioningTailCategory.UNKNOWN),
+        ):
+            sequence = watermark.get(f"{prefix}_sequence")
+            if type(sequence) is int and verified_through_sequence < sequence <= tip:
+                tail_categories.append(category.value)
+        mutation_sequence = int(watermark.get("last_authority_mutation_sequence") or 0)
+        unknown_sequence = int(watermark.get("last_unknown_sequence") or 0)
+        blocking_prefix = "last_unknown" if unknown_sequence >= mutation_sequence else "last_authority_mutation"
+        blocking_sequence = max(mutation_sequence, unknown_sequence)
+        blocking_classification = (
+            None if blocking_sequence == 0
+            else CommissioningTailCategory.UNKNOWN.value
+            if blocking_prefix == "last_unknown"
+            else CommissioningTailCategory.AUTHORITY_MUTATION.value
+        )
+        return {
+            "policy_version": COMMISSIONING_TAIL_POLICY_VERSION,
+            "ledger_identity": self._ledger_uuid,
+            "ledger_epoch": self._ledger_epoch,
+            "ledger_schema_version": self._schema_version,
+            "verified_through_sequence": verified_through_sequence,
+            "verified_anchor_record_hash": hashes.get(verified_through_sequence),
+            "last_full_verified_sequence": last_full_verified_sequence,
+            "last_full_anchor_record_hash": (
+                None if last_full_verified_sequence is None else hashes.get(last_full_verified_sequence)
+            ),
+            "arm_snapshot_tip": tip,
+            "arm_snapshot_tip_hash": barrier.record_hash,
+            "deferred_barrier_token": barrier.token,
+            "deferred_barrier_ledger_sequence": tip,
+            "deferred_barrier_wait_seconds": round(float(barrier.wait_seconds or 0.0), 6),
+            "unverified_tail_rows": tip - verified_through_sequence,
+            "tail_start_sequence": verified_through_sequence + 1 if tip > verified_through_sequence else None,
+            "tail_end_sequence": tip if tip > verified_through_sequence else None,
+            "tail_record_kinds": tail_kinds,
+            "tail_record_categories": tail_categories,
+            "last_blocking_sequence": blocking_sequence,
+            "last_blocking_kind": (
+                None if blocking_sequence == 0 else watermark.get(f"{blocking_prefix}_kind")
+            ),
+            "last_blocking_domain": (
+                None if blocking_sequence == 0 else watermark.get(f"{blocking_prefix}_domain")
+            ),
+            "last_blocking_hash": (
+                None if blocking_sequence == 0 else watermark.get(f"{blocking_prefix}_hash")
+            ),
+            "last_blocking_classification": blocking_classification,
+            **watermark,
+        }
 
     def health_status(self) -> dict[str, object]:
         """Return cached integrity state plus inexpensive filesystem metadata."""
@@ -1840,6 +1972,14 @@ class PaperLedger:
             final_record_hash = self._final_record_hash
             quick_check_state = self._quick_check_state
             authority_watermark = dict(self._authority_watermark)
+        with self._deferred_condition:
+            deferred_queue_depth = self._deferred_record_count
+            deferred_writer_active = self._deferred_active
+            deferred_queue_high_water = self._deferred_queue_high_water
+            deferred_writer_error = None if self._deferred_error is None else type(self._deferred_error).__name__
+            last_barrier_token = self._last_barrier_token
+            last_barrier_sequence = self._last_barrier_sequence
+            last_barrier_wait_seconds = self._last_barrier_wait_seconds
         try:
             file_size: int | None = self.path.stat().st_size
         except OSError:
@@ -1868,6 +2008,13 @@ class PaperLedger:
             "wal_size": wal_size,
             "counts": self.counts(),
             "authority_watermark": authority_watermark,
+            "deferred_queue_depth": deferred_queue_depth,
+            "deferred_writer_active": deferred_writer_active,
+            "deferred_queue_high_water": deferred_queue_high_water,
+            "deferred_writer_error": deferred_writer_error,
+            "last_deferred_barrier_token": last_barrier_token,
+            "last_deferred_barrier_ledger_sequence": last_barrier_sequence,
+            "last_deferred_barrier_wait_seconds": last_barrier_wait_seconds,
         }
 
     def close(self) -> None:

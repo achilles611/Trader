@@ -432,35 +432,41 @@ class PaperExecutionTransport:
             self._reject_frame("STALE_OR_FUTURE_TIMESTAMP")
             return
         receipt_id = str(payload.get("receipt_id", ""))
-        if receipt_id:
-            with self._lock:
-                if receipt_id in self._seen_receipts:
-                    self._duplicate_receipts += 1
+        # Linearize accepted broker input against commissioning authority before
+        # mutating receipt/reconciliation state. Runtime authority holds the
+        # same ledger fence from its final proof through command admission.
+        # Release it before the runtime callback to preserve runtime->ledger
+        # lock order and avoid a ledger->runtime deadlock.
+        with self.ledger.commissioning_authority_fence():
+            if receipt_id:
+                with self._lock:
+                    if receipt_id in self._seen_receipts:
+                        self._duplicate_receipts += 1
+                        return
+                    self._seen_receipts.add(receipt_id)
+            if message_type == "RECONCILIATION":
+                valid = self._validate_reconciliation(payload)
+                with self._lock:
+                    self._reconciled = valid
+                if not valid:
+                    self._reject_frame("RECONCILIATION_MISMATCH")
                     return
-                self._seen_receipts.add(receipt_id)
-        if message_type == "RECONCILIATION":
-            valid = self._validate_reconciliation(payload)
-            with self._lock:
-                self._reconciled = valid
-            if not valid:
-                self._reject_frame("RECONCILIATION_MISMATCH")
-                return
-        if message_type == "COMMAND_ACK":
-            with self._lock:
-                self._acknowledgements += 1
-                self._pending_acknowledgements.pop(str(payload.get("command_id", "")), None)
-        elif message_type == "COMMAND_REJECTED":
-            with self._lock:
-                self._command_rejections += 1
-                self._pending_acknowledgements.pop(str(payload.get("command_id", "")), None)
-        identity = receipt_id or "l3g-receipt-" + hashlib.sha256(canonical_json(payload)).hexdigest()
-        kind = {
-            "ORDER_EVENT": "ORDER_EVENT",
-            "EXECUTION_EVENT": "EXECUTION",
-            "POSITION_EVENT": "POSITION_SNAPSHOT_EVENT",
-            "SAFETY_EVENT": "INCIDENT_SAFETY_EVENT",
-        }.get(str(message_type), "COMMAND_RECEIPT_" + str(message_type))
-        self.ledger.append(kind, dict(payload), identity=identity, execution_session_id=session_id)
+            if message_type == "COMMAND_ACK":
+                with self._lock:
+                    self._acknowledgements += 1
+                    self._pending_acknowledgements.pop(str(payload.get("command_id", "")), None)
+            elif message_type == "COMMAND_REJECTED":
+                with self._lock:
+                    self._command_rejections += 1
+                    self._pending_acknowledgements.pop(str(payload.get("command_id", "")), None)
+            identity = receipt_id or "l3g-receipt-" + hashlib.sha256(canonical_json(payload)).hexdigest()
+            kind = {
+                "ORDER_EVENT": "ORDER_EVENT",
+                "EXECUTION_EVENT": "EXECUTION",
+                "POSITION_EVENT": "POSITION_SNAPSHOT_EVENT",
+                "SAFETY_EVENT": "INCIDENT_SAFETY_EVENT",
+            }.get(str(message_type), "COMMAND_RECEIPT_" + str(message_type))
+            self.ledger.append(kind, dict(payload), identity=identity, execution_session_id=session_id)
         callback = self._on_message
         if callback is not None:
             try:
@@ -498,18 +504,24 @@ class PaperExecutionTransport:
             self._reject_frame("HELLO_IDENTITY_MISSING")
             return
         session_id = "l3g-es-" + uuid.uuid4().hex
-        with self._lock:
-            self._execution_session_id = session_id
-            self._ninjatrader_session_id = str(payload["ninjatrader_session_id"])
-            self._authenticated = True
-            self._reconciled = False
-            self._state = "AUTHENTICATED"
-            self._last_sent_sequence = 0
-            self._addon_protocol_version = str(payload["addon_protocol_version"])
-            self._addon_source_fingerprint = str(payload["addon_source_fingerprint"])
-            self._addon_build_fingerprint = str(payload["addon_build_fingerprint"])
-            self._addon_build_timestamp = str(payload["addon_build_timestamp"])
-        self.ledger.append("SESSION_HANDSHAKE", {key: value for key, value in payload.items() if key != "signature"}, identity=session_id, execution_session_id=session_id)
+        with self.ledger.commissioning_authority_fence():
+            with self._lock:
+                self._execution_session_id = session_id
+                self._ninjatrader_session_id = str(payload["ninjatrader_session_id"])
+                self._authenticated = True
+                self._reconciled = False
+                self._state = "AUTHENTICATED"
+                self._last_sent_sequence = 0
+                self._addon_protocol_version = str(payload["addon_protocol_version"])
+                self._addon_source_fingerprint = str(payload["addon_source_fingerprint"])
+                self._addon_build_fingerprint = str(payload["addon_build_fingerprint"])
+                self._addon_build_timestamp = str(payload["addon_build_timestamp"])
+            self.ledger.append(
+                "SESSION_HANDSHAKE",
+                {key: value for key, value in payload.items() if key != "signature"},
+                identity=session_id,
+                execution_session_id=session_id,
+            )
         response: dict[str, object] = {
             "schema": EXECUTION_SCHEMA,
             "message_type": "SESSION_GRANT",
@@ -599,6 +611,12 @@ class PaperExecutionTransport:
     def send_command(self, command: PaperExecutionCommand, grant: PaperRiskGrant) -> PaperExecutionCommand:
         if type(command) is not PaperExecutionCommand or type(grant) is not PaperRiskGrant:
             raise ValueError("Execution transport requires exact command and grant contracts.")
+        # Ledger records are append-only, so proving durability before taking
+        # the transport lock cannot become false. Keeping the one ledger access
+        # outside that lock standardizes ledger->transport ordering with broker
+        # receipt ingress and prevents a send/receipt lock inversion.
+        if not self.ledger.contains(command.command_id):
+            raise RuntimeError("A command must be durably recorded before socket send.")
         with self._lock:
             session_id = self._execution_session_id
             if not self._authenticated or session_id is None:
@@ -611,8 +629,6 @@ class PaperExecutionTransport:
                 raise ValueError("Command sequence must be exactly monotonic.")
             if not grant.valid_at(_now()) or grant.grant_id != command.risk_grant_id or grant.intent_id != command.intent_id:
                 raise ValueError("A positive, current, matching paper risk grant is required.")
-            if not self.ledger.contains(command.command_id):
-                raise RuntimeError("A command must be durably recorded before socket send.")
             if command.policy_hash != POLICY.configuration_hash or command.risk_profile_hash != RISK_PROFILE.configuration_hash or command.account_binding_hash != ACCOUNT_BINDING.binding_hash:
                 raise ValueError("Command authority hashes do not match the compiled paper authority.")
             legacy = command.session_kind is PaperSessionKind.OFF_SESSION and command.session_id != UNSPECIFIED_OFF_SESSION_CONTEXT.session_id

@@ -94,6 +94,20 @@ def _atomic_json(path: Path, value: Mapping[str, Any], *, replace: bool = True) 
             pass
 
 
+def _unlink_with_retry(path: Path) -> None:
+    """Remove a verifier artifact despite a brief Windows status-reader handle."""
+    for attempt in range(50):
+        try:
+            path.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            if attempt == 49:
+                raise
+            time.sleep(0.01)
+
+
 def _file_identity(path: Path) -> dict[str, int | None]:
     try:
         stat = path.stat()
@@ -654,10 +668,7 @@ class LocalLedgerVerifier:
         _atomic_json(history, report, replace=False)
         # "latest" always refers to a fully written terminal artifact.
         _atomic_json(self.paths.latest, report)
-        try:
-            self.paths.current.unlink()
-        except FileNotFoundError:
-            pass
+        _unlink_with_retry(self.paths.current)
 
     def run(self, *, adopt_lock: bool = False) -> dict[str, Any]:
         self.paths.root.mkdir(parents=True, exist_ok=True)
@@ -906,10 +917,7 @@ class LocalLedgerVerificationController:
             history = self.paths.history(verification_id, str(report["completed_at"]))
             _atomic_json(history, report, replace=False)
             _atomic_json(self.paths.latest, report)
-            try:
-                self.paths.current.unlink()
-            except FileNotFoundError:
-                pass
+            _unlink_with_retry(self.paths.current)
         _release_lock(self.paths, verification_id)
 
     def status(self) -> dict[str, Any]:
