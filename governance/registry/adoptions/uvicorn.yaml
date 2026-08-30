@@ -1,0 +1,40 @@
+schema_version: BEELZEBUB_THIRD_PARTY_ADOPTION_V1
+adoption_id: uvicorn
+display_name: Uvicorn
+supplier: Uvicorn contributors
+ecosystem: PyPI
+category: PYTHON_RUNTIME_PACKAGE
+adoption_mode: PACKAGE_MANAGER
+lifecycle_status: INTEGRATED
+upstream_source: https://pypi.org/project/uvicorn/0.52.1/
+immutable_provenance: pypi:uvicorn==0.52.1
+exact_version: 0.52.1
+release_tag: 0.52.1
+upstream_commit: ''
+lock_evidence: requirements.lock
+artifact_hashes: {}
+license_expression: BSD-3-Clause
+license_evidence_source: PyPI project metadata for uvicorn 0.52.1
+license_evidence_strength: PUBLISHED_PACKAGE_METADATA
+redistribution_obligations: retain BSD notice
+notice_obligations: BSD notice where redistributed
+adopted_scope: local control-center server process
+explicit_exclusions: no remote provider writes
+owning_components: [copytrade, project-launchers]
+technical_capability_profile: local ASGI server
+network_behavior: loopback endpoint only by existing source
+filesystem_behavior: none
+subprocess_behavior: launches server process
+credential_secret_behavior: no governance secret use
+data_classes_handled: local read models
+storage_footprint: none
+determinism_classification: request-driven
+security_review_status: existing launcher tests
+maintenance_health: active upstream
+commissioning_requirements: existing service tests and lock reconciliation
+upgrade_policy: PATCH_REQUALIFICATION
+rollback_policy: restore prior exact lock
+replacement_strategy: reviewed ASGI server
+decision_evidence: requirements.lock
+unresolved_risks: operator-selected binding
+package_name: uvicorn

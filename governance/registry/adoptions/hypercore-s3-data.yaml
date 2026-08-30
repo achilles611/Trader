@@ -1,0 +1,39 @@
+adoption_id: hypercore-s3-data
+display_name: HyperCore requester-pays historical data
+supplier: Hyperliquid historical data service
+ecosystem: external-data-source
+category: EXTERNAL_DATA_SOURCE
+adoption_mode: DATA_CONSUMER
+lifecycle_status: INTEGRATED
+upstream_source: https://hyperliquid.gitbook.io/hyperliquid-docs/historical-data
+immutable_provenance: official-documentation-reviewed-f5
+exact_version: documented-data-layout
+release_tag: ''
+upstream_commit: ''
+lock_evidence: src/copytrade/source_acquisition.py
+artifact_hashes: {}
+license_expression: SERVICE_TERMS_NOT_OPEN_SOURCE_LICENSE
+license_evidence_source: official historical-data documentation
+license_evidence_strength: OFFICIAL_SERVICE_DOCUMENTATION
+redistribution_obligations: service terms review outside this registry
+notice_obligations: no open-source notice asserted
+adopted_scope: existing optional requester-pays historical acquisition
+explicit_exclusions: governance does not load AWS credentials or acquire data
+owning_components: [copytrade]
+technical_capability_profile: read-only object retrieval
+network_behavior: configured read-only requester-pays access
+filesystem_behavior: existing configured data root only
+subprocess_behavior: none
+credential_secret_behavior: existing runtime requires configured AWS credentials
+data_classes_handled: historical node data
+storage_footprint: existing bounded acquisition policy
+determinism_classification: nondeterministic remote availability
+security_review_status: explicit source configuration required
+maintenance_health: provider-operated
+commissioning_requirements: source acquisition tests
+upgrade_policy: AUTHORITY_REVIEW
+rollback_policy: disable acquisition configuration
+replacement_strategy: reviewed data-source adapter
+decision_evidence: src/copytrade/source_acquisition.py
+unresolved_risks: provider availability and requester-pays costs
+package_name: ''

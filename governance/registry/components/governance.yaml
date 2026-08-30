@@ -1,0 +1,27 @@
+schema_version: BEELZEBUB_ARCHITECTURE_COMPONENT_V1
+component_id: governance
+display_name: F5 offline governance
+description: Offline architecture, adoption, toolchain, and evidence validator.
+lane: GOVERNANCE
+phase_owner: f5.0
+lifecycle_status: READY_FROZEN_CANDIDATE
+source_roots: [src/governance, governance]
+include_patterns: ["**"]
+exclude_patterns: [governance/generated/**]
+executable_entrypoints: [src/governance/cli.py, scripts/provision_f5_toolchains.ps1]
+internal_dependencies: [project-contracts]
+third_party_adoptions: [jsonschema, pyyaml]
+inputs: [repository source, registry records, local receipts]
+outputs: [static audits, generated reports, commissioning evidence]
+persistent_state: [committed registry and generated reports]
+retention_class: SOURCE
+retention_policy: {data_written: bounded governance reports, storage_root_class: repository-and-evidence-root, expected_growth: bounded-by-records-and-evidence, maximum_retained_bytes: 1073741824, rotation_trigger: phase-successor, rotation_unit: commissioning-package, minimum_preserved_set: freeze-seal-and-evidence, deletion_eligibility: explicit-retention-policy-only, hash_verification_required: true, recovery_requirement: Git-and-archive-manifest, enforcement_status: GOVERNANCE_ENFORCED, owner: governance}
+failure_policy: offline fail closed with bounded reason code
+rollback_boundary: Git revision and immutable evidence
+commissioning_evidence: [governance evidence package]
+deprecation_policy: successor governance phase
+technical_capabilities: [read_local_files, write_local_files, launch_local_subprocesses]
+current_authority: [read_local_files, write_local_files, launch_local_subprocesses]
+authority_ceiling: [read_local_files, write_local_files, launch_local_subprocesses]
+prohibited_actions: [contact_remote_read_endpoints, write_to_remote_provider_endpoints, read_credentials, sign_wallet_actions, construct_order_intents, submit_paper_orders, submit_testnet_orders, submit_mainnet_orders, allocate_live_capital, generate_scientific_hypotheses, evaluate_scientific_hypotheses, decide_strategy_actions, alter_production_ledger_state, alter_frozen_evidence]
+authority_enforced_by: [src/governance, governance/frozen-baselines/f4.1.1.json]

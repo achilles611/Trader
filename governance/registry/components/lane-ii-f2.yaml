@@ -1,0 +1,27 @@
+schema_version: BEELZEBUB_ARCHITECTURE_COMPONENT_V1
+component_id: lane-ii-f2
+display_name: Phase D bridge
+description: Frozen bridge from Lane II outputs to existing Phase D contracts.
+lane: LANE_II
+phase_owner: f2
+lifecycle_status: READY_FROZEN
+source_roots: [src/lane_ii/phase_d_bridge.py]
+include_patterns: ["**"]
+exclude_patterns: []
+executable_entrypoints: []
+internal_dependencies: [copytrade, lane-ii-f0, lane-ii-f1]
+third_party_adoptions: []
+inputs: [Trader V0 actions]
+outputs: [phase-d bridge contracts]
+persistent_state: []
+retention_class: SOURCE
+retention_policy: {data_written: none, storage_root_class: repository, expected_growth: none, maximum_retained_bytes: 0, rotation_trigger: not-applicable, rotation_unit: none, minimum_preserved_set: source, deletion_eligibility: explicit-unfreeze-only, hash_verification_required: true, recovery_requirement: Git, enforcement_status: GIT_ENFORCED, owner: lane-ii-f2}
+failure_policy: fail closed at bridge contracts
+rollback_boundary: frozen f2 commit
+commissioning_evidence: [docs/commissioning/phase-f2]
+deprecation_policy: explicit successor phase
+technical_capabilities: [read_local_files, construct_order_intents]
+current_authority: [read_local_files]
+authority_ceiling: [read_local_files, construct_order_intents]
+prohibited_actions: [submit_paper_orders, submit_testnet_orders, submit_mainnet_orders, sign_wallet_actions, allocate_live_capital]
+authority_enforced_by: [src/lane_ii/phase_d_bridge.py, tests/test_phase_f2_lane_ii_bridge.py]

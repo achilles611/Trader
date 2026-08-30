@@ -1,0 +1,13 @@
+schema_version: BEELZEBUB_GOVERNANCE_POLICY_V1
+policy_id: adoption-lifecycle
+purpose: Exact reviewed identity and rollback evidence are required before commissioning.
+rules:
+  - commissioned records require exact identity immutable provenance and license classification
+  - commissioned records require ownership scope exclusions authority network filesystem subprocess and secret classifications
+  - commissioned records require deterministic classification tests evidence rollback replacement and upgrade policy
+  - DOCUMENTATION_ONLY changes do not alter executable behavior
+  - PATCH_REQUALIFICATION changes require focused tests and evidence
+  - SEMANTIC_RECOMMISSIONING changes require full associated commissioning
+  - AUTHORITY_REVIEW changes require authority review before adoption
+  - PHASE_UNFREEZE_REQUIRED changes cannot modify frozen semantic authority strategy execution or science surfaces
+  - any Anvil identity or semantic contract change requires semantic recommissioning and may require explicit F4 successor

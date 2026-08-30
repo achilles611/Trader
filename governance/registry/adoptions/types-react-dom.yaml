@@ -1,0 +1,15 @@
+adoption_id: types-react-dom
+display_name: React DOM TypeScript definitions
+supplier: DefinitelyTyped contributors
+ecosystem: npm
+category: NODE_DEVELOPMENT_PACKAGE
+upstream_source: https://www.npmjs.com/package/@types/react-dom/v/18.3.7
+immutable_provenance: npm:@types/react-dom@18.3.7
+exact_version: 18.3.7
+release_tag: 18.3.7
+lock_evidence: control-center-ui/package-lock.json
+license_expression: MIT
+license_evidence_source: npm published metadata for @types/react-dom 18.3.7
+adopted_scope: UI type checking
+owning_components: [control-center-ui]
+package_name: '@types/react-dom'

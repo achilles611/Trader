@@ -1,0 +1,40 @@
+schema_version: BEELZEBUB_THIRD_PARTY_ADOPTION_V1
+adoption_id: hyperliquid-python-sdk
+display_name: Hyperliquid Python SDK
+supplier: Hyperliquid
+ecosystem: PyPI
+category: PYTHON_RUNTIME_PACKAGE
+adoption_mode: WRAPPED
+lifecycle_status: INTEGRATED
+upstream_source: https://pypi.org/project/hyperliquid-python-sdk/0.24.0/
+immutable_provenance: pypi:hyperliquid-python-sdk==0.24.0
+exact_version: 0.24.0
+release_tag: 0.24.0
+upstream_commit: ''
+lock_evidence: requirements.lock
+artifact_hashes: {}
+license_expression: MIT
+license_evidence_source: PyPI project metadata for hyperliquid-python-sdk 0.24.0
+license_evidence_strength: PUBLISHED_PACKAGE_METADATA
+redistribution_obligations: retain MIT notice
+notice_obligations: MIT notice where redistributed
+adopted_scope: existing Phase F3 testnet adapter only
+explicit_exclusions: does not authorize mainnet transactions or governance imports
+owning_components: [copytrade]
+technical_capability_profile: venue protocol client including signing support
+network_behavior: source-enforced testnet binding only
+filesystem_behavior: none
+subprocess_behavior: none
+credential_secret_behavior: existing F3 boundary controls configured credentials
+data_classes_handled: testnet venue data
+storage_footprint: none
+determinism_classification: nondeterministic remote responses
+security_review_status: frozen F3 contracts apply
+maintenance_health: active upstream
+commissioning_requirements: Phase F3 requalification and authority review
+upgrade_policy: SEMANTIC_RECOMMISSIONING
+rollback_policy: restore exact lock and F3 evidence
+replacement_strategy: reviewed official protocol implementation
+decision_evidence: requirements.lock and tests/test_phase_f3_hyperliquid_testnet.py
+unresolved_risks: remote venue semantics
+package_name: hyperliquid-python-sdk

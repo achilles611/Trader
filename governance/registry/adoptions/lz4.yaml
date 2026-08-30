@@ -1,0 +1,40 @@
+schema_version: BEELZEBUB_THIRD_PARTY_ADOPTION_V1
+adoption_id: lz4
+display_name: lz4
+supplier: python-lz4 contributors
+ecosystem: PyPI
+category: PYTHON_RUNTIME_PACKAGE
+adoption_mode: PACKAGE_MANAGER
+lifecycle_status: INTEGRATED
+upstream_source: https://pypi.org/project/lz4/4.4.5/
+immutable_provenance: pypi:lz4==4.4.5
+exact_version: 4.4.5
+release_tag: 4.4.5
+upstream_commit: ''
+lock_evidence: requirements.lock
+artifact_hashes: {}
+license_expression: BSD-3-Clause
+license_evidence_source: PyPI project metadata for lz4 4.4.5
+license_evidence_strength: PUBLISHED_PACKAGE_METADATA
+redistribution_obligations: retain BSD notice
+notice_obligations: BSD notice where redistributed
+adopted_scope: documented compressed historical data ingestion
+explicit_exclusions: no governance decompression of user data
+owning_components: [copytrade]
+technical_capability_profile: local compression codec
+network_behavior: none
+filesystem_behavior: existing source reads selected local data
+subprocess_behavior: none
+credential_secret_behavior: none
+data_classes_handled: historical market data
+storage_footprint: no retained state
+determinism_classification: deterministic codec
+security_review_status: existing acquisition boundary
+maintenance_health: active upstream
+commissioning_requirements: lock reconciliation and acquisition tests
+upgrade_policy: PATCH_REQUALIFICATION
+rollback_policy: restore prior exact lock
+replacement_strategy: reviewed codec alternative
+decision_evidence: requirements.lock
+unresolved_risks: malformed external data
+package_name: lz4

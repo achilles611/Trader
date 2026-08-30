@@ -1,0 +1,9 @@
+schema_version: BEELZEBUB_GOVERNANCE_POLICY_V1
+policy_id: provenance-policy
+purpose: Active direct dependencies require immutable provenance and recorded license evidence.
+rules:
+  - active direct packages resolve to an exact committed lock version
+  - executable toolchains require an exact artifact hash before execution
+  - CI actions use full immutable commit SHA references
+  - unknown active provenance or active direct license blocks freeze
+  - remote service terms are not represented as open-source licenses

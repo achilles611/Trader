@@ -1,0 +1,27 @@
+schema_version: BEELZEBUB_ARCHITECTURE_COMPONENT_V1
+component_id: project-launchers
+display_name: Root application launchers
+description: Root-level Python entrypoints retained from the frozen checkout.
+lane: PROJECT
+phase_owner: shared
+lifecycle_status: ACTIVE
+source_roots: [main.py, beez_console.py, build_prop_firm_comparison.py]
+include_patterns: ["**"]
+exclude_patterns: []
+executable_entrypoints: [main.py, beez_console.py, build_prop_firm_comparison.py]
+internal_dependencies: []
+third_party_adoptions: [fastapi, uvicorn]
+inputs: [explicit local operator action]
+outputs: [local user interface and reports]
+persistent_state: []
+retention_class: SOURCE
+retention_policy: {data_written: none, storage_root_class: repository, expected_growth: none, maximum_retained_bytes: 0, rotation_trigger: not-applicable, rotation_unit: none, minimum_preserved_set: source, deletion_eligibility: reviewed-source-change, hash_verification_required: true, recovery_requirement: Git, enforcement_status: GIT_ENFORCED, owner: project-launchers}
+failure_policy: source-defined fail closed
+rollback_boundary: Git revision
+commissioning_evidence: [existing launcher tests]
+deprecation_policy: explicit replacement
+technical_capabilities: [read_local_files, write_local_files, bind_loopback_sockets]
+current_authority: [read_local_files, write_local_files, bind_loopback_sockets]
+authority_ceiling: [read_local_files, write_local_files, bind_loopback_sockets]
+prohibited_actions: [submit_mainnet_orders, allocate_live_capital]
+authority_enforced_by: [main.py, beez_console.py]

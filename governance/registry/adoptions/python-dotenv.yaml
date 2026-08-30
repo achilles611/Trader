@@ -1,0 +1,40 @@
+schema_version: BEELZEBUB_THIRD_PARTY_ADOPTION_V1
+adoption_id: python-dotenv
+display_name: python-dotenv
+supplier: Saurabh Kumar and contributors
+ecosystem: PyPI
+category: PYTHON_RUNTIME_PACKAGE
+adoption_mode: PACKAGE_MANAGER
+lifecycle_status: INTEGRATED
+upstream_source: https://pypi.org/project/python-dotenv/1.2.2/
+immutable_provenance: pypi:python-dotenv==1.2.2
+exact_version: 1.2.2
+release_tag: 1.2.2
+upstream_commit: ''
+lock_evidence: requirements.lock
+artifact_hashes: {}
+license_expression: BSD-3-Clause
+license_evidence_source: PyPI project metadata for python-dotenv 1.2.2
+license_evidence_strength: PUBLISHED_PACKAGE_METADATA
+redistribution_obligations: retain BSD notice
+notice_obligations: BSD notice where redistributed
+adopted_scope: existing operator configuration loading
+explicit_exclusions: governance never loads environment secrets
+owning_components: [copytrade]
+technical_capability_profile: parse local dotenv files
+network_behavior: none
+filesystem_behavior: reads operator-selected files
+subprocess_behavior: none
+credential_secret_behavior: may expose configured values only to existing runtime
+data_classes_handled: configuration
+storage_footprint: none
+determinism_classification: deterministic local parsing
+security_review_status: source-enforced configuration boundary
+maintenance_health: active upstream
+commissioning_requirements: existing tests and lock reconciliation
+upgrade_policy: AUTHORITY_REVIEW
+rollback_policy: restore prior exact lock
+replacement_strategy: explicit configuration loader review
+decision_evidence: requirements.lock
+unresolved_risks: configuration secrets remain operator-managed
+package_name: python-dotenv

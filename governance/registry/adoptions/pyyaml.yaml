@@ -1,0 +1,40 @@
+schema_version: BEELZEBUB_THIRD_PARTY_ADOPTION_V1
+adoption_id: pyyaml
+display_name: PyYAML
+supplier: Kirill Simonov and contributors
+ecosystem: PyPI
+category: PYTHON_RUNTIME_PACKAGE
+adoption_mode: PACKAGE_MANAGER
+lifecycle_status: INTEGRATED
+upstream_source: https://pypi.org/project/PyYAML/6.0.3/
+immutable_provenance: pypi:PyYAML==6.0.3
+exact_version: 6.0.3
+release_tag: 6.0.3
+upstream_commit: ''
+lock_evidence: requirements.lock
+artifact_hashes: {}
+license_expression: MIT
+license_evidence_source: PyPI project metadata for PyYAML 6.0.3
+license_evidence_strength: PUBLISHED_PACKAGE_METADATA
+redistribution_obligations: retain applicable notices
+notice_obligations: MIT notice where redistributed
+adopted_scope: existing configuration and F5 registry parsing
+explicit_exclusions: no unsafe YAML constructors or aliases
+owning_components: [copytrade, governance]
+technical_capability_profile: safe local YAML parsing
+network_behavior: none at runtime
+filesystem_behavior: reads configuration and registry files
+subprocess_behavior: none
+credential_secret_behavior: no secret loading in governance
+data_classes_handled: configuration and registry metadata
+storage_footprint: none
+determinism_classification: deterministic under strict loader
+security_review_status: strict SafeLoader wrapper required
+maintenance_health: active upstream
+commissioning_requirements: lock reconciliation and duplicate-key tests
+upgrade_policy: AUTHORITY_REVIEW
+rollback_policy: restore prior exact lock
+replacement_strategy: reviewed parser replacement
+decision_evidence: requirements.lock and F5 strict-loader tests
+unresolved_risks: generic YAML features are intentionally rejected
+package_name: pyyaml

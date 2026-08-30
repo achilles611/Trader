@@ -1,0 +1,14 @@
+adoption_id: pillow
+display_name: Pillow
+supplier: Python Pillow contributors
+ecosystem: PyPI
+category: PYTHON_BUILD_PACKAGE
+upstream_source: https://pypi.org/project/pillow/12.3.0/
+immutable_provenance: pypi:pillow==12.3.0
+exact_version: 12.3.0
+release_tag: 12.3.0
+lock_evidence: requirements-build.lock
+license_expression: MIT-CMU
+license_evidence_source: PyPI published metadata for Pillow 12.3.0
+adopted_scope: Windows launcher icon packaging only
+package_name: pillow

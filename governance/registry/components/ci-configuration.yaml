@@ -1,0 +1,27 @@
+schema_version: BEELZEBUB_ARCHITECTURE_COMPONENT_V1
+component_id: ci-configuration
+display_name: Continuous integration configuration
+description: Immutable-pinned CI workflow definitions.
+lane: PROJECT
+phase_owner: f5.0
+lifecycle_status: ACTIVE
+source_roots: [.github]
+include_patterns: ["**"]
+exclude_patterns: []
+executable_entrypoints: [.github/workflows/ci.yml]
+internal_dependencies: []
+third_party_adoptions: [actions-checkout, actions-setup-python, actions-setup-node]
+inputs: [GitHub-hosted CI environment]
+outputs: [test and audit results]
+persistent_state: []
+retention_class: SOURCE
+retention_policy: {data_written: CI provider logs, storage_root_class: CI-provider, expected_growth: provider-policy, maximum_retained_bytes: 0, rotation_trigger: provider-policy, rotation_unit: CI-run, minimum_preserved_set: commissioning-evidence, deletion_eligibility: provider-policy, hash_verification_required: false, recovery_requirement: rerun-from-commit, enforcement_status: CI_PROVIDER_ENFORCED, owner: ci-configuration}
+failure_policy: CI failure blocks merge
+rollback_boundary: Git revision
+commissioning_evidence: [CI run]
+deprecation_policy: reviewed workflow replacement
+technical_capabilities: [read_local_files, launch_local_subprocesses, contact_remote_read_endpoints]
+current_authority: [read_local_files, launch_local_subprocesses, contact_remote_read_endpoints]
+authority_ceiling: [read_local_files, launch_local_subprocesses, contact_remote_read_endpoints]
+prohibited_actions: [write_to_remote_provider_endpoints, submit_paper_orders, submit_testnet_orders, submit_mainnet_orders, sign_wallet_actions, allocate_live_capital]
+authority_enforced_by: [.github/workflows/ci.yml]

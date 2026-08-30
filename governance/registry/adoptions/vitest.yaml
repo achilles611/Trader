@@ -1,0 +1,15 @@
+adoption_id: vitest
+display_name: Vitest
+supplier: Vitest contributors
+ecosystem: npm
+category: NODE_DEVELOPMENT_PACKAGE
+upstream_source: https://www.npmjs.com/package/vitest/v/4.1.10
+immutable_provenance: npm:vitest@4.1.10
+exact_version: 4.1.10
+release_tag: 4.1.10
+lock_evidence: control-center-ui/package-lock.json
+license_expression: MIT
+license_evidence_source: npm published metadata for vitest 4.1.10
+adopted_scope: UI unit tests
+owning_components: [control-center-ui]
+package_name: vitest

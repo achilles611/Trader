@@ -1,0 +1,15 @@
+adoption_id: testing-library-user-event
+display_name: Testing Library User Event
+supplier: Testing Library contributors
+ecosystem: npm
+category: NODE_DEVELOPMENT_PACKAGE
+upstream_source: https://www.npmjs.com/package/@testing-library/user-event/v/14.6.3
+immutable_provenance: npm:@testing-library/user-event@14.6.3
+exact_version: 14.6.3
+release_tag: 14.6.3
+lock_evidence: control-center-ui/package-lock.json
+license_expression: MIT
+license_evidence_source: npm published metadata for @testing-library/user-event 14.6.3
+adopted_scope: UI interaction tests
+owning_components: [control-center-ui]
+package_name: '@testing-library/user-event'

@@ -1,0 +1,39 @@
+adoption_id: hyperliquid-public-api
+display_name: Hyperliquid public API
+supplier: Hyperliquid
+ecosystem: remote-service
+category: REMOTE_SERVICE
+adoption_mode: REMOTE_API
+lifecycle_status: INTEGRATED
+upstream_source: https://hyperliquid.gitbook.io/hyperliquid-docs
+immutable_provenance: documented-public-endpoint-contract-reviewed-f5
+exact_version: documented-api-surface
+release_tag: ''
+upstream_commit: ''
+lock_evidence: src/copytrade/hyperliquid.py
+artifact_hashes: {}
+license_expression: SERVICE_TERMS_NOT_OPEN_SOURCE_LICENSE
+license_evidence_source: official Hyperliquid documentation
+license_evidence_strength: OFFICIAL_SERVICE_DOCUMENTATION
+redistribution_obligations: service terms review outside this registry
+notice_obligations: no open-source notice asserted
+adopted_scope: existing public market and account observation
+explicit_exclusions: no governance calls and no authority expansion
+owning_components: [copytrade]
+technical_capability_profile: public HTTP and WebSocket information endpoints
+network_behavior: source-constrained remote reads; F3 has separately frozen testnet boundary
+filesystem_behavior: no provider filesystem access
+subprocess_behavior: none
+credential_secret_behavior: public adapter unauthenticated
+data_classes_handled: public market data and observed wallets
+storage_footprint: existing bounded local runtime stores
+determinism_classification: nondeterministic remote data
+security_review_status: source endpoint allowlists and rate limits
+maintenance_health: provider-operated
+commissioning_requirements: existing phase tests
+upgrade_policy: SEMANTIC_RECOMMISSIONING
+rollback_policy: disable configured source
+replacement_strategy: reviewed provider adapter
+decision_evidence: src/copytrade/hyperliquid.py and phase records
+unresolved_risks: external service availability and terms
+package_name: ''

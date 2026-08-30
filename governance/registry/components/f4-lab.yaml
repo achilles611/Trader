@@ -1,0 +1,27 @@
+schema_version: BEELZEBUB_ARCHITECTURE_COMPONENT_V1
+component_id: f4-lab
+display_name: F4 counterfactual laboratory
+description: Immutable F4 local disposable Anvil semantic-restoration laboratory.
+lane: LANE_II
+phase_owner: f4.1.1
+lifecycle_status: READY_FROZEN
+source_roots: [src/lane_ii/lab]
+include_patterns: ["**"]
+exclude_patterns: []
+executable_entrypoints: [src/lane_ii/lab/cli.py]
+internal_dependencies: [lane-ii-core]
+third_party_adoptions: [foundry-anvil]
+inputs: [counterfactual scenarios]
+outputs: [immutable laboratory evidence]
+persistent_state: [disposable local Anvil state]
+retention_class: COMMISSIONING_EVIDENCE
+retention_policy: {data_written: immutable evidence packages, storage_root_class: evidence-root, expected_growth: bounded-per-scenario, maximum_retained_bytes: 10737418240, rotation_trigger: archive-policy, rotation_unit: evidence-package, minimum_preserved_set: all commissioned evidence, deletion_eligibility: never-by-age-alone, hash_verification_required: true, recovery_requirement: archive-copy-verification, enforcement_status: FROZEN_MANIFEST_ENFORCED, owner: f4-lab}
+failure_policy: terminate disposable process and fail closed
+rollback_boundary: snapshot restoration and process termination
+commissioning_evidence: [docs/commissioning/phase-f4-counterfactual-lab]
+deprecation_policy: explicit F4 successor or unfreeze
+technical_capabilities: [read_local_files, write_local_files, launch_local_subprocesses, bind_loopback_sockets, mutate_disposable_laboratory_state]
+current_authority: [read_local_files, write_local_files, launch_local_subprocesses, bind_loopback_sockets, mutate_disposable_laboratory_state]
+authority_ceiling: [read_local_files, write_local_files, launch_local_subprocesses, bind_loopback_sockets, mutate_disposable_laboratory_state]
+prohibited_actions: [contact_remote_read_endpoints, write_to_remote_provider_endpoints, submit_paper_orders, submit_testnet_orders, submit_mainnet_orders, sign_wallet_actions, allocate_live_capital, alter_frozen_evidence]
+authority_enforced_by: [docs/commissioning/phase-f4-counterfactual-lab/f4-authority-manifest.json, tests/test_phase_f4_counterfactual_lab.py]

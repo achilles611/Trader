@@ -1,0 +1,8 @@
+schema_version: BEELZEBUB_GOVERNANCE_POLICY_V1
+policy_id: source-ownership-policy
+purpose: Every included executable or source file has exactly one logical component owner.
+rules:
+  - included source extensions are enumerated by the inventory generator
+  - generated outputs and non-source assets use explicit exclusions
+  - source ownership coverage must be 100 percent with zero gaps and overlaps
+  - F4 protected paths are marked frozen and verified against the baseline

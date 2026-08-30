@@ -1,0 +1,27 @@
+schema_version: BEELZEBUB_THIRD_PARTY_ADOPTION_V1
+adoption_mode: PACKAGE_MANAGER
+lifecycle_status: INTEGRATED
+release_tag: ''
+upstream_commit: ''
+artifact_hashes: {}
+license_evidence_strength: PUBLISHED_PACKAGE_METADATA
+redistribution_obligations: retain applicable upstream notices when redistributed
+notice_obligations: retain applicable upstream notice
+explicit_exclusions: does not grant additional runtime authority
+owning_components: [project-contracts]
+technical_capability_profile: package capability is constrained by existing source contracts
+network_behavior: no governance network use
+filesystem_behavior: package-defined local behavior only
+subprocess_behavior: none
+credential_secret_behavior: no governance secret use
+data_classes_handled: source-defined data only
+storage_footprint: no independently governed retained state
+determinism_classification: source-defined
+security_review_status: F5 provenance and lock review
+maintenance_health: active upstream
+commissioning_requirements: exact lock reconciliation and focused existing tests
+upgrade_policy: PATCH_REQUALIFICATION
+rollback_policy: restore prior exact locked version
+replacement_strategy: reviewed successor adoption
+decision_evidence: committed lock and F5 registry audit
+unresolved_risks: none known

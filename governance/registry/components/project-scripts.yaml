@@ -1,0 +1,27 @@
+schema_version: BEELZEBUB_ARCHITECTURE_COMPONENT_V1
+component_id: project-scripts
+display_name: Command and launcher scripts
+description: Existing operator scripts plus the F5 explicit provisioning entrypoint.
+lane: PROJECT
+phase_owner: shared
+lifecycle_status: ACTIVE
+source_roots: [scripts]
+include_patterns: ["**"]
+exclude_patterns: []
+executable_entrypoints: [scripts/start_beelzebub.ps1, scripts/stop_beelzebub.ps1, scripts/provision_f5_toolchains.ps1]
+internal_dependencies: []
+third_party_adoptions: [pyinstaller, pillow, foundry-anvil]
+inputs: [explicit operator commands]
+outputs: [local processes and packages]
+persistent_state: [bounded local build products]
+retention_class: EPHEMERAL
+retention_policy: {data_written: temporary build products, storage_root_class: configured-build-root, expected_growth: bounded-per-build, maximum_retained_bytes: 21474836480, rotation_trigger: successful-rebuild, rotation_unit: build-output, minimum_preserved_set: none, deletion_eligibility: after-verified-rebuild, hash_verification_required: true, recovery_requirement: rebuild-from-lock, enforcement_status: OPERATOR_COMMAND_ENFORCED, owner: project-scripts}
+failure_policy: explicit command and nonzero exit
+rollback_boundary: process stop and Git revision
+commissioning_evidence: [build-lock verification]
+deprecation_policy: explicit replacement
+technical_capabilities: [read_local_files, write_local_files, launch_local_subprocesses]
+current_authority: [read_local_files, write_local_files, launch_local_subprocesses]
+authority_ceiling: [read_local_files, write_local_files, launch_local_subprocesses]
+prohibited_actions: [submit_mainnet_orders, allocate_live_capital, alter_frozen_evidence]
+authority_enforced_by: [scripts, src/governance/toolchains.py]

@@ -1,0 +1,1 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":true,"required":["schema","packages","summary"],"properties":{"schema":{"const":"BEELZEBUB_SUPPLY_CHAIN_INVENTORY_V1"},"packages":{"type":"array"},"summary":{"type":"object"}}}

@@ -1,0 +1,27 @@
+schema_version: BEELZEBUB_ARCHITECTURE_COMPONENT_V1
+component_id: lane-ii-core
+display_name: Lane II package contract
+description: Package-level Lane II namespace with no independent runtime authority.
+lane: LANE_II
+phase_owner: lane-ii
+lifecycle_status: FROZEN
+source_roots: [src/lane_ii/__init__.py]
+include_patterns: ["**"]
+exclude_patterns: []
+executable_entrypoints: []
+internal_dependencies: [project-contracts]
+third_party_adoptions: []
+inputs: []
+outputs: []
+persistent_state: []
+retention_class: SOURCE
+retention_policy: {data_written: none, storage_root_class: repository, expected_growth: none, maximum_retained_bytes: 0, rotation_trigger: not-applicable, rotation_unit: none, minimum_preserved_set: source, deletion_eligibility: never-without-phase-change, hash_verification_required: true, recovery_requirement: Git, enforcement_status: GIT_ENFORCED, owner: lane-ii-core}
+failure_policy: no authority
+rollback_boundary: Git revision
+commissioning_evidence: [phase-f0-closure]
+deprecation_policy: successor phase required
+technical_capabilities: []
+current_authority: []
+authority_ceiling: []
+prohibited_actions: [submit_paper_orders, submit_testnet_orders, submit_mainnet_orders, sign_wallet_actions, allocate_live_capital]
+authority_enforced_by: [src/lane_ii]

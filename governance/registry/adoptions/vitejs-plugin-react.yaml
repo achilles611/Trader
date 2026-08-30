@@ -1,0 +1,15 @@
+adoption_id: vitejs-plugin-react
+display_name: Vite React plugin
+supplier: Vite contributors
+ecosystem: npm
+category: NODE_DEVELOPMENT_PACKAGE
+upstream_source: https://www.npmjs.com/package/@vitejs/plugin-react/v/6.0.5
+immutable_provenance: npm:@vitejs/plugin-react@6.0.5
+exact_version: 6.0.5
+release_tag: 6.0.5
+lock_evidence: control-center-ui/package-lock.json
+license_expression: MIT
+license_evidence_source: npm published metadata for @vitejs/plugin-react 6.0.5
+adopted_scope: UI build transform
+owning_components: [control-center-ui]
+package_name: '@vitejs/plugin-react'

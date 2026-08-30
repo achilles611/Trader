@@ -1,0 +1,14 @@
+adoption_id: pyinstaller
+display_name: PyInstaller
+supplier: PyInstaller Development Team
+ecosystem: PyPI
+category: PYTHON_BUILD_PACKAGE
+upstream_source: https://pypi.org/project/pyinstaller/6.22.2/
+immutable_provenance: pypi:pyinstaller==6.22.2
+exact_version: 6.22.2
+release_tag: 6.22.2
+lock_evidence: requirements-build.lock
+license_expression: GPL-2.0-or-later WITH PyInstaller-exception
+license_evidence_source: PyPI published metadata for pyinstaller 6.22.2
+adopted_scope: Windows launcher packaging only
+package_name: pyinstaller

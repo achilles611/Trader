@@ -1,0 +1,40 @@
+schema_version: BEELZEBUB_THIRD_PARTY_ADOPTION_V1
+adoption_id: requests
+display_name: Requests
+supplier: Python Requests contributors
+ecosystem: PyPI
+category: PYTHON_RUNTIME_PACKAGE
+adoption_mode: PACKAGE_MANAGER
+lifecycle_status: INTEGRATED
+upstream_source: https://pypi.org/project/requests/2.33.1/
+immutable_provenance: pypi:requests==2.33.1
+exact_version: 2.33.1
+release_tag: 2.33.1
+upstream_commit: ''
+lock_evidence: requirements.lock
+artifact_hashes: {}
+license_expression: Apache-2.0
+license_evidence_source: PyPI project metadata for requests 2.33.1
+license_evidence_strength: PUBLISHED_PACKAGE_METADATA
+redistribution_obligations: retain Apache notice where redistributed
+notice_obligations: Apache-2.0 notice
+adopted_scope: existing public HTTP market observation
+explicit_exclusions: no governance network use or provider writes
+owning_components: [copytrade]
+technical_capability_profile: HTTP client
+network_behavior: existing source restricts endpoints and calls
+filesystem_behavior: none
+subprocess_behavior: none
+credential_secret_behavior: no governance secret use
+data_classes_handled: public market observations
+storage_footprint: none
+determinism_classification: nondeterministic remote responses
+security_review_status: existing rate and endpoint controls apply
+maintenance_health: active upstream
+commissioning_requirements: existing source tests and lock reconciliation
+upgrade_policy: AUTHORITY_REVIEW
+rollback_policy: restore prior exact lock
+replacement_strategy: reviewed HTTP client substitution
+decision_evidence: requirements.lock
+unresolved_risks: upstream network availability
+package_name: requests

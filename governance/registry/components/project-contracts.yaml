@@ -1,0 +1,27 @@
+schema_version: BEELZEBUB_ARCHITECTURE_COMPONENT_V1
+component_id: project-contracts
+display_name: Dependency and configuration contracts
+description: Locked dependency declarations and non-secret configuration example.
+lane: PROJECT
+phase_owner: shared
+lifecycle_status: ACTIVE
+source_roots: [requirements.txt, requirements.lock, requirements-build.txt, requirements-build.lock, .env.example, config, src/__init__.py]
+include_patterns: ["**"]
+exclude_patterns: []
+executable_entrypoints: []
+internal_dependencies: []
+third_party_adoptions: []
+inputs: [operator configuration]
+outputs: [deterministic dependency environments]
+persistent_state: []
+retention_class: LOCKFILE
+retention_policy: {data_written: none, storage_root_class: repository, expected_growth: reviewed-lockfile-only, maximum_retained_bytes: 10485760, rotation_trigger: reviewed-upgrade, rotation_unit: lockfile, minimum_preserved_set: current-lockfiles, deletion_eligibility: reviewed-replacement-only, hash_verification_required: true, recovery_requirement: Git, enforcement_status: GIT_ENFORCED, owner: project-contracts}
+failure_policy: reject lock drift
+rollback_boundary: Git revision
+commissioning_evidence: [requirements lock]
+deprecation_policy: explicit replacement
+technical_capabilities: []
+current_authority: []
+authority_ceiling: []
+prohibited_actions: [submit_paper_orders, submit_testnet_orders, submit_mainnet_orders, sign_wallet_actions, allocate_live_capital]
+authority_enforced_by: [requirements.lock, requirements-build.lock]

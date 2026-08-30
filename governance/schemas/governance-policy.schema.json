@@ -1,0 +1,1 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["schema_version","policy_id","purpose","rules"],"properties":{"schema_version":{"const":"BEELZEBUB_GOVERNANCE_POLICY_V1"},"policy_id":{"type":"string"},"purpose":{"type":"string"},"rules":{"type":"array","items":{"type":"string"},"minItems":1}}}

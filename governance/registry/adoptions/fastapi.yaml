@@ -1,0 +1,40 @@
+schema_version: BEELZEBUB_THIRD_PARTY_ADOPTION_V1
+adoption_id: fastapi
+display_name: FastAPI
+supplier: Sebastián Ramírez and contributors
+ecosystem: PyPI
+category: PYTHON_RUNTIME_PACKAGE
+adoption_mode: PACKAGE_MANAGER
+lifecycle_status: INTEGRATED
+upstream_source: https://pypi.org/project/fastapi/0.141.1/
+immutable_provenance: pypi:fastapi==0.141.1
+exact_version: 0.141.1
+release_tag: 0.141.1
+upstream_commit: ''
+lock_evidence: requirements.lock
+artifact_hashes: {}
+license_expression: MIT
+license_evidence_source: PyPI project metadata for fastapi 0.141.1
+license_evidence_strength: PUBLISHED_PACKAGE_METADATA
+redistribution_obligations: retain MIT notice
+notice_obligations: MIT notice where redistributed
+adopted_scope: local control-center HTTP service
+explicit_exclusions: does not grant remote provider writes
+owning_components: [copytrade, project-launchers]
+technical_capability_profile: local HTTP application framework
+network_behavior: source-defined loopback binding
+filesystem_behavior: none
+subprocess_behavior: none
+credential_secret_behavior: no governance secret use
+data_classes_handled: local read models
+storage_footprint: none
+determinism_classification: request-driven
+security_review_status: existing service tests
+maintenance_health: active upstream
+commissioning_requirements: existing launcher tests and lock reconciliation
+upgrade_policy: PATCH_REQUALIFICATION
+rollback_policy: restore prior exact lock
+replacement_strategy: reviewed ASGI replacement
+decision_evidence: requirements.lock
+unresolved_risks: local API exposure is source-controlled
+package_name: fastapi

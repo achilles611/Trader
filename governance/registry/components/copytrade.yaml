@@ -1,0 +1,27 @@
+schema_version: BEELZEBUB_ARCHITECTURE_COMPONENT_V1
+component_id: copytrade
+display_name: Copy-trading control and analysis
+description: Existing copy-trading, execution-boundary, storage, and read-model implementation.
+lane: LANE_III
+phase_owner: phases-c-through-d
+lifecycle_status: FROZEN
+source_roots: [src/copytrade]
+include_patterns: ["**"]
+exclude_patterns: []
+executable_entrypoints: [src/copytrade/cli.py, src/copytrade/control_center.py]
+internal_dependencies: [project-contracts]
+third_party_adoptions: [requests, websockets, fastapi, uvicorn, boto3, lz4, hyperliquid-python-sdk]
+inputs: [configured market data, local configuration]
+outputs: [local reports, bounded execution intents]
+persistent_state: [SQLite operational state]
+retention_class: HOT_RUNTIME
+retention_policy: {data_written: bounded runtime databases, storage_root_class: configured-data-root, expected_growth: bounded-by-configured-retention, maximum_retained_bytes: 214748364800, rotation_trigger: configured-capacity, rotation_unit: database, minimum_preserved_set: verified-ledger-prefix, deletion_eligibility: existing-runtime-policy-only, hash_verification_required: true, recovery_requirement: existing-source-enforced, enforcement_status: EXISTING_SOURCE_ENFORCED, owner: copytrade}
+failure_policy: fail closed at existing authority and venue boundaries
+rollback_boundary: existing phase-specific rollback contracts
+commissioning_evidence: [existing phase C and D commissioning records]
+deprecation_policy: successor phase required
+technical_capabilities: [read_local_files, write_local_files, contact_remote_read_endpoints, construct_order_intents, submit_paper_orders, submit_testnet_orders, read_credentials]
+current_authority: [read_local_files, write_local_files, contact_remote_read_endpoints]
+authority_ceiling: [read_local_files, write_local_files, contact_remote_read_endpoints, construct_order_intents, submit_paper_orders, submit_testnet_orders, read_credentials]
+prohibited_actions: [submit_mainnet_orders, allocate_live_capital, alter_frozen_evidence]
+authority_enforced_by: [src/copytrade/execution_contracts.py, tests/test_phase_d_execution_foundation.py]

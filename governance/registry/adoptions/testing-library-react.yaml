@@ -1,0 +1,15 @@
+adoption_id: testing-library-react
+display_name: Testing Library React
+supplier: Testing Library contributors
+ecosystem: npm
+category: NODE_DEVELOPMENT_PACKAGE
+upstream_source: https://www.npmjs.com/package/@testing-library/react/v/16.3.2
+immutable_provenance: npm:@testing-library/react@16.3.2
+exact_version: 16.3.2
+release_tag: 16.3.2
+lock_evidence: control-center-ui/package-lock.json
+license_expression: MIT
+license_evidence_source: npm published metadata for @testing-library/react 16.3.2
+adopted_scope: UI component tests
+owning_components: [control-center-ui]
+package_name: '@testing-library/react'

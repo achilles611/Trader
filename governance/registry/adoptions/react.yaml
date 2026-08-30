@@ -1,0 +1,15 @@
+adoption_id: react
+display_name: React
+supplier: Meta and React contributors
+ecosystem: npm
+category: NODE_RUNTIME_PACKAGE
+upstream_source: https://www.npmjs.com/package/react/v/18.3.1
+immutable_provenance: npm:react@18.3.1
+exact_version: 18.3.1
+release_tag: 18.3.1
+lock_evidence: control-center-ui/package-lock.json
+license_expression: MIT
+license_evidence_source: npm published metadata for react 18.3.1
+adopted_scope: control-center user interface
+owning_components: [control-center-ui]
+package_name: react

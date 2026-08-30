@@ -1,0 +1,40 @@
+schema_version: BEELZEBUB_THIRD_PARTY_ADOPTION_V1
+adoption_id: jsonschema
+display_name: jsonschema
+supplier: Julian Berman and contributors
+ecosystem: PyPI
+category: PYTHON_RUNTIME_PACKAGE
+adoption_mode: PACKAGE_MANAGER
+lifecycle_status: INTEGRATED
+upstream_source: https://pypi.org/project/jsonschema/4.26.0/
+immutable_provenance: pypi:jsonschema==4.26.0
+exact_version: 4.26.0
+release_tag: 4.26.0
+upstream_commit: ''
+lock_evidence: requirements.lock
+artifact_hashes: {}
+license_expression: MIT
+license_evidence_source: PyPI project metadata for jsonschema 4.26.0
+license_evidence_strength: PUBLISHED_PACKAGE_METADATA
+redistribution_obligations: retain applicable notices
+notice_obligations: MIT notice where redistributed
+adopted_scope: governance schema validation
+explicit_exclusions: no authority grant
+owning_components: [governance]
+technical_capability_profile: local JSON Schema validation
+network_behavior: none at runtime
+filesystem_behavior: reads registry files
+subprocess_behavior: none
+credential_secret_behavior: none
+data_classes_handled: registry metadata
+storage_footprint: none
+determinism_classification: deterministic
+security_review_status: reviewed for F5 offline use
+maintenance_health: active upstream
+commissioning_requirements: lock reconciliation and offline tests
+upgrade_policy: PATCH_REQUALIFICATION
+rollback_policy: restore prior exact lock
+replacement_strategy: standard library validation subset only after review
+decision_evidence: requirements.lock and F5 tests
+unresolved_risks: none known
+package_name: jsonschema

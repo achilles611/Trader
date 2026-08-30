@@ -1,0 +1,27 @@
+schema_version: BEELZEBUB_ARCHITECTURE_COMPONENT_V1
+component_id: project-tests
+display_name: Test and fixture suite
+description: Repository unittest suite and static fixtures.
+lane: PROJECT
+phase_owner: shared
+lifecycle_status: ACTIVE
+source_roots: [tests]
+include_patterns: ["**"]
+exclude_patterns: []
+executable_entrypoints: []
+internal_dependencies: [copytrade, f4-lab, governance, lane-ii-f0, lane-ii-f1, lane-ii-f2, phase-e]
+third_party_adoptions: []
+inputs: [source under test]
+outputs: [local test results]
+persistent_state: [test fixtures]
+retention_class: SOURCE
+retention_policy: {data_written: disposable test files, storage_root_class: system-temp, expected_growth: bounded-per-test, maximum_retained_bytes: 1073741824, rotation_trigger: test-process-exit, rotation_unit: test-run, minimum_preserved_set: committed-fixtures, deletion_eligibility: after-process-exit, hash_verification_required: false, recovery_requirement: rerun-tests, enforcement_status: TEST_HARNESS_ENFORCED, owner: project-tests}
+failure_policy: test failure blocks commissioning
+rollback_boundary: temporary test directories
+commissioning_evidence: [unittest output]
+deprecation_policy: retain coverage for supported phases
+technical_capabilities: [read_local_files, write_local_files, launch_local_subprocesses, bind_loopback_sockets]
+current_authority: [read_local_files, write_local_files, launch_local_subprocesses, bind_loopback_sockets]
+authority_ceiling: [read_local_files, write_local_files, launch_local_subprocesses, bind_loopback_sockets]
+prohibited_actions: [write_to_remote_provider_endpoints, submit_paper_orders, submit_testnet_orders, submit_mainnet_orders, sign_wallet_actions, allocate_live_capital]
+authority_enforced_by: [tests, CI]

@@ -1,0 +1,8 @@
+schema_version: BEELZEBUB_GOVERNANCE_POLICY_V1
+policy_id: authority-policy
+purpose: Registry descriptions cannot enlarge source-enforced authority; unknown authority is denied.
+rules:
+  - current authority must be a subset of authority ceiling
+  - governance has no order wallet strategy capital or scientific authority
+  - F4 is limited to disposable local laboratory mutation
+  - every remote write and credential access requires a source-enforced contract

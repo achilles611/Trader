@@ -1,0 +1,40 @@
+schema_version: BEELZEBUB_THIRD_PARTY_ADOPTION_V1
+adoption_id: websockets
+display_name: websockets
+supplier: websockets contributors
+ecosystem: PyPI
+category: PYTHON_RUNTIME_PACKAGE
+adoption_mode: PACKAGE_MANAGER
+lifecycle_status: INTEGRATED
+upstream_source: https://pypi.org/project/websockets/13.1/
+immutable_provenance: pypi:websockets==13.1
+exact_version: '13.1'
+release_tag: '13.1'
+upstream_commit: ''
+lock_evidence: requirements.lock
+artifact_hashes: {}
+license_expression: BSD-3-Clause
+license_evidence_source: PyPI project metadata for websockets 13.1
+license_evidence_strength: PUBLISHED_PACKAGE_METADATA
+redistribution_obligations: retain BSD notice
+notice_obligations: BSD notice where redistributed
+adopted_scope: existing public WebSocket observation
+explicit_exclusions: no governance network use or provider writes
+owning_components: [copytrade]
+technical_capability_profile: WebSocket client
+network_behavior: source-constrained remote read channels
+filesystem_behavior: none
+subprocess_behavior: none
+credential_secret_behavior: no governance secret use
+data_classes_handled: public market observations
+storage_footprint: none
+determinism_classification: nondeterministic remote responses
+security_review_status: existing endpoint controls apply
+maintenance_health: active upstream
+commissioning_requirements: existing source tests and lock reconciliation
+upgrade_policy: AUTHORITY_REVIEW
+rollback_policy: restore prior exact lock
+replacement_strategy: reviewed protocol client
+decision_evidence: requirements.lock
+unresolved_risks: upstream network availability
+package_name: websockets

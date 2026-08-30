@@ -1,0 +1,27 @@
+schema_version: BEELZEBUB_ARCHITECTURE_COMPONENT_V1
+component_id: lane-ii-f1
+display_name: Trader V0
+description: Frozen Trader V0 signal interpretation boundary.
+lane: LANE_II
+phase_owner: f1
+lifecycle_status: READY_FROZEN
+source_roots: [src/lane_ii/trader_v0.py]
+include_patterns: ["**"]
+exclude_patterns: []
+executable_entrypoints: []
+internal_dependencies: [lane-ii-f0]
+third_party_adoptions: []
+inputs: [approved signals]
+outputs: [bounded strategy actions]
+persistent_state: []
+retention_class: SOURCE
+retention_policy: {data_written: none, storage_root_class: repository, expected_growth: none, maximum_retained_bytes: 0, rotation_trigger: not-applicable, rotation_unit: none, minimum_preserved_set: source, deletion_eligibility: explicit-unfreeze-only, hash_verification_required: true, recovery_requirement: Git, enforcement_status: GIT_ENFORCED, owner: lane-ii-f1}
+failure_policy: fail closed on missing evidence
+rollback_boundary: frozen f1 commit
+commissioning_evidence: [docs/commissioning/phase-f1-trader-v0]
+deprecation_policy: explicit successor phase
+technical_capabilities: [read_local_files, interpret_strategy_signals, decide_strategy_actions]
+current_authority: [read_local_files]
+authority_ceiling: [read_local_files, interpret_strategy_signals, decide_strategy_actions]
+prohibited_actions: [submit_paper_orders, submit_testnet_orders, submit_mainnet_orders, allocate_live_capital]
+authority_enforced_by: [src/lane_ii/trader_v0.py, tests/test_phase_f1_trader_v0.py]

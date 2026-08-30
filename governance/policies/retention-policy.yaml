@@ -1,0 +1,11 @@
+schema_version: BEELZEBUB_GOVERNANCE_POLICY_V1
+policy_id: retention-policy
+purpose: Storage writers are bounded and immutable evidence is retained with verified recovery.
+rules:
+  - reserve at least 20 percent free capacity and allocate no more than 80 percent of configured volume
+  - no active writer may be UNKNOWN or UNBOUNDED
+  - immutable commissioning evidence cannot be deleted merely because it is old
+  - evidence moves require recursive hashes verified copy and archive manifest
+  - commissioned toolchain versions may not be rotated out
+  - cache and ephemeral data have deterministic cleanup eligibility
+  - F5 evidence excludes virtual environments node_modules Git objects runtime databases toolchain archives and unrelated worktrees

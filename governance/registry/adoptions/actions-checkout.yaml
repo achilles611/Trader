@@ -1,0 +1,39 @@
+adoption_id: actions-checkout
+display_name: actions checkout
+supplier: GitHub
+ecosystem: GitHub Actions
+category: CI_ACTION
+adoption_mode: CI_ONLY
+lifecycle_status: INTEGRATED
+upstream_source: https://github.com/actions/checkout
+immutable_provenance: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+exact_version: v6
+release_tag: v6
+upstream_commit: d23441a48e516b6c34aea4fa41551a30e30af803
+lock_evidence: .github/workflows/ci.yml
+artifact_hashes: {}
+license_expression: MIT
+license_evidence_source: https://github.com/actions/checkout/blob/d23441a48e516b6c34aea4fa41551a30e30af803/LICENSE
+license_evidence_strength: PINNED_UPSTREAM_LICENSE
+redistribution_obligations: retain MIT notice where redistributed
+notice_obligations: MIT notice
+adopted_scope: CI checkout
+explicit_exclusions: no application authority
+owning_components: [ci-configuration]
+technical_capability_profile: CI repository checkout
+network_behavior: GitHub read and CI service traffic
+filesystem_behavior: CI workspace checkout
+subprocess_behavior: CI action runtime
+credential_secret_behavior: GitHub token only under CI permissions
+data_classes_handled: repository source
+storage_footprint: ephemeral CI workspace
+determinism_classification: immutable action commit
+security_review_status: full SHA pin
+maintenance_health: official action
+commissioning_requirements: CI execution
+upgrade_policy: PATCH_REQUALIFICATION
+rollback_policy: restore prior pin
+replacement_strategy: reviewed CI action
+decision_evidence: F5 SHA-pin audit
+unresolved_risks: CI provider availability
+package_name: ''

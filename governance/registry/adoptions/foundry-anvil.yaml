@@ -1,0 +1,39 @@
+adoption_id: foundry-anvil
+display_name: Foundry Anvil
+supplier: Foundry Rust contributors
+ecosystem: executable
+category: EXECUTABLE_TOOLCHAIN
+adoption_mode: ISOLATED_SUBPROCESS
+lifecycle_status: COMMISSIONED
+upstream_source: https://github.com/foundry-rs/foundry/releases/tag/v1.8.1
+immutable_provenance: github:foundry-rs/foundry@982849d3140c01fd3b72905759581a132df7aa98
+exact_version: 1.8.1
+release_tag: v1.8.1
+upstream_commit: 982849d3140c01fd3b72905759581a132df7aa98
+lock_evidence: docs/commissioning/phase-f4-counterfactual-lab/f4-specification.md
+artifact_hashes: {archive_sha256: 02d98fc2c573793960ee06b7f642487d483fe30572f7e248804c207334a418d8, anvil_exe_sha256: c6e29da1b010fe00bac6c0dc5c29484bd641deb5a84050aea10d13e9dc4fe26f}
+license_expression: MIT OR Apache-2.0
+license_evidence_source: https://github.com/foundry-rs/foundry/blob/982849d3140c01fd3b72905759581a132df7aa98/LICENSE-APACHE
+license_evidence_strength: PINNED_UPSTREAM_LICENSE
+redistribution_obligations: retain applicable dual-license notices
+notice_obligations: dual-license notice where redistributed
+adopted_scope: F4 local disposable semantic restoration only
+explicit_exclusions: no fork mode remote RPC mutation wallet signing trading or governance authority
+owning_components: [f4-lab]
+technical_capability_profile: loopback local chain process
+network_behavior: loopback only under frozen F4 source
+filesystem_behavior: stable verified toolchain cache and local evidence
+subprocess_behavior: hash-verified anvil.exe only
+credential_secret_behavior: none
+data_classes_handled: disposable local chain state
+storage_footprint: archive and one executable under toolchain-root template
+determinism_classification: deterministic within frozen scenario contract
+security_review_status: F4 and F5 hash and receipt verified
+maintenance_health: version deliberately frozen
+commissioning_requirements: exact archive executable version shutdown and port-release proof
+upgrade_policy: SEMANTIC_RECOMMISSIONING
+rollback_policy: retain verified v1.8.1 installation; do not replace in place
+replacement_strategy: explicit F4 successor or unfreeze
+decision_evidence: F4 manifest, F5 installation receipt, F5 requalification
+unresolved_risks: upstream semantic changes are disallowed without recommissioning
+package_name: ''

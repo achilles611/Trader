@@ -1,0 +1,1 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":true,"required":["schema","phase","artifacts","manifest_sha256"],"properties":{"schema":{"const":"BEELZEBUB_F5_COMMISSIONING_EVIDENCE_V1"},"phase":{"const":"f5.0"},"artifacts":{"type":"array"},"manifest_sha256":{"type":"string"}}}

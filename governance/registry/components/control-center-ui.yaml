@@ -1,0 +1,27 @@
+schema_version: BEELZEBUB_ARCHITECTURE_COMPONENT_V1
+component_id: control-center-ui
+display_name: Control-center UI
+description: Existing React control-center user interface.
+lane: UI
+phase_owner: phase-c
+lifecycle_status: ACTIVE
+source_roots: [control-center-ui]
+include_patterns: ["**"]
+exclude_patterns: [control-center-ui/node_modules/**, control-center-ui/dist/**]
+executable_entrypoints: [control-center-ui/src/main.tsx]
+internal_dependencies: []
+third_party_adoptions: [react, react-dom, vite, vitest]
+inputs: [local control-center HTTP responses]
+outputs: [browser-rendered read models]
+persistent_state: [browser local state]
+retention_class: CACHE
+retention_policy: {data_written: browser cache, storage_root_class: browser-profile, expected_growth: browser-managed, maximum_retained_bytes: 1073741824, rotation_trigger: browser-cache-policy, rotation_unit: cache, minimum_preserved_set: none, deletion_eligibility: browser-managed, hash_verification_required: false, recovery_requirement: reload-from-source, enforcement_status: BROWSER_MANAGED, owner: control-center-ui}
+failure_policy: display unavailable data explicitly
+rollback_boundary: UI deployment revision
+commissioning_evidence: [control-center-ui tests and build]
+deprecation_policy: explicit UI successor
+technical_capabilities: [read_local_files, contact_remote_read_endpoints]
+current_authority: [contact_remote_read_endpoints]
+authority_ceiling: [contact_remote_read_endpoints]
+prohibited_actions: [write_to_remote_provider_endpoints, read_credentials, submit_paper_orders, submit_testnet_orders, submit_mainnet_orders, sign_wallet_actions, allocate_live_capital]
+authority_enforced_by: [control-center-ui/src, tests/test_beez_console.py]

@@ -1,0 +1,15 @@
+adoption_id: typescript
+display_name: TypeScript
+supplier: Microsoft and TypeScript contributors
+ecosystem: npm
+category: NODE_DEVELOPMENT_PACKAGE
+upstream_source: https://www.npmjs.com/package/typescript/v/7.0.2
+immutable_provenance: npm:typescript@7.0.2
+exact_version: 7.0.2
+release_tag: 7.0.2
+lock_evidence: control-center-ui/package-lock.json
+license_expression: Apache-2.0
+license_evidence_source: npm published metadata for typescript 7.0.2
+adopted_scope: UI static type checking
+owning_components: [control-center-ui]
+package_name: typescript

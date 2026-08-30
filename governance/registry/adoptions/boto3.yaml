@@ -1,0 +1,40 @@
+schema_version: BEELZEBUB_THIRD_PARTY_ADOPTION_V1
+adoption_id: boto3
+display_name: boto3
+supplier: Amazon Web Services
+ecosystem: PyPI
+category: PYTHON_RUNTIME_PACKAGE
+adoption_mode: PACKAGE_MANAGER
+lifecycle_status: INTEGRATED
+upstream_source: https://pypi.org/project/boto3/1.43.68/
+immutable_provenance: pypi:boto3==1.43.68
+exact_version: 1.43.68
+release_tag: 1.43.68
+upstream_commit: ''
+lock_evidence: requirements.lock
+artifact_hashes: {}
+license_expression: Apache-2.0
+license_evidence_source: PyPI project metadata for boto3 1.43.68
+license_evidence_strength: PUBLISHED_PACKAGE_METADATA
+redistribution_obligations: retain Apache notice where redistributed
+notice_obligations: Apache-2.0 notice
+adopted_scope: requester-pays historical data discovery
+explicit_exclusions: governance does not load AWS credentials or make requests
+owning_components: [copytrade]
+technical_capability_profile: S3 client
+network_behavior: source-gated read-only requester-pays object retrieval
+filesystem_behavior: may write existing local acquired data
+subprocess_behavior: none
+credential_secret_behavior: existing runtime may use AWS credentials; governance does not
+data_classes_handled: historical market data
+storage_footprint: configured existing data root
+determinism_classification: nondeterministic remote data availability
+security_review_status: existing source requirements apply
+maintenance_health: active upstream
+commissioning_requirements: explicit operator configuration and source tests
+upgrade_policy: AUTHORITY_REVIEW
+rollback_policy: restore prior exact lock
+replacement_strategy: reviewed S3 data client
+decision_evidence: requirements.lock and source acquisition tests
+unresolved_risks: requester-pays credential and provider availability
+package_name: boto3

@@ -1,0 +1,27 @@
+schema_version: BEELZEBUB_ARCHITECTURE_COMPONENT_V1
+component_id: lane-ii-f0
+display_name: Lane II constitutional boundary
+description: Frozen Lane II capability and authority boundary.
+lane: LANE_II
+phase_owner: f0
+lifecycle_status: READY_FROZEN
+source_roots: [src/lane_ii/boundary.py]
+include_patterns: ["**"]
+exclude_patterns: []
+executable_entrypoints: []
+internal_dependencies: []
+third_party_adoptions: []
+inputs: [candidate inputs]
+outputs: [boundary verdicts]
+persistent_state: []
+retention_class: SOURCE
+retention_policy: {data_written: none, storage_root_class: repository, expected_growth: none, maximum_retained_bytes: 0, rotation_trigger: not-applicable, rotation_unit: none, minimum_preserved_set: source, deletion_eligibility: explicit-unfreeze-only, hash_verification_required: true, recovery_requirement: Git, enforcement_status: GIT_ENFORCED, owner: lane-ii-f0}
+failure_policy: deny unknown authority
+rollback_boundary: frozen f0 commit
+commissioning_evidence: [docs/commissioning/phase-f0-lane-ii-boundary]
+deprecation_policy: explicit successor phase
+technical_capabilities: [read_local_files]
+current_authority: [read_local_files]
+authority_ceiling: [read_local_files]
+prohibited_actions: [write_local_files, submit_paper_orders, submit_testnet_orders, submit_mainnet_orders, sign_wallet_actions, allocate_live_capital]
+authority_enforced_by: [src/lane_ii/boundary.py, tests/test_phase_f0_lane_ii_boundary.py]
