@@ -4,8 +4,8 @@ import type { Candidate, CandidatesResponse, ControlState, Portfolio } from "./t
 import { AutomatedSciencePage, ConfidencePage, DataIgnitionPage, EcosystemPage, ScienceResourcePage } from "./ScienceViews";
 import { SchedulerPage } from "./SchedulerPage";
 
-type Page = "Automated Science" | "Data Ignition" | "Ecosystem" | "Data Soil" | "Wallet Sensors" | "Hypothesis Lab" | "Indicator Forge" | "Experiments" | "Confidence Engine" | "Execution + Risk" | "Lane III Paper" | "Task Scheduler" | "Watchers + Alerts" | "Graveyard" | "Overview" | "Discovery" | "Candidates" | "Shadow" | "Active" | "Portfolio" | "Positions" | "Activity" | "System";
-const pages: Page[] = ["Automated Science", "Data Ignition", "Ecosystem", "Data Soil", "Wallet Sensors", "Hypothesis Lab", "Indicator Forge", "Experiments", "Confidence Engine", "Execution + Risk", "Lane III Paper", "Task Scheduler", "Watchers + Alerts", "Graveyard", "Overview", "Discovery", "Candidates", "Shadow", "Active", "Portfolio", "Positions", "Activity", "System"];
+type Page = "Automated Science" | "Data Ignition" | "Ecosystem" | "Data Soil" | "Wallet Sensors" | "Hypothesis Lab" | "Indicator Forge" | "Experiments" | "Confidence Engine" | "Execution + Risk" | "Lane III Paper" | "Lane III Live" | "Task Scheduler" | "Watchers + Alerts" | "Graveyard" | "Overview" | "Discovery" | "Candidates" | "Shadow" | "Active" | "Portfolio" | "Positions" | "Activity" | "System";
+const pages: Page[] = ["Automated Science", "Data Ignition", "Ecosystem", "Data Soil", "Wallet Sensors", "Hypothesis Lab", "Indicator Forge", "Experiments", "Confidence Engine", "Execution + Risk", "Lane III Paper", "Lane III Live", "Task Scheduler", "Watchers + Alerts", "Graveyard", "Overview", "Discovery", "Candidates", "Shadow", "Active", "Portfolio", "Positions", "Activity", "System"];
 
 const money = (value: unknown) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(Number(value || 0));
 const observedMoney = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? money(value) : "Awaiting NinjaTrader data";
@@ -120,6 +120,7 @@ export function App() {
       {page === "Confidence Engine" && <ConfidencePage />}
       {page === "Execution + Risk" && <ScienceResourcePage endpoint="/api/decisions" title="Execution + Risk" subtitle="Explainable simulation/shadow decisions after model, edge, and risk gates." columns={["created_at", "symbol", "decision", "payload"]} />}
       {page === "Lane III Paper" && <LaneIIIPaperPage notify={setToast} confirmation={setConfirmation} />}
+      {page === "Lane III Live" && <LaneIIILivePage />}
       {page === "Task Scheduler" && <SchedulerPage revision={schedulerRevision} notify={setToast} confirmation={setConfirmation} />}
       {page === "Watchers + Alerts" && <ScienceResourcePage endpoint="/api/science/health" title="Watchers + Alerts" subtitle="Operational data is unavailable until real watcher evidence is persisted." columns={[]} />}
       {page === "Graveyard" && <ScienceResourcePage endpoint="/api/graveyard" title="Graveyard" subtitle="Rejected hypotheses are permanent evidence and searchable before rediscovery." columns={["hypothesis_id", "version", "reason", "recorded_at", "payload"]} search />}
@@ -287,6 +288,23 @@ function SystemPage({ control, watcherHealth }: { control: ControlState | null; 
   const watcher = watcherHealth || health.watcher || {};
   const recovery = health.recovery?.wallets || [];
   return <div className="page-grid">{loadError && <section className="panel span-12"><p className="empty-note">Unable to load system status: {loadError}</p></section>}<section className="panel span-6"><PanelTitle title="System health" /><MetricList values={[["Mode", health.mode || "—"], ["Paper-only", health.paper_only ? "Yes" : "—"], ["Database", health.database?.connected ? "Connected" : "Degraded"], ["Watcher", watcher.state || "NOT_ATTACHED"], ["Supervisor", watcher.supervisor_state || watcher.state || "NOT_ATTACHED"], ["Desired targets", watcher.desired_target_count ?? 0], ["Subscribed targets", watcher.subscribed_target_count ?? 0], ["Membership", watcher.membership_in_sync ? "IN SYNC" : "OUT OF SYNC"], ["Active entry targets", watcher.active_entry_target_count ?? 0], ["Open sleeve wallets", watcher.open_sleeve_wallet_count ?? 0], ["Recovery gaps", recovery.filter((item: any) => item.state !== "CONTINUOUS").length], ["Market data", health.market_data?.fresh ? "Fresh" : "Stale / unavailable"], ["Kill switch", health.kill_switch?.active ? "ACTIVE" : "Off"]]} /></section><section className="panel span-6"><PanelTitle title="Paper control state" /><MetricList values={[["State", control?.state || "—"], ["New OPEN entries", control?.entries_allowed ? "Allowed" : "Paused"], ["Existing exits", "Enabled"], ["WebSocket", health.websocket?.available ? "Available" : "Unavailable"], ["Hyperliquid API", apiRate.state || "READY"], ["REST budget", `${Number(apiRate.estimated_weight_last_minute || 0).toLocaleString()} / ${Number(apiRate.documented_limit || 1200).toLocaleString()} weighted units`], ["429 retry signals", apiRate.retry_count ?? 0], ["HyperCore source", source.connection_state || "SETUP REQUIRED"], ["Cache size", `${Number(source.cache?.size_bytes || 0).toLocaleString()} bytes`], ["Last discovery", health.last_discovery_run?.started_at || "—"], ["Last Phase B", health.last_phase_b_run?.started_at || "—"]]} /></section><section className="panel span-12"><PanelTitle title="Risk controls — current / limit" /><div className="risk-grid">{(risk.limits || []).map((item: any) => <div key={item.label}><div><span>{item.label}</span><strong>{percent(item.current)} / {percent(item.limit)}</strong></div><div className="progress"><i style={{ width: `${Math.min(100, Number(item.current) / Math.max(Number(item.limit), 0.00001) * 100)}%` }} /></div></div>)}</div><p className="muted">These values reflect the existing paper risk gates. This GUI cannot override risk controls or bypass paper-mode validation.</p></section></div>;
+}
+
+function LaneIIILivePage() {
+  const [status, setStatus] = useState<Record<string, any> | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let active = true;
+    api<Record<string, any>>("/api/lane-iii/live").then((value) => { if (active) setStatus(value); }).catch((failure) => { if (active) setError(failure instanceof Error ? failure.message : "Lane III live status is unavailable."); });
+    return () => { active = false; };
+  }, []);
+  const start = status?.one_control_start || {};
+  const emergency = status?.emergency_control || {};
+  return <div className="page-grid">
+    <section className="panel span-12"><PanelTitle title="Lane III live-capital canary" subtitle="Isolated from the paper runtime. Live capital remains denied until a local signed capability and every fresh broker/risk/evidence gate pass." />{error && <p className="error">{error}</p>}</section>
+    <section className="panel span-6"><MetricList values={[["Terminal status", status?.terminal_status || "LOADING"], ["Runtime", status?.state || "—"], ["Account class", status?.account_class || "UNKNOWN"], ["Capital mode", status?.live_capital || "DENIED"], ["Contract", status?.contract || "MNQ SEP26"], ["Maximum quantity", status?.maximum_quantity ?? 1], ["Canary limit", status?.canary_limit ?? 1]]} /></section>
+    <section className="panel span-6"><PanelTitle title="One-control activation" subtitle={start.reason || "Live preflight required."} /><button className="button positive" disabled={!start.enabled}>{start.label || "START LIVE — 1 MNQ CANARY"}</button><p className="muted">This control remains disabled until the capability, reconciliation, protection, storage, and UI gates all pass.</p><PanelTitle title="Emergency control" subtitle={emergency.reason || "Unavailable"} /><button className="button danger" disabled={!emergency.enabled}>EMERGENCY FLATTEN + DISARM</button></section>
+  </div>;
 }
 
 function LaneIIIPaperPage({ notify, confirmation }: { notify: (toast: Toast) => void; confirmation: (value: Confirmation) => void }) {

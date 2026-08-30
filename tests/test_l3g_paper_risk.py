@@ -8,7 +8,7 @@ import unittest
 from src.l3g_paper.contracts import POLICY, PaperDecisionKind, PaperDirection
 from src.l3g_paper.risk import PaperRiskAuthority, PaperRiskSnapshot
 
-from .l3g_helpers import warmed_bullish_policy
+from tests.l3g_helpers import warmed_bullish_policy
 
 
 AT = "2026-08-24T14:00:00Z"

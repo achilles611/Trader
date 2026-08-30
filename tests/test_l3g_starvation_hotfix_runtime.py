@@ -25,7 +25,7 @@ from src.l3g_paper.risk import PaperRiskSnapshot
 from src.l3g_paper.runtime import LaneIIIPaperRuntime
 from src.l3g_paper.sessions import PaperSessionResolver
 
-from .l3g_helpers import ObservationFactory, warmed_bullish_policy
+from tests.l3g_helpers import ObservationFactory, warmed_bullish_policy
 
 
 NOW = "2026-08-26T14:00:00Z"

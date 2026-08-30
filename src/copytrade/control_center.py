@@ -1540,6 +1540,35 @@ def create_control_center_app(
             status["ledger"] = ledger_health_projection(raw_ledger, verification)
         return status
 
+    def lane_iii_live_health() -> dict[str, object]:
+        """Expose only the L3H fail-closed shell until a local capability is verified.
+
+        Deliberately do not construct a live runtime here: an HTTP status read
+        must not create a key, capability, ledger, listener, or order path.
+        """
+        return {
+            "schema": "lane-iii-phase-h-live-status-v1",
+            "mode": "L3H_LIVE_CAPITAL",
+            "state": "BLOCKED",
+            "terminal_status": "BLOCKED_CAPABILITY_MISSING",
+            "account_alias": None,
+            "account_class": "UNKNOWN",
+            "live_capital": "DENIED",
+            "contract": "MNQ SEP26",
+            "maximum_quantity": 1,
+            "canary_limit": 1,
+            "one_control_start": {
+                "label": "START LIVE — 1 MNQ CANARY",
+                "enabled": False,
+                "reason": "LOCAL_SIGNED_CAPABILITY_REQUIRED",
+            },
+            "emergency_control": {
+                "enabled": False,
+                "reason": "LIVE_ADDON_NOT_REGISTERED",
+            },
+            "authority": "DISARMED_FAIL_CLOSED",
+        }
+
     async def quiesce_ledger_verifier_for_shutdown() -> dict[str, object]:
         """Release a read-only verifier snapshot before the writer truncates WAL.
 
@@ -2077,6 +2106,7 @@ def create_control_center_app(
             "ninjatrader_observer": ninja_listener_health(),
             "lane_iii_shadow": lane_iii_shadow_health(),
             "lane_iii_paper": sanitized_paper_health(lane_iii_paper_health()),
+            "lane_iii_live": lane_iii_live_health(),
             "scheduler": scheduler_service.status(),
             "runtime_binding": runtime_binding,
         }
@@ -2235,6 +2265,11 @@ def create_control_center_app(
     @app.get("/api/lane-iii/paper")
     async def api_lane_iii_paper() -> dict[str, object]:
         return lane_iii_paper_health()
+
+    @app.get("/api/lane-iii/live")
+    async def api_lane_iii_live() -> dict[str, object]:
+        """Read-only L3H status. No live order-producing route is registered."""
+        return lane_iii_live_health()
 
     @app.get("/api/accounts/balances")
     async def api_account_balances() -> dict[str, object]:

@@ -19,7 +19,7 @@ from src.l3g_paper.ledger import (
 from src.l3g_paper.runtime import LaneIIIPaperRuntime
 from src.l3g_paper.sessions import UNSPECIFIED_OFF_SESSION_CONTEXT
 
-from .l3g_helpers import ObservationFactory
+from tests.l3g_helpers import ObservationFactory
 
 
 START = datetime(2026, 8, 26, 14, 0, tzinfo=timezone.utc)

@@ -25,7 +25,7 @@ from src.l3g_paper.runtime import (
 from src.l3g_paper.contracts import PaperDirection, PaperEntryOwner, PaperRuntimeState, PaperSessionArmGrant
 from src.l3g_paper.risk import PaperRiskSnapshot
 from src.l3g_paper.sessions import PaperSessionResolver
-from .l3g_helpers import ObservationFactory, warmed_bullish_policy
+from tests.l3g_helpers import ObservationFactory, warmed_bullish_policy
 
 
 class PaperRuntimeTests(unittest.TestCase):

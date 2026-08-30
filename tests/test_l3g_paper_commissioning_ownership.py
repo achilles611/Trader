@@ -15,7 +15,7 @@ from src.l3g_paper.ninjatrader_transport import ADDON_PROTOCOL_VERSION, PaperExe
 from src.l3g_paper.risk import PaperRiskSnapshot
 from src.l3g_paper.runtime import LaneIIIPaperRuntime
 from src.l3g_paper.sessions import PaperSessionResolver, context_from_identity
-from .l3g_helpers import warmed_bullish_policy
+from tests.l3g_helpers import warmed_bullish_policy
 
 
 class CommissioningOwnershipTests(unittest.TestCase):

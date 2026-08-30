@@ -21,7 +21,7 @@ from src.l3g_paper.sessions import (
 )
 from src.l3f_provider.tradovate_observation import StreamHealth
 
-from .l3g_helpers import ObservationFactory, warmed_bullish_policy
+from tests.l3g_helpers import ObservationFactory, warmed_bullish_policy
 
 
 def resolved(value: str):

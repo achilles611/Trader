@@ -1,0 +1,17 @@
+{
+  "schema": "lane-iii-phase-h-live-risk-canary-v1",
+  "profile_id": "l3h-live-risk-canary-v0",
+  "maximum_absolute_position": 1,
+  "maximum_entry_quantity": 1,
+  "maximum_pending_entries": 1,
+  "maximum_canary_round_trips": 1,
+  "pyramiding": false,
+  "averaging": false,
+  "same_event_reversal": false,
+  "protective_stop_distance_points": "25.00",
+  "maximum_trade_risk_dollars": "50.00",
+  "daily_loss_limit_dollars": "200.00",
+  "maximum_entry_slippage_points": "2.00",
+  "hard_flat_deadline": "15:58",
+  "session_timezone": "America/New_York"
+}

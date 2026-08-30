@@ -7,7 +7,7 @@ from src.l3f_provider.tradovate_observation import StreamHealth
 from src.l3g_paper.contracts import PaperDecisionKind, PaperDirection
 from src.l3g_paper.policy import ExperimentalPaperPolicy
 
-from .l3g_helpers import ObservationFactory, warmed_bullish_policy
+from tests.l3g_helpers import ObservationFactory, warmed_bullish_policy
 
 
 class PaperPolicyTests(unittest.TestCase):

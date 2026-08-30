@@ -1,0 +1,20 @@
+{
+  "schema": "lane-iii-phase-h-live-policy-v1",
+  "policy_id": "l3h-live-policy-v0",
+  "strategy_mode": "NATURAL_SIGNAL_ONLY",
+  "native_contract": "MNQ SEP26",
+  "canonical_contract": "MNQU6",
+  "maximum_quantity": 1,
+  "entry_session_start": "09:35",
+  "entry_session_end": "15:30",
+  "hard_flat_deadline": "15:58",
+  "session_timezone": "America/New_York",
+  "source_provenance_required": true,
+  "accepted_sequence_authorities": [
+    "PROVIDER_SEQUENCE",
+    "NINJATRADER_CALLBACK_ORDER",
+    "NT_REPLAY_FILE_ORDER",
+    "LOCAL_RECEIPT_ORDER"
+  ],
+  "scientific_eligibility": false
+}

@@ -12,11 +12,12 @@ working tree and tests before treating an older task as complete.
 
 ## Current direction
 
-The newest work concentrates on a safe, public-only Hyperliquid observer and
-the F4 counterfactual lab, while the preceding work establishes a paper-only
-Lane III commissioning, durable ledger, verification, and read-only control
-center foundation. The project remains paper/simulation only; no task here
-authorizes live trading or external venue writes.
+The current `l3h` branch adds an isolated, fail-closed live-capital authority
+boundary without changing the sealed L3G Sim101 paper capability. Its source
+contracts, write-ahead event store, reconciliation rules, canary risk limit,
+and disabled operator surface are present, but no local signed capability or
+installed L3H AddOn is registered. The truthful terminal state is therefore
+`BLOCKED_CAPABILITY_MISSING`; no L3H order path is enabled or authorized.
 
 ## Task index
 
