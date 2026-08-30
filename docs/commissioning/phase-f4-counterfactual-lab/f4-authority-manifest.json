@@ -1,0 +1,18 @@
+{
+  "schema": "phase-f4-counterfactual-authority-manifest-v1",
+  "version": "phase-f4-counterfactual-lab-v1",
+  "lane": "TRADER_LANE",
+  "capability": "COUNTERFACTUAL_SIMULATION",
+  "authority": "ALLOWED",
+  "signal_authority": false,
+  "prediction_authority": false,
+  "scientific_evaluation_authority": false,
+  "execution_authority": false,
+  "trading_authority": false,
+  "live_capital_authority": false,
+  "production_network_mutation": false,
+  "testnet_network_mutation": false,
+  "local_state_mutation": true,
+  "counterfactual_evidence_only": true,
+  "canonical_manifest_sha256": "ffaeb0af596c2d6c9e021baccda5a9118d015fbd12b540a5732b5c5454dbc4da"
+}

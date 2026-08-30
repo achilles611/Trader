@@ -1,0 +1,17 @@
+{
+  "schema_version": "counterfactual-scenario-v1",
+  "scenario_id": "hostile-external-position",
+  "scenario_version": "v1",
+  "deterministic_seed": 7331,
+  "backend": "VENUE_MODEL",
+  "target_domain": "SYNTHETIC_HYPERCORE",
+  "initial_state_fingerprint": "163a8336f71856a1a877c9782a693f2b63536457e2d6bf0be499678d2ad4e15e",
+  "mutations": [
+    {"verb": "inject_external_position", "parameters": {"symbol": "BTC", "quantity": 1}}
+  ],
+  "assertions": [
+    {"verb": "safety_state_equals", "parameters": {"state": "RECONCILIATION_REQUIRED"}}
+  ],
+  "timeout_seconds": 15,
+  "provenance": "COUNTERFACTUAL_ONLY"
+}
