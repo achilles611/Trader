@@ -68,6 +68,19 @@ class BeezConsoleTests(unittest.TestCase):
         start_server.assert_not_called()
         open_brave.assert_called_once_with(brave, root)
 
+    def test_brave_open_uses_a_unique_document_url_after_a_restart(self) -> None:
+        brave = Path(r"C:\\Tools\\brave.exe")
+        root = Path(r"C:\\Trader")
+        with (
+            patch("beez_console.time.time_ns", return_value=12345),
+            patch("beez_console.subprocess.Popen") as popen,
+        ):
+            beez_console.open_brave(brave, root)
+        self.assertEqual(
+            popen.call_args.args[0],
+            [str(brave), "--new-window", "http://127.0.0.1:8090/?launch=12345"],
+        )
+
     def test_wait_reports_exited_backend(self) -> None:
         process = Mock()
         process.poll.return_value = 1

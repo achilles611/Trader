@@ -127,6 +127,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 bool isLucid = String.Equals(account.Name, configuredId, StringComparison.Ordinal);
                 BeelzebubReadOnlyOutbound.Publish("CONNECTION", Alias(account, isLucid), Class(isLucid),
                     "{\"state\":\"ACCOUNT_BOUND\"}");
+                PublishAccountBalanceSnapshot(account, isLucid);
                 PublishAccountStateSnapshot(account, isLucid);
             }
             BeelzebubReadOnlyOutbound.Diagnostic("ACCOUNT_DISCOVERY_MATCH_COUNT_" + matched);
@@ -187,6 +188,31 @@ namespace NinjaTrader.NinjaScript.AddOns
             {
                 BeelzebubReadOnlyOutbound.Diagnostic("ACCOUNT_SNAPSHOT_FAILED_" + error.GetType().Name);
             }
+        }
+
+        // AccountItemUpdate is event-driven and may not fire immediately for
+        // a quiet account. Emit the current read-only values at attachment so
+        // the local console does not display a synthetic paper balance.
+        private void PublishAccountBalanceSnapshot(Account account, bool isLucid)
+        {
+            try
+            {
+                PublishAccountItem(account, isLucid, AccountItem.CashValue);
+                PublishAccountItem(account, isLucid, AccountItem.NetLiquidation);
+                PublishAccountItem(account, isLucid, AccountItem.RealizedProfitLoss);
+                PublishAccountItem(account, isLucid, AccountItem.UnrealizedProfitLoss);
+            }
+            catch (Exception error)
+            {
+                BeelzebubReadOnlyOutbound.Diagnostic("ACCOUNT_BALANCE_SNAPSHOT_FAILED_" + error.GetType().Name);
+            }
+        }
+
+        private static void PublishAccountItem(Account account, bool isLucid, AccountItem item)
+        {
+            BeelzebubReadOnlyOutbound.Publish("ACCOUNT", Alias(account, isLucid), Class(isLucid),
+                "{\"item\":\"" + Escape(item.ToString()) + "\",\"value\":" +
+                account.Get(item, Currency.UsDollar).ToString(CultureInfo.InvariantCulture) + "}");
         }
 
         private static string Alias(Account account, bool isLucid)

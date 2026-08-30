@@ -1407,6 +1407,25 @@ def create_control_center_app(
         if supervisor is not None:
             supervisor.wake()
 
+    def unobserved_account_balances() -> dict[str, dict[str, object]]:
+        """Stable display shape before the read-only listener receives a value."""
+        return {
+            "Sim101": {
+                "alias": "Sim101", "account_class": "LOCAL_SIMULATION",
+                "cash_value": None, "cash_value_observed_at": None,
+                "net_liquidation": None, "net_liquidation_observed_at": None,
+                "realized_pnl": None, "realized_pnl_observed_at": None,
+                "unrealized_pnl": None, "unrealized_pnl_observed_at": None,
+            },
+            "Lucid25kflex01": {
+                "alias": "Lucid25kflex01", "account_class": "PROVIDER_EVALUATION",
+                "cash_value": None, "cash_value_observed_at": None,
+                "net_liquidation": None, "net_liquidation_observed_at": None,
+                "realized_pnl": None, "realized_pnl_observed_at": None,
+                "unrealized_pnl": None, "unrealized_pnl_observed_at": None,
+            },
+        }
+
     def ninja_listener_health() -> dict[str, object]:
         listener = ninjatrader_runtime.get("listener")
         if listener is None:
@@ -1432,9 +1451,11 @@ def create_control_center_app(
                     "fresh": False,
                     "reason": "MISSING_OBSERVATION_TIMESTAMP",
                 },
+                "account_balances": unobserved_account_balances(),
                 "authority": "OBSERVE_ONLY",
             }
         value = listener.status().as_dict()
+        value.setdefault("account_balances", unobserved_account_balances())
         freshness = _authentic_observation_freshness(
             {"last_observation_at": value.get("last_level_one_at")},
             MARKET_OBSERVER_ACTIVE_FRESHNESS_SECONDS,
@@ -1482,6 +1503,7 @@ def create_control_center_app(
     def lane_iii_paper_health() -> dict[str, object]:
         paper = ninjatrader_runtime.get("paper")
         if paper is None:
+            observer = ninja_listener_health()
             return {
                 "schema": "lane-iii-phase-g-paper-runtime-status-v1",
                 "mode": "PAPER_SIM101",
@@ -1495,7 +1517,8 @@ def create_control_center_app(
                 "market_instrument": "MNQ SEP26",
                 "maximum_quantity": 1,
                 "live_capital": "DENIED",
-                "market_observer": ninja_listener_health(),
+                "account_balances": observer["account_balances"],
+                "market_observer": observer,
                 "ledger_verification": ledger_verifier.status(),
                 "ledger_shutdown": paper_ledger_shutdown_receipt,
             }
@@ -1509,6 +1532,7 @@ def create_control_center_app(
                 checkpoint_matches_report=ledger_verifier.checkpoint_matches_report(verification),
             )
         status["market_observer"] = ninja_listener_health()
+        status["account_balances"] = status["market_observer"]["account_balances"]
         status["ledger_verification"] = verification
         status["ledger_shutdown"] = paper_ledger_shutdown_receipt
         raw_ledger = status.get("ledger")
@@ -2212,6 +2236,14 @@ def create_control_center_app(
     async def api_lane_iii_paper() -> dict[str, object]:
         return lane_iii_paper_health()
 
+    @app.get("/api/accounts/balances")
+    async def api_account_balances() -> dict[str, object]:
+        """Expose the two NinjaTrader AccountItem CashValue readings, read-only."""
+        return {
+            "accounts": ninja_listener_health()["account_balances"],
+            "authority": "OBSERVE_ONLY",
+        }
+
     @app.get("/api/lane-iii/paper/ledger-verification")
     async def api_lane_iii_paper_ledger_verification() -> dict[str, Any]:
         return ledger_verification_status()
@@ -2683,6 +2715,7 @@ def create_control_center_app(
                     "portfolio_update": center.portfolio_summary(),
                     "position_update": {"items": center.positions(), "paper_only": True},
                     "watcher_health": center.health(live_watcher_health)["watcher"],
+                    "account_balances": ninja_listener_health()["account_balances"],
                     "activity": {"items": center.activity(limit=20)},
                     "scheduler_status": scheduler_service.status(),
                     "scheduler_schedule_update": scheduler_service.schedules(page=1, page_size=50),
@@ -2722,7 +2755,10 @@ def create_control_center_app(
             # route falls back to index.html, including traversal-like paths.
             if root not in requested.parents or not requested.is_file():
                 requested = root / "index.html"
-            return FileResponse(requested)
+            # Never retain an old SPA shell across a local backend restart.
+            # The hashed JS/CSS assets can remain safely cacheable.
+            headers = {"Cache-Control": "no-store, max-age=0"} if requested.name == "index.html" else None
+            return FileResponse(requested, headers=headers)
     else:
         @app.get("/", response_class=HTMLResponse)
         async def frontend_missing() -> str:

@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import logging
+import math
 import select
 import socket
 import threading
@@ -22,6 +23,39 @@ from .ninjatrader_observation import (
     NinjaTraderObservationError,
 )
 from .tradovate_observation import StreamHealth
+
+
+# These are display-only account facts from NinjaTrader's read-only
+# AccountItemUpdate stream.  They must never become execution or risk inputs.
+_ACCOUNT_BALANCE_FIELD_BY_ITEM = {
+    "CashValue": "cash_value",
+    "NetLiquidation": "net_liquidation",
+    "RealizedProfitLoss": "realized_pnl",
+    "UnrealizedProfitLoss": "unrealized_pnl",
+}
+_DISPLAY_ACCOUNT_CLASSES = {
+    "Sim101": AccountClass.LOCAL_SIMULATION.value,
+    "Lucid25kflex01": AccountClass.PROVIDER_EVALUATION.value,
+}
+
+
+def _empty_account_balances() -> dict[str, dict[str, object]]:
+    """Return the fixed, credential-free account-balance read model."""
+    return {
+        alias: {
+            "alias": alias,
+            "account_class": account_class,
+            "cash_value": None,
+            "cash_value_observed_at": None,
+            "net_liquidation": None,
+            "net_liquidation_observed_at": None,
+            "realized_pnl": None,
+            "realized_pnl_observed_at": None,
+            "unrealized_pnl": None,
+            "unrealized_pnl_observed_at": None,
+        }
+        for alias, account_class in _DISPLAY_ACCOUNT_CLASSES.items()
+    }
 
 
 @dataclass
@@ -121,6 +155,7 @@ class NinjaTraderListenerRuntimeStatus:
     observation_types: Mapping[str, int]
     last_level_one_at: str | None
     last_depth_at: str | None
+    account_balances: Mapping[str, Mapping[str, object]]
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -138,6 +173,9 @@ class NinjaTraderListenerRuntimeStatus:
             "market_observer_depth_received": self.last_depth_at is not None,
             "last_level_one_at": self.last_level_one_at,
             "last_depth_at": self.last_depth_at,
+            "account_balances": {
+                alias: dict(values) for alias, values in self.account_balances.items()
+            },
             "authority": "OBSERVE_ONLY",
         }
 
@@ -375,6 +413,7 @@ class NinjaTraderListenerWorker:
         self._observation_types: dict[str, int] = {}
         self._last_level_one_at: str | None = None
         self._last_depth_at: str | None = None
+        self._account_balances = _empty_account_balances()
 
     def status(self) -> NinjaTraderListenerRuntimeStatus:
         with self._lock:
@@ -389,7 +428,24 @@ class NinjaTraderListenerWorker:
                 observation_types=dict(self._observation_types),
                 last_level_one_at=self._last_level_one_at,
                 last_depth_at=self._last_depth_at,
+                account_balances={alias: dict(values) for alias, values in self._account_balances.items()},
             )
+
+    def _record_account_balance(self, observation: NinjaTraderObservation) -> None:
+        """Keep only finite, read-only account values from the exact two aliases."""
+        if observation.observation_type != "ACCOUNT" or observation.account_alias not in _DISPLAY_ACCOUNT_CLASSES:
+            return
+        item = observation.payload.get("item")
+        field = _ACCOUNT_BALANCE_FIELD_BY_ITEM.get(item) if isinstance(item, str) else None
+        value = observation.payload.get("value")
+        if field is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+            return
+        numeric_value = float(value)
+        if not math.isfinite(numeric_value):
+            return
+        account = self._account_balances[observation.account_alias]
+        account[field] = numeric_value
+        account[f"{field}_observed_at"] = observation.ninja_receipt_time
 
     def _record_and_forward_observation(self, observation: NinjaTraderObservation) -> None:
         with self._lock:
@@ -401,6 +457,7 @@ class NinjaTraderListenerWorker:
                 self._last_level_one_at = observation.ninja_receipt_time
             elif kind == "DEPTH":
                 self._last_depth_at = observation.ninja_receipt_time
+            self._record_account_balance(observation)
             callback = self._on_observation
         if callback is not None:
             callback(observation)
@@ -464,6 +521,7 @@ class NinjaTraderListenerWorker:
             self._observation_types = {}
             self._last_level_one_at = None
             self._last_depth_at = None
+            self._account_balances = _empty_account_balances()
             self._harness = NinjaTraderCommissioningHarness(
                 self.config,
                 on_listener_started=self._listener_started,

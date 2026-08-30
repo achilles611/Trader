@@ -8,6 +8,7 @@ type Page = "Automated Science" | "Data Ignition" | "Ecosystem" | "Data Soil" | 
 const pages: Page[] = ["Automated Science", "Data Ignition", "Ecosystem", "Data Soil", "Wallet Sensors", "Hypothesis Lab", "Indicator Forge", "Experiments", "Confidence Engine", "Execution + Risk", "Lane III Paper", "Task Scheduler", "Watchers + Alerts", "Graveyard", "Overview", "Discovery", "Candidates", "Shadow", "Active", "Portfolio", "Positions", "Activity", "System"];
 
 const money = (value: unknown) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(Number(value || 0));
+const observedMoney = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? money(value) : "Awaiting NinjaTrader data";
 const percent = (value: unknown) => `${(Number(value || 0) * 100).toFixed(1)}%`;
 const number = (value: unknown, digits = 1) => value === null || value === undefined ? "—" : Number(value).toFixed(digits);
 const walletLabel = (wallet: string) => wallet.length > 14 ? `${wallet.slice(0, 8)}…${wallet.slice(-6)}` : wallet;
@@ -20,13 +21,18 @@ const optionalBytes = (value: unknown) => value === null || value === undefined 
 
 type Toast = { tone: "error" | "success" | "warning"; message: string } | null;
 type Confirmation = { title: string; body: string; action: () => Promise<void>; confirm: string } | null;
+type AccountBalances = Record<string, { cash_value?: number | null; cash_value_observed_at?: string | null; net_liquidation?: number | null; net_liquidation_observed_at?: string | null }>;
 const terminalDiscoveryStatuses = new Set(["completed", "completed_with_warnings", "failed", "cancelled"]);
 const isTerminalDiscoveryJob = (status?: string) => terminalDiscoveryStatuses.has(String(status || ""));
+const accountReading = (balances: AccountBalances | null, alias: string) => balances?.[alias] || null;
+const accountBalanceValue = (account: ReturnType<typeof accountReading>) => account?.cash_value ?? account?.net_liquidation;
+const accountBalanceSubtitle = (account: ReturnType<typeof accountReading>) => account?.cash_value_observed_at ? `NinjaTrader CashValue · ${timeLabel(account.cash_value_observed_at)}` : account?.net_liquidation_observed_at ? `NinjaTrader Net Liquidation · ${timeLabel(account.net_liquidation_observed_at)}` : "Awaiting read-only NinjaTrader account value";
 
 export function App() {
   const [page, setPage] = useState<Page>("Overview");
   const [overview, setOverview] = useState<Record<string, any> | null>(null);
   const [portfolio, setPortfolio] = useState<Portfolio | null>(null);
+  const [accountBalances, setAccountBalances] = useState<AccountBalances | null>(null);
   const [control, setControl] = useState<ControlState | null>(null);
   const [livePositions, setLivePositions] = useState<any[] | null>(null);
   const [watcherHealth, setWatcherHealth] = useState<Record<string, any> | null>(null);
@@ -40,8 +46,8 @@ export function App() {
   const reportError = useCallback((error: unknown) => setToast({ tone: "error", message: error instanceof Error ? error.message : "The action failed. No state change was made." }), []);
   const refresh = useCallback(async () => {
     try {
-      const [nextOverview, nextPortfolio, nextControl] = await Promise.all([api<Record<string, any>>("/api/overview"), api<Portfolio>("/api/portfolio"), api<ControlState>("/api/controls")]);
-      setOverview(nextOverview); setPortfolio(nextPortfolio); setControl(nextControl);
+      const [nextOverview, nextPortfolio, nextControl, nextBalances] = await Promise.all([api<Record<string, any>>("/api/overview"), api<Portfolio>("/api/portfolio"), api<ControlState>("/api/controls"), api<{ accounts: AccountBalances }>("/api/accounts/balances")]);
+      setOverview(nextOverview); setPortfolio(nextPortfolio); setControl(nextControl); setAccountBalances(nextBalances.accounts || null);
     } catch (error) { reportError(error); }
   }, [reportError]);
 
@@ -51,6 +57,7 @@ export function App() {
     ws.onmessage = (event) => {
       const message = JSON.parse(event.data) as { type: string; data: any };
       if (message.type === "portfolio_update") setPortfolio(message.data);
+      if (message.type === "account_balances") setAccountBalances(message.data || null);
       if (message.type === "control_state") setControl(message.data);
       if (message.type === "position_update") setLivePositions(message.data?.items || []);
       if (message.type === "watcher_health") setWatcherHealth(message.data || null);
@@ -116,12 +123,12 @@ export function App() {
       {page === "Task Scheduler" && <SchedulerPage revision={schedulerRevision} notify={setToast} confirmation={setConfirmation} />}
       {page === "Watchers + Alerts" && <ScienceResourcePage endpoint="/api/science/health" title="Watchers + Alerts" subtitle="Operational data is unavailable until real watcher evidence is persisted." columns={[]} />}
       {page === "Graveyard" && <ScienceResourcePage endpoint="/api/graveyard" title="Graveyard" subtitle="Rejected hypotheses are permanent evidence and searchable before rediscovery." columns={["hypothesis_id", "version", "reason", "recorded_at", "payload"]} search />}
-      {page === "Overview" && <Overview data={overview} portfolio={portfolio} navigate={setPage} />}
+      {page === "Overview" && <Overview data={overview} portfolio={portfolio} accountBalances={accountBalances} navigate={setPage} />}
       {page === "Discovery" && <DiscoveryPage discoveryJob={discoveryJob} navigate={setPage} confirmation={setConfirmation} refresh={refresh} />}
       {page === "Candidates" && <CandidatesPage key={discoveryRevision} notify={setToast} confirmation={setConfirmation} refresh={refresh} navigate={setPage} />}
       {page === "Shadow" && <ShadowPage notify={setToast} confirmation={setConfirmation} refresh={refresh} />}
       {page === "Active" && <ActivePage notify={setToast} confirmation={setConfirmation} refresh={refresh} />}
-      {page === "Portfolio" && <PortfolioPage portfolio={portfolio} />}
+      {page === "Portfolio" && <PortfolioPage portfolio={portfolio} accountBalances={accountBalances} />}
       {page === "Positions" && <PositionsPage livePositions={livePositions} />}
       {page === "Activity" && <ActivityPage liveItems={liveActivity} />}
       {page === "System" && <><SystemPage control={control} watcherHealth={watcherHealth} /><ShadowObservationStatus /></>}
@@ -131,18 +138,22 @@ export function App() {
   </div>;
 }
 
-function Overview({ data, portfolio, navigate }: { data: Record<string, any> | null; portfolio: Portfolio | null; navigate: (page: Page) => void }) {
+function Overview({ data, portfolio, accountBalances, navigate }: { data: Record<string, any> | null; portfolio: Portfolio | null; accountBalances: AccountBalances | null; navigate: (page: Page) => void }) {
   const counts = data?.counts || {};
+  const sim101 = accountReading(accountBalances, "Sim101");
+  const lucidFlex = accountReading(accountBalances, "Lucid25kflex01");
   const cards = [
     ["Discovered", counts.total_discovered, "Research universe"], ["Qualified", counts.qualified, "Current Phase B evidence"],
     ["Shadow", counts.shadow, "Monitored finalists"], ["Active", counts.active, "PAPER cohort"],
-    ["Open PAPER P&L", money(portfolio?.open_pnl), "Unrealized"], ["Paper equity", money(portfolio?.equity), `Max DD ${percent(portfolio?.max_drawdown)}`],
+    ["Open PAPER P&L", money(portfolio?.open_pnl), "Unrealized simulation P&L"],
+    ["Sim101 balance", observedMoney(accountBalanceValue(sim101)), accountBalanceSubtitle(sim101)],
+    ["LucidFlex balance", observedMoney(accountBalanceValue(lucidFlex)), accountBalanceSubtitle(lucidFlex)],
   ];
   return <div className="page-grid">
     {Number(counts.total_discovered || 0) === 0 && <section className="panel span-12"><PanelTitle title="Candidate universe not initialized" subtitle="Start with recent public HyperCore activity, then use Phase B research before any manual PAPER cohort decision." /><button className="button positive" onClick={() => navigate("Discovery")}>Start Discovery</button></section>}
     <section className="stat-grid">{cards.map(([label, value, sub]) => <article className="panel stat" key={String(label)}><span>{label}</span><strong>{value ?? "—"}</strong><small>{sub}</small></article>)}</section>
     <section className="panel span-8"><PanelTitle title="Research funnel" action="Open candidates" onAction={() => navigate("Candidates")} /><div className="funnel">{(data?.funnel || []).map((stage: any) => <button key={stage.key} onClick={() => navigate("Candidates")}><strong>{Number(stage.count).toLocaleString()}</strong><span>{stage.label}</span></button>)}</div></section>
-    <section className="panel span-4"><PanelTitle title="Paper portfolio" action="Open portfolio" onAction={() => navigate("Portfolio")} /><MetricList values={[["Free cash", money(portfolio?.cash)], ["Committed", money(portfolio?.committed_capital)], ["Realized total", money(portfolio?.realized_pnl_total)], ["Open positions", portfolio?.open_positions ?? "—"]]} /></section>
+    <section className="panel span-4"><PanelTitle title="NinjaTrader balances" action="Open portfolio" onAction={() => navigate("Portfolio")} /><MetricList values={[["Sim101", observedMoney(accountBalanceValue(sim101))], ["LucidFlex", observedMoney(accountBalanceValue(lucidFlex))], ["Open PAPER P&L", money(portfolio?.open_pnl)], ["Open positions", portfolio?.open_positions ?? "—"]]} /></section>
     <section className="panel span-7"><PanelTitle title="Top research candidates" action="Candidate table" onAction={() => navigate("Candidates")} /><CandidateRows candidates={data?.top_candidates || []} /></section>
     <section className="panel span-5"><PanelTitle title="Recent activity" action="Full activity" onAction={() => navigate("Activity")} /><ActivityList items={data?.recent_activity || []} /></section>
   </div>;
@@ -247,8 +258,10 @@ function ActivePage({ notify, confirmation, refresh }: { notify: (toast: Toast) 
   return <div className="page-grid"><section className="panel span-12"><PanelTitle title="Manual active PAPER cohort" subtitle={`Target size 5–7 — ${cohort?.count ?? 0} active — activation is manual only`} /><div className="table-scroll"><table><thead><tr><th>Wallet</th><th>Score</th><th>Allocation state</th><th>Open P&L</th><th>Total P&L</th><th>DD</th><th>Research state</th><th>Status</th><th /></tr></thead><tbody>{(cohort?.members || []).map((item: any) => <tr key={item.wallet}><td className="mono">{walletLabel(item.wallet)}</td><td>{number(item.score)}</td><td>{item.allocation_policy}</td><td>{money(item.open_pnl)}</td><td>{money(item.total_pnl)}</td><td>{percent(item.drawdown)}</td><td><span className="badge neutral">{item.research_state || "—"}</span></td><td><span className="badge state">ACTIVE — PAPER</span></td><td><button className="link-button" onClick={() => remove(item.wallet)}>Remove</button></td></tr>)}{!cohort?.members?.length && <tr><td className="empty" colSpan={9}>No active PAPER traders. Activate a qualified/shadow finalist from the Shadow page.</td></tr>}</tbody></table></div></section><section className="panel span-6"><PanelTitle title="Cohort guardrails" /><MetricList values={[["Paper only", "Yes"], ["Automatic promotion", "Disabled"], ["Entry eligibility", "Active state + global control"], ["Exit handling", "Continues while entries paused/muted"]]} /></section><section className="panel span-6"><PanelTitle title="Portfolio overlap" /><p className="muted">Current trader/symbol overlap is shown through the portfolio's attribution and positions views. The canonical Phase B finalist selection includes persisted diversification evidence before this manual activation step.</p></section></div>;
 }
 
-function PortfolioPage({ portfolio }: { portfolio: Portfolio | null }) {
-  return <div className="page-grid"><section className="stat-grid span-12">{[["Paper equity", money(portfolio?.equity)], ["Free cash", money(portfolio?.cash)], ["Committed", money(portfolio?.committed_capital)], ["Open P&L", money(portfolio?.open_pnl)], ["Realized today", money(portfolio?.realized_pnl_today)], ["Realized total", money(portfolio?.realized_pnl_total)], ["Fees", money(portfolio?.fees)], ["Max DD", percent(portfolio?.max_drawdown)]].map(([label, value]) => <article className="panel stat" key={String(label)}><span>{label}</span><strong>{value}</strong></article>)}</section><section className="panel span-8"><PanelTitle title="Paper equity curve" subtitle="Persisted portfolio snapshots" /><MiniChart points={(portfolio?.equity_curve || []).map((point: any) => Number(point.equity || 0))} color="#46c995" /></section><section className="panel span-4"><PanelTitle title="Drawdown curve" /><MiniChart points={(portfolio?.drawdown_curve || []).map((point: any) => Number(point.value || 0))} color="#e7a950" /></section><Attribution title="P&L by trader" rows={portfolio?.pnl_by_trader || []} keys={["target_wallet", "open_pnl", "realized_pnl", "total_pnl", "fees", "capital_usage"]} /><Attribution title="P&L by symbol" rows={portfolio?.pnl_by_symbol || []} keys={["symbol", "open_pnl", "realized_pnl", "total_pnl", "exposure", "position_count"]} /><Attribution title="P&L by sizing bucket" rows={portfolio?.pnl_by_bucket || []} keys={["bucket", "open_pnl", "realized_pnl", "total_pnl", "capital_usage", "position_count"]} /></div>;
+function PortfolioPage({ portfolio, accountBalances }: { portfolio: Portfolio | null; accountBalances: AccountBalances | null }) {
+  const sim101 = accountReading(accountBalances, "Sim101");
+  const lucidFlex = accountReading(accountBalances, "Lucid25kflex01");
+  return <div className="page-grid"><section className="stat-grid span-12">{[["Sim101 balance", observedMoney(accountBalanceValue(sim101))], ["LucidFlex balance", observedMoney(accountBalanceValue(lucidFlex))], ["Open PAPER P&L", money(portfolio?.open_pnl)], ["Realized today", money(portfolio?.realized_pnl_today)], ["Realized total", money(portfolio?.realized_pnl_total)], ["Fees", money(portfolio?.fees)], ["Max DD", percent(portfolio?.max_drawdown)]].map(([label, value]) => <article className="panel stat" key={String(label)}><span>{label}</span><strong>{value}</strong></article>)}</section><section className="panel span-12"><PanelTitle title="Read-only NinjaTrader account readings" subtitle="CashValue is reported when available, with Net Liquidation as the display fallback; neither value can authorize execution." /><MetricList values={[["Sim101 balance", observedMoney(accountBalanceValue(sim101))], ["Sim101 source / updated", accountBalanceSubtitle(sim101)], ["LucidFlex balance", observedMoney(accountBalanceValue(lucidFlex))], ["LucidFlex source / updated", accountBalanceSubtitle(lucidFlex)]]} /></section><section className="panel span-8"><PanelTitle title="Copy-trade simulation equity curve" subtitle="Legacy simulated-copy portfolio snapshots; this is not either NinjaTrader account balance." /><MiniChart points={(portfolio?.equity_curve || []).map((point: any) => Number(point.equity || 0))} color="#46c995" /></section><section className="panel span-4"><PanelTitle title="Simulation drawdown curve" /><MiniChart points={(portfolio?.drawdown_curve || []).map((point: any) => Number(point.value || 0))} color="#e7a950" /></section><Attribution title="P&L by trader" rows={portfolio?.pnl_by_trader || []} keys={["target_wallet", "open_pnl", "realized_pnl", "total_pnl", "fees", "capital_usage"]} /><Attribution title="P&L by symbol" rows={portfolio?.pnl_by_symbol || []} keys={["symbol", "open_pnl", "realized_pnl", "total_pnl", "exposure", "position_count"]} /><Attribution title="P&L by sizing bucket" rows={portfolio?.pnl_by_bucket || []} keys={["bucket", "open_pnl", "realized_pnl", "total_pnl", "capital_usage", "position_count"]} /></div>;
 }
 
 function PositionsPage({ livePositions }: { livePositions: any[] | null }) {
@@ -317,7 +330,7 @@ function LaneIIIPaperPage({ notify, confirmation }: { notify: (toast: Toast) => 
     catch (failure) { notify({ tone: "error", message: failure instanceof Error ? failure.message : "Ledger verification schedule could not be saved." }); }
     finally { setBusy(false); }
   };
-  const policy = status?.policy || {}; const transport = status?.transport || {}; const lastDecision = status?.last_paper_decision || {}; const commissioning = status?.commissioning_lifecycle || {}; const warmup = status?.commissioning_warmup || {}; const freshness = status?.market_freshness || {}; const observerState = status?.market_observer?.market_observer_state || "NOT_ACTIVE"; const ledger = status?.ledger || {}; const verification = status?.ledger_verification || {}; const postRun = status?.commissioning_post_run_verification || {}; const scheduleDraft = schedule?.frequency ? schedule : { enabled: false, frequency: "DISABLED", local_time: "03:00", weekday: 0, mode: "auto" };
+  const policy = status?.policy || {}; const transport = status?.transport || {}; const lastDecision = status?.last_paper_decision || {}; const commissioning = status?.commissioning_lifecycle || {}; const warmup = status?.commissioning_warmup || {}; const freshness = status?.market_freshness || {}; const observerState = status?.market_observer?.market_observer_state || "NOT_ACTIVE"; const accountBalances = (status?.account_balances || {}) as AccountBalances; const sim101Balance = accountReading(accountBalances, "Sim101"); const lucidFlexBalance = accountReading(accountBalances, "Lucid25kflex01"); const ledger = status?.ledger || {}; const verification = status?.ledger_verification || {}; const postRun = status?.commissioning_post_run_verification || {}; const scheduleDraft = schedule?.frequency ? schedule : { enabled: false, frequency: "DISABLED", local_time: "03:00", weekday: 0, mode: "auto" };
   const rehearsalLedger = rehearsal?.ledger || {};
   const diagnosticSources = [
     ledger,
@@ -409,6 +422,7 @@ function LaneIIIPaperPage({ notify, confirmation }: { notify: (toast: Toast) => 
     {observerState !== "ACTIVE" && <p className="empty-note"><strong>OBSERVER NOT ACTIVE</strong><br />Open the MNQ SEP26 chart → attach BeelzebubReadOnlyMarketObserver → wait for ACTIVE.</p>}
     {blockers.length > 0 && <div className="reason-list"><span>Exact blockers</span>{blockers.map((reason: string) => <em key={reason}>{reason}</em>)}</div>}
     <div className="l3g-controls"><button className="button minor" disabled={busy} onClick={() => void runRehearsal()}>Run Read-Only Commissioning Rehearsal</button><button className="button positive" disabled={busy || !rehearsalIsCurrent} onClick={() => confirmation({ title: "Start the exact commissioning lifecycle?", body: "One atomic request revalidates every gate, reserves commissioning ownership, arms Sim101, and submits one sealed 1 MNQ commissioning entry. This is the canonical production path.", confirm: "Atomic Commissioning Start", action: startCommissioning })}>Atomic Commissioning Start</button></div></section>
+    <section className="panel span-6"><PanelTitle title="Observed NinjaTrader balances" subtitle="CashValue is shown when available, otherwise Net Liquidation; these displays cannot authorize execution." /><MetricList values={[["Sim101 balance", observedMoney(accountBalanceValue(sim101Balance))], ["Sim101 updated", accountBalanceSubtitle(sim101Balance)], ["LucidFlex balance", observedMoney(accountBalanceValue(lucidFlexBalance))], ["LucidFlex updated", accountBalanceSubtitle(lucidFlexBalance)], ["Sim101 net liquidation", observedMoney(sim101Balance?.net_liquidation)], ["LucidFlex net liquidation", observedMoney(lucidFlexBalance?.net_liquidation)]]} /></section>
     <section className="panel span-6"><PanelTitle title="Lane III paper authority" subtitle="A separately labeled provisional policy; frozen Lane III science remains fail-closed." /><MetricList values={[["Market connection", status?.market_connection || "LucidFlex"], ["Market observer", status?.market_observer?.market_observer_state || "NOT_ACTIVE"], ["Observer L1", status?.market_observer?.market_observer_level_one_received ? timeLabel(status?.market_observer?.last_level_one_at) : "Not received"], ["Observer depth", status?.market_observer?.market_observer_depth_received ? timeLabel(status?.market_observer?.last_depth_at) : "Not received"], ["Market instrument", status?.market_instrument || "MNQ SEP26"], ["Paper account", status?.paper_account || "Sim101"], ["Mode", status?.display_mode || "EXPERIMENTAL PAPER"], ["Scientific Lane III", status?.scientific_lane_iii || "INCOMPLETE / BLOCKED ON SEQUENCING"], ["Paper execution", status?.paper_execution || "DISARMED"], ["Live capital", status?.live_capital || "DENIED"], ["Sequence authority", status?.sequence_authority || "LOCAL_CALLBACK_ORDER_ONLY"], ["Book completeness", status?.book_completeness || "UNVERIFIED"]]} /></section>
     <section className="panel span-6"><PanelTitle title="Execution truth" subtitle="Order acceptance is not treated as a fill; position truth comes from reconciliation callbacks." /><MetricList values={[["Runtime state", status?.state || "UNSTARTED"], ["Execution bridge", transport.state || "UNSTARTED"], ["Authenticated", transport.authenticated_client ? "Yes" : "No"], ["Reconciled", transport.reconciled ? "Yes" : "No"], ["AddOn source", transport.addon_provenance?.status || "COMPILE REQUIRED"], ["AddOn protocol", transport.addon_provenance?.protocol_version || "—"], ["Current position", `${status?.current_position || "FLAT"} ${status?.current_quantity || 0}`], ["Working owned orders", status?.working_owned_orders ?? 0], ["Protective stop", status?.protective_stop_state || "NONE"], ["Last reconciliation", status?.last_reconciliation?.timestamp || "—"], ["Lockout / fault", status?.lockout_or_fault_reason || "None"]]} /></section>
     <section className="panel span-6"><PanelTitle title="Session regime" subtitle="Asia Globex and New York RTH have isolated evidence; trade-date risk remains cumulative." /><MetricList values={[["Current session", status?.current_session || "OFF_SESSION"], ["Current session ID", status?.current_session_id || "—"], ["Trade date", status?.trade_date || "—"], ["Session state", status?.session_state || "—"], ["Entry window", status?.entry_window || "—"], ["Entry cutoff", status?.entry_cutoff || "—"], ["Hard flat", `${status?.hard_flat_deadline || "—"} America/New_York`], ["Session arm", status?.session_armed_state || "DISARMED"], ["Commissioning warmup", warmup.status || "NOT_WARMED"], ["Strategy evidence", status?.strategy_evidence_status || "INCOMPLETE"]]} /></section>

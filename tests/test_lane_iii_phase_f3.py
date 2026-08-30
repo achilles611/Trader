@@ -118,6 +118,27 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
         self.assertFalse(status["market_observer_active"])
         self.assertFalse(status["market_observer_level_one_received"])
 
+    def test_listener_surfaces_latest_read_only_cash_values_for_sim_and_lucid(self):
+        worker = NinjaTraderListenerWorker()
+        bridge = LoopbackNinjaTraderBridge()
+        sim = bridge.accept_observation(frame(
+            "ACCOUNT", 1, {"alias": "Sim101", "class": "LOCAL_SIMULATION"},
+            {"item": "CashValue", "value": 100_123.45},
+        ))
+        lucid = bridge.accept_observation(frame(
+            "ACCOUNT", 2, {"alias": "Lucid25kflex01", "class": "PROVIDER_EVALUATION"},
+            {"item": "CashValue", "value": 24_987.65},
+        ))
+        assert sim is not None and lucid is not None
+        worker._record_and_forward_observation(sim)
+        worker._record_and_forward_observation(lucid)
+
+        balances = worker.status().as_dict()["account_balances"]
+        self.assertEqual(balances["Sim101"]["cash_value"], 100_123.45)
+        self.assertEqual(balances["Lucid25kflex01"]["cash_value"], 24_987.65)
+        self.assertEqual(balances["Sim101"]["cash_value_observed_at"], TIME)
+        self.assertEqual(balances["Lucid25kflex01"]["account_class"], "PROVIDER_EVALUATION")
+
     def test_harness_reports_authoritative_empty_position_and_order_snapshots(self):
         account = {"alias": "Lucid25kflex01", "class": "PROVIDER_EVALUATION"}
         harness = NinjaTraderCommissioningHarness()

@@ -142,7 +142,11 @@ def wait_for_server(process: subprocess.Popen[bytes] | None, *, timeout_seconds:
 
 
 def open_brave(brave: Path, root: Path) -> None:
-    subprocess.Popen([str(brave), "--new-window", URL], cwd=root, creationflags=_creation_flags())
+    # Brave may retain the SPA shell from an earlier local backend.  A unique
+    # document URL makes a launcher restart load the current hashed bundle;
+    # assets themselves remain cacheable and content-addressed.
+    launch_url = f"{URL}/?launch={time.time_ns()}"
+    subprocess.Popen([str(brave), "--new-window", launch_url], cwd=root, creationflags=_creation_flags())
 
 
 def show_error(message: str) -> None:

@@ -28,10 +28,17 @@ let laneIIIPaperOverrides: Record<string, unknown> = {};
 let laneIIILedgerOverrides: Record<string, unknown> = {};
 let commissioningRehearsalResponse: Record<string, unknown> | null = null;
 let commissioningRehearsalSideEffect: (() => void) | null = null;
+let accountBalancesResponse: Record<string, unknown> = {
+  accounts: {
+    Sim101: { cash_value: 100123.45, cash_value_observed_at: "2026-08-29T15:00:00Z" },
+    Lucid25kflex01: { cash_value: 24987.65, cash_value_observed_at: "2026-08-29T15:00:00Z" },
+  },
+};
 
 function payload(path: string) {
   if (path.startsWith("/api/overview")) return { counts: { total_discovered: emptyUniverse ? 0 : 20, qualified: 2, shadow: 1, active: 0 }, funnel: [], top_candidates: [candidate], recent_activity: [] };
   if (path.startsWith("/api/portfolio")) return { equity: 210, cash: 190, committed_capital: 10, open_pnl: 1, realized_pnl_total: 9, max_drawdown: 0.02, open_positions: 1 };
+  if (path.startsWith("/api/accounts/balances")) return accountBalancesResponse;
   if (path.startsWith("/api/controls/close-all-paper-positions")) return closeAllResponse || { status: "completed", control: { state: "RUNNING", entries_allowed: true, paper_only: true } };
   if (path.startsWith("/api/controls")) return { state: "RUNNING", entries_allowed: true, paper_only: true };
   if (path.startsWith("/api/discovery/status")) return { candidate_universe_count: emptyUniverse ? 0 : 20, source: { source: "Official HyperCore node data", connection_state: "SETUP REQUIRED", aws_credentials_detected: false, requester_pays_access: "not tested", message: "No usable AWS credentials were detected on this machine. No credentials are stored by Trader.", cache: { object_count: 0, size_bytes: 0 } }, presets: { quick: { window_hours: 1, candidate_limit: 1000, min_activity: 2, max_activity_age: "30d" }, standard: { window_hours: 6, candidate_limit: 2500, min_activity: 2, max_activity_age: "30d" }, deep: { window_hours: 24, candidate_limit: 5000, min_activity: 2, max_activity_age: "30d" } } };
@@ -149,6 +156,12 @@ beforeEach(() => {
   laneIIILedgerOverrides = {};
   commissioningRehearsalResponse = null;
   commissioningRehearsalSideEffect = null;
+  accountBalancesResponse = {
+    accounts: {
+      Sim101: { cash_value: 100123.45, cash_value_observed_at: "2026-08-29T15:00:00Z" },
+      Lucid25kflex01: { cash_value: 24987.65, cash_value_observed_at: "2026-08-29T15:00:00Z" },
+    },
+  };
   vi.stubGlobal("WebSocket", WebSocketStub);
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => new Response(JSON.stringify(payload(String(input))), { status: 200, headers: { "Content-Type": "application/json" } })));
 });
@@ -156,6 +169,13 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 describe("copy control center", () => {
+  it("shows observed Sim101 and LucidFlex balances instead of the seed paper equity", async () => {
+    render(<App />);
+    expect((await screen.findAllByText("$100,123.45")).length).toBeGreaterThan(0);
+    expect(screen.getAllByText("$24,987.65").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Paper equity")).not.toBeInTheDocument();
+  });
+
   it("renders paper-only controls and candidate table filtering/sorting surface", async () => {
     render(<App />);
     expect(await screen.findByText("PAPER POSITIONS ONLY")).toBeInTheDocument();
