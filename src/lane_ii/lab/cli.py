@@ -8,7 +8,8 @@ import socket
 import sys
 from pathlib import Path
 
-from .anvil_backend import PINNED_ANVIL_VERSION, anvil_version, installed_anvil
+from .anvil_backend import PINNED_ANVIL_VERSION, AnvilBackend, anvil_version, installed_anvil
+from .anvil_state import ANVIL_EXECUTION_STATE_SCHEMA, PINNED_WINDOWS_ARCHIVE_SHA256
 from .contracts import BackendType, ScenarioValidationError, canonical_json
 from .coordinator import CounterfactualCoordinator
 from .evidence import default_artifact_root, persist_result
@@ -26,6 +27,7 @@ def _doctor() -> dict[str, object]:
         loopback = False
     path = installed_anvil()
     version = anvil_version(path)
+    binary_identity = AnvilBackend(chain_id=31337, binary=path).binary_identity if path is not None else {}
     return {
         "authority_domain": "COUNTERFACTUAL_ONLY",
         "execution_authority": False,
@@ -33,7 +35,10 @@ def _doctor() -> dict[str, object]:
         "local_state_mutation": True,
         "anvil_available": path is not None and version is not None,
         "anvil_version": version,
+        "anvil_binary_identity": binary_identity,
+        "anvil_archive_sha256": PINNED_WINDOWS_ARCHIVE_SHA256,
         "pinned_anvil_version": PINNED_ANVIL_VERSION,
+        "semantic_fingerprint_schema": ANVIL_EXECUTION_STATE_SCHEMA,
         "loopback_binding_capable": loopback,
         "artifact_root": str(default_artifact_root()),
         "supported_backends": [item.value for item in BackendType],

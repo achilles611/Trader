@@ -61,9 +61,8 @@ MODEL_MUTATION_VERBS = frozenset({
     "inject_transport_unavailable", "advance_time",
 })
 ANVIL_MUTATION_VERBS = frozenset({
-    "snapshot", "revert", "set_native_balance", "set_contract_code", "set_storage_slot",
-    "impersonate_account", "stop_impersonation", "advance_timestamp", "mine_block",
-    "mine_blocks", "dump_state", "load_state",
+    "set_native_balance", "set_nonce", "set_contract_code", "set_storage_slot",
+    "advance_timestamp", "mine_block", "mine_blocks",
 })
 ASSERTION_VERBS = frozenset({
     "state_path_equals", "balance_equals", "position_equals", "open_order_count_equals",
@@ -350,6 +349,7 @@ class CounterfactualEvidence:
     cleanup_status: str
     restoration_verified: bool
     run_status: RunStatus
+    restoration_evidence: Mapping[str, object] = field(default_factory=dict)
     fork_chain_id: int | None = None
     fork_block: int | None = None
     bounded_diagnostics: Mapping[str, object] = field(default_factory=dict)
@@ -377,6 +377,9 @@ class CounterfactualEvidence:
         if not isinstance(self.bounded_diagnostics, Mapping):
             raise ScenarioValidationError("bounded_diagnostics must be a JSON object.")
         object.__setattr__(self, "bounded_diagnostics", _freeze_json(self.bounded_diagnostics, "bounded_diagnostics"))
+        if not isinstance(self.restoration_evidence, Mapping):
+            raise ScenarioValidationError("restoration_evidence must be a JSON object.")
+        object.__setattr__(self, "restoration_evidence", _freeze_json(self.restoration_evidence, "restoration_evidence"))
 
     def payload(self) -> dict[str, object]:
         return {
@@ -386,6 +389,7 @@ class CounterfactualEvidence:
             "mutations_applied": list(self.mutations_applied), "assertions": list(self.assertions),
             "state_diff": [item.payload() for item in self.state_diff], "cleanup_status": self.cleanup_status,
             "restoration_verified": self.restoration_verified, "run_status": self.run_status.value,
+            "restoration_evidence": thaw_json(self.restoration_evidence),
             "bounded_diagnostics": thaw_json(self.bounded_diagnostics), "provenance": self.provenance,
         }
 
@@ -399,6 +403,7 @@ class CounterfactualRunResult:
     identity: CounterfactualRunIdentity
     evidence: CounterfactualEvidence
     outcome: str
+    provider_artifacts: Mapping[str, str] = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if type(self.identity) is not CounterfactualRunIdentity or type(self.evidence) is not CounterfactualEvidence:
@@ -406,6 +411,18 @@ class CounterfactualRunResult:
         if self.identity.scenario_hash != self.evidence.scenario_hash or self.identity.backend is not self.evidence.backend:
             raise ScenarioValidationError("Result identity/evidence mismatch.")
         _bounded_text(self.outcome, "outcome")
+        allowed_artifacts = {
+            "raw_dump_before.txt", "raw_dump_after.txt", "raw_dump_structural_diff.json",
+            "mutation_witness_manifest.json", "semantic_state_before.json", "semantic_state_after.json",
+        }
+        if not isinstance(self.provider_artifacts, Mapping) or set(self.provider_artifacts) - allowed_artifacts:
+            raise ScenarioValidationError("Provider artifacts contain an unrecognized file.")
+        artifacts: dict[str, str] = {}
+        for name, content in self.provider_artifacts.items():
+            if not isinstance(content, str) or not content or len(content.encode("utf-8")) > 64 * 1024 * 1024:
+                raise ScenarioValidationError("Provider artifact content is malformed or unbounded.")
+            artifacts[name] = content
+        object.__setattr__(self, "provider_artifacts", MappingProxyType(artifacts))
 
     def payload(self) -> dict[str, object]:
         return {"identity": self.identity.payload(), "evidence": self.evidence.payload(), "outcome": self.outcome}

@@ -7,6 +7,7 @@ the private transport module.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import socket
@@ -18,6 +19,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .contracts import (
+    ANVIL_MUTATION_VERBS,
     CounterfactualAssertion,
     CounterfactualMutation,
     ScenarioValidationError,
@@ -26,10 +28,22 @@ from .contracts import (
     validate_hex,
     validate_uint,
 )
+from .anvil_state import (
+    PINNED_ANVIL_RELEASE_PROVENANCE,
+    PINNED_ANVIL_RELEASE_TAG,
+    PINNED_WINDOWS_ANVIL_SHA256,
+    MutationWitnessSpec,
+    RawDumpCapture,
+    SemanticObservation,
+    capture_raw_dump,
+    capture_semantic_observation,
+    read_witness,
+)
 from .rpc import RpcTransportError, _LoopbackRpc, assert_loopback_endpoint
 
 
 PINNED_ANVIL_VERSION = "1.8.1"
+PINNED_ANVIL_GENESIS_TIMESTAMP = 1_700_000_000
 
 
 class AnvilUnavailable(RuntimeError):
@@ -84,6 +98,7 @@ class AnvilBackend:
         fork_source: str | None = None,
         binary: str | None = None,
         startup_timeout_seconds: float = 10.0,
+        genesis_timestamp: int | None = PINNED_ANVIL_GENESIS_TIMESTAMP,
     ) -> None:
         self.chain_id = validate_uint(chain_id, "chain_id", maximum=(2**63) - 1)
         if self.chain_id == 0:
@@ -99,6 +114,10 @@ class AnvilBackend:
         self.fork_source = _valid_fork_source(fork_source) if fork_source is not None else None
         self.binary = binary or installed_anvil()
         self.startup_timeout_seconds = startup_timeout_seconds
+        self.genesis_timestamp = (
+            validate_uint(genesis_timestamp, "genesis_timestamp", maximum=(2**63) - 1)
+            if genesis_timestamp is not None else None
+        )
         self._process: subprocess.Popen[bytes] | None = None
         self._rpc: _LoopbackRpc | None = None
         self._endpoint: str | None = None
@@ -106,6 +125,10 @@ class AnvilBackend:
         self._dump_cache: dict[str, str] = {}
         self._impersonated: set[str] = set()
         self._discarded = False
+        self._last_pid: int | None = None
+        self._last_port: int | None = None
+        self._shutdown_verified = False
+        self._port_release_verified = False
 
     @classmethod
     def expected_initial_fingerprint(cls, chain_id: int, *, fixed_fork_block: int | None = None) -> str:
@@ -126,6 +149,31 @@ class AnvilBackend:
     def toolchain_version(self) -> str:
         return anvil_version(self.binary) or "ANVIL_UNAVAILABLE"
 
+    @property
+    def binary_identity(self) -> dict[str, object]:
+        path = Path(self.binary).resolve() if self.binary is not None else None
+        sha256 = None
+        if path is not None:
+            try:
+                sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                sha256 = None
+        return {
+            "anvil_version": self.toolchain_version,
+            "release_tag": PINNED_ANVIL_RELEASE_TAG,
+            "release_provenance": PINNED_ANVIL_RELEASE_PROVENANCE,
+            "binary_path": str(path) if path is not None else None,
+            "binary_sha256": sha256,
+        }
+
+    @property
+    def shutdown_verified(self) -> bool:
+        return self._shutdown_verified
+
+    @property
+    def port_release_verified(self) -> bool:
+        return self._port_release_verified
+
     def start(self) -> None:
         if self._discarded:
             raise AnvilExperimentError("Discarded Anvil process cannot be reused.")
@@ -136,8 +184,16 @@ class AnvilBackend:
         version = anvil_version(self.binary)
         if version is None or PINNED_ANVIL_VERSION not in version:
             raise AnvilUnavailable("Foundry Anvil is not the pinned f4 v1.8.1 toolchain.")
+        identity = self.binary_identity
+        if os.name == "nt" and identity["binary_sha256"] != PINNED_WINDOWS_ANVIL_SHA256:
+            raise AnvilUnavailable("Foundry Anvil binary hash is not the pinned official v1.8.1 Windows artifact.")
         port = _free_loopback_port()
-        arguments = [self.binary, "--host", "127.0.0.1", "--port", str(port), "--chain-id", str(self.chain_id), "--accounts", "2", "--silent"]
+        arguments = [
+            self.binary, "--host", "127.0.0.1", "--port", str(port), "--chain-id",
+            str(self.chain_id), "--accounts", "2", "--silent",
+        ]
+        if self.genesis_timestamp is not None:
+            arguments.extend(["--timestamp", str(self.genesis_timestamp)])
         if self.fork_source is not None:
             arguments.extend(["--fork-url", self.fork_source, "--fork-block-number", str(self.fixed_fork_block)])
         creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -148,6 +204,8 @@ class AnvilBackend:
             )
         except OSError as exc:
             raise AnvilUnavailable("Foundry Anvil could not be started.") from exc
+        self._last_pid = self._process.pid
+        self._last_port = port
         self._endpoint = assert_loopback_endpoint(f"http://127.0.0.1:{port}")
         self._rpc = _LoopbackRpc(self._endpoint)
         deadline = time.monotonic() + self.startup_timeout_seconds
@@ -195,11 +253,18 @@ class AnvilBackend:
         return self._call("evm_revert", [snapshot]) is True
 
     def fingerprint(self) -> str:
-        """Hash full local state without persisting its potentially large dump."""
-        dumped = self._call("anvil_dumpState", [])
-        if not isinstance(dumped, str):
-            raise AnvilExperimentError("Anvil state dump response was invalid.")
-        return canonical_hash({"chain_id": self._chain_id(), "block_number": self._block_number(), "fork_block": self.fixed_fork_block, "state_hash": canonical_hash(dumped)})
+        """Return the strict versioned semantic execution-state fingerprint."""
+        raw = self.capture_raw_dump()
+        return self.capture_semantic_observation(raw).semantic_state_sha256
+
+    def capture_raw_dump(self) -> RawDumpCapture:
+        return capture_raw_dump(self._call)
+
+    def capture_semantic_observation(self, raw: RawDumpCapture) -> SemanticObservation:
+        return capture_semantic_observation(self._call, raw, expected_chain_id=self.chain_id)
+
+    def read_mutation_witness(self, spec: MutationWitnessSpec) -> object:
+        return read_witness(self._call, spec)
 
     def local_fingerprint(self) -> str:
         """Small empty-chain fingerprint for reproducible no-fork scenarios."""
@@ -208,6 +273,8 @@ class AnvilBackend:
     def apply(self, mutation: CounterfactualMutation) -> None:
         if type(mutation) is not CounterfactualMutation:
             raise AnvilExperimentError("Anvil requires an exact counterfactual mutation.")
+        if mutation.verb not in ANVIL_MUTATION_VERBS:
+            raise AnvilExperimentError("Anvil capability has no commissioned restoration witness.")
         capability = getattr(self, f"_apply_{mutation.verb}", None)
         if capability is None:
             raise AnvilExperimentError("Unknown Anvil capability.")
@@ -240,6 +307,12 @@ class AnvilBackend:
         address = validate_address(parameters["address"])
         balance = validate_uint(parameters["balance"], "balance")
         self._call("anvil_setBalance", [address, hex(balance)])
+
+    def _apply_set_nonce(self, parameters: Mapping[str, object]) -> None:
+        self._params(parameters, {"address", "nonce"})
+        address = validate_address(parameters["address"])
+        nonce = validate_uint(parameters["nonce"], "nonce", maximum=(2**64) - 1)
+        self._call("anvil_setNonce", [address, hex(nonce)])
 
     def _apply_set_contract_code(self, parameters: Mapping[str, object]) -> None:
         self._params(parameters, {"address", "code"})
@@ -332,6 +405,8 @@ class AnvilBackend:
         self._impersonated.clear()
         if self._process is None:
             return
+        process = self._process
+        port = self._last_port
         if self._process.poll() is None:
             self._process.terminate()
             try:
@@ -339,18 +414,24 @@ class AnvilBackend:
             except subprocess.TimeoutExpired:
                 self._process.kill()
                 self._process.wait(timeout=3)
+        self._shutdown_verified = process.poll() is not None
+        self._port_release_verified = self._port_is_released(port)
         self._process = None
         self._rpc = None
         self._endpoint = None
         self._discarded = True
 
     def kill(self) -> None:
+        process = self._process
+        port = self._last_port
         if self._process is not None and self._process.poll() is None:
             self._process.kill()
             try:
                 self._process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 pass
+        self._shutdown_verified = process is None or process.poll() is not None
+        self._port_release_verified = self._port_is_released(port)
         self._process = None
         self._rpc = None
         self._endpoint = None
@@ -358,3 +439,16 @@ class AnvilBackend:
         self._dump_cache.clear()
         self._impersonated.clear()
         self._discarded = True
+
+    @staticmethod
+    def _port_is_released(port: int | None) -> bool:
+        if port is None:
+            return False
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                if os.name == "nt":
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                sock.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False

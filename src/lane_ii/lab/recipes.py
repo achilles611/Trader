@@ -8,7 +8,7 @@ from .contracts import BackendType, CounterfactualMutation, ScenarioValidationEr
 
 
 RECIPE_NAMES = frozenset({
-    "FUNDED_ACTOR", "IMPERSONATED_ACTOR", "CONTRACT_CODE_OVERRIDE", "STORAGE_OVERRIDE", "TIME_JUMP",
+    "FUNDED_ACTOR", "CONTRACT_CODE_OVERRIDE", "STORAGE_OVERRIDE", "TIME_JUMP",
     "BLOCK_ADVANCE", "HOSTILE_EXTERNAL_POSITION", "HOSTILE_EXTERNAL_ORDER", "PARTIAL_FILL_RACE",
     "RATE_LIMIT_EVENT", "METADATA_DRIFT",
 })
@@ -20,8 +20,6 @@ def recipe(name: str, parameters: Mapping[str, object], *, backend: BackendType)
         raise ScenarioValidationError("Recipe is not allowlisted or its parameters are invalid.")
     if name == "FUNDED_ACTOR" and backend is BackendType.ANVIL:
         return (CounterfactualMutation("set_native_balance", dict(parameters)),)
-    if name == "IMPERSONATED_ACTOR" and backend is BackendType.ANVIL:
-        return (CounterfactualMutation("impersonate_account", dict(parameters)),)
     if name == "CONTRACT_CODE_OVERRIDE" and backend is BackendType.ANVIL:
         return (CounterfactualMutation("set_contract_code", dict(parameters)),)
     if name == "STORAGE_OVERRIDE" and backend is BackendType.ANVIL:
