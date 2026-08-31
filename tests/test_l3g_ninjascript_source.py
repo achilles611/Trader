@@ -112,6 +112,8 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertIn("TryReservePublication(ref lastQuotePublicationTicks)", source)
         self.assertIn("TryReservePublication(ref lastTradePublicationTicks)", source)
         self.assertIn("TryReservePublication(ref lastDepthPublicationTicks)", source)
+        self.assertIn("Interlocked.Exchange(ref lastQuotePublicationTicks", source)
+        self.assertIn("A sampled Last event must retain its exact same-callback", source)
         self.assertIn("publication_policy", source)
 
         addon = (Path(__file__).parents[1] / "ninjatrader" / "NinjaScript" / "AddOns" / "BeelzebubReadOnlyAddOn.cs").read_text(encoding="utf-8")

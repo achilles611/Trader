@@ -84,7 +84,13 @@ namespace NinjaTrader.NinjaScript.Indicators
                     && e.Time >= bestBidTime && e.Time - bestBidTime <= TimeSpan.FromSeconds(10)
                     && e.Time >= bestAskTime && e.Time - bestAskTime <= TimeSpan.FromSeconds(10);
                 string quoteObservationId = null;
-                if (completeQuote && TryReservePublication(ref lastQuotePublicationTicks))
+                if (completeQuote)
+                {
+                    // A sampled Last event must retain its exact same-callback
+                    // quote pair or aggressor classification becomes UNKNOWN.
+                    // Reset the independent quote timer so the pair replaces,
+                    // rather than adds to, the next bounded quote publication.
+                    Interlocked.Exchange(ref lastQuotePublicationTicks, System.Diagnostics.Stopwatch.GetTimestamp());
                     quoteObservationId = BeelzebubReadOnlyOutbound.Publish("QUOTE", null, null,
                         "{\"contract_id\":\"" + contract + "\",\"bid\":" + bidAtTrade.ToString(CultureInfo.InvariantCulture)
                         + ",\"ask\":" + askAtTrade.ToString(CultureInfo.InvariantCulture) + ",\"bid_size\":" + bestBidSize
@@ -92,6 +98,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                         + bestBidTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture) + "\",\"ask_source_time\":\""
                         + bestAskTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture)
                         + "\",\"publication_policy\":\"" + PublicationPolicy + "\"}", e.Time);
+                }
                 string source = quoteObservationId == null ? "UNKNOWN" : "BID_ASK_CLASSIFICATION";
                 string bid = completeQuote ? bidAtTrade.ToString(CultureInfo.InvariantCulture) : "null";
                 string ask = completeQuote ? askAtTrade.ToString(CultureInfo.InvariantCulture) : "null";
