@@ -1,0 +1,6 @@
+{
+  "schema": "lane-iii-phase-h-fill-calibration-report-v1",
+  "status": "NOT_MEASURED",
+  "reason": "No installed L3H Sim101 AddOn was available during this pass.",
+  "real_capital_order_sent": false
+}

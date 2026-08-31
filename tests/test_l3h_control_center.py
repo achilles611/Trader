@@ -27,6 +27,12 @@ class L3HControlCenterTests(unittest.TestCase):
         self.assertEqual(status["live_capital"], "DENIED")
         self.assertFalse(status["one_control_start"]["enabled"])
         self.assertFalse(status["emergency_control"]["enabled"])
+        self.assertEqual(status["components"]["LIVE_AUTHORITY"], {"state": "RED", "reason": "DISARMED_FAIL_CLOSED"})
+        self.assertEqual(set(status["components"]), {
+            "ACCOUNT", "ACCOUNT_CLASS", "CONTRACT", "SESSION", "MARKET_DATA", "ACCOUNT_TRUTH", "POSITION_TRUTH",
+            "ORDER_TRUTH", "EXECUTION_GATEWAY", "NT_RISK_GUARD", "PROTECTION", "RECONCILIATION", "LEDGER",
+            "CAPABILITY", "KILL_PATHS", "DISK", "STRATEGY", "LIVE_AUTHORITY",
+        })
         self.assertFalse(any(route.path == "/api/lane-iii/live/activate" for route in app.routes))
 
 

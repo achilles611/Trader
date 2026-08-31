@@ -34,6 +34,7 @@ from src.l3g_paper.ninjatrader_login import NinjaTraderLoginBootstrap, NinjaTrad
 from src.l3g_paper.ninjatrader_transport import PaperExecutionTransport
 from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout
 from src.l3g_paper.verification import LocalLedgerVerificationController
+from src.l3h_live.status import fail_closed_status
 from src.ops_scheduler.api_models import PreviewRequest, RunNowRequest, ScheduleRequest, ScheduleUpdateRequest, TemplateRequest
 from src.ops_scheduler.engine import SchedulerEngine, SchedulerSettings
 from src.ops_scheduler.models import ScheduleLifecycle
@@ -1546,28 +1547,7 @@ def create_control_center_app(
         Deliberately do not construct a live runtime here: an HTTP status read
         must not create a key, capability, ledger, listener, or order path.
         """
-        return {
-            "schema": "lane-iii-phase-h-live-status-v1",
-            "mode": "L3H_LIVE_CAPITAL",
-            "state": "BLOCKED",
-            "terminal_status": "BLOCKED_CAPABILITY_MISSING",
-            "account_alias": None,
-            "account_class": "UNKNOWN",
-            "live_capital": "DENIED",
-            "contract": "MNQ SEP26",
-            "maximum_quantity": 1,
-            "canary_limit": 1,
-            "one_control_start": {
-                "label": "START LIVE — 1 MNQ CANARY",
-                "enabled": False,
-                "reason": "LOCAL_SIGNED_CAPABILITY_REQUIRED",
-            },
-            "emergency_control": {
-                "enabled": False,
-                "reason": "LIVE_ADDON_NOT_REGISTERED",
-            },
-            "authority": "DISARMED_FAIL_CLOSED",
-        }
+        return fail_closed_status()
 
     async def quiesce_ledger_verifier_for_shutdown() -> dict[str, object]:
         """Release a read-only verifier snapshot before the writer truncates WAL.

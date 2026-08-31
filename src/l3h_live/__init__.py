@@ -6,21 +6,37 @@ can acquire authority only from a locally stored, signed capability artifact.
 """
 
 from .authority import LiveReadiness, ReadinessGate, derive_terminal_status
-from .contracts import AccountClass, LiveCapability, load_capability
+from .bootstrap import AccountAttestation, AccountEvidence, NativeCapabilityBinding, classify_account
+from .contracts import AccountClass, LiveCapability, load_capability, load_verified_capability
 from .event_store import LiveEventStore
+from .gateway import AuthenticatedLoopbackGateway, NoDispatchLiveGateway
+from .lifecycle import ExecutionLifecycle, OrderLifecycleState, ProtectionLifecycle, ProtectionState
+from .reconciliation import ExecutionSupervisor
 from .risk import LiveCanaryRiskProfile, LiveRiskAuthority
 from .runtime import LiveRuntime, LiveRuntimeState
 
 __all__ = [
     "AccountClass",
+    "AccountAttestation",
+    "AccountEvidence",
+    "AuthenticatedLoopbackGateway",
+    "ExecutionLifecycle",
+    "ExecutionSupervisor",
     "LiveCanaryRiskProfile",
     "LiveCapability",
     "LiveEventStore",
     "LiveReadiness",
     "LiveRiskAuthority",
+    "NativeCapabilityBinding",
+    "NoDispatchLiveGateway",
+    "OrderLifecycleState",
+    "ProtectionLifecycle",
+    "ProtectionState",
     "LiveRuntime",
     "LiveRuntimeState",
     "ReadinessGate",
     "derive_terminal_status",
+    "classify_account",
     "load_capability",
+    "load_verified_capability",
 ]

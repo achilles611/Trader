@@ -68,6 +68,22 @@ class L3HAuthorityTests(unittest.TestCase):
         blocked = derive_terminal_status(capability(), LiveReadiness(gate_passes={gate: True for gate in ReadinessGate}))
         self.assertEqual(blocked, "BLOCKED_BROKER_POSITION_NOT_PROVEN_FLAT")
 
+    def test_stale_or_future_broker_snapshot_never_allows_activation(self) -> None:
+        stale = BrokerSnapshot(
+            observed_at="2026-08-30T00:00:00Z", account_alias="UnitLive", account_class=AccountClass.BROKERAGE_LIVE,
+            account_binding_hash=HASH, native_instrument="MNQ SEP26", position="FLAT", quantity=0,
+            owned_working_orders=0, foreign_or_unknown_orders=0, position_snapshot_complete=True,
+            order_snapshot_complete=True, connection_healthy=True,
+        )
+        self.assertEqual(reconcile(capability(), stale).reason, "BROKER_SNAPSHOT_STALE")
+        future = BrokerSnapshot(
+            observed_at="2099-01-01T00:00:00Z", account_alias="UnitLive", account_class=AccountClass.BROKERAGE_LIVE,
+            account_binding_hash=HASH, native_instrument="MNQ SEP26", position="FLAT", quantity=0,
+            owned_working_orders=0, foreign_or_unknown_orders=0, position_snapshot_complete=True,
+            order_snapshot_complete=True, connection_healthy=True,
+        )
+        self.assertEqual(reconcile(capability(), future).reason, "BROKER_SNAPSHOT_STALE")
+
     def test_event_store_seal_is_idempotent_and_unknown_is_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = LiveEventStore(Path(directory) / "l3h.sqlite3")

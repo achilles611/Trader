@@ -218,6 +218,17 @@ class LiveEventStore:
             "sealed_event_id": str(row["sealed_event_id"]), "updated_at": str(row["updated_at"]),
         }
 
+    def stream(self, stream_id: str) -> tuple[LiveEvent, ...]:
+        """Read one ordered evidence stream without exposing SQLite details."""
+
+        if not isinstance(stream_id, str) or not stream_id:
+            raise ValueError("L3H event stream is required.")
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT * FROM l3h_event WHERE stream_id=? ORDER BY stream_version", (stream_id,),
+            ).fetchall()
+        return tuple(self._row(row) for row in rows)
+
     def verify(self) -> tuple[bool, str]:
         with closing(self._connect()) as connection:
             streams = [str(row[0]) for row in connection.execute("SELECT DISTINCT stream_id FROM l3h_event ORDER BY stream_id")]

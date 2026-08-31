@@ -12,12 +12,15 @@ working tree and tests before treating an older task as complete.
 
 ## Current direction
 
-The current `l3h` branch adds an isolated, fail-closed live-capital authority
-boundary without changing the sealed L3G Sim101 paper capability. Its source
-contracts, write-ahead event store, reconciliation rules, canary risk limit,
-and disabled operator surface are present, but no local signed capability or
-installed L3H AddOn is registered. The truthful terminal state is therefore
-`BLOCKED_CAPABILITY_MISSING`; no L3H order path is enabled or authorized.
+The current `l3h` branch has an isolated, fail-closed live-capital authority
+boundary without changing the sealed L3G Sim101 paper capability. It now has a
+dedicated HMAC/replay-safe loopback protocol, native AddOn source, write-ahead
+lifecycle, reconciliation supervisor, bootstrap/install/parity/kill tooling,
+and detailed disabled dashboard gates. No local signed capability, installed
+L3H AddOn, compiled DLL, runtime hello, or Sim101 matrix is present. The
+truthful terminal state is `BLOCKED_CAPABILITY_MISSING`; no L3H order path is
+enabled or authorized. The exact next action is visible AddOn installation and
+compile, followed by the disarmed Sim101 mechanical matrix.
 
 ## Task index
 

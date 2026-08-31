@@ -300,10 +300,13 @@ function LaneIIILivePage() {
   }, []);
   const start = status?.one_control_start || {};
   const emergency = status?.emergency_control || {};
+  const components = status?.components || {};
+  const gateValues = Object.entries(components).map(([name, value]: [string, any]) => [name, `${value?.state || "RED"} — ${value?.reason || "UNKNOWN"}`] as [string, string]);
   return <div className="page-grid">
-    <section className="panel span-12"><PanelTitle title="Lane III live-capital canary" subtitle="Isolated from the paper runtime. Live capital remains denied until a local signed capability and every fresh broker/risk/evidence gate pass." />{error && <p className="error">{error}</p>}</section>
+    <section className="panel span-12"><PanelTitle title="Lane III live-capital canary" subtitle="Isolated from the paper runtime. Live capital remains denied until a local signed capability and every fresh broker/risk/evidence gate pass." />{error && <p className="error">{error}</p>}<p className="empty-note">These states are observational. A browser cannot grant authority, create a capability, or arm NinjaTrader.</p></section>
     <section className="panel span-6"><MetricList values={[["Terminal status", status?.terminal_status || "LOADING"], ["Runtime", status?.state || "—"], ["Account class", status?.account_class || "UNKNOWN"], ["Capital mode", status?.live_capital || "DENIED"], ["Contract", status?.contract || "MNQ SEP26"], ["Maximum quantity", status?.maximum_quantity ?? 1], ["Canary limit", status?.canary_limit ?? 1]]} /></section>
-    <section className="panel span-6"><PanelTitle title="One-control activation" subtitle={start.reason || "Live preflight required."} /><button className="button positive" disabled={!start.enabled}>{start.label || "START LIVE — 1 MNQ CANARY"}</button><p className="muted">This control remains disabled until the capability, reconciliation, protection, storage, and UI gates all pass.</p><PanelTitle title="Emergency control" subtitle={emergency.reason || "Unavailable"} /><button className="button danger" disabled={!emergency.enabled}>EMERGENCY FLATTEN + DISARM</button></section>
+    <section className="panel span-6"><PanelTitle title="One-control activation" subtitle={start.reason || "Live preflight required."} /><button className="button positive" disabled={!start.enabled}>{start.label || "START LIVE — 1 MNQ CANARY"}</button><p className="muted">Activation remains disabled until installed Sim101 commissioning, native protection, reconciliation, and all three kill paths have passed.</p><PanelTitle title="Emergency control" subtitle={emergency.reason || "Unavailable"} /><button className="button danger" disabled={!emergency.enabled}>{emergency.label || "FLATTEN MNQ & DISARM"}</button></section>
+    <section className="panel span-12"><PanelTitle title="Mechanical live gates" subtitle="Each component is red, yellow, or green with its current concrete reason; generic READY is never inferred." /><MetricList values={gateValues} /></section>
   </div>;
 }
 

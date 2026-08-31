@@ -201,3 +201,11 @@ def load_capability(path: str | Path) -> LiveCapability:
     raw["point_value_dollars"] = Decimal(str(raw["point_value_dollars"]))
     raw["allowed_session_profiles"] = tuple(raw["allowed_session_profiles"])
     return LiveCapability(**raw)
+
+
+def load_verified_capability(path: str | Path, key: bytes, *, now: str | None = None) -> LiveCapability:
+    """Load and verify a local capability before it can reach a runtime."""
+
+    capability = load_capability(path)
+    capability.verify(key, now=now)
+    return capability

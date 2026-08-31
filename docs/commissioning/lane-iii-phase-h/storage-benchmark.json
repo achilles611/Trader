@@ -1,0 +1,6 @@
+{
+  "schema": "lane-iii-phase-h-storage-benchmark-v1",
+  "status": "NOT_MEASURED",
+  "implemented_guard": "DISARM_DENY_NEW_ENTRY_AT_MANAGED_DISK_PRESSURE_ABOVE_85_PERCENT",
+  "reason": "Execution evidence must not be deleted automatically and no installed L3H workload was run."
+}
