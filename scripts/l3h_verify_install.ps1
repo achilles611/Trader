@@ -7,7 +7,8 @@ $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $source = Join-Path $repo "ninjatrader\NinjaScript\AddOns\BeelzebubLiveExecutionAddOn.cs"
 $installed = Join-Path $NinjaTraderDocumentsRoot "bin\Custom\AddOns\BeelzebubLiveExecutionAddOn.cs"
-$dll = Get-ChildItem -LiteralPath (Join-Path $NinjaTraderDocumentsRoot "bin\Custom") -Recurse -File -Filter '*Beelzebub*Live*' -ErrorAction SilentlyContinue | Select-Object -First 1
+$dllPath = Join-Path $NinjaTraderDocumentsRoot "bin\Custom\NinjaTrader.Custom.dll"
+$dll = if (Test-Path -LiteralPath $dllPath) { Get-Item -LiteralPath $dllPath } else { $null }
 $sourceHash = if (Test-Path -LiteralPath $source) { (Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash.ToLowerInvariant() } else { $null }
 $installedHash = if (Test-Path -LiteralPath $installed) { (Get-FileHash -Algorithm SHA256 -LiteralPath $installed).Hash.ToLowerInvariant() } else { $null }
 $sourceNormalized = if (Test-Path -LiteralPath $source) { [regex]::Replace((Get-Content -Raw -LiteralPath $source), 'private const string SourceFingerprint = "[^"]+";', 'private const string SourceFingerprint = "SOURCE_FINGERPRINT_PLACEHOLDER";') } else { $null }

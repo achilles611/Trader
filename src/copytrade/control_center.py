@@ -1547,7 +1547,8 @@ def create_control_center_app(
         Deliberately do not construct a live runtime here: an HTTP status read
         must not create a key, capability, ledger, listener, or order path.
         """
-        return fail_closed_status()
+        status_path = os.environ.get("BEELZEBUB_L3H_GATEWAY_STATUS_PATH")
+        return fail_closed_status(mechanical_status_path=None if not status_path else Path(status_path))
 
     async def quiesce_ledger_verifier_for_shutdown() -> dict[str, object]:
         """Release a read-only verifier snapshot before the writer truncates WAL.

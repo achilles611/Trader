@@ -55,6 +55,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private bool authenticated;
         private bool armed;
         private bool killLatch;
+        private bool unknownState;
         private bool foreignActivity;
         private bool protectionAvailable;
         private string capabilityHash;
@@ -78,7 +79,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             lock (stateLock)
             {
-                armed = false; killLatch = false; authenticated = false; foreignActivity = false;
+                armed = false; killLatch = false; authenticated = false; foreignActivity = false; unknownState = false;
                 protectionAvailable = false; capabilityHash = null; capabilityGeneration = null; commissioningEpoch = null;
                 if (!LoadLocalBindingAndKey()) { Diagnostic("L3H_BINDING_OR_KEY_UNAVAILABLE"); return; }
                 if (SourceFingerprint == "PENDING_L3H_INSTALL_FINGERPRINT") { Diagnostic("L3H_SOURCE_FINGERPRINT_PENDING"); return; }
@@ -109,8 +110,11 @@ namespace NinjaTrader.NinjaScript.AddOns
             // protected; this AddOn refuses a missing or malformed binding.
             try
             {
-                string root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "NinjaTrader 8");
-                signingKey = File.ReadAllBytes(Path.Combine(root, "l3h.execution.local.key"));
+                // This must match l3h_bootstrap.ps1 exactly. Keeping both the
+                // key and signed native binding in LocalApplicationData avoids
+                // broadening the NinjaTrader Documents ACL for a capability.
+                string root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Beelzebub", "authority", "l3h");
+                signingKey = File.ReadAllBytes(Path.Combine(root, "keys", "l3h.execution.local.key"));
                 if (signingKey.Length < 32) return false;
                 string text = File.ReadAllText(Path.Combine(root, "l3h.live.binding.json"), Encoding.UTF8);
                 JavaScriptSerializer serializer = new JavaScriptSerializer();
@@ -161,7 +165,21 @@ namespace NinjaTrader.NinjaScript.AddOns
                     ReadFrames(stream);
                 }
                 catch (Exception error) { if (!stopping) Diagnostic("L3H_TRANSPORT_" + error.GetType().Name); }
-                finally { lock (stateLock) { authenticated = false; armed = false; CloseTransport(); } }
+                finally
+                {
+                    bool unresolved;
+                    lock (stateLock)
+                    {
+                        unresolved = armed && !stopping;
+                        authenticated = false; armed = false; CloseTransport();
+                    }
+                    if (unresolved)
+                    {
+                        unknownState = true;
+                        Diagnostic("L3H_UNKNOWN_STATE_TRANSPORT_LOSS");
+                        NativeKillFlattenDisarm(null, "TRANSPORT_LOSS_UNKNOWN");
+                    }
+                }
                 if (!stopping) Thread.Sleep(1000);
             }
         }
@@ -258,6 +276,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             reason = "DENY_UNKNOWN_BROKER_STATE";
             if (killLatch) { reason = "DENY_KILL_LATCH"; return false; }
             if (!authenticated) { reason = "DENY_NOT_AUTHENTICATED"; return false; }
+            if (Text(command, "native_instrument") != "MNQ SEP26" || Text(command, "canonical_contract") != "MNQU6") { reason = "DENY_WRONG_CONTRACT"; return false; }
             if (!ExactCapability(command)) { reason = "DENY_COMMISSION_EPOCH"; return false; }
             if (!ExactInstrument(instrument) || account == null || !String.Equals(account.Name, expectedAccountName, StringComparison.Ordinal)) { reason = "DENY_WRONG_ACCOUNT"; return false; }
             if (foreignActivity) { reason = "DENY_FOREIGN_ORDER"; return false; }
@@ -282,7 +301,11 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             if (e == null || e.Execution == null || e.Execution.Order == null || e.Execution.Order.Account != account) return;
             Order entry = e.Execution.Order;
-            if (!IsOwned(entry)) { foreignActivity = true; NativeKillFlattenDisarm(null, "FOREIGN_EXECUTION"); return; }
+            // NinjaTrader creates the exact-instrument Close order for our
+            // native flatten request. That exit is not foreign activity; only
+            // an independently created order must quarantine the session.
+            if (!IsOwned(entry) && !IsNativeKillFlattenOrder(entry)) { foreignActivity = true; NativeKillFlattenDisarm(null, "FOREIGN_EXECUTION"); return; }
+            if (IsNativeKillFlattenOrder(entry)) return;
             if (entry.OrderType == OrderType.StopMarket) return;
             try
             {
@@ -301,16 +324,36 @@ namespace NinjaTrader.NinjaScript.AddOns
         private void OnOrderUpdate(object sender, OrderEventArgs e)
         {
             if (e == null || e.Order == null || e.Order.Account != account) return;
-            if (!IsOwned(e.Order) && Working(e.Order.OrderState)) { foreignActivity = true; armed = false; Diagnostic("L3H_FOREIGN_ACTIVITY_QUARANTINE"); }
+            if (!IsOwned(e.Order) && !IsNativeKillFlattenOrder(e.Order) && Working(e.Order.OrderState)) { foreignActivity = true; armed = false; Diagnostic("L3H_FOREIGN_ACTIVITY_QUARANTINE"); }
             if (protectiveOrder != null && String.Equals(e.Order.Name, protectiveOrder.Name, StringComparison.Ordinal)
-                && (e.Order.OrderState == OrderState.Accepted || e.Order.OrderState == OrderState.Working)) protectionAvailable = true;
+                && (e.Order.OrderState == OrderState.Accepted || e.Order.OrderState == OrderState.Working))
+            {
+                // A broker can acknowledge the stop after NativeKill has
+                // already observed its owned-order list. Cancel that late
+                // acknowledgement rather than leaving a flat account exposed
+                // to a stale protective order.
+                if (killLatch || CurrentQuantity() == 0)
+                {
+                    try { account.Cancel(new[] { e.Order }); }
+                    catch (Exception error) { Diagnostic("L3H_KILL_LATE_PROTECTIVE_CANCEL_" + error.GetType().Name); }
+                }
+                else protectionAvailable = true;
+            }
             if (protectiveOrder != null && String.Equals(e.Order.Name, protectiveOrder.Name, StringComparison.Ordinal)
                 && (e.Order.OrderState == OrderState.Rejected || e.Order.OrderState == OrderState.Cancelled) && CurrentQuantity() != 0)
                 NativeKillFlattenDisarm(null, "PROTECTION_REJECTED");
             SendReconciliation("ORDER_UPDATE");
         }
 
-        private void OnPositionUpdate(object sender, PositionEventArgs e) { SendReconciliation("POSITION_UPDATE"); }
+        private void OnPositionUpdate(object sender, PositionEventArgs e)
+        {
+            // Execution callbacks can precede NinjaTrader's position update.
+            // A foreign fill therefore needs one safe, idempotent retry after
+            // the native quantity becomes observable; otherwise Flatten can
+            // race a still-zero position and leave exposure behind.
+            if (killLatch && CurrentQuantity() != 0) NativeKillFlattenDisarm(null, "KILL_LATCH_POSITION_RETRY");
+            SendReconciliation("POSITION_UPDATE");
+        }
 
         private void WatchdogLoop()
         {
@@ -362,9 +405,9 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (!authenticated || stream == null || account == null || instrument == null) return;
             Send("RECONCILIATION", "l3h-recon-" + Guid.NewGuid().ToString("N"), new Dictionary<string, object> {
                 { "reason", reason }, { "account", account.Name }, { "contract", instrument.FullName },
-                { "quantity", CurrentQuantity() }, { "owned_working_orders", OwnedWorkingOrders().Count },
+                { "position", CurrentPositionState() }, { "quantity", CurrentQuantity() }, { "owned_working_orders", OwnedWorkingOrders().Count },
                 { "foreign_or_unknown_orders", foreignActivity ? 1 : 0 }, { "armed", armed },
-                { "kill_latch", killLatch }, { "protection_available", protectionAvailable }
+                { "kill_latch", killLatch }, { "unknown_state", unknownState }, { "protection_available", protectionAvailable }
             });
         }
 
@@ -412,9 +455,21 @@ namespace NinjaTrader.NinjaScript.AddOns
             return FixedEquals(expected, signature);
         }
         private int CurrentQuantity() { lock (account.Positions) { Position position = account.Positions.FirstOrDefault(item => item.Instrument != null && item.Instrument.FullName == "MNQ SEP26"); return position == null ? 0 : position.Quantity; } }
+        private string CurrentPositionState()
+        {
+            lock (account.Positions)
+            {
+                Position position = account.Positions.FirstOrDefault(item => item.Instrument != null && item.Instrument.FullName == "MNQ SEP26");
+                if (position == null || position.Quantity == 0) return "FLAT";
+                if (position.MarketPosition == MarketPosition.Long) return "LONG";
+                if (position.MarketPosition == MarketPosition.Short) return "SHORT";
+                return "UNKNOWN";
+            }
+        }
         private List<Order> OwnedWorkingOrders() { lock (account.Orders) return account.Orders.Where(item => IsOwned(item) && Working(item.OrderState)).ToList(); }
         private bool HasWorkingOrders() { lock (account.Orders) return account.Orders.Any(item => Working(item.OrderState)); }
         private bool IsOwned(Order order) { return order != null && !String.IsNullOrWhiteSpace(order.Name) && order.Name.StartsWith("BZ-L3H-", StringComparison.Ordinal); }
+        private bool IsNativeKillFlattenOrder(Order order) { return killLatch && order != null && String.Equals(order.Name, "Close", StringComparison.Ordinal) && order.Instrument != null && ExactInstrument(order.Instrument); }
         private static bool ExactInstrument(Instrument value) { return value != null && value.FullName == "MNQ SEP26" && value.MasterInstrument != null && value.MasterInstrument.Name == "MNQ" && Math.Abs(value.MasterInstrument.TickSize - TickSize) < 0.0000001; }
         private static bool ValidCommandIdentity(Dictionary<string, object> command) { return Text(command, "command_id").StartsWith("l3h-cmd-", StringComparison.Ordinal) && Text(command, "client_order_id").StartsWith("BZ-L3H-", StringComparison.Ordinal); }
         private static bool Working(OrderState state) { return state == OrderState.Initialized || state == OrderState.Submitted || state == OrderState.Accepted || state == OrderState.TriggerPending || state == OrderState.Working || state == OrderState.PartFilled || state == OrderState.ChangePending || state == OrderState.ChangeSubmitted || state == OrderState.CancelPending || state == OrderState.CancelSubmitted; }

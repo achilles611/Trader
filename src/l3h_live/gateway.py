@@ -179,6 +179,8 @@ class AuthenticatedLoopbackGateway(LiveGateway):
         self._response_lock = threading.Condition()
         self._responses: dict[str, Mapping[str, object]] = {}
         self._command_responses: dict[str, Mapping[str, object]] = {}
+        self._reconciliation_lock = threading.Condition()
+        self._reconciliations: list[Mapping[str, object]] = []
         self._session_id: str | None = None
         self._last_error: str | None = None
 
@@ -245,6 +247,35 @@ class AuthenticatedLoopbackGateway(LiveGateway):
             self._command_responses[command_id] = result
             return result
 
+    def heartbeat(self) -> None:
+        """Keep an already-authenticated native session disarmed-or-alive.
+
+        A heartbeat neither arms the AddOn nor carries an execution command.
+        It exists so a mechanical test can prove the native watchdog without
+        reaching into socket internals.
+        """
+
+        if not self._connected.is_set():
+            raise GatewayDispatchError("GATEWAY_ADDON_NOT_AUTHENTICATED")
+        self._send(sign_frame({
+            "message_type": "HEARTBEAT", "request_id": "l3h-heartbeat-" + uuid4().hex,
+            "nonce": "l3h-gw-" + uuid4().hex, "timestamp": utc_now(), "payload": {},
+        }, self._key))
+
+    def reconciliations(self) -> tuple[Mapping[str, object], ...]:
+        """Return received native truth reports without creating broker state."""
+
+        with self._reconciliation_lock:
+            return tuple(self._reconciliations)
+
+    def wait_for_reconciliation(self, *, after: int = 0, timeout_seconds: float = 3.0) -> Mapping[str, object] | None:
+        """Wait for a new native reconciliation report, or return ``None``."""
+
+        with self._reconciliation_lock:
+            if not self._reconciliation_lock.wait_for(lambda: len(self._reconciliations) > after, timeout=timeout_seconds):
+                return None
+            return self._reconciliations[-1]
+
     def _serve(self) -> None:
         assert self._listener is not None
         while not self._stopping.is_set():
@@ -308,6 +339,12 @@ class AuthenticatedLoopbackGateway(LiveGateway):
             with self._response_lock:
                 self._responses[frame.request_id] = dict(frame.payload)
                 self._response_lock.notify_all()
+        elif frame.message_type == "RECONCILIATION":
+            with self._reconciliation_lock:
+                self._reconciliations.append(dict(frame.payload))
+                if len(self._reconciliations) > 2_048:
+                    del self._reconciliations[: len(self._reconciliations) - 2_048]
+                self._reconciliation_lock.notify_all()
 
     def _accept_hello(self, frame: VerifiedFrame, connection: socket.socket) -> None:
         payload = frame.payload

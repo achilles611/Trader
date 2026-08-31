@@ -13,6 +13,12 @@ class L3HNinjaScriptSourceTests(unittest.TestCase):
             "DENY_BAD_SIGNATURE", "DENY_REPLAY", "DENY_WRONG_ACCOUNT", "DENY_WRONG_CONTRACT", "DENY_QTY",
             "DENY_POSITION_NONFLAT", "DENY_FOREIGN_ORDER", "DENY_PROTECTION_UNAVAILABLE", "DENY_NOT_ARMED", "DENY_DAILY_LOSS",
             "NativeKillFlattenDisarm", "account.Flatten", "StopMarket", "CONTROL_HEARTBEAT_LOST",
+            "Environment.SpecialFolder.LocalApplicationData", "keys\", \"l3h.execution.local.key",
+            "L3H_UNKNOWN_STATE_TRANSPORT_LOSS", "unknown_state",
+            "IsNativeKillFlattenOrder", "String.Equals(order.Name, \"Close\"",
+            "L3H_KILL_LATE_PROTECTIVE_CANCEL", "CurrentQuantity() == 0",
+            "CurrentPositionState", "MarketPosition.Short", "IsNativeKillFlattenOrder(entry)",
+            "KILL_LATCH_POSITION_RETRY", "killLatch && CurrentQuantity() != 0",
         ):
             self.assertIn(required, source)
         self.assertNotIn("BeelzebubPaperExecutionAddOn", source)

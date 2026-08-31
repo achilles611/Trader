@@ -13,8 +13,9 @@ New-Item -ItemType Directory -Force -Path $keyRoot, $capabilityRoot, $eventRoot 
 # The current Windows user and Administrators retain access; inheritance is
 # removed so a local capability/key never becomes a repository artifact.
 $acl = Get-Acl -LiteralPath $resolvedRoot
+$currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $acl.SetAccessRuleProtection($true, $false)
-$acl.SetAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($env:USERNAME, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")))
+$acl.SetAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($currentIdentity, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")))
 $acl.SetAccessRule((New-Object Security.AccessControl.FileSystemAccessRule("BUILTIN\Administrators", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")))
 Set-Acl -LiteralPath $resolvedRoot -AclObject $acl
 
