@@ -301,7 +301,10 @@ namespace NinjaTrader.NinjaScript.AddOns
     public static class BeelzebubReadOnlyOutbound
     {
         private const int Port = 48135;
-        private const int MaximumQueuedFrames = 20000;
+        // Bound recovery lag. At the observer's declared 2 Hz-per-stream
+        // publication policy this holds well under one freshness epoch. If it
+        // fills, sequence gaps remain visible and authority fails closed.
+        private const int MaximumQueuedFrames = 8;
         private static long sequence = 0;
         private static readonly string sessionId = Guid.NewGuid().ToString("N");
         private static readonly HashSet<string> transportMarkers = new HashSet<string>();
