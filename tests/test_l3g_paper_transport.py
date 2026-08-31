@@ -22,6 +22,7 @@ from src.l3g_paper.contracts import (
     ACCOUNT_BINDING, POLICY, RISK_PROFILE, ExecutionAction, PaperDirection,
     PaperExecutionCommand, PaperRiskGrant,
 )
+from src.l3g_paper.runtime import LaneIIIPaperRuntime
 
 
 def free_port() -> int:
@@ -65,6 +66,56 @@ class PaperTransportTests(unittest.TestCase):
         signature = sign_payload(key, payload)
         self.assertTrue(verify_signature(key, {**payload, "signature": signature}))
         self.assertFalse(verify_signature(key, {**payload, "a": 3, "signature": signature}))
+
+    def test_reconciliation_receipt_and_runtime_projection_have_distinct_identities(self) -> None:
+        """A valid signed flat snapshot must not become a callback incident."""
+        with TemporaryDirectory() as directory:
+            key = bytes(range(32))
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            runtime = LaneIIIPaperRuntime(ledger)
+            transport = PaperExecutionTransport(
+                ledger, port=free_port(), on_message=runtime.on_execution_message,
+            )
+            runtime.bind_transport(transport)
+            runtime.start()
+            session_id = "l3g-es-reconciliation-identity"
+            receipt_id = "l3g-reconciliation-identity-0001"
+            with transport._lock:
+                transport._key = key
+                transport._client = object()  # type: ignore[assignment]
+                transport._state = "AUTHENTICATED"
+                transport._authenticated = True
+                transport._reconciled = True
+                transport._execution_session_id = session_id
+            runtime.on_execution_bridge_state("AUTHENTICATED")
+            frame = self._signed_inbound_receipt(
+                key,
+                session_id,
+                "RECONCILIATION",
+                receipt_id,
+                account_name="Sim101",
+                account_class="LOCAL_SIMULATION",
+                instrument="MNQ SEP26",
+                position_quantity=0,
+                working_order_count=0,
+                working_entry_count=0,
+                position_snapshot_complete=True,
+                order_snapshot_complete=True,
+            )
+            try:
+                transport._receive_frame(frame)
+                self.assertEqual(runtime.status()["state"], "READY_DISARMED")
+                self.assertTrue(ledger.contains(receipt_id))
+                self.assertTrue(ledger.contains("l3g-position-snapshot-reconciliation-" + receipt_id))
+                with ledger._lock:
+                    incident_count = ledger._connection.execute(
+                        "SELECT COUNT(*) FROM lane_iii_paper_audit WHERE kind = ?",
+                        ("INCIDENT_CALLBACK_FAILURE",),
+                    ).fetchone()[0]
+                self.assertEqual(incident_count, 0)
+            finally:
+                runtime.stop()
+                ledger.close()
 
     def test_one_loopback_listener_starts_once_and_releases_port(self) -> None:
         with TemporaryDirectory() as directory:

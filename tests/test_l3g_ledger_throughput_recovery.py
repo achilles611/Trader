@@ -31,6 +31,7 @@ import threading
 import time
 from typing import Callable, Mapping, Sequence
 import unittest
+from unittest.mock import patch
 
 # ``unittest discover`` imports this module from the repository root, while
 # the documented benchmark form executes this file directly from ``tests``.
@@ -535,6 +536,41 @@ class LedgerThroughputRecoveryTests(unittest.TestCase):
             finally:
                 if receipt is None:
                     ledger.close()
+
+    def test_startup_observes_existing_physical_wal_capacity_before_admission(self) -> None:
+        """An oversized retained WAL must fail closed before the worker's first pass."""
+        with TemporaryDirectory() as folder:
+            with patch.object(PaperLedger, "_current_wal_size_bytes", return_value=1_073_741_825):
+                ledger = PaperLedger(Path(folder) / "paper.sqlite3", max_deferred_records=64)
+            try:
+                capacity = ledger.deferred_capacity()
+                self.assertEqual(capacity["state"], "EXHAUSTED")
+                self.assertFalse(capacity["admission_open"])
+                self.assertEqual(
+                    capacity["wal_capacity_fault_reason"],
+                    "WAL_FILE_CAPACITY_CEILING_EXCEEDED_AT_STARTUP",
+                )
+                with self.assertRaisesRegex(LedgerCapacityError, "WAL capacity is exhausted"):
+                    _append_item(ledger, _work_items(1, 1, "startup-wal-capacity")[0])
+            finally:
+                ledger.close()
+
+    def test_degraded_capacity_rejects_new_deferred_admission(self) -> None:
+        """Telemetry and the actual admission path must enforce the same gate."""
+        with TemporaryDirectory() as folder:
+            ledger = PaperLedger(Path(folder) / "paper.sqlite3", max_deferred_records=64)
+            try:
+                with ledger._checkpoint_condition:
+                    ledger._checkpoint_worker_error = "OperationalError: test maintenance failure"
+                    ledger._publish_passive_checkpoint_state_locked()
+                capacity = ledger.deferred_capacity()
+                self.assertEqual(capacity["state"], "DEGRADED")
+                self.assertFalse(capacity["admission_open"])
+                with self.assertRaisesRegex(LedgerCapacityError, "capacity is not healthy"):
+                    _append_item(ledger, _work_items(1, 1, "degraded-admission")[0])
+                self.assertEqual(ledger.deferred_capacity()["admission_rejections_total"], 1)
+            finally:
+                ledger.close()
 
     def test_capacity_hard_cap_rejects_without_silent_loss_and_surfaces_degradation(self) -> None:
         """The RAM queue cannot silently absorb an unbounded writer deficit."""

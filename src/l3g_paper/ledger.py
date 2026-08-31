@@ -1038,9 +1038,15 @@ class PaperLedger:
         self._checkpoint_durable_total = 0
         self._last_passive_checkpoint: dict[str, object] | None = None
         self._checkpoint_worker_error: str | None = None
-        self._checkpoint_wal_size_bytes = 0
+        self._checkpoint_wal_size_bytes = self._current_wal_size_bytes()
         self._checkpoint_uncheckpointed_bytes = 0
-        self._wal_capacity_fault_latched = False
+        self._wal_capacity_fault_latched = (
+            self._checkpoint_wal_size_bytes > _WAL_FILE_CAPACITY_CEILING_BYTES
+        )
+        self._wal_capacity_fault_reason: str | None = (
+            "WAL_FILE_CAPACITY_CEILING_EXCEEDED_AT_STARTUP"
+            if self._wal_capacity_fault_latched else None
+        )
         # The writer's hot admission path reads this immutable replacement
         # snapshot without acquiring the maintenance condition. The worker
         # never mutates a published mapping; it replaces it while holding its
@@ -1185,6 +1191,7 @@ class PaperLedger:
             and not self._deferred_stopping
             and not self._capacity_fault_latched
             and not wal_capacity_fault
+            and state == "HEALTHY"
         )
         return {
             "schema": "l3g-ledger-writer-capacity-v1",
@@ -1192,6 +1199,7 @@ class PaperLedger:
             "admission_open": admission_open,
             "capacity_fault_latched": self._capacity_fault_latched,
             "wal_capacity_fault_latched": wal_capacity_fault,
+            "wal_capacity_fault_reason": checkpoint_state["wal_capacity_fault_reason"],
             "wal_size_bytes": checkpoint_state["wal_size_bytes"],
             "wal_uncheckpointed_bytes": checkpoint_state["wal_uncheckpointed_bytes"],
             "wal_uncheckpointed_capacity_ceiling_bytes": checkpoint_state[
@@ -1979,6 +1987,7 @@ class PaperLedger:
             "wal_uncheckpointed_capacity_ceiling_bytes": _WAL_UNCHECKPOINTED_CAPACITY_CEILING_BYTES,
             "wal_file_capacity_ceiling_bytes": _WAL_FILE_CAPACITY_CEILING_BYTES,
             "wal_capacity_fault_latched": self._wal_capacity_fault_latched,
+            "wal_capacity_fault_reason": self._wal_capacity_fault_reason,
             "last_passive_checkpoint": (
                 None if self._last_passive_checkpoint is None
                 else dict(self._last_passive_checkpoint)
@@ -2129,11 +2138,12 @@ class PaperLedger:
                             self._checkpoint_last_completed_durable_total,
                             checkpoint_target_durable_total,
                         )
-                    if (
-                        self._checkpoint_uncheckpointed_bytes
-                        > _WAL_UNCHECKPOINTED_CAPACITY_CEILING_BYTES
-                    ) or wal_size > _WAL_FILE_CAPACITY_CEILING_BYTES:
+                    if self._checkpoint_uncheckpointed_bytes > _WAL_UNCHECKPOINTED_CAPACITY_CEILING_BYTES:
                         self._wal_capacity_fault_latched = True
+                        self._wal_capacity_fault_reason = "WAL_UNCHECKPOINTED_CAPACITY_CEILING_EXCEEDED"
+                    elif wal_size > _WAL_FILE_CAPACITY_CEILING_BYTES:
+                        self._wal_capacity_fault_latched = True
+                        self._wal_capacity_fault_reason = "WAL_FILE_CAPACITY_CEILING_EXCEEDED"
                     self._publish_passive_checkpoint_state_locked()
                     self._checkpoint_condition.notify_all()
         except BaseException as exc:  # pragma: no cover - host-level SQLite failure
@@ -2522,6 +2532,12 @@ class PaperLedger:
                 self._admission_rejections_total += 1
                 raise LedgerCapacityError(
                     "Deferred paper ledger WAL capacity is exhausted; record was not admitted.",
+                    capacity,
+                )
+            if capacity["state"] != "HEALTHY":
+                self._admission_rejections_total += 1
+                raise LedgerCapacityError(
+                    "Deferred paper ledger capacity is not healthy; record was not admitted.",
                     capacity,
                 )
             if self._deferred_backlog_depth_locked() >= self._max_deferred_records:

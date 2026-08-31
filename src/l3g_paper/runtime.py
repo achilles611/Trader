@@ -1763,7 +1763,21 @@ class LaneIIIPaperRuntime:
             # truth can release the watchdog transport only; it can never
             # produce a clean ledger receipt or normal lifecycle transition.
             return
-        self.ledger.append("POSITION_SNAPSHOT_RECONCILIATION", dict(message), identity=str(message.get("receipt_id", "l3g-reconcile-" + canonical_hash(dict(message)))), execution_session_id=self._execution_session_id())
+        receipt_id = str(message.get("receipt_id", "")).strip()
+        projection_identity = "l3g-position-snapshot-reconciliation-" + (
+            receipt_id or canonical_hash(dict(message))
+        )
+        # The transport has already persisted the authenticated wire receipt
+        # under ``receipt_id``.  This row is a distinct runtime projection of
+        # that receipt and must never reuse the transport identity: doing so
+        # turns a valid reconciliation into an idempotency conflict after the
+        # durable receipt is already committed.
+        self.ledger.append(
+            "POSITION_SNAPSHOT_RECONCILIATION",
+            dict(message),
+            identity=projection_identity,
+            execution_session_id=self._execution_session_id(),
+        )
         if foreign or (quantity != 0 or orders != 0):
             ownership = self._commissioning_ownership
             if ownership is not None and ownership.recovered_after_restart:

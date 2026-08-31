@@ -230,6 +230,14 @@ class PaperControlCenterTests(unittest.TestCase):
         self.assertNotIn("commission_entry", verifier_source)
         self.assertNotIn("live_capital", verifier_source)
 
+        lifecycle_source = inspect.getsource(create_control_center_app)
+        verifier_refusal = lifecycle_source.index(
+            'if verifier_shutdown.get("completed") is not True:'
+        )
+        ledger_close = lifecycle_source.index("paper_ledger.close()", verifier_refusal)
+        self.assertLess(verifier_refusal, ledger_close)
+        self.assertIn("VERIFIER_READER_NOT_QUIESCED", lifecycle_source[verifier_refusal:ledger_close])
+
 
 if __name__ == "__main__":
     unittest.main()

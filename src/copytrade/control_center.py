@@ -1902,6 +1902,33 @@ def create_control_center_app(
                                     NINJATRADER_RUNTIME_LOGGER.exception(
                                         "Could not quiesce L3G verifier before ledger shutdown."
                                     )
+                                if verifier_shutdown.get("completed") is not True:
+                                    paper_ledger_shutdown_receipt = {
+                                        "schema": "l3g-ledger-controlled-shutdown-v1",
+                                        "closed_at": None,
+                                        "clean_shutdown": False,
+                                        "admission_sealed": False,
+                                        "writer_stopped": False,
+                                        "checkpoint": None,
+                                        "error": (
+                                            "VERIFIER_READER_NOT_QUIESCED: controlled WAL checkpoint "
+                                            "was refused; manual intervention is required."
+                                        ),
+                                        "transport_stop_skipped": False,
+                                        "ledger_close_deferred": True,
+                                        "lifecycle_shutdown_aborted": True,
+                                        "manual_intervention_required": True,
+                                        "verifier_shutdown": verifier_shutdown,
+                                        "runtime_watchdog_shutdown": runtime_watchdog_shutdown,
+                                    }
+                                    ninjatrader_runtime["unsafe_shutdown"] = paper_ledger_shutdown_receipt
+                                    NINJATRADER_RUNTIME_LOGGER.critical(
+                                        "L3G ledger close refused because verifier did not quiesce: %s",
+                                        paper_ledger_shutdown_receipt,
+                                    )
+                                    raise UnsafePaperExecutionShutdown(
+                                        "L3G ledger verifier reader did not quiesce before controlled shutdown."
+                                    )
                                 watcher_runtime.clear()
                                 ninjatrader_runtime.clear()
                                 app.state.ninjatrader_observer = None
