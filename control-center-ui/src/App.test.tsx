@@ -34,11 +34,23 @@ let accountBalancesResponse: Record<string, unknown> = {
     Lucid25kflex01: { cash_value: 24987.65, cash_value_observed_at: "2026-08-29T15:00:00Z" },
   },
 };
+let laneIIILiveResponse: Record<string, unknown> = {
+  terminal_status: "BLOCKED_LIVE_ACCOUNT_IDENTITY", state: "AUTHORIZATION_BOUNDARY_IMPLEMENTED",
+  mechanical_commissioning: "COMMISSIONED", live_account_identity: "UNVERIFIED",
+  authorization_boundary: "IMPLEMENTED", live_authority: "DISARMED", live_canary: "NOT_RUN",
+  account_class: "UNKNOWN", authorized_account: null, live_capital: "DENIED",
+  contract: "MNQ SEP26", maximum_quantity: 1, preflight_age_seconds: null,
+  authorization_expires_at: null, gateway: "AUTHENTICATED_LOOPBACK", addon_provenance: "PASS",
+  reconciliation: "PASS", protection: "PASS", kill_paths: "PASS", quarantine: false, locked: false,
+  live_send_count: 0, one_control_start: { enabled: false, reason: "LIVE_ACCOUNT_IDENTITY_UNVERIFIED" },
+  components: { LIVE_AUTHORITY: { state: "RED", reason: "DISARMED" } },
+};
 
 function payload(path: string) {
   if (path.startsWith("/api/overview")) return { counts: { total_discovered: emptyUniverse ? 0 : 20, qualified: 2, shadow: 1, active: 0 }, funnel: [], top_candidates: [candidate], recent_activity: [] };
   if (path.startsWith("/api/portfolio")) return { equity: 210, cash: 190, committed_capital: 10, open_pnl: 1, realized_pnl_total: 9, max_drawdown: 0.02, open_positions: 1 };
   if (path.startsWith("/api/accounts/balances")) return accountBalancesResponse;
+  if (path.startsWith("/api/lane-iii/live")) return laneIIILiveResponse;
   if (path.startsWith("/api/controls/close-all-paper-positions")) return closeAllResponse || { status: "completed", control: { state: "RUNNING", entries_allowed: true, paper_only: true } };
   if (path.startsWith("/api/controls")) return { state: "RUNNING", entries_allowed: true, paper_only: true };
   if (path.startsWith("/api/discovery/status")) return { candidate_universe_count: emptyUniverse ? 0 : 20, source: { source: "Official HyperCore node data", connection_state: "SETUP REQUIRED", aws_credentials_detected: false, requester_pays_access: "not tested", message: "No usable AWS credentials were detected on this machine. No credentials are stored by Trader.", cache: { object_count: 0, size_bytes: 0 } }, presets: { quick: { window_hours: 1, candidate_limit: 1000, min_activity: 2, max_activity_age: "30d" }, standard: { window_hours: 6, candidate_limit: 2500, min_activity: 2, max_activity_age: "30d" }, deep: { window_hours: 24, candidate_limit: 5000, min_activity: 2, max_activity_age: "30d" } } };
@@ -143,6 +155,7 @@ function configureReadyLaneIIIUiFixture() {
 }
 
 beforeEach(() => {
+  localStorage.clear();
   WebSocketStub.instances = [];
   closeAllResponse = null;
   emptyUniverse = false;
@@ -162,6 +175,17 @@ beforeEach(() => {
       Lucid25kflex01: { cash_value: 24987.65, cash_value_observed_at: "2026-08-29T15:00:00Z" },
     },
   };
+  laneIIILiveResponse = {
+    terminal_status: "BLOCKED_LIVE_ACCOUNT_IDENTITY", state: "AUTHORIZATION_BOUNDARY_IMPLEMENTED",
+    mechanical_commissioning: "COMMISSIONED", live_account_identity: "UNVERIFIED",
+    authorization_boundary: "IMPLEMENTED", live_authority: "DISARMED", live_canary: "NOT_RUN",
+    account_class: "UNKNOWN", authorized_account: null, live_capital: "DENIED",
+    contract: "MNQ SEP26", maximum_quantity: 1, preflight_age_seconds: null,
+    authorization_expires_at: null, gateway: "AUTHENTICATED_LOOPBACK", addon_provenance: "PASS",
+    reconciliation: "PASS", protection: "PASS", kill_paths: "PASS", quarantine: false, locked: false,
+    live_send_count: 0, one_control_start: { enabled: false, reason: "LIVE_ACCOUNT_IDENTITY_UNVERIFIED" },
+    components: { LIVE_AUTHORITY: { state: "RED", reason: "DISARMED" } },
+  };
   vi.stubGlobal("WebSocket", WebSocketStub);
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => new Response(JSON.stringify(payload(String(input))), { status: 200, headers: { "Content-Type": "application/json" } })));
 });
@@ -169,6 +193,95 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 describe("copy control center", () => {
+  it("separates L3H mechanical commissioning from live authorization and canary state", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Lane III Live" }));
+    expect(await screen.findByText("BLOCKED_LIVE_ACCOUNT_IDENTITY")).toBeInTheDocument();
+    const panel = screen.getByRole("heading", { name: "Authorization boundary" }).closest("section") as HTMLElement;
+    expect(panel).toHaveTextContent("COMMISSIONED");
+    expect(panel).toHaveTextContent("IMPLEMENTED");
+    expect(panel).toHaveTextContent("DISARMED");
+    expect(panel).toHaveTextContent("NOT_RUN");
+    expect(screen.getByRole("button", { name: "START LIVE — 1 MNQ CANARY" })).toBeDisabled();
+  });
+
+  it("does not let a sim account or server-provided enabled flag manufacture browser authority", async () => {
+    laneIIILiveResponse = {
+      ...laneIIILiveResponse, account_class: "LOCAL_SIMULATION", live_account_identity: "VERIFIED",
+      live_authority: "ONE_SHOT_AUTHORIZED", authorized_account: "Sim101",
+      one_control_start: { enabled: true, reason: "UNTRUSTED_FIXTURE" },
+    };
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Lane III Live" }));
+    const panel = await screen.findByRole("heading", { name: "Authorization boundary" });
+    expect(panel.closest("section")).toHaveTextContent("UNVERIFIED");
+    expect(panel.closest("section")).toHaveTextContent("DISARMED");
+    expect(panel.closest("section")).not.toHaveTextContent("ONE_SHOT_AUTHORIZED");
+    expect(screen.getByRole("button", { name: "START LIVE — 1 MNQ CANARY" })).toBeDisabled();
+    expect(fetch).not.toHaveBeenCalledWith(expect.stringContaining("authorize"), expect.anything());
+  });
+
+  it("lets quarantine dominate a server-reported one-shot authorization", async () => {
+    laneIIILiveResponse = {
+      ...laneIIILiveResponse, account_class: "LIVE_CAPITAL", live_account_identity: "VERIFIED",
+      live_authority: "ONE_SHOT_AUTHORIZED", authorized_account: "LIVE-SAFE-ID", quarantine: true,
+    };
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Lane III Live" }));
+    const panel = (await screen.findByRole("heading", { name: "Authorization boundary" })).closest("section") as HTMLElement;
+    expect(panel).toHaveTextContent("VERIFIED");
+    expect(panel).toHaveTextContent("DISARMED");
+    expect(panel).not.toHaveTextContent("ONE_SHOT_AUTHORIZED");
+    expect(screen.getByRole("button", { name: "START LIVE — 1 MNQ CANARY" })).toBeDisabled();
+  });
+
+  it("renders an expired capability as expired and disarmed", async () => {
+    laneIIILiveResponse = {
+      ...laneIIILiveResponse, account_class: "LIVE_CAPITAL", live_account_identity: "VERIFIED",
+      live_authority: "ONE_SHOT_AUTHORIZED", authorized_account: "LIVE-SAFE-ID",
+      authorization_expires_at: "2000-01-01T00:00:00Z",
+    };
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Lane III Live" }));
+    const panel = (await screen.findByRole("heading", { name: "Authorization boundary" })).closest("section") as HTMLElement;
+    expect(panel).toHaveTextContent("EXPIRED");
+    expect(panel).toHaveTextContent("DISARMED");
+    expect(panel).not.toHaveTextContent("ONE_SHOT_AUTHORIZED");
+  });
+
+  it("ignores browser-restored authority state", async () => {
+    localStorage.setItem("live_authority", "ONE_SHOT_AUTHORIZED");
+    localStorage.setItem("account_class", "LIVE_CAPITAL");
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Lane III Live" }));
+    const panel = (await screen.findByRole("heading", { name: "Authorization boundary" })).closest("section") as HTMLElement;
+    expect(panel).toHaveTextContent("DISARMED");
+    expect(screen.getByRole("button", { name: "START LIVE — 1 MNQ CANARY" })).toBeDisabled();
+  });
+
+  it("treats live-page selection as observational and performs no mutation", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Lane III Live" }));
+    await screen.findByText(/Viewing a live chart or this status is observational only/);
+    const calls = vi.mocked(fetch).mock.calls;
+    expect(calls.some(([, init]) => String(init?.method || "GET").toUpperCase() !== "GET")).toBe(false);
+    expect(screen.getByRole("button", { name: "START LIVE — 1 MNQ CANARY" })).toBeDisabled();
+  });
+
+  it("fails closed when the live-status API is unavailable", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).startsWith("/api/lane-iii/live")) throw new Error("status unavailable");
+      return new Response(JSON.stringify(payload(String(input))), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Lane III Live" }));
+    expect(await screen.findByText("status unavailable")).toBeInTheDocument();
+    const panel = screen.getByRole("heading", { name: "Authorization boundary" }).closest("section") as HTMLElement;
+    expect(panel).toHaveTextContent("DISARMED");
+    expect(panel).toHaveTextContent("NOT_RUN");
+    expect(screen.getByRole("button", { name: "START LIVE — 1 MNQ CANARY" })).toBeDisabled();
+  });
+
   it("shows observed Sim101 and LucidFlex balances instead of the seed paper equity", async () => {
     render(<App />);
     expect((await screen.findAllByText("$100,123.45")).length).toBeGreaterThan(0);

@@ -60,6 +60,8 @@ def _command(capability, action: str, *, command_id: str | None = None, client_o
         "native_instrument": capability.native_instrument,
         "canonical_contract": capability.canonical_contract,
         "quantity": 1,
+        "account_class": AccountClass.LOCAL_SIMULATION.value,
+        "live_capital": False,
         "session_valid": True,
         "daily_loss_clear": True,
     }

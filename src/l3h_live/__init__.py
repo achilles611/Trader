@@ -11,6 +11,11 @@ from .contracts import AccountClass, LiveCapability, load_capability, load_verif
 from .event_store import LiveEventStore
 from .gateway import AuthenticatedLoopbackGateway, NoDispatchLiveGateway
 from .lifecycle import ExecutionLifecycle, OrderLifecycleState, ProtectionLifecycle, ProtectionState
+from .live_authorization import (
+    ActionClass, AuthorizationAccountClass, AuthorizationFacts, ExactLiveAccountIdentity,
+    HumanAuthorization, LiveAuthorizationBoundary, LiveAuthorizationState, LiveEntryRequest,
+    classify_action, identity_from_native_metadata,
+)
 from .reconciliation import ExecutionSupervisor
 from .risk import LiveCanaryRiskProfile, LiveRiskAuthority
 from .runtime import LiveRuntime, LiveRuntimeState
@@ -22,8 +27,13 @@ __all__ = [
     "AuthenticatedLoopbackGateway",
     "ExecutionLifecycle",
     "ExecutionSupervisor",
+    "ExactLiveAccountIdentity",
+    "HumanAuthorization",
     "LiveCanaryRiskProfile",
     "LiveCapability",
+    "LiveAuthorizationBoundary",
+    "LiveAuthorizationState",
+    "LiveEntryRequest",
     "LiveEventStore",
     "LiveReadiness",
     "LiveRiskAuthority",
@@ -35,8 +45,13 @@ __all__ = [
     "LiveRuntime",
     "LiveRuntimeState",
     "ReadinessGate",
+    "ActionClass",
+    "AuthorizationAccountClass",
+    "AuthorizationFacts",
+    "classify_action",
     "derive_terminal_status",
     "classify_account",
     "load_capability",
     "load_verified_capability",
+    "identity_from_native_metadata",
 ]

@@ -99,19 +99,15 @@ class L3HAuthorityTests(unittest.TestCase):
                 store.mark_command("l3h-cmd-unit", state="ACKNOWLEDGED")
             self.assertEqual(store.verify(), (True, "PASS"))
 
-    def test_default_runtime_gateway_quarantines_after_durable_seal_without_resubmission(self) -> None:
+    def test_generic_runtime_activation_cannot_bypass_l3h3_exact_ceremony(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runtime = LiveRuntime(LiveEventStore(Path(directory) / "l3h.sqlite3"), capability=capability())
             self.assertEqual(runtime.preflight(readiness(), snapshot()), "LIVE_READY_DISARMED")
-            self.assertEqual(runtime.activate(OperatorActivation("request-123", "l3h-activation-unit-1", True, "2026-08-30T00:00:00Z")), "ARMED_FLAT")
-            sealed = runtime.seal_entry(expected_trade_risk=Decimal("50.00"))
-            command_id = str(sealed["command"]["command_id"])
-            with self.assertRaisesRegex(GatewayDispatchError, "NOT_CONFIGURED"):
-                runtime.dispatch_sealed()
-            self.assertEqual(runtime.state, LiveRuntimeState.QUARANTINED)
-            self.assertEqual(runtime.store.command(command_id)["state"], "UNKNOWN")
-            with self.assertRaisesRegex(ValueError, "NO_SEALED_COMMAND"):
-                runtime.dispatch_sealed()
+            with self.assertRaisesRegex(ValueError, "EXACT_AUTHORIZATION_CEREMONY"):
+                runtime.activate(OperatorActivation("request-123", "l3h-activation-unit-1", True, "2026-08-30T00:00:00Z"))
+            with self.assertRaisesRegex(ValueError, "EXACT_AUTHORIZATION_CEREMONY"):
+                runtime.seal_entry(expected_trade_risk=Decimal("50.00"))
+            self.assertEqual(runtime.state, LiveRuntimeState.READY_DISARMED)
 
 
 if __name__ == "__main__":

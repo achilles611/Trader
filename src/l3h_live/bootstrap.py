@@ -73,6 +73,12 @@ class NativeCapabilityBinding:
     capability_hash: str
     capability_generation: str
     commissioning_epoch: str
+    account_class: str = "LOCAL_SIMULATION"
+    live_capital: bool = False
+    native_account_fingerprint: str = ""
+    connection_identity_hash: str = ""
+    provider_identity_hash: str = ""
+    authorization_boundary_version: str = "L3H3_NONE"
     signature: str = ""
 
     def signed(self, key: bytes) -> "NativeCapabilityBinding":
@@ -86,6 +92,14 @@ class NativeCapabilityBinding:
     def verify(self, key: bytes) -> None:
         if self.schema != "lane-iii-phase-h-native-binding-v1" or not self.native_account_id:
             raise ValueError("NATIVE_BINDING_INVALID")
+        if self.live_capital:
+            if self.account_class != "LIVE_CAPITAL" or self.authorization_boundary_version != "L3H3_ONE_SHOT_V1":
+                raise ValueError("NATIVE_LIVE_BINDING_CLASS_INVALID")
+            for value in (self.native_account_fingerprint, self.connection_identity_hash, self.provider_identity_hash):
+                if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                    raise ValueError("NATIVE_LIVE_BINDING_IDENTITY_INVALID")
+        elif self.account_class != "LOCAL_SIMULATION":
+            raise ValueError("NATIVE_NONLIVE_BINDING_CLASS_INVALID")
         expected = self.signed(key).signature
         if not self.signature or not hmac.compare_digest(expected, self.signature):
             raise ValueError("NATIVE_BINDING_SIGNATURE_INVALID")

@@ -10,6 +10,7 @@ class L3HOperationsScriptTests(unittest.TestCase):
         required = {
             "bootstrap-l3h.ps1", "l3h_bootstrap.ps1", "l3h_status.ps1", "l3h_deploy_ninjatrader.ps1",
             "l3h_verify_install.ps1", "l3h_kill.ps1", "l3h_recover.ps1", "l3h_audit.ps1", "l3h_prepare_sim101.py", "l3h_sim101_commission.py", "l3h_gateway_service.py",
+            "l3h3_live_authorization_commission.py",
         }
         self.assertTrue(all((root / name).is_file() for name in required))
         bootstrap = (root / "l3h_bootstrap.ps1").read_text(encoding="utf-8")
@@ -29,6 +30,11 @@ class L3HOperationsScriptTests(unittest.TestCase):
         gateway_service = (root / "l3h_gateway_service.py").read_text(encoding="utf-8")
         self.assertIn("live_capital", gateway_service)
         self.assertNotIn("dispatch(", gateway_service)
+        l3h3 = (root / "l3h3_live_authorization_commission.py").read_text(encoding="utf-8")
+        self.assertIn('"live_authority": "DISARMED"', l3h3)
+        self.assertIn('"live_canary": "NOT_RUN"', l3h3)
+        self.assertIn('"live_send_count": 0', l3h3)
+        self.assertNotIn(".dispatch(", l3h3)
 
 
 if __name__ == "__main__":

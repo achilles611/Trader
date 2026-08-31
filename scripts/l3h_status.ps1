@@ -15,11 +15,13 @@ $capabilityRoot = Join-Path ([IO.Path]::GetFullPath($AuthorityRoot)) "capabiliti
 $eventRoot = Join-Path ([IO.Path]::GetFullPath($AuthorityRoot)) "events"
 $gatewayStatusPath = Join-Path $eventRoot "l3h-gateway-status.json"
 $commissioningResultsPath = Join-Path $eventRoot "l3h-sim101-mechanical-results.json"
+$authorizationStatusPath = Join-Path $eventRoot "l3h3-live-authorization-status.json"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $verify = & (Join-Path $PSScriptRoot "l3h_verify_install.ps1") | ConvertFrom-Json
 $disk = Get-PSDrive -Name ([IO.Path]::GetPathRoot($AuthorityRoot).TrimEnd(':','\')) -ErrorAction SilentlyContinue
 $gateway = if (Test-Path -LiteralPath $gatewayStatusPath) { Get-Content -Raw -LiteralPath $gatewayStatusPath | ConvertFrom-Json } else { $null }
 $results = if (Test-Path -LiteralPath $commissioningResultsPath) { Get-Content -Raw -LiteralPath $commissioningResultsPath | ConvertFrom-Json } else { $null }
+$authorization = if (Test-Path -LiteralPath $authorizationStatusPath) { Get-Content -Raw -LiteralPath $authorizationStatusPath | ConvertFrom-Json } else { $null }
 $reconciliation = if ($gateway) { $gateway.reconciliation } else { $null }
 $stages = if ($results) { $results.stages } else { $null }
 $mechanicallyCommissioned = $gateway -and $stages -and
@@ -35,7 +37,7 @@ $mechanicallyCommissioned = $gateway -and $stages -and
     $stages.'short-await-menu-kill'.native_menu_kill -eq "PASS" -and $stages.'long-await-script-kill'.script_kill -eq "PASS" -and
     $stages.'unknown-transport'.unknown_state -eq "PASS" -and $stages.reconnect.reconnect -eq "PASS" -and $stages.'foreign-await'.foreign_activity -eq "PASS"
 [pscustomobject]@{
-    terminal_status = if ($mechanicallyCommissioned) { "L3H_MECHANICALLY_COMMISSIONED" } else { "BLOCKED_SIM101_COMMISSIONING" }
+    terminal_status = if ($mechanicallyCommissioned -and $authorization -and $authorization.live_authority -eq "DISARMED" -and $authorization.live_send_count -eq 0) { $authorization.terminal_status } elseif ($mechanicallyCommissioned) { "L3H_MECHANICALLY_COMMISSIONED" } else { "BLOCKED_SIM101_COMMISSIONING" }
     authority_root = [IO.Path]::GetFullPath($AuthorityRoot)
     local_capability_count = @(Get-ChildItem -LiteralPath $capabilityRoot -File -Filter 'l3h-cap-*.json' -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '*.attestation.json' }).Count
     listeners = @($listeners)
@@ -50,6 +52,11 @@ $mechanicallyCommissioned = $gateway -and $stages -and
     reconciliation = if ($mechanicallyCommissioned) { "PASS" } else { "NOT_PROVEN" }
     protection = if ($mechanicallyCommissioned) { "PASS" } else { "NOT_PROVEN" }
     kill_paths = if ($mechanicallyCommissioned) { "PASS" } else { "NOT_PROVEN" }
+    live_account_identity = if ($authorization) { $authorization.live_account_identity } else { "UNVERIFIED" }
+    authorization_boundary = if ($authorization) { $authorization.authorization_boundary } else { "NOT_COMMISSIONED" }
     live_armed = $false
-    next_action = if ($mechanicallyCommissioned) { "L3H.2 is mechanically commissioned. L3H.3 requires a separate capital-bearing authorization; live authority remains disarmed." } else { "Install and visibly compile the dedicated AddOn, then conduct only the Sim101 mechanical matrix; no status action may arm L3H." }
-} | ConvertTo-Json -Depth 4
+    live_authority = "DISARMED"
+    live_canary = if ($authorization) { $authorization.live_canary } else { "NOT_RUN" }
+    live_send_count = if ($authorization) { $authorization.live_send_count } else { 0 }
+    next_action = if ($authorization -and $authorization.terminal_status -eq "BLOCKED_LIVE_ACCOUNT_IDENTITY") { "Obtain an exact read-only native live-account identity observation; do not authorize or send a canary." } elseif ($mechanicallyCommissioned) { "L3H.2 is mechanically commissioned. L3H.3 requires a separate capital-bearing authorization; live authority remains disarmed." } else { "Install and visibly compile the dedicated AddOn, then conduct only the Sim101 mechanical matrix; no status action may arm L3H." }
+} | ConvertTo-Json -Depth 8

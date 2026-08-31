@@ -13,6 +13,7 @@ from .contracts import LiveCapability, canonical_hash, utc_now
 from .event_store import LiveEventStore
 from .gateway import GatewayDispatchError, LiveGateway, NoDispatchLiveGateway
 from .lifecycle import ExecutionLifecycle, OrderLifecycleState
+from .live_authorization import AuthorizationFacts, LiveAuthorizationBoundary, LiveEntryRequest
 from .reconciliation import BrokerSnapshot, reconcile
 from .risk import LiveRiskAuthority
 
@@ -45,11 +46,13 @@ class LiveRuntime:
     def __init__(
         self, store: LiveEventStore, *, capability: LiveCapability | None = None,
         risk: LiveRiskAuthority | None = None, gateway: LiveGateway | None = None,
+        authorization_boundary: LiveAuthorizationBoundary | None = None,
     ) -> None:
         self.store = store
         self.capability = capability
         self.risk = risk or LiveRiskAuthority()
         self.gateway = gateway or NoDispatchLiveGateway()
+        self.authorization_boundary = authorization_boundary
         self.state = LiveRuntimeState.BLOCKED
         self.terminal_status = "BLOCKED_CAPABILITY_MISSING"
         self._snapshot: BrokerSnapshot | None = None
@@ -73,37 +76,25 @@ class LiveRuntime:
         return self.terminal_status
 
     def activate(self, activation: OperatorActivation) -> str:
-        if self.state is not LiveRuntimeState.READY_DISARMED or self.capability is None:
-            raise ValueError("LIVE_PREFLIGHT_NOT_READY")
-        if self.terminal_status != "LIVE_READY_DISARMED":
-            raise ValueError("LIVE_CAPITAL_NOT_AUTHORIZED")
-        # A prior GET/preflight is not enough.  The bounded snapshot is
-        # rechecked under this runtime transition so an operator cannot arm
-        # from a stale or newly exposed account view.
-        if self._snapshot is None or reconcile(self.capability, self._snapshot).state != "FLAT":
-            self.state = LiveRuntimeState.QUARANTINED
-            raise ValueError("ACTIVATION_BROKER_STATE_NOT_FRESH_FLAT")
-        if not activation.nonce.startswith(self.capability.activation_nonce_family + "-"):
-            raise ValueError("ACTIVATION_NONCE_FAMILY_MISMATCH")
-        self._activation = activation
-        self.state = LiveRuntimeState.ARMED_FLAT
-        self.store.append("activation:" + activation.request_id, "ACTIVATION_ARMED", {
-            "request_id": activation.request_id, "nonce_family": self.capability.activation_nonce_family,
-            "commissioning_epoch": self.capability.commissioning_epoch,
-        })
-        return self.state.value
+        del activation
+        # L3H.3 removed generic activation as a live-capital authority source.
+        # Callers must complete the exact preflight/challenge ceremony through
+        # LiveAuthorizationBoundary and present its one-shot capability.
+        raise ValueError("L3H3_EXACT_AUTHORIZATION_CEREMONY_REQUIRED")
 
     def seal_entry(
         self, *, expected_trade_risk: Decimal, side: str = "LONG", session_valid: bool = False,
-        daily_loss_clear: bool = False,
+        daily_loss_clear: bool = False, authorization_id: str | None = None,
+        authorization_facts: AuthorizationFacts | None = None,
+        request_id: str | None = None, strategy_signal_id: str | None = None,
     ) -> Mapping[str, object]:
-        if self.state is not LiveRuntimeState.ARMED_FLAT or self.capability is None or self._activation is None or self._snapshot is None:
-            raise ValueError("LIVE_RUNTIME_NOT_ARMED_FLAT")
-        broker = reconcile(self.capability, self._snapshot)
-        if broker.state != "FLAT":
-            self.state = LiveRuntimeState.QUARANTINED
-            raise ValueError("BROKER_STATE_NOT_PROVEN_FLAT")
-        admitted, reason = self.risk.admit_entry(position_quantity=self._snapshot.quantity or 0, pending_entries=self._snapshot.owned_working_orders or 0, expected_trade_risk=expected_trade_risk)
+        if self.capability is None or self.authorization_boundary is None or authorization_id is None or authorization_facts is None:
+            raise ValueError("L3H3_EXACT_AUTHORIZATION_CEREMONY_REQUIRED")
+        admitted, reason = self.risk.admit_entry(
+            position_quantity=authorization_facts.quantity or 0,
+            pending_entries=authorization_facts.owned_working_entry_orders or 0,
+            expected_trade_risk=expected_trade_risk,
+        )
         if not admitted:
             raise ValueError(reason)
         if side not in {"LONG", "SHORT"}:
@@ -111,24 +102,46 @@ class LiveRuntime:
         command_id = "l3h-cmd-" + uuid4().hex
         intent_id = "l3h-intent-" + uuid4().hex
         client_order_id = "BZ-L3H-" + uuid4().hex[:20].upper()
+        exact_request_id = request_id or "l3h3-request-" + uuid4().hex
+        exact_strategy_signal_id = strategy_signal_id or "l3h3-signal-" + uuid4().hex
+        request = LiveEntryRequest(
+            request_id=exact_request_id, strategy_signal_id=exact_strategy_signal_id,
+            action="ENTER_" + side,
+            account_fingerprint=authorization_facts.account.account_fingerprint,
+            account_class=authorization_facts.account.account_class.value,
+            native_instrument=authorization_facts.native_instrument,
+            canonical_contract=authorization_facts.canonical_contract,
+            quantity=1, resulting_position_quantity=1 if side == "LONG" else -1,
+        )
+        envelope = self.authorization_boundary.atomic_admit(
+            authorization_id, request, authorization_facts, command_id=command_id,
+        )
         lifecycle = ExecutionLifecycle(self.store, client_order_id)
-        lifecycle.transition(OrderLifecycleState.INTENT_CREATED, evidence={"activation_request_id": self._activation.request_id})
+        lifecycle.transition(OrderLifecycleState.INTENT_CREATED, evidence={
+            "authorization_id_hash": canonical_hash(authorization_id), "request_id": exact_request_id,
+        })
         lifecycle.transition(OrderLifecycleState.ADMITTED, evidence={"risk_hash": self.risk.profile.configuration_hash})
         command = {
-            "command_id": command_id, "request_id": self._activation.request_id, "intent_id": intent_id,
+            "command_id": command_id, "request_id": exact_request_id, "intent_id": intent_id,
             "client_order_id": client_order_id, "action": "ENTER_" + side, "side": side,
             "order_type": "MARKET", "limit_price": None, "stop_price": None,
-            "strategy_run_id": "l3h-activation-" + self._activation.request_id,
-            "prior_causal_event": "ACTIVATION_ARMED", "account_alias": self.capability.account_alias,
+            "strategy_run_id": exact_strategy_signal_id,
+            "prior_causal_event": "ONE_SHOT_CAPABILITY_ATOMICALLY_CONSUMED", "account_alias": self.capability.account_alias,
             "account_binding_hash": self.capability.account_binding_hash, "native_instrument": self.capability.native_instrument,
             "canonical_contract": self.capability.canonical_contract, "quantity": 1, "commissioning_epoch": self.capability.commissioning_epoch,
             "capability_generation": self.capability.capability_id, "created_at": utc_now(),
             "capability_hash": self.capability.capability_hash, "risk_hash": self.risk.profile.configuration_hash,
             "session_valid": session_valid, "daily_loss_clear": daily_loss_clear,
-            "idempotency_fingerprint": canonical_hash({"activation": self._activation.request_id, "command_id": command_id}),
+            "account_class": "LIVE_CAPITAL", "live_capital": True,
+            "account_fingerprint": authorization_facts.account.account_fingerprint,
+            "provider_identity_hash": authorization_facts.account.provider_identity_hash,
+            "connection_identity_hash": authorization_facts.account.connection_identity_hash,
+            "addon_provenance": authorization_facts.addon_provenance,
+            "live_authorization": envelope.as_mapping(),
+            "idempotency_fingerprint": canonical_hash({"authorization": authorization_id, "command_id": command_id}),
         }
         command["canonical_payload_hash"] = canonical_hash(command)
-        seal, replayed = self.store.seal_command(request_id=self._activation.request_id, command=command)
+        seal, replayed = self.store.seal_command(request_id=exact_request_id, command=command)
         self._active_command_id = command_id
         self._active_client_order_id = client_order_id
         self.state = LiveRuntimeState.COMMAND_SEALED
@@ -190,10 +203,13 @@ class LiveRuntime:
         return state.value
 
     def status(self) -> Mapping[str, object]:
-        return {
+        result = {
             "mode": "L3H_LIVE_CAPITAL", "state": self.state.value, "terminal_status": self.terminal_status,
             "capability_loaded": self.capability is not None, "account_class": None if self.capability is None else self.capability.account_class.value,
             "live_capital": "DENIED" if self.capability is None or not self.capability.live_capital else "CAPABILITY_BOUND",
             "active_command_id": self._active_command_id, "unknown_never_flat": True,
             "active_client_order_id": self._active_client_order_id,
         }
+        if self.authorization_boundary is not None:
+            result["live_authorization_boundary"] = self.authorization_boundary.status()
+        return result

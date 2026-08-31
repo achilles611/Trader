@@ -53,16 +53,32 @@ namespace NinjaTrader.NinjaScript.AddOns
         private byte[] signingKey;
         private bool stopping;
         private bool authenticated;
-        private bool armed;
+        // Mechanical readiness is not live-capital authority.  A live entry
+        // additionally requires an exact, fresh, one-shot signed envelope.
+        private bool mechanicallyArmed;
         private bool killLatch;
         private bool unknownState;
         private bool foreignActivity;
         private bool protectionAvailable;
+        // Exposure tracking is a risk-reduction latch, never entry authority.
+        // It keeps the watchdog active after a one-shot live capability has
+        // been consumed even though mechanicallyArmed must remain false.
+        private bool exposureGuardActive;
         private string capabilityHash;
         private string capabilityGeneration;
         private string commissioningEpoch;
         private string accountBindingHash;
         private string expectedAccountName;
+        private string bindingAccountClass;
+        private bool bindingLiveCapital;
+        private string expectedNativeAccountFingerprint;
+        private string expectedConnectionIdentityHash;
+        private string expectedProviderIdentityHash;
+        private string authorizationBoundaryVersion;
+        private string authorizationSessionId;
+        private string gatewaySessionId;
+        private readonly HashSet<string> consumedLiveAuthorizations = new HashSet<string>(StringComparer.Ordinal);
+        private int liveSendCount;
         private DateTime lastHeartbeatUtc = DateTime.MinValue;
         private Order protectiveOrder;
         private EventWaitHandle outOfBandKillEvent;
@@ -79,8 +95,9 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             lock (stateLock)
             {
-                armed = false; killLatch = false; authenticated = false; foreignActivity = false; unknownState = false;
-                protectionAvailable = false; capabilityHash = null; capabilityGeneration = null; commissioningEpoch = null;
+                mechanicallyArmed = false; killLatch = false; authenticated = false; foreignActivity = false; unknownState = false;
+                protectionAvailable = false; exposureGuardActive = false; capabilityHash = null; capabilityGeneration = null; commissioningEpoch = null;
+                authorizationSessionId = null; gatewaySessionId = null; liveSendCount = 0; consumedLiveAuthorizations.Clear();
                 if (!LoadLocalBindingAndKey()) { Diagnostic("L3H_BINDING_OR_KEY_UNAVAILABLE"); return; }
                 if (SourceFingerprint == "PENDING_L3H_INSTALL_FINGERPRINT") { Diagnostic("L3H_SOURCE_FINGERPRINT_PENDING"); return; }
                 instrument = Instrument.GetInstrument("MNQ SEP26");
@@ -89,6 +106,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 lock (Account.All) matches = Account.All.Where(item => String.Equals(item.Name, expectedAccountName, StringComparison.Ordinal)).ToList();
                 if (matches.Count != 1) { Diagnostic("L3H_DENY_WRONG_ACCOUNT"); return; }
                 account = matches[0];
+                if (!NativeAccountIdentityReady()) { account = null; Diagnostic("L3H_BLOCKED_LIVE_ACCOUNT_IDENTITY"); return; }
                 protectionAvailable = true;
                 try { outOfBandKillEvent = new EventWaitHandle(false, EventResetMode.ManualReset, @"Global\BeelzebubL3HNativeKill"); }
                 catch (Exception error) { protectionAvailable = false; Diagnostic("L3H_OUT_OF_BAND_KILL_UNAVAILABLE_" + error.GetType().Name); }
@@ -125,9 +143,19 @@ namespace NinjaTrader.NinjaScript.AddOns
                 capabilityHash = Text(binding, "capability_hash");
                 capabilityGeneration = Text(binding, "capability_generation");
                 commissioningEpoch = Text(binding, "commissioning_epoch");
+                bindingAccountClass = Text(binding, "account_class");
+                // Legacy L3H.2 bindings are accepted only for exact Sim101
+                // mechanics.  Missing metadata can never become live capital.
+                if (String.IsNullOrWhiteSpace(bindingAccountClass) && String.Equals(expectedAccountName, "Sim101", StringComparison.Ordinal))
+                    bindingAccountClass = "LOCAL_SIMULATION";
+                bindingLiveCapital = Boolean(binding, "live_capital");
+                expectedNativeAccountFingerprint = Text(binding, "native_account_fingerprint");
+                expectedConnectionIdentityHash = Text(binding, "connection_identity_hash");
+                expectedProviderIdentityHash = Text(binding, "provider_identity_hash");
+                authorizationBoundaryVersion = Text(binding, "authorization_boundary_version");
                 return !String.IsNullOrWhiteSpace(expectedAccountName) && Hash(accountBindingHash)
                     && Hash(capabilityHash) && !String.IsNullOrWhiteSpace(capabilityGeneration)
-                    && !String.IsNullOrWhiteSpace(commissioningEpoch);
+                    && !String.IsNullOrWhiteSpace(commissioningEpoch) && BindingClassValid();
             }
             catch (Exception error) { Diagnostic("L3H_BINDING_LOAD_" + error.GetType().Name); return false; }
         }
@@ -136,7 +164,8 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             lock (stateLock)
             {
-                stopping = true; armed = false; authenticated = false; capabilityHash = null;
+                stopping = true; mechanicallyArmed = false; authenticated = false; capabilityHash = null;
+                authorizationSessionId = null; gatewaySessionId = null; consumedLiveAuthorizations.Clear();
                 CloseTransport();
                 if (account != null)
                 {
@@ -157,10 +186,13 @@ namespace NinjaTrader.NinjaScript.AddOns
                 try
                 {
                     TcpClient next = new TcpClient(); next.Connect(IPAddress.Loopback, Port);
-                    lock (stateLock) { if (stopping) { next.Close(); return; } client = next; stream = next.GetStream(); authenticated = false; armed = false; }
+                    lock (stateLock) { if (stopping) { next.Close(); return; } client = next; stream = next.GetStream(); authenticated = false; mechanicallyArmed = false; authorizationSessionId = null; gatewaySessionId = null; }
                     Send("ADDON_HELLO", "l3h-hello-" + addonSessionId, new Dictionary<string, object> {
                         { "addon_session_id", addonSessionId }, { "addon_fingerprint", SourceFingerprint },
-                        { "capability_hash", capabilityHash ?? "UNBOUND" }, { "state", "DISARMED" }
+                        { "capability_hash", capabilityHash ?? "UNBOUND" }, { "state", "DISARMED" },
+                        { "account_class", bindingAccountClass }, { "account_fingerprint", NativeAccountFingerprint() },
+                        { "connection_identity_hash", NativeConnectionIdentityHash() },
+                        { "provider_identity_hash", NativeProviderIdentityHash() }, { "live_send_count", liveSendCount }
                     });
                     ReadFrames(stream);
                 }
@@ -170,8 +202,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                     bool unresolved;
                     lock (stateLock)
                     {
-                        unresolved = armed && !stopping;
-                        authenticated = false; armed = false; CloseTransport();
+                        unresolved = (mechanicallyArmed || exposureGuardActive) && !stopping;
+                        authenticated = false; mechanicallyArmed = false; authorizationSessionId = null; gatewaySessionId = null; CloseTransport();
                     }
                     if (unresolved)
                     {
@@ -214,7 +246,17 @@ namespace NinjaTrader.NinjaScript.AddOns
             string denial;
             if (!VerifyFrame(message, out denial)) { Reject(message, denial); return; }
             string type = Text(message, "message_type");
-            if (type == "GATEWAY_HELLO") { authenticated = true; armed = false; SendReconciliation("GATEWAY_HELLO"); return; }
+            if (type == "GATEWAY_HELLO")
+            {
+                Dictionary<string, object> hello = message["payload"] as Dictionary<string, object>;
+                string nextAuthorizationSession = Text(hello, "authorization_session_id");
+                string nextGatewaySession = Text(hello, "gateway_session_id");
+                if (!nextAuthorizationSession.StartsWith("l3h3-auth-session-", StringComparison.Ordinal)
+                    || !nextGatewaySession.StartsWith("l3h3-gateway-session-", StringComparison.Ordinal))
+                { Reject(message, "DENY_AUTHORIZATION_SESSION"); return; }
+                authorizationSessionId = nextAuthorizationSession; gatewaySessionId = nextGatewaySession;
+                authenticated = true; mechanicallyArmed = false; SendReconciliation("GATEWAY_HELLO"); return;
+            }
             if (!authenticated) { Reject(message, "DENY_NOT_AUTHENTICATED"); return; }
             if (type == "HEARTBEAT") { lastHeartbeatUtc = DateTime.UtcNow; return; }
             if (type != "COMMAND") { Reject(message, "DENY_UNSUPPORTED_MESSAGE"); return; }
@@ -243,16 +285,18 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             if (!ExactCapability(command)) { RejectCommand(requestId, Text(command, "command_id"), "DENY_CAPABILITY_BINDING"); return; }
             capabilityHash = Text(command, "capability_hash"); capabilityGeneration = Text(command, "capability_generation");
-            commissioningEpoch = Text(command, "commissioning_epoch"); armed = false;
+            commissioningEpoch = Text(command, "commissioning_epoch"); mechanicallyArmed = false;
             Ack(requestId, Text(command, "command_id"), "ACK", "CAPABILITY_BOUND_DISARMED"); SendReconciliation("CAPABILITY_BOUND");
         }
 
         private void Arm(Dictionary<string, object> command, string requestId)
         {
+            if (bindingLiveCapital || bindingAccountClass == "LIVE_CAPITAL")
+            { RejectCommand(requestId, Text(command, "command_id"), "DENY_LIVE_REQUIRES_ONE_SHOT_AUTHORIZATION"); return; }
             string reason;
             if (!NativeReady(command, out reason)) { RejectCommand(requestId, Text(command, "command_id"), reason); return; }
             if (CurrentQuantity() != 0 || HasWorkingOrders() || foreignActivity) { RejectCommand(requestId, Text(command, "command_id"), "DENY_UNKNOWN_BROKER_STATE"); return; }
-            armed = true; lastHeartbeatUtc = DateTime.UtcNow;
+            mechanicallyArmed = true; lastHeartbeatUtc = DateTime.UtcNow;
             Ack(requestId, Text(command, "command_id"), "ACK", "ARMED_FLAT"); SendReconciliation("ARMED_FLAT");
         }
 
@@ -260,14 +304,18 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             string reason;
             if (!NativeReady(command, out reason)) { RejectCommand(requestId, Text(command, "command_id"), reason); return; }
-            if (!armed) { RejectCommand(requestId, Text(command, "command_id"), "DENY_NOT_ARMED"); return; }
+            bool liveEntry = bindingLiveCapital && bindingAccountClass == "LIVE_CAPITAL";
+            if (!liveEntry && !mechanicallyArmed) { RejectCommand(requestId, Text(command, "command_id"), "DENY_NOT_ARMED"); return; }
             if (CurrentQuantity() != 0) { RejectCommand(requestId, Text(command, "command_id"), "DENY_POSITION_NONFLAT"); return; }
             if (HasWorkingOrders()) { RejectCommand(requestId, Text(command, "command_id"), "DENY_FOREIGN_ORDER"); return; }
             if (!protectionAvailable) { RejectCommand(requestId, Text(command, "command_id"), "DENY_PROTECTION_UNAVAILABLE"); return; }
+            if (liveEntry && !ValidateAndConsumeLiveAuthorization(command, out reason))
+            { RejectCommand(requestId, Text(command, "command_id"), reason); return; }
             string id = Text(command, "client_order_id");
             Order order = account.CreateOrder(instrument, longSide ? OrderAction.Buy : OrderAction.SellShort, OrderType.Market,
                 OrderEntry.Automated, TimeInForce.Day, 1, 0, 0, String.Empty, id, NinjaTrader.Core.Globals.MaxDate, null);
-            lock (stateLock) ownedOrders[id] = order;
+            lock (stateLock) { ownedOrders[id] = order; if (liveEntry) exposureGuardActive = true; }
+            if (liveEntry) Interlocked.Increment(ref liveSendCount);
             account.Submit(new[] { order }); Ack(requestId, Text(command, "command_id"), "ACK", "BROKER_SUBMIT_REQUESTED");
         }
 
@@ -278,7 +326,15 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (!authenticated) { reason = "DENY_NOT_AUTHENTICATED"; return false; }
             if (Text(command, "native_instrument") != "MNQ SEP26" || Text(command, "canonical_contract") != "MNQU6") { reason = "DENY_WRONG_CONTRACT"; return false; }
             if (!ExactCapability(command)) { reason = "DENY_COMMISSION_EPOCH"; return false; }
-            if (!ExactInstrument(instrument) || account == null || !String.Equals(account.Name, expectedAccountName, StringComparison.Ordinal)) { reason = "DENY_WRONG_ACCOUNT"; return false; }
+            if (!ExactInstrument(instrument) || account == null || !String.Equals(account.Name, expectedAccountName, StringComparison.Ordinal)
+                || !NativeAccountIdentityReady()) { reason = "DENY_WRONG_ACCOUNT"; return false; }
+            if (bindingLiveCapital)
+            {
+                if (Text(command, "account_class") != "LIVE_CAPITAL" || !Boolean(command, "live_capital"))
+                { reason = "DENY_LIVE_ACCOUNT_CLASS"; return false; }
+            }
+            else if (Text(command, "account_class") != "LOCAL_SIMULATION" || Boolean(command, "live_capital"))
+            { reason = "DENY_SIMULATION_ACCOUNT_CLASS"; return false; }
             if (foreignActivity) { reason = "DENY_FOREIGN_ORDER"; return false; }
             if (DateTime.UtcNow - lastHeartbeatUtc > TimeSpan.FromSeconds(HeartbeatTimeoutSeconds)) { reason = "DENY_SESSION"; return false; }
             if (!Boolean(command, "session_valid")) { reason = "DENY_SESSION"; return false; }
@@ -316,6 +372,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 protectiveOrder = account.CreateOrder(instrument, action, OrderType.StopMarket, OrderEntry.Automated, TimeInForce.Gtc,
                     e.Execution.Quantity, 0, stopPrice, String.Empty, stopId, NinjaTrader.Core.Globals.MaxDate, null);
                 lock (stateLock) ownedOrders[stopId] = protectiveOrder;
+                if (bindingLiveCapital) Interlocked.Increment(ref liveSendCount);
                 account.Submit(new[] { protectiveOrder }); protectionAvailable = true;
             }
             catch (Exception error) { Diagnostic("L3H_PROTECTION_FAILURE_" + error.GetType().Name); NativeKillFlattenDisarm(null, "PROTECTION_FAILURE"); }
@@ -324,7 +381,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private void OnOrderUpdate(object sender, OrderEventArgs e)
         {
             if (e == null || e.Order == null || e.Order.Account != account) return;
-            if (!IsOwned(e.Order) && !IsNativeKillFlattenOrder(e.Order) && Working(e.Order.OrderState)) { foreignActivity = true; armed = false; Diagnostic("L3H_FOREIGN_ACTIVITY_QUARANTINE"); }
+            if (!IsOwned(e.Order) && !IsNativeKillFlattenOrder(e.Order) && Working(e.Order.OrderState)) { foreignActivity = true; mechanicallyArmed = false; Diagnostic("L3H_FOREIGN_ACTIVITY_QUARANTINE"); }
             if (protectiveOrder != null && String.Equals(e.Order.Name, protectiveOrder.Name, StringComparison.Ordinal)
                 && (e.Order.OrderState == OrderState.Accepted || e.Order.OrderState == OrderState.Working))
             {
@@ -342,6 +399,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (protectiveOrder != null && String.Equals(e.Order.Name, protectiveOrder.Name, StringComparison.Ordinal)
                 && (e.Order.OrderState == OrderState.Rejected || e.Order.OrderState == OrderState.Cancelled) && CurrentQuantity() != 0)
                 NativeKillFlattenDisarm(null, "PROTECTION_REJECTED");
+            RefreshExposureGuard();
             SendReconciliation("ORDER_UPDATE");
         }
 
@@ -352,6 +410,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             // the native quantity becomes observable; otherwise Flatten can
             // race a still-zero position and leave exposure behind.
             if (killLatch && CurrentQuantity() != 0) NativeKillFlattenDisarm(null, "KILL_LATCH_POSITION_RETRY");
+            RefreshExposureGuard();
             SendReconciliation("POSITION_UPDATE");
         }
 
@@ -359,7 +418,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             while (!stopping)
             {
-                if (armed && DateTime.UtcNow - lastHeartbeatUtc > TimeSpan.FromSeconds(HeartbeatTimeoutSeconds))
+                if ((mechanicallyArmed || exposureGuardActive) && DateTime.UtcNow - lastHeartbeatUtc > TimeSpan.FromSeconds(HeartbeatTimeoutSeconds))
                     NativeKillFlattenDisarm(null, "CONTROL_HEARTBEAT_LOST");
                 if (outOfBandKillEvent != null && outOfBandKillEvent.WaitOne(0))
                 {
@@ -375,7 +434,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         // and remains disarmed even after a reconnect.
         public void NativeKillFlattenDisarm(string commandId, string reason)
         {
-            lock (stateLock) { killLatch = true; armed = false; }
+            lock (stateLock) { killLatch = true; mechanicallyArmed = false; exposureGuardActive = false; }
             try { account.Cancel(OwnedWorkingOrders()); } catch (Exception error) { Diagnostic("L3H_KILL_CANCEL_" + error.GetType().Name); }
             try { account.Flatten(new[] { instrument }); } catch (Exception error) { Diagnostic("L3H_KILL_FLATTEN_" + error.GetType().Name); }
             Diagnostic("L3H_NATIVE_KILL_" + reason); SendReconciliation("KILL_" + reason);
@@ -404,10 +463,16 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             if (!authenticated || stream == null || account == null || instrument == null) return;
             Send("RECONCILIATION", "l3h-recon-" + Guid.NewGuid().ToString("N"), new Dictionary<string, object> {
-                { "reason", reason }, { "account", account.Name }, { "contract", instrument.FullName },
+                { "reason", reason }, { "account", SafeAccountIdentifier() }, { "contract", instrument.FullName },
                 { "position", CurrentPositionState() }, { "quantity", CurrentQuantity() }, { "owned_working_orders", OwnedWorkingOrders().Count },
-                { "foreign_or_unknown_orders", foreignActivity ? 1 : 0 }, { "armed", armed },
-                { "kill_latch", killLatch }, { "unknown_state", unknownState }, { "protection_available", protectionAvailable }
+                { "foreign_or_unknown_orders", foreignActivity ? 1 : 0 }, { "armed", mechanicallyArmed },
+                { "kill_latch", killLatch }, { "unknown_state", unknownState }, { "protection_available", protectionAvailable },
+                { "exposure_guard_active", exposureGuardActive },
+                { "account_class", bindingAccountClass }, { "account_fingerprint", NativeAccountFingerprint() },
+                { "connection_identity_hash", NativeConnectionIdentityHash() }, { "provider_identity_hash", NativeProviderIdentityHash() },
+                { "addon_session_id", addonSessionId }, { "gateway_session_id", gatewaySessionId ?? "DISCONNECTED" },
+                { "addon_provenance", SourceFingerprint }, { "live_send_count", liveSendCount },
+                { "observed_at", DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture) }
             });
         }
 
@@ -454,6 +519,149 @@ namespace NinjaTrader.NinjaScript.AddOns
             binding.Remove("signature"); string expected = Hex(new HMACSHA256(signingKey).ComputeHash(Encoding.UTF8.GetBytes(Canonical(binding)))); binding["signature"] = signature;
             return FixedEquals(expected, signature);
         }
+
+        private bool BindingClassValid()
+        {
+            if (bindingAccountClass == "LOCAL_SIMULATION")
+                return !bindingLiveCapital && (String.IsNullOrWhiteSpace(authorizationBoundaryVersion) || authorizationBoundaryVersion == "L3H3_NONE");
+            if (bindingAccountClass == "LIVE_CAPITAL")
+                return bindingLiveCapital && authorizationBoundaryVersion == "L3H3_ONE_SHOT_V1"
+                    && Hash(expectedNativeAccountFingerprint) && Hash(expectedConnectionIdentityHash) && Hash(expectedProviderIdentityHash);
+            return false;
+        }
+
+        private bool NativeAccountIdentityReady()
+        {
+            if (account == null || account.Connection == null || account.Connection.Options == null) return false;
+            if (bindingAccountClass == "LOCAL_SIMULATION")
+            {
+                bool nativeSimulation = account.Provider == Provider.Simulator || account.Connection.Options.Provider == Provider.Simulator;
+                return !bindingLiveCapital && nativeSimulation && String.Equals(expectedAccountName, "Sim101", StringComparison.Ordinal);
+            }
+            if (bindingAccountClass != "LIVE_CAPITAL" || !bindingLiveCapital || authorizationBoundaryVersion != "L3H3_ONE_SHOT_V1") return false;
+            bool liveMetadata = account.Provider != Provider.Simulator && account.Provider != Provider.Unknown
+                && account.Connection.Options.Provider != Provider.Simulator && account.Connection.Options.Provider != Provider.Unknown
+                && !account.Connection.Options.IsDemo && account.Connection.Options.CanManageOrders
+                && String.Equals(account.AccountStatus.ToString(), "Enabled", StringComparison.OrdinalIgnoreCase)
+                && String.Equals(account.Connection.Status.ToString(), "Connected", StringComparison.OrdinalIgnoreCase);
+            return liveMetadata
+                && FixedEquals(NativeAccountFingerprint(), expectedNativeAccountFingerprint)
+                && FixedEquals(NativeConnectionIdentityHash(), expectedConnectionIdentityHash)
+                && FixedEquals(NativeProviderIdentityHash(), expectedProviderIdentityHash);
+        }
+
+        private string NativeAccountFingerprint()
+        {
+            if (account == null) return "UNKNOWN";
+            Dictionary<string, object> facts = new Dictionary<string, object> {
+                { "platform", "NINJATRADER" }, { "account_id", account.Id.ToString(CultureInfo.InvariantCulture) },
+                { "account_name", account.Name ?? String.Empty }, { "display_name", account.DisplayName ?? String.Empty },
+                { "fcm", account.Fcm ?? String.Empty }, { "account_provider", account.Provider.ToString() },
+                { "account_status", account.AccountStatus.ToString() }, { "connection_identity_hash", NativeConnectionIdentityHash() }
+            };
+            return Sha256(Canonical(facts));
+        }
+
+        private string NativeConnectionIdentityHash()
+        {
+            if (account == null || account.Connection == null || account.Connection.Options == null) return "UNKNOWN";
+            ConnectOptions options = account.Connection.Options;
+            Dictionary<string, object> facts = new Dictionary<string, object> {
+                { "name", options.Name ?? String.Empty }, { "provider", options.Provider.ToString() },
+                { "brand", options.BrandName ?? String.Empty }, { "type", options.TypeName ?? String.Empty },
+                { "mode", options.Mode.ToString() }, { "is_demo", options.IsDemo },
+                { "can_manage_orders", options.CanManageOrders }, { "connection_status", account.Connection.Status.ToString() }
+            };
+            return Sha256(Canonical(facts));
+        }
+
+        private string NativeProviderIdentityHash()
+        {
+            if (account == null || account.Connection == null || account.Connection.Options == null) return "UNKNOWN";
+            Dictionary<string, object> facts = new Dictionary<string, object> {
+                { "account_provider", account.Provider.ToString() },
+                { "connection_provider", account.Connection.Options.Provider.ToString() },
+                { "brand", account.Connection.Options.BrandName ?? String.Empty }, { "fcm", account.Fcm ?? String.Empty }
+            };
+            return Sha256(Canonical(facts));
+        }
+
+        private string SafeAccountIdentifier()
+        {
+            if (bindingAccountClass == "LOCAL_SIMULATION") return "Sim101";
+            string fingerprint = NativeAccountFingerprint();
+            return Hash(fingerprint) ? "LIVE-" + fingerprint.Substring(0, 12).ToUpperInvariant() : "LIVE-UNVERIFIED";
+        }
+
+        private bool ValidateAndConsumeLiveAuthorization(Dictionary<string, object> command, out string reason)
+        {
+            reason = "DENY_LIVE_AUTHORIZATION";
+            object rawEnvelope;
+            Dictionary<string, object> envelope = command.TryGetValue("live_authorization", out rawEnvelope) ? rawEnvelope as Dictionary<string, object> : null;
+            if (envelope == null) { reason = "DENY_LIVE_AUTHORIZATION_REQUIRED"; return false; }
+            string[] required = {
+                "schema", "authorization_id", "authorization_session_id", "addon_session_id", "gateway_session_id",
+                "preflight_digest", "admission_facts_digest", "account_fingerprint", "account_class",
+                "provider_identity_hash", "connection_identity_hash", "native_instrument", "canonical_contract",
+                "quantity", "action", "command_id", "request_id", "nonce", "issued_at", "expires_at",
+                "beelzebub_build_identity", "addon_provenance", "signature"
+            };
+            if (envelope.Count != required.Length || required.Any(field => !envelope.ContainsKey(field)))
+            { reason = "DENY_LIVE_AUTHORIZATION_FIELDS"; return false; }
+            string signature = Text(envelope, "signature");
+            if (!Hash(signature)) { reason = "DENY_LIVE_AUTHORIZATION_SIGNATURE"; return false; }
+            envelope.Remove("signature");
+            string expectedSignature = Hex(new HMACSHA256(signingKey).ComputeHash(Encoding.UTF8.GetBytes(Canonical(envelope))));
+            envelope["signature"] = signature;
+            if (!FixedEquals(expectedSignature, signature)) { reason = "DENY_LIVE_AUTHORIZATION_SIGNATURE"; return false; }
+            if (Text(envelope, "schema") != "lane-iii-phase-h-live-admission-v1"
+                || Text(envelope, "authorization_session_id") != authorizationSessionId
+                || Text(envelope, "addon_session_id") != addonSessionId
+                || Text(envelope, "gateway_session_id") != gatewaySessionId)
+            { reason = "DENY_LIVE_AUTHORIZATION_SESSION"; return false; }
+            if (!Text(envelope, "authorization_id").StartsWith("l3h3-canary-cap-", StringComparison.Ordinal)
+                || !Text(envelope, "nonce").StartsWith("l3h3-admission-nonce-", StringComparison.Ordinal)
+                || !Hash(Text(envelope, "preflight_digest")) || !Hash(Text(envelope, "admission_facts_digest")))
+            { reason = "DENY_LIVE_AUTHORIZATION_IDENTITY"; return false; }
+            if (Text(envelope, "account_class") != "LIVE_CAPITAL"
+                || Text(envelope, "account_fingerprint") != NativeAccountFingerprint()
+                || Text(envelope, "account_fingerprint") != expectedNativeAccountFingerprint
+                || Text(envelope, "provider_identity_hash") != NativeProviderIdentityHash()
+                || Text(envelope, "connection_identity_hash") != NativeConnectionIdentityHash()
+                || Text(envelope, "native_instrument") != "MNQ SEP26" || Text(envelope, "canonical_contract") != "MNQU6"
+                || Integer(envelope, "quantity") != 1)
+            { reason = "DENY_LIVE_AUTHORIZATION_ACCOUNT_OR_CONTRACT"; return false; }
+            if (Text(envelope, "action") != Text(command, "action") || Text(envelope, "command_id") != Text(command, "command_id")
+                || Text(envelope, "request_id") != Text(command, "request_id") || Text(envelope, "addon_provenance") != SourceFingerprint
+                || !Hash(Text(envelope, "beelzebub_build_identity")))
+            { reason = "DENY_LIVE_AUTHORIZATION_COMMAND"; return false; }
+            DateTime issued; DateTime expires;
+            if (!DateTime.TryParse(Text(envelope, "issued_at"), CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal, out issued)
+                || !DateTime.TryParse(Text(envelope, "expires_at"), CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal, out expires)
+                || DateTime.UtcNow < issued.ToUniversalTime() || DateTime.UtcNow >= expires.ToUniversalTime()
+                || expires.ToUniversalTime() - issued.ToUniversalTime() > TimeSpan.FromSeconds(60))
+            { reason = "DENY_LIVE_AUTHORIZATION_EXPIRED"; return false; }
+            // Recheck the native facts after validating the envelope and
+            // immediately before one-shot consumption.  This closes the
+            // preflight-to-submit account/order/position race at the final
+            // native boundary.
+            if (!authenticated || !NativeAccountIdentityReady() || CurrentQuantity() != 0 || HasWorkingOrders()
+                || foreignActivity || !protectionAvailable)
+            { reason = "DENY_LIVE_ATOMIC_FACTS_CHANGED"; return false; }
+            lock (stateLock)
+            {
+                if (!consumedLiveAuthorizations.Add(Text(envelope, "authorization_id")))
+                { reason = "DENY_LIVE_AUTHORIZATION_REPLAY"; return false; }
+            }
+            return true;
+        }
+
+        private void RefreshExposureGuard()
+        {
+            if (!bindingLiveCapital || CurrentQuantity() != 0 || OwnedWorkingOrders().Count != 0) return;
+            lock (stateLock) exposureGuardActive = false;
+        }
+
         private int CurrentQuantity() { lock (account.Positions) { Position position = account.Positions.FirstOrDefault(item => item.Instrument != null && item.Instrument.FullName == "MNQ SEP26"); return position == null ? 0 : position.Quantity; } }
         private string CurrentPositionState()
         {

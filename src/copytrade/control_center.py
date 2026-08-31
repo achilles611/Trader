@@ -1548,7 +1548,13 @@ def create_control_center_app(
         must not create a key, capability, ledger, listener, or order path.
         """
         status_path = os.environ.get("BEELZEBUB_L3H_GATEWAY_STATUS_PATH")
-        return fail_closed_status(mechanical_status_path=None if not status_path else Path(status_path))
+        authorization_path = os.environ.get("BEELZEBUB_L3H3_STATUS_PATH")
+        if not authorization_path and status_path:
+            authorization_path = str(Path(status_path).with_name("l3h3-live-authorization-status.json"))
+        return fail_closed_status(
+            mechanical_status_path=None if not status_path else Path(status_path),
+            authorization_status_path=None if not authorization_path else Path(authorization_path),
+        )
 
     async def quiesce_ledger_verifier_for_shutdown() -> dict[str, object]:
         """Release a read-only verifier snapshot before the writer truncates WAL.

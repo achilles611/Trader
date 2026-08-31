@@ -20,18 +20,18 @@ if ($InstallSource) {
     # The runtime reports a source fingerprint whose value is excluded from the
     # fingerprint input itself. This prevents a self-referential hash while
     # preserving repository/installed parity under a controlled substitution.
-    $template = Get-Content -Raw -LiteralPath $source
+    $template = [IO.File]::ReadAllText($source, [Text.UTF8Encoding]::new($false))
     $normalized = [regex]::Replace($template, 'private const string SourceFingerprint = "[^"]+";', 'private const string SourceFingerprint = "SOURCE_FINGERPRINT_PLACEHOLDER";')
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($normalized)
     $fingerprint = ([Security.Cryptography.SHA256]::Create().ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join ''
-    $installed = [regex]::Replace((Get-Content -Raw -LiteralPath $target), 'private const string SourceFingerprint = "[^"]+";', "private const string SourceFingerprint = `"$fingerprint`";")
+    $installed = [regex]::Replace([IO.File]::ReadAllText($target, [Text.UTF8Encoding]::new($false)), 'private const string SourceFingerprint = "[^"]+";', "private const string SourceFingerprint = `"$fingerprint`";")
     [IO.File]::WriteAllText($target, $installed, [Text.UTF8Encoding]::new($false))
 }
 $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash.ToLowerInvariant()
-$sourceNormalized = [regex]::Replace((Get-Content -Raw -LiteralPath $source), 'private const string SourceFingerprint = "[^"]+";', 'private const string SourceFingerprint = "SOURCE_FINGERPRINT_PLACEHOLDER";')
+$sourceNormalized = [regex]::Replace([IO.File]::ReadAllText($source, [Text.UTF8Encoding]::new($false)), 'private const string SourceFingerprint = "[^"]+";', 'private const string SourceFingerprint = "SOURCE_FINGERPRINT_PLACEHOLDER";')
 $sourceFingerprint = (([Security.Cryptography.SHA256]::Create().ComputeHash([Text.UTF8Encoding]::new($false).GetBytes($sourceNormalized)) | ForEach-Object { $_.ToString("x2") }) -join '')
 $installedHash = if (Test-Path -LiteralPath $target) { (Get-FileHash -Algorithm SHA256 -LiteralPath $target).Hash.ToLowerInvariant() } else { $null }
-$installedNormalized = if (Test-Path -LiteralPath $target) { [regex]::Replace((Get-Content -Raw -LiteralPath $target), 'private const string SourceFingerprint = "[^"]+";', 'private const string SourceFingerprint = "SOURCE_FINGERPRINT_PLACEHOLDER";') } else { $null }
+$installedNormalized = if (Test-Path -LiteralPath $target) { [regex]::Replace([IO.File]::ReadAllText($target, [Text.UTF8Encoding]::new($false)), 'private const string SourceFingerprint = "[^"]+";', 'private const string SourceFingerprint = "SOURCE_FINGERPRINT_PLACEHOLDER";') } else { $null }
 $installedFingerprint = if ($installedNormalized) { (([Security.Cryptography.SHA256]::Create().ComputeHash([Text.UTF8Encoding]::new($false).GetBytes($installedNormalized)) | ForEach-Object { $_.ToString("x2") }) -join '') } else { $null }
 [pscustomobject]@{
     source = $source; source_sha256 = $sourceHash; source_fingerprint = $sourceFingerprint; installed_source = $target; installed_sha256 = $installedHash

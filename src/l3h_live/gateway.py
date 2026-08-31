@@ -19,6 +19,7 @@ from typing import Any, Mapping
 from uuid import uuid4
 
 from .contracts import canonical_hash, canonical_json, parse_utc, utc_now
+from .live_authorization import LIVE_ACCOUNT_CLASS, verify_native_admission_envelope
 
 
 WIRE_SCHEMA = "lane-iii-phase-h-live-execution-v1"
@@ -159,6 +160,7 @@ class AuthenticatedLoopbackGateway(LiveGateway):
     def __init__(
         self, key: bytes, *, expected_addon_fingerprint: str, expected_capability_hash: str,
         port: int = LOOPBACK_PORT, timeout_seconds: float = 3.0,
+        authorization_session_id: str | None = None,
     ) -> None:
         if not isinstance(key, bytes) or len(key) < 32:
             raise ValueError("L3H gateway key must contain at least 256 bits.")
@@ -169,6 +171,10 @@ class AuthenticatedLoopbackGateway(LiveGateway):
         self.expected_capability_hash = expected_capability_hash
         self.port = port
         self.timeout_seconds = timeout_seconds
+        self.authorization_session_id = authorization_session_id or "l3h3-auth-session-" + uuid4().hex
+        if not self.authorization_session_id.startswith("l3h3-auth-session-"):
+            raise ValueError("L3H gateway authorization session is invalid.")
+        self.gateway_session_id = "l3h3-gateway-session-" + uuid4().hex
         self._listener: socket.socket | None = None
         self._connection: socket.socket | None = None
         self._thread: threading.Thread | None = None
@@ -183,6 +189,7 @@ class AuthenticatedLoopbackGateway(LiveGateway):
         self._reconciliations: list[Mapping[str, object]] = []
         self._session_id: str | None = None
         self._last_error: str | None = None
+        self._live_send_count = 0
 
     @property
     def status(self) -> Mapping[str, object]:
@@ -190,8 +197,18 @@ class AuthenticatedLoopbackGateway(LiveGateway):
             "state": "AUTHENTICATED" if self._connected.is_set() else "DISCONNECTED",
             "port": self.port, "loopback_only": True, "protocol_version": PROTOCOL_VERSION,
             "authenticated_addon": self._connected.is_set(), "session_id": self._session_id,
-            "last_error": self._last_error,
+            "authorization_session_id_hash": canonical_hash(self.authorization_session_id),
+            "gateway_session_id_hash": canonical_hash(self.gateway_session_id),
+            "live_send_count": self._live_send_count, "last_error": self._last_error,
         }
+
+    @property
+    def addon_session_id(self) -> str | None:
+        return self._session_id
+
+    @property
+    def live_send_count(self) -> int:
+        return self._live_send_count
 
     def start(self) -> None:
         if self._listener is not None:
@@ -225,6 +242,7 @@ class AuthenticatedLoopbackGateway(LiveGateway):
         request_id = command.get("request_id")
         if not isinstance(command_id, str) or not command_id.startswith("l3h-cmd-") or not isinstance(request_id, str):
             raise GatewayDispatchError("COMMAND_IDENTITY_INVALID")
+        live_entry = self._validate_entry_authority(command)
         with self._response_lock:
             prior = self._command_responses.get(command_id)
             if prior is not None:
@@ -235,6 +253,8 @@ class AuthenticatedLoopbackGateway(LiveGateway):
             "message_type": "COMMAND", "request_id": request_id, "nonce": "l3h-gw-" + uuid4().hex,
             "timestamp": utc_now(), "payload": dict(command),
         }, self._key)
+        if live_entry:
+            self._live_send_count += 1
         self._send(frame)
         with self._response_lock:
             if not self._response_lock.wait_for(lambda: request_id in self._responses, timeout=self.timeout_seconds):
@@ -362,8 +382,34 @@ class AuthenticatedLoopbackGateway(LiveGateway):
         self._connected.set()
         self._send(sign_frame({
             "message_type": "GATEWAY_HELLO", "request_id": frame.request_id, "nonce": "l3h-gw-" + uuid4().hex,
-            "timestamp": utc_now(), "payload": {"addon_session_id": session_id, "protocol_version": PROTOCOL_VERSION},
+            "timestamp": utc_now(), "payload": {
+                "addon_session_id": session_id, "protocol_version": PROTOCOL_VERSION,
+                "authorization_session_id": self.authorization_session_id,
+                "gateway_session_id": self.gateway_session_id,
+            },
         }, self._key))
+
+    def _validate_entry_authority(self, command: Mapping[str, object]) -> bool:
+        """A bare signed gateway frame is never enough for a live entry."""
+
+        action = command.get("action")
+        if action not in {"ENTER_LONG", "ENTER_SHORT"}:
+            return False
+        if command.get("account_class") == "LOCAL_SIMULATION" and command.get("live_capital") is False:
+            return False
+        if command.get("account_class") != LIVE_ACCOUNT_CLASS or command.get("live_capital") is not True:
+            raise GatewayDispatchError("LIVE_AUTHORIZATION_REQUIRED")
+        envelope = command.get("live_authorization")
+        if not isinstance(envelope, Mapping) or self._session_id is None:
+            raise GatewayDispatchError("LIVE_AUTHORIZATION_REQUIRED")
+        try:
+            verify_native_admission_envelope(
+                envelope, self._key, authorization_session_id=self.authorization_session_id,
+                addon_session_id=self._session_id, gateway_session_id=self.gateway_session_id, command=command,
+            )
+        except ValueError as error:
+            raise GatewayDispatchError(str(error)) from error
+        return True
 
     def _send(self, frame: Mapping[str, object]) -> None:
         encoded = canonical_json(frame) + b"\n"

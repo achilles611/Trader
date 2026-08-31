@@ -295,18 +295,34 @@ function LaneIIILivePage() {
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     let active = true;
-    api<Record<string, any>>("/api/lane-iii/live").then((value) => { if (active) setStatus(value); }).catch((failure) => { if (active) setError(failure instanceof Error ? failure.message : "Lane III live status is unavailable."); });
-    return () => { active = false; };
+    const load = () => api<Record<string, any>>("/api/lane-iii/live").then((value) => {
+      if (active) { setStatus(value); setError(null); }
+    }).catch((failure) => {
+      if (active) {
+        setError(failure instanceof Error ? failure.message : "Lane III live status is unavailable.");
+        setStatus({ terminal_status: "BLOCKED_STATUS_UNAVAILABLE", state: "BLOCKED", mechanical_commissioning: "UNVERIFIED", live_account_identity: "UNVERIFIED", authorization_boundary: "UNVERIFIED", live_authority: "DISARMED", live_canary: "NOT_RUN", live_capital: "DENIED", contract: "MNQ SEP26", maximum_quantity: 1, quarantine: true, locked: true, components: {} });
+      }
+    });
+    void load(); const timer = window.setInterval(() => void load(), 2000);
+    return () => { active = false; window.clearInterval(timer); };
   }, []);
   const start = status?.one_control_start || {};
   const emergency = status?.emergency_control || {};
   const components = status?.components || {};
+  const exactLiveIdentity = status?.account_class === "LIVE_CAPITAL" && status?.live_account_identity === "VERIFIED";
+  const displayedLiveIdentity = exactLiveIdentity ? "VERIFIED" : "UNVERIFIED";
+  const expiryMilliseconds = typeof status?.authorization_expires_at === "string" ? Date.parse(status.authorization_expires_at) : Number.NaN;
+  const authorizationFresh = Number.isFinite(expiryMilliseconds) && expiryMilliseconds > Date.now();
+  const displayedLiveAuthority = exactLiveIdentity && !status?.quarantine && !status?.locked
+    && status?.live_authority === "ONE_SHOT_AUTHORIZED" && authorizationFresh ? "ONE_SHOT_AUTHORIZED" : "DISARMED";
+  const displayedAuthorizationExpiry = status?.authorization_expires_at == null
+    ? "NONE" : authorizationFresh ? status.authorization_expires_at : "EXPIRED";
   const gateValues = Object.entries(components).map(([name, value]: [string, any]) => [name, `${value?.state || "RED"} — ${value?.reason || "UNKNOWN"}`] as [string, string]);
   return <div className="page-grid">
-    <section className="panel span-12"><PanelTitle title="Lane III live-capital canary" subtitle="Isolated from the paper runtime. Live capital remains denied until a local signed capability and every fresh broker/risk/evidence gate pass." />{error && <p className="error">{error}</p>}<p className="empty-note">These states are observational. A browser cannot grant authority, create a capability, or arm NinjaTrader.</p></section>
-    <section className="panel span-6"><MetricList values={[["Terminal status", status?.terminal_status || "LOADING"], ["Runtime", status?.state || "—"], ["Account class", status?.account_class || "UNKNOWN"], ["Capital mode", status?.live_capital || "DENIED"], ["Contract", status?.contract || "MNQ SEP26"], ["Maximum quantity", status?.maximum_quantity ?? 1], ["Canary limit", status?.canary_limit ?? 1]]} /></section>
-    <section className="panel span-6"><PanelTitle title="One-control activation" subtitle={start.reason || "Live preflight required."} /><button className="button positive" disabled={!start.enabled}>{start.label || "START LIVE — 1 MNQ CANARY"}</button><p className="muted">Activation remains disabled until installed Sim101 commissioning, native protection, reconciliation, and all three kill paths have passed.</p><PanelTitle title="Emergency control" subtitle={emergency.reason || "Unavailable"} /><button className="button danger" disabled={!emergency.enabled}>{emergency.label || "FLATTEN MNQ & DISARM"}</button></section>
-    <section className="panel span-12"><PanelTitle title="Mechanical live gates" subtitle="Each component is red, yellow, or green with its current concrete reason; generic READY is never inferred." /><MetricList values={gateValues} /></section>
+    <section className="panel span-12"><PanelTitle title="Lane III live-capital authorization" subtitle="Mechanical execution and live-capital authority are separate. Viewing a live chart or this status is observational only." />{error && <p className="error">{error}</p>}<p className="empty-note">These states are observational. A browser cannot grant authority, create a capability, restore authority, or arm NinjaTrader.</p></section>
+    <section className="panel span-6"><PanelTitle title="Authorization boundary" /><MetricList values={[["Terminal status", status?.terminal_status || "LOADING"], ["Mechanical", status?.mechanical_commissioning || "UNVERIFIED"], ["Live account", displayedLiveIdentity], ["Authorization boundary", status?.authorization_boundary || "UNVERIFIED"], ["Live authority", displayedLiveAuthority], ["Live canary", status?.live_canary || "NOT_RUN"], ["Account", exactLiveIdentity ? (status?.authorized_account || "NONE") : "NONE"], ["Account class", status?.account_class || "UNKNOWN"], ["Contract", status?.contract || "MNQ SEP26"], ["Maximum quantity", status?.maximum_quantity ?? 1], ["Preflight age", status?.preflight_age_seconds == null ? "NONE" : `${status.preflight_age_seconds}s`], ["Authorization expiry", displayedAuthorizationExpiry]]} /></section>
+    <section className="panel span-6"><PanelTitle title="Independent safety truth" /><MetricList values={[["Gateway", status?.gateway || "DISCONNECTED"], ["AddOn provenance", status?.addon_provenance || "UNVERIFIED"], ["Reconciliation", status?.reconciliation || "UNVERIFIED"], ["Protection", status?.protection || "UNVERIFIED"], ["Kill paths", status?.kill_paths || "UNVERIFIED"], ["Quarantine", status?.quarantine ? "ACTIVE" : "CLEAR"], ["Lock", status?.locked ? "ACTIVE" : "CLEAR"], ["Live send count", status?.live_send_count ?? 0]]} /><PanelTitle title="Future canary control" subtitle={start.reason || "A separate operator ceremony is required."} /><button className="button positive" disabled>{start.label || "START LIVE — 1 MNQ CANARY"}</button><p className="muted">L3H.3 never enables this browser control. A future build must bind an exact local human ceremony to one server-side capability.</p><PanelTitle title="Emergency control" subtitle={emergency.reason || "Use an independently commissioned kill path."} /><button className="button danger" disabled>{emergency.label || "FLATTEN MNQ & DISARM"}</button></section>
+    <section className="panel span-12"><PanelTitle title="Mechanical and authorization gates" subtitle="Quarantine, lock, unknown state, or API failure dominates every green mechanical state." /><MetricList values={gateValues} /></section>
   </div>;
 }
 
