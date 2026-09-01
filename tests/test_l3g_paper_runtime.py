@@ -98,6 +98,32 @@ class PaperRuntimeTests(unittest.TestCase):
             message["safety_settlement_sequence"] = safety_settlement_sequence
         return message
 
+    def test_accepted_deferred_receipt_does_not_treat_its_own_enqueue_as_capacity_failure(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            runtime = LaneIIIPaperRuntime(ledger)
+            receipt = {
+                "schema": "l3g-ledger-writer-capacity-v1",
+                "state": "HEALTHY",
+                "admission_open": True,
+                "capacity_fault_latched": False,
+                "wal_capacity_fault_latched": False,
+                "negative_headroom_sustained": False,
+                "writer_error": None,
+                "queue_growth_records_per_second": 1.0,
+            }
+            try:
+                with patch.object(ledger, "append_deferred", return_value=receipt):
+                    accepted = runtime._append_deferred_or_pause_locked(
+                        "OBSERVATION_ENVELOPE", {"observation_type": "QUOTE"},
+                    )
+                self.assertTrue(accepted)
+                self.assertIsNone(runtime.status()["lockout_or_fault_reason"])
+                self.assertFalse(runtime._deferred_capacity_healthy_locked(receipt))
+            finally:
+                runtime.stop()
+                ledger.close()
+
     def test_restart_reconciliation_returns_ready_disarmed_and_never_auto_arms(self) -> None:
         with TemporaryDirectory() as directory:
             ledger = PaperLedger(Path(directory) / "paper.sqlite3")

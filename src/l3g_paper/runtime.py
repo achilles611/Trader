@@ -527,7 +527,7 @@ class LaneIIIPaperRuntime:
             except LedgerCapacityError as error:
                 self._pause_for_ledger_capacity_locked(error.capacity)
             else:
-                if not self._deferred_capacity_healthy_locked(receipt):
+                if not self._deferred_admission_receipt_healthy_locked(receipt):
                     self._pause_for_ledger_capacity_locked(receipt)
 
     def _observe_commissioning_warmup(self, at: str) -> None:
@@ -588,7 +588,7 @@ class LaneIIIPaperRuntime:
         except LedgerCapacityError as error:
             self._pause_for_ledger_capacity_locked(error.capacity)
         else:
-            if not self._deferred_capacity_healthy_locked(receipt):
+            if not self._deferred_admission_receipt_healthy_locked(receipt):
                 self._pause_for_ledger_capacity_locked(receipt)
 
     def _release_commissioning_ownership(self, reason: str) -> None:
@@ -1115,6 +1115,27 @@ class LaneIIIPaperRuntime:
     def _deferred_capacity_healthy_locked(self, receipt: Mapping[str, object]) -> bool:
         return deferred_capacity_allows_authority(receipt)
 
+    @staticmethod
+    def _deferred_admission_receipt_healthy_locked(receipt: Mapping[str, object]) -> bool:
+        """Accept a record the writer admitted without treating that enqueue as growth.
+
+        ``append_deferred`` returns its capacity snapshot immediately after it
+        enqueues the accepted record.  That snapshot may transiently report a
+        positive queue-growth rate solely because of the successful admission.
+        Authority gates still use ``deferred_capacity_allows_authority`` and
+        require a later non-growing snapshot; this receipt check only proves
+        that the writer accepted the no-authority record without a latch or
+        writer failure.
+        """
+        return (
+            receipt.get("schema") == "l3g-ledger-writer-capacity-v1"
+            and receipt.get("state") == "HEALTHY"
+            and receipt.get("admission_open") is True
+            and receipt.get("capacity_fault_latched") is False
+            and receipt.get("wal_capacity_fault_latched") is False
+            and receipt.get("writer_error") is None
+        )
+
     def _append_deferred_or_pause_locked(
         self,
         kind: str,
@@ -1132,7 +1153,7 @@ class LaneIIIPaperRuntime:
         except LedgerCapacityError as error:
             self._pause_for_ledger_capacity_locked(error.capacity)
             return False
-        if not self._deferred_capacity_healthy_locked(receipt):
+        if not self._deferred_admission_receipt_healthy_locked(receipt):
             self._pause_for_ledger_capacity_locked(receipt)
             return False
         return True
