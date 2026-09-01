@@ -2096,6 +2096,33 @@ class PaperLedger:
                         raise RuntimeError("SQLite passive checkpoint returned no status row.")
                     busy, log_frames, checkpointed_frames = (int(row[index]) for index in range(3))
                     uncheckpointed_frames = max(0, log_frames - checkpointed_frames)
+                    reuse: dict[str, object] | None = None
+                    if busy == 0 and uncheckpointed_frames == 0:
+                        # A continuously active writer can append between the
+                        # PASSIVE copy's snapshot and its completion, preventing
+                        # SQLite from resetting the retained WAL allocation even
+                        # though every reported frame was copied.  Hold the
+                        # existing database lock only for a non-waiting RESTART
+                        # fence after the bulk copy.  busy_timeout=0 keeps an
+                        # external reader from turning this into an ingest stall;
+                        # a busy result remains visible and the physical 1 GiB
+                        # backstop still fails closed if reuse cannot be proven.
+                        reuse_started = time.perf_counter()
+                        with self._lock:
+                            reuse_row = connection.execute("PRAGMA wal_checkpoint(RESTART)").fetchone()
+                        if reuse_row is None:
+                            raise RuntimeError("SQLite WAL reuse checkpoint returned no status row.")
+                        reuse_busy, reuse_log, reuse_checkpointed = (
+                            int(reuse_row[index]) for index in range(3)
+                        )
+                        reuse = {
+                            "mode": "RESTART",
+                            "busy": reuse_busy,
+                            "log_frames": reuse_log,
+                            "checkpointed_frames": reuse_checkpointed,
+                            "complete": reuse_busy == 0 and reuse_log == reuse_checkpointed,
+                            "duration_seconds": round(time.perf_counter() - reuse_started, 6),
+                        }
                     result = {
                         "mode": "PASSIVE",
                         "busy": busy,
@@ -2105,6 +2132,7 @@ class PaperLedger:
                         "uncheckpointed_bytes": uncheckpointed_frames * page_size,
                         "duration_seconds": round(time.perf_counter() - started, 6),
                         "complete": busy == 0 and log_frames == checkpointed_frames,
+                        "reuse_checkpoint": reuse,
                     }
                 except BaseException as exc:  # keep data admission separate from maintenance telemetry
                     error = f"{type(exc).__name__}: {exc}"

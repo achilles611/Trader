@@ -507,6 +507,11 @@ class LedgerThroughputRecoveryTests(unittest.TestCase):
                 self.assertIsInstance(checkpoint, Mapping)
                 self.assertEqual(checkpoint["mode"], "PASSIVE")  # type: ignore[index]
                 self.assertIn("uncheckpointed_bytes", checkpoint)  # type: ignore[arg-type]
+                reuse = checkpoint["reuse_checkpoint"]  # type: ignore[index]
+                self.assertIsInstance(reuse, Mapping)
+                self.assertEqual(reuse["mode"], "RESTART")
+                self.assertTrue(reuse["complete"], reuse)
+                self.assertEqual(reuse["busy"], 0)
 
                 # A retained physical WAL allocation after a complete
                 # PASSIVE copy remains safe. The 1 GiB disk-growth backstop
