@@ -26,7 +26,10 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
     || ["STARTING", "PAPER_RUNNING", "ENTRY_PENDING", "OPEN_POSITION", "EXIT_PENDING", "PAUSED", "RECONCILING", "FAULTED", "LOCKED_OUT"].includes(runtimeState);
   // Keep the stop control available if the concise status cannot be refreshed
   // but the last canonical runtime snapshot could still represent authority.
-  const stopAvailable = active || runtimeMayBeActive || status === null;
+  // Any non-green presentation is safety-ambiguous from the operator's point
+  // of view. Keep the idempotent stop path visible rather than making them
+  // infer whether a red or yellow transition still owns paper authority.
+  const stopAvailable = active || runtimeMayBeActive || status === null || light !== "GREEN";
   const verification = status?.ledger_verification || {};
   const pnl = status?.pnl || { state: "MISSING" };
   const verificationRunning = verification.state === "IN_PROGRESS" || paper.verificationInFlight;

@@ -35,9 +35,9 @@ that backend session. The latest successful ledger proof must be a **Full**
 verification (including its structural quick check); an inherited incremental
 proof is intentionally insufficient for a new Slim paper session.
 
-**STOP TRADING** is always shown whenever the canonical or last-known runtime
-might still have paper authority, including red/yellow and unavailable Slim
-status. It invokes the idempotent guarded flatten-and-disarm path, cancels
+**STOP TRADING** is always shown for every red, yellow, active, or unavailable
+Slim status, so a safety-ambiguous presentation never hides the paper stop
+path. It invokes the idempotent guarded flatten-and-disarm path, cancels
 owned pending entries, flattens an open position when required, and releases
 the operational session only after a clean Sim101 reconciliation proves flat
 with no owned orders. The next start requires a fresh verifier proof. Neither

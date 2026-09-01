@@ -688,7 +688,7 @@ describe("copy control center", () => {
     fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
     fireEvent.click(await screen.findByRole("button", { name: "Start Paper Trading" }));
     expect(await screen.findByRole("img", { name: "Readiness: RED" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Start Paper Trading" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "STOP TRADING" })).toBeEnabled();
   });
 
   it("fails closed in red or yellow Slim states, protects duplicate verification, and never renders stale P&L as zero", async () => {
@@ -701,7 +701,7 @@ describe("copy control center", () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
     expect(await screen.findByRole("img", { name: "Readiness: YELLOW" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Start Paper Trading" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "STOP TRADING" })).toBeEnabled();
     expect(screen.getByText("STALE")).toBeInTheDocument();
     expect(screen.queryByText("$0.00")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Ledger Verification" })).toBeDisabled();
