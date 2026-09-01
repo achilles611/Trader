@@ -28,6 +28,14 @@ let laneIIIPaperOverrides: Record<string, unknown> = {};
 let laneIIILedgerOverrides: Record<string, unknown> = {};
 let commissioningRehearsalResponse: Record<string, unknown> | null = null;
 let commissioningRehearsalSideEffect: (() => void) | null = null;
+let commissioningStartResponse: Record<string, unknown> | null = null;
+let commissioningStartSideEffect: (() => void) | null = null;
+let slimStatusResponse: Record<string, unknown> = {
+  generated_at: new Date().toISOString(), light: "RED", label: "NOT READY",
+  message: "Paper runtime status is unavailable.", can_start: false, paper_active: false,
+  ledger_verification: { state: "UNAVAILABLE", message: "Verification status is unavailable." },
+  pnl: { state: "MISSING", total: null, realized: null, unrealized: null },
+};
 let accountBalancesResponse: Record<string, unknown> = {
   accounts: {
     Sim101: { cash_value: 100123.45, cash_value_observed_at: "2026-08-29T15:00:00Z" },
@@ -62,9 +70,14 @@ function payload(path: string) {
   if (path.startsWith("/api/lane-iii/paper/ledger-verification/schedule")) return ledgerVerificationSchedule;
   if (path.startsWith("/api/lane-iii/paper/ledger-verification/cancel")) return { ...ledgerVerificationResponse, cancellation_requested: true };
   if (path.startsWith("/api/lane-iii/paper/ledger-verification")) return ledgerVerificationResponse;
+  if (path.startsWith("/api/lane-iii/paper/slim-status")) return slimStatusResponse;
   if (path.startsWith("/api/lane-iii/paper/commissioning-rehearsal")) {
     commissioningRehearsalSideEffect?.();
     return commissioningRehearsalResponse || { result: "BLOCKED", blocking_reasons: ["FIXTURE_BLOCKED"] };
+  }
+  if (path.startsWith("/api/lane-iii/paper/commissioning-start")) {
+    commissioningStartSideEffect?.();
+    return commissioningStartResponse || { submitted: false, state: "READY_DISARMED" };
   }
   if (path.startsWith("/api/lane-iii/paper")) return {
     state: "READY_DISARMED",
@@ -169,6 +182,14 @@ beforeEach(() => {
   laneIIILedgerOverrides = {};
   commissioningRehearsalResponse = null;
   commissioningRehearsalSideEffect = null;
+  commissioningStartResponse = null;
+  commissioningStartSideEffect = null;
+  slimStatusResponse = {
+    generated_at: new Date().toISOString(), light: "RED", label: "NOT READY",
+    message: "Paper runtime status is unavailable.", can_start: false, paper_active: false,
+    ledger_verification: { state: "UNAVAILABLE", message: "Verification status is unavailable." },
+    pnl: { state: "MISSING", total: null, realized: null, unrealized: null },
+  };
   accountBalancesResponse = {
     accounts: {
       Sim101: { cash_value: 100123.45, cash_value_observed_at: "2026-08-29T15:00:00Z" },
@@ -618,5 +639,116 @@ describe("copy control center", () => {
       WebSocketStub.instances[0].onmessage?.({ data: JSON.stringify({ type: "position_update", data: { items: [{ sleeve_id: "sleeve-1", target_wallet: candidate.wallet, symbol: "BTC", direction: "long", quantity: 1, entry_price: 100, current_mark: 101, allocated_capital: 10, remaining_capital: 10, allocation_bucket: "10%", unrealized_pnl: 1, realized_pnl: 0, fees: 0, opened_at: "2026-01-01T00:00:00Z", mark_fresh: true }] } }) } as MessageEvent);
     });
     expect(await screen.findByText("10%")).toBeInTheDocument();
+  });
+
+  it("renders the compact green Slim Mode with all three lights and the guarded paper-start path", async () => {
+    slimStatusResponse = {
+      generated_at: new Date().toISOString(), light: "GREEN", label: "READY TO START PAPER TRADING",
+      message: "All canonical paper-start gates are currently satisfied.", can_start: true, paper_active: false,
+      ledger_verification: { state: "PASS", completed_at: "2026-09-01T14:00:00Z", message: "Verified" },
+      pnl: { state: "CURRENT", total: "10.25", realized: "12.50", unrealized: "-2.25" },
+    };
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+    expect(await screen.findByRole("img", { name: "Readiness: GREEN" })).toBeInTheDocument();
+    expect(document.querySelectorAll(".slim-light")).toHaveLength(3);
+    const start = screen.getByRole("button", { name: "Start Paper Trading" });
+    expect(start).toBeEnabled();
+    fireEvent.click(start);
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/lane-iii/paper/commissioning-start", expect.objectContaining({ method: "POST" })));
+    expect(screen.getByText("$10.25")).toBeInTheDocument();
+  });
+
+  it("fails closed when canonical state changes after Slim rendered green", async () => {
+    slimStatusResponse = {
+      generated_at: new Date().toISOString(), light: "GREEN", label: "READY TO START PAPER TRADING",
+      message: "All canonical paper-start gates are currently satisfied.", can_start: true, paper_active: false,
+      ledger_verification: { state: "PASS", completed_at: "2026-09-01T14:00:00Z", message: "Verified" },
+      pnl: { state: "CURRENT", total: "1", realized: "1", unrealized: "0" },
+    };
+    commissioningStartResponse = { submitted: false, armed: false, state: "READY_DISARMED", reason_codes: ["COMMISSIONING_READINESS_SNAPSHOT_STALE"] };
+    commissioningStartSideEffect = () => {
+      slimStatusResponse = {
+        generated_at: new Date().toISOString(), light: "RED", label: "NOT READY",
+        message: "Runtime changed during the last readiness check.", can_start: false, paper_active: false,
+        ledger_verification: { state: "PASS", completed_at: "2026-09-01T14:00:00Z", message: "Verified" },
+        pnl: { state: "CURRENT", total: "1", realized: "1", unrealized: "0" },
+      };
+    };
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start Paper Trading" }));
+    expect(await screen.findByRole("img", { name: "Readiness: RED" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start Paper Trading" })).toBeDisabled();
+  });
+
+  it("fails closed in red or yellow Slim states, protects duplicate verification, and never renders stale P&L as zero", async () => {
+    slimStatusResponse = {
+      generated_at: new Date().toISOString(), light: "YELLOW", label: "PREPARING",
+      message: "Ledger verification is still running.", can_start: false, paper_active: false,
+      ledger_verification: { state: "IN_PROGRESS", message: "Verifying…" },
+      pnl: { state: "STALE", total: null, realized: null, unrealized: null },
+    };
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+    expect(await screen.findByRole("img", { name: "Readiness: YELLOW" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start Paper Trading" })).toBeDisabled();
+    expect(screen.getByText("STALE")).toBeInTheDocument();
+    expect(screen.queryByText("$0.00")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Ledger Verification" })).toBeDisabled();
+  });
+
+  it("uses the same stop-and-disarm command while active and preserves mode preference without changing Full Console", async () => {
+    slimStatusResponse = {
+      generated_at: new Date().toISOString(), light: "GREEN", label: "PAPER TRADING ACTIVE",
+      message: "Sim101 paper operation is healthy and protected.", can_start: false, paper_active: true,
+      ledger_verification: { state: "PASS", completed_at: "2026-09-01T14:00:00Z", message: "Verified" },
+      pnl: { state: "CURRENT", total: "5", realized: "4", unrealized: "1" },
+    };
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+    const stop = await screen.findByRole("button", { name: "Stop & Disarm" });
+    fireEvent.click(stop);
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/lane-iii/paper/flatten-and-disarm", expect.objectContaining({ method: "POST" })));
+    expect(localStorage.getItem("beezconsole-console-mode")).toBe("slim");
+    fireEvent.click(screen.getByRole("button", { name: "Full Console" }));
+    expect(await screen.findByRole("button", { name: "Lane III Paper" })).toBeInTheDocument();
+    expect(localStorage.getItem("beezconsole-console-mode")).toBe("full");
+  });
+
+  it("falls back to Full Console for an invalid saved mode preference", async () => {
+    localStorage.setItem("beezconsole-console-mode", "unsupported-mode");
+    render(<App />);
+    expect(await screen.findByRole("button", { name: "Lane III Paper" })).toBeInTheDocument();
+  });
+
+  it("keeps a requested Slim preference across refresh and coalesces duplicate verification clicks", async () => {
+    slimStatusResponse = {
+      generated_at: new Date().toISOString(), light: "RED", label: "NOT READY",
+      message: "Run a current ledger verification.", can_start: false, paper_active: false,
+      ledger_verification: { state: "UNVERIFIED", message: "Verification required" },
+      pnl: { state: "MISSING", total: null, realized: null, unrealized: null },
+    };
+    let resolveVerification: (response: Response) => void = () => { throw new Error("Verification promise was not created."); };
+    const deferredFetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).startsWith("/api/lane-iii/paper/ledger-verification") && init?.method === "POST") {
+        return new Promise<Response>((resolve) => { resolveVerification = resolve; });
+      }
+      return Promise.resolve(new Response(JSON.stringify(payload(String(input))), { status: 200, headers: { "Content-Type": "application/json" } }));
+    });
+    vi.stubGlobal("fetch", deferredFetch);
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+    const verify = await screen.findByRole("button", { name: "Ledger Verification" });
+    fireEvent.click(verify);
+    expect(await screen.findByText("Verifying…")).toBeInTheDocument();
+    expect(verify).toBeDisabled();
+    fireEvent.click(verify);
+    expect(deferredFetch.mock.calls.filter(([path, init]) => String(path).startsWith("/api/lane-iii/paper/ledger-verification") && (init as RequestInit | undefined)?.method === "POST")).toHaveLength(1);
+    resolveVerification(new Response(JSON.stringify({ status: "IN_PROGRESS" }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    await waitFor(() => expect(deferredFetch.mock.calls.filter(([path]) => String(path).startsWith("/api/lane-iii/paper/slim-status"))).not.toHaveLength(0));
+    cleanup();
+    render(<App />);
+    expect(await screen.findByRole("button", { name: "Full Console" })).toBeInTheDocument();
   });
 });

@@ -3113,8 +3113,18 @@ class LaneIIIPaperRuntime:
                 "warning": "EXPERIMENTAL PAPER EXECUTION / NOT SCIENTIFICALLY COMMISSIONED / SIM101 ONLY / LIVE CAPITAL DENIED",
                 "current_position": self._position.value,
                 "current_quantity": self._position_quantity,
+                "current_position_quantity": self._snapshot.current_position_quantity,
+                "broker_snapshot_position": self._snapshot.current_position.value,
+                "broker_snapshot_position_quantity": self._snapshot.current_position_quantity,
                 "working_owned_orders": self._snapshot.working_owned_orders,
+                "working_entry_orders": self._snapshot.working_entry_orders,
                 "protective_stop_state": self._snapshot.protective_stop_state,
+                "position_snapshot_complete": self._snapshot.position_snapshot_complete,
+                "order_snapshot_complete": self._snapshot.order_snapshot_complete,
+                "reconciliation_current": self._snapshot.reconciliation_current,
+                "unresolved_command": self._snapshot.unresolved_command,
+                "unresolved_native_order": self._snapshot.unresolved_native_order,
+                "unresolved_execution": self._snapshot.unresolved_execution,
                 "daily_realized_pnl": str(self._snapshot.daily_realized_pnl),
                 "daily_unrealized_pnl": str(self._snapshot.daily_unrealized_pnl),
                 "session_entries": self._snapshot.session_entry_count,
@@ -3165,6 +3175,13 @@ class LaneIIIPaperRuntime:
                     "bearish": str(self.policy.score(_now(), HypothesisKind.BEARISH_CONTINUATION)[0]),
                 },
                 "session_pnl": str(self._session_pnl.get(context.session_id, Decimal("0"))),
+                "paper_session_pnl": {
+                    # Session realized P&L is retained by canonical session ID;
+                    # the one allowed open position belongs to the current
+                    # session because the runtime hard-flattens on rollover.
+                    "realized": str(self._session_pnl.get(context.session_id, Decimal("0"))),
+                    "unrealized": str(trade_risk.unrealized_pnl),
+                },
                 "asia_session_pnl": str(sum(value for key, value in self._session_pnl.items() if ":ASIA:" in key and key.endswith(context.trade_date))),
                 "new_york_session_pnl": str(sum(value for key, value in self._session_pnl.items() if (":NEW_YORK_RTH:" in key or ":NY_AFTER:" in key) and key.endswith(context.trade_date))),
                 "family_cumulative_pnl": str(trade_risk.realized_pnl + trade_risk.unrealized_pnl),

@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, post } from "./api";
 import type { Candidate, CandidatesResponse, ControlState, Portfolio } from "./types";
+import { SlimConsole } from "./SlimConsole";
+import { usePaperConsoleState, type PaperConsoleState, type PaperConsoleToast } from "./paperConsole";
 import { AutomatedSciencePage, ConfidencePage, DataIgnitionPage, EcosystemPage, ScienceResourcePage } from "./ScienceViews";
 import { SchedulerPage } from "./SchedulerPage";
 
@@ -19,7 +21,7 @@ const bytes = (value: unknown) => {
 };
 const optionalBytes = (value: unknown) => value === null || value === undefined ? "—" : bytes(value);
 
-type Toast = { tone: "error" | "success" | "warning"; message: string } | null;
+type Toast = PaperConsoleToast | null;
 type Confirmation = { title: string; body: string; action: () => Promise<void>; confirm: string } | null;
 type AccountBalances = Record<string, { cash_value?: number | null; cash_value_observed_at?: string | null; net_liquidation?: number | null; net_liquidation_observed_at?: string | null }>;
 const terminalDiscoveryStatuses = new Set(["completed", "completed_with_warnings", "failed", "cancelled"]);
@@ -28,8 +30,23 @@ const accountReading = (balances: AccountBalances | null, alias: string) => bala
 const accountBalanceValue = (account: ReturnType<typeof accountReading>) => account?.cash_value ?? account?.net_liquidation;
 const accountBalanceSubtitle = (account: ReturnType<typeof accountReading>) => account?.cash_value_observed_at ? `NinjaTrader CashValue · ${timeLabel(account.cash_value_observed_at)}` : account?.net_liquidation_observed_at ? `NinjaTrader Net Liquidation · ${timeLabel(account.net_liquidation_observed_at)}` : "Awaiting read-only NinjaTrader account value";
 
+type ConsoleMode = "full" | "slim";
+const CONSOLE_MODE_PREFERENCE = "beezconsole-console-mode";
+
+function initialConsoleMode(): ConsoleMode {
+  const query = new URLSearchParams(window.location.search).get("console");
+  if (query === "slim" || query === "full") return query;
+  try {
+    const stored = window.localStorage.getItem(CONSOLE_MODE_PREFERENCE);
+    return stored === "slim" || stored === "full" ? stored : "full";
+  } catch {
+    return "full";
+  }
+}
+
 export function App() {
   const [page, setPage] = useState<Page>("Overview");
+  const [consoleMode, setConsoleMode] = useState<ConsoleMode>(initialConsoleMode);
   const [overview, setOverview] = useState<Record<string, any> | null>(null);
   const [portfolio, setPortfolio] = useState<Portfolio | null>(null);
   const [accountBalances, setAccountBalances] = useState<AccountBalances | null>(null);
@@ -42,6 +59,16 @@ export function App() {
   const [schedulerRevision, setSchedulerRevision] = useState(0);
   const [toast, setToast] = useState<Toast>(null);
   const [confirmation, setConfirmation] = useState<Confirmation>(null);
+
+  const selectConsoleMode = useCallback((mode: ConsoleMode) => {
+    setConsoleMode(mode);
+    try { window.localStorage.setItem(CONSOLE_MODE_PREFERENCE, mode); } catch { /* preference persistence is optional */ }
+  }, []);
+  const paperConsole = usePaperConsoleState({
+    active: consoleMode === "slim" || page === "Lane III Paper",
+    includeSlim: consoleMode === "slim",
+    notify: (value) => setToast(value),
+  });
 
   const reportError = useCallback((error: unknown) => setToast({ tone: "error", message: error instanceof Error ? error.message : "The action failed. No state change was made." }), []);
   const refresh = useCallback(async () => {
@@ -89,6 +116,8 @@ export function App() {
     } catch (error) { reportError(error); }
   };
 
+  if (consoleMode === "slim") return <SlimConsole paper={paperConsole} onFullConsole={() => selectConsoleMode("full")} />;
+
   return <div className="shell">
     <aside className="sidebar">
       <div className="brand"><span className="brand-mark">B</span><div><strong>BEELZEBUB</strong><small>SCIENTIFIC ALPHA ENGINE</small></div></div>
@@ -100,6 +129,7 @@ export function App() {
       <header className="topbar">
         <div><div className="eyebrow">SCIENTIFIC ALPHA OPERATIONS</div><h1>{page}</h1></div>
         <div className="header-controls">
+          <button className="button minor" onClick={() => selectConsoleMode("slim")}>Slim Console</button>
           <span className={`control-chip ${control?.entries_allowed ? "running" : "paused"}`}>{control?.state || "CONNECTING"}</span>
           {control?.entries_allowed
             ? <button className="button warning" onClick={() => void command("/api/controls/pause-entries", "New PAPER entries are paused. Existing exits remain enabled.")}>Pause Paper Entries</button>
@@ -119,7 +149,7 @@ export function App() {
       {page === "Experiments" && <ScienceResourcePage endpoint="/api/experiments" title="Experiments" subtitle="Historical and forward evidence remain separate, cost-adjusted, and reproducible." columns={["experiment_id", "kind", "state", "hypothesis_id", "dataset_fingerprint", "result"]} />}
       {page === "Confidence Engine" && <ConfidencePage />}
       {page === "Execution + Risk" && <ScienceResourcePage endpoint="/api/decisions" title="Execution + Risk" subtitle="Explainable simulation/shadow decisions after model, edge, and risk gates." columns={["created_at", "symbol", "decision", "payload"]} />}
-      {page === "Lane III Paper" && <LaneIIIPaperPage notify={setToast} confirmation={setConfirmation} />}
+      {page === "Lane III Paper" && <LaneIIIPaperPage paper={paperConsole} confirmation={setConfirmation} />}
       {page === "Lane III Live" && <LaneIIILivePage />}
       {page === "Task Scheduler" && <SchedulerPage revision={schedulerRevision} notify={setToast} confirmation={setConfirmation} />}
       {page === "Watchers + Alerts" && <ScienceResourcePage endpoint="/api/science/health" title="Watchers + Alerts" subtitle="Operational data is unavailable until real watcher evidence is persisted." columns={[]} />}
@@ -326,47 +356,8 @@ function LaneIIILivePage() {
   </div>;
 }
 
-function LaneIIIPaperPage({ notify, confirmation }: { notify: (toast: Toast) => void; confirmation: (value: Confirmation) => void }) {
-  const [status, setStatus] = useState<any>(null); const [schedule, setSchedule] = useState<any>(null); const [rehearsal, setRehearsal] = useState<any>(null); const [commissioningRequestId, setCommissioningRequestId] = useState<string | null>(null); const [error, setError] = useState<string | null>(null); const [busy, setBusy] = useState(false); const [verificationMode, setVerificationMode] = useState("auto");
-  const load = useCallback(async () => {
-    try { const [paper, nextSchedule] = await Promise.all([api<any>("/api/lane-iii/paper"), api<any>("/api/lane-iii/paper/ledger-verification/schedule")]); setStatus(paper); setSchedule(nextSchedule); setError(null); }
-    catch (failure) { setError(failure instanceof Error ? failure.message : "Lane III paper status is unavailable."); }
-  }, []);
-  useEffect(() => { void load(); const timer = window.setInterval(() => void load(), 2000); return () => window.clearInterval(timer); }, [load]);
-  const act = async (path: string, label: string, body?: Record<string, string>) => {
-    if (busy) return; setBusy(true);
-    try { const result = await post<any>(path, body); await load(); notify({ tone: result.armed === false || result.paused === false || result.resumed === false || result.submitted === false ? "warning" : "success", message: `${label}: ${String(result.state || "recorded")}` }); return result; }
-    catch (failure) { notify({ tone: "error", message: failure instanceof Error ? failure.message : `${label} failed.` }); }
-    finally { setBusy(false); }
-  };
-  const runRehearsal = async () => {
-    const result = await act("/api/lane-iii/paper/commissioning-rehearsal", "Commissioning Rehearsal");
-    if (result) setRehearsal(result);
-  };
-  const startCommissioning = async () => {
-    const requestId = commissioningRequestId || `l3g-ui-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    setCommissioningRequestId(requestId);
-    const result = await act("/api/lane-iii/paper/commissioning-start", "Atomic Commissioning Start", { request_id: requestId });
-    if (result?.submitted || result?.idempotent_replay) setCommissioningRequestId(null);
-  };
-  const startVerification = async () => {
-    if (busy) return; setBusy(true);
-    try { const result = await post<any>("/api/lane-iii/paper/ledger-verification", { mode: verificationMode }); await load(); notify({ tone: "success", message: result.status === "IN_PROGRESS" ? "Local ledger verification is running." : `Ledger verification: ${result.status}.` }); }
-    catch (failure) { notify({ tone: "error", message: failure instanceof Error ? failure.message : "Ledger verification could not start." }); }
-    finally { setBusy(false); }
-  };
-  const cancelVerification = async () => {
-    if (busy) return; setBusy(true);
-    try { await post<any>("/api/lane-iii/paper/ledger-verification/cancel"); await load(); notify({ tone: "warning", message: "Local ledger verification cancellation requested." }); }
-    catch (failure) { notify({ tone: "error", message: failure instanceof Error ? failure.message : "Ledger verification could not be cancelled." }); }
-    finally { setBusy(false); }
-  };
-  const saveSchedule = async () => {
-    if (busy || !schedule) return; setBusy(true);
-    try { const saved = await post<any>("/api/lane-iii/paper/ledger-verification/schedule", schedule); setSchedule(saved); notify({ tone: "success", message: saved.enabled ? "Local ledger verification schedule saved." : "Local ledger verification schedule disabled." }); }
-    catch (failure) { notify({ tone: "error", message: failure instanceof Error ? failure.message : "Ledger verification schedule could not be saved." }); }
-    finally { setBusy(false); }
-  };
+function LaneIIIPaperPage({ paper, confirmation }: { paper: PaperConsoleState; confirmation: (value: Confirmation) => void }) {
+  const { status, schedule, rehearsal, error, busy, verificationMode, setVerificationMode, act, runRehearsal, startCommissioning, startVerification, cancelVerification, saveSchedule, setSchedule } = paper;
   const policy = status?.policy || {}; const transport = status?.transport || {}; const lastDecision = status?.last_paper_decision || {}; const commissioning = status?.commissioning_lifecycle || {}; const warmup = status?.commissioning_warmup || {}; const freshness = status?.market_freshness || {}; const observerState = status?.market_observer?.market_observer_state || "NOT_ACTIVE"; const accountBalances = (status?.account_balances || {}) as AccountBalances; const sim101Balance = accountReading(accountBalances, "Sim101"); const lucidFlexBalance = accountReading(accountBalances, "Lucid25kflex01"); const ledger = status?.ledger || {}; const verification = status?.ledger_verification || {}; const postRun = status?.commissioning_post_run_verification || {}; const scheduleDraft = schedule?.frequency ? schedule : { enabled: false, frequency: "DISABLED", local_time: "03:00", weekday: 0, mode: "auto" };
   const rehearsalLedger = rehearsal?.ledger || {};
   const diagnosticSources = [

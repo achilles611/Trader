@@ -33,6 +33,7 @@ from src.l3g_paper.ledger import PaperLedger, resolve_ledger_epoch
 from src.l3g_paper.ninjatrader_login import NinjaTraderLoginBootstrap, NinjaTraderLoginState
 from src.l3g_paper.ninjatrader_transport import PaperExecutionTransport
 from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout
+from src.l3g_paper.slim_status import derive_slim_paper_status, unavailable_slim_status
 from src.l3g_paper.verification import LocalLedgerVerificationController
 from src.l3h_live.status import fail_closed_status
 from src.ops_scheduler.api_models import PreviewRequest, RunNowRequest, ScheduleRequest, ScheduleUpdateRequest, TemplateRequest
@@ -2038,6 +2039,41 @@ def create_control_center_app(
                 launch_detail = f" Auto verification launched ({launched.get('verification_id', 'local run')})."
             raise HTTPException(status_code=409, detail=f"{exc.code}: {exc}.{launch_detail}") from exc
 
+    def paper_commissioning_rehearsal(paper: LaneIIIPaperRuntime) -> dict[str, object]:
+        """Run the same authority-free readiness proof for Full and Slim views."""
+        result = paper.commissioning_rehearsal(
+            lambda commissioning_id, runtime_snapshot: require_commissioning_ledger_verification(
+                commissioning_id, runtime_snapshot,
+                launch_auto_on_failure=False,
+                enforce_observer=False,
+            )
+        )
+        observer = ninja_listener_health()
+        observer_active = observer.get("market_observer_state") == "ACTIVE"
+        runtime_observer = result.get("observer")
+        result["observer"] = {
+            **(dict(runtime_observer) if isinstance(runtime_observer, Mapping) else {}),
+            "status": observer.get("market_observer_state", "NOT_ACTIVE"),
+            "listener_state": observer.get("state", "UNSTARTED"),
+            "last_level_one_at": observer.get("last_level_one_at"),
+            "last_depth_at": observer.get("last_depth_at"),
+            "freshness": observer.get("market_observer_freshness"),
+            "operator_guidance": None if observer_active else (
+                "Open the MNQ SEP26 chart, attach BeelzebubReadOnlyMarketObserver, and wait for ACTIVE."
+            ),
+        }
+        reasons = [str(value) for value in result.get("blocking_reasons", [])]
+        if not observer_active:
+            reasons.append("MARKET_OBSERVER_NOT_ACTIVE")
+        result["blocking_reasons"] = list(dict.fromkeys(reasons))
+        result["result"] = "READY" if not result["blocking_reasons"] else "BLOCKED"
+        hash_payload = dict(result)
+        hash_payload.pop("snapshot_hash", None)
+        result["snapshot_hash"] = hashlib.sha256(
+            json.dumps(hash_payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        ).hexdigest()
+        return result
+
     def _ledger_schedule() -> dict[str, Any] | None:
         schedules = scheduler_service.schedules(task_type="lane_iii.ledger_verification", page=1, page_size=10).get("items", [])
         return schedules[0] if schedules else None
@@ -2280,6 +2316,26 @@ def create_control_center_app(
     async def api_lane_iii_paper() -> dict[str, object]:
         return lane_iii_paper_health()
 
+    @app.get("/api/lane-iii/paper/slim-status")
+    async def api_lane_iii_paper_slim_status() -> dict[str, object]:
+        """Compact, read-only rendering state; it cannot acquire paper authority."""
+        paper = ninjatrader_runtime.get("paper")
+        if paper is None:
+            return unavailable_slim_status()
+        runtime_status = paper.status()
+        verification = ledger_verifier.status()
+        raw_ledger = runtime_status.get("ledger")
+        if isinstance(raw_ledger, Mapping):
+            runtime_status["ledger"] = ledger_health_projection(raw_ledger, verification)
+        observer = ninja_listener_health()
+        return derive_slim_paper_status(
+            runtime_status,
+            verification,
+            observer,
+            paper_commissioning_rehearsal(paper),
+            verification_freshness_seconds=LEDGER_VERIFICATION_FRESHNESS_SECONDS,
+        )
+
     @app.get("/api/lane-iii/live")
     async def api_lane_iii_live() -> dict[str, object]:
         """Read-only L3H status. No live order-producing route is registered."""
@@ -2410,38 +2466,7 @@ def create_control_center_app(
         paper = ninjatrader_runtime.get("paper")
         if paper is None:
             raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
-        result = paper.commissioning_rehearsal(
-            lambda commissioning_id, runtime_snapshot: require_commissioning_ledger_verification(
-                commissioning_id, runtime_snapshot,
-                launch_auto_on_failure=False,
-                enforce_observer=False,
-            )
-        )
-        observer = ninja_listener_health()
-        observer_active = observer.get("market_observer_state") == "ACTIVE"
-        runtime_observer = result.get("observer")
-        result["observer"] = {
-            **(dict(runtime_observer) if isinstance(runtime_observer, Mapping) else {}),
-            "status": observer.get("market_observer_state", "NOT_ACTIVE"),
-            "listener_state": observer.get("state", "UNSTARTED"),
-            "last_level_one_at": observer.get("last_level_one_at"),
-            "last_depth_at": observer.get("last_depth_at"),
-            "freshness": observer.get("market_observer_freshness"),
-            "operator_guidance": None if observer_active else (
-                "Open the MNQ SEP26 chart, attach BeelzebubReadOnlyMarketObserver, and wait for ACTIVE."
-            ),
-        }
-        reasons = [str(value) for value in result.get("blocking_reasons", [])]
-        if not observer_active:
-            reasons.append("MARKET_OBSERVER_NOT_ACTIVE")
-        result["blocking_reasons"] = list(dict.fromkeys(reasons))
-        result["result"] = "READY" if not result["blocking_reasons"] else "BLOCKED"
-        hash_payload = dict(result)
-        hash_payload.pop("snapshot_hash", None)
-        result["snapshot_hash"] = hashlib.sha256(
-            json.dumps(hash_payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
-        ).hexdigest()
-        return result
+        return paper_commissioning_rehearsal(paper)
 
     @app.post("/api/lane-iii/paper/commissioning-start")
     async def api_lane_iii_paper_commissioning_start(
