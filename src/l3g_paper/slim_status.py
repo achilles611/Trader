@@ -36,6 +36,7 @@ _TRANSIENT_RUNTIME_STATES = frozenset({
 _BLOCKER_MESSAGES = {
     "MARKET_OBSERVER_NOT_ACTIVE": "Attach and warm the MNQ market observer.",
     "COMMISSIONING_LEDGER_VERIFICATION_REQUIRED": "Run a current ledger verification.",
+    "OPERATIONAL_FULL_LEDGER_VERIFICATION_REQUIRED": "Run a successful Full ledger verification before paper start.",
     "COMMISSIONING_LEDGER_VERIFICATION_IN_PROGRESS": "Ledger verification is still running.",
     "COMMISSIONING_LEDGER_VERIFICATION_FAILED": "Ledger verification failed; review Full Console diagnostics.",
     "COMMISSIONING_LEDGER_ANCHOR_STALE": "Ledger verification is stale; run it again.",

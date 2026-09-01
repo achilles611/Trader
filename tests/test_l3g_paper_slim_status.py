@@ -122,6 +122,7 @@ class SlimPaperStatusTests(unittest.TestCase):
             "unavailable": (None, None),
             "addon mismatch": (runtime(), {"result": "BLOCKED", "blocking_reasons": ["ADDON_BUILD_MISMATCH"]}),
             "stale quote": (runtime(), {"result": "BLOCKED", "blocking_reasons": ["QUOTE_STALE"]}),
+            "full verification required": (runtime(), {"result": "BLOCKED", "blocking_reasons": ["OPERATIONAL_FULL_LEDGER_VERIFICATION_REQUIRED"]}),
             "lockout": (runtime(state="LOCKED_OUT"), {"result": "BLOCKED", "blocking_reasons": ["STATE_NOT_READY_DISARMED"]}),
             "unknown identity": (runtime(), {"result": "BLOCKED", "blocking_reasons": ["COMMISSIONING_ACCOUNT_INSTRUMENT_MISMATCH"]}),
         }

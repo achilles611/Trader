@@ -31,7 +31,9 @@ second readiness algorithm. **Start Paper Trading** invokes
 pre-start proof, records a continuous operational-paper session, and does not
 reserve commissioning ownership or submit a commissioning entry. A browser
 refresh or a switch to Full Console only changes presentation; it cannot stop
-that backend session.
+that backend session. The latest successful ledger proof must be a **Full**
+verification (including its structural quick check); an inherited incremental
+proof is intentionally insufficient for a new Slim paper session.
 
 **STOP TRADING** is always shown whenever the canonical or last-known runtime
 might still have paper authority, including red/yellow and unavailable Slim

@@ -2089,11 +2089,34 @@ def create_control_center_app(
         launch_auto_on_failure: bool = True,
         enforce_observer: bool = True,
     ) -> dict[str, object]:
-        """Bind an operational paper session to the same verified Sim101 fence.
+        """Bind an operational paper session to a fresh Full Sim101 proof.
 
         This is a validation-only bridge.  It deliberately does not reserve or
-        consume any commissioning credential.
+        consume any commissioning credential.  Unlike the historic
+        commissioning route, an operational session never accepts a merely
+        incremental result that inherits an older Full proof: the Full scan
+        itself must be the latest successful verifier run before new continuous
+        paper authority can begin.
         """
+        status = ledger_verification_status()
+        full_is_latest_pass = (
+            status.get("status") == "PASS"
+            and status.get("verification_mode") == "full"
+            and status.get("verification_id") == status.get("last_full_verification_id")
+        )
+        if not full_is_latest_pass:
+            launch_detail = ""
+            if launch_auto_on_failure and status.get("status") != "IN_PROGRESS":
+                launched = ledger_verifier.start("full")
+                launch_detail = f" Full verification launched ({launched.get('verification_id', 'local run')})."
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "OPERATIONAL_FULL_LEDGER_VERIFICATION_REQUIRED: "
+                    "A successful Full local ledger verification must be the latest proof before paper start."
+                    + launch_detail
+                ),
+            )
         return require_commissioning_ledger_verification(
             operation_id,
             runtime_snapshot,
