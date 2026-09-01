@@ -57,6 +57,7 @@ _BLOCKER_MESSAGES = {
     "PENDING_ORDER_LOCKOUT": "Owned working orders must be reconciled first.",
     "COMMISSIONING_OWNERSHIP_ACTIVE": "A paper operation is already in progress.",
     "PAPER_SESSION_PNL_UNAVAILABLE": "Current paper-session P&L is unavailable.",
+    "OPERATIONAL_LEDGER_INTEGRITY_FAILED": "Online ledger integrity is not confirmed; stop paper trading.",
 }
 
 
@@ -123,7 +124,6 @@ def _active_blockers(
         "market_instrument": "MNQ SEP26",
         "maximum_quantity": 1,
         "live_capital": "DENIED",
-        "paper_execution": "POSITIONED",
     }
     for field, value in expected.items():
         if runtime.get(field) != value:
@@ -132,16 +132,30 @@ def _active_blockers(
 
     state = runtime.get("state")
     position = runtime.get("current_position")
-    if state not in {"LONG", "SHORT"} or position != state or runtime.get("current_quantity") != 1:
-        blockers.append("ACTIVE_POSITION_UNHEALTHY")
-    if runtime.get("current_position_quantity") != 1 or runtime.get("broker_snapshot_position") != state:
-        blockers.append("ACTIVE_POSITION_UNHEALTHY")
-    if runtime.get("broker_snapshot_position_quantity") != 1:
-        blockers.append("ACTIVE_POSITION_UNHEALTHY")
+    positioned = state in {"LONG", "SHORT"}
+    if positioned:
+        if runtime.get("paper_execution") != "POSITIONED" or position != state or runtime.get("current_quantity") != 1:
+            blockers.append("ACTIVE_POSITION_UNHEALTHY")
+        if runtime.get("current_position_quantity") != 1 or runtime.get("broker_snapshot_position") != state:
+            blockers.append("ACTIVE_POSITION_UNHEALTHY")
+        if runtime.get("broker_snapshot_position_quantity") != 1:
+            blockers.append("ACTIVE_POSITION_UNHEALTHY")
+        if runtime.get("protective_stop_state") != "WORKING":
+            blockers.append("PROTECTIVE_STOP_REJECTED")
+    else:
+        if (
+            state != "PAPER_RUNNING"
+            or runtime.get("paper_execution") != "RUNNING"
+            or position != "FLAT"
+            or runtime.get("current_quantity") != 0
+            or runtime.get("current_position_quantity") != 0
+            or runtime.get("broker_snapshot_position") != "FLAT"
+            or runtime.get("broker_snapshot_position_quantity") != 0
+            or runtime.get("protective_stop_state") not in {"NONE", "CANCELLED"}
+        ):
+            blockers.append("ACTIVE_POSITION_UNHEALTHY")
     if runtime.get("working_entry_orders") != 0:
         blockers.append("ACTIVE_WORKING_ENTRY_ORDER")
-    if runtime.get("protective_stop_state") != "WORKING":
-        blockers.append("PROTECTIVE_STOP_REJECTED")
     if runtime.get("lockout_or_fault_reason") not in (None, ""):
         blockers.append("ACTIVE_LOCKOUT_OR_FAULT")
     if any(runtime.get(name) is not expected for name, expected in {
@@ -177,12 +191,20 @@ def _active_blockers(
         blockers.append("MARKET_OBSERVER_NOT_ACTIVE")
 
     ledger = _as_mapping(runtime.get("ledger"))
-    if ledger.get("commissioning_ledger_state") not in _ACCEPTED_LEDGER_STATES or ledger.get("writer_capacity_healthy") is not True:
-        blockers.append("COMMISSIONING_LEDGER_CAPACITY_INADEQUATE")
-    if not _verification_is_current(
-        verification, now=now, freshness_seconds=verification_freshness_seconds,
-    ):
-        blockers.append("COMMISSIONING_LEDGER_VERIFICATION_REQUIRED")
+    operational = _as_mapping(runtime.get("operational_paper_session"))
+    if operational.get("active") is True:
+        online = _as_mapping(ledger.get("operational_ledger"))
+        if online.get("online_append_integrity") is not True:
+            blockers.append("OPERATIONAL_LEDGER_INTEGRITY_FAILED")
+        if verification.get("status") == "FAIL":
+            blockers.append("COMMISSIONING_LEDGER_VERIFICATION_FAILED")
+    else:
+        if ledger.get("commissioning_ledger_state") not in _ACCEPTED_LEDGER_STATES or ledger.get("writer_capacity_healthy") is not True:
+            blockers.append("COMMISSIONING_LEDGER_CAPACITY_INADEQUATE")
+        if not _verification_is_current(
+            verification, now=now, freshness_seconds=verification_freshness_seconds,
+        ):
+            blockers.append("COMMISSIONING_LEDGER_VERIFICATION_REQUIRED")
     return tuple(dict.fromkeys(blockers))
 
 
@@ -276,8 +298,39 @@ def derive_slim_paper_status(
     pnl = paper_session_pnl(runtime)
 
     state = str(runtime.get("state") or "UNKNOWN")
-    active_state = state in {"LONG", "SHORT"}
+    operational = _as_mapping(runtime.get("operational_paper_session"))
+    active_state = (
+        operational.get("active") is True
+        or state in {"PAPER_RUNNING", "ENTRY_PENDING", "LONG", "SHORT", "EXIT_PENDING", "STOPPING"}
+    )
     if active_state:
+        stopping = operational.get("stopping") is True or state == "STOPPING"
+        if stopping:
+            return {
+                "schema": SLIM_STATUS_SCHEMA,
+                "generated_at": _timestamp(current),
+                "light": "YELLOW",
+                "label": "STOPPING…",
+                "message": "Cancelling owned work and waiting for Sim101 flat reconciliation.",
+                "primary_blocker": None,
+                "can_start": False,
+                "paper_active": True,
+                "ledger_verification": verification_payload,
+                "pnl": pnl,
+            }
+        if state in {"ENTRY_PENDING", "EXIT_PENDING", "STARTING"}:
+            return {
+                "schema": SLIM_STATUS_SCHEMA,
+                "generated_at": _timestamp(current),
+                "light": "YELLOW",
+                "label": "PAPER TRADING ACTIVE",
+                "message": "Waiting for the current Sim101 order lifecycle to settle.",
+                "primary_blocker": None,
+                "can_start": False,
+                "paper_active": True,
+                "ledger_verification": verification_payload,
+                "pnl": pnl,
+            }
         blockers = _active_blockers(
             runtime, verification_value, observer_value, now=current,
             verification_freshness_seconds=verification_freshness_seconds,

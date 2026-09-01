@@ -16,6 +16,7 @@ export type PaperConsoleState = {
   act: (path: string, label: string, body?: Record<string, string>) => Promise<any>;
   runRehearsal: () => Promise<void>;
   startCommissioning: () => Promise<void>;
+  startPaperTrading: () => Promise<void>;
   startVerification: () => Promise<void>;
   cancelVerification: () => Promise<void>;
   saveSchedule: () => Promise<void>;
@@ -37,6 +38,7 @@ export function usePaperConsoleState({ active, includeSlim, notify }: Options): 
   const [rehearsal, setRehearsal] = useState<any>(null);
   const [slimStatus, setSlimStatus] = useState<any>(null);
   const [commissioningRequestId, setCommissioningRequestId] = useState<string | null>(null);
+  const [operationalPaperRequestId, setOperationalPaperRequestId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [verificationInFlight, setVerificationInFlight] = useState(false);
@@ -115,6 +117,13 @@ export function usePaperConsoleState({ active, includeSlim, notify }: Options): 
     if (result?.submitted || result?.idempotent_replay) setCommissioningRequestId(null);
   }, [act, commissioningRequestId]);
 
+  const startPaperTrading = useCallback(async () => {
+    const requestId = operationalPaperRequestId || `l3g-paper-ui-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    setOperationalPaperRequestId(requestId);
+    const result = await act("/api/lane-iii/paper/operational-start", "Start Paper Trading", { request_id: requestId });
+    if (result?.started || result?.idempotent_replay) setOperationalPaperRequestId(null);
+  }, [act, operationalPaperRequestId]);
+
   const startVerification = useCallback(async () => {
     if (busy) return;
     setBusy(true);
@@ -178,6 +187,7 @@ export function usePaperConsoleState({ active, includeSlim, notify }: Options): 
     act,
     runRehearsal,
     startCommissioning,
+    startPaperTrading,
     startVerification,
     cancelVerification,
     saveSchedule,

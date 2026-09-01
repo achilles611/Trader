@@ -20,16 +20,28 @@ advanced controls.
 - **Green — READY TO START PAPER TRADING:** the authority-free production
   rehearsal has passed every current Sim101 paper gate. Green does not reserve
   authority: the server repeats its complete preflight when Start is pressed.
-- **Green — PAPER TRADING ACTIVE:** the backend has a reconciled, protected,
-  healthy one-MNQ Sim101 paper position. If any active health fact becomes
-  uncertain, Slim Mode returns to yellow or red.
+- **Green — PAPER TRADING ACTIVE:** the backend-owned continuous Sim101 paper
+  session is running. It remains active while flat and between trades as well
+  as while a one-MNQ position is protected. If any active health fact becomes
+  uncertain, Slim Mode returns to yellow or red, but retains the stop control.
 
 The browser renders the backend Slim-status projection; it does not calculate a
-second readiness algorithm. **Start Paper Trading** uses the same atomic
-commissioning-start endpoint as Full Console, while **Stop & Disarm** uses the
-existing guarded flatten-and-disarm endpoint. Neither control can reach live
-capital, and neither view overrides provenance, verification, reconciliation,
-observer, account-class, quantity, protection, or session gates.
+second readiness algorithm. **Start Paper Trading** invokes
+`POST /api/lane-iii/paper/operational-start`: it reruns the full Sim101
+pre-start proof, records a continuous operational-paper session, and does not
+reserve commissioning ownership or submit a commissioning entry. A browser
+refresh or a switch to Full Console only changes presentation; it cannot stop
+that backend session.
+
+**STOP TRADING** is always shown whenever the canonical or last-known runtime
+might still have paper authority, including red/yellow and unavailable Slim
+status. It invokes the idempotent guarded flatten-and-disarm path, cancels
+owned pending entries, flattens an open position when required, and releases
+the operational session only after a clean Sim101 reconciliation proves flat
+with no owned orders. The next start requires a fresh verifier proof. Neither
+control can reach live capital, and neither view overrides provenance,
+verification, reconciliation, observer, account-class, quantity, protection,
+or session gates.
 
 ## Combined-server API contract
 

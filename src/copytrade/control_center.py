@@ -1539,7 +1539,15 @@ def create_control_center_app(
         status["ledger_shutdown"] = paper_ledger_shutdown_receipt
         raw_ledger = status.get("ledger")
         if isinstance(raw_ledger, Mapping):
-            status["ledger"] = ledger_health_projection(raw_ledger, verification)
+            status["ledger"] = ledger_health_projection(
+                raw_ledger,
+                verification,
+                operational_session=(
+                    status.get("operational_paper_session")
+                    if isinstance(status.get("operational_paper_session"), Mapping)
+                    else None
+                ),
+            )
         return status
 
     def lane_iii_live_health() -> dict[str, object]:
@@ -2074,6 +2082,25 @@ def create_control_center_app(
         ).hexdigest()
         return result
 
+    def require_operational_paper_ledger_verification(
+        operation_id: str,
+        runtime_snapshot: Mapping[str, object],
+        *,
+        launch_auto_on_failure: bool = True,
+        enforce_observer: bool = True,
+    ) -> dict[str, object]:
+        """Bind an operational paper session to the same verified Sim101 fence.
+
+        This is a validation-only bridge.  It deliberately does not reserve or
+        consume any commissioning credential.
+        """
+        return require_commissioning_ledger_verification(
+            operation_id,
+            runtime_snapshot,
+            launch_auto_on_failure=launch_auto_on_failure,
+            enforce_observer=enforce_observer,
+        )
+
     def _ledger_schedule() -> dict[str, Any] | None:
         schedules = scheduler_service.schedules(task_type="lane_iii.ledger_verification", page=1, page_size=10).get("items", [])
         return schedules[0] if schedules else None
@@ -2326,13 +2353,27 @@ def create_control_center_app(
         verification = ledger_verifier.status()
         raw_ledger = runtime_status.get("ledger")
         if isinstance(raw_ledger, Mapping):
-            runtime_status["ledger"] = ledger_health_projection(raw_ledger, verification)
+            runtime_status["ledger"] = ledger_health_projection(
+                raw_ledger,
+                verification,
+                operational_session=(
+                    runtime_status.get("operational_paper_session")
+                    if isinstance(runtime_status.get("operational_paper_session"), Mapping)
+                    else None
+                ),
+            )
         observer = ninja_listener_health()
         return derive_slim_paper_status(
             runtime_status,
             verification,
             observer,
-            paper_commissioning_rehearsal(paper),
+            paper.operational_paper_readiness(
+                lambda operation_id, runtime_snapshot: require_operational_paper_ledger_verification(
+                    operation_id, runtime_snapshot,
+                    launch_auto_on_failure=False,
+                    enforce_observer=False,
+                )
+            ),
             verification_freshness_seconds=LEDGER_VERIFICATION_FRESHNESS_SECONDS,
         )
 
@@ -2490,6 +2531,31 @@ def create_control_center_app(
         try:
             return paper.commissioning_start(
                 str(body["request_id"]), require_commissioning_ledger_verification,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/lane-iii/paper/operational-start")
+    async def api_lane_iii_paper_operational_start(
+        body: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, object]:
+        """Start the continuous, paper-only Sim101 operator lifecycle."""
+        paper = ninjatrader_runtime.get("paper")
+        if paper is None:
+            raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
+        if not isinstance(body, dict) or set(body) != {"request_id"} or not isinstance(body.get("request_id"), str):
+            raise HTTPException(status_code=400, detail="Operational paper start accepts only a request_id.")
+        bootstrap = ninjatrader_runtime.get("login_bootstrap")
+        if bootstrap is not None and bootstrap.state is not NinjaTraderLoginState.AUTHENTICATED:
+            transport = paper.status().get("transport")
+            if not isinstance(transport, Mapping) or (
+                transport.get("state"), transport.get("authenticated_client"), transport.get("reconciled"),
+                transport.get("account"), transport.get("account_class"), transport.get("instrument"),
+            ) != ("AUTHENTICATED", True, True, "Sim101", "LOCAL_SIMULATION", "MNQ SEP26"):
+                raise HTTPException(status_code=409, detail="NinjaTrader desktop authentication is not operational.")
+        try:
+            return paper.operational_paper_start(
+                str(body["request_id"]), require_operational_paper_ledger_verification,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

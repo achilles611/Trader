@@ -100,6 +100,7 @@ class ProductionControlCenterRoutingTests(unittest.TestCase):
         paths = (
             "/api/lane-iii/paper/ledger-verification",
             "/api/lane-iii/paper/commissioning-start",
+            "/api/lane-iii/paper/operational-start",
             "/api/lane-iii/paper/flatten-and-disarm",
         )
         with TemporaryDirectory() as directory:

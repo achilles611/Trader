@@ -69,6 +69,28 @@ def runtime(*, state: str = "READY_DISARMED") -> dict[str, object]:
     }
 
 
+def operational_runtime(*, online_append_integrity: bool = True) -> dict[str, object]:
+    value = runtime(state="PAPER_RUNNING")
+    value["paper_execution"] = "RUNNING"
+    value["operational_paper_session"] = {
+        "active": True,
+        "stopping": False,
+        "request_id": "operational-start-001",
+    }
+    value["ledger"] = {
+        **value["ledger"],
+        "operational_ledger": {
+            "active": True,
+            "online_append_integrity": online_append_integrity,
+            "tail_state": (
+                "LEGITIMATE_AUTHORITY_MUTATION_TAIL_AWAITING_BATCH_VERIFICATION"
+                if online_append_integrity else "UNTRUSTED_AUTHORITY_MUTATION_TAIL"
+            ),
+        },
+    }
+    return value
+
+
 OBSERVER = {"market_observer_active": True, "market_observer_state": "ACTIVE"}
 
 
@@ -130,6 +152,24 @@ class SlimPaperStatusTests(unittest.TestCase):
         self.assertEqual(result["label"], "PAPER TRADING ACTIVE")
         self.assertTrue(result["paper_active"])
         self.assertFalse(result["can_start"])
+
+    def test_operational_session_allows_a_healthy_online_append_tail_but_rejects_corruption(self) -> None:
+        healthy = self.status(
+            operational_runtime(),
+            {"result": "BLOCKED", "blocking_reasons": ["STATE_NOT_READY_DISARMED"]},
+        )
+        self.assertEqual(healthy["light"], "GREEN")
+        self.assertTrue(healthy["paper_active"])
+        self.assertEqual(healthy["label"], "PAPER TRADING ACTIVE")
+        self.assertFalse(healthy["can_start"])
+
+        corrupt = self.status(
+            operational_runtime(online_append_integrity=False),
+            {"result": "BLOCKED", "blocking_reasons": ["STATE_NOT_READY_DISARMED"]},
+        )
+        self.assertEqual(corrupt["light"], "RED")
+        self.assertTrue(corrupt["paper_active"])
+        self.assertEqual(corrupt["primary_blocker"], "OPERATIONAL_LEDGER_INTEGRITY_FAILED")
 
     def test_unhealthy_active_paper_operation_fails_closed(self) -> None:
         paper = runtime(state="SHORT")

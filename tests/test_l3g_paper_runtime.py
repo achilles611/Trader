@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from decimal import Decimal
@@ -16,6 +17,7 @@ from src.l3g_paper.ledger import (
     commissioning_tail_classification,
 )
 from src.l3g_paper.ninjatrader_transport import ADDON_PROTOCOL_VERSION, PaperExecutionTransport, expected_addon_source_fingerprint
+from src.l3g_paper.health import ledger_health_projection
 from src.l3g_paper.runtime import (
     LaneIIIPaperRuntime,
     ObservationFanout,
@@ -97,6 +99,225 @@ class PaperRuntimeTests(unittest.TestCase):
         if safety_settlement_sequence is not None:
             message["safety_settlement_sequence"] = safety_settlement_sequence
         return message
+
+    @staticmethod
+    def operational_runtime(directory: str, *, now: str = "2026-08-24T22:10:00Z") -> tuple[PaperLedger, LaneIIIPaperRuntime]:
+        """Ready, authenticated Sim101 fixture without a listener or order transport."""
+        ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+        runtime = LaneIIIPaperRuntime(ledger)
+        transport = PaperExecutionTransport(ledger, port=48175)
+        runtime.bind_transport(transport)
+        with transport._lock:
+            transport._state = "AUTHENTICATED"
+            transport._authenticated = True
+            transport._client = object()  # type: ignore[assignment]
+            transport._execution_session_id = "l3g-es-operational-test"
+            transport._addon_protocol_version = ADDON_PROTOCOL_VERSION
+            transport._addon_source_fingerprint = expected_addon_source_fingerprint()
+        context = PaperSessionResolver().resolve(now, generation=1).context
+        runtime._state = PaperRuntimeState.READY_DISARMED
+        runtime._session_context = context
+        runtime._snapshot = PaperRiskSnapshot(
+            now, account_name="Sim101", account_class="LOCAL_SIMULATION", instrument="MNQ SEP26",
+            position_snapshot_complete=True, order_snapshot_complete=True,
+            reconciliation_current=True, local_bridge_healthy=True,
+            market_price_connected=True, execution_bridge_healthy=True, evidence_warmed=True,
+            commissioning_session_warmed=True, depth_reset_recovery=False,
+            quote_observed_at=now, classified_trade_observed_at=now, depth_mutation_observed_at=now,
+            session_kind=context.session_kind, session_id=context.session_id, trade_date=context.trade_date,
+            session_profile_hash=context.session_profile_hash, session_generation=context.session_generation,
+        )
+        runtime._persist_and_send = lambda *_: None  # type: ignore[method-assign]
+        runtime.operational_paper_readiness = lambda _preflight=None: {  # type: ignore[method-assign]
+            "result": "READY", "blocking_reasons": [], "ledger": {"status": "PASS"},
+        }
+        return ledger, runtime
+
+    def test_operational_paper_start_is_continuous_and_never_invokes_atomic_commissioning(self) -> None:
+        now = "2026-08-24T22:10:00Z"
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.operational_runtime(directory, now=now)
+            try:
+                with (
+                    patch("src.l3g_paper.runtime._now", return_value=now),
+                    patch.object(runtime, "commissioning_start", side_effect=AssertionError("atomic commissioning must not run")),
+                ):
+                    started = runtime.operational_paper_start("operational-start-001")
+                    replay = runtime.operational_paper_start("operational-start-001")
+
+                self.assertTrue(started["started"])
+                self.assertEqual(runtime.state, PaperRuntimeState.PAPER_RUNNING)
+                self.assertTrue(runtime.status()["operational_paper_session"]["active"])
+                self.assertTrue(replay["idempotent_replay"])
+                self.assertEqual(runtime.state, PaperRuntimeState.PAPER_RUNNING)
+                self.assertEqual(
+                    [record["kind"] for record in ledger.recent(30)].count("SESSION_OPERATIONAL_PAPER_STARTED"),
+                    1,
+                )
+            finally:
+                runtime.stop(); ledger.close()
+
+    def test_operational_session_stays_running_across_idle_time_and_three_flat_trade_cycles(self) -> None:
+        now = "2026-08-24T22:10:00Z"
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.operational_runtime(directory, now=now)
+            try:
+                with patch("src.l3g_paper.runtime._now", return_value=now):
+                    self.assertTrue(runtime.operational_paper_start("operational-start-002")["started"])
+                    # Five simulated idle minutes with no signal/command are
+                    # not a lifecycle boundary.
+                    with patch("src.l3g_paper.runtime._now", return_value="2026-08-24T22:15:00Z"):
+                        runtime.status()
+                    self.assertEqual(runtime.state, PaperRuntimeState.PAPER_RUNNING)
+
+                    for sequence in range(3):
+                        runtime._transition(PaperRuntimeState.ENTRY_PENDING, f"TEST_ENTRY_{sequence}")
+                        runtime._transition(PaperRuntimeState.LONG, f"TEST_FILL_{sequence}")
+                        runtime._position = PaperDirection.LONG
+                        runtime._position_quantity = 1
+                        runtime._entry_fill_price = Decimal("100")
+                        runtime._entry_fill_quantity = 1
+                        runtime._entry_direction = PaperDirection.LONG
+                        runtime._entry_execution = {"native_execution_id": f"entry-{sequence}", "timestamp": now}
+                        runtime._entry_session_context = runtime._session_context
+                        runtime._snapshot = replace(
+                            runtime._snapshot, current_position=PaperDirection.LONG,
+                            current_position_quantity=1, protective_stop_state="WORKING",
+                        )
+                        runtime._request_exit("TEST_NORMAL_EXIT")
+                        self.assertEqual(runtime.state, PaperRuntimeState.EXIT_PENDING)
+                        runtime.on_execution_message({
+                            "message_type": "EXECUTION_EVENT", "order_role": "EXIT", "price": "101",
+                            "quantity": 1, "native_execution_id": f"exit-{sequence}", "timestamp": now,
+                        })
+                        runtime.on_execution_message({"message_type": "POSITION_EVENT", "quantity": 0, "timestamp": now})
+                        runtime.on_execution_message({
+                            "message_type": "RECONCILIATION", "receipt_id": f"operational-flat-{sequence}",
+                            "account_name": "Sim101", "account_class": "LOCAL_SIMULATION", "instrument": "MNQ SEP26",
+                            "position_quantity": 0, "working_order_count": 0, "working_entry_count": 0,
+                            "position_snapshot_complete": True, "order_snapshot_complete": True,
+                            "foreign_activity": False, "timestamp": now,
+                        })
+                        self.assertEqual(runtime.state, PaperRuntimeState.PAPER_RUNNING)
+                        self.assertTrue(runtime.status()["operational_paper_session"]["active"])
+
+                status = runtime.status()
+                self.assertEqual(status["paper_session_pnl"]["realized"], "6")
+                self.assertEqual(status["paper_session_pnl"]["unrealized"], "0")
+                self.assertEqual(status["current_position"], "FLAT")
+            finally:
+                runtime.stop(); ledger.close()
+
+    def test_operational_stop_is_idempotent_and_requires_clean_flat_reconciliation(self) -> None:
+        now = "2026-08-24T22:10:00Z"
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.operational_runtime(directory, now=now)
+            try:
+                with patch("src.l3g_paper.runtime._now", return_value=now):
+                    self.assertTrue(runtime.operational_paper_start("operational-start-003")["started"])
+                    first = runtime.flatten_and_disarm()
+                    replay = runtime.flatten_and_disarm()
+                self.assertTrue(first["flat_confirmed"])
+                self.assertTrue(replay["flat_confirmed"])
+                self.assertEqual(runtime.state, PaperRuntimeState.READY_DISARMED)
+                self.assertIsNone(runtime.status()["operational_paper_session"])
+                self.assertEqual(
+                    [record["kind"] for record in ledger.recent(50)].count("SESSION_OPERATIONAL_PAPER_STOPPED"),
+                    1,
+                )
+            finally:
+                runtime.stop(); ledger.close()
+
+    def test_operational_ledger_accepts_its_known_online_tail_but_not_an_unknown_row(self) -> None:
+        now = "2026-08-24T22:10:00Z"
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.operational_runtime(directory, now=now)
+            try:
+                anchor = ledger.health_status()
+                verification = {
+                    "status": "PASS", "chain_valid": True, "checkpoint_valid": True,
+                    "verified_through_sequence": anchor["highest_sequence"],
+                    "tip_hash": anchor["final_record_hash"],
+                }
+                with patch("src.l3g_paper.runtime._now", return_value=now):
+                    self.assertTrue(runtime.operational_paper_start("operational-start-003b")["started"])
+                active = runtime.status()["operational_paper_session"]
+                healthy = ledger_health_projection(ledger.health_status(), verification, operational_session=active)
+                self.assertTrue(healthy["operational_ledger"]["online_append_integrity"])
+                self.assertEqual(
+                    healthy["operational_ledger"]["tail_state"],
+                    "LEGITIMATE_AUTHORITY_MUTATION_TAIL_AWAITING_BATCH_VERIFICATION",
+                )
+
+                ledger.append("FUTURE_UNCLASSIFIED_OPERATIONAL_RECORD", {"opaque": "must-fail-closed"})
+                corrupt = ledger_health_projection(ledger.health_status(), verification, operational_session=active)
+                self.assertFalse(corrupt["operational_ledger"]["online_append_integrity"])
+                self.assertTrue(corrupt["operational_ledger"]["unknown_tail_present"])
+            finally:
+                runtime.stop(); ledger.close()
+
+    def test_operational_stop_seals_pending_entries_and_open_positions_until_reconciled(self) -> None:
+        now = "2026-08-24T22:10:00Z"
+
+        def reconciliation(receipt_id: str) -> dict[str, object]:
+            return {
+                "message_type": "RECONCILIATION", "receipt_id": receipt_id,
+                "account_name": "Sim101", "account_class": "LOCAL_SIMULATION", "instrument": "MNQ SEP26",
+                "position_quantity": 0, "working_order_count": 0, "working_entry_count": 0,
+                "position_snapshot_complete": True, "order_snapshot_complete": True,
+                "foreign_activity": False, "timestamp": now,
+            }
+
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.operational_runtime(directory, now=now)
+            try:
+                with patch("src.l3g_paper.runtime._now", return_value=now):
+                    runtime.operational_paper_start("operational-start-004")
+                    runtime._last_quote = (Decimal("100"), Decimal("100.25"), now)
+                    runtime._transition(PaperRuntimeState.ENTRY_PENDING, "TEST_PENDING_ENTRY")
+                    runtime._snapshot = replace(runtime._snapshot, working_owned_orders=1, working_entry_orders=1)
+                    pending_stop = runtime.flatten_and_disarm()
+                self.assertTrue(pending_stop["stopping"])
+                self.assertTrue(runtime.status()["operational_paper_session"]["stopping"])
+                self.assertEqual(runtime.state, PaperRuntimeState.RECONCILING)
+                runtime.on_execution_message(reconciliation("operational-pending-flat"))
+                self.assertEqual(runtime.state, PaperRuntimeState.READY_DISARMED)
+                self.assertIsNone(runtime.status()["operational_paper_session"])
+            finally:
+                runtime.stop(); ledger.close()
+
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.operational_runtime(directory, now=now)
+            try:
+                with patch("src.l3g_paper.runtime._now", return_value=now):
+                    runtime.operational_paper_start("operational-start-005")
+                    runtime._last_quote = (Decimal("100"), Decimal("100.25"), now)
+                    runtime._transition(PaperRuntimeState.ENTRY_PENDING, "TEST_OPEN_ENTRY")
+                    runtime._transition(PaperRuntimeState.LONG, "TEST_OPEN_FILL")
+                    runtime._position = PaperDirection.LONG
+                    runtime._position_quantity = 1
+                    runtime._entry_fill_price = Decimal("100")
+                    runtime._entry_fill_quantity = 1
+                    runtime._entry_direction = PaperDirection.LONG
+                    runtime._entry_execution = {"native_execution_id": "open-entry", "timestamp": now}
+                    runtime._entry_session_context = runtime._session_context
+                    runtime._snapshot = replace(
+                        runtime._snapshot, current_position=PaperDirection.LONG,
+                        current_position_quantity=1, protective_stop_state="WORKING",
+                    )
+                    open_stop = runtime.flatten_and_disarm()
+                self.assertTrue(open_stop["stopping"])
+                self.assertEqual(runtime.state, PaperRuntimeState.EXIT_PENDING)
+                runtime.on_execution_message({
+                    "message_type": "EXECUTION_EVENT", "order_role": "EXIT", "price": "101", "quantity": 1,
+                    "native_execution_id": "open-exit", "timestamp": now,
+                })
+                runtime.on_execution_message({"message_type": "POSITION_EVENT", "quantity": 0, "timestamp": now})
+                runtime.on_execution_message(reconciliation("operational-open-flat"))
+                self.assertEqual(runtime.state, PaperRuntimeState.READY_DISARMED)
+                self.assertIsNone(runtime.status()["operational_paper_session"])
+            finally:
+                runtime.stop(); ledger.close()
 
     def test_accepted_deferred_receipt_does_not_treat_its_own_enqueue_as_capacity_failure(self) -> None:
         with TemporaryDirectory() as directory:

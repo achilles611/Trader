@@ -104,6 +104,22 @@ class _CommissioningReadinessCapture:
     commissioning_warmup_warmed_at: str | None
 
 
+@dataclass(frozen=True)
+class _OperationalPaperSession:
+    """Backend-owned authority for one continuous operator paper session.
+
+    This is intentionally distinct from the single-use commissioning
+    credential.  Browser views only project this state; neither a refresh nor
+    a mode switch can release it.
+    """
+
+    request_id: str
+    started_at: str
+    context: PaperSessionContext
+    ledger_preflight: Mapping[str, object]
+    stopping_reason: str | None = None
+
+
 class _CommissioningAuthorizationExpired(RuntimeError):
     """A sealed commissioning authorization expired before transport admission."""
 
@@ -228,6 +244,7 @@ class LaneIIIPaperRuntime:
         self._position_quantity = 0
         self._entries_paused = False
         self._commissioning_ownership = self._load_unresolved_commissioning_ownership()
+        self._operational_session: _OperationalPaperSession | None = None
         self._entry_owner = PaperEntryOwner.COMMISSIONING if self._commissioning_ownership is not None else PaperEntryOwner.NONE
         if self._commissioning_ownership is not None:
             # A process restart must not accidentally restore normal strategy
@@ -342,6 +359,66 @@ class LaneIIIPaperRuntime:
             "reserved_at": ownership.reserved_at,
             "reason": reason,
         }
+
+    def _operational_session_payload(self) -> dict[str, object] | None:
+        session = self._operational_session
+        if session is None:
+            return None
+        return {
+            "active": True,
+            "request_id": session.request_id,
+            "started_at": session.started_at,
+            "context": session.context.payload(),
+            "stopping": session.stopping_reason is not None,
+            "stopping_reason": session.stopping_reason,
+            "ledger_preflight": dict(session.ledger_preflight),
+        }
+
+    def _operational_session_is_stopping_locked(self) -> bool:
+        return self._operational_session is not None and self._operational_session.stopping_reason is not None
+
+    def _request_operational_stop_locked(self, reason: str) -> None:
+        """Seal new entries while retaining backend authority through settlement."""
+        session = self._operational_session
+        if session is None:
+            return
+        if session.stopping_reason is None:
+            self._operational_session = replace(session, stopping_reason=reason)
+            self._entries_paused = True
+            self._armed_session = None
+            self._disarm_after_flat = True
+
+    def _complete_operational_stop_locked(self, reason: str) -> None:
+        """Release paper-session authority only after a clean flat reconciliation."""
+        session = self._operational_session
+        if session is None:
+            return
+        if self._position is not PaperDirection.FLAT or self._snapshot.working_owned_orders:
+            raise RuntimeError("Operational paper session cannot release before flat reconciliation.")
+        self._entries_paused = True
+        self._armed_session = None
+        if self._state is not PaperRuntimeState.READY_DISARMED:
+            self._transition(PaperRuntimeState.READY_DISARMED, reason)
+        self.ledger.append(
+            "SESSION_OPERATIONAL_PAPER_STOPPED",
+            {
+                **session.context.payload(),
+                "request_id": session.request_id,
+                "started_at": session.started_at,
+                "reason": session.stopping_reason or reason,
+                "final_position": "FLAT",
+                "final_quantity": 0,
+                "final_working_order_count": 0,
+                "live_capital": "DENIED",
+            },
+            identity="l3g-operational-paper-stop-" + canonical_hash({
+                "request_id": session.request_id,
+                "started_at": session.started_at,
+            }),
+            execution_session_id=self._execution_session_id(),
+        )
+        self._operational_session = None
+        self._disarm_after_flat = False
 
     @staticmethod
     def _commissioning_transport_guard(status: ExecutionTransportStatus | None) -> dict[str, object] | None:
@@ -704,6 +781,17 @@ class LaneIIIPaperRuntime:
             }, identity="l3g-paper-session-close-" + canonical_hash({**context.payload(), "reason": reason}),
         )
         self.policy.reset("SESSION_CLOSED")
+        if self._operational_session is not None:
+            self._request_operational_stop_locked("SCHEDULED_SESSION_CLOSE")
+            if (
+                self._position is PaperDirection.FLAT
+                and self._snapshot.working_owned_orders == 0
+                and self._snapshot.reconciliation_current
+                and self._snapshot.position_snapshot_complete
+                and self._snapshot.order_snapshot_complete
+            ):
+                self._complete_operational_stop_locked("SCHEDULED_SESSION_CLOSE_RECONCILED")
+                return
         ownership = self._commissioning_ownership
         if ownership is not None and not ownership.entry_consumed and self._position is PaperDirection.FLAT and not self._snapshot.working_owned_orders:
             if self._state in {PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.PAUSED}:
@@ -779,16 +867,17 @@ class LaneIIIPaperRuntime:
         prior = self._state
         allowed: dict[PaperRuntimeState, set[PaperRuntimeState]] = {
             PaperRuntimeState.DISABLED: {PaperRuntimeState.STARTING},
-            PaperRuntimeState.STARTING: {PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.FAULTED},
+            PaperRuntimeState.STARTING: {PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.READY_DISARMED, PaperRuntimeState.PAPER_RUNNING, PaperRuntimeState.FAULTED, PaperRuntimeState.STOPPING},
             PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE: {PaperRuntimeState.RECONCILING, PaperRuntimeState.FAULTED, PaperRuntimeState.STOPPING},
-            PaperRuntimeState.RECONCILING: {PaperRuntimeState.READY_DISARMED, PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.PAUSED, PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED, PaperRuntimeState.STOPPING},
-            PaperRuntimeState.READY_DISARMED: {PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.RECONCILING, PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.STOPPING},
+            PaperRuntimeState.RECONCILING: {PaperRuntimeState.READY_DISARMED, PaperRuntimeState.PAPER_RUNNING, PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.PAUSED, PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED, PaperRuntimeState.STOPPING},
+            PaperRuntimeState.READY_DISARMED: {PaperRuntimeState.STARTING, PaperRuntimeState.PAPER_RUNNING, PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.RECONCILING, PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.STOPPING},
+            PaperRuntimeState.PAPER_RUNNING: {PaperRuntimeState.ENTRY_PENDING, PaperRuntimeState.PAUSED, PaperRuntimeState.READY_DISARMED, PaperRuntimeState.RECONCILING, PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED, PaperRuntimeState.STOPPING},
             PaperRuntimeState.ARMED_FLAT: {PaperRuntimeState.ENTRY_PENDING, PaperRuntimeState.PAUSED, PaperRuntimeState.READY_DISARMED, PaperRuntimeState.RECONCILING, PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED, PaperRuntimeState.STOPPING},
-            PaperRuntimeState.ENTRY_PENDING: {PaperRuntimeState.LONG, PaperRuntimeState.SHORT, PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.PAUSED, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED, PaperRuntimeState.RECONCILING, PaperRuntimeState.STOPPING},
+            PaperRuntimeState.ENTRY_PENDING: {PaperRuntimeState.LONG, PaperRuntimeState.SHORT, PaperRuntimeState.PAPER_RUNNING, PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.PAUSED, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED, PaperRuntimeState.RECONCILING, PaperRuntimeState.STOPPING},
             PaperRuntimeState.LONG: {PaperRuntimeState.EXIT_PENDING, PaperRuntimeState.PAUSED, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED, PaperRuntimeState.RECONCILING, PaperRuntimeState.STOPPING},
             PaperRuntimeState.SHORT: {PaperRuntimeState.EXIT_PENDING, PaperRuntimeState.PAUSED, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED, PaperRuntimeState.RECONCILING, PaperRuntimeState.STOPPING},
-            PaperRuntimeState.EXIT_PENDING: {PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.READY_DISARMED, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED, PaperRuntimeState.RECONCILING, PaperRuntimeState.STOPPING},
-            PaperRuntimeState.PAUSED: {PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.LONG, PaperRuntimeState.SHORT, PaperRuntimeState.EXIT_PENDING, PaperRuntimeState.READY_DISARMED, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED, PaperRuntimeState.RECONCILING, PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.STOPPING},
+            PaperRuntimeState.EXIT_PENDING: {PaperRuntimeState.PAPER_RUNNING, PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.READY_DISARMED, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED, PaperRuntimeState.RECONCILING, PaperRuntimeState.STOPPING},
+            PaperRuntimeState.PAUSED: {PaperRuntimeState.PAPER_RUNNING, PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.LONG, PaperRuntimeState.SHORT, PaperRuntimeState.EXIT_PENDING, PaperRuntimeState.READY_DISARMED, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED, PaperRuntimeState.RECONCILING, PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.STOPPING},
             PaperRuntimeState.LOCKED_OUT: {PaperRuntimeState.RECONCILING, PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.STOPPING},
             PaperRuntimeState.FAULTED: {PaperRuntimeState.RECONCILING, PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.STOPPING},
             PaperRuntimeState.STOPPING: {PaperRuntimeState.STOPPED},
@@ -820,7 +909,7 @@ class LaneIIIPaperRuntime:
             with self._lock:
                 transport = self._transport
                 armed = self._state in {
-                    PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.ENTRY_PENDING, PaperRuntimeState.LONG,
+                    PaperRuntimeState.PAPER_RUNNING, PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.ENTRY_PENDING, PaperRuntimeState.LONG,
                     PaperRuntimeState.SHORT, PaperRuntimeState.EXIT_PENDING, PaperRuntimeState.PAUSED,
                 }
             if transport is None:
@@ -847,7 +936,7 @@ class LaneIIIPaperRuntime:
             self._snapshot = replace(self._snapshot, observed_at=_now(), execution_bridge_healthy=healthy, reconciliation_current=False if state in {"CONNECTED", "DISCONNECTED", "AUTHENTICATED"} else self._snapshot.reconciliation_current)
             if state == "AUTHENTICATED":
                 self._command_sequence = 0
-                if self._state in {PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.READY_DISARMED, PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.PAUSED, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED}:
+                if self._state in {PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.READY_DISARMED, PaperRuntimeState.PAPER_RUNNING, PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.PAUSED, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED}:
                     self._entries_paused = self._commissioning_ownership is not None
                     self._transition(PaperRuntimeState.RECONCILING, "EXECUTION_BRIDGE_AUTHENTICATED")
             elif state == "DISCONNECTED":
@@ -859,7 +948,9 @@ class LaneIIIPaperRuntime:
                         self._transition(PaperRuntimeState.LOCKED_OUT, self._fault_reason)
                 elif self._state not in {PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.STOPPING, PaperRuntimeState.STOPPED}:
                     # A clean flat reconnect still requires a fresh snapshot.
-                    if self._state in {PaperRuntimeState.RECONCILING, PaperRuntimeState.READY_DISARMED, PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.PAUSED, PaperRuntimeState.FAULTED, PaperRuntimeState.LOCKED_OUT}:
+                    if self._operational_session is not None:
+                        self._request_operational_stop_locked("EXECUTION_BRIDGE_DISCONNECTED")
+                    if self._state in {PaperRuntimeState.RECONCILING, PaperRuntimeState.READY_DISARMED, PaperRuntimeState.PAPER_RUNNING, PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.PAUSED, PaperRuntimeState.FAULTED, PaperRuntimeState.LOCKED_OUT}:
                         self._transition(PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, "EXECUTION_BRIDGE_DISCONNECTED")
 
     def on_observation_transport_state(self, state: StreamHealth) -> None:
@@ -907,6 +998,7 @@ class LaneIIIPaperRuntime:
         self._armed_session = None
         self._fault_reason = reason
         self.risk.lock_out(reason)
+        self._request_operational_stop_locked(reason)
         self._advance_commissioning_authority_epoch()
 
     def _append_best_effort_safety_audit_locked(
@@ -992,6 +1084,7 @@ class LaneIIIPaperRuntime:
         self._disarm_after_flat = True
         self._fault_reason = reason
         self.risk.lock_out(reason)
+        self._request_operational_stop_locked(reason)
         self._activate_independent_watchdog_locked(reason)
         # _transition() writes the in-memory state before it records its audit
         # row.  On a sealed/failed ledger that can leave a phantom pending
@@ -1323,7 +1416,7 @@ class LaneIIIPaperRuntime:
                     self._recorded_evidence.add(evidence.evidence_id)
             can_cause_side_effect = (
                 decision.decision in {PaperDecisionKind.LONG, PaperDecisionKind.SHORT}
-                and self._state is PaperRuntimeState.ARMED_FLAT
+                and self._state in {PaperRuntimeState.PAPER_RUNNING, PaperRuntimeState.ARMED_FLAT}
                 and not self._entries_paused
                 and self._armed_session is not None
                 and self._armed_session.valid_at(_now())
@@ -1357,7 +1450,7 @@ class LaneIIIPaperRuntime:
                     self._request_exit(decision.reason_code)
                 return
             if (
-                self._state is PaperRuntimeState.ARMED_FLAT and not self._entries_paused
+                self._state in {PaperRuntimeState.PAPER_RUNNING, PaperRuntimeState.ARMED_FLAT} and not self._entries_paused
                 and self._armed_session is not None and self._armed_session.valid_at(_now())
                 and self._armed_session.session_id == context.session_id
                 and context.entry_permitted_at(datetime.fromisoformat(normalized_utc(event_at, "Entry event time").replace("Z", "+00:00")))
@@ -1388,13 +1481,17 @@ class LaneIIIPaperRuntime:
             return
         pnl = self._snapshot.daily_realized_pnl + self._snapshot.daily_unrealized_pnl
         if self._snapshot.foreign_activity:
+            self._request_operational_stop_locked("FOREIGN_ACTIVITY")
             self._request_exit("FOREIGN_ACTIVITY", emergency=True)
         elif pnl <= -RISK_PROFILE.daily_loss_limit_dollars:
             self.risk.lock_out("DAILY_LOSS_LIMIT")
+            self._request_operational_stop_locked("DAILY_LOSS_LIMIT")
             self._request_exit("DAILY_LOSS_LIMIT", emergency=True)
         elif self._session_context.hard_flat_due_at(datetime.fromisoformat(normalized_utc(at, "Risk exit time").replace("Z", "+00:00"))):
+            self._request_operational_stop_locked("HARD_FLAT_DEADLINE")
             self._request_exit("HARD_FLAT_DEADLINE")
         elif self.risk.maximum_age_due(self._snapshot, at):
+            self._request_operational_stop_locked("MAXIMUM_POSITION_AGE")
             self._request_exit("MAXIMUM_POSITION_AGE")
         else:
             now = datetime.fromisoformat(normalized_utc(at, "Risk exit time").replace("Z", "+00:00"))
@@ -1497,6 +1594,8 @@ class LaneIIIPaperRuntime:
         return True
 
     def _request_exit(self, reason: str, *, emergency: bool = False) -> None:
+        if emergency:
+            self._request_operational_stop_locked(reason)
         if self._position is PaperDirection.FLAT or self._state in {
             PaperRuntimeState.EXIT_PENDING, PaperRuntimeState.LOCKED_OUT,
             PaperRuntimeState.FAULTED, PaperRuntimeState.STOPPING, PaperRuntimeState.STOPPED,
@@ -1817,6 +1916,10 @@ class LaneIIIPaperRuntime:
                 return
             if self._post_exit_reconciliation_pending:
                 self._complete_post_exit_reconciliation(message)
+            elif self._operational_session_is_stopping_locked():
+                self._complete_operational_stop_locked("OPERATIONAL_STOP_RECONCILIATION_COMPLETE")
+            elif self._operational_session is not None:
+                self._transition(PaperRuntimeState.PAPER_RUNNING, "OPERATIONAL_PAPER_RECONCILIATION_COMPLETE")
             else:
                 self._transition(PaperRuntimeState.READY_DISARMED, "FLAT_RECONCILIATION_COMPLETE")
 
@@ -2016,11 +2119,21 @@ class LaneIIIPaperRuntime:
         """Close a fully evidenced lifecycle only after a fresh clean reconciliation."""
         ownership = self._commissioning_ownership
         commissioning = ownership is not None and ownership.entry_consumed
+        operational_stopping = self._operational_session_is_stopping_locked()
+        operational_active = self._operational_session is not None
         self.policy.confirm_flat(str(reconciliation.get("timestamp", _now())))
         self._pending_intent = None
         self._pending_grant = None
         self._entry_authority_artifact = None
-        target = PaperRuntimeState.READY_DISARMED if self._disarm_after_flat or commissioning else PaperRuntimeState.PAUSED if self._entries_paused else PaperRuntimeState.ARMED_FLAT
+        target = (
+            PaperRuntimeState.READY_DISARMED
+            if operational_stopping or self._disarm_after_flat or commissioning
+            else PaperRuntimeState.PAUSED
+            if self._entries_paused
+            else PaperRuntimeState.PAPER_RUNNING
+            if operational_active
+            else PaperRuntimeState.ARMED_FLAT
+        )
         self._transition(target, "POST_EXIT_FLAT_RECONCILIATION_COMPLETE")
         if commissioning:
             entry = self._entry_execution or {}
@@ -2119,6 +2232,8 @@ class LaneIIIPaperRuntime:
         self._entry_session_context = None
         self._post_exit_reconciliation_pending = False
         self._disarm_after_flat = False
+        if operational_stopping:
+            self._complete_operational_stop_locked("OPERATIONAL_STOP_FLAT_RECONCILIATION_COMPLETE")
 
     def _abort_unsubmitted_commissioning(self, reason: str) -> None:
         """Release only the pre-broker, provably flat commissioning failure."""
@@ -2346,6 +2461,144 @@ class LaneIIIPaperRuntime:
                 preflight_duration_seconds=duration,
             )
 
+    def operational_paper_readiness(
+        self,
+        ledger_preflight: Callable[[str, Mapping[str, object]], Mapping[str, object]] | None = None,
+    ) -> dict[str, object]:
+        """Run the authority-free production start proof for an operator session.
+
+        The shared validator is intentionally reused, but this method never
+        reserves commissioning ownership, creates a one-shot credential, or
+        submits a commissioning entry.
+        """
+        result = self.commissioning_rehearsal(ledger_preflight)
+        return {
+            **result,
+            "schema": "lane-iii-phase-g-operational-paper-readiness-v1",
+            "operational_paper": True,
+            "commissioning": False,
+        }
+
+    def operational_paper_start(
+        self,
+        request_id: str,
+        ledger_preflight: Callable[[str, Mapping[str, object]], Mapping[str, object]] | None = None,
+    ) -> dict[str, object]:
+        """Start one continuous Sim101 paper session without commissioning it."""
+        if (
+            not isinstance(request_id, str) or not 8 <= len(request_id) <= 128
+            or any(not (character.isalnum() or character in "-_.:") for character in request_id)
+        ):
+            raise ValueError("Operational paper start requires an 8-128 character idempotency request ID.")
+        with self._lock:
+            existing = self._operational_session
+            if existing is not None:
+                return {
+                    "started": existing.stopping_reason is None,
+                    "operational_paper": True,
+                    "request_id": existing.request_id,
+                    "idempotent_replay": existing.request_id == request_id,
+                    "reason_codes": (
+                        "OPERATIONAL_PAPER_SESSION_ALREADY_ACTIVE"
+                        if existing.stopping_reason is None else "OPERATIONAL_PAPER_SESSION_STOPPING",
+                    ),
+                    "state": self._state.value,
+                }
+
+        readiness = self.operational_paper_readiness(ledger_preflight)
+        reasons = tuple(str(value) for value in readiness.get("blocking_reasons", []) if isinstance(value, str))
+        if readiness.get("result") != "READY" or reasons:
+            with self._lock:
+                return {
+                    "started": False,
+                    "operational_paper": True,
+                    "request_id": request_id,
+                    "idempotent_replay": False,
+                    "reason_codes": reasons or ("OPERATIONAL_PAPER_PREFLIGHT_FAILED",),
+                    "state": self._state.value,
+                    "readiness": readiness,
+                }
+
+        with self._lock:
+            if self._operational_session is not None:
+                return {
+                    "started": self._operational_session.stopping_reason is None,
+                    "operational_paper": True,
+                    "request_id": self._operational_session.request_id,
+                    "idempotent_replay": self._operational_session.request_id == request_id,
+                    "reason_codes": ("OPERATIONAL_PAPER_SESSION_ALREADY_ACTIVE",),
+                    "state": self._state.value,
+                }
+            try:
+                with self.ledger.authority_capacity_fence():
+                    if self._state is not PaperRuntimeState.READY_DISARMED:
+                        return {
+                            "started": False,
+                            "operational_paper": True,
+                            "request_id": request_id,
+                            "idempotent_replay": False,
+                            "reason_codes": ("STATE_NOT_READY_DISARMED",),
+                            "state": self._state.value,
+                        }
+                    self._transition(PaperRuntimeState.STARTING, "OPERATOR_OPERATIONAL_PAPER_START")
+                    started_at = _now()
+                    session = _OperationalPaperSession(
+                        request_id=request_id,
+                        started_at=started_at,
+                        context=self._session_context,
+                        ledger_preflight=dict(readiness.get("ledger") or {}),
+                    )
+                    self.ledger.append(
+                        "SESSION_OPERATIONAL_PAPER_STARTED",
+                        {
+                            **session.context.payload(),
+                            "request_id": request_id,
+                            "started_at": started_at,
+                            "classification": "OPERATIONAL_PAPER_SESSION",
+                            "pre_start_verification": dict(readiness.get("ledger") or {}),
+                            "live_capital": "DENIED",
+                        },
+                        identity="l3g-operational-paper-start-" + canonical_hash({
+                            "request_id": request_id,
+                            "started_at": started_at,
+                        }),
+                        execution_session_id=self._execution_session_id(),
+                    )
+                    self._operational_session = session
+                    armed = self._arm_with_capacity_fence_locked(
+                        target_state=PaperRuntimeState.PAPER_RUNNING,
+                        allow_starting=True,
+                    )
+                    if not armed.get("armed"):
+                        self._operational_session = None
+                        if self._state is PaperRuntimeState.STARTING:
+                            self._transition(PaperRuntimeState.READY_DISARMED, "OPERATIONAL_PAPER_START_REFUSED")
+                        return {
+                            **armed,
+                            "started": False,
+                            "operational_paper": True,
+                            "request_id": request_id,
+                            "idempotent_replay": False,
+                        }
+                    return {
+                        **armed,
+                        "started": True,
+                        "operational_paper": True,
+                        "request_id": request_id,
+                        "idempotent_replay": False,
+                        "readiness": readiness,
+                    }
+            except LedgerCapacityError as error:
+                self._pause_for_ledger_capacity_locked(error.capacity)
+                return {
+                    "started": False,
+                    "operational_paper": True,
+                    "request_id": request_id,
+                    "idempotent_replay": False,
+                    "reason_codes": ("LEDGER_CAPACITY_INADEQUATE",),
+                    "state": self._state.value,
+                }
+
     def arm(self) -> dict[str, object]:
         with self._lock:
             try:
@@ -2359,11 +2612,18 @@ class LaneIIIPaperRuntime:
                     "state": self._state.value,
                 }
 
-    def _arm_with_capacity_fence_locked(self) -> dict[str, object]:
+    def _arm_with_capacity_fence_locked(
+        self,
+        *,
+        target_state: PaperRuntimeState = PaperRuntimeState.ARMED_FLAT,
+        allow_starting: bool = False,
+    ) -> dict[str, object]:
         """Persist an arm outcome while the ledger capacity/order fence is held."""
         if self._entry_owner is not PaperEntryOwner.NONE:
             return {"armed": False, "reason_codes": ("COMMISSIONING_OWNERSHIP_ACTIVE",), "state": self._state.value}
-        if self._state is not PaperRuntimeState.READY_DISARMED:
+        if self._state is not PaperRuntimeState.READY_DISARMED and not (
+            allow_starting and self._state is PaperRuntimeState.STARTING
+        ):
             return {"armed": False, "reason_codes": ("STATE_NOT_READY_DISARMED",), "state": self._state.value}
         transport = None if self._transport is None else self._transport.status()
         if transport is None or not transport.addon_provenance_valid:
@@ -2396,7 +2656,12 @@ class LaneIIIPaperRuntime:
             context.boundary_at("entry_cutoff").isoformat().replace("+00:00", "Z"),
         )
         self._entries_paused = False
-        self._transition(PaperRuntimeState.ARMED_FLAT, "OPERATOR_ARM_AFTER_PREFLIGHT")
+        transition_reason = (
+            "OPERATOR_OPERATIONAL_PAPER_SESSION_STARTED"
+            if target_state is PaperRuntimeState.PAPER_RUNNING
+            else "OPERATOR_ARM_AFTER_PREFLIGHT"
+        )
+        self._transition(target_state, transition_reason)
         return {
             "armed": True, "reason_codes": ("PAPER_ARMED",), "state": self._state.value,
             "session_armed_state": "ARMED_" + context.session_kind.value, "arm_grant": self._armed_session.payload(),
@@ -2906,12 +3171,70 @@ class LaneIIIPaperRuntime:
             if self._armed_session is None or not self._armed_session.valid_at(_now()):
                 return {"resumed": False, "state": self._state.value, "reason": "SESSION_ARM_EXPIRED"}
             self._entries_paused = False
-            target = PaperRuntimeState.ARMED_FLAT if self._position is PaperDirection.FLAT else PaperRuntimeState.LONG if self._position is PaperDirection.LONG else PaperRuntimeState.SHORT
+            target = (
+                PaperRuntimeState.PAPER_RUNNING
+                if self._position is PaperDirection.FLAT and self._operational_session is not None
+                else PaperRuntimeState.ARMED_FLAT
+                if self._position is PaperDirection.FLAT
+                else PaperRuntimeState.LONG
+                if self._position is PaperDirection.LONG
+                else PaperRuntimeState.SHORT
+            )
             self._transition(target, "OPERATOR_RESUME_ENTRIES")
             return {"resumed": True, "state": self._state.value}
 
     def flatten_and_disarm(self) -> dict[str, object]:
         with self._lock:
+            operational = self._operational_session
+            if operational is not None:
+                self._request_operational_stop_locked("OPERATOR_STOP_TRADING")
+                audit_payload = {
+                    "position": self._position.value,
+                    "state": self._state.value,
+                    "request_id": operational.request_id,
+                    "operational_paper": True,
+                }
+                if self._position is PaperDirection.FLAT and (
+                    self._state is PaperRuntimeState.ENTRY_PENDING or self._snapshot.working_owned_orders > 0
+                ):
+                    self._cancel_pending_and_reconcile()
+                    result = {
+                        "initiated": True,
+                        "stopping": True,
+                        "flat_confirmed": False,
+                        "state": self._state.value,
+                        "reason_codes": ("OPERATIONAL_STOP_PENDING_RECONCILIATION",),
+                    }
+                elif self._position is PaperDirection.FLAT and (
+                    self._snapshot.reconciliation_current
+                    and self._snapshot.position_snapshot_complete
+                    and self._snapshot.order_snapshot_complete
+                    and self._snapshot.working_owned_orders == 0
+                ):
+                    self._complete_operational_stop_locked("OPERATOR_STOP_TRADING_RECONCILED")
+                    result = {
+                        "initiated": True,
+                        "stopping": False,
+                        "flat_confirmed": True,
+                        "state": self._state.value,
+                        "reason_codes": ("OPERATIONAL_STOP_RECONCILED",),
+                    }
+                else:
+                    self._request_exit("OPERATOR_STOP_TRADING", emergency=True)
+                    result = {
+                        "initiated": self._state is not PaperRuntimeState.FAULTED,
+                        "stopping": True,
+                        "flat_confirmed": False,
+                        "state": self._state.value,
+                        "reason_codes": (
+                            "OPERATIONAL_STOP_PENDING_RECONCILIATION"
+                            if self._state is not PaperRuntimeState.FAULTED
+                            else "OPERATIONAL_STOP_REQUIRES_EMERGENCY_KILL",
+                        ),
+                    }
+                self._append_best_effort_safety_audit_locked("RISK_EVENT_FLATTEN_AND_DISARM", audit_payload)
+                return result
+
             self._entries_paused = True
             self._armed_session = None
             self._disarm_after_flat = True
@@ -3094,7 +3417,7 @@ class LaneIIIPaperRuntime:
                 "mode": "PAPER_SIM101",
                 "display_mode": "EXPERIMENTAL PAPER",
                 "state": self._state.value,
-                "paper_execution": "POSITIONED" if self._position is not PaperDirection.FLAT else "ARMED" if self._state in {PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.PAUSED} else "LOCKED" if self._state in {PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED} else "DISARMED",
+                "paper_execution": "POSITIONED" if self._position is not PaperDirection.FLAT else "RUNNING" if self._state is PaperRuntimeState.PAPER_RUNNING else "ARMED" if self._state in {PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.PAUSED} else "LOCKED" if self._state in {PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED} else "DISARMED",
                 "scientific_lane_iii": "INCOMPLETE / BLOCKED ON SEQUENCING",
                 "scientific_eligibility": False,
                 "sequence_authority": "LOCAL_CALLBACK_ORDER_ONLY",
@@ -3201,6 +3524,7 @@ class LaneIIIPaperRuntime:
                     "strategy_generated": ownership is None,
                     "scientific_evidence": False,
                 },
+                "operational_paper_session": self._operational_session_payload(),
                 "last_paper_decision": None if self._last_decision is None else self._last_decision.payload(),
                 "last_risk_result": risk.get("last_risk_result"),
                 "last_command": None if self._last_command is None else self._last_command.payload(),

@@ -21,6 +21,12 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
   const status = paper.slimStatus;
   const light = status?.light || "RED";
   const active = status?.paper_active === true;
+  const runtimeState = String(paper.status?.state || "");
+  const runtimeMayBeActive = paper.status?.operational_paper_session?.active === true
+    || ["STARTING", "PAPER_RUNNING", "ENTRY_PENDING", "OPEN_POSITION", "EXIT_PENDING", "PAUSED", "RECONCILING", "FAULTED", "LOCKED_OUT"].includes(runtimeState);
+  // Keep the stop control available if the concise status cannot be refreshed
+  // but the last canonical runtime snapshot could still represent authority.
+  const stopAvailable = active || runtimeMayBeActive || status === null;
   const verification = status?.ledger_verification || {};
   const pnl = status?.pnl || { state: "MISSING" };
   const verificationRunning = verification.state === "IN_PROGRESS" || paper.verificationInFlight;
@@ -61,9 +67,9 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
         Ledger Verification
       </button>
       <p id="slim-verification-result" className={`slim-verification-result ${verification.state === "FAIL" ? "failed" : ""}`} role="status" aria-live="polite">{resultLabel}</p>
-      {active
-        ? <button className="slim-action stop" type="button" disabled={paper.busy} onClick={() => void paper.stopAndDisarm()}>{paper.busy ? "Stopping…" : "Stop & Disarm"}</button>
-        : <button className="slim-action start" type="button" disabled={!startEnabled} onClick={() => void paper.startCommissioning()} aria-describedby="slim-readiness-heading">{paper.busy ? "Starting…" : "Start Paper Trading"}</button>}
+      {stopAvailable
+        ? <button className="slim-action stop" type="button" disabled={paper.busy} onClick={() => void paper.stopAndDisarm()}>{paper.busy ? "STOPPING…" : "STOP TRADING"}</button>
+        : <button className="slim-action start" type="button" disabled={!startEnabled} onClick={() => void paper.startPaperTrading()} aria-describedby="slim-readiness-heading">{paper.busy ? "Starting…" : "Start Paper Trading"}</button>}
     </section>
     {paper.error && <p className="slim-error" role="alert">Status unavailable — {paper.error}</p>}
     <p className="slim-footnote">Paper-only Sim101 controls. Full Console contains diagnostics and advanced controls.</p>

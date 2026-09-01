@@ -7,7 +7,12 @@ from typing import Mapping
 from .ledger import deferred_capacity_allows_authority
 
 
-def ledger_health_projection(runtime: Mapping[str, object], verification: Mapping[str, object]) -> dict[str, object]:
+def ledger_health_projection(
+    runtime: Mapping[str, object],
+    verification: Mapping[str, object],
+    *,
+    operational_session: Mapping[str, object] | None = None,
+) -> dict[str, object]:
     """Join inexpensive writer state with the verifier's durable authority."""
     value = dict(runtime)
     current = int(value.get("highest_sequence") or 0)
@@ -72,6 +77,28 @@ def ledger_health_projection(runtime: Mapping[str, object], verification: Mappin
         )
     else:
         commissioning_state = "UNTRUSTED"
+    operational_active = (
+        isinstance(operational_session, Mapping)
+        and operational_session.get("active") is True
+    )
+    online_append_integrity = (
+        operational_active
+        and verification_pass
+        and writer_capacity_healthy
+        and value.get("chain_valid") is not False
+        and classified_sequence == current
+        and classified_hash == value.get("final_record_hash")
+        and isinstance(unknown_sequence, int)
+        and verified is not None
+        and unknown_sequence <= verified
+    )
+    operational_tail_state = (
+        "LEGITIMATE_AUTHORITY_MUTATION_TAIL_AWAITING_BATCH_VERIFICATION"
+        if online_append_integrity and isinstance(authority_sequence, int) and authority_sequence > (verified or 0)
+        else "ONLINE_APPEND_INTEGRITY_VALID"
+        if online_append_integrity
+        else "ONLINE_APPEND_INTEGRITY_FAILED"
+    )
     value.update({
         "main_database_bytes": value.get("file_size"),
         "total_footprint_bytes": sum(int(value.get(name) or 0) for name in ("file_size", "wal_size")),
@@ -121,6 +148,17 @@ def ledger_health_projection(runtime: Mapping[str, object], verification: Mappin
         "epoch_warning": value.get("epoch_id") == "UNSPECIFIED",
         "deferred_capacity": dict(capacity),
         "writer_capacity_healthy": writer_capacity_healthy,
+        "operational_ledger": {
+            "active": operational_active,
+            "online_append_integrity": online_append_integrity,
+            "tail_state": operational_tail_state,
+            "verification_anchor_sequence": verified,
+            "tail_tip_sequence": current,
+            "unknown_tail_present": (
+                isinstance(unknown_sequence, int) and verified is not None and unknown_sequence > verified
+            ),
+            "batch_verification_required_after_stop": operational_active and tail not in (None, 0),
+        },
     })
     return value
 

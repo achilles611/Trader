@@ -30,6 +30,8 @@ let commissioningRehearsalResponse: Record<string, unknown> | null = null;
 let commissioningRehearsalSideEffect: (() => void) | null = null;
 let commissioningStartResponse: Record<string, unknown> | null = null;
 let commissioningStartSideEffect: (() => void) | null = null;
+let operationalStartResponse: Record<string, unknown> | null = null;
+let operationalStartSideEffect: (() => void) | null = null;
 let slimStatusResponse: Record<string, unknown> = {
   generated_at: new Date().toISOString(), light: "RED", label: "NOT READY",
   message: "Paper runtime status is unavailable.", can_start: false, paper_active: false,
@@ -78,6 +80,10 @@ function payload(path: string) {
   if (path.startsWith("/api/lane-iii/paper/commissioning-start")) {
     commissioningStartSideEffect?.();
     return commissioningStartResponse || { submitted: false, state: "READY_DISARMED" };
+  }
+  if (path.startsWith("/api/lane-iii/paper/operational-start")) {
+    operationalStartSideEffect?.();
+    return operationalStartResponse || { started: false, state: "READY_DISARMED" };
   }
   if (path.startsWith("/api/lane-iii/paper")) return {
     state: "READY_DISARMED",
@@ -184,6 +190,8 @@ beforeEach(() => {
   commissioningRehearsalSideEffect = null;
   commissioningStartResponse = null;
   commissioningStartSideEffect = null;
+  operationalStartResponse = null;
+  operationalStartSideEffect = null;
   slimStatusResponse = {
     generated_at: new Date().toISOString(), light: "RED", label: "NOT READY",
     message: "Paper runtime status is unavailable.", can_start: false, paper_active: false,
@@ -641,7 +649,7 @@ describe("copy control center", () => {
     expect(await screen.findByText("10%")).toBeInTheDocument();
   });
 
-  it("renders the compact green Slim Mode with all three lights and the guarded paper-start path", async () => {
+  it("renders the compact green Slim Mode with all three lights and the persistent paper-start path", async () => {
     slimStatusResponse = {
       generated_at: new Date().toISOString(), light: "GREEN", label: "READY TO START PAPER TRADING",
       message: "All canonical paper-start gates are currently satisfied.", can_start: true, paper_active: false,
@@ -655,7 +663,8 @@ describe("copy control center", () => {
     const start = screen.getByRole("button", { name: "Start Paper Trading" });
     expect(start).toBeEnabled();
     fireEvent.click(start);
-    await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/lane-iii/paper/commissioning-start", expect.objectContaining({ method: "POST" })));
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/lane-iii/paper/operational-start", expect.objectContaining({ method: "POST" })));
+    expect(fetch).not.toHaveBeenCalledWith("/api/lane-iii/paper/commissioning-start", expect.anything());
     expect(screen.getByText("$10.25")).toBeInTheDocument();
   });
 
@@ -666,8 +675,8 @@ describe("copy control center", () => {
       ledger_verification: { state: "PASS", completed_at: "2026-09-01T14:00:00Z", message: "Verified" },
       pnl: { state: "CURRENT", total: "1", realized: "1", unrealized: "0" },
     };
-    commissioningStartResponse = { submitted: false, armed: false, state: "READY_DISARMED", reason_codes: ["COMMISSIONING_READINESS_SNAPSHOT_STALE"] };
-    commissioningStartSideEffect = () => {
+    operationalStartResponse = { started: false, armed: false, state: "READY_DISARMED", reason_codes: ["OPERATIONAL_PAPER_PREFLIGHT_STALE"] };
+    operationalStartSideEffect = () => {
       slimStatusResponse = {
         generated_at: new Date().toISOString(), light: "RED", label: "NOT READY",
         message: "Runtime changed during the last readiness check.", can_start: false, paper_active: false,
@@ -698,7 +707,7 @@ describe("copy control center", () => {
     expect(screen.getByRole("button", { name: "Ledger Verification" })).toBeDisabled();
   });
 
-  it("uses the same stop-and-disarm command while active and preserves mode preference without changing Full Console", async () => {
+  it("preserves an active backend paper session across refresh and mode changes, then uses STOP TRADING", async () => {
     slimStatusResponse = {
       generated_at: new Date().toISOString(), light: "GREEN", label: "PAPER TRADING ACTIVE",
       message: "Sim101 paper operation is healthy and protected.", can_start: false, paper_active: true,
@@ -707,13 +716,16 @@ describe("copy control center", () => {
     };
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
-    const stop = await screen.findByRole("button", { name: "Stop & Disarm" });
-    fireEvent.click(stop);
-    await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/lane-iii/paper/flatten-and-disarm", expect.objectContaining({ method: "POST" })));
     expect(localStorage.getItem("beezconsole-console-mode")).toBe("slim");
     fireEvent.click(screen.getByRole("button", { name: "Full Console" }));
     expect(await screen.findByRole("button", { name: "Lane III Paper" })).toBeInTheDocument();
     expect(localStorage.getItem("beezconsole-console-mode")).toBe("full");
+    expect(fetch).not.toHaveBeenCalledWith("/api/lane-iii/paper/flatten-and-disarm", expect.anything());
+    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+    const stop = await screen.findByRole("button", { name: "STOP TRADING" });
+    fireEvent.click(stop);
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/lane-iii/paper/flatten-and-disarm", expect.objectContaining({ method: "POST" })));
+    expect(fetch).not.toHaveBeenCalledWith("/api/lane-iii/paper/operational-start", expect.anything());
   });
 
   it("falls back to Full Console for an invalid saved mode preference", async () => {
@@ -764,6 +776,7 @@ describe("copy control center", () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
     expect(await screen.findByText("Status unavailable — backend endpoint returned HTML")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "STOP TRADING" })).toBeEnabled();
 
     cleanup();
     localStorage.clear();
