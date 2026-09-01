@@ -751,4 +751,24 @@ describe("copy control center", () => {
     render(<App />);
     expect(await screen.findByRole("button", { name: "Full Console" })).toBeInTheDocument();
   });
+
+  it("shows a concise HTML-endpoint failure in both Slim and Full Console", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.startsWith("/api/lane-iii/paper/slim-status") || path === "/api/lane-iii/paper") {
+        return new Response("<!doctype html><html></html>", { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
+      }
+      return new Response(JSON.stringify(payload(path)), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+    expect(await screen.findByText("Status unavailable — backend endpoint returned HTML")).toBeInTheDocument();
+
+    cleanup();
+    localStorage.clear();
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Lane III Paper" }));
+    expect(await screen.findByText("Paper status unavailable — backend endpoint returned HTML")).toBeInTheDocument();
+  });
 });

@@ -30,3 +30,13 @@ commissioning-start endpoint as Full Console, while **Stop & Disarm** uses the
 existing guarded flatten-and-disarm endpoint. Neither control can reach live
 capital, and neither view overrides provenance, verification, reconciliation,
 observer, account-class, quantity, protection, or session gates.
+
+## Combined-server API contract
+
+Slim Mode requests the same-origin URL
+`/api/lane-iii/paper/slim-status`. The combined BeezConsole server registers
+that API route before its frontend fallback. Any unmatched `GET /api/*` route
+returns structured `404 application/json` (`API_ENDPOINT_NOT_FOUND`), never
+the SPA `index.html`. The browser validates both HTTP status and JSON content
+type before parsing; an HTML response is shown as the concise, fail-closed
+operator message `Status unavailable — backend endpoint returned HTML`.

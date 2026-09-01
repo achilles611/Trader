@@ -435,7 +435,7 @@ function LaneIIIPaperPage({ paper, confirmation }: { paper: PaperConsoleState; c
   const blockers = rehearsal?.blocking_reasons || [];
   return <div className="page-grid">
     <section className="panel span-12 l3g-warning" role="alert"><strong>EXPERIMENTAL PAPER EXECUTION</strong><span>NOT SCIENTIFICALLY COMMISSIONED</span><span>SIM101 ONLY</span><span>LIVE CAPITAL DENIED</span></section>
-    {error && <section className="panel span-12"><p className="empty-note">{error}</p></section>}
+    {error && <section className="panel span-12"><p className="empty-note">Paper status unavailable — {error}</p></section>}
     <section className="panel span-12"><PanelTitle title="Commissioning readiness" subtitle="Every gate remains visible. Only the rehearsal runs the complete production validator graph; it cannot reserve ownership, arm, or submit an order." /><div className="metric-grid">
       <div className="metric-card"><span>FINAL</span><strong>{rehearsalIsCurrent ? "READY FOR COMMISSIONING" : rehearsal?.result === "READY" ? "REHEARSAL STALE" : rehearsal?.result === "BLOCKED" ? "BLOCKED" : "REHEARSAL REQUIRED"}</strong></div>
       <div className="metric-card"><span>SESSION</span><strong>{status?.current_session || "OFF_SESSION"} / {status?.entry_window || "UNKNOWN"}</strong></div>

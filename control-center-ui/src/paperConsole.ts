@@ -55,7 +55,11 @@ export function usePaperConsoleState({ active, includeSlim, notify }: Options): 
       setError(null);
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : "Lane III paper status is unavailable.");
-      // An old green result must never survive a failed Slim refresh.
+      // No prior paper state may survive a failed refresh in either view.
+      // In particular, a stale READY_DISARMED status must not leave a Full
+      // Console control looking eligible while its backend is unavailable.
+      setStatus(null);
+      setSchedule(null);
       if (includeSlim) setSlimStatus(null);
     }
   }, [includeSlim]);

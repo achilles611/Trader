@@ -65,7 +65,7 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
         ? <button className="slim-action stop" type="button" disabled={paper.busy} onClick={() => void paper.stopAndDisarm()}>{paper.busy ? "Stopping…" : "Stop & Disarm"}</button>
         : <button className="slim-action start" type="button" disabled={!startEnabled} onClick={() => void paper.startCommissioning()} aria-describedby="slim-readiness-heading">{paper.busy ? "Starting…" : "Start Paper Trading"}</button>}
     </section>
-    {paper.error && <p className="slim-error" role="alert">Status unavailable: {paper.error}</p>}
+    {paper.error && <p className="slim-error" role="alert">Status unavailable — {paper.error}</p>}
     <p className="slim-footnote">Paper-only Sim101 controls. Full Console contains diagnostics and advanced controls.</p>
   </main>;
 }

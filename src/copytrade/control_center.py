@@ -2823,6 +2823,18 @@ def create_control_center_app(
 
         @app.get("/{path:path}", response_class=FileResponse)
         async def frontend(path: str) -> Any:
+            # The SPA shell must never masquerade as an API success.  Routes
+            # above own every registered API handler; an unmatched API GET is
+            # a backend failure and stays structured JSON for all clients.
+            if path == "api" or path.startswith("api/"):
+                return JSONResponse(
+                    status_code=404,
+                    content={
+                        "detail": "API endpoint not found.",
+                        "code": "API_ENDPOINT_NOT_FOUND",
+                        "path": f"/{path}",
+                    },
+                )
             root = frontend_dist.resolve()
             requested = (root / path).resolve() if path else root / "index.html"
             # Only explicitly built files under dist may be served.  Every SPA
