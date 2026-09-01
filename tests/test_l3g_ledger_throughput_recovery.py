@@ -512,6 +512,7 @@ class LedgerThroughputRecoveryTests(unittest.TestCase):
                 self.assertEqual(reuse["mode"], "RESTART")
                 self.assertTrue(reuse["complete"], reuse)
                 self.assertEqual(reuse["busy"], 0)
+                self.assertEqual(telemetry["wal_passive_checkpoint_trigger_records"], 1_024)
 
                 # A retained physical WAL allocation after a complete
                 # PASSIVE copy remains safe. The 1 GiB disk-growth backstop
