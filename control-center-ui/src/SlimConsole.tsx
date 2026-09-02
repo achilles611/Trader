@@ -24,26 +24,20 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
   const runtimeState = String(paper.status?.state || "");
   const runtimeMayBeActive = paper.status?.operational_paper_session?.active === true
     || ["STARTING", "PAPER_RUNNING", "ENTRY_PENDING", "OPEN_POSITION", "EXIT_PENDING", "PAUSED", "RECONCILING", "FAULTED", "LOCKED_OUT"].includes(runtimeState);
-  // Keep the stop control available if the concise status cannot be refreshed
-  // but the last canonical runtime snapshot could still represent authority.
-  // Any non-green presentation is safety-ambiguous from the operator's point
-  // of view. Keep the idempotent stop path visible rather than making them
-  // infer whether a red or yellow transition still owns paper authority.
-  const stopAvailable = active || runtimeMayBeActive || status === null || light !== "GREEN";
-  const verification = status?.ledger_verification || {};
-  const maintenance = paper.ninjaTraderMaintenance;
-  const maintenanceButton = maintenance?.button || { label: "Checking NinjaTrader…", enabled: false, tone: "progress" };
-  const maintenanceDisabled = maintenanceButton.enabled !== true || maintenance?.in_progress === true || paper.maintenanceBusy;
+  // Keep the idempotent stop path when authority may exist or current runtime
+  // truth is unavailable. A known disarmed red/yellow state is a prerequisite
+  // condition for the backend-owned start sequence, not a reason to show STOP.
+  const stopAvailable = active || runtimeMayBeActive || (status === null && paper.status === null);
+  const autoStart = paper.paperAutoStart;
+  const autoStartButton = autoStart?.button || { label: "Checking startup gates…", enabled: false };
   const pnl = status?.pnl || { state: "MISSING" };
   const session = status?.session || {};
-  const verificationRunning = verification.state === "IN_PROGRESS" || paper.verificationInFlight;
-  const startEnabled = status?.can_start === true && !paper.busy;
+  const startEnabled = autoStartButton.enabled === true && autoStart?.in_progress !== true && !paper.autoStartBusy;
   const pnlUnavailable = pnl.state !== "CURRENT";
-  const resultLabel = verificationRunning
-    ? "Verifying…"
-    : verification.state === "PASS" ? `Verified${verification.completed_at ? ` · ${new Date(verification.completed_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : ""}`
-    : verification.state === "FAIL" ? verification.message || "Verification failed"
-    : verification.message || "Verification required";
+  const startupStatus = autoStart?.in_progress
+    ? autoStartButton.label
+    : autoStart?.blockers?.length ? `Blocked: ${autoStart.blockers.join(", ")}`
+    : "Launch, sign-in, MNQ observer, reconciliation, and ledger verification are automatic.";
 
   return <main className="slim-console" aria-label="BeezConsole Slim Mode">
     <header className="slim-header">
@@ -61,31 +55,6 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
       <p className="slim-session">Session: <strong>{session.session_kind || "OFF_SESSION"}</strong>{session.session_family ? ` / ${session.session_family}` : ""}{session.entry_window ? ` · ${session.entry_window}` : ""}</p>
     </section>
 
-    <section className="slim-card slim-ninjatrader" aria-labelledby="slim-ninjatrader-heading">
-      <div className="slim-kicker">NINJATRADER / MNQ OBSERVER</div>
-      <h2 id="slim-ninjatrader-heading" className={maintenance?.readiness === "READY" ? "positive" : "neutral"}>
-        {maintenance?.readiness === "READY" ? "READY" : maintenance?.stage || "CHECKING"}
-      </h2>
-      <button
-        className={`slim-action ninja-maintenance ${maintenanceButton.tone || "primary"}`}
-        type="button"
-        disabled={maintenanceDisabled}
-        onClick={() => void paper.startNinjaTraderMaintenance()}
-      >
-        {paper.maintenanceBusy ? "Starting maintenance…" : maintenanceButton.label}
-      </button>
-      <dl className="slim-maintenance-status">
-        <div><dt>Process</dt><dd>{maintenance?.process?.state || "UNKNOWN"}</dd></div>
-        <div><dt>AddOn / provenance</dt><dd>{maintenance ? `${maintenance.addon?.state || "UNKNOWN"} / ${maintenance.addon?.provenance || "UNVERIFIED"}` : "UNKNOWN"}</dd></div>
-        <div><dt>Configured instrument</dt><dd>{maintenance?.configured_instrument || "UNRESOLVED"}</dd></div>
-        <div><dt>Chart</dt><dd>{maintenance?.chart?.found ? `FOUND / ${maintenance.chart.instrument || "UNKNOWN"}` : maintenance?.chart?.state || "NOT FOUND"}</dd></div>
-        <div><dt>Observer</dt><dd>{maintenance?.observer?.attached ? "ATTACHED" : "NOT ATTACHED"}</dd></div>
-        <div><dt>Market data</dt><dd>{maintenance?.observer?.market_data_fresh ? "FRESH" : maintenance?.observer?.freshness_reason || "NOT FRESH"}</dd></div>
-      </dl>
-      {maintenance?.blockers?.length > 0 && <p className="slim-maintenance-blocker" role="alert">Blocked: {maintenance.blockers.join(", ")}</p>}
-      {maintenance?.manual_action && <p className="slim-maintenance-manual" role="status">Manual step: {maintenance.manual_action}</p>}
-    </section>
-
     <section className="slim-card slim-pnl" aria-labelledby="slim-pnl-heading">
       <div className="slim-kicker">PAPER / SESSION P&amp;L</div>
       <h2 id="slim-pnl-heading" className={pnlUnavailable ? "neutral" : pnlClass(pnl.total)}>{pnlUnavailable ? (pnl.state === "STALE" ? "STALE" : "—") : money(pnl.total)}</h2>
@@ -96,13 +65,10 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
     </section>
 
     <section className="slim-actions" aria-label="Paper controls">
-      <button className="slim-action verification" type="button" disabled={paper.busy || verificationRunning} onClick={() => void paper.startVerification()} aria-describedby="slim-verification-result">
-        Ledger Verification
-      </button>
-      <p id="slim-verification-result" className={`slim-verification-result ${verification.state === "FAIL" ? "failed" : ""}`} role="status" aria-live="polite">{resultLabel}</p>
       {stopAvailable
         ? <button className="slim-action stop" type="button" disabled={paper.busy} onClick={() => void paper.stopAndDisarm()}>{paper.busy ? "STOPPING…" : "STOP TRADING"}</button>
-        : <button className="slim-action start" type="button" disabled={!startEnabled} onClick={() => void paper.startPaperTrading()} aria-describedby="slim-readiness-heading">{paper.busy ? "Starting…" : "Start Paper Trading"}</button>}
+        : <button className="slim-action start" type="button" disabled={!startEnabled} onClick={() => void paper.startPaperAutoStart()} aria-describedby="slim-startup-status">{paper.autoStartBusy ? "Starting…" : autoStartButton.label}</button>}
+      <p id="slim-startup-status" className="slim-verification-result" role="status" aria-live="polite">{startupStatus}</p>
     </section>
     {paper.error && <p className="slim-error" role="alert">Status unavailable — {paper.error}</p>}
     <p className="slim-footnote">Paper-only Sim101 controls. Full Console contains diagnostics and advanced controls.</p>

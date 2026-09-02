@@ -237,8 +237,11 @@ class NinjaTraderLoginBootstrapTests(unittest.TestCase):
         self.assertIn("bootstrap.state is not NinjaTraderLoginState.AUTHENTICATED", control_center)
         self.assertNotIn("PaperExecutionIntent", source)
         self.assertNotIn("LucidFlex25k", source)
-        self.assertNotIn("else NinjaTraderLoginBootstrap()", control_center)
-        self.assertIn('"state": "MANUAL_LOGIN_ONLY"', control_center)
+        self.assertIn("else NinjaTraderLoginBootstrap()", control_center)
+        self.assertIn('"state": "READY_ON_DEMAND"', control_center)
+        self.assertIn("begin_automatic_ninjatrader_login", control_center)
+        lifespan = control_center[control_center.index("async def lifespan"):control_center.index("app = FastAPI")]
+        self.assertNotIn("NinjaTraderLoginBootstrap()", lifespan)
 
 
 if __name__ == "__main__":

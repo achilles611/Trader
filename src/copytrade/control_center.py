@@ -38,6 +38,12 @@ from src.l3g_paper.ninjatrader_maintenance import (
     AUTH_TOKEN_HEADER,
     NinjaTraderMaintenanceService,
 )
+from src.l3g_paper.paper_autostart import (
+    PAPER_AUTOSTART_ACTION_HEADER,
+    PAPER_AUTOSTART_ACTION_VALUE,
+    PAPER_AUTOSTART_TOKEN_HEADER,
+    PaperAutoStartService,
+)
 from src.l3g_paper.ninjatrader_transport import PaperExecutionTransport
 from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout
 from src.l3g_paper.sessions import session_catalog
@@ -1462,6 +1468,7 @@ def create_control_center_app(
                     "instrument": None,
                     "chart_found": False,
                     "observer_attached": False,
+                    "subscription_mode": None,
                     "observed_at": None,
                 },
                 "market_observer_freshness": {
@@ -1493,9 +1500,9 @@ def create_control_center_app(
         if bootstrap is None:
             return {
                 "schema": "lane-iii-phase-g-ninjatrader-login-bootstrap-v1",
-                "state": "MANUAL_LOGIN_ONLY",
+                "state": "READY_ON_DEMAND",
                 "attempt_count": 0,
-                "automation_enabled": False,
+                "automation_enabled": True,
                 "ninjatrader_process_detected": False,
                 "login_window_detected": False,
                 "control_center_detected": False,
@@ -1600,18 +1607,71 @@ def create_control_center_app(
         sequence = payload.get("command_sequence") if isinstance(payload, Mapping) else None
         return int(sequence) if type(sequence) is int and sequence >= 0 else 0
 
+    def begin_automatic_ninjatrader_login() -> bool:
+        """Create one sealed, redacted login attempt for the active startup."""
+        current = ninjatrader_runtime.get("login_bootstrap")
+        if type(current) is NinjaTraderLoginBootstrap and current.state not in {
+            NinjaTraderLoginState.AUTHENTICATED,
+            NinjaTraderLoginState.BLOCKED,
+            NinjaTraderLoginState.FAULTED,
+        }:
+            current.start()
+            return True
+        if type(current) is NinjaTraderLoginBootstrap:
+            current.stop()
+        bootstrap = (
+            ninjatrader_login_bootstrap_factory()
+            if ninjatrader_login_bootstrap_factory is not None
+            else NinjaTraderLoginBootstrap()
+        )
+        if type(bootstrap) is not NinjaTraderLoginBootstrap:
+            raise RuntimeError("NINJATRADER_LOGIN factory must return the exact sealed bootstrap")
+        ninjatrader_runtime["login_bootstrap"] = bootstrap
+        app.state.ninjatrader_login_bootstrap = bootstrap
+        bootstrap.start()
+        return True
+
     maintenance_arguments = {
         "paper_status": lane_iii_paper_health,
         "live_status": lane_iii_live_health,
         "ledger_status": ledger_verifier.status,
         "start_ledger_verification": lambda: ledger_verifier.start("incremental"),
         "historical_command_count": lambda: latest_durable_command_sequence(),
+        "begin_automatic_login": begin_automatic_ninjatrader_login,
+        "automatic_login_status": ninja_login_health,
         "audit_path": audit_root / "ninjatrader-maintenance-audit.jsonl",
     }
     ninjatrader_maintenance = (
         ninjatrader_maintenance_factory(**maintenance_arguments)
         if ninjatrader_maintenance_factory is not None
         else NinjaTraderMaintenanceService(**maintenance_arguments)
+    )
+
+    def start_operational_paper_from_autostart(request_id: str) -> Mapping[str, object]:
+        """Enter only the canonical persistent Sim101 lifecycle after orchestration."""
+        paper = ninjatrader_runtime.get("paper")
+        if not isinstance(paper, LaneIIIPaperRuntime):
+            raise RuntimeError("PAPER_RUNTIME_UNAVAILABLE")
+        try:
+            return paper.operational_paper_start(
+                request_id,
+                require_operational_paper_ledger_verification,
+            )
+        except HTTPException as error:
+            NINJATRADER_RUNTIME_LOGGER.warning(
+                "One-click paper start was refused by the canonical gate: %s",
+                error.detail,
+            )
+            raise RuntimeError("OPERATIONAL_PAPER_START_REFUSED") from error
+
+    paper_autostart = PaperAutoStartService(
+        paper_status=lane_iii_paper_health,
+        ensure_ninjatrader=ninjatrader_maintenance.ensure_started,
+        ninjatrader_status=ninjatrader_maintenance.status,
+        start_full_verification=lambda: ledger_verifier.start("full"),
+        ledger_status=ledger_verifier.status,
+        start_operational_paper=start_operational_paper_from_autostart,
+        audit_path=audit_root / "paper-autostart-audit.jsonl",
     )
 
     async def quiesce_ledger_verifier_for_shutdown() -> dict[str, object]:
@@ -1700,7 +1760,6 @@ def create_control_center_app(
         paper_transport: PaperExecutionTransport | None = None
         paper_runtime: LaneIIIPaperRuntime | None = None
         paper_ledger: PaperLedger | None = None
-        login_bootstrap: NinjaTraderLoginBootstrap | None = None
         verifier_shutdown: dict[str, object] | None = None
         runtime_watchdog_shutdown: dict[str, object] = {
             "required": False,
@@ -1815,21 +1874,8 @@ def create_control_center_app(
                     f"NINJATRADER_OBSERVER startup failed at {listener_status.host}:{listener_status.port}: "
                     f"{listener_status.error or listener_status.state}"
                 )
-            # Listener ownership is established before desktop bootstrap so a
-            # newly started NinjaTrader process cannot build an offline market
-            # callback queue or miss the signed execution handshake.
-            if ninjatrader_login_bootstrap_factory is not None:
-                login_bootstrap = ninjatrader_login_bootstrap_factory()
-            # Production desktop maintenance is intentionally manual-login
-            # only. A legacy bootstrap may be injected explicitly in tests or
-            # a separately authorized deployment, but the console never
-            # constructs credential automation by default.
-            if login_bootstrap is not None:
-                if type(login_bootstrap) is not NinjaTraderLoginBootstrap:
-                    raise RuntimeError("NINJATRADER_LOGIN factory must return the exact sealed bootstrap")
-                ninjatrader_runtime["login_bootstrap"] = login_bootstrap
-                app.state.ninjatrader_login_bootstrap = login_bootstrap
-                login_bootstrap.start()
+            # Listener ownership is established before any button-triggered
+            # desktop/login bootstrap so startup cannot miss a signed hello.
             # A thread cannot be safely resumed after a process restart.  Preserve
             # its durable record and make the interruption explicit to operators.
             for job in center.store.list_jobs(job_type="candidate_discovery", limit=200):
@@ -1861,10 +1907,12 @@ def create_control_center_app(
             supervisor = watcher_runtime.get("supervisor")
             task = watcher_runtime.get("task")
             try:
+                paper_autostart.stop()
                 ninjatrader_maintenance.stop()
                 await scheduler_engine.stop()
-                if login_bootstrap is not None:
-                    login_bootstrap.stop()
+                active_login = ninjatrader_runtime.get("login_bootstrap")
+                if type(active_login) is NinjaTraderLoginBootstrap:
+                    active_login.stop()
                 if listener is not None:
                     listener.stop()
             finally:
@@ -2033,6 +2081,7 @@ def create_control_center_app(
     app = FastAPI(title="Trader Copy Control Center", version="1.0", docs_url=None, redoc_url=None,
                   lifespan=lifespan)
     app.state.ninjatrader_maintenance = ninjatrader_maintenance
+    app.state.paper_autostart = paper_autostart
     app.state.ninjatrader_observer = None
     app.state.lane_iii_shadow = None
     app.state.lane_iii_paper = None
@@ -2484,6 +2533,40 @@ def create_control_center_app(
             raise HTTPException(status_code=400, detail="NinjaTrader maintenance accepts only request_id.")
         try:
             return ninjatrader_maintenance.start(payload["request_id"])
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.get("/api/lane-iii/paper/auto-start")
+    async def api_lane_iii_paper_auto_start() -> dict[str, object]:
+        """Read-only status for the one-button persistent paper startup."""
+        return paper_autostart.status()
+
+    @app.post("/api/lane-iii/paper/auto-start")
+    async def api_start_lane_iii_paper_auto_start(
+        request: Request,
+        body: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, object]:
+        """Request the fixed launch/login/observer/verify/operational-start sequence."""
+        hostname = (request.url.hostname or "").lower()
+        if hostname not in {"127.0.0.1", "localhost", "::1", "testserver"}:
+            raise HTTPException(status_code=403, detail="Paper auto-start is loopback-only.")
+        origin = request.headers.get("origin")
+        if origin:
+            try:
+                origin_host = (urlsplit(origin).hostname or "").lower()
+            except ValueError:
+                origin_host = ""
+            if origin_host not in {"127.0.0.1", "localhost", "::1", "testserver"}:
+                raise HTTPException(status_code=403, detail="Paper auto-start requires a local same-origin request.")
+        if request.headers.get(PAPER_AUTOSTART_ACTION_HEADER) != PAPER_AUTOSTART_ACTION_VALUE:
+            raise HTTPException(status_code=403, detail="Paper auto-start action authentication failed.")
+        if request.headers.get(PAPER_AUTOSTART_TOKEN_HEADER) != paper_autostart.action_token:
+            raise HTTPException(status_code=403, detail="Paper auto-start session authentication failed.")
+        payload = body or {}
+        if not isinstance(payload, dict) or set(payload) != {"request_id"}:
+            raise HTTPException(status_code=400, detail="Paper auto-start accepts only request_id.")
+        try:
+            return paper_autostart.start(payload["request_id"])
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 

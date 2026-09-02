@@ -141,7 +141,18 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
                 "observer_attached": True,
             },
         ))
-        assert missing is not None and attached is not None
+        native = bridge.accept_observation(frame(
+            "HEALTH", 3, payload={
+                "component": "MARKET_OBSERVER_ATTACHMENT",
+                "state": "NATIVE_ADDON_OBSERVER_ACTIVE",
+                "configured_instrument": "MNQ SEP26",
+                "instrument": "MNQ SEP26",
+                "chart_found": False,
+                "observer_attached": True,
+                "subscription_mode": "NATIVE_ADDON",
+            },
+        ))
+        assert missing is not None and attached is not None and native is not None
         worker._record_and_forward_observation(missing)
         self.assertFalse(worker.status().as_dict()["observer_attachment"]["observer_attached"])
         worker._record_and_forward_observation(attached)
@@ -151,6 +162,12 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
         self.assertTrue(status["observer_attachment"]["chart_found"])
         self.assertTrue(status["observer_attachment"]["observer_attached"])
         self.assertEqual(status["observer_attachment"]["observed_at"], TIME)
+        worker._record_and_forward_observation(native)
+        status = worker.status().as_dict()
+        self.assertEqual(status["observer_attachment"]["state"], "NATIVE_ADDON_OBSERVER_ACTIVE")
+        self.assertFalse(status["observer_attachment"]["chart_found"])
+        self.assertTrue(status["observer_attachment"]["observer_attached"])
+        self.assertEqual(status["observer_attachment"]["subscription_mode"], "NATIVE_ADDON")
 
     def test_listener_surfaces_latest_read_only_cash_values_for_sim_and_lucid(self):
         worker = NinjaTraderListenerWorker()

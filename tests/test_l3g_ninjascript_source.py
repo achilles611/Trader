@@ -104,16 +104,19 @@ class NinjaScriptSourceTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, source)
 
-    def test_read_only_addon_reports_native_chart_reuse_and_attachment_without_hardcoded_contract(self) -> None:
+    def test_read_only_addon_uses_native_headless_subscription_with_optional_chart_focus(self) -> None:
         root = Path(__file__).parents[1] / "ninjatrader" / "NinjaScript"
         addon = (root / "AddOns" / "BeelzebubReadOnlyAddOn.cs").read_text(encoding="utf-8")
         observer = (root / "Indicators" / "BeelzebubReadOnlyMarketObserver.cs").read_text(encoding="utf-8")
         self.assertIn("window as NinjaTrader.Gui.Chart.Chart", addon)
         self.assertIn("ActiveChartControl.Instrument.FullName", addon)
         self.assertIn("correct.Activate()", addon)
+        self.assertIn("instrument.MarketData.Update += OnMarketData", addon)
+        self.assertIn("instrument.MarketDepth.Update += OnMarketDepth", addon)
+        self.assertIn('"NATIVE_ADDON"', addon)
+        self.assertIn("BeelzebubAutomaticMarketObserver", addon)
         self.assertIn("MARKET_OBSERVER_ATTACHMENT", addon)
-        self.assertIn("OBSERVER_MISSING", addon)
-        self.assertIn("OBSERVER_ATTACHED", addon)
+        self.assertIn("NATIVE_ADDON_OBSERVER_ACTIVE", addon)
         self.assertIn("beelzebub-observer.local.config", addon)
         self.assertIn("L3F_NT_MARKET_INSTRUMENT", addon)
         self.assertIn("ResolveConfiguredInstrument()", observer)

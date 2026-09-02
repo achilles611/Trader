@@ -5,12 +5,14 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Windows;
 using NinjaTrader.Cbi;
+using NinjaTrader.Data;
 using NinjaTrader.Gui;
 using NinjaTrader.Gui.Tools;
 using NinjaTrader.NinjaScript.AddOns;
@@ -23,7 +25,14 @@ namespace NinjaTrader.NinjaScript.AddOns
         private readonly List<NinjaTrader.Gui.Chart.Chart> observedCharts = new List<NinjaTrader.Gui.Chart.Chart>();
         private NTMenuItem controlCenterNewMenu;
         private NTMenuItem attachMenuItem;
+        private BeelzebubAutomaticMarketObserver automaticObserver;
         private bool addonActive;
+        private static int automaticObserverActive;
+
+        public static bool AutomaticObserverActive
+        {
+            get { return Volatile.Read(ref automaticObserverActive) == 1; }
+        }
 
         protected override void OnStateChange()
         {
@@ -33,11 +42,13 @@ namespace NinjaTrader.NinjaScript.AddOns
                 Account.AccountStatusUpdate += OnAccountStatusUpdate;
                 BeelzebubReadOnlyOutbound.Diagnostic("ADDON_ACTIVE");
                 AttachKnownAccounts();
+                EnsureAutomaticObserver();
             }
             else if (State == State.Terminated)
             {
                 addonActive = false;
                 Account.AccountStatusUpdate -= OnAccountStatusUpdate;
+                DetachAutomaticObserver();
                 DetachKnownAccounts();
                 BeelzebubReadOnlyOutbound.Shutdown();
                 BeelzebubReadOnlyOutbound.Diagnostic("ADDON_TERMINATED");
@@ -97,16 +108,15 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void OnAttachMenuItemClick(object sender, RoutedEventArgs e)
         {
-            BeelzebubReadOnlyOutbound.Diagnostic("MANUAL_ATTACH_REQUESTED");
+            BeelzebubReadOnlyOutbound.Diagnostic("OBSERVER_RECHECK_REQUESTED");
             AttachKnownAccounts();
+            EnsureAutomaticObserver();
             InspectCharts(true);
         }
 
-        // Chart discovery is observation-only. NinjaTrader documents existing
-        // Chart windows as available to AddOns through OnWindowCreated, but it
-        // does not document adding an Indicator instance from an AddOn. We
-        // therefore reuse/focus an exact chart and report one honest manual
-        // attachment step when the established observer is missing.
+        // A chart is optional. The observer uses NinjaTrader's supported AddOn
+        // MarketData/MarketDepth subscriptions and merely focuses an already
+        // open matching chart as a convenience.
         private void InspectCharts(bool focusCorrectChart)
         {
             if (!addonActive)
@@ -114,7 +124,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             string configured = ResolveConfiguredInstrument();
             if (String.IsNullOrWhiteSpace(configured))
             {
-                PublishObserverAttachment("CONFIGURED_INSTRUMENT_UNRESOLVED", null, null, false, false);
+                PublishObserverAttachment("CONFIGURED_INSTRUMENT_UNRESOLVED", null, null, false, false, "NATIVE_ADDON");
                 return;
             }
             NinjaTrader.Gui.Chart.Chart correct = null;
@@ -134,9 +144,8 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
             if (correct == null)
             {
-                PublishObserverAttachment(
-                    firstInstrument == null ? "CHART_NOT_FOUND" : "WRONG_CHART_INSTRUMENT",
-                    configured, firstInstrument, firstInstrument != null, false);
+                if (automaticObserver != null)
+                    automaticObserver.PublishAttachment(false);
                 return;
             }
             if (focusCorrectChart)
@@ -144,22 +153,58 @@ namespace NinjaTrader.NinjaScript.AddOns
                 try { correct.Activate(); }
                 catch (InvalidOperationException) { }
             }
-            bool attached = false;
-            foreach (object indicator in correct.ActiveChartControl.Indicators)
+            if (automaticObserver != null)
+                automaticObserver.PublishAttachment(true);
+        }
+
+        private void EnsureAutomaticObserver()
+        {
+            if (!addonActive || automaticObserver != null)
+                return;
+            string configured = ResolveConfiguredInstrument();
+            if (String.IsNullOrWhiteSpace(configured))
             {
-                if (indicator != null && String.Equals(indicator.GetType().Name, "BeelzebubReadOnlyMarketObserver", StringComparison.Ordinal))
-                {
-                    attached = true;
-                    break;
-                }
+                PublishObserverAttachment("CONFIGURED_INSTRUMENT_UNRESOLVED", null, null, false, false, "NATIVE_ADDON");
+                return;
             }
-            PublishObserverAttachment(attached ? "OBSERVER_ATTACHED" : "OBSERVER_MISSING",
-                configured, configured, true, attached);
+            Instrument instrument = Instrument.GetInstrument(configured);
+            if (instrument == null)
+            {
+                PublishObserverAttachment("NATIVE_ADDON_OBSERVER_FAILED", configured, null, false, false, "NATIVE_ADDON");
+                return;
+            }
+            automaticObserver = new BeelzebubAutomaticMarketObserver(instrument);
+            if (!automaticObserver.Start())
+            {
+                automaticObserver = null;
+                PublishObserverAttachment("NATIVE_ADDON_OBSERVER_FAILED", configured, instrument.FullName, false, false, "NATIVE_ADDON");
+            }
+        }
+
+        private void DetachAutomaticObserver()
+        {
+            BeelzebubAutomaticMarketObserver current = automaticObserver;
+            automaticObserver = null;
+            if (current != null)
+                current.Stop();
+            Interlocked.Exchange(ref automaticObserverActive, 0);
+        }
+
+        internal static void SetAutomaticObserverActive(bool active)
+        {
+            Interlocked.Exchange(ref automaticObserverActive, active ? 1 : 0);
         }
 
         public static void PublishObserverAttachment(
             string state, string configuredInstrument, string instrument,
             bool chartFound, bool observerAttached)
+        {
+            PublishObserverAttachment(state, configuredInstrument, instrument, chartFound, observerAttached, "CHART_INDICATOR");
+        }
+
+        public static void PublishObserverAttachment(
+            string state, string configuredInstrument, string instrument,
+            bool chartFound, bool observerAttached, string subscriptionMode)
         {
             string configured = configuredInstrument == null ? "null" : "\"" + Escape(configuredInstrument) + "\"";
             string actual = instrument == null ? "null" : "\"" + Escape(instrument) + "\"";
@@ -167,7 +212,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                 "{\"component\":\"MARKET_OBSERVER_ATTACHMENT\",\"state\":\"" + Escape(state)
                 + "\",\"configured_instrument\":" + configured + ",\"instrument\":" + actual
                 + ",\"chart_found\":" + (chartFound ? "true" : "false")
-                + ",\"observer_attached\":" + (observerAttached ? "true" : "false") + "}");
+                + ",\"observer_attached\":" + (observerAttached ? "true" : "false")
+                + ",\"subscription_mode\":\"" + Escape(subscriptionMode) + "\"}");
         }
 
         // Connection/account lifecycle notifications make late account
@@ -178,6 +224,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             BeelzebubReadOnlyOutbound.Diagnostic("ACCOUNT_STATUS_UPDATE");
             AttachKnownAccounts();
+            EnsureAutomaticObserver();
         }
 
         private void AttachKnownAccounts()
@@ -404,6 +451,281 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
         private static string Escape(string value) { return value.Replace("\\", "\\\\").Replace("\"", "\\\""); }
+    }
+
+    // Supported, chart-independent AddOn subscriptions. This object is
+    // observation-only: it has no Account, order, ATM, strategy, or inbound
+    // command reference. One instance owns both subscriptions for exactly the
+    // configured MNQ contract and unsubscribes on the Instrument dispatcher.
+    internal sealed class BeelzebubAutomaticMarketObserver
+    {
+        private const int MaximumPublishedBookLevelsPerSide = 10;
+        private static readonly long MinimumPublicationTicks = Math.Max(1L, System.Diagnostics.Stopwatch.Frequency / 2L);
+        private static readonly long MinimumAttachmentPublicationTicks = Math.Max(1L, System.Diagnostics.Stopwatch.Frequency * 5L);
+        private const string PublicationPolicy = "BOUNDED_LATEST_STATE_2HZ";
+        private readonly Instrument instrument;
+        private readonly SortedDictionary<double, long> bids = new SortedDictionary<double, long>(Comparer<double>.Create((x, y) => y.CompareTo(x)));
+        private readonly SortedDictionary<double, long> asks = new SortedDictionary<double, long>();
+        private bool subscribed;
+        private bool stopping;
+        private bool chartFound;
+        private bool reportedLevelOne;
+        private bool reportedDepth;
+        private bool reportedMarketDataConnected;
+        private double bestBid = Double.NaN;
+        private double bestAsk = Double.NaN;
+        private long bestBidSize;
+        private long bestAskSize;
+        private DateTime bestBidTime = DateTime.MinValue;
+        private DateTime bestAskTime = DateTime.MinValue;
+        private long lastQuotePublicationTicks;
+        private long lastTradePublicationTicks;
+        private long lastDepthPublicationTicks;
+        private long lastAttachmentPublicationTicks;
+
+        public BeelzebubAutomaticMarketObserver(Instrument instrument)
+        {
+            this.instrument = instrument;
+        }
+
+        public bool Start()
+        {
+            if (instrument == null || instrument.Dispatcher == null || instrument.Dispatcher.HasShutdownStarted)
+                return false;
+            try
+            {
+                instrument.Dispatcher.InvokeAsync(() =>
+                {
+                    if (stopping || subscribed)
+                        return;
+                    try
+                    {
+                        instrument.MarketData.Update += OnMarketData;
+                        instrument.MarketDepth.Update += OnMarketDepth;
+                        subscribed = true;
+                        BeelzebubReadOnlyAddOn.SetAutomaticObserverActive(true);
+                        BeelzebubReadOnlyOutbound.Diagnostic("NATIVE_ADDON_OBSERVER_ACTIVE");
+                        PublishAttachment(false, true);
+                    }
+                    catch (Exception error)
+                    {
+                        subscribed = false;
+                        BeelzebubReadOnlyAddOn.SetAutomaticObserverActive(false);
+                        BeelzebubReadOnlyOutbound.Diagnostic("NATIVE_ADDON_OBSERVER_FAILED_" + error.GetType().Name);
+                        BeelzebubReadOnlyAddOn.PublishObserverAttachment(
+                            "NATIVE_ADDON_OBSERVER_FAILED", BeelzebubReadOnlyAddOn.ResolveConfiguredInstrument(),
+                            instrument.FullName, false, false, "NATIVE_ADDON");
+                    }
+                });
+                return true;
+            }
+            catch (Exception error)
+            {
+                BeelzebubReadOnlyOutbound.Diagnostic("NATIVE_ADDON_OBSERVER_START_FAILED_" + error.GetType().Name);
+                return false;
+            }
+        }
+
+        public void Stop()
+        {
+            stopping = true;
+            BeelzebubReadOnlyAddOn.SetAutomaticObserverActive(false);
+            if (instrument == null || instrument.Dispatcher == null || instrument.Dispatcher.HasShutdownStarted)
+                return;
+            try
+            {
+                instrument.Dispatcher.InvokeAsync(() =>
+                {
+                    if (!subscribed)
+                        return;
+                    instrument.MarketData.Update -= OnMarketData;
+                    instrument.MarketDepth.Update -= OnMarketDepth;
+                    subscribed = false;
+                    BeelzebubReadOnlyAddOn.PublishObserverAttachment(
+                        "OBSERVER_TERMINATED", BeelzebubReadOnlyAddOn.ResolveConfiguredInstrument(),
+                        instrument.FullName, chartFound, false, "NATIVE_ADDON");
+                });
+            }
+            catch (Exception error)
+            {
+                BeelzebubReadOnlyOutbound.Diagnostic("NATIVE_ADDON_OBSERVER_STOP_FAILED_" + error.GetType().Name);
+            }
+        }
+
+        public void PublishAttachment(bool found)
+        {
+            chartFound = found;
+            PublishAttachment(found, true);
+        }
+
+        private void PublishAttachment(bool found, bool force)
+        {
+            if (!subscribed && !force)
+                return;
+            if (!force && !TryReservePublication(ref lastAttachmentPublicationTicks, MinimumAttachmentPublicationTicks))
+                return;
+            if (force)
+                Interlocked.Exchange(ref lastAttachmentPublicationTicks, System.Diagnostics.Stopwatch.GetTimestamp());
+            string configured = BeelzebubReadOnlyAddOn.ResolveConfiguredInstrument();
+            bool matches = !String.IsNullOrWhiteSpace(configured)
+                && String.Equals(configured, instrument.FullName, StringComparison.Ordinal);
+            BeelzebubReadOnlyAddOn.PublishObserverAttachment(
+                matches ? "NATIVE_ADDON_OBSERVER_ACTIVE" : "WRONG_CHART_INSTRUMENT",
+                configured, instrument.FullName, found, matches, "NATIVE_ADDON");
+        }
+
+        private void OnMarketData(object sender, MarketDataEventArgs e)
+        {
+            if (stopping)
+                return;
+            PublishAttachment(chartFound, false);
+            PublishMarketConnectedOnce();
+            if (!reportedLevelOne)
+            {
+                reportedLevelOne = true;
+                BeelzebubReadOnlyOutbound.Diagnostic("NATIVE_ADDON_LEVEL_ONE_RECEIVED");
+            }
+            string contract = instrument.FullName;
+            if (e.MarketDataType == MarketDataType.Last)
+            {
+                if (!TryReservePublication(ref lastTradePublicationTicks, MinimumPublicationTicks))
+                    return;
+                double bidAtTrade = e.Bid;
+                double askAtTrade = e.Ask;
+                bool completeQuote = FinitePositive(bidAtTrade) && FinitePositive(askAtTrade) && bidAtTrade < askAtTrade
+                    && bestBid == bidAtTrade && bestAsk == askAtTrade && bestBidSize > 0 && bestAskSize > 0
+                    && e.Time >= bestBidTime && e.Time - bestBidTime <= TimeSpan.FromSeconds(10)
+                    && e.Time >= bestAskTime && e.Time - bestAskTime <= TimeSpan.FromSeconds(10);
+                string quoteObservationId = null;
+                if (completeQuote)
+                {
+                    Interlocked.Exchange(ref lastQuotePublicationTicks, System.Diagnostics.Stopwatch.GetTimestamp());
+                    quoteObservationId = BeelzebubReadOnlyOutbound.Publish("QUOTE", null, null,
+                        "{\"contract_id\":\"" + contract + "\",\"bid\":" + bidAtTrade.ToString(CultureInfo.InvariantCulture)
+                        + ",\"ask\":" + askAtTrade.ToString(CultureInfo.InvariantCulture) + ",\"bid_size\":" + bestBidSize
+                        + ",\"ask_size\":" + bestAskSize + ",\"bid_source_time\":\""
+                        + bestBidTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture) + "\",\"ask_source_time\":\""
+                        + bestAskTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture)
+                        + "\",\"publication_policy\":\"" + PublicationPolicy + "\"}", e.Time);
+                }
+                string source = quoteObservationId == null ? "UNKNOWN" : "BID_ASK_CLASSIFICATION";
+                string bid = completeQuote ? bidAtTrade.ToString(CultureInfo.InvariantCulture) : "null";
+                string ask = completeQuote ? askAtTrade.ToString(CultureInfo.InvariantCulture) : "null";
+                string quoteReference = quoteObservationId == null ? "null" : "\"" + quoteObservationId + "\"";
+                BeelzebubReadOnlyOutbound.Publish("TRADE", null, null,
+                    "{\"contract_id\":\"" + contract + "\",\"price\":" + e.Price.ToString(CultureInfo.InvariantCulture)
+                    + ",\"size\":" + e.Volume + ",\"aggressor_side\":\"UNKNOWN\",\"aggressor_source\":\"" + source
+                    + "\",\"bid_at_trade\":" + bid + ",\"ask_at_trade\":" + ask
+                    + ",\"derivation_quote_observation_id\":" + quoteReference
+                    + ",\"publication_policy\":\"" + PublicationPolicy + "\"}", e.Time);
+                return;
+            }
+            if (e.MarketDataType == MarketDataType.Bid)
+            {
+                bestBid = e.Price;
+                bestBidSize = e.Volume;
+                bestBidTime = e.Time;
+            }
+            else if (e.MarketDataType == MarketDataType.Ask)
+            {
+                bestAsk = e.Price;
+                bestAskSize = e.Volume;
+                bestAskTime = e.Time;
+            }
+            if (FinitePositive(bestBid) && FinitePositive(bestAsk) && bestBid < bestAsk
+                && bestBidSize > 0 && bestAskSize > 0
+                && TryReservePublication(ref lastQuotePublicationTicks, MinimumPublicationTicks))
+                BeelzebubReadOnlyOutbound.Publish("QUOTE", null, null,
+                    "{\"contract_id\":\"" + contract + "\",\"bid\":" + bestBid.ToString(CultureInfo.InvariantCulture)
+                    + ",\"ask\":" + bestAsk.ToString(CultureInfo.InvariantCulture) + ",\"bid_size\":" + bestBidSize
+                    + ",\"ask_size\":" + bestAskSize + ",\"publication_policy\":\"" + PublicationPolicy + "\"}", e.Time);
+        }
+
+        private void OnMarketDepth(object sender, MarketDepthEventArgs e)
+        {
+            if (stopping)
+                return;
+            PublishAttachment(chartFound, false);
+            PublishMarketConnectedOnce();
+            if (!reportedDepth)
+            {
+                reportedDepth = true;
+                BeelzebubReadOnlyOutbound.Diagnostic("NATIVE_ADDON_DEPTH_RECEIVED");
+            }
+            SortedDictionary<double, long> book = e.MarketDataType == MarketDataType.Bid ? bids : asks;
+            double mutationPrice = e.Price;
+            if (e.Operation == Operation.Remove && !FinitePositive(mutationPrice))
+            {
+                if (e.Position < 0 || e.Position >= book.Count)
+                    return;
+                mutationPrice = book.ElementAt(e.Position).Key;
+            }
+            if (!FinitePositive(mutationPrice))
+                return;
+            if (e.Operation == Operation.Remove)
+                book.Remove(mutationPrice);
+            else
+                book[mutationPrice] = e.Volume;
+            TrimBook(book);
+            if (e.Position >= MaximumPublishedBookLevelsPerSide
+                || !TryReservePublication(ref lastDepthPublicationTicks, MinimumPublicationTicks))
+                return;
+            BeelzebubReadOnlyOutbound.Publish("DEPTH", null, null,
+                "{\"contract_id\":\"" + instrument.FullName + "\",\"bids\":" + Levels(bids)
+                + ",\"asks\":" + Levels(asks) + ",\"operation\":\"" + e.Operation
+                + "\",\"side\":\"" + e.MarketDataType + "\",\"mutation_price\":"
+                + mutationPrice.ToString(CultureInfo.InvariantCulture) + ",\"mutation_volume\":" + e.Volume
+                + ",\"mutation_position\":" + e.Position
+                + ",\"is_reset\":false,\"publication_policy\":\"" + PublicationPolicy + "\"}", e.Time);
+        }
+
+        private void PublishMarketConnectedOnce()
+        {
+            if (reportedMarketDataConnected)
+                return;
+            reportedMarketDataConnected = true;
+            BeelzebubReadOnlyOutbound.Publish("CONNECTION", null, null,
+                "{\"scope\":\"MARKET_DATA\",\"price_status\":\"Connected\"}");
+        }
+
+        private static bool FinitePositive(double value)
+        {
+            return !Double.IsNaN(value) && !Double.IsInfinity(value) && value > 0;
+        }
+
+        private static string Levels(SortedDictionary<double, long> book)
+        {
+            List<string> values = new List<string>();
+            foreach (KeyValuePair<double, long> item in book)
+                values.Add("{\"price\":" + item.Key.ToString(CultureInfo.InvariantCulture) + ",\"size\":" + item.Value + "}");
+            return "[" + String.Join(",", values) + "]";
+        }
+
+        private static void TrimBook(SortedDictionary<double, long> book)
+        {
+            if (book.Count <= MaximumPublishedBookLevelsPerSide)
+                return;
+            List<double> discarded = new List<double>();
+            int index = 0;
+            foreach (KeyValuePair<double, long> item in book)
+                if (index++ >= MaximumPublishedBookLevelsPerSide)
+                    discarded.Add(item.Key);
+            foreach (double price in discarded)
+                book.Remove(price);
+        }
+
+        private static bool TryReservePublication(ref long lastPublicationTicks, long minimumTicks)
+        {
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            while (true)
+            {
+                long prior = Interlocked.Read(ref lastPublicationTicks);
+                if (prior != 0 && now - prior < minimumTicks)
+                    return false;
+                if (Interlocked.CompareExchange(ref lastPublicationTicks, now, prior) == prior)
+                    return true;
+            }
+        }
     }
 
     // Outbound-only loopback sink. It opens a local client connection and only

@@ -154,6 +154,7 @@ class MaintenanceStage(StrEnum):
     GATE_CHECK = "GATE_CHECK"
     GRACEFUL_SHUTDOWN = "GRACEFUL_SHUTDOWN"
     LAUNCHING = "LAUNCHING"
+    AUTHENTICATING = "AUTHENTICATING"
     WAITING_FOR_OPERATOR_LOGIN = "WAITING_FOR_OPERATOR_LOGIN"
     WAITING_FOR_ADDON = "WAITING_FOR_ADDON"
     VERIFYING_CHART = "VERIFYING_CHART"
@@ -174,7 +175,8 @@ class MaintenanceAuditError(RuntimeError):
 _ACTIVE_STAGES = frozenset({
     MaintenanceStage.CHECKING, MaintenanceStage.VERIFYING_RESTART_LEDGER,
     MaintenanceStage.GATE_CHECK, MaintenanceStage.GRACEFUL_SHUTDOWN,
-    MaintenanceStage.LAUNCHING, MaintenanceStage.WAITING_FOR_OPERATOR_LOGIN,
+    MaintenanceStage.LAUNCHING, MaintenanceStage.AUTHENTICATING,
+    MaintenanceStage.WAITING_FOR_OPERATOR_LOGIN,
     MaintenanceStage.WAITING_FOR_ADDON, MaintenanceStage.VERIFYING_CHART,
     MaintenanceStage.WAITING_FOR_MANUAL_CHART_ATTACHMENT,
     MaintenanceStage.VERIFYING_MARKET_DATA, MaintenanceStage.RECONCILING,
@@ -188,7 +190,7 @@ class MaintenanceTimeouts:
     graceful_shutdown_seconds: float = 45.0
     operator_login_seconds: float = 900.0
     addon_seconds: float = 120.0
-    chart_seconds: float = 900.0
+    chart_seconds: float = 120.0
     market_data_seconds: float = 60.0
     reconciliation_seconds: float = 60.0
     ledger_seconds: float = 120.0
@@ -211,6 +213,8 @@ class NinjaTraderMaintenanceService:
         ledger_status: Callable[[], Mapping[str, object]],
         start_ledger_verification: Callable[[], Mapping[str, object]],
         historical_command_count: Callable[[], int] | None = None,
+        begin_automatic_login: Callable[[], bool] | None = None,
+        automatic_login_status: Callable[[], Mapping[str, object]] | None = None,
         desktop: NinjaTraderDesktopAdapter | None = None,
         audit_path: str | Path | None = None,
         timeouts: MaintenanceTimeouts = MaintenanceTimeouts(),
@@ -222,17 +226,21 @@ class NinjaTraderMaintenanceService:
         self._ledger_status = ledger_status
         self._start_ledger_verification = start_ledger_verification
         self._historical_command_count = historical_command_count or (lambda: 0)
+        self._begin_automatic_login = begin_automatic_login
+        self._automatic_login_status = automatic_login_status
         self._desktop = desktop or PowerShellNinjaTraderDesktopAdapter()
         root = Path(__file__).resolve().parents[2]
         self._audit_path = Path(audit_path or root / "logs" / "ninjatrader-maintenance-audit.jsonl").resolve()
         self._timeouts = timeouts
         self._clock = clock
         self._stop = threading.Event()
+        self._custom_wait = wait
         self._wait = wait or self._stop.wait
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._operation_id: str | None = None
         self._request_id: str | None = None
+        self._restart_requested = True
         self._stage = MaintenanceStage.IDLE
         self._stage_started_at = _utc_now()
         self._operation_started_at: str | None = None
@@ -395,10 +403,13 @@ class NinjaTraderMaintenanceService:
         configured = cls._configured_instrument(paper)
         attachment = cls._attachment(cls._observer(paper))
         return (
-            attachment.get("chart_found") is True
-            and attachment.get("observer_attached") is True
+            attachment.get("observer_attached") is True
             and attachment.get("instrument") == configured
             and attachment.get("configured_instrument") == configured
+            and (
+                attachment.get("chart_found") is True
+                or attachment.get("subscription_mode") == "NATIVE_ADDON"
+            )
         )
 
     @classmethod
@@ -508,7 +519,7 @@ class NinjaTraderMaintenanceService:
             return {"label": "NinjaTrader Ready", "enabled": False, "tone": "ready"}
         if probe.process_detected:
             return {"label": "Restart + Repair Observer", "enabled": True, "tone": "warning"}
-        return {"label": "Open NinjaTrader + Attach Observer", "enabled": True, "tone": "primary"}
+        return {"label": "Open NinjaTrader + Start Observer", "enabled": True, "tone": "primary"}
 
     @staticmethod
     def _progress_label(stage: MaintenanceStage) -> str:
@@ -518,9 +529,10 @@ class NinjaTraderMaintenanceService:
             MaintenanceStage.GATE_CHECK: "Checking restart safety…",
             MaintenanceStage.GRACEFUL_SHUTDOWN: "Closing NinjaTrader gracefully…",
             MaintenanceStage.LAUNCHING: "Opening NinjaTrader…",
+            MaintenanceStage.AUTHENTICATING: "Signing in to NinjaTrader…",
             MaintenanceStage.WAITING_FOR_OPERATOR_LOGIN: "Waiting for operator login…",
             MaintenanceStage.WAITING_FOR_ADDON: "Waiting for authenticated AddOn…",
-            MaintenanceStage.VERIFYING_CHART: "Locating MNQ chart…",
+            MaintenanceStage.VERIFYING_CHART: "Starting native MNQ observer…",
             MaintenanceStage.WAITING_FOR_MANUAL_CHART_ATTACHMENT: "Waiting for observer attachment…",
             MaintenanceStage.VERIFYING_MARKET_DATA: "Verifying market data…",
             MaintenanceStage.RECONCILING: "Reconciling Sim101…",
@@ -545,6 +557,13 @@ class NinjaTraderMaintenanceService:
         attachment = self._attachment(observer)
         freshness = observer.get("market_observer_freshness")
         freshness = freshness if isinstance(freshness, Mapping) else {}
+        login: Mapping[str, object] = {}
+        if self._automatic_login_status is not None:
+            try:
+                value = self._automatic_login_status()
+                login = value if isinstance(value, Mapping) else {}
+            except Exception:
+                login = {"state": "FAULTED", "failure_category": "AUTOMATIC_LOGIN_STATUS_UNAVAILABLE"}
         with self._lock:
             if self._operation_id is None:
                 self._durable_baseline_command_count = self._durable_command_count()
@@ -560,6 +579,7 @@ class NinjaTraderMaintenanceService:
                 "action_token": self._action_token,
                 "operation_id": self._operation_id,
                 "request_id": self._request_id,
+                "operation_kind": "RECOVERY_RESTART" if self._restart_requested else "NORMAL_STARTUP",
                 "stage": stage.value,
                 "stage_started_at": self._stage_started_at,
                 "operation_started_at": self._operation_started_at,
@@ -570,6 +590,11 @@ class NinjaTraderMaintenanceService:
                     "login_window_detected": probe.login_window_detected,
                     "control_center_detected": probe.control_center_detected,
                     "failure_category": probe.failure_category,
+                },
+                "login": {
+                    "state": login.get("state", "NOT_CONFIGURED"),
+                    "attempt_count": login.get("attempt_count", 0),
+                    "failure_category": login.get("failure_category"),
                 },
                 "addon": {
                     "state": transport.get("state", "UNSTARTED"),
@@ -587,6 +612,7 @@ class NinjaTraderMaintenanceService:
                 "observer": {
                     "state": observer.get("market_observer_state", "NOT_ACTIVE"),
                     "attached": attachment.get("observer_attached") is True,
+                    "subscription_mode": attachment.get("subscription_mode"),
                     "instrument": attachment.get("instrument"),
                     "last_attachment_at": attachment.get("observed_at"),
                     "market_data_fresh": freshness.get("fresh") is True,
@@ -615,6 +641,14 @@ class NinjaTraderMaintenanceService:
         return result
 
     def start(self, request_id: str) -> dict[str, object]:
+        """Run the explicitly requested hard-reset recovery workflow."""
+        return self._start(request_id, restart_requested=True)
+
+    def ensure_started(self, request_id: str) -> dict[str, object]:
+        """Run normal startup without ever closing an existing desktop."""
+        return self._start(request_id, restart_requested=False)
+
+    def _start(self, request_id: str, *, restart_requested: bool) -> dict[str, object]:
         if not isinstance(request_id, str) or not _REQUEST_ID.fullmatch(request_id):
             raise ValueError("Invalid NinjaTrader maintenance request ID.")
         with self._lock:
@@ -623,9 +657,10 @@ class NinjaTraderMaintenanceService:
             if self._request_id == request_id and self._operation_id is not None:
                 return self.status()
             self._stop = threading.Event()
-            self._wait = self._stop.wait
+            self._wait = self._custom_wait or self._stop.wait
             self._operation_id = f"ntm-{uuid4().hex}"
             self._request_id = request_id
+            self._restart_requested = restart_requested
             self._operation_started_at = _utc_now()
             self._stage = MaintenanceStage.CHECKING
             self._stage_started_at = self._operation_started_at
@@ -739,7 +774,7 @@ class NinjaTraderMaintenanceService:
             ok, report = self._verify_ledger(MaintenanceStage.VERIFYING_RESTART_LEDGER)
             if not ok:
                 return
-            if probe.process_detected:
+            if probe.process_detected and self._restart_requested:
                 self._transition(MaintenanceStage.GATE_CHECK)
                 paper = self._paper_status()
                 live = self._live_status()
@@ -760,20 +795,45 @@ class NinjaTraderMaintenanceService:
                         "Close NinjaTrader manually, or separately authorize a forced termination; no force kill was attempted.",
                     )
                     return
-            self._transition(MaintenanceStage.LAUNCHING)
-            if not self._desktop.start():
-                self._transition(MaintenanceStage.FAILED, ["NINJATRADER_START_FAILED"])
+            if not probe.process_detected or self._restart_requested:
+                self._transition(MaintenanceStage.LAUNCHING)
+                if not self._desktop.start():
+                    self._transition(MaintenanceStage.FAILED, ["NINJATRADER_START_FAILED"])
+                    return
+                self._launch_count += 1
+                self._audit("NINJATRADER_LAUNCH_REQUESTED")
+                if not self._wait_for(lambda: self._probe(force=True).process_detected, self._timeouts.process_start_seconds):
+                    self._transition(MaintenanceStage.FAILED, ["NINJATRADER_PROCESS_START_TIMEOUT"])
+                    return
+
+            if self._begin_automatic_login is not None and self._automatic_login_status is not None:
+                self._transition(MaintenanceStage.AUTHENTICATING)
+                if not self._begin_automatic_login():
+                    self._transition(MaintenanceStage.BLOCKED, ["AUTOMATIC_LOGIN_UNAVAILABLE"])
+                    return
+                terminal_login: dict[str, object] = {}
+
+                def automatic_login_finished() -> bool:
+                    nonlocal terminal_login
+                    value = self._automatic_login_status()
+                    terminal_login = dict(value) if isinstance(value, Mapping) else {}
+                    return terminal_login.get("state") in {"AUTHENTICATED", "BLOCKED", "FAULTED"}
+
+                if not self._wait_for(automatic_login_finished, self._timeouts.operator_login_seconds):
+                    self._transition(MaintenanceStage.BLOCKED, ["AUTOMATIC_LOGIN_TIMEOUT"])
+                    return
+                if terminal_login.get("state") != "AUTHENTICATED":
+                    failure = terminal_login.get("failure_category")
+                    blocker = "AUTOMATIC_LOGIN_FAILED" if not isinstance(failure, str) else "AUTOMATIC_LOGIN_" + failure
+                    self._transition(MaintenanceStage.BLOCKED, [blocker])
+                    return
+            elif not self._probe(force=True).control_center_detected:
+                self._transition(
+                    MaintenanceStage.BLOCKED,
+                    ["WAITING_FOR_OPERATOR_LOGIN"],
+                    "Complete NinjaTrader login manually; automatic login is not configured for this runtime.",
+                )
                 return
-            self._launch_count += 1
-            self._audit("NINJATRADER_LAUNCH_REQUESTED")
-            if not self._wait_for(lambda: self._probe(force=True).process_detected, self._timeouts.process_start_seconds):
-                self._transition(MaintenanceStage.FAILED, ["NINJATRADER_PROCESS_START_TIMEOUT"])
-                return
-            self._transition(
-                MaintenanceStage.WAITING_FOR_OPERATOR_LOGIN,
-                [],
-                "Complete NinjaTrader login manually; Beelzebub will not enter or store credentials.",
-            )
 
             def control_center_ready() -> bool:
                 value = self._probe(force=True)
@@ -784,8 +844,7 @@ class NinjaTraderMaintenanceService:
             if not self._wait_for(control_center_ready, self._timeouts.operator_login_seconds):
                 self._transition(
                     MaintenanceStage.BLOCKED,
-                    ["WAITING_FOR_OPERATOR_LOGIN"],
-                    "Complete NinjaTrader login manually; Beelzebub will not enter or store credentials.",
+                    ["NINJATRADER_CONTROL_CENTER_TIMEOUT"],
                 )
                 return
             self._transition(MaintenanceStage.WAITING_FOR_ADDON)
@@ -798,16 +857,11 @@ class NinjaTraderMaintenanceService:
                 return
             self._transition(MaintenanceStage.VERIFYING_CHART)
             if not self._chart_ready(self._paper_status()):
-                self._transition(
-                    MaintenanceStage.WAITING_FOR_MANUAL_CHART_ATTACHMENT,
-                    [],
-                    f"Open or select the {instrument} chart and add BeelzebubReadOnlyMarketObserver once; the workflow will verify it automatically.",
-                )
                 if not self._wait_for(lambda: self._chart_ready(self._paper_status()), self._timeouts.chart_seconds):
                     paper = self._paper_status()
                     attachment = self._attachment(self._observer(paper))
-                    blocker = "WRONG_CHART_INSTRUMENT" if attachment.get("chart_found") is True and attachment.get("instrument") not in {None, instrument} else "OBSERVER_ATTACHMENT_NOT_VERIFIED"
-                    self._transition(MaintenanceStage.BLOCKED, [blocker], self._manual_action)
+                    blocker = "WRONG_OBSERVER_INSTRUMENT" if attachment.get("instrument") not in {None, instrument} else "AUTOMATIC_OBSERVER_NOT_VERIFIED"
+                    self._transition(MaintenanceStage.BLOCKED, [blocker])
                     return
             self._transition(MaintenanceStage.VERIFYING_MARKET_DATA)
             if not self._wait_for(lambda: self._market_fresh(self._paper_status()), self._timeouts.market_data_seconds):

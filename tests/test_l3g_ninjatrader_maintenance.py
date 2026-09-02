@@ -226,6 +226,38 @@ class NinjaTraderMaintenanceTests(unittest.TestCase):
         self.assertEqual((desktop.start_calls, desktop.close_calls), (0, 0))
         self.assertEqual(self.ledger.start_calls, 1)
 
+    def test_normal_startup_never_turns_stale_observer_into_an_implicit_restart(self) -> None:
+        self.make_observer_unhealthy(self.paper.value)
+        desktop = FakeDesktop(process=True)
+        service = self.service(desktop)
+        service.ensure_started("ntm-normal-0001")
+        service.wait(2)
+        status = service.status()
+        self.assertEqual(status["operation_kind"], "NORMAL_STARTUP")
+        self.assertIn("AUTOMATIC_OBSERVER_NOT_VERIFIED", status["blockers"])
+        self.assertEqual((desktop.close_calls, desktop.start_calls), (0, 0))
+
+    def test_automatic_login_is_requested_and_verified_before_addon(self) -> None:
+        desktop = FakeDesktop(process=False, on_start=lambda value: setattr(value, "control_center", True))
+        begin_calls: list[bool] = []
+        service = NinjaTraderMaintenanceService(
+            paper_status=self.paper,
+            live_status=self.live,
+            ledger_status=self.ledger.status,
+            start_ledger_verification=self.ledger.start,
+            begin_automatic_login=lambda: begin_calls.append(True) is None or True,
+            automatic_login_status=lambda: {"state": "AUTHENTICATED", "attempt_count": 1},
+            desktop=desktop,
+            audit_path=Path(self.temporary.name) / "automatic-login.jsonl",
+            timeouts=FAST_TIMEOUTS,
+        )
+        service.ensure_started("ntm-auto-login-0001")
+        service.wait(2)
+        status = service.status()
+        self.assertEqual(status["stage"], "READY")
+        self.assertEqual(status["login"]["state"], "AUTHENTICATED")
+        self.assertEqual(begin_calls, [True])
+
     def test_unhealthy_observer_uses_gated_graceful_restart_then_recovers(self) -> None:
         self.make_observer_unhealthy(self.paper.value)
 
@@ -327,7 +359,7 @@ class NinjaTraderMaintenanceTests(unittest.TestCase):
         status = self.run_service(self.service(desktop))
         self.assertIn("ADDON_PROVENANCE_MISMATCH", status["blockers"])
 
-    def test_wrong_chart_instrument_blocks_with_one_manual_step(self) -> None:
+    def test_wrong_native_observer_instrument_blocks_without_manual_bypass(self) -> None:
         observer = self.paper.value["market_observer"]
         assert isinstance(observer, dict)
         observer["observer_attachment"] = {
@@ -337,8 +369,22 @@ class NinjaTraderMaintenanceTests(unittest.TestCase):
         }
         desktop = FakeDesktop(process=False, on_start=lambda value: setattr(value, "control_center", True))
         status = self.run_service(self.service(desktop))
-        self.assertIn("WRONG_CHART_INSTRUMENT", status["blockers"])
-        self.assertIn("MNQ SEP26", str(status["manual_action"]))
+        self.assertIn("WRONG_OBSERVER_INSTRUMENT", status["blockers"])
+        self.assertIsNone(status["manual_action"])
+
+    def test_headless_native_observer_is_ready_without_chart(self) -> None:
+        observer = self.paper.value["market_observer"]
+        assert isinstance(observer, dict)
+        observer["observer_attachment"] = {
+            "state": "NATIVE_ADDON_OBSERVER_ACTIVE", "configured_instrument": "MNQ SEP26",
+            "instrument": "MNQ SEP26", "chart_found": False, "observer_attached": True,
+            "subscription_mode": "NATIVE_ADDON", "observed_at": "2026-09-02T17:00:00Z",
+        }
+        desktop = FakeDesktop(process=False, on_start=lambda value: setattr(value, "control_center", True))
+        status = self.run_service(self.service(desktop))
+        self.assertEqual(status["stage"], "READY")
+        self.assertFalse(status["chart"]["found"])
+        self.assertEqual(status["observer"]["subscription_mode"], "NATIVE_ADDON")
 
     def test_existing_correct_chart_and_attached_observer_are_reused(self) -> None:
         desktop = FakeDesktop(process=False, on_start=lambda value: setattr(value, "control_center", True))
@@ -453,6 +499,9 @@ class FakeMaintenanceEndpointService:
     def start(self, request_id: str) -> dict[str, object]:
         self.requests.append(request_id)
         return {"stage": "CHECKING", "request_id": request_id}
+
+    def ensure_started(self, request_id: str) -> dict[str, object]:
+        return self.start(request_id)
 
     def stop(self) -> None:
         return None

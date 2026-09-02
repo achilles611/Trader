@@ -421,6 +421,7 @@ class NinjaTraderListenerWorker:
             "instrument": None,
             "chart_found": False,
             "observer_attached": False,
+            "subscription_mode": None,
             "observed_at": None,
         }
         self._account_balances = _empty_account_balances()
@@ -454,16 +455,19 @@ class NinjaTraderListenerWorker:
         instrument = payload.get("instrument")
         chart_found = payload.get("chart_found")
         observer_attached = payload.get("observer_attached")
+        subscription_mode = payload.get("subscription_mode")
         if (
             state not in {
                 "CONFIGURED_INSTRUMENT_UNRESOLVED", "CHART_NOT_FOUND",
                 "WRONG_CHART_INSTRUMENT", "OBSERVER_MISSING", "OBSERVER_ATTACHED",
-                "OBSERVER_TERMINATED",
+                "OBSERVER_TERMINATED", "NATIVE_ADDON_OBSERVER_ACTIVE",
+                "NATIVE_ADDON_OBSERVER_FAILED",
             }
             or (configured is not None and not isinstance(configured, str))
             or (instrument is not None and not isinstance(instrument, str))
             or type(chart_found) is not bool
             or type(observer_attached) is not bool
+            or subscription_mode not in {None, "CHART_INDICATOR", "NATIVE_ADDON"}
         ):
             return
         self._observer_attachment = {
@@ -472,6 +476,7 @@ class NinjaTraderListenerWorker:
             "instrument": instrument,
             "chart_found": chart_found,
             "observer_attached": observer_attached,
+            "subscription_mode": subscription_mode,
             "observed_at": observation.ninja_receipt_time,
         }
 
@@ -572,6 +577,7 @@ class NinjaTraderListenerWorker:
                 "instrument": None,
                 "chart_found": False,
                 "observer_attached": False,
+                "subscription_mode": None,
                 "observed_at": None,
             }
             self._account_balances = _empty_account_balances()

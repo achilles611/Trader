@@ -54,12 +54,16 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
             else if (State == State.Realtime)
             {
+                if (BeelzebubReadOnlyAddOn.AutomaticObserverActive)
+                    return;
                 BeelzebubReadOnlyOutbound.Diagnostic("MARKET_OBSERVER_REALTIME");
                 BeelzebubReadOnlyOutbound.Diagnostic("MARKET_OBSERVER_REALTIME_STRICT_SPREAD_V1");
                 PublishAttachmentHealth(true);
             }
             else if (State == State.Terminated)
             {
+                if (BeelzebubReadOnlyAddOn.AutomaticObserverActive)
+                    return;
                 string configured = BeelzebubReadOnlyAddOn.ResolveConfiguredInstrument();
                 string instrument = Instrument == null ? null : Instrument.FullName;
                 BeelzebubReadOnlyAddOn.PublishObserverAttachment(
@@ -69,6 +73,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         protected override void OnMarketData(MarketDataEventArgs e)
         {
+            if (BeelzebubReadOnlyAddOn.AutomaticObserverActive)
+                return;
             PublishAttachmentHealth();
             PublishMarketConnectedOnce();
             if (!reportedLevelOne)
@@ -141,6 +147,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         protected override void OnConnectionStatusUpdate(ConnectionStatusEventArgs e)
         {
+            if (BeelzebubReadOnlyAddOn.AutomaticObserverActive)
+                return;
             // Any price-feed transition invalidates locally accumulated quote
             // and book state. A reconnect must rebuild from new callbacks.
             ClearMarketState();
@@ -152,6 +160,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         protected override void OnMarketDepth(MarketDepthEventArgs e)
         {
+            if (BeelzebubReadOnlyAddOn.AutomaticObserverActive)
+                return;
             PublishAttachmentHealth();
             PublishMarketConnectedOnce();
             if (!reportedDepth)

@@ -32,6 +32,11 @@ let commissioningStartResponse: Record<string, unknown> | null = null;
 let commissioningStartSideEffect: (() => void) | null = null;
 let operationalStartResponse: Record<string, unknown> | null = null;
 let operationalStartSideEffect: (() => void) | null = null;
+let paperAutoStartSideEffect: (() => void) | null = null;
+let paperAutoStartResponse: Record<string, unknown> = {
+  action_token: "fixture-paper-autostart-token", stage: "IDLE", in_progress: false,
+  button: { label: "Start Paper Trading", enabled: true, tone: "primary" }, blockers: [],
+};
 let slimStatusResponse: Record<string, unknown> = {
   generated_at: new Date().toISOString(), light: "RED", label: "NOT READY",
   message: "Paper runtime status is unavailable.", can_start: false, paper_active: false,
@@ -85,6 +90,10 @@ function payload(path: string) {
   if (path.startsWith("/api/lane-iii/paper/ledger-verification")) return ledgerVerificationResponse;
   if (path.startsWith("/api/lane-iii/paper/slim-status")) return slimStatusResponse;
   if (path.startsWith("/api/lane-iii/ninjatrader-maintenance")) return ninjaTraderMaintenanceResponse;
+  if (path.startsWith("/api/lane-iii/paper/auto-start")) {
+    paperAutoStartSideEffect?.();
+    return paperAutoStartResponse;
+  }
   if (path.startsWith("/api/lane-iii/paper/commissioning-rehearsal")) {
     commissioningRehearsalSideEffect?.();
     return commissioningRehearsalResponse || { result: "BLOCKED", blocking_reasons: ["FIXTURE_BLOCKED"] };
@@ -204,6 +213,11 @@ beforeEach(() => {
   commissioningStartSideEffect = null;
   operationalStartResponse = null;
   operationalStartSideEffect = null;
+  paperAutoStartSideEffect = null;
+  paperAutoStartResponse = {
+    action_token: "fixture-paper-autostart-token", stage: "IDLE", in_progress: false,
+    button: { label: "Start Paper Trading", enabled: true, tone: "primary" }, blockers: [],
+  };
   slimStatusResponse = {
     generated_at: new Date().toISOString(), light: "RED", label: "NOT READY",
     message: "Paper runtime status is unavailable.", can_start: false, paper_active: false,
@@ -693,7 +707,7 @@ describe("copy control center", () => {
     expect(await screen.findByText("10%")).toBeInTheDocument();
   });
 
-  it("renders the compact green Slim Mode with all three lights and the persistent paper-start path", async () => {
+  it("renders one compact guarded paper-start action with launch, login, and observer orchestration", async () => {
     slimStatusResponse = {
       generated_at: new Date().toISOString(), light: "GREEN", label: "READY TO START PAPER TRADING",
       message: "All canonical paper-start gates are currently satisfied.", can_start: true, paper_active: false,
@@ -708,37 +722,54 @@ describe("copy control center", () => {
     const start = screen.getByRole("button", { name: "Start Paper Trading" });
     expect(start).toBeEnabled();
     fireEvent.click(start);
-    await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/lane-iii/paper/operational-start", expect.objectContaining({ method: "POST" })));
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(
+      "/api/lane-iii/paper/auto-start",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          "Content-Type": "application/json",
+          "X-Beelzebub-Paper-Autostart-Action": "sim101-paper-autostart-v1",
+          "X-Beelzebub-Paper-Autostart-Token": "fixture-paper-autostart-token",
+        }),
+      }),
+    ));
+    const call = vi.mocked(fetch).mock.calls.find(([path, init]) => String(path) === "/api/lane-iii/paper/auto-start" && init?.method === "POST");
+    expect(JSON.parse(String(call?.[1]?.body))).toEqual({ request_id: expect.stringMatching(/^paper-auto-ui-/) });
     expect(fetch).not.toHaveBeenCalledWith("/api/lane-iii/paper/commissioning-start", expect.anything());
+    expect(fetch).not.toHaveBeenCalledWith("/api/lane-iii/paper/operational-start", expect.anything());
+    expect(fetch).not.toHaveBeenCalledWith("/api/lane-iii/ninjatrader-maintenance", expect.objectContaining({ method: "POST" }));
     expect(screen.getByText("$10.25")).toBeInTheDocument();
     expect(document.querySelector(".slim-session")).toHaveTextContent("LONDON / EUROPE · 08:00-11:30 Europe/London");
   });
 
-  it("renders the state-aware NinjaTrader control and authentic observer proof in Slim Mode", async () => {
+  it("keeps NinjaTrader recovery diagnostics out of Slim Mode", async () => {
     ninjaTraderMaintenanceResponse = {
       ...ninjaTraderMaintenanceResponse,
       stage: "READY", readiness: "READY",
       button: { label: "NinjaTrader Ready", enabled: false, tone: "ready" },
       process: { state: "RUNNING", control_center_detected: true },
       addon: { state: "AUTHENTICATED", provenance: "MATCH" },
-      chart: { state: "OBSERVER_ATTACHED", found: true, created: false, instrument: "MNQ SEP26" },
-      observer: { state: "ACTIVE", attached: true, market_data_fresh: true, freshness_reason: "CURRENT" },
+      chart: { state: "OBSERVER_ATTACHED", found: false, created: false, instrument: "MNQ SEP26" },
+      observer: { state: "ACTIVE", attached: true, subscription_mode: "NATIVE_ADDON", market_data_fresh: true, freshness_reason: "CURRENT" },
     };
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
-    const ready = await screen.findByRole("button", { name: "NinjaTrader Ready" });
-    expect(ready).toBeDisabled();
-    const panel = screen.getByRole("heading", { name: "READY" }).closest("section") as HTMLElement;
-    expect(panel).toHaveTextContent("AUTHENTICATED / MATCH");
-    expect(panel).toHaveTextContent("FOUND / MNQ SEP26");
-    expect(panel).toHaveTextContent("ATTACHED");
-    expect(panel).toHaveTextContent("FRESH");
+    await screen.findByRole("button", { name: "Start Paper Trading" });
+    expect(screen.queryByText("NINJATRADER / MNQ OBSERVER")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "NinjaTrader Ready" })).not.toBeInTheDocument();
+    expect(screen.getByText(/Launch, sign-in, MNQ observer, reconciliation/)).toBeInTheDocument();
   });
 
-  it("starts only the authenticated fixed NinjaTrader maintenance action", async () => {
+  it("exposes the authenticated hard-reset action only in Full Console", async () => {
+    ninjaTraderMaintenanceResponse = {
+      ...ninjaTraderMaintenanceResponse,
+      process: { state: "RUNNING", control_center_detected: true },
+      button: { label: "Restart + Repair Observer", enabled: true, tone: "warning" },
+    };
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Open NinjaTrader + Attach Observer" }));
+    fireEvent.click(screen.getByRole("button", { name: "Lane III Paper" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Hard Reset NinjaTrader + Observer" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Hard Reset NinjaTrader + Observer" }));
     await waitFor(() => expect(fetch).toHaveBeenCalledWith(
       "/api/lane-iii/ninjatrader-maintenance",
       expect.objectContaining({
@@ -777,8 +808,12 @@ describe("copy control center", () => {
       ledger_verification: { state: "PASS", completed_at: "2026-09-01T14:00:00Z", message: "Verified" },
       pnl: { state: "CURRENT", total: "1", realized: "1", unrealized: "0" },
     };
-    operationalStartResponse = { started: false, armed: false, state: "READY_DISARMED", reason_codes: ["OPERATIONAL_PAPER_PREFLIGHT_STALE"] };
-    operationalStartSideEffect = () => {
+    paperAutoStartResponse = {
+      action_token: "fixture-paper-autostart-token", stage: "BLOCKED", in_progress: false,
+      button: { label: "Start Paper Trading", enabled: false, tone: "blocked" },
+      blockers: ["OPERATIONAL_PAPER_PREFLIGHT_STALE"],
+    };
+    paperAutoStartSideEffect = () => {
       slimStatusResponse = {
         generated_at: new Date().toISOString(), light: "RED", label: "NOT READY",
         message: "Runtime changed during the last readiness check.", can_start: false, paper_active: false,
@@ -789,8 +824,8 @@ describe("copy control center", () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
     fireEvent.click(await screen.findByRole("button", { name: "Start Paper Trading" }));
-    expect(await screen.findByRole("img", { name: "Readiness: RED" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "STOP TRADING" })).toBeEnabled();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start Paper Trading" })).toBeDisabled());
+    expect(await screen.findByText(/OPERATIONAL_PAPER_PREFLIGHT_STALE/)).toBeInTheDocument();
   });
 
   it("fails closed in red or yellow Slim states, protects duplicate verification, and never renders stale P&L as zero", async () => {
@@ -800,13 +835,17 @@ describe("copy control center", () => {
       ledger_verification: { state: "IN_PROGRESS", message: "Verifying…" },
       pnl: { state: "STALE", total: null, realized: null, unrealized: null },
     };
+    paperAutoStartResponse = {
+      action_token: "fixture-paper-autostart-token", stage: "VERIFYING_FULL_LEDGER", in_progress: true,
+      button: { label: "Verifying ledger…", enabled: false, tone: "progress" }, blockers: [],
+    };
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
     expect(await screen.findByRole("img", { name: "Readiness: YELLOW" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "STOP TRADING" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Verifying ledger…" })).toBeDisabled();
     expect(screen.getByText("STALE")).toBeInTheDocument();
     expect(screen.queryByText("$0.00")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Ledger Verification" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Ledger Verification" })).not.toBeInTheDocument();
   });
 
   it("preserves an active backend paper session across refresh and mode changes, then uses STOP TRADING", async () => {
@@ -836,30 +875,29 @@ describe("copy control center", () => {
     expect(await screen.findByRole("button", { name: "Lane III Paper" })).toBeInTheDocument();
   });
 
-  it("keeps a requested Slim preference across refresh and coalesces duplicate verification clicks", async () => {
+  it("keeps a requested Slim preference across refresh and coalesces duplicate one-click starts", async () => {
     slimStatusResponse = {
       generated_at: new Date().toISOString(), light: "RED", label: "NOT READY",
       message: "Run a current ledger verification.", can_start: false, paper_active: false,
       ledger_verification: { state: "UNVERIFIED", message: "Verification required" },
       pnl: { state: "MISSING", total: null, realized: null, unrealized: null },
     };
-    let resolveVerification: (response: Response) => void = () => { throw new Error("Verification promise was not created."); };
+    let resolveStart: (response: Response) => void = () => { throw new Error("Auto-start promise was not created."); };
     const deferredFetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
-      if (String(input).startsWith("/api/lane-iii/paper/ledger-verification") && init?.method === "POST") {
-        return new Promise<Response>((resolve) => { resolveVerification = resolve; });
+      if (String(input) === "/api/lane-iii/paper/auto-start" && init?.method === "POST") {
+        return new Promise<Response>((resolve) => { resolveStart = resolve; });
       }
       return Promise.resolve(new Response(JSON.stringify(payload(String(input))), { status: 200, headers: { "Content-Type": "application/json" } }));
     });
     vi.stubGlobal("fetch", deferredFetch);
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
-    const verify = await screen.findByRole("button", { name: "Ledger Verification" });
-    fireEvent.click(verify);
-    expect(await screen.findByText("Verifying…")).toBeInTheDocument();
-    expect(verify).toBeDisabled();
-    fireEvent.click(verify);
-    expect(deferredFetch.mock.calls.filter(([path, init]) => String(path).startsWith("/api/lane-iii/paper/ledger-verification") && (init as RequestInit | undefined)?.method === "POST")).toHaveLength(1);
-    resolveVerification(new Response(JSON.stringify({ status: "IN_PROGRESS" }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    const start = await screen.findByRole("button", { name: "Start Paper Trading" });
+    fireEvent.click(start);
+    await waitFor(() => expect(start).toBeDisabled());
+    fireEvent.click(start);
+    expect(deferredFetch.mock.calls.filter(([path, init]) => String(path) === "/api/lane-iii/paper/auto-start" && (init as RequestInit | undefined)?.method === "POST")).toHaveLength(1);
+    resolveStart(new Response(JSON.stringify({ ...paperAutoStartResponse, stage: "ENSURING_NINJATRADER", in_progress: true, button: { label: "Starting NinjaTrader…", enabled: false } }), { status: 200, headers: { "Content-Type": "application/json" } }));
     await waitFor(() => expect(deferredFetch.mock.calls.filter(([path]) => String(path).startsWith("/api/lane-iii/paper/slim-status"))).not.toHaveLength(0));
     cleanup();
     render(<App />);
