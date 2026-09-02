@@ -387,7 +387,7 @@ class PaperRuntimeTests(unittest.TestCase):
             self.assertFalse(runtime.arm()["armed"])
             runtime.stop(); ledger.close()
 
-    def test_only_exact_read_only_account_items_receive_no_authority_marker(self) -> None:
+    def test_exact_read_only_account_items_are_suppressed_but_unknown_shapes_remain_durable(self) -> None:
         with TemporaryDirectory() as directory:
             ledger = PaperLedger(Path(directory) / "paper.sqlite3")
             runtime = LaneIIIPaperRuntime(ledger)
@@ -404,12 +404,12 @@ class PaperRuntimeTests(unittest.TestCase):
             runtime.ingest(account(2, {"item": "RealizedProfitLoss", "value": "0", "unknown": True}))
             ledger.flush_deferred()
             records = [record for record in ledger.recent(20, domain="OBSERVATION") if record["payload"]["observation_type"] == "ACCOUNT"]
-            self.assertEqual(len(records), 2)
-            marked = records[1]["payload"]
+            self.assertEqual(len(records), 1)
             unmarked = records[0]["payload"]
-            self.assertEqual(marked["authority_effect"], "NONE")
-            self.assertEqual(marked["observation_semantics"], "INFORMATIONAL_ACCOUNT_ITEM")
             self.assertNotIn("authority_effect", unmarked)
+            policy = ledger.health_status()["persistence_policy"]
+            self.assertEqual(policy["informational_account_observations"], "DISABLED")
+            self.assertEqual(policy["suppressed_records_by_domain"]["OBSERVATION"], 1)
             runtime.stop(); ledger.close()
 
     def test_only_exact_account_authority_observations_receive_no_effect_marker(self) -> None:
@@ -478,6 +478,12 @@ class PaperRuntimeTests(unittest.TestCase):
                     runtime.ingest(quote)
                     runtime.ingest(factory.trade(quote, quote.payload["ask"]))
                     runtime.ingest(factory.depth("UPDATE", 10 + (index % 2)))
+                    runtime.ingest(replace(
+                        factory.make("CONNECTION", {"item": "UnrealizedProfitLoss", "value": "0"}),
+                        observation_type="ACCOUNT",
+                        account_alias="Sim101",
+                        account_class=AccountClass.LOCAL_SIMULATION,
+                    ))
                 ledger.flush_deferred()
 
                 health = ledger.health_status()
@@ -486,9 +492,10 @@ class PaperRuntimeTests(unittest.TestCase):
                 self.assertEqual(health["counts"].get("DECISION", 0), 0)
                 policy = health["persistence_policy"]
                 self.assertEqual(policy["raw_market_observations"], "DISABLED")
+                self.assertEqual(policy["informational_account_observations"], "DISABLED")
                 self.assertEqual(policy["derived_evidence"], "DISABLED")
                 self.assertEqual(policy["no_effect_decisions"], "DISABLED")
-                self.assertGreaterEqual(policy["suppressed_records_total"], 600)
+                self.assertGreaterEqual(policy["suppressed_records_total"], 800)
                 self.assertEqual(
                     policy["scientific_bulk_persistence"],
                     "DISABLED_UNTIL_SEPARATE_BOUNDED_STORE",

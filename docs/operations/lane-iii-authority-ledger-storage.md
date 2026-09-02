@@ -6,19 +6,23 @@ risk grants and denials, commands and receipts, owned order/fill/protection
 events, position and reconciliation truth, incidents, realized P&L, integrity
 metadata, and clean-session boundaries.
 
-Raw `QUOTE`, `TRADE`, and `DEPTH` envelopes do not enter this ledger. Neither
-do derived evidence items or no-effect decisions. Those values still drive the
-in-memory observer, policy, warmup, mark-to-market, and classification paths.
+Raw `QUOTE`, `TRADE`, and `DEPTH` envelopes do not enter this ledger. Repeated
+read-only `ACCOUNT item/value` frames marked `INFORMATIONAL_ACCOUNT_ITEM` also
+remain outside it; native reconciliation and ORDER/EXECUTION/POSITION authority
+observations remain durable. Neither derived evidence items nor no-effect
+decisions enter the ledger. Those values still drive the in-memory observer,
+policy, warmup, mark-to-market, balance display, and classification paths.
 Scientifically useful bulk persistence is disabled until a separate bounded,
 time-partitioned store is commissioned; it may not fall back into the authority
 ledger. Low-volume commissioning warmup attestations retain compact source IDs
 and hashes, not raw payloads.
 
 `persistence_policy` in paper-ledger health is the runtime proof. Production
-must report raw market observations, derived evidence, and no-effect decisions
-as `DISABLED`. The suppressed counters are diagnostic only and reset with the
-process. Tests may explicitly opt into the former high-volume persistence path
-only to exercise writer/checkpoint mechanics; production never does.
+must report raw market observations, informational account observations,
+derived evidence, and no-effect decisions as `DISABLED`. The suppressed
+counters are diagnostic only and reset with the process. Tests may explicitly
+opt into the former high-volume persistence path only to exercise
+writer/checkpoint mechanics; production never does.
 
 The authority ledger warns at 32 GiB and latches a capacity fault at 40 GiB.
 It also warns below 8 GiB free, hard-fails below 4 GiB free, and warns when the

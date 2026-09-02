@@ -2634,11 +2634,20 @@ class PaperLedger:
         observation_type = (
             stored_payload.get("observation_type") if isinstance(stored_payload, Mapping) else None
         )
+        observation_semantics = (
+            stored_payload.get("observation_semantics") if isinstance(stored_payload, Mapping) else None
+        )
         suppress = (
             not self._persist_high_frequency_records
             and (
                 domain in {"EVIDENCE", "DECISION"}
-                or (domain == "OBSERVATION" and observation_type in _PASSIVE_MARKET_OBSERVATION_TYPES)
+                or (
+                    domain == "OBSERVATION"
+                    and (
+                        observation_type in _PASSIVE_MARKET_OBSERVATION_TYPES
+                        or observation_semantics == "INFORMATIONAL_ACCOUNT_ITEM"
+                    )
+                )
             )
         )
         if suppress:
@@ -3302,6 +3311,9 @@ class PaperLedger:
                 "schema": "l3g-authority-ledger-persistence-policy-v1",
                 "authority_ledger": "PERMANENT_SAFETY_AND_AUTHORITY_RECORDS_ONLY",
                 "raw_market_observations": (
+                    "ENABLED_TEST_ONLY" if self._persist_high_frequency_records else "DISABLED"
+                ),
+                "informational_account_observations": (
                     "ENABLED_TEST_ONLY" if self._persist_high_frequency_records else "DISABLED"
                 ),
                 "derived_evidence": (
