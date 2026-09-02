@@ -210,6 +210,7 @@ class NinjaTraderMaintenanceService:
         live_status: Callable[[], Mapping[str, object]],
         ledger_status: Callable[[], Mapping[str, object]],
         start_ledger_verification: Callable[[], Mapping[str, object]],
+        historical_command_count: Callable[[], int] | None = None,
         desktop: NinjaTraderDesktopAdapter | None = None,
         audit_path: str | Path | None = None,
         timeouts: MaintenanceTimeouts = MaintenanceTimeouts(),
@@ -220,6 +221,7 @@ class NinjaTraderMaintenanceService:
         self._live_status = live_status
         self._ledger_status = ledger_status
         self._start_ledger_verification = start_ledger_verification
+        self._historical_command_count = historical_command_count or (lambda: 0)
         self._desktop = desktop or PowerShellNinjaTraderDesktopAdapter()
         root = Path(__file__).resolve().parents[2]
         self._audit_path = Path(audit_path or root / "logs" / "ninjatrader-maintenance-audit.jsonl").resolve()
@@ -240,6 +242,7 @@ class NinjaTraderMaintenanceService:
         self._launch_count = 0
         self._graceful_shutdown_count = 0
         self._forced_shutdown_count = 0
+        self._durable_baseline_command_count = 0
         self._baseline_command_count = 0
         self._task_command_count = 0
         self._ledger_result: dict[str, object] = {}
@@ -356,11 +359,25 @@ class NinjaTraderMaintenanceService:
         return str(value) if isinstance(value, str) else "UNRESOLVED"
 
     @staticmethod
-    def _command_count(paper: Mapping[str, object]) -> int:
+    def _runtime_command_count(paper: Mapping[str, object]) -> int:
+        transport = NinjaTraderMaintenanceService._transport(paper)
+        sent = transport.get("commands_sent")
+        if type(sent) is int and sent >= 0:
+            return int(sent)
         value = paper.get("last_command")
         if isinstance(value, Mapping) and type(value.get("command_sequence")) is int:
             return int(value["command_sequence"])
         return 0
+
+    def _durable_command_count(self) -> int:
+        try:
+            value = self._historical_command_count()
+        except Exception:
+            return 0
+        return int(value) if type(value) is int and value >= 0 else 0
+
+    def _current_command_count(self, paper: Mapping[str, object]) -> int:
+        return self._durable_baseline_command_count + self._runtime_command_count(paper)
 
     @classmethod
     def _addon_ready(cls, paper: Mapping[str, object]) -> bool:
@@ -528,7 +545,13 @@ class NinjaTraderMaintenanceService:
         attachment = self._attachment(observer)
         freshness = observer.get("market_observer_freshness")
         freshness = freshness if isinstance(freshness, Mapping) else {}
-        command_count = self._command_count(paper)
+        with self._lock:
+            if self._operation_id is None:
+                self._durable_baseline_command_count = self._durable_command_count()
+                self._baseline_command_count = (
+                    self._durable_baseline_command_count + self._runtime_command_count(paper)
+                )
+        command_count = self._current_command_count(paper)
         with self._lock:
             self._task_command_count = max(0, command_count - self._baseline_command_count) if self._operation_id else 0
             stage = self._stage
@@ -614,7 +637,8 @@ class NinjaTraderMaintenanceService:
             self._graceful_shutdown_count = 0
             self._forced_shutdown_count = 0
             paper = self._paper_status()
-            self._baseline_command_count = self._command_count(paper)
+            self._durable_baseline_command_count = self._durable_command_count()
+            self._baseline_command_count = self._current_command_count(paper)
             self._task_command_count = 0
             self._ledger_result = {}
             try:
@@ -818,7 +842,7 @@ class NinjaTraderMaintenanceService:
 
     def _final_reconciliation_ready(self) -> bool:
         paper = self._paper_status()
-        current_commands = self._command_count(paper)
+        current_commands = self._current_command_count(paper)
         with self._lock:
             self._task_command_count = max(0, current_commands - self._baseline_command_count)
         if self._task_command_count:
@@ -845,7 +869,7 @@ class NinjaTraderMaintenanceService:
 
     def _finish_ready(self) -> None:
         paper = self._paper_status()
-        current = self._command_count(paper)
+        current = self._current_command_count(paper)
         with self._lock:
             self._task_command_count = max(0, current - self._baseline_command_count)
         if self._task_command_count:

@@ -1588,11 +1588,24 @@ def create_control_center_app(
             authorization_status_path=None if not authorization_path else Path(authorization_path),
         )
 
+    def latest_durable_command_sequence() -> int:
+        """Recover the most recent execution-session counter across restarts."""
+        ledger = ninjatrader_runtime.get("paper_ledger")
+        if type(ledger) is not PaperLedger:
+            return 0
+        records = ledger.recent(domain="COMMAND", limit=1)
+        if not records:
+            return 0
+        payload = records[0].get("payload")
+        sequence = payload.get("command_sequence") if isinstance(payload, Mapping) else None
+        return int(sequence) if type(sequence) is int and sequence >= 0 else 0
+
     maintenance_arguments = {
         "paper_status": lane_iii_paper_health,
         "live_status": lane_iii_live_health,
         "ledger_status": ledger_verifier.status,
         "start_ledger_verification": lambda: ledger_verifier.start("incremental"),
+        "historical_command_count": lambda: latest_durable_command_sequence(),
         "audit_path": audit_root / "ninjatrader-maintenance-audit.jsonl",
     }
     ninjatrader_maintenance = (

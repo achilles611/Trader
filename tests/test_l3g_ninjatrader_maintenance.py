@@ -379,6 +379,28 @@ class NinjaTraderMaintenanceTests(unittest.TestCase):
         self.assertIn('"execution_command_baseline":3', audit)
         self.assertIn('"execution_commands_sent_by_task":0', audit)
 
+    def test_durable_command_counter_survives_runtime_restart(self) -> None:
+        self.paper.value["last_command"] = None
+        transport = self.paper.value["transport"]
+        assert isinstance(transport, dict)
+        transport["commands_sent"] = 0
+        desktop = FakeDesktop(process=False, on_start=lambda value: setattr(value, "control_center", True))
+        service = NinjaTraderMaintenanceService(
+            paper_status=self.paper,
+            live_status=self.live,
+            ledger_status=self.ledger.status,
+            start_ledger_verification=self.ledger.start,
+            historical_command_count=lambda: 3,
+            desktop=desktop,
+            audit_path=Path(self.temporary.name) / "maintenance.jsonl",
+            timeouts=FAST_TIMEOUTS,
+        )
+        self.assertEqual(service.status()["actions"]["current_execution_command_count"], 3)
+        status = self.run_service(service)
+        self.assertEqual(status["actions"]["execution_command_baseline"], 3)
+        self.assertEqual(status["actions"]["current_execution_command_count"], 3)
+        self.assertEqual(status["actions"]["execution_commands_sent_by_task"], 0)
+
     def test_unwritable_audit_fails_before_any_desktop_action(self) -> None:
         desktop = FakeDesktop(process=False, on_start=lambda value: setattr(value, "control_center", True))
         audit_directory = Path(self.temporary.name) / "audit-is-a-directory"
