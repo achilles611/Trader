@@ -193,17 +193,19 @@ class PaperControlCenterTests(unittest.TestCase):
             "/api/lane-iii/paper/commissioning-arm", "/api/lane-iii/paper/commission-entry", "/api/lane-iii/paper/commission-exit",
             "/api/lane-iii/paper/commissioning-rehearsal", "/api/lane-iii/paper/commissioning-start",
             "/api/lane-iii/paper/operational-start",
+            "/api/lane-iii/paper/entry-profile",
         }
         self.assertTrue(expected.issubset(routes))
         self.assertFalse(any("order" in path and path.startswith("/api/lane-iii/paper") for path in routes))
         for path in expected:
             self.assertEqual(set(routes[path].methods), {"POST"})
             self.assertNotIn("{", path)
-        for path in expected - {"/api/lane-iii/paper/commission-entry", "/api/lane-iii/paper/commissioning-start", "/api/lane-iii/paper/operational-start"}:
+        for path in expected - {"/api/lane-iii/paper/commission-entry", "/api/lane-iii/paper/commissioning-start", "/api/lane-iii/paper/operational-start", "/api/lane-iii/paper/entry-profile"}:
             self.assertEqual(inspect.signature(routes[path].endpoint).parameters, {})
         self.assertEqual(tuple(inspect.signature(routes["/api/lane-iii/paper/commission-entry"].endpoint).parameters), ("body",))
         self.assertEqual(tuple(inspect.signature(routes["/api/lane-iii/paper/commissioning-start"].endpoint).parameters), ("body",))
         self.assertEqual(tuple(inspect.signature(routes["/api/lane-iii/paper/operational-start"].endpoint).parameters), ("body",))
+        self.assertEqual(tuple(inspect.signature(routes["/api/lane-iii/paper/entry-profile"].endpoint).parameters), ("body",))
         arm_source = inspect.getsource(routes["/api/lane-iii/paper/commissioning-arm"].endpoint)
         entry_source = inspect.getsource(routes["/api/lane-iii/paper/commission-entry"].endpoint)
         start_source = inspect.getsource(routes["/api/lane-iii/paper/commissioning-start"].endpoint)

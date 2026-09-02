@@ -2621,6 +2621,33 @@ def create_control_center_app(
             raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
         return paper.flatten_and_disarm()
 
+    @app.post("/api/lane-iii/paper/entry-profile")
+    async def api_lane_iii_paper_entry_profile(
+        body: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, object]:
+        """Select the backend-owned Sim101 entry profile; never execution authority."""
+        paper = ninjatrader_runtime.get("paper")
+        if paper is None:
+            raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
+        if (
+            not isinstance(body, dict)
+            or set(body) != {"operator_command_id", "profile"}
+            or not isinstance(body.get("operator_command_id"), str)
+            or not isinstance(body.get("profile"), str)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Entry-profile selection accepts only operator_command_id and profile.",
+            )
+        try:
+            return paper.select_entry_profile(
+                str(body["operator_command_id"]), str(body["profile"]),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.get("/api/science/health")
     async def api_science_health() -> dict[str, Any]:
         return center.science.health()

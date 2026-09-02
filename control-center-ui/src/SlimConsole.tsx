@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { PaperConsoleState } from "./paperConsole";
 
 type Props = {
@@ -18,6 +19,7 @@ const pnlClass = (value: unknown) => {
 };
 
 export function SlimConsole({ paper, onFullConsole }: Props) {
+  const [confirmBeeztmode, setConfirmBeeztmode] = useState(false);
   const status = paper.slimStatus;
   const light = status?.light || "RED";
   const active = status?.paper_active === true;
@@ -34,6 +36,9 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
   const pnl = status?.pnl || { state: "MISSING" };
   const verificationRunning = verification.state === "IN_PROGRESS" || paper.verificationInFlight;
   const startEnabled = status?.can_start === true && !paper.busy;
+  const profile = paper.status?.entry_profile || {};
+  const beeztmodeActive = profile.selected_profile === "BEEZTMODE_V1";
+  const profileSelectionEnabled = profile.selection_permitted === true && !paper.busy;
   const pnlUnavailable = pnl.state !== "CURRENT";
   const resultLabel = verificationRunning
     ? "Verifying…"
@@ -63,6 +68,29 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
         <div><dt>Realized</dt><dd className={pnlUnavailable ? "neutral" : pnlClass(pnl.realized)}>{pnlUnavailable ? "—" : money(pnl.realized)}</dd></div>
         <div><dt>Unrealized</dt><dd className={pnlUnavailable ? "neutral" : pnlClass(pnl.unrealized)}>{pnlUnavailable ? "—" : money(pnl.unrealized)}</dd></div>
       </dl>
+    </section>
+
+    <section className={`slim-card slim-beeztmode ${beeztmodeActive ? "active" : ""}`} aria-labelledby="slim-beeztmode-heading">
+      <div className="slim-profile-heading">
+        <div><div className="slim-kicker">EXPERIMENTAL PAPER PROFILE</div><h2 id="slim-beeztmode-heading">Beeztmode</h2></div>
+        <span className={`beeztmode-badge ${beeztmodeActive ? "active" : "standard"}`}>{beeztmodeActive ? "BEEZTMODE ACTIVE" : "STANDARD"}</span>
+      </div>
+      <p className="slim-profile-copy">{beeztmodeActive ? "Aggressive paper profile" : "Standard paper profile"}</p>
+      <div className="slim-profile-row"><span>Effective confidence threshold</span><strong>{profile.effective_threshold ?? "—"}</strong></div>
+      <button
+        className={`beeztmode-toggle ${beeztmodeActive ? "enabled" : ""}`}
+        type="button"
+        role="switch"
+        aria-checked={beeztmodeActive}
+        disabled={!profileSelectionEnabled}
+        onClick={() => beeztmodeActive ? void paper.selectEntryProfile("STANDARD") : setConfirmBeeztmode(true)}
+      ><span aria-hidden="true" />{beeztmodeActive ? "Use Standard" : "Enable Beeztmode"}</button>
+      {!profileSelectionEnabled && <p className="slim-profile-reason">{profile.selection_reason || "Profile selection is unavailable."}</p>}
+      {confirmBeeztmode && <div className="slim-profile-confirm" role="dialog" aria-modal="true" aria-labelledby="slim-beeztmode-confirm-title">
+        <strong id="slim-beeztmode-confirm-title">Enable Beeztmode?</strong>
+        <p>Beeztmode lowers the paper entry-confidence threshold and may increase trade frequency. All safety and risk gates remain active.</p>
+        <div><button type="button" onClick={() => setConfirmBeeztmode(false)}>Cancel</button><button type="button" className="confirm" onClick={() => { setConfirmBeeztmode(false); void paper.selectEntryProfile("BEEZTMODE_V1"); }}>Enable Beeztmode</button></div>
+      </div>}
     </section>
 
     <section className="slim-actions" aria-label="Paper controls">

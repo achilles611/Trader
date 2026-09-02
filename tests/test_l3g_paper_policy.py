@@ -2,15 +2,62 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 from src.l3f_provider.tradovate_observation import StreamHealth
 from src.l3g_paper.contracts import PaperDecisionKind, PaperDirection
 from src.l3g_paper.policy import ExperimentalPaperPolicy
+from src.l3g_paper.profiles import PaperEntryProfile
 
 from tests.l3g_helpers import ObservationFactory, warmed_bullish_policy
 
 
 class PaperPolicyTests(unittest.TestCase):
+    @staticmethod
+    def _candidate_policy(bull: str, bear: str, *, families: int = 3) -> tuple[ExperimentalPaperPolicy, object]:
+        policy = ExperimentalPaperPolicy()
+        policy._transport_state = StreamHealth.HEALTHY
+        policy._price_connected = True
+        policy._depth_recovering = False
+        summary = {
+            "STRUCTURAL_CONTEXT": {"support": bull, "contradiction": "0", "labels": ["STRUCTURE"]},
+            "ORDER_FLOW": {"support": bull, "contradiction": "0", "labels": ["FLOW"]},
+            "RESTING_LIQUIDITY": {"support": bull, "contradiction": "0", "labels": ["LIQUIDITY"]},
+            "VOLATILITY_CONTEXT": {"support": "0", "contradiction": "0", "labels": []},
+            "MARKET_REGIME": {"support": "0", "contradiction": "0", "labels": []},
+            "positive_family_count": families,
+            "blocking_contradiction": False,
+        }
+        losing = {**summary, "positive_family_count": 0}
+        policy.score = lambda _at, hypothesis: (  # type: ignore[method-assign]
+            (Decimal(bull), summary) if hypothesis.value == "BULLISH_REVERSAL" else (Decimal(bear), losing)
+        )
+        return policy, ObservationFactory().quote(100)
+
+    def test_standard_threshold_is_unchanged_and_beeztmode_is_exactly_fifteen_percent_lower(self) -> None:
+        policy, observation = self._candidate_policy("0.60", "0.40")
+        standard = policy.evaluate(observation)  # type: ignore[arg-type]
+        self.assertEqual(standard.decision, PaperDecisionKind.NO_TRADE)
+        self.assertEqual(standard.reason_code, "ENTRY_SUPPORT_THRESHOLD")
+        self.assertEqual(standard.effective_confidence_threshold, Decimal("0.65"))
+
+        policy.select_entry_profile(PaperEntryProfile.BEEZTMODE_V1)
+        beezt = policy.evaluate(observation)  # type: ignore[arg-type]
+        self.assertEqual(beezt.decision, PaperDecisionKind.LONG)
+        self.assertEqual(beezt.effective_confidence_threshold, Decimal("0.5525"))
+        self.assertEqual(beezt.entry_profile, "BEEZTMODE_V1")
+        self.assertEqual(beezt.candidate_confidence, Decimal("0.60"))
+
+    def test_beeztmode_preserves_hard_floor_and_independent_family_gate(self) -> None:
+        policy, observation = self._candidate_policy("0.49", "0.20")
+        policy.select_entry_profile(PaperEntryProfile.BEEZTMODE_V1)
+        below_floor = policy.evaluate(observation)  # type: ignore[arg-type]
+        self.assertEqual(below_floor.reason_code, "ENTRY_CONFIDENCE_HARD_FLOOR")
+
+        family_policy, family_observation = self._candidate_policy("0.60", "0.40", families=2)
+        family_policy.select_entry_profile(PaperEntryProfile.BEEZTMODE_V1)
+        missing_family = family_policy.evaluate(family_observation)  # type: ignore[arg-type]
+        self.assertEqual(missing_family.reason_code, "ENTRY_FAMILY_COUNT")
     def test_non_market_observation_advances_global_local_sequence(self) -> None:
         policy = ExperimentalPaperPolicy(); policy.on_transport_state(StreamHealth.HEALTHY)
         factory = ObservationFactory()

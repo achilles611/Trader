@@ -85,6 +85,7 @@ function payload(path: string) {
     operationalStartSideEffect?.();
     return operationalStartResponse || { started: false, state: "READY_DISARMED" };
   }
+  if (path.startsWith("/api/lane-iii/paper/entry-profile")) return { changed: true, state: "READY_DISARMED" };
   if (path.startsWith("/api/lane-iii/paper")) return {
     state: "READY_DISARMED",
     ledger_verification: ledgerVerificationResponse,
@@ -145,6 +146,14 @@ function configureReadyLaneIIIUiFixture() {
     transport: {
       state: "AUTHENTICATED", authenticated_client: true, reconciled: true,
       addon_provenance: { status: "MATCH" },
+    },
+    entry_profile: {
+      selected_profile: "STANDARD", entry_profile: "STANDARD", entry_profile_version: "STANDARD_V1",
+      standard_threshold: "0.65", effective_threshold: "0.65", hard_confidence_floor: "0.50",
+      current_candidate_confidence: null, distance_to_active_threshold: null,
+      last_candidate_disposition: null, last_rejection_reason: null, activation_timestamp: null,
+      paper_only: true, live_capital: "DENIED", selection_permitted: true,
+      selection_reason: "ENTRY_PROFILE_SELECTION_PERMITTED", backend_authority: true,
     },
   };
   laneIIILedgerOverrides = {
@@ -666,6 +675,52 @@ describe("copy control center", () => {
     await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/lane-iii/paper/operational-start", expect.objectContaining({ method: "POST" })));
     expect(fetch).not.toHaveBeenCalledWith("/api/lane-iii/paper/commissioning-start", expect.anything());
     expect(screen.getByText("$10.25")).toBeInTheDocument();
+  });
+
+  it("confirms Beeztmode once and preserves the backend profile across Slim and Full Console", async () => {
+    configureReadyLaneIIIUiFixture();
+    slimStatusResponse = {
+      generated_at: new Date().toISOString(), light: "GREEN", label: "READY TO START PAPER TRADING",
+      message: "All canonical paper-start gates are currently satisfied.", can_start: true, paper_active: false,
+      ledger_verification: { state: "PASS", completed_at: "2026-09-01T14:00:00Z", message: "Verified" },
+      pnl: { state: "CURRENT", total: "0", realized: "0", unrealized: "0" },
+    };
+    const profileFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.startsWith("/api/lane-iii/paper/entry-profile") && init?.method === "POST") {
+        const request = JSON.parse(String(init.body)) as { profile: string };
+        expect(request.profile).toBe("BEEZTMODE_V1");
+        laneIIIPaperOverrides = {
+          ...laneIIIPaperOverrides,
+          entry_profile: {
+            ...(laneIIIPaperOverrides.entry_profile as Record<string, unknown>),
+            selected_profile: "BEEZTMODE_V1", entry_profile: "BEEZTMODE_V1",
+            entry_profile_version: "BEEZTMODE_V1", effective_threshold: "0.5525",
+            activation_timestamp: "2026-09-02T01:00:00Z", selection_permitted: true,
+          },
+        };
+        return new Response(JSON.stringify({ changed: true, selected_profile: "BEEZTMODE_V1" }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return new Response(JSON.stringify(payload(path)), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    vi.stubGlobal("fetch", profileFetch);
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+    expect(await screen.findByText("STANDARD")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("switch", { name: "Enable Beeztmode" }));
+    const dialog = screen.getByRole("dialog");
+    expect(dialog).toHaveTextContent("Beeztmode lowers the paper entry-confidence threshold and may increase trade frequency. All safety and risk gates remain active.");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Enable Beeztmode" }));
+    expect(await screen.findByText("BEEZTMODE ACTIVE")).toBeInTheDocument();
+    expect(screen.getByText("0.5525")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Full Console" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Lane III Paper" }));
+    const panel = (await screen.findByRole("heading", { name: "Experimental entry profile" })).closest("section") as HTMLElement;
+    expect(panel).toHaveTextContent("BEEZTMODE ACTIVE");
+    expect(panel).toHaveTextContent("0.5525");
+    expect(profileFetch.mock.calls.filter(([path]) => String(path).startsWith("/api/lane-iii/paper/entry-profile"))).toHaveLength(1);
   });
 
   it("fails closed when canonical state changes after Slim rendered green", async () => {

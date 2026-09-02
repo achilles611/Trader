@@ -396,6 +396,12 @@ class PaperDecision:
     commissioning: bool = False
     strategy_generated: bool = True
     scientific_evidence: bool = False
+    entry_profile: str = "STANDARD"
+    entry_profile_version: str = "STANDARD_V1"
+    effective_confidence_threshold: Decimal = Decimal("0.65")
+    candidate_confidence: Decimal | None = None
+    confluence_family_summary: Mapping[str, object] = field(default_factory=dict)
+    paper_only: bool = True
 
     def __post_init__(self) -> None:
         if not self.paper_decision_id.startswith("l3g-pd-"):
@@ -422,14 +428,27 @@ class PaperDecision:
                 raise ValueError("Only bullish reversal may create a long paper decision.")
             if self.decision is PaperDecisionKind.SHORT and (self.hypothesis_kind is not HypothesisKind.BEARISH_CONTINUATION or self.direction is not PaperDirection.SHORT):
                 raise ValueError("Only bearish continuation may create a short paper decision.")
+        expected_profile_threshold = {
+            ("STANDARD", "STANDARD_V1"): Decimal("0.65"),
+            ("BEEZTMODE_V1", "BEEZTMODE_V1"): Decimal("0.5525"),
+        }.get((self.entry_profile, self.entry_profile_version))
+        if (
+            expected_profile_threshold is None
+            or self.effective_confidence_threshold != expected_profile_threshold
+            or self.candidate_confidence is not None and not Decimal("0") <= self.candidate_confidence <= Decimal("1")
+            or not self.paper_only
+        ):
+            raise ValueError("Paper decision entry-profile attribution is invalid.")
         if self.decision in {PaperDecisionKind.NO_TRADE, PaperDecisionKind.EXIT} and self.direction is not PaperDirection.FLAT:
             raise ValueError("NO_TRADE and EXIT have a flat target direction.")
         _validate_session_identity(self.session_kind, self.session_id, self.trade_date, self.session_profile_hash, self.session_generation)
         object.__setattr__(self, "family_summary", MappingProxyType(dict(self.family_summary)))
+        object.__setattr__(self, "confluence_family_summary", MappingProxyType(dict(self.confluence_family_summary)))
 
     def payload(self) -> dict[str, object]:
         result = dict(self.__dict__)
         result["family_summary"] = dict(self.family_summary)
+        result["confluence_family_summary"] = dict(self.confluence_family_summary)
         result["session_family"] = session_family(self.session_kind).value
         return _jsonable(result)  # type: ignore[return-value]
 

@@ -48,6 +48,7 @@ from .ninjatrader_transport import (
     PaperExecutionTransport,
 )
 from .policy import ExperimentalPaperPolicy
+from .profiles import PaperEntryProfile, STANDARD_PROFILE, entry_profile_spec
 from .risk import PaperRiskAuthority, PaperRiskSnapshot
 from .sessions import (
     PaperSessionContext,
@@ -329,6 +330,12 @@ class LaneIIIPaperRuntime:
         self._commissioning_stale_snapshot_refusals = 0
         self._last_commissioning_preflight_duration_seconds: float | None = None
         self._last_commissioning_snapshot_token: str | None = None
+        # Entry-profile authority is deliberately process-local. A restart
+        # always reconstructs STANDARD and cannot replay browser state.
+        self._entry_profile_selected_at: str | None = None
+        self._entry_profile_command_results: dict[str, tuple[str, dict[str, object]]] = {}
+        self._active_trade_profile_attribution: dict[str, object] | None = None
+        self._command_profile_attribution: dict[str, dict[str, object]] = {}
 
     @staticmethod
     def _ownership_context_matches(left: PaperSessionContext, right: PaperSessionContext) -> bool:
@@ -373,6 +380,182 @@ class LaneIIIPaperRuntime:
             "stopping_reason": session.stopping_reason,
             "ledger_preflight": dict(session.ledger_preflight),
         }
+
+    @staticmethod
+    def _profile_attribution_from_decision(decision: PaperDecision) -> dict[str, object]:
+        return {
+            "entry_profile": decision.entry_profile,
+            "entry_profile_version": decision.entry_profile_version,
+            "effective_confidence_threshold": str(decision.effective_confidence_threshold),
+            "candidate_confidence": None if decision.candidate_confidence is None else str(decision.candidate_confidence),
+            "confluence_family_summary": dict(decision.confluence_family_summary),
+            "paper_only": True,
+        }
+
+    def _current_profile_attribution_locked(self, *, prefer_active_trade: bool = False) -> dict[str, object]:
+        if prefer_active_trade and self._active_trade_profile_attribution is not None:
+            return dict(self._active_trade_profile_attribution)
+        profile = self.policy.entry_profile
+        return {
+            "entry_profile": profile.profile.value,
+            "entry_profile_version": profile.version,
+            "effective_confidence_threshold": str(profile.effective_threshold),
+            "candidate_confidence": None,
+            "confluence_family_summary": {},
+            "paper_only": True,
+        }
+
+    def _profile_selection_eligibility_locked(self) -> tuple[bool, str, dict[str, object]]:
+        transport = None if self._transport is None else self._transport.status().as_dict()
+        authenticated = isinstance(transport, Mapping) and (
+            transport.get("state"), transport.get("authenticated_client"), transport.get("account"),
+            transport.get("account_class"), transport.get("instrument"), transport.get("paper_only"),
+            transport.get("live_capital"),
+        ) == ("AUTHENTICATED", True, "Sim101", "LOCAL_SIMULATION", "MNQ SEP26", True, "DENIED")
+        proof = {
+            "runtime_state": self._state.value,
+            "operational_session_active": self._operational_session is not None,
+            "position": self._position.value,
+            "position_quantity": self._position_quantity,
+            "working_owned_orders": self._snapshot.working_owned_orders,
+            "working_entry_orders": self._snapshot.working_entry_orders,
+            "unresolved_command": self._snapshot.unresolved_command,
+            "unresolved_native_order": self._snapshot.unresolved_native_order,
+            "unresolved_execution": self._snapshot.unresolved_execution,
+            "reconciliation_current": self._snapshot.reconciliation_current,
+            "position_snapshot_complete": self._snapshot.position_snapshot_complete,
+            "order_snapshot_complete": self._snapshot.order_snapshot_complete,
+            "execution_session_id": self._execution_session_id(),
+            "authenticated_paper_binding": authenticated,
+            "account": ACCOUNT_BINDING.account_name,
+            "account_class": ACCOUNT_BINDING.account_class,
+            "instrument": ACCOUNT_BINDING.instrument,
+            "live_capital": "DENIED",
+        }
+        if not authenticated:
+            return False, "ENTRY_PROFILE_AUTHENTICATED_PAPER_SESSION_REQUIRED", proof
+        if self._state is PaperRuntimeState.ENTRY_PENDING or self._snapshot.working_entry_orders:
+            return False, "ENTRY_PROFILE_ENTRY_PENDING", proof
+        if self._state is PaperRuntimeState.EXIT_PENDING:
+            return False, "ENTRY_PROFILE_EXIT_PENDING", proof
+        if self._position is not PaperDirection.FLAT or self._position_quantity != 0:
+            return False, "ENTRY_PROFILE_POSITION_OPEN", proof
+        if self._snapshot.working_owned_orders:
+            return False, "ENTRY_PROFILE_OWNED_ORDERS_PRESENT", proof
+        if (
+            self._snapshot.unresolved_command or self._snapshot.unresolved_native_order
+            or self._snapshot.unresolved_execution or not self._snapshot.reconciliation_current
+            or not self._snapshot.position_snapshot_complete or not self._snapshot.order_snapshot_complete
+        ):
+            return False, "ENTRY_PROFILE_EXECUTION_TRUTH_UNCERTAIN", proof
+        disarmed = self._state is PaperRuntimeState.READY_DISARMED and self._operational_session is None
+        active_flat = self._state is PaperRuntimeState.PAPER_RUNNING and self._operational_session is not None
+        if not (disarmed or active_flat):
+            return False, "ENTRY_PROFILE_STATE_NOT_ELIGIBLE", proof
+        return True, "ENTRY_PROFILE_SELECTION_PERMITTED", proof
+
+    def select_entry_profile(self, operator_command_id: str, profile: PaperEntryProfile | str) -> dict[str, object]:
+        """Select one backend-owned paper profile without changing session authority."""
+        if (
+            not isinstance(operator_command_id, str) or not 8 <= len(operator_command_id) <= 160
+            or any(not (character.isalnum() or character in "-_.:") for character in operator_command_id)
+        ):
+            raise ValueError("ENTRY_PROFILE_OPERATOR_COMMAND_ID_INVALID")
+        spec = entry_profile_spec(profile)
+        with self._lock:
+            prior_result = self._entry_profile_command_results.get(operator_command_id)
+            if prior_result is not None:
+                prior_profile, result = prior_result
+                if prior_profile != spec.profile.value:
+                    raise ValueError("ENTRY_PROFILE_COMMAND_ID_CONFLICT")
+                return {**result, "idempotent_replay": True}
+            allowed, reason, proof = self._profile_selection_eligibility_locked()
+            if not allowed:
+                raise RuntimeError(reason)
+            previous = self.policy.entry_profile
+            if previous.profile is spec.profile:
+                result = {
+                    "changed": False, "idempotent_replay": False, "reason_code": "ENTRY_PROFILE_ALREADY_SELECTED",
+                    "operator_command_id": operator_command_id, **spec.payload(), "activation_timestamp": self._entry_profile_selected_at,
+                    "eligibility_proof": proof,
+                }
+                self._entry_profile_command_results[operator_command_id] = (spec.profile.value, result)
+                return result
+            changed_at = _now()
+            payload = {
+                "operator_command_id": operator_command_id,
+                "previous_profile": previous.profile.value,
+                "new_profile": spec.profile.value,
+                "standard_threshold": str(spec.standard_threshold),
+                "effective_threshold": str(spec.effective_threshold),
+                "hard_confidence_floor": str(spec.hard_confidence_floor),
+                "timestamp": changed_at,
+                "runtime_identity": dict(self._runtime_identity),
+                "execution_session_id": self._execution_session_id(),
+                "session_identity": self._session_context.payload(),
+                "eligibility_proof": proof,
+                "entry_profile_version": spec.version,
+                "paper_only": True,
+                "live_capital": "DENIED",
+                "reason": "OPERATOR_SELECTION",
+            }
+            self.ledger.append(
+                "SESSION_ENTRY_PROFILE_CHANGED", payload,
+                identity="l3g-entry-profile-command-" + operator_command_id,
+                occurred_at=changed_at, execution_session_id=self._execution_session_id(),
+            )
+            self.policy.select_entry_profile(spec.profile)
+            self._entry_profile_selected_at = changed_at if spec.profile is PaperEntryProfile.BEEZTMODE_V1 else None
+            result = {
+                "changed": True, "idempotent_replay": False, "reason_code": "ENTRY_PROFILE_CHANGED",
+                "operator_command_id": operator_command_id, **spec.payload(),
+                "activation_timestamp": self._entry_profile_selected_at, "eligibility_proof": proof,
+            }
+            self._entry_profile_command_results[operator_command_id] = (spec.profile.value, result)
+            return result
+
+    def _reset_entry_profile_locked(self, reason: str) -> None:
+        previous = self.policy.entry_profile
+        if previous.profile is PaperEntryProfile.STANDARD:
+            self._entry_profile_selected_at = None
+            return
+        changed_at = _now()
+        payload = {
+            "operator_command_id": "SYSTEM_RESET:" + reason,
+            "previous_profile": previous.profile.value,
+            "new_profile": PaperEntryProfile.STANDARD.value,
+            "standard_threshold": str(STANDARD_PROFILE.standard_threshold),
+            "effective_threshold": str(STANDARD_PROFILE.effective_threshold),
+            "hard_confidence_floor": str(STANDARD_PROFILE.hard_confidence_floor),
+            "timestamp": changed_at,
+            "runtime_identity": dict(self._runtime_identity),
+            "execution_session_id": self._execution_session_id(),
+            "session_identity": self._session_context.payload(),
+            "eligibility_proof": {
+                "position": self._position.value,
+                "position_quantity": self._position_quantity,
+                "working_owned_orders": self._snapshot.working_owned_orders,
+                "reset_is_safety_dominant": True,
+            },
+            "entry_profile_version": STANDARD_PROFILE.version,
+            "paper_only": True,
+            "live_capital": "DENIED",
+            "reason": reason,
+        }
+        try:
+            self.ledger.append(
+                "SESSION_ENTRY_PROFILE_CHANGED", payload,
+                identity="l3g-entry-profile-reset-" + canonical_hash({"selected_at": self._entry_profile_selected_at, "reason": reason}),
+                occurred_at=changed_at, execution_session_id=self._execution_session_id(),
+            )
+        except Exception:
+            # The already-running safety action must continue even if its
+            # explanatory reset record cannot be written.
+            pass
+        finally:
+            # Safety reset cannot depend on the audit sink remaining writable.
+            self.policy.select_entry_profile(PaperEntryProfile.STANDARD)
+            self._entry_profile_selected_at = None
 
     def _operational_session_is_stopping_locked(self) -> bool:
         return self._operational_session is not None and self._operational_session.stopping_reason is not None
@@ -778,9 +961,11 @@ class LaneIIIPaperRuntime:
                 **context.payload(), "reason": reason,
                 "session_realized_pnl": str(self._session_pnl.get(context.session_id, Decimal("0"))),
                 "position": self._position.value, "working_owned_orders": self._snapshot.working_owned_orders,
+                **self._current_profile_attribution_locked(prefer_active_trade=True),
             }, identity="l3g-paper-session-close-" + canonical_hash({**context.payload(), "reason": reason}),
         )
         self.policy.reset("SESSION_CLOSED")
+        self._reset_entry_profile_locked("SESSION_CLOSED")
         if self._operational_session is not None:
             self._request_operational_stop_locked("SCHEDULED_SESSION_CLOSE")
             if (
@@ -886,6 +1071,8 @@ class LaneIIIPaperRuntime:
         if target not in allowed[prior]:
             raise RuntimeError(f"Illegal paper state transition {prior.value} -> {target.value}.")
         self._state = target
+        if target in {PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED, PaperRuntimeState.STOPPING, PaperRuntimeState.STOPPED}:
+            self._reset_entry_profile_locked("SAFETY_TERMINATION:" + target.value + ":" + reason)
         self._transitions += 1
         self._advance_commissioning_authority_epoch()
         transition_identity = "l3g-transition-" + canonical_hash({"number": self._transitions, "prior": prior.value, "target": target.value, "reason": reason, "process_session": id(self)})
@@ -1565,10 +1752,11 @@ class LaneIIIPaperRuntime:
         elif self._entry_owner is not PaperEntryOwner.NONE:
             return False
         bid, ask, last = self._references()
+        attribution = self._profile_attribution_from_decision(decision)
         intent = self.risk.make_intent(decision, reference_bid=bid, reference_ask=ask, reference_last=last)
-        self.ledger.append("INTENT", intent.payload(), identity=intent.intent_id, occurred_at=intent.created_at, execution_session_id=self._execution_session_id())
+        self.ledger.append("INTENT", {**intent.payload(), **attribution}, identity=intent.intent_id, occurred_at=intent.created_at, execution_session_id=self._execution_session_id())
         grant = self.risk.evaluate(intent, self._snapshot, at=_now())
-        self.ledger.append("RISK_GRANT", grant.payload(), identity=grant.grant_id, occurred_at=grant.evaluated_at, execution_session_id=self._execution_session_id())
+        self.ledger.append("RISK_GRANT", {**grant.payload(), **attribution}, identity=grant.grant_id, occurred_at=grant.evaluated_at, execution_session_id=self._execution_session_id())
         if not grant.granted:
             return False
         action = ExecutionAction.ENTER_LONG if decision.decision is PaperDecisionKind.LONG else ExecutionAction.ENTER_SHORT
@@ -1578,6 +1766,7 @@ class LaneIIIPaperRuntime:
             commissioning=decision.commissioning,
             strategy_generated=decision.strategy_generated,
             scientific_evidence=decision.scientific_evidence,
+            profile_attribution=attribution,
         )
         self._entry_authority_artifact = {
             "decision": decision.payload(),
@@ -1611,6 +1800,7 @@ class LaneIIIPaperRuntime:
             self._entry_owner = PaperEntryOwner.STRATEGY
         self._pending_intent = intent
         self._pending_grant = grant
+        self._active_trade_profile_attribution = dict(attribution)
         if not decision.commissioning:
             self.policy.mark_entry_used(decision)
         # Install every callback-visible authority fact before transport.  A
@@ -1633,6 +1823,7 @@ class LaneIIIPaperRuntime:
         else:
             decision_id = self._last_decision.paper_decision_id
         commissioning = self._commissioning_ownership is not None
+        attribution = self._current_profile_attribution_locked(prefer_active_trade=True)
         if commissioning:
             self._entries_paused = True
             self._armed_session = None
@@ -1652,14 +1843,18 @@ class LaneIIIPaperRuntime:
             self._session_context.trade_date, self._session_context.session_profile_hash,
             self._session_context.session_generation,
             commissioning, not commissioning, False,
+            str(attribution["entry_profile"]), str(attribution["entry_profile_version"]),
+            Decimal(str(attribution["effective_confidence_threshold"])),
+            None if attribution["candidate_confidence"] is None else Decimal(str(attribution["candidate_confidence"])),
+            dict(attribution["confluence_family_summary"]), True,
         )
         try:
             self.ledger.append("DECISION", pseudo.payload(), identity=pseudo.paper_decision_id, occurred_at=pseudo.created_at, execution_session_id=self._execution_session_id())
             bid, ask, last = self._references()
             intent = self.risk.make_intent(pseudo, reference_bid=bid, reference_ask=ask, reference_last=last)
-            self.ledger.append("INTENT", intent.payload(), identity=intent.intent_id, occurred_at=intent.created_at, execution_session_id=self._execution_session_id())
+            self.ledger.append("INTENT", {**intent.payload(), **attribution}, identity=intent.intent_id, occurred_at=intent.created_at, execution_session_id=self._execution_session_id())
             grant = self.risk.evaluate(intent, self._snapshot, at=_now())
-            self.ledger.append("RISK_GRANT", grant.payload(), identity=grant.grant_id, occurred_at=grant.evaluated_at, execution_session_id=self._execution_session_id())
+            self.ledger.append("RISK_GRANT", {**grant.payload(), **attribution}, identity=grant.grant_id, occurred_at=grant.evaluated_at, execution_session_id=self._execution_session_id())
             if not grant.granted:
                 self._fail_closed_without_ledger_locked(
                     "EXIT_RISK_AUTHORITY_UNAVAILABLE:" + ",".join(grant.reason_codes),
@@ -1669,6 +1864,7 @@ class LaneIIIPaperRuntime:
             command = self._make_command(
                 intent.intent_id, pseudo.paper_decision_id, grant.grant_id, action, PaperDirection.FLAT, reason,
                 commissioning=commissioning, strategy_generated=not commissioning, scientific_evidence=False,
+                profile_attribution=attribution,
             )
             self._exit_submission_in_progress = True
             try:
@@ -1697,6 +1893,7 @@ class LaneIIIPaperRuntime:
         commissioning: bool = False,
         strategy_generated: bool = True,
         scientific_evidence: bool = False,
+        profile_attribution: Mapping[str, object] | None = None,
     ) -> PaperExecutionCommand:
         execution_session = self._execution_session_id()
         if execution_session is None:
@@ -1732,10 +1929,15 @@ class LaneIIIPaperRuntime:
             "strategy_generated": strategy_generated,
             "scientific_evidence": scientific_evidence,
         }
-        return PaperExecutionCommand(deterministic_id("l3g-pc-", payload), **payload)
+        command = PaperExecutionCommand(deterministic_id("l3g-pc-", payload), **payload)
+        self._command_profile_attribution[command.command_id] = dict(
+            profile_attribution or self._current_profile_attribution_locked(prefer_active_trade=True)
+        )
+        return command
 
     def _persist_and_send(self, command: PaperExecutionCommand, grant: object) -> None:
-        self.ledger.append("COMMAND", command.payload(), identity=command.command_id, occurred_at=command.created_at, execution_session_id=command.execution_session_id)
+        attribution = self._command_profile_attribution.get(command.command_id, self._current_profile_attribution_locked(prefer_active_trade=True))
+        self.ledger.append("COMMAND", {**command.payload(), **attribution}, identity=command.command_id, occurred_at=command.created_at, execution_session_id=command.execution_session_id)
         adapter = self._adapter
         if adapter is None:
             raise RuntimeError("Sim101 paper adapter is unavailable.")
@@ -1767,6 +1969,19 @@ class LaneIIIPaperRuntime:
                 self._apply_reconciliation(inbound, durable_receipt_unavailable=durable_receipt_unavailable)
             elif message_type in {"ORDER_EVENT", "COMMAND_ACK", "COMMAND_REJECTED"}:
                 self._last_order_state = dict(inbound)
+                command_id = str(inbound.get("command_id", ""))
+                if message_type == "ORDER_EVENT" and str(inbound.get("order_role", "")).upper() in {"ENTRY", "EXIT", "PROTECTIVE"}:
+                    attribution = self._command_profile_attribution.get(
+                        command_id, self._current_profile_attribution_locked(prefer_active_trade=True),
+                    )
+                    self.ledger.append(
+                        "ORDER_EVENT_PROFILE_ATTRIBUTION",
+                        {"receipt_id": inbound.get("receipt_id"), "command_id": command_id,
+                         "native_order_id": inbound.get("native_order_id"), "order_role": inbound.get("order_role"),
+                         "order_state": inbound.get("order_state"), **attribution},
+                        identity="l3g-order-profile-" + str(inbound.get("receipt_id", canonical_hash(dict(inbound)))),
+                        execution_session_id=self._execution_session_id(),
+                    )
                 if message_type == "COMMAND_REJECTED":
                     self._fault_reason = "EXECUTION_COMMAND_REJECTED:" + str(inbound.get("reason_code", "UNKNOWN"))
                     self.risk.lock_out(self._fault_reason)
@@ -1981,6 +2196,18 @@ class LaneIIIPaperRuntime:
             self._fault_reason = "MALFORMED_EXECUTION_EVENT"
             self.risk.lock_out(self._fault_reason)
             return
+        command_id = str(message.get("command_id", ""))
+        attribution = self._command_profile_attribution.get(
+            command_id, self._current_profile_attribution_locked(prefer_active_trade=True),
+        )
+        self.ledger.append(
+            "EXECUTION_PROFILE_ATTRIBUTION",
+            {"receipt_id": message.get("receipt_id"), "command_id": command_id,
+             "native_execution_id": native_execution_id, "native_order_id": message.get("native_order_id"),
+             "order_role": role, **attribution},
+            identity="l3g-execution-profile-" + str(native_execution_id or message.get("receipt_id", canonical_hash(dict(message)))),
+            execution_session_id=self._execution_session_id(),
+        )
         if role == "ENTRY":
             if self._state is not PaperRuntimeState.ENTRY_PENDING:
                 self._fault_reason = "UNEXPECTED_ENTRY_EXECUTION_STATE"
@@ -2076,6 +2303,7 @@ class LaneIIIPaperRuntime:
                     "realized_pnl": str(realized),
                     "pnl_basis": "AUTHENTIC_ENTRY_AND_EXIT_FILLS",
                     "position_confirmation": "PENDING",
+                    **self._current_profile_attribution_locked(prefer_active_trade=True),
                 },
                 identity="l3g-realized-pnl-" + str(message.get("native_execution_id", canonical_hash(dict(message)))),
                 execution_session_id=self._execution_session_id(),
@@ -2111,6 +2339,7 @@ class LaneIIIPaperRuntime:
         """Require a new signed flat/order snapshot before lifecycle completion."""
         created_at = _now()
         commissioning = self._commissioning_ownership is not None
+        attribution = self._current_profile_attribution_locked(prefer_active_trade=True)
         decision = PaperDecision(
             "l3g-pd-" + canonical_hash({"reason": "POST_EXIT_RECONCILIATION", "at": created_at})[:32],
             POLICY.policy_id, POLICY.configuration_hash, PaperDecisionKind.EXIT, created_at,
@@ -2124,13 +2353,17 @@ class LaneIIIPaperRuntime:
             self._session_context.trade_date, self._session_context.session_profile_hash,
             self._session_context.session_generation,
             commissioning, not commissioning, False,
+            str(attribution["entry_profile"]), str(attribution["entry_profile_version"]),
+            Decimal(str(attribution["effective_confidence_threshold"])),
+            None if attribution["candidate_confidence"] is None else Decimal(str(attribution["candidate_confidence"])),
+            dict(attribution["confluence_family_summary"]), True,
         )
         self.ledger.append("DECISION", decision.payload(), identity=decision.paper_decision_id, occurred_at=decision.created_at, execution_session_id=self._execution_session_id())
         bid, ask, last = self._references()
         intent = self.risk.make_intent(decision, reference_bid=bid, reference_ask=ask, reference_last=last)
-        self.ledger.append("INTENT", intent.payload(), identity=intent.intent_id, occurred_at=intent.created_at, execution_session_id=self._execution_session_id())
+        self.ledger.append("INTENT", {**intent.payload(), **attribution}, identity=intent.intent_id, occurred_at=intent.created_at, execution_session_id=self._execution_session_id())
         grant = self.risk.evaluate(intent, self._snapshot, at=created_at)
-        self.ledger.append("RISK_GRANT", grant.payload(), identity=grant.grant_id, occurred_at=grant.evaluated_at, execution_session_id=self._execution_session_id())
+        self.ledger.append("RISK_GRANT", {**grant.payload(), **attribution}, identity=grant.grant_id, occurred_at=grant.evaluated_at, execution_session_id=self._execution_session_id())
         if not grant.granted:
             self._fault_reason = "POST_EXIT_RECONCILIATION_AUTHORITY_UNAVAILABLE:" + ",".join(grant.reason_codes)
             self.risk.lock_out(self._fault_reason)
@@ -2139,7 +2372,7 @@ class LaneIIIPaperRuntime:
         command = self._make_command(
             intent.intent_id, decision.paper_decision_id, grant.grant_id, ExecutionAction.RECONCILE, PaperDirection.FLAT,
             "POST_EXIT_RECONCILIATION", commissioning=commissioning, strategy_generated=not commissioning,
-            scientific_evidence=False,
+            scientific_evidence=False, profile_attribution=attribution,
         )
         self._persist_and_send(command, grant)
 
@@ -2262,6 +2495,7 @@ class LaneIIIPaperRuntime:
         self._disarm_after_flat = False
         if operational_stopping:
             self._complete_operational_stop_locked("OPERATIONAL_STOP_FLAT_RECONCILIATION_COMPLETE")
+        self._active_trade_profile_attribution = None
 
     def _abort_unsubmitted_commissioning(self, reason: str) -> None:
         """Release only the pre-broker, provably flat commissioning failure."""
@@ -2585,6 +2819,7 @@ class LaneIIIPaperRuntime:
                             "classification": "OPERATIONAL_PAPER_SESSION",
                             "pre_start_verification": dict(readiness.get("ledger") or {}),
                             "live_capital": "DENIED",
+                            **self._current_profile_attribution_locked(),
                         },
                         identity="l3g-operational-paper-start-" + canonical_hash({
                             "request_id": request_id,
@@ -3213,6 +3448,10 @@ class LaneIIIPaperRuntime:
 
     def flatten_and_disarm(self) -> dict[str, object]:
         with self._lock:
+            # STOP is safety-dominant and resets the sampling profile before
+            # any cancel/exit path; open lifecycle attribution is retained in
+            # _active_trade_profile_attribution until final flat truth.
+            self._reset_entry_profile_locked("STOP_TRADING")
             operational = self._operational_session
             if operational is not None:
                 self._request_operational_stop_locked("OPERATOR_STOP_TRADING")
@@ -3294,6 +3533,7 @@ class LaneIIIPaperRuntime:
 
     def _cancel_pending_and_reconcile(self) -> None:
         created = _now()
+        attribution = self._current_profile_attribution_locked(prefer_active_trade=True)
         decision = PaperDecision(
             "l3g-pd-" + canonical_hash({"reason": "CANCEL_PENDING_AND_DISARM", "at": created})[:32],
             POLICY.policy_id, POLICY.configuration_hash, PaperDecisionKind.EXIT, created,
@@ -3305,23 +3545,28 @@ class LaneIIIPaperRuntime:
             self._session_context.session_kind, self._session_context.session_id,
             self._session_context.trade_date, self._session_context.session_profile_hash,
             self._session_context.session_generation,
+            False, True, False,
+            str(attribution["entry_profile"]), str(attribution["entry_profile_version"]),
+            Decimal(str(attribution["effective_confidence_threshold"])),
+            None if attribution["candidate_confidence"] is None else Decimal(str(attribution["candidate_confidence"])),
+            dict(attribution["confluence_family_summary"]), True,
         )
         try:
             self.ledger.append("DECISION", decision.payload(), identity=decision.paper_decision_id, occurred_at=decision.created_at, execution_session_id=self._execution_session_id())
             bid, ask, last = self._references()
             intent = self.risk.make_intent(decision, reference_bid=bid, reference_ask=ask, reference_last=last)
-            self.ledger.append("INTENT", intent.payload(), identity=intent.intent_id, occurred_at=intent.created_at, execution_session_id=self._execution_session_id())
+            self.ledger.append("INTENT", {**intent.payload(), **attribution}, identity=intent.intent_id, occurred_at=intent.created_at, execution_session_id=self._execution_session_id())
             grant = self.risk.evaluate(intent, self._snapshot, at=created)
-            self.ledger.append("RISK_GRANT", grant.payload(), identity=grant.grant_id, occurred_at=grant.evaluated_at, execution_session_id=self._execution_session_id())
+            self.ledger.append("RISK_GRANT", {**grant.payload(), **attribution}, identity=grant.grant_id, occurred_at=grant.evaluated_at, execution_session_id=self._execution_session_id())
             if not grant.granted:
                 self._fail_closed_without_ledger_locked(
                     "CANCEL_RISK_AUTHORITY_UNAVAILABLE:" + ",".join(grant.reason_codes),
                 )
                 return
-            cancel = self._make_command(intent.intent_id, decision.paper_decision_id, grant.grant_id, ExecutionAction.CANCEL_OWNED_ORDERS, PaperDirection.FLAT, "OPERATOR_FLATTEN_AND_DISARM")
+            cancel = self._make_command(intent.intent_id, decision.paper_decision_id, grant.grant_id, ExecutionAction.CANCEL_OWNED_ORDERS, PaperDirection.FLAT, "OPERATOR_FLATTEN_AND_DISARM", profile_attribution=attribution)
             self._persist_and_send(cancel, grant)
             self._transition(PaperRuntimeState.RECONCILING, "PENDING_ENTRY_CANCEL_SENT")
-            reconcile = self._make_command(intent.intent_id, decision.paper_decision_id, grant.grant_id, ExecutionAction.RECONCILE, PaperDirection.FLAT, "POST_CANCEL_RECONCILIATION")
+            reconcile = self._make_command(intent.intent_id, decision.paper_decision_id, grant.grant_id, ExecutionAction.RECONCILE, PaperDirection.FLAT, "POST_CANCEL_RECONCILIATION", profile_attribution=attribution)
             self._persist_and_send(reconcile, grant)
         except Exception as error:
             # A still-working entry order is activity for the AddOn watchdog;
@@ -3440,6 +3685,15 @@ class LaneIIIPaperRuntime:
                     RISK_PROFILE.depth_mutation_maximum_age_seconds, status_now,
                 ),
             }
+            profile_allowed, profile_reason, profile_proof = self._profile_selection_eligibility_locked()
+            profile_status = {
+                **dict(policy.get("entry_profile", {})),
+                "activation_timestamp": self._entry_profile_selected_at,
+                "selection_permitted": profile_allowed,
+                "selection_reason": profile_reason,
+                "eligibility_proof": profile_proof,
+                "backend_authority": True,
+            }
             status = {
                 "schema": "lane-iii-phase-g-paper-runtime-status-v1",
                 "mode": "PAPER_SIM101",
@@ -3456,6 +3710,7 @@ class LaneIIIPaperRuntime:
                 "account_class": "LOCAL_SIMULATION",
                 "maximum_quantity": 1,
                 "live_capital": "DENIED",
+                "entry_profile": profile_status,
                 "commissioning_readiness_snapshot_generation": self._commissioning_readiness_generation,
                 "commissioning_authority_epoch": self._commissioning_authority_epoch,
                 "commissioning_readiness_snapshot_token": self._last_commissioning_snapshot_token,

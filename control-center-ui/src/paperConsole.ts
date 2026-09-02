@@ -22,6 +22,7 @@ export type PaperConsoleState = {
   saveSchedule: () => Promise<void>;
   setSchedule: (value: any) => void;
   stopAndDisarm: () => Promise<void>;
+  selectEntryProfile: (profile: "STANDARD" | "BEEZTMODE_V1") => Promise<any>;
 };
 
 type Options = {
@@ -174,6 +175,14 @@ export function usePaperConsoleState({ active, includeSlim, notify }: Options): 
     await act("/api/lane-iii/paper/flatten-and-disarm", "Stop & Disarm");
   }, [act]);
 
+  const selectEntryProfile = useCallback(async (profile: "STANDARD" | "BEEZTMODE_V1") => {
+    const commandId = `l3g-profile-ui-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    return act("/api/lane-iii/paper/entry-profile", "Beeztmode profile", {
+      operator_command_id: commandId,
+      profile,
+    });
+  }, [act]);
+
   return {
     status,
     schedule,
@@ -193,5 +202,6 @@ export function usePaperConsoleState({ active, includeSlim, notify }: Options): 
     saveSchedule,
     setSchedule,
     stopAndDisarm,
+    selectEntryProfile,
   };
 }

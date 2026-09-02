@@ -26,6 +26,7 @@ from .contracts import (
     SequenceAuthority,
 )
 from .sessions import PaperCalendarState, PaperSessionContext, PaperSessionKind
+from .profiles import BEEZTMODE_PROFILE, STANDARD_PROFILE, PaperEntryProfile, PaperEntryProfileSpec
 
 __all__ = [
     "ACCOUNT_BINDING", "AUTHORITY", "CAPABILITY", "POLICY", "RISK_PROFILE",
@@ -35,4 +36,5 @@ __all__ = [
     "PaperRiskGrant", "PaperRiskProfile", "PaperRuntimeState", "PaperSourceQuality",
     "PaperSessionArmGrant", "PaperSessionContext", "PaperSessionKind", "PaperCalendarState",
     "SequenceAuthority",
+    "BEEZTMODE_PROFILE", "STANDARD_PROFILE", "PaperEntryProfile", "PaperEntryProfileSpec",
 ]

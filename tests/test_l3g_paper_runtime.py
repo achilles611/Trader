@@ -27,6 +27,7 @@ from src.l3g_paper.runtime import (
 from src.l3g_paper.contracts import PaperDirection, PaperEntryOwner, PaperRuntimeState, PaperSessionArmGrant
 from src.l3g_paper.risk import PaperRiskSnapshot
 from src.l3g_paper.sessions import PaperSessionResolver
+from src.l3g_paper.profiles import PaperEntryProfile
 from tests.l3g_helpers import ObservationFactory, warmed_bullish_policy
 
 
@@ -155,6 +156,187 @@ class PaperRuntimeTests(unittest.TestCase):
                     1,
                 )
             finally:
+                runtime.stop(); ledger.close()
+
+    def test_entry_profile_selection_is_backend_owned_idempotent_and_active_flat_safe(self) -> None:
+        now = "2026-08-24T22:10:00Z"
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.operational_runtime(directory, now=now)
+            try:
+                selected = runtime.select_entry_profile("profile-command-001", PaperEntryProfile.BEEZTMODE_V1)
+                replay = runtime.select_entry_profile("profile-command-001", PaperEntryProfile.BEEZTMODE_V1)
+                self.assertTrue(selected["changed"])
+                self.assertTrue(replay["idempotent_replay"])
+                self.assertEqual(runtime.status()["entry_profile"]["effective_threshold"], "0.5525")
+                changes = [item for item in ledger.recent(20) if item["kind"] == "SESSION_ENTRY_PROFILE_CHANGED"]
+                self.assertEqual(len(changes), 1)
+                self.assertEqual(changes[0]["payload"]["operator_command_id"], "profile-command-001")
+                self.assertEqual(changes[0]["payload"]["eligibility_proof"]["position_quantity"], 0)
+
+                with patch("src.l3g_paper.runtime._now", return_value=now):
+                    self.assertTrue(runtime.operational_paper_start("profile-active-session")["started"])
+                self.assertEqual(runtime.state, PaperRuntimeState.PAPER_RUNNING)
+                off = runtime.select_entry_profile("profile-command-002", PaperEntryProfile.STANDARD)
+                on = runtime.select_entry_profile("profile-command-003", PaperEntryProfile.BEEZTMODE_V1)
+                self.assertTrue(off["changed"] and on["changed"])
+                self.assertEqual(runtime.state, PaperRuntimeState.PAPER_RUNNING)
+                self.assertTrue(runtime.status()["operational_paper_session"]["active"])
+
+                stopped = runtime.flatten_and_disarm()
+                self.assertTrue(stopped["flat_confirmed"])
+                self.assertEqual(runtime.status()["entry_profile"]["selected_profile"], "STANDARD")
+            finally:
+                runtime.stop(); ledger.close()
+
+    def test_entry_profile_rejects_every_transition_position_order_and_uncertain_state(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.operational_runtime(directory)
+            try:
+                cases = (
+                    (PaperRuntimeState.ENTRY_PENDING, PaperDirection.FLAT, 0, {}, "ENTRY_PROFILE_ENTRY_PENDING"),
+                    (PaperRuntimeState.LONG, PaperDirection.LONG, 1, {}, "ENTRY_PROFILE_POSITION_OPEN"),
+                    (PaperRuntimeState.EXIT_PENDING, PaperDirection.LONG, 1, {}, "ENTRY_PROFILE_EXIT_PENDING"),
+                    (PaperRuntimeState.READY_DISARMED, PaperDirection.FLAT, 0, {"working_owned_orders": 1}, "ENTRY_PROFILE_OWNED_ORDERS_PRESENT"),
+                    (PaperRuntimeState.READY_DISARMED, PaperDirection.FLAT, 0, {"reconciliation_current": False}, "ENTRY_PROFILE_EXECUTION_TRUTH_UNCERTAIN"),
+                )
+                for index, (state, position, quantity, updates, reason) in enumerate(cases):
+                    runtime._state = state
+                    runtime._position = position
+                    runtime._position_quantity = quantity
+                    snapshot_updates = {
+                        "working_owned_orders": 0, "working_entry_orders": 0,
+                        "reconciliation_current": True, "position_snapshot_complete": True,
+                        "order_snapshot_complete": True, "unresolved_command": False,
+                        "unresolved_native_order": False, "unresolved_execution": False,
+                    }
+                    snapshot_updates.update(updates)
+                    runtime._snapshot = replace(runtime._snapshot, **snapshot_updates)
+                    with self.subTest(reason=reason):
+                        with self.assertRaisesRegex(RuntimeError, reason):
+                            runtime.select_entry_profile(f"profile-reject-{index}", PaperEntryProfile.BEEZTMODE_V1)
+                self.assertEqual(runtime.policy.entry_profile.profile, PaperEntryProfile.STANDARD)
+            finally:
+                runtime._state = PaperRuntimeState.READY_DISARMED
+                runtime._position = PaperDirection.FLAT
+                runtime._position_quantity = 0
+                runtime.stop(); ledger.close()
+
+    def test_restart_and_safety_termination_reset_entry_profile_and_live_route_cannot_select(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.operational_runtime(directory)
+            try:
+                runtime.select_entry_profile("profile-command-session-close", PaperEntryProfile.BEEZTMODE_V1)
+                runtime._close_session(runtime._session_context, "TEST_SESSION_CLOSE")
+                self.assertEqual(runtime.policy.entry_profile.profile, PaperEntryProfile.STANDARD)
+
+                runtime.select_entry_profile("profile-command-safety", PaperEntryProfile.BEEZTMODE_V1)
+                runtime._transition(PaperRuntimeState.LOCKED_OUT, "TEST_SAFETY_TERMINATION")
+                self.assertEqual(runtime.policy.entry_profile.profile, PaperEntryProfile.STANDARD)
+            finally:
+                runtime._state = PaperRuntimeState.READY_DISARMED
+                runtime.stop(); ledger.close()
+
+        with TemporaryDirectory() as directory:
+            ledger, restarted = self.operational_runtime(directory)
+            try:
+                self.assertEqual(restarted.status()["entry_profile"]["selected_profile"], "STANDARD")
+                restarted._transport = None
+                with self.assertRaisesRegex(RuntimeError, "ENTRY_PROFILE_AUTHENTICATED_PAPER_SESSION_REQUIRED"):
+                    restarted.select_entry_profile("profile-live-denied", PaperEntryProfile.BEEZTMODE_V1)
+            finally:
+                restarted._state = PaperRuntimeState.READY_DISARMED
+                restarted.stop(); ledger.close()
+
+    def test_beeztmode_decision_order_fill_exit_and_pnl_records_remain_separately_attributed(self) -> None:
+        now = "2026-08-24T22:10:00Z"
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.operational_runtime(directory, now=now)
+
+            class MockAdapter:
+                def submit(self, _command: object, _grant: object) -> None:
+                    return None
+
+            runtime._adapter = MockAdapter()  # type: ignore[assignment]
+            runtime._persist_and_send = LaneIIIPaperRuntime._persist_and_send.__get__(runtime, LaneIIIPaperRuntime)  # type: ignore[method-assign]
+            try:
+                runtime.select_entry_profile("profile-attribution", PaperEntryProfile.BEEZTMODE_V1)
+                with patch("src.l3g_paper.runtime._now", return_value=now):
+                    self.assertTrue(runtime.operational_paper_start("profile-attribution-session")["started"])
+                    context = runtime._session_context
+                    runtime.policy._paper_session_context = context
+                    _, _, base = warmed_bullish_policy()
+                    decision = replace(
+                        base,
+                        paper_decision_id="l3g-pd-beeztmode-attribution",
+                        created_at=now,
+                        expires_at="2026-08-24T22:10:05Z",
+                        session_kind=context.session_kind,
+                        session_id=context.session_id,
+                        trade_date=context.trade_date,
+                        session_profile_hash=context.session_profile_hash,
+                        session_generation=context.session_generation,
+                        entry_profile="BEEZTMODE_V1",
+                        entry_profile_version="BEEZTMODE_V1",
+                        effective_confidence_threshold=Decimal("0.5525"),
+                        candidate_confidence=Decimal("0.60"),
+                        confluence_family_summary=dict(base.family_summary),
+                    )
+                    runtime._last_decision = decision
+                    runtime._last_quote = (Decimal("100"), Decimal("100.25"), now)
+                    runtime._last_trade = (Decimal("100.25"), now)
+                    ledger.append("DECISION", decision.payload(), identity=decision.paper_decision_id, occurred_at=now)
+                    self.assertTrue(runtime._request_entry(decision))
+                    entry_command = runtime._last_command
+                    self.assertIsNotNone(entry_command)
+                    runtime.on_execution_message({
+                        "message_type": "ORDER_EVENT", "receipt_id": "beezt-order-entry",
+                        "command_id": entry_command.command_id, "order_role": "ENTRY",  # type: ignore[union-attr]
+                        "order_state": "WORKING", "native_order_id": "beezt-entry-order",
+                    })
+                    runtime.on_execution_message({
+                        "message_type": "EXECUTION_EVENT", "receipt_id": "beezt-fill-entry",
+                        "command_id": entry_command.command_id, "order_role": "ENTRY",  # type: ignore[union-attr]
+                        "direction": "LONG", "price": "100.25", "quantity": 1,
+                        "native_execution_id": "beezt-entry-fill", "native_order_id": "beezt-entry-order",
+                        "account_name": "Sim101", "instrument": "MNQ SEP26", "timestamp": now,
+                    })
+                    runtime._snapshot = replace(runtime._snapshot, protective_stop_state="WORKING")
+                    runtime._request_exit("TEST_PROFILE_EXIT")
+                    exit_command = runtime._last_command
+                    runtime.on_execution_message({
+                        "message_type": "EXECUTION_EVENT", "receipt_id": "beezt-fill-exit",
+                        "command_id": exit_command.command_id, "order_role": "EXIT",  # type: ignore[union-attr]
+                        "price": "101.25", "quantity": 1, "native_execution_id": "beezt-exit-fill",
+                        "native_order_id": "beezt-exit-order", "account_name": "Sim101",
+                        "instrument": "MNQ SEP26", "timestamp": now,
+                    })
+                    runtime.on_execution_message({
+                        "message_type": "POSITION_EVENT", "quantity": 0, "timestamp": now,
+                    })
+                    self.assertEqual(runtime._last_command.reason_code, "POST_EXIT_RECONCILIATION")  # type: ignore[union-attr]
+
+                attributed_kinds = {
+                    "DECISION", "INTENT", "RISK_GRANT", "COMMAND",
+                    "ORDER_EVENT_PROFILE_ATTRIBUTION", "EXECUTION_PROFILE_ATTRIBUTION",
+                    "EXECUTION_REALIZED_PNL",
+                }
+                records = [item for item in ledger.recent(100) if item["kind"] in attributed_kinds]
+                self.assertTrue(attributed_kinds.issubset({item["kind"] for item in records}))
+                for record in records:
+                    if record["kind"] == "DECISION" and record["payload"].get("commissioning") is True:
+                        continue
+                    self.assertEqual(record["payload"]["entry_profile"], "BEEZTMODE_V1", record["kind"])
+                    self.assertEqual(record["payload"]["effective_confidence_threshold"], "0.5525", record["kind"])
+                    self.assertEqual(record["payload"]["candidate_confidence"], "0.60", record["kind"])
+                    self.assertIn("confluence_family_summary", record["payload"])
+            finally:
+                runtime._position = PaperDirection.FLAT
+                runtime._position_quantity = 0
+                runtime._snapshot = replace(
+                    runtime._snapshot, current_position=PaperDirection.FLAT,
+                    current_position_quantity=0, working_owned_orders=0, working_entry_orders=0,
+                )
+                runtime._state = PaperRuntimeState.READY_DISARMED
                 runtime.stop(); ledger.close()
 
     def test_operational_session_stays_running_across_idle_time_and_three_flat_trade_cycles(self) -> None:

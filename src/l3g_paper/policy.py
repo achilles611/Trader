@@ -34,6 +34,7 @@ from .contracts import (
     expires_at,
 )
 from .time_rules import america_new_york
+from .profiles import PaperEntryProfile, PaperEntryProfileSpec, STANDARD_PROFILE, entry_profile_spec
 from .sessions import (
     PaperSessionContext,
     PaperSessionKind,
@@ -135,6 +136,18 @@ class ExperimentalPaperPolicy:
             "decisions_no_trade": 0,
         }
         self._suppression_reasons: dict[str, int] = {}
+        self._entry_profile = STANDARD_PROFILE
+
+    @property
+    def entry_profile(self) -> PaperEntryProfileSpec:
+        with self._lock:
+            return self._entry_profile
+
+    def select_entry_profile(self, profile: PaperEntryProfile | str) -> PaperEntryProfileSpec:
+        spec = entry_profile_spec(profile)
+        with self._lock:
+            self._entry_profile = spec
+            return spec
 
     @staticmethod
     def _time(value: str, name: str = "Paper event time") -> datetime:
@@ -752,6 +765,9 @@ class ExperimentalPaperPolicy:
         at = self._time(created)
         source_ids, sequences, hashes = self._decision_sources(hypothesis, at, observation)
         direction = PaperDirection.LONG if kind is PaperDecisionKind.LONG else PaperDirection.SHORT if kind is PaperDecisionKind.SHORT else PaperDirection.FLAT
+        profile = self._entry_profile
+        candidate_confidence = score if family_summary and "positive_family_count" in family_summary else None
+        confluence_summary = dict(family_summary or {}) if candidate_confidence is not None else {}
         payload = {
             "policy_id": self.artifact.policy_id,
             "policy_hash": self._policy_hash,
@@ -774,6 +790,12 @@ class ExperimentalPaperPolicy:
             "trade_date": self._paper_session_context.trade_date,
             "session_profile_hash": self._paper_session_context.session_profile_hash,
             "session_generation": self._paper_session_context.session_generation,
+            "entry_profile": profile.profile.value,
+            "entry_profile_version": profile.version,
+            "effective_confidence_threshold": str(profile.effective_threshold),
+            "candidate_confidence": None if candidate_confidence is None else str(candidate_confidence),
+            "confluence_family_summary": confluence_summary,
+            "paper_only": True,
         }
         decision = PaperDecision(
             deterministic_id("l3g-pd-", payload), self.artifact.policy_id, self._policy_hash,
@@ -783,6 +805,9 @@ class ExperimentalPaperPolicy:
             self._paper_session_context.session_kind, self._paper_session_context.session_id,
             self._paper_session_context.trade_date, self._paper_session_context.session_profile_hash,
             self._paper_session_context.session_generation,
+            False, True, False,
+            profile.profile.value, profile.version, profile.effective_threshold,
+            candidate_confidence, confluence_summary, True,
         )
         self._last_decision = decision
         counter = {
@@ -844,7 +869,10 @@ class ExperimentalPaperPolicy:
             return self._decision(observation, PaperDecisionKind.NO_TRADE, winner, "PENDING_ORDER", score=score, family_summary=families)
         if positive < self.artifact.entry_family_count:
             return self._decision(observation, PaperDecisionKind.NO_TRADE, winner, "ENTRY_FAMILY_COUNT", score=score, family_summary=families)
-        if score < self.artifact.entry_support_threshold:
+        profile = self._entry_profile
+        if profile.profile is PaperEntryProfile.BEEZTMODE_V1 and score < profile.hard_confidence_floor:
+            return self._decision(observation, PaperDecisionKind.NO_TRADE, winner, "ENTRY_CONFIDENCE_HARD_FLOOR", score=score, family_summary=families)
+        if score < profile.effective_threshold:
             return self._decision(observation, PaperDecisionKind.NO_TRADE, winner, "ENTRY_SUPPORT_THRESHOLD", score=score, family_summary=families)
         if dominance < self.artifact.entry_dominance_margin:
             return self._decision(observation, PaperDecisionKind.NO_TRADE, winner, "ENTRY_DOMINANCE_MARGIN", score=score, family_summary=families)
@@ -866,6 +894,15 @@ class ExperimentalPaperPolicy:
                 family.value: sum(1 for value in self._evidence.values() if value.family is family and self._time(value.expires_at) >= now)
                 for family in EvidenceFamily
             }
+            profile = self._entry_profile
+            last_candidate = self._last_decision if self._last_decision is not None and self._last_decision.candidate_confidence is not None else None
+            candidate_distance = None if last_candidate is None else last_candidate.candidate_confidence - profile.effective_threshold  # type: ignore[operator]
+            candidate_disposition = None
+            last_rejection_reason = None
+            if last_candidate is not None:
+                candidate_disposition = "ENTRY_AUTHORIZED" if last_candidate.decision in {PaperDecisionKind.LONG, PaperDecisionKind.SHORT} else "EXIT" if last_candidate.decision is PaperDecisionKind.EXIT else "REJECTED"
+                if last_candidate.decision is PaperDecisionKind.NO_TRADE:
+                    last_rejection_reason = last_candidate.reason_code
             return {
                 "schema": "lane-iii-phase-g-paper-policy-status-v1",
                 "paper_policy_id": self.artifact.policy_id,
@@ -892,4 +929,11 @@ class ExperimentalPaperPolicy:
                 "suppression_reasons": dict(sorted(self._suppression_reasons.items())),
                 "last_paper_decision": None if self._last_decision is None else self._last_decision.payload(),
                 "last_input_fault": self._last_input_fault,
+                "entry_profile": {
+                    **profile.payload(),
+                    "current_candidate_confidence": None if last_candidate is None else str(last_candidate.candidate_confidence),
+                    "distance_to_active_threshold": None if candidate_distance is None else str(candidate_distance),
+                    "last_candidate_disposition": candidate_disposition,
+                    "last_rejection_reason": last_rejection_reason,
+                },
             }

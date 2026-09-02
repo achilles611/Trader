@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from enum import StrEnum
 from functools import lru_cache
 import json
@@ -118,6 +119,12 @@ _DECISION_KEYS = frozenset({
     "authority_effect",
 })
 _DECISION_WITH_EFFECT_KEYS = _DECISION_KEYS - {"authority_effect"}
+_DECISION_PROFILE_KEYS = frozenset({
+    "entry_profile", "entry_profile_version", "effective_confidence_threshold",
+    "candidate_confidence", "confluence_family_summary", "paper_only",
+})
+_ATTRIBUTED_DECISION_KEYS = _DECISION_KEYS | _DECISION_PROFILE_KEYS
+_ATTRIBUTED_DECISION_WITH_EFFECT_KEYS = _DECISION_WITH_EFFECT_KEYS | _DECISION_PROFILE_KEYS
 _WARMUP_ATTESTATION_KEYS = _SESSION_CONTEXT_KEYS | frozenset({
     "authority_effect", "record_semantics", "record_semantics_version",
     "commissioning_warmup_state", "policy_hash", "required_families", "reason",
@@ -562,6 +569,34 @@ def _evidence_shape(payload: Mapping[str, object]) -> str | None:
     return "EVIDENCE:EVIDENCE"
 
 
+def _decision_profile_shape(payload: Mapping[str, object]) -> bool:
+    """Accept legacy decisions and the closed Beeztmode attribution extension."""
+    present = _DECISION_PROFILE_KEYS.intersection(payload)
+    if not present:
+        return True
+    if present != _DECISION_PROFILE_KEYS:
+        return False
+    profile = payload.get("entry_profile")
+    version = payload.get("entry_profile_version")
+    expected = {
+        ("STANDARD", "STANDARD_V1"): Decimal("0.65"),
+        ("BEEZTMODE_V1", "BEEZTMODE_V1"): Decimal("0.5525"),
+    }.get((profile, version))
+    try:
+        threshold = Decimal(str(payload.get("effective_confidence_threshold")))
+        candidate_value = payload.get("candidate_confidence")
+        candidate = None if candidate_value is None else Decimal(str(candidate_value))
+    except Exception:
+        return False
+    return (
+        expected is not None
+        and threshold == expected
+        and (candidate is None or Decimal("0") <= candidate <= Decimal("1"))
+        and isinstance(payload.get("confluence_family_summary"), Mapping)
+        and payload.get("paper_only") is True
+    )
+
+
 def _passive_decision_shape(payload: Mapping[str, object]) -> str | None:
     decision = payload.get("decision")
     expected_direction = {
@@ -570,7 +605,8 @@ def _passive_decision_shape(payload: Mapping[str, object]) -> str | None:
     if (
         not isinstance(decision, str)
         or decision not in _PASSIVE_DECISIONS
-        or not _exact_keys(payload, _DECISION_KEYS)
+        or not (_exact_keys(payload, _DECISION_KEYS) or _exact_keys(payload, _ATTRIBUTED_DECISION_KEYS))
+        or not _decision_profile_shape(payload)
         or not _session_identity_matches(payload)
         or payload.get("direction") != expected_direction
         or payload.get("authority_effect") != COMMISSIONING_NO_AUTHORITY_EFFECT
@@ -606,7 +642,8 @@ def _authority_decision_shape(payload: Mapping[str, object]) -> bool:
     return (
         isinstance(decision, str)
         and decision in _PASSIVE_DECISIONS
-        and _exact_keys(payload, _DECISION_WITH_EFFECT_KEYS)
+        and (_exact_keys(payload, _DECISION_WITH_EFFECT_KEYS) or _exact_keys(payload, _ATTRIBUTED_DECISION_WITH_EFFECT_KEYS))
+        and _decision_profile_shape(payload)
         and _session_identity_matches(payload)
         and payload.get("direction") == expected_direction
         and payload.get("scientific_eligibility") is False
