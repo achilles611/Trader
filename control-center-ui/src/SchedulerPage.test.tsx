@@ -32,6 +32,7 @@ describe("Task Scheduler", () => {
   it("shows durable scheduler status, lifecycle filtering, templates, and no command surface", async () => {
     render(<SchedulerPage revision={0} notify={() => undefined} confirmation={() => undefined} />);
     expect(await screen.findByText("Operations scheduler")).toBeInTheDocument();
+    expect(screen.getByText(/cannot arm Asia, London, or New York/)).toBeInTheDocument();
     expect(screen.getByText("LEADER")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Runs" }));
     fireEvent.click(screen.getByRole("button", { name: "Active" }));
