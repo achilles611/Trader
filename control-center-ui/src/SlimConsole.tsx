@@ -31,6 +31,9 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
   // infer whether a red or yellow transition still owns paper authority.
   const stopAvailable = active || runtimeMayBeActive || status === null || light !== "GREEN";
   const verification = status?.ledger_verification || {};
+  const maintenance = paper.ninjaTraderMaintenance;
+  const maintenanceButton = maintenance?.button || { label: "Checking NinjaTrader…", enabled: false, tone: "progress" };
+  const maintenanceDisabled = maintenanceButton.enabled !== true || maintenance?.in_progress === true || paper.maintenanceBusy;
   const pnl = status?.pnl || { state: "MISSING" };
   const session = status?.session || {};
   const verificationRunning = verification.state === "IN_PROGRESS" || paper.verificationInFlight;
@@ -56,6 +59,31 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
       <h1 id="slim-readiness-heading">{status?.label || "NOT READY"}</h1>
       <p className="slim-message" role="status" aria-live="polite">{status?.message || "Waiting for current canonical paper runtime status."}</p>
       <p className="slim-session">Session: <strong>{session.session_kind || "OFF_SESSION"}</strong>{session.session_family ? ` / ${session.session_family}` : ""}{session.entry_window ? ` · ${session.entry_window}` : ""}</p>
+    </section>
+
+    <section className="slim-card slim-ninjatrader" aria-labelledby="slim-ninjatrader-heading">
+      <div className="slim-kicker">NINJATRADER / MNQ OBSERVER</div>
+      <h2 id="slim-ninjatrader-heading" className={maintenance?.readiness === "READY" ? "positive" : "neutral"}>
+        {maintenance?.readiness === "READY" ? "READY" : maintenance?.stage || "CHECKING"}
+      </h2>
+      <button
+        className={`slim-action ninja-maintenance ${maintenanceButton.tone || "primary"}`}
+        type="button"
+        disabled={maintenanceDisabled}
+        onClick={() => void paper.startNinjaTraderMaintenance()}
+      >
+        {paper.maintenanceBusy ? "Starting maintenance…" : maintenanceButton.label}
+      </button>
+      <dl className="slim-maintenance-status">
+        <div><dt>Process</dt><dd>{maintenance?.process?.state || "UNKNOWN"}</dd></div>
+        <div><dt>AddOn / provenance</dt><dd>{maintenance ? `${maintenance.addon?.state || "UNKNOWN"} / ${maintenance.addon?.provenance || "UNVERIFIED"}` : "UNKNOWN"}</dd></div>
+        <div><dt>Configured instrument</dt><dd>{maintenance?.configured_instrument || "UNRESOLVED"}</dd></div>
+        <div><dt>Chart</dt><dd>{maintenance?.chart?.found ? `FOUND / ${maintenance.chart.instrument || "UNKNOWN"}` : maintenance?.chart?.state || "NOT FOUND"}</dd></div>
+        <div><dt>Observer</dt><dd>{maintenance?.observer?.attached ? "ATTACHED" : "NOT ATTACHED"}</dd></div>
+        <div><dt>Market data</dt><dd>{maintenance?.observer?.market_data_fresh ? "FRESH" : maintenance?.observer?.freshness_reason || "NOT FRESH"}</dd></div>
+      </dl>
+      {maintenance?.blockers?.length > 0 && <p className="slim-maintenance-blocker" role="alert">Blocked: {maintenance.blockers.join(", ")}</p>}
+      {maintenance?.manual_action && <p className="slim-maintenance-manual" role="status">Manual step: {maintenance.manual_action}</p>}
     </section>
 
     <section className="slim-card slim-pnl" aria-labelledby="slim-pnl-heading">

@@ -102,6 +102,7 @@ class PowerShellNinjaTraderLoginAdapter:
         allowed = (
             "SystemRoot", "WINDIR", "USERPROFILE", "ProgramFiles", "ProgramData",
             "LOCALAPPDATA", "APPDATA", "TEMP", "TMP", "PATH", "PATHEXT", "ComSpec",
+            "NINJATRADER_EXECUTABLE",
         )
         environment = {name: source[name] for name in allowed if source.get(name)}
         environment.update({

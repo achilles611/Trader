@@ -98,8 +98,28 @@ class NinjaScriptSourceTests(unittest.TestCase):
 
     def test_read_only_addon_remains_without_order_or_inbound_authority(self) -> None:
         source = (Path(__file__).parents[1] / "ninjatrader" / "NinjaScript" / "AddOns" / "BeelzebubReadOnlyAddOn.cs").read_text(encoding="utf-8")
-        for forbidden in ("CreateOrder(", ".Submit(", ".Cancel(", ".Flatten(", "Stream.Read"):
+        for forbidden in (
+            "CreateOrder(", ".Submit(", ".Cancel(", ".Flatten(", "Stream.Read",
+            "SendKeys", "Mouse", "Cursor", "Indicators.Add(",
+        ):
             self.assertNotIn(forbidden, source)
+
+    def test_read_only_addon_reports_native_chart_reuse_and_attachment_without_hardcoded_contract(self) -> None:
+        root = Path(__file__).parents[1] / "ninjatrader" / "NinjaScript"
+        addon = (root / "AddOns" / "BeelzebubReadOnlyAddOn.cs").read_text(encoding="utf-8")
+        observer = (root / "Indicators" / "BeelzebubReadOnlyMarketObserver.cs").read_text(encoding="utf-8")
+        self.assertIn("window as NinjaTrader.Gui.Chart.Chart", addon)
+        self.assertIn("ActiveChartControl.Instrument.FullName", addon)
+        self.assertIn("correct.Activate()", addon)
+        self.assertIn("MARKET_OBSERVER_ATTACHMENT", addon)
+        self.assertIn("OBSERVER_MISSING", addon)
+        self.assertIn("OBSERVER_ATTACHED", addon)
+        self.assertIn("beelzebub-observer.local.config", addon)
+        self.assertIn("L3F_NT_MARKET_INSTRUMENT", addon)
+        self.assertIn("ResolveConfiguredInstrument()", observer)
+        self.assertIn("PublishObserverAttachment(", observer)
+        self.assertNotIn("MNQ SEP26", observer)
+        self.assertNotIn("MNQ September 2026", observer)
 
     def test_observer_bounds_unverified_book_frames_and_stays_observation_only(self) -> None:
         source = (Path(__file__).parents[1] / "ninjatrader" / "NinjaScript" / "Indicators" / "BeelzebubReadOnlyMarketObserver.cs").read_text(encoding="utf-8")

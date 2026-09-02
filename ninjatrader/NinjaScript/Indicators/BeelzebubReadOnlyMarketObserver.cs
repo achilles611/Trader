@@ -1,4 +1,4 @@
-// Attach only to the resolved MNQ September 2026 chart/instrument.
+// Attach only to the MNQ contract resolved by Beelzebub's local configuration.
 // This indicator publishes market observations through the outbound-only sink.
 using System;
 using System.Collections.Generic;
@@ -25,6 +25,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         // unavailable and book completeness remains UNVERIFIED, so this is an
         // explicit bounded observation policy, never a complete-feed claim.
         private static readonly long MinimumPublicationTicks = Math.Max(1L, System.Diagnostics.Stopwatch.Frequency / 2L);
+        private static readonly long MinimumAttachmentPublicationTicks = Math.Max(1L, System.Diagnostics.Stopwatch.Frequency * 5L);
         private const string PublicationPolicy = "BOUNDED_LATEST_STATE_2HZ";
         private readonly SortedDictionary<double, long> bids = new SortedDictionary<double, long>(Comparer<double>.Create((x, y) => y.CompareTo(x)));
         private readonly SortedDictionary<double, long> asks = new SortedDictionary<double, long>();
@@ -40,6 +41,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         private long lastQuotePublicationTicks;
         private long lastTradePublicationTicks;
         private long lastDepthPublicationTicks;
+        private long lastAttachmentPublicationTicks;
 
         protected override void OnStateChange()
         {
@@ -54,11 +56,20 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 BeelzebubReadOnlyOutbound.Diagnostic("MARKET_OBSERVER_REALTIME");
                 BeelzebubReadOnlyOutbound.Diagnostic("MARKET_OBSERVER_REALTIME_STRICT_SPREAD_V1");
+                PublishAttachmentHealth(true);
+            }
+            else if (State == State.Terminated)
+            {
+                string configured = BeelzebubReadOnlyAddOn.ResolveConfiguredInstrument();
+                string instrument = Instrument == null ? null : Instrument.FullName;
+                BeelzebubReadOnlyAddOn.PublishObserverAttachment(
+                    "OBSERVER_TERMINATED", configured, instrument, true, false);
             }
         }
 
         protected override void OnMarketData(MarketDataEventArgs e)
         {
+            PublishAttachmentHealth();
             PublishMarketConnectedOnce();
             if (!reportedLevelOne)
             {
@@ -134,12 +145,14 @@ namespace NinjaTrader.NinjaScript.Indicators
             // and book state. A reconnect must rebuild from new callbacks.
             ClearMarketState();
             reportedMarketDataConnected = String.Equals(e.PriceStatus.ToString(), "Connected", StringComparison.OrdinalIgnoreCase);
+            PublishAttachmentHealth(true);
             BeelzebubReadOnlyOutbound.Publish("CONNECTION", null, null,
                 "{\"scope\":\"MARKET_DATA\",\"price_status\":\"" + e.PriceStatus + "\"}");
         }
 
         protected override void OnMarketDepth(MarketDepthEventArgs e)
         {
+            PublishAttachmentHealth();
             PublishMarketConnectedOnce();
             if (!reportedDepth)
             {
@@ -201,6 +214,21 @@ namespace NinjaTrader.NinjaScript.Indicators
                 "{\"scope\":\"MARKET_DATA\",\"price_status\":\"Connected\"}");
         }
 
+        private void PublishAttachmentHealth(bool force = false)
+        {
+            if (!force && !TryReservePublication(ref lastAttachmentPublicationTicks, MinimumAttachmentPublicationTicks))
+                return;
+            if (force)
+                Interlocked.Exchange(ref lastAttachmentPublicationTicks, System.Diagnostics.Stopwatch.GetTimestamp());
+            string configured = BeelzebubReadOnlyAddOn.ResolveConfiguredInstrument();
+            string instrument = Instrument == null ? null : Instrument.FullName;
+            bool matches = !String.IsNullOrWhiteSpace(configured)
+                && String.Equals(configured, instrument, StringComparison.Ordinal);
+            BeelzebubReadOnlyAddOn.PublishObserverAttachment(
+                matches ? "OBSERVER_ATTACHED" : "WRONG_CHART_INSTRUMENT",
+                configured, instrument, true, true);
+        }
+
         private static string Levels(SortedDictionary<double, long> book)
         {
             List<string> values = new List<string>();
@@ -226,11 +254,16 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         private static bool TryReservePublication(ref long lastPublicationTicks)
         {
+            return TryReservePublication(ref lastPublicationTicks, MinimumPublicationTicks);
+        }
+
+        private static bool TryReservePublication(ref long lastPublicationTicks, long minimumTicks)
+        {
             long now = System.Diagnostics.Stopwatch.GetTimestamp();
             while (true)
             {
                 long prior = Interlocked.Read(ref lastPublicationTicks);
-                if (prior != 0 && now - prior < MinimumPublicationTicks)
+                if (prior != 0 && now - prior < minimumTicks)
                     return false;
                 if (Interlocked.CompareExchange(ref lastPublicationTicks, now, prior) == prior)
                     return true;

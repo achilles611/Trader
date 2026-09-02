@@ -10,7 +10,7 @@ const responseTypeMessage = (contentType: string | null) => {
 };
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, { headers: { "Content-Type": "application/json", ...(init?.headers || {}) }, ...init });
+  const response = await fetch(path, { ...init, headers: { "Content-Type": "application/json", ...(init?.headers || {}) } });
   const contentType = response.headers.get("Content-Type");
   if (!isJsonContentType(contentType)) throw new Error(responseTypeMessage(contentType));
 

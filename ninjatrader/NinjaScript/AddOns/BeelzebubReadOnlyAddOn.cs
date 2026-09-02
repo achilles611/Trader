@@ -20,19 +20,23 @@ namespace NinjaTrader.NinjaScript.AddOns
     public sealed class BeelzebubReadOnlyAddOn : AddOnBase
     {
         private readonly List<Account> observedAccounts = new List<Account>();
+        private readonly List<NinjaTrader.Gui.Chart.Chart> observedCharts = new List<NinjaTrader.Gui.Chart.Chart>();
         private NTMenuItem controlCenterNewMenu;
         private NTMenuItem attachMenuItem;
+        private bool addonActive;
 
         protected override void OnStateChange()
         {
             if (State == State.Active)
             {
+                addonActive = true;
                 Account.AccountStatusUpdate += OnAccountStatusUpdate;
                 BeelzebubReadOnlyOutbound.Diagnostic("ADDON_ACTIVE");
                 AttachKnownAccounts();
             }
             else if (State == State.Terminated)
             {
+                addonActive = false;
                 Account.AccountStatusUpdate -= OnAccountStatusUpdate;
                 DetachKnownAccounts();
                 BeelzebubReadOnlyOutbound.Shutdown();
@@ -45,6 +49,15 @@ namespace NinjaTrader.NinjaScript.AddOns
         // It neither opens nor controls an order entry surface.
         protected override void OnWindowCreated(Window window)
         {
+            NinjaTrader.Gui.Chart.Chart chart = window as NinjaTrader.Gui.Chart.Chart;
+            if (chart != null)
+            {
+                if (!observedCharts.Contains(chart))
+                    observedCharts.Add(chart);
+                InspectCharts(true);
+                return;
+            }
+
             ControlCenter controlCenter = window as ControlCenter;
             if (controlCenter == null)
                 return;
@@ -65,6 +78,13 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         protected override void OnWindowDestroyed(Window window)
         {
+            NinjaTrader.Gui.Chart.Chart chart = window as NinjaTrader.Gui.Chart.Chart;
+            if (chart != null)
+            {
+                observedCharts.Remove(chart);
+                InspectCharts(false);
+                return;
+            }
             if (attachMenuItem == null || !(window is ControlCenter))
                 return;
 
@@ -79,6 +99,75 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             BeelzebubReadOnlyOutbound.Diagnostic("MANUAL_ATTACH_REQUESTED");
             AttachKnownAccounts();
+            InspectCharts(true);
+        }
+
+        // Chart discovery is observation-only. NinjaTrader documents existing
+        // Chart windows as available to AddOns through OnWindowCreated, but it
+        // does not document adding an Indicator instance from an AddOn. We
+        // therefore reuse/focus an exact chart and report one honest manual
+        // attachment step when the established observer is missing.
+        private void InspectCharts(bool focusCorrectChart)
+        {
+            if (!addonActive)
+                return;
+            string configured = ResolveConfiguredInstrument();
+            if (String.IsNullOrWhiteSpace(configured))
+            {
+                PublishObserverAttachment("CONFIGURED_INSTRUMENT_UNRESOLVED", null, null, false, false);
+                return;
+            }
+            NinjaTrader.Gui.Chart.Chart correct = null;
+            string firstInstrument = null;
+            foreach (NinjaTrader.Gui.Chart.Chart chart in observedCharts)
+            {
+                if (chart == null || chart.ActiveChartControl == null || chart.ActiveChartControl.Instrument == null)
+                    continue;
+                string instrument = chart.ActiveChartControl.Instrument.FullName;
+                if (firstInstrument == null)
+                    firstInstrument = instrument;
+                if (String.Equals(instrument, configured, StringComparison.Ordinal))
+                {
+                    correct = chart;
+                    break;
+                }
+            }
+            if (correct == null)
+            {
+                PublishObserverAttachment(
+                    firstInstrument == null ? "CHART_NOT_FOUND" : "WRONG_CHART_INSTRUMENT",
+                    configured, firstInstrument, firstInstrument != null, false);
+                return;
+            }
+            if (focusCorrectChart)
+            {
+                try { correct.Activate(); }
+                catch (InvalidOperationException) { }
+            }
+            bool attached = false;
+            foreach (object indicator in correct.ActiveChartControl.Indicators)
+            {
+                if (indicator != null && String.Equals(indicator.GetType().Name, "BeelzebubReadOnlyMarketObserver", StringComparison.Ordinal))
+                {
+                    attached = true;
+                    break;
+                }
+            }
+            PublishObserverAttachment(attached ? "OBSERVER_ATTACHED" : "OBSERVER_MISSING",
+                configured, configured, true, attached);
+        }
+
+        public static void PublishObserverAttachment(
+            string state, string configuredInstrument, string instrument,
+            bool chartFound, bool observerAttached)
+        {
+            string configured = configuredInstrument == null ? "null" : "\"" + Escape(configuredInstrument) + "\"";
+            string actual = instrument == null ? "null" : "\"" + Escape(instrument) + "\"";
+            BeelzebubReadOnlyOutbound.Publish("HEALTH", null, null,
+                "{\"component\":\"MARKET_OBSERVER_ATTACHMENT\",\"state\":\"" + Escape(state)
+                + "\",\"configured_instrument\":" + configured + ",\"instrument\":" + actual
+                + ",\"chart_found\":" + (chartFound ? "true" : "false")
+                + ",\"observer_attached\":" + (observerAttached ? "true" : "false") + "}");
         }
 
         // Connection/account lifecycle notifications make late account
@@ -239,6 +328,27 @@ namespace NinjaTrader.NinjaScript.AddOns
                 foreach (string line in File.ReadAllLines(path))
                 {
                     const string prefix = "L3F_NT_LUCID_ACCOUNT_ID=";
+                    if (line.StartsWith(prefix, StringComparison.Ordinal))
+                        return line.Substring(prefix.Length).Trim();
+                }
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            return null;
+        }
+
+        public static string ResolveConfiguredInstrument()
+        {
+            string value = Environment.GetEnvironmentVariable("L3F_NT_MARKET_INSTRUMENT");
+            if (!String.IsNullOrWhiteSpace(value))
+                return value.Trim();
+            string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                "NinjaTrader 8", "beelzebub-observer.local.config");
+            try
+            {
+                foreach (string line in File.ReadAllLines(path))
+                {
+                    const string prefix = "L3F_NT_MARKET_INSTRUMENT=";
                     if (line.StartsWith(prefix, StringComparison.Ordinal))
                         return line.Substring(prefix.Length).Trim();
                 }

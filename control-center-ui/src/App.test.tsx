@@ -38,6 +38,17 @@ let slimStatusResponse: Record<string, unknown> = {
   ledger_verification: { state: "UNAVAILABLE", message: "Verification status is unavailable." },
   pnl: { state: "MISSING", total: null, realized: null, unrealized: null },
 };
+let ninjaTraderMaintenanceResponse: Record<string, unknown> = {
+  action_token: "fixture-maintenance-token",
+  stage: "IDLE", in_progress: false, readiness: "NOT_READY",
+  button: { label: "Open NinjaTrader + Attach Observer", enabled: true, tone: "primary" },
+  process: { state: "ABSENT", control_center_detected: false },
+  addon: { state: "UNSTARTED", provenance: "UNVERIFIED" }, configured_instrument: "MNQ SEP26",
+  chart: { state: "CHART_NOT_FOUND", found: false, created: false, instrument: null },
+  observer: { state: "NOT_ACTIVE", attached: false, market_data_fresh: false, freshness_reason: "MISSING_OBSERVATION_TIMESTAMP" },
+  blockers: [], manual_action: null, diagnostics: [],
+  actions: { launches: 0, graceful_shutdowns: 0, forced_shutdowns: 0, execution_command_baseline: 3, execution_commands_sent_by_task: 0, orders_submitted_by_task: 0, orders_cancelled_by_task: 0 },
+};
 let accountBalancesResponse: Record<string, unknown> = {
   accounts: {
     Sim101: { cash_value: 100123.45, cash_value_observed_at: "2026-08-29T15:00:00Z" },
@@ -73,6 +84,7 @@ function payload(path: string) {
   if (path.startsWith("/api/lane-iii/paper/ledger-verification/cancel")) return { ...ledgerVerificationResponse, cancellation_requested: true };
   if (path.startsWith("/api/lane-iii/paper/ledger-verification")) return ledgerVerificationResponse;
   if (path.startsWith("/api/lane-iii/paper/slim-status")) return slimStatusResponse;
+  if (path.startsWith("/api/lane-iii/ninjatrader-maintenance")) return ninjaTraderMaintenanceResponse;
   if (path.startsWith("/api/lane-iii/paper/commissioning-rehearsal")) {
     commissioningRehearsalSideEffect?.();
     return commissioningRehearsalResponse || { result: "BLOCKED", blocking_reasons: ["FIXTURE_BLOCKED"] };
@@ -197,6 +209,17 @@ beforeEach(() => {
     message: "Paper runtime status is unavailable.", can_start: false, paper_active: false,
     ledger_verification: { state: "UNAVAILABLE", message: "Verification status is unavailable." },
     pnl: { state: "MISSING", total: null, realized: null, unrealized: null },
+  };
+  ninjaTraderMaintenanceResponse = {
+    action_token: "fixture-maintenance-token",
+    stage: "IDLE", in_progress: false, readiness: "NOT_READY",
+    button: { label: "Open NinjaTrader + Attach Observer", enabled: true, tone: "primary" },
+    process: { state: "ABSENT", control_center_detected: false },
+    addon: { state: "UNSTARTED", provenance: "UNVERIFIED" }, configured_instrument: "MNQ SEP26",
+    chart: { state: "CHART_NOT_FOUND", found: false, created: false, instrument: null },
+    observer: { state: "NOT_ACTIVE", attached: false, market_data_fresh: false, freshness_reason: "MISSING_OBSERVATION_TIMESTAMP" },
+    blockers: [], manual_action: null, diagnostics: [],
+    actions: { launches: 0, graceful_shutdowns: 0, forced_shutdowns: 0, execution_command_baseline: 3, execution_commands_sent_by_task: 0, orders_submitted_by_task: 0, orders_cancelled_by_task: 0 },
   };
   accountBalancesResponse = {
     accounts: {
@@ -689,6 +712,62 @@ describe("copy control center", () => {
     expect(fetch).not.toHaveBeenCalledWith("/api/lane-iii/paper/commissioning-start", expect.anything());
     expect(screen.getByText("$10.25")).toBeInTheDocument();
     expect(document.querySelector(".slim-session")).toHaveTextContent("LONDON / EUROPE · 08:00-11:30 Europe/London");
+  });
+
+  it("renders the state-aware NinjaTrader control and authentic observer proof in Slim Mode", async () => {
+    ninjaTraderMaintenanceResponse = {
+      ...ninjaTraderMaintenanceResponse,
+      stage: "READY", readiness: "READY",
+      button: { label: "NinjaTrader Ready", enabled: false, tone: "ready" },
+      process: { state: "RUNNING", control_center_detected: true },
+      addon: { state: "AUTHENTICATED", provenance: "MATCH" },
+      chart: { state: "OBSERVER_ATTACHED", found: true, created: false, instrument: "MNQ SEP26" },
+      observer: { state: "ACTIVE", attached: true, market_data_fresh: true, freshness_reason: "CURRENT" },
+    };
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+    const ready = await screen.findByRole("button", { name: "NinjaTrader Ready" });
+    expect(ready).toBeDisabled();
+    const panel = screen.getByRole("heading", { name: "READY" }).closest("section") as HTMLElement;
+    expect(panel).toHaveTextContent("AUTHENTICATED / MATCH");
+    expect(panel).toHaveTextContent("FOUND / MNQ SEP26");
+    expect(panel).toHaveTextContent("ATTACHED");
+    expect(panel).toHaveTextContent("FRESH");
+  });
+
+  it("starts only the authenticated fixed NinjaTrader maintenance action", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Open NinjaTrader + Attach Observer" }));
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(
+      "/api/lane-iii/ninjatrader-maintenance",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          "Content-Type": "application/json",
+          "X-Beelzebub-Maintenance-Action": "ninjatrader-observer-repair-v1",
+          "X-Beelzebub-Maintenance-Token": "fixture-maintenance-token",
+        }),
+      }),
+    ));
+    const call = vi.mocked(fetch).mock.calls.find(([path, init]) => String(path) === "/api/lane-iii/ninjatrader-maintenance" && init?.method === "POST");
+    expect(JSON.parse(String(call?.[1]?.body))).toEqual({ request_id: expect.stringMatching(/^ntm-ui-/) });
+  });
+
+  it("shows full NinjaTrader maintenance diagnostics with historical commands separated", async () => {
+    ninjaTraderMaintenanceResponse = {
+      ...ninjaTraderMaintenanceResponse,
+      stage: "BLOCKED", blockers: ["RECONCILIATION_NOT_CURRENT"],
+      diagnostics: [{ at: "2026-09-02T17:00:00Z", message: "gate_refused" }],
+    };
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Lane III Paper" }));
+    const panel = (await screen.findByRole("heading", { name: "NinjaTrader observer maintenance diagnostics" })).closest("section") as HTMLElement;
+    expect(panel).toHaveTextContent("RECONCILIATION_NOT_CURRENT");
+    expect(panel).toHaveTextContent("Historical command baseline3");
+    expect(panel).toHaveTextContent("Commands sent by maintenance0");
+    expect(panel).toHaveTextContent("Forced shutdowns0");
+    expect(panel).toHaveTextContent("gate_refused");
   });
 
   it("fails closed when canonical state changes after Slim rendered green", async () => {

@@ -237,6 +237,8 @@ class NinjaTraderLoginBootstrapTests(unittest.TestCase):
         self.assertIn("bootstrap.state is not NinjaTraderLoginState.AUTHENTICATED", control_center)
         self.assertNotIn("PaperExecutionIntent", source)
         self.assertNotIn("LucidFlex25k", source)
+        self.assertNotIn("else NinjaTraderLoginBootstrap()", control_center)
+        self.assertIn('"state": "MANUAL_LOGIN_ONLY"', control_center)
 
 
 if __name__ == "__main__":

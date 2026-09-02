@@ -118,6 +118,40 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
         self.assertFalse(status["market_observer_active"])
         self.assertFalse(status["market_observer_level_one_received"])
 
+    def test_listener_tracks_authoritative_chart_and_observer_attachment_health(self):
+        worker = NinjaTraderListenerWorker()
+        bridge = LoopbackNinjaTraderBridge()
+        missing = bridge.accept_observation(frame(
+            "HEALTH", 1, payload={
+                "component": "MARKET_OBSERVER_ATTACHMENT",
+                "state": "OBSERVER_MISSING",
+                "configured_instrument": "MNQ SEP26",
+                "instrument": "MNQ SEP26",
+                "chart_found": True,
+                "observer_attached": False,
+            },
+        ))
+        attached = bridge.accept_observation(frame(
+            "HEALTH", 2, payload={
+                "component": "MARKET_OBSERVER_ATTACHMENT",
+                "state": "OBSERVER_ATTACHED",
+                "configured_instrument": "MNQ SEP26",
+                "instrument": "MNQ SEP26",
+                "chart_found": True,
+                "observer_attached": True,
+            },
+        ))
+        assert missing is not None and attached is not None
+        worker._record_and_forward_observation(missing)
+        self.assertFalse(worker.status().as_dict()["observer_attachment"]["observer_attached"])
+        worker._record_and_forward_observation(attached)
+        status = worker.status().as_dict()
+        self.assertEqual(status["observer_attachment"]["state"], "OBSERVER_ATTACHED")
+        self.assertEqual(status["observer_attachment"]["instrument"], "MNQ SEP26")
+        self.assertTrue(status["observer_attachment"]["chart_found"])
+        self.assertTrue(status["observer_attachment"]["observer_attached"])
+        self.assertEqual(status["observer_attachment"]["observed_at"], TIME)
+
     def test_listener_surfaces_latest_read_only_cash_values_for_sim_and_lucid(self):
         worker = NinjaTraderListenerWorker()
         bridge = LoopbackNinjaTraderBridge()

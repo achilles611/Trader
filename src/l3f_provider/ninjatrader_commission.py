@@ -155,6 +155,7 @@ class NinjaTraderListenerRuntimeStatus:
     observation_types: Mapping[str, int]
     last_level_one_at: str | None
     last_depth_at: str | None
+    observer_attachment: Mapping[str, object]
     account_balances: Mapping[str, Mapping[str, object]]
 
     def as_dict(self) -> dict[str, object]:
@@ -173,6 +174,7 @@ class NinjaTraderListenerRuntimeStatus:
             "market_observer_depth_received": self.last_depth_at is not None,
             "last_level_one_at": self.last_level_one_at,
             "last_depth_at": self.last_depth_at,
+            "observer_attachment": dict(self.observer_attachment),
             "account_balances": {
                 alias: dict(values) for alias, values in self.account_balances.items()
             },
@@ -413,6 +415,14 @@ class NinjaTraderListenerWorker:
         self._observation_types: dict[str, int] = {}
         self._last_level_one_at: str | None = None
         self._last_depth_at: str | None = None
+        self._observer_attachment: dict[str, object] = {
+            "state": "UNKNOWN",
+            "configured_instrument": None,
+            "instrument": None,
+            "chart_found": False,
+            "observer_attached": False,
+            "observed_at": None,
+        }
         self._account_balances = _empty_account_balances()
 
     def status(self) -> NinjaTraderListenerRuntimeStatus:
@@ -428,8 +438,42 @@ class NinjaTraderListenerWorker:
                 observation_types=dict(self._observation_types),
                 last_level_one_at=self._last_level_one_at,
                 last_depth_at=self._last_depth_at,
+                observer_attachment=dict(self._observer_attachment),
                 account_balances={alias: dict(values) for alias, values in self._account_balances.items()},
             )
+
+    def _record_observer_attachment(self, observation: NinjaTraderObservation) -> None:
+        """Retain only the fixed, observation-only chart attachment model."""
+        if observation.observation_type != "HEALTH":
+            return
+        payload = observation.payload
+        if payload.get("component") != "MARKET_OBSERVER_ATTACHMENT":
+            return
+        state = payload.get("state")
+        configured = payload.get("configured_instrument")
+        instrument = payload.get("instrument")
+        chart_found = payload.get("chart_found")
+        observer_attached = payload.get("observer_attached")
+        if (
+            state not in {
+                "CONFIGURED_INSTRUMENT_UNRESOLVED", "CHART_NOT_FOUND",
+                "WRONG_CHART_INSTRUMENT", "OBSERVER_MISSING", "OBSERVER_ATTACHED",
+                "OBSERVER_TERMINATED",
+            }
+            or (configured is not None and not isinstance(configured, str))
+            or (instrument is not None and not isinstance(instrument, str))
+            or type(chart_found) is not bool
+            or type(observer_attached) is not bool
+        ):
+            return
+        self._observer_attachment = {
+            "state": state,
+            "configured_instrument": configured,
+            "instrument": instrument,
+            "chart_found": chart_found,
+            "observer_attached": observer_attached,
+            "observed_at": observation.ninja_receipt_time,
+        }
 
     def _record_account_balance(self, observation: NinjaTraderObservation) -> None:
         """Keep only finite, read-only account values from the exact two aliases."""
@@ -457,6 +501,7 @@ class NinjaTraderListenerWorker:
                 self._last_level_one_at = observation.ninja_receipt_time
             elif kind == "DEPTH":
                 self._last_depth_at = observation.ninja_receipt_time
+            self._record_observer_attachment(observation)
             self._record_account_balance(observation)
             callback = self._on_observation
         if callback is not None:
@@ -521,6 +566,14 @@ class NinjaTraderListenerWorker:
             self._observation_types = {}
             self._last_level_one_at = None
             self._last_depth_at = None
+            self._observer_attachment = {
+                "state": "UNKNOWN",
+                "configured_instrument": None,
+                "instrument": None,
+                "chart_found": False,
+                "observer_attached": False,
+                "observed_at": None,
+            }
             self._account_balances = _empty_account_balances()
             self._harness = NinjaTraderCommissioningHarness(
                 self.config,

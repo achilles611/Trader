@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
+from urllib.parse import urlsplit
 
 from src.l3f_provider.ninjatrader_commission import NinjaTraderListenerWorker
 from src.l3f_provider.shadow_runtime import LaneIIIShadowRuntime
@@ -31,6 +32,12 @@ from src.l3g_paper.commissioning import (
 from src.l3g_paper.health import ledger_health_projection, sanitized_paper_health
 from src.l3g_paper.ledger import PaperLedger, resolve_ledger_epoch
 from src.l3g_paper.ninjatrader_login import NinjaTraderLoginBootstrap, NinjaTraderLoginState
+from src.l3g_paper.ninjatrader_maintenance import (
+    ACTION_TOKEN_HEADER,
+    ACTION_TOKEN_VALUE,
+    AUTH_TOKEN_HEADER,
+    NinjaTraderMaintenanceService,
+)
 from src.l3g_paper.ninjatrader_transport import PaperExecutionTransport
 from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout
 from src.l3g_paper.sessions import session_catalog
@@ -1352,10 +1359,11 @@ def create_control_center_app(
     paper_execution_transport_factory: Callable[[PaperLedger, Callable[[dict[str, object]], None], Callable[[str], None]], PaperExecutionTransport] | None = None,
     paper_ledger_factory: Callable[[Path], PaperLedger] | None = None,
     ninjatrader_login_bootstrap_factory: Callable[[], NinjaTraderLoginBootstrap] | None = None,
+    ninjatrader_maintenance_factory: Callable[..., NinjaTraderMaintenanceService] | None = None,
 ) -> Any:
     """Create the local FastAPI Phase C application; no live-trading routes exist."""
     try:
-        from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+        from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
         from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
         from fastapi.staticfiles import StaticFiles
     except ImportError as exc:  # pragma: no cover - dependency guidance
@@ -1367,6 +1375,7 @@ def create_control_center_app(
     # Publish the injected type so the /ws parameter is recognized as a
     # WebSocket instead of being interpreted as an HTTP query parameter.
     globals()["WebSocket"] = WebSocket
+    globals()["Request"] = Request
 
     # Import lazily: CopyTradeService itself owns Phase C control-state setup.
     from .service import CopyTradeService
@@ -1447,6 +1456,14 @@ def create_control_center_app(
                 "market_observer_depth_received": False,
                 "last_level_one_at": None,
                 "last_depth_at": None,
+                "observer_attachment": {
+                    "state": "UNKNOWN",
+                    "configured_instrument": None,
+                    "instrument": None,
+                    "chart_found": False,
+                    "observer_attached": False,
+                    "observed_at": None,
+                },
                 "market_observer_freshness": {
                     "timestamp": None,
                     "threshold_seconds": MARKET_OBSERVER_ACTIVE_FRESHNESS_SECONDS,
@@ -1476,8 +1493,9 @@ def create_control_center_app(
         if bootstrap is None:
             return {
                 "schema": "lane-iii-phase-g-ninjatrader-login-bootstrap-v1",
-                "state": "UNSTARTED",
+                "state": "MANUAL_LOGIN_ONLY",
                 "attempt_count": 0,
+                "automation_enabled": False,
                 "ninjatrader_process_detected": False,
                 "login_window_detected": False,
                 "control_center_detected": False,
@@ -1569,6 +1587,19 @@ def create_control_center_app(
             mechanical_status_path=None if not status_path else Path(status_path),
             authorization_status_path=None if not authorization_path else Path(authorization_path),
         )
+
+    maintenance_arguments = {
+        "paper_status": lane_iii_paper_health,
+        "live_status": lane_iii_live_health,
+        "ledger_status": ledger_verifier.status,
+        "start_ledger_verification": lambda: ledger_verifier.start("incremental"),
+        "audit_path": audit_root / "ninjatrader-maintenance-audit.jsonl",
+    }
+    ninjatrader_maintenance = (
+        ninjatrader_maintenance_factory(**maintenance_arguments)
+        if ninjatrader_maintenance_factory is not None
+        else NinjaTraderMaintenanceService(**maintenance_arguments)
+    )
 
     async def quiesce_ledger_verifier_for_shutdown() -> dict[str, object]:
         """Release a read-only verifier snapshot before the writer truncates WAL.
@@ -1776,8 +1807,10 @@ def create_control_center_app(
             # callback queue or miss the signed execution handshake.
             if ninjatrader_login_bootstrap_factory is not None:
                 login_bootstrap = ninjatrader_login_bootstrap_factory()
-            elif ninjatrader_listener_factory is None:
-                login_bootstrap = NinjaTraderLoginBootstrap()
+            # Production desktop maintenance is intentionally manual-login
+            # only. A legacy bootstrap may be injected explicitly in tests or
+            # a separately authorized deployment, but the console never
+            # constructs credential automation by default.
             if login_bootstrap is not None:
                 if type(login_bootstrap) is not NinjaTraderLoginBootstrap:
                     raise RuntimeError("NINJATRADER_LOGIN factory must return the exact sealed bootstrap")
@@ -1815,6 +1848,7 @@ def create_control_center_app(
             supervisor = watcher_runtime.get("supervisor")
             task = watcher_runtime.get("task")
             try:
+                ninjatrader_maintenance.stop()
                 await scheduler_engine.stop()
                 if login_bootstrap is not None:
                     login_bootstrap.stop()
@@ -1985,6 +2019,7 @@ def create_control_center_app(
 
     app = FastAPI(title="Trader Copy Control Center", version="1.0", docs_url=None, redoc_url=None,
                   lifespan=lifespan)
+    app.state.ninjatrader_maintenance = ninjatrader_maintenance
     app.state.ninjatrader_observer = None
     app.state.lane_iii_shadow = None
     app.state.lane_iii_paper = None
@@ -2404,6 +2439,40 @@ def create_control_center_app(
             ),
             verification_freshness_seconds=LEDGER_VERIFICATION_FRESHNESS_SECONDS,
         )
+
+    @app.get("/api/lane-iii/ninjatrader-maintenance")
+    async def api_ninjatrader_maintenance() -> dict[str, object]:
+        """Read-only status for the fixed NinjaTrader/observer workflow."""
+        return ninjatrader_maintenance.status()
+
+    @app.post("/api/lane-iii/ninjatrader-maintenance")
+    async def api_start_ninjatrader_maintenance(
+        request: Request,
+        body: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, object]:
+        """Start one local, idempotent workflow; never accept a path or command."""
+        hostname = (request.url.hostname or "").lower()
+        if hostname not in {"127.0.0.1", "localhost", "::1", "testserver"}:
+            raise HTTPException(status_code=403, detail="NinjaTrader maintenance is loopback-only.")
+        origin = request.headers.get("origin")
+        if origin:
+            try:
+                origin_host = (urlsplit(origin).hostname or "").lower()
+            except ValueError:
+                origin_host = ""
+            if origin_host not in {"127.0.0.1", "localhost", "::1", "testserver"}:
+                raise HTTPException(status_code=403, detail="NinjaTrader maintenance requires a local same-origin request.")
+        if request.headers.get(ACTION_TOKEN_HEADER) != ACTION_TOKEN_VALUE:
+            raise HTTPException(status_code=403, detail="NinjaTrader maintenance action authentication failed.")
+        if request.headers.get(AUTH_TOKEN_HEADER) != ninjatrader_maintenance.action_token:
+            raise HTTPException(status_code=403, detail="NinjaTrader maintenance session authentication failed.")
+        payload = body or {}
+        if not isinstance(payload, dict) or set(payload) != {"request_id"}:
+            raise HTTPException(status_code=400, detail="NinjaTrader maintenance accepts only request_id.")
+        try:
+            return ninjatrader_maintenance.start(payload["request_id"])
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get("/api/lane-iii/live")
     async def api_lane_iii_live() -> dict[str, object]:

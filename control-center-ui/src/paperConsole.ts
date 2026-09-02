@@ -8,8 +8,10 @@ export type PaperConsoleState = {
   schedule: any;
   rehearsal: any;
   slimStatus: any;
+  ninjaTraderMaintenance: any;
   error: string | null;
   busy: boolean;
+  maintenanceBusy: boolean;
   verificationInFlight: boolean;
   verificationMode: string;
   setVerificationMode: (mode: string) => void;
@@ -22,6 +24,7 @@ export type PaperConsoleState = {
   saveSchedule: () => Promise<void>;
   setSchedule: (value: any) => void;
   stopAndDisarm: () => Promise<void>;
+  startNinjaTraderMaintenance: () => Promise<void>;
 };
 
 type Options = {
@@ -37,23 +40,28 @@ export function usePaperConsoleState({ active, includeSlim, notify }: Options): 
   const [schedule, setSchedule] = useState<any>(null);
   const [rehearsal, setRehearsal] = useState<any>(null);
   const [slimStatus, setSlimStatus] = useState<any>(null);
+  const [ninjaTraderMaintenance, setNinjaTraderMaintenance] = useState<any>(null);
+  const [maintenanceRequestId, setMaintenanceRequestId] = useState<string | null>(null);
   const [commissioningRequestId, setCommissioningRequestId] = useState<string | null>(null);
   const [operationalPaperRequestId, setOperationalPaperRequestId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [maintenanceBusy, setMaintenanceBusy] = useState(false);
   const [verificationInFlight, setVerificationInFlight] = useState(false);
   const [verificationMode, setVerificationMode] = useState("auto");
 
   const load = useCallback(async () => {
     try {
-      const [paper, nextSchedule, nextSlim] = await Promise.all([
+      const [paper, nextSchedule, nextSlim, maintenance] = await Promise.all([
         api<any>("/api/lane-iii/paper"),
         api<any>("/api/lane-iii/paper/ledger-verification/schedule"),
         includeSlim ? api<any>("/api/lane-iii/paper/slim-status") : Promise.resolve(null),
+        api<any>("/api/lane-iii/ninjatrader-maintenance"),
       ]);
       setStatus(paper);
       setSchedule(nextSchedule);
       setSlimStatus(nextSlim);
+      setNinjaTraderMaintenance(maintenance);
       setError(null);
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : "Lane III paper status is unavailable.");
@@ -62,6 +70,7 @@ export function usePaperConsoleState({ active, includeSlim, notify }: Options): 
       // Console control looking eligible while its backend is unavailable.
       setStatus(null);
       setSchedule(null);
+      setNinjaTraderMaintenance(null);
       if (includeSlim) setSlimStatus(null);
     }
   }, [includeSlim]);
@@ -84,6 +93,13 @@ export function usePaperConsoleState({ active, includeSlim, notify }: Options): 
     }, slimTimeoutMilliseconds);
     return () => window.clearTimeout(timer);
   }, [slimStatus?.generated_at]);
+
+  useEffect(() => {
+    if (!ninjaTraderMaintenance || ninjaTraderMaintenance.in_progress === true) return;
+    if (["READY", "BLOCKED", "FAILED", "CANCELLED"].includes(String(ninjaTraderMaintenance.stage))) {
+      setMaintenanceRequestId(null);
+    }
+  }, [ninjaTraderMaintenance]);
 
   const act = useCallback(async (path: string, label: string, body?: Record<string, string>) => {
     if (busy) return undefined;
@@ -174,13 +190,44 @@ export function usePaperConsoleState({ active, includeSlim, notify }: Options): 
     await act("/api/lane-iii/paper/flatten-and-disarm", "Stop & Disarm");
   }, [act]);
 
+  const startNinjaTraderMaintenance = useCallback(async () => {
+    if (maintenanceBusy || ninjaTraderMaintenance?.in_progress === true) return;
+    if (typeof ninjaTraderMaintenance?.action_token !== "string" || !ninjaTraderMaintenance.action_token) {
+      notify({ tone: "error", message: "NinjaTrader maintenance authentication is unavailable." });
+      return;
+    }
+    const requestId = maintenanceRequestId || `ntm-ui-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    setMaintenanceRequestId(requestId);
+    setMaintenanceBusy(true);
+    try {
+      const result = await api<any>("/api/lane-iii/ninjatrader-maintenance", {
+        method: "POST",
+        headers: {
+          "X-Beelzebub-Maintenance-Action": "ninjatrader-observer-repair-v1",
+          "X-Beelzebub-Maintenance-Token": ninjaTraderMaintenance.action_token,
+        },
+        body: JSON.stringify({ request_id: requestId }),
+      });
+      setNinjaTraderMaintenance(result);
+      notify({ tone: "success", message: "NinjaTrader observer maintenance started." });
+      await load();
+    } catch (failure) {
+      notify({ tone: "error", message: failure instanceof Error ? failure.message : "NinjaTrader maintenance could not start." });
+      await load();
+    } finally {
+      setMaintenanceBusy(false);
+    }
+  }, [load, maintenanceBusy, maintenanceRequestId, ninjaTraderMaintenance?.action_token, ninjaTraderMaintenance?.in_progress, notify]);
+
   return {
     status,
     schedule,
     rehearsal,
     slimStatus,
+    ninjaTraderMaintenance,
     error,
     busy,
+    maintenanceBusy,
     verificationInFlight,
     verificationMode,
     setVerificationMode,
@@ -193,5 +240,6 @@ export function usePaperConsoleState({ active, includeSlim, notify }: Options): 
     saveSchedule,
     setSchedule,
     stopAndDisarm,
+    startNinjaTraderMaintenance,
   };
 }

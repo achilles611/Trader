@@ -1,12 +1,11 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('probe', 'start', 'submit-login', 'connect-lucid')]
+    [ValidateSet('probe', 'start', 'close-gracefully', 'submit-login', 'connect-lucid')]
     [string] $Action
 )
 
 $ErrorActionPreference = 'Stop'
 $targetConnection = 'LucidFlex25k'
-$ninjaExecutable = 'C:\Program Files\NinjaTrader 8\bin\NinjaTrader.exe'
 $credentialRoot = Join-Path $env:USERPROFILE 'Documents\NinjaTrader 8'
 $usernamePath = Join-Path $credentialRoot 'beelzebub-login.username'
 $secretPath = Join-Path $credentialRoot 'beelzebub-login.secret'
@@ -17,6 +16,62 @@ Add-Type -AssemblyName UIAutomationTypes
 function Write-SanitizedResult {
     param([hashtable] $Payload)
     [Console]::Out.WriteLine(($Payload | ConvertTo-Json -Compress -Depth 5))
+}
+
+# Resolve only the fixed NinjaTrader executable name from administrator or
+# machine configuration.  No HTTP/request value reaches this helper.
+function Resolve-NinjaExecutable {
+    $candidates = @()
+    if (-not [String]::IsNullOrWhiteSpace($env:NINJATRADER_EXECUTABLE)) {
+        $candidates += $env:NINJATRADER_EXECUTABLE
+    }
+    foreach ($registryPath in @(
+        'Registry::HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\App Paths\NinjaTrader.exe',
+        'Registry::HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\App Paths\NinjaTrader.exe'
+    )) {
+        try {
+            $configured = (Get-ItemProperty -LiteralPath $registryPath -ErrorAction Stop).'(default)'
+            if (-not [String]::IsNullOrWhiteSpace($configured)) { $candidates += $configured }
+        }
+        catch { }
+    }
+    if (-not [String]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+        $candidates += (Join-Path $env:ProgramFiles 'NinjaTrader 8\bin\NinjaTrader.exe')
+    }
+    foreach ($candidate in $candidates) {
+        try {
+            $resolved = [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string] $candidate))
+            if ([System.IO.Path]::GetFileName($resolved) -eq 'NinjaTrader.exe' -and [System.IO.File]::Exists($resolved)) {
+                return $resolved
+            }
+        }
+        catch { }
+    }
+    return $null
+}
+
+function Request-GracefulNinjaShutdown {
+    param(
+        [System.Diagnostics.Process] $Process,
+        [System.Windows.Automation.AutomationElement] $ControlCenter
+    )
+    if ($null -eq $Process) { return $true }
+    try {
+        if ($Process.CloseMainWindow()) { return $true }
+    }
+    catch { }
+    if ($null -eq $ControlCenter) { return $false }
+    try {
+        $current = $ControlCenter
+        while ($null -ne $current -and $current.Current.ControlType -ne [System.Windows.Automation.ControlType]::Window) {
+            $current = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($current)
+        }
+        if ($null -eq $current) { return $false }
+        $windowPattern = $current.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern)
+        $windowPattern.Close()
+        return $true
+    }
+    catch { return $false }
 }
 
 function Find-Descendants {
@@ -220,12 +275,32 @@ try {
             Write-SanitizedResult @{ ok = $true; result = 'ALREADY_RUNNING'; failure_category = $null }
             exit 0
         }
-        if (-not [System.IO.File]::Exists($ninjaExecutable)) {
+        $ninjaExecutable = Resolve-NinjaExecutable
+        if ($null -eq $ninjaExecutable) {
             Write-SanitizedResult @{ ok = $false; failure_category = 'NINJATRADER_START_FAILED' }
             exit 0
         }
         Start-Process -FilePath $ninjaExecutable -WorkingDirectory (Split-Path $ninjaExecutable -Parent) | Out-Null
         Write-SanitizedResult @{ ok = $true; result = 'STARTED'; failure_category = $null }
+        exit 0
+    }
+
+    if ($Action -eq 'close-gracefully') {
+        $context = Get-NinjaContext
+        if ($null -ne $context.Failure) {
+            Write-SanitizedResult @{ ok = $false; failure_category = $context.Failure }
+            exit 0
+        }
+        if ($null -eq $context.Process) {
+            Write-SanitizedResult @{ ok = $true; result = 'ALREADY_STOPPED'; failure_category = $null }
+            exit 0
+        }
+        $controlCenter = Get-ControlCenter -Process $context.Process
+        if (-not (Request-GracefulNinjaShutdown -Process $context.Process -ControlCenter $controlCenter)) {
+            Write-SanitizedResult @{ ok = $false; failure_category = 'GRACEFUL_SHUTDOWN_REFUSED' }
+            exit 0
+        }
+        Write-SanitizedResult @{ ok = $true; result = 'GRACEFUL_CLOSE_REQUESTED'; failure_category = $null }
         exit 0
     }
 
