@@ -85,8 +85,8 @@ def validate_trigger(kind: str, specification: Mapping[str, Any], *, default_tim
             raise ValueError("INTERVAL requires interval_seconds of at least one minute.")
         spec["interval_seconds"] = int(seconds)
     else:
-        if str(spec.get("session") or "").upper() not in {"ASIA", "NEW_YORK"}:
-            raise ValueError("SESSION_RELATIVE requires session ASIA or NEW_YORK.")
+        if str(spec.get("session") or "").upper() not in {"ASIA", "LONDON", "NEW_YORK"}:
+            raise ValueError("SESSION_RELATIVE requires session ASIA, LONDON, or NEW_YORK.")
         if str(spec.get("event") or "").upper() not in {"OPEN", "CLOSE"}:
             raise ValueError("SESSION_RELATIVE requires event OPEN or CLOSE.")
         offset = spec.get("offset_minutes", 0)
@@ -100,7 +100,11 @@ def validate_trigger(kind: str, specification: Mapping[str, Any], *, default_tim
 
 
 def _session_occurrences(spec: Mapping[str, Any], after: datetime, count: int, resolver: PaperSessionResolver) -> Iterable[ResolvedOccurrence]:
-    wanted = PaperSessionKind.ASIA_GLOBEX if str(spec["session"]) == "ASIA" else PaperSessionKind.NEW_YORK_RTH
+    wanted = {
+        "ASIA": PaperSessionKind.ASIA,
+        "LONDON": PaperSessionKind.LONDON,
+        "NEW_YORK": PaperSessionKind.NEW_YORK_RTH,
+    }[str(spec["session"])]
     cursor = after
     produced = 0
     while produced < count:
@@ -109,14 +113,14 @@ def _session_occurrences(spec: Mapping[str, Any], after: datetime, count: int, r
         for _ in range(16):
             candidate = resolver.next_valid_session(cursor)
             if candidate is None:
-                yield ResolvedOccurrence(None, "America/New_York", None, "SESSION_CALENDAR_UNVERIFIED")
+                yield ResolvedOccurrence(None, "UTC", None, "SESSION_CALENDAR_UNVERIFIED")
                 return
             cursor = candidate.boundary_at("session_end") + timedelta(seconds=1)
             if candidate.session_kind is wanted:
                 context = candidate
                 break
         if context is None:
-            yield ResolvedOccurrence(None, "America/New_York", None, "SESSION_NOT_RESOLVABLE")
+            yield ResolvedOccurrence(None, "UTC", None, "SESSION_NOT_RESOLVABLE")
             return
         boundary = "observation_start" if str(spec["event"]) == "OPEN" else "session_end"
         due = context.boundary_at(boundary) + timedelta(minutes=int(spec.get("offset_minutes", 0)))

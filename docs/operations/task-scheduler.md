@@ -19,7 +19,7 @@ order fields.
 - `DAILY`: local time and timezone.
 - `WEEKDAYS`: numeric weekdays (`0` Monday through `6` Sunday).
 - `INTERVAL`: UTC anchor and a minimum one-minute interval.
-- `SESSION_RELATIVE`: existing L3G `ASIA` or `NEW_YORK` open/close plus offset.
+- `SESSION_RELATIVE`: existing L3G `ASIA`, `LONDON`, or `NEW_YORK` open/close plus offset.
 
 Spring DST gaps are recorded as `MISSED`, never shifted. Autumn overlaps use
 deterministic fold 0 and execute once. The backend, not the browser, resolves
@@ -50,8 +50,8 @@ scientific worker with its durable resource lock.
 ## Lane III templates and boundaries
 
 **Create paused** instantiates an independent template; it is not a workflow
-engine. Asia and New York each have readiness, opening reminder, close-audit,
-and audit-export templates.
+engine. Asia, London, and New York each have readiness, opening reminder,
+close-audit, and audit-export templates.
 
 ```text
 ASIA OPEN -15m  Readiness task
@@ -60,6 +60,8 @@ ASIA OPEN       Operator manually reviews and arms outside scheduler
 ASIA CLOSE      l3g owns its existing hard-flat/disarm behavior
 ASIA CLOSE +2m  Close audit
 ASIA CLOSE +5m  Audit export
+LONDON OPEN      08:00 Europe/London (DST-aware)
+LONDON CLOSE     11:30 Europe/London (exclusive boundary)
 ```
 
 The scheduler never performs manual arming. It cannot arm sessions, submit,

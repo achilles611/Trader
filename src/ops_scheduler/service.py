@@ -31,7 +31,7 @@ def _retry_policy(value: Mapping[str, Any] | None) -> dict[str, Any]:
 
 def scheduler_templates() -> list[dict[str, Any]]:
     templates: list[dict[str, Any]] = []
-    for display, session in (("Asia", "ASIA"), ("New York", "NEW_YORK")):
+    for display, session in (("Asia", "ASIA"), ("London", "LONDON"), ("New York", "NEW_YORK")):
         templates.extend([
             {"template_id": f"{session.lower()}-readiness", "name": f"{display} readiness", "description": "Read-only session readiness before a deliberate operator arm.", "task_type": "lane_iii.session_readiness", "task_configuration": {"session": session, "freshness_threshold_seconds": 15}, "trigger_kind": "SESSION_RELATIVE", "trigger_specification": {"session": session, "event": "OPEN", "offset_minutes": -15}, "missed_run_policy": "SKIP", "retry_policy": {"max_attempts": 1}},
             {"template_id": f"{session.lower()}-opening-reminder", "name": f"{display} opening reminder", "description": "Reminder that manual arming happens outside the scheduler.", "task_type": "operator.reminder", "task_configuration": {"title": f"{display} session approaching", "message": f"{display} session is approaching. Review readiness and arm manually only if all gates pass.", "severity": "warning"}, "trigger_kind": "SESSION_RELATIVE", "trigger_specification": {"session": session, "event": "OPEN", "offset_minutes": -2}, "missed_run_policy": "SKIP", "retry_policy": {"max_attempts": 1}},

@@ -259,6 +259,7 @@ def unavailable_slim_status(reason: str = "PAPER_RUNTIME_UNAVAILABLE") -> dict[s
         "primary_blocker": reason,
         "can_start": False,
         "paper_active": False,
+        "session": None,
         "ledger_verification": {"state": "UNAVAILABLE", "completed_at": None, "message": "Verification status is unavailable."},
         "pnl": {"state": "MISSING", "total": None, "realized": None, "unrealized": None},
     }
@@ -281,6 +282,19 @@ def derive_slim_paper_status(
     """
     if runtime is None:
         return unavailable_slim_status()
+    session = {
+        "session_kind": runtime.get("current_session", "OFF_SESSION"),
+        "session_family": runtime.get("current_session_family", "OFF_SESSION"),
+        "session_id": runtime.get("current_session_id"),
+        "trade_date": runtime.get("trade_date"),
+        "timezone": runtime.get("session_timezone", "America/New_York"),
+        "entry_window": runtime.get("entry_window"),
+        "session_generation": runtime.get("session_generation"),
+    }
+
+    def finalize(payload: dict[str, object]) -> dict[str, object]:
+        payload["session"] = session
+        return payload
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
@@ -307,7 +321,7 @@ def derive_slim_paper_status(
     if active_state:
         stopping = operational.get("stopping") is True or state == "STOPPING"
         if stopping:
-            return {
+            return finalize({
                 "schema": SLIM_STATUS_SCHEMA,
                 "generated_at": _timestamp(current),
                 "light": "YELLOW",
@@ -318,9 +332,9 @@ def derive_slim_paper_status(
                 "paper_active": True,
                 "ledger_verification": verification_payload,
                 "pnl": pnl,
-            }
+            })
         if state in {"ENTRY_PENDING", "EXIT_PENDING", "STARTING"}:
-            return {
+            return finalize({
                 "schema": SLIM_STATUS_SCHEMA,
                 "generated_at": _timestamp(current),
                 "light": "YELLOW",
@@ -331,7 +345,7 @@ def derive_slim_paper_status(
                 "paper_active": True,
                 "ledger_verification": verification_payload,
                 "pnl": pnl,
-            }
+            })
         blockers = _active_blockers(
             runtime, verification_value, observer_value, now=current,
             verification_freshness_seconds=verification_freshness_seconds,
@@ -339,7 +353,7 @@ def derive_slim_paper_status(
         if pnl["state"] != "CURRENT":
             blockers = tuple(dict.fromkeys((*blockers, "PAPER_SESSION_PNL_UNAVAILABLE")))
         if not blockers:
-            return {
+            return finalize({
                 "schema": SLIM_STATUS_SCHEMA,
                 "generated_at": _timestamp(current),
                 "light": "GREEN",
@@ -350,8 +364,8 @@ def derive_slim_paper_status(
                 "paper_active": True,
                 "ledger_verification": verification_payload,
                 "pnl": pnl,
-            }
-        return {
+            })
+        return finalize({
             "schema": SLIM_STATUS_SCHEMA,
             "generated_at": _timestamp(current),
             "light": "RED",
@@ -362,7 +376,7 @@ def derive_slim_paper_status(
             "paper_active": True,
             "ledger_verification": verification_payload,
             "pnl": pnl,
-        }
+        })
 
     reasons = tuple(str(value) for value in readiness_value.get("blocking_reasons", []) if isinstance(value, str))
     # A compact operator surface must not show a green start state while its
@@ -370,7 +384,7 @@ def derive_slim_paper_status(
     # canonical runtime normally provides a zero-valued, reconciled session
     # baseline, so this only fails closed on unavailable evidence.
     if readiness_value.get("result") == "READY" and pnl["state"] != "CURRENT":
-        return {
+        return finalize({
             "schema": SLIM_STATUS_SCHEMA,
             "generated_at": _timestamp(current),
             "light": "RED",
@@ -381,9 +395,9 @@ def derive_slim_paper_status(
             "paper_active": False,
             "ledger_verification": verification_payload,
             "pnl": pnl,
-        }
+        })
     if readiness_value.get("result") == "READY":
-        return {
+        return finalize({
             "schema": SLIM_STATUS_SCHEMA,
             "generated_at": _timestamp(current),
             "light": "GREEN",
@@ -394,7 +408,7 @@ def derive_slim_paper_status(
             "paper_active": False,
             "ledger_verification": verification_payload,
             "pnl": pnl,
-        }
+        })
 
     waiting_for_bridge = state == "WAITING_FOR_EXECUTION_BRIDGE" and _as_mapping(runtime.get("transport")).get("state") in {
         "NEW", "LISTENING", "CONNECTED", "AUTHENTICATED",
@@ -415,7 +429,7 @@ def derive_slim_paper_status(
             if verification_status == "IN_PROGRESS"
             else _message(reasons[0] if reasons else None, "Preparing canonical paper runtime state.")
         )
-        return {
+        return finalize({
             "schema": SLIM_STATUS_SCHEMA,
             "generated_at": _timestamp(current),
             "light": "YELLOW",
@@ -426,10 +440,10 @@ def derive_slim_paper_status(
             "paper_active": False,
             "ledger_verification": verification_payload,
             "pnl": pnl,
-        }
+        })
 
     reason = reasons[0] if reasons else "PAPER_RUNTIME_NOT_READY"
-    return {
+    return finalize({
         "schema": SLIM_STATUS_SCHEMA,
         "generated_at": _timestamp(current),
         "light": "RED",
@@ -440,4 +454,4 @@ def derive_slim_paper_status(
         "paper_active": False,
         "ledger_verification": verification_payload,
         "pnl": pnl,
-    }
+    })

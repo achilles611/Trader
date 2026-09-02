@@ -5,10 +5,11 @@ Slim Mode is the compact, paper-only Lane III-G operating surface. Select
 Slim header to return. The choice is stored locally and `?console=slim` or
 `?console=full` overrides that saved preference for the current visit.
 
-Slim Mode shows only the paper-session P&L, local ledger verification, the
-guarded paper start/stop position, and a three-light readiness display. Full
-Console retains rehearsal evidence, ledger diagnostics, scheduling, and all
-advanced controls.
+Slim Mode shows the exact current session kind/family/window, paper-session
+P&L, local ledger verification, the guarded paper start/stop position, and a
+three-light readiness display. This includes the independent `LONDON / EUROPE`
+identity and `Europe/London` window. Full Console retains rehearsal evidence,
+ledger diagnostics, scheduling, and all advanced controls.
 
 ## Lights
 

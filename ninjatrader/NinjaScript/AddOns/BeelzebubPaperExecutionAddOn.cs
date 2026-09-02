@@ -25,7 +25,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         // Updated from the checked-in source before a NinjaTrader build.  The
         // Python bridge independently fingerprints the same source, so an old
         // compiled AddOn cannot be armed merely because its DLL timestamp is new.
-        private const string AddonSourceFingerprint = "b91b91b651d312768e2bbfbf4206de9d133303e31597ef364691e4f5c7728bf9";
+        private const string AddonSourceFingerprint = "ca43253d190e164a55cde371b148879d369901738ecf282cbe881eaa2f9375ef";
         private const string ExactAccountName = "Sim101";
         private const string ExactAccountClass = "LOCAL_SIMULATION";
         private const string ExactInstrumentName = "MNQ SEP26";
@@ -39,7 +39,9 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const int WatchdogSettlementSeconds = 1;
         private const int MaximumWatchdogFinalProofAttempts = 3;
         private const string PaperTimezone = "America/New_York";
+        private const string LondonTimezone = "Europe/London";
         private const string AsiaProfileHash = "55225b35ccdb289d179bb23afd7f3fdb2c5ab193d53aba21603f17ff9f6d43aa";
+        private const string LondonProfileHash = "db211b6665e873fc3bf0b93db76210b25d154893ca1d5ca15ef0d7d6bea233cc";
         private const string NewYorkProfileHash = "8b8560a08ff41963a7a78d09bc977fbc1faf10f4a11ce58d05f47cacd89e0814";
         private const string NyAfterProfileHash = "e0cea9aa679c24ad4491ad929bcd72832cd3dcb49e2e5a7a64226c8abb5a1db2";
         private const string OffSessionProfileHash = "168f289a5847781ccb7a09f2556c4b3aa03e6f767071dc061dc5e3211d3834eb";
@@ -550,6 +552,15 @@ namespace NinjaTrader.NinjaScript.AddOns
             catch (InvalidTimeZoneException) { return TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"); }
         }
 
+        private static TimeZoneInfo LondonTimezoneInfo()
+        {
+            // Preserve the IANA identity on the wire. NinjaTrader's Windows
+            // .NET Framework runtime uses the registry-equivalent timezone.
+            try { return TimeZoneInfo.FindSystemTimeZoneById(LondonTimezone); }
+            catch (TimeZoneNotFoundException) { return TimeZoneInfo.FindSystemTimeZoneById("GMT Standard Time"); }
+            catch (InvalidTimeZoneException) { return TimeZoneInfo.FindSystemTimeZoneById("GMT Standard Time"); }
+        }
+
         private static bool AsiaStartDay(DateTime local)
         {
             return local.DayOfWeek == DayOfWeek.Sunday || local.DayOfWeek == DayOfWeek.Monday
@@ -558,6 +569,11 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
         private static bool NewYorkStartDay(DateTime local)
+        {
+            return local.DayOfWeek >= DayOfWeek.Monday && local.DayOfWeek <= DayOfWeek.Friday;
+        }
+
+        private static bool LondonStartDay(DateTime local)
         {
             return local.DayOfWeek >= DayOfWeek.Monday && local.DayOfWeek <= DayOfWeek.Friday;
         }
@@ -578,11 +594,14 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (String.IsNullOrWhiteSpace(kind) || String.IsNullOrWhiteSpace(family) || String.IsNullOrWhiteSpace(sessionId)
                 || String.IsNullOrWhiteSpace(tradeDate) || String.IsNullOrWhiteSpace(profileHash))
                 return "MISSING_SESSION_IDENTITY";
-            DateTime local = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, NewYorkTimezone());
+            DateTime nowUtc = DateTime.UtcNow;
+            DateTime local = TimeZoneInfo.ConvertTimeFromUtc(nowUtc, NewYorkTimezone());
+            DateTime londonLocal = TimeZoneInfo.ConvertTimeFromUtc(nowUtc, LondonTimezoneInfo());
             DateTime parsedDate;
             if (!DateTime.TryParseExact(tradeDate, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out parsedDate))
                 return "TRADE_DATE_MISMATCH";
             TimeSpan clock = local.TimeOfDay;
+            TimeSpan londonClock = londonLocal.TimeOfDay;
             string expectedKind;
             string expectedFamily;
             string expectedDate;
@@ -596,6 +615,15 @@ namespace NinjaTrader.NinjaScript.AddOns
                 expectedDate = IsoDate(clock >= new TimeSpan(18, 0, 0) ? local.AddDays(1) : local);
                 expectedHash = AsiaProfileHash;
                 insideEntry = (clock >= new TimeSpan(18, 5, 0)) || (clock < new TimeSpan(1, 30, 0));
+            }
+            else if (londonClock >= new TimeSpan(8, 0, 0) && londonClock < new TimeSpan(11, 30, 0)
+                && LondonStartDay(londonLocal))
+            {
+                expectedKind = "LONDON";
+                expectedFamily = "EUROPE";
+                expectedDate = IsoDate(londonLocal);
+                expectedHash = LondonProfileHash;
+                insideEntry = true;
             }
             else if (clock >= new TimeSpan(9, 30, 0) && clock < new TimeSpan(16, 0, 0) && NewYorkStartDay(local))
             {
@@ -1311,7 +1339,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             message["execution_session_id"] = executionSessionId;
             message["session_kind"] = kind;
             message["session_family"] = kind == "NEW_YORK_RTH" || kind == "NY_AFTER"
-                ? "NEW_YORK" : kind == "ASIA" ? "ASIA" : "OFF_SESSION";
+                ? "NEW_YORK" : kind == "LONDON" ? "EUROPE" : kind == "ASIA" ? "ASIA" : "OFF_SESSION";
             message["session_id"] = sessionId;
             message["trade_date"] = tradeDate;
             message["session_profile_hash"] = profileHash;

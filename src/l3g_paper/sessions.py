@@ -1,4 +1,4 @@
-"""Immutable America/New_York session regimes for Sim101 paper operation.
+"""Immutable timezone-aware session regimes for Sim101 paper operation.
 
 This module deliberately sits outside of :mod:`src.lane_iii`.  Lane III
 remains a frozen scientific/observation boundary; these profiles are a paper
@@ -18,10 +18,14 @@ from src.lane_iii.contracts import canonical_hash
 
 
 NEW_YORK_TIMEZONE = "America/New_York"
+LONDON_TIMEZONE = "Europe/London"
 PAPER_SESSION_CONTRACT = "MNQU6"
 _NY = tz.gettz(NEW_YORK_TIMEZONE)
 if _NY is None:  # Never substitute a fixed offset for a market timezone.
     raise RuntimeError("America/New_York timezone data is unavailable.")
+_LONDON = tz.gettz(LONDON_TIMEZONE)
+if _LONDON is None:  # Never substitute a fixed offset for London civil time.
+    raise RuntimeError("Europe/London timezone data is unavailable.")
 
 
 class PaperSessionKind(StrEnum):
@@ -30,6 +34,7 @@ class PaperSessionKind(StrEnum):
     # every serialized identity is now exactly ASIA.
     ASIA = "ASIA"
     ASIA_GLOBEX = "ASIA"
+    LONDON = "LONDON"
     NEW_YORK_RTH = "NEW_YORK_RTH"
     NY_AFTER = "NY_AFTER"
     OFF_SESSION = "OFF_SESSION"
@@ -37,6 +42,7 @@ class PaperSessionKind(StrEnum):
 
 class PaperSessionFamily(StrEnum):
     NEW_YORK = "NEW_YORK"
+    EUROPE = "EUROPE"
     ASIA = "ASIA"
     OFF_SESSION = "OFF_SESSION"
 
@@ -45,6 +51,8 @@ def session_family(kind: PaperSessionKind) -> PaperSessionFamily:
     """Return the sealed accounting family for one exact paper session."""
     if kind in {PaperSessionKind.NEW_YORK_RTH, PaperSessionKind.NY_AFTER}:
         return PaperSessionFamily.NEW_YORK
+    if kind is PaperSessionKind.LONDON:
+        return PaperSessionFamily.EUROPE
     if kind is PaperSessionKind.ASIA:
         return PaperSessionFamily.ASIA
     if kind is PaperSessionKind.OFF_SESSION:
@@ -146,7 +154,7 @@ def _clock(value: str) -> time:
 
 @dataclass(frozen=True)
 class PaperSessionProfile:
-    """A sealed market regime, expressed only in America/New_York time."""
+    """A sealed market regime expressed in its canonical IANA timezone."""
 
     session_kind: PaperSessionKind
     timezone: str
@@ -158,8 +166,9 @@ class PaperSessionProfile:
     valid_start_weekdays: tuple[int, ...]
 
     def __post_init__(self) -> None:
-        if self.timezone != NEW_YORK_TIMEZONE:
-            raise ValueError("Paper sessions must calculate in America/New_York.")
+        expected_timezone = LONDON_TIMEZONE if self.session_kind is PaperSessionKind.LONDON else NEW_YORK_TIMEZONE
+        if self.timezone != expected_timezone:
+            raise ValueError("Paper session timezone does not match its compiled definition.")
         for value in (self.observation_start, self.entry_start, self.entry_cutoff, self.hard_flat_deadline, self.session_end):
             _clock(value)
         if self.session_kind is PaperSessionKind.OFF_SESSION:
@@ -195,6 +204,10 @@ ASIA_PROFILE = PaperSessionProfile(
 # Compatibility symbol only; its identity remains ASIA rather than a
 # separately serialized pre-/post-Globex regime.
 ASIA_GLOBEX_PROFILE = ASIA_PROFILE
+LONDON_PROFILE = PaperSessionProfile(
+    PaperSessionKind.LONDON, LONDON_TIMEZONE,
+    "08:00", "08:00", "11:30", "11:30", "11:30", (0, 1, 2, 3, 4),
+)
 NEW_YORK_RTH_PROFILE = PaperSessionProfile(
     PaperSessionKind.NEW_YORK_RTH, NEW_YORK_TIMEZONE,
     "09:30", "09:35", "15:30", "15:58", "16:00", (0, 1, 2, 3, 4),
@@ -209,10 +222,26 @@ OFF_SESSION_PROFILE = PaperSessionProfile(
 )
 SESSION_PROFILES: Mapping[PaperSessionKind, PaperSessionProfile] = MappingProxyType({
     PaperSessionKind.ASIA: ASIA_PROFILE,
+    PaperSessionKind.LONDON: LONDON_PROFILE,
     PaperSessionKind.NEW_YORK_RTH: NEW_YORK_RTH_PROFILE,
     PaperSessionKind.NY_AFTER: NY_AFTER_PROFILE,
     PaperSessionKind.OFF_SESSION: OFF_SESSION_PROFILE,
 })
+SESSION_PRECEDENCE: tuple[PaperSessionKind, ...] = (
+    PaperSessionKind.ASIA,
+    PaperSessionKind.LONDON,
+    PaperSessionKind.NEW_YORK_RTH,
+    PaperSessionKind.NY_AFTER,
+)
+
+
+def session_catalog() -> tuple[dict[str, object], ...]:
+    """Serialize every first-class operational session and its precedence."""
+    return tuple({
+        **SESSION_PROFILES[kind].payload(),
+        "session_family": session_family(kind).value,
+        "precedence": index,
+    } for index, kind in enumerate(SESSION_PRECEDENCE, start=1))
 
 
 @dataclass(frozen=True)
@@ -233,7 +262,8 @@ class PaperSessionContext:
     calendar_state: PaperCalendarState = PaperCalendarState.NORMAL
 
     def __post_init__(self) -> None:
-        if self.timezone != NEW_YORK_TIMEZONE:
+        profile = SESSION_PROFILES[self.session_kind]
+        if self.timezone != profile.timezone:
             raise ValueError("Paper session context timezone is immutable.")
         try:
             date.fromisoformat(self.trade_date)
@@ -241,7 +271,6 @@ class PaperSessionContext:
             raise ValueError("Paper session trade_date must be ISO calendar date.") from exc
         if type(self.session_generation) is not int or self.session_generation < 0:
             raise ValueError("Paper session generation must be a non-negative integer.")
-        profile = SESSION_PROFILES[self.session_kind]
         if self.session_profile_hash != profile.profile_hash:
             raise ValueError("Paper session profile hash does not match the compiled profile.")
         if self.session_kind is PaperSessionKind.OFF_SESSION:
@@ -292,13 +321,14 @@ class PaperSessionContext:
         # boundaries occur on the trade date after midnight.
         if self.session_kind is PaperSessionKind.ASIA and name in {"observation_start", "entry_start"}:
             trading_date -= timedelta(days=1)
-        return datetime.combine(trading_date, boundary, tzinfo=_NY).astimezone(timezone.utc)
+        session_zone = _LONDON if self.timezone == LONDON_TIMEZONE else _NY
+        return datetime.combine(trading_date, boundary, tzinfo=session_zone).astimezone(timezone.utc)
 
     def entry_permitted_at(self, moment: datetime) -> bool:
         if not self.entry_authorized_by_calendar:
             return False
-        current = _aware_utc(moment).astimezone(_NY)
-        return self.boundary_at("entry_start") <= current.astimezone(timezone.utc) < self.boundary_at("entry_cutoff")
+        current = _aware_utc(moment)
+        return self.boundary_at("entry_start") <= current < self.boundary_at("entry_cutoff")
 
     def hard_flat_due_at(self, moment: datetime) -> bool:
         return self.session_kind is not PaperSessionKind.OFF_SESSION and _aware_utc(moment) >= self.boundary_at("hard_flat_deadline")
@@ -384,7 +414,12 @@ def parse_market_event_time(value: str | datetime) -> datetime:
 
 
 class PaperSessionResolver:
-    """Classifies event time only, retaining a fail-closed backward-time fence."""
+    """Classifies event time only, retaining a fail-closed backward-time fence.
+
+    Precedence is deterministic: ASIA, LONDON, NEW_YORK_RTH, then NY_AFTER.
+    The V1 windows do not ordinarily overlap, but this order is sealed so a
+    future calendar or timezone-rule change cannot silently change identity.
+    """
 
     def __init__(self, calendar: PaperSessionCalendar | None = None) -> None:
         self.calendar = calendar or PaperSessionCalendar()
@@ -411,6 +446,8 @@ class PaperSessionResolver:
         self._last_event_at = moment
         local = moment.astimezone(_NY)
         current = local.timetz().replace(tzinfo=None)
+        london_local = moment.astimezone(_LONDON)
+        london_current = london_local.timetz().replace(tzinfo=None)
 
         profile: PaperSessionProfile | None = None
         trade_day: date | None = None
@@ -418,6 +455,8 @@ class PaperSessionResolver:
             profile, trade_day = ASIA_PROFILE, local.date() + timedelta(days=1)
         elif current < _clock("02:00") and (local.date() - timedelta(days=1)).weekday() in ASIA_PROFILE.valid_start_weekdays:
             profile, trade_day = ASIA_PROFILE, local.date()
+        elif _clock("08:00") <= london_current < _clock("11:30") and london_local.weekday() in LONDON_PROFILE.valid_start_weekdays:
+            profile, trade_day = LONDON_PROFILE, london_local.date()
         elif _clock("09:30") <= current < _clock("16:00") and local.weekday() in NEW_YORK_RTH_PROFILE.valid_start_weekdays:
             profile, trade_day = NEW_YORK_RTH_PROFILE, local.date()
         elif _clock("16:00") <= current < _clock("18:00") and local.weekday() in NY_AFTER_PROFILE.valid_start_weekdays:

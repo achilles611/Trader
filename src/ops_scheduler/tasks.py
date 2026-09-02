@@ -55,8 +55,8 @@ def validate_science(configuration: Mapping[str, Any]) -> dict[str, Any]:
 def validate_session(configuration: Mapping[str, Any], *, freshness: bool = False) -> dict[str, Any]:
     data = _mapping(configuration, {"session", "freshness_threshold_seconds"} if freshness else {"session"}, {"session"})
     session = str(data["session"]).upper()
-    if session not in {"ASIA", "NEW_YORK"}:
-        raise ValueError("session must be ASIA or NEW_YORK.")
+    if session not in {"ASIA", "LONDON", "NEW_YORK"}:
+        raise ValueError("session must be ASIA, LONDON, or NEW_YORK.")
     result = {"session": session}
     if freshness:
         threshold = data.get("freshness_threshold_seconds", 15)
@@ -132,7 +132,11 @@ def science_run_once(context: Any) -> TaskOutcome:
 def _session_context(session: str) -> tuple[dict[str, Any], str | None]:
     resolver = PaperSessionResolver()
     now = utc_now()
-    desired = PaperSessionKind.ASIA_GLOBEX if session == "ASIA" else PaperSessionKind.NEW_YORK_RTH
+    desired = {
+        "ASIA": PaperSessionKind.ASIA,
+        "LONDON": PaperSessionKind.LONDON,
+        "NEW_YORK": PaperSessionKind.NEW_YORK_RTH,
+    }[session]
     resolution = resolver.resolve(now)
     if resolution.context.session_kind is desired:
         return resolution.context.payload(), resolution.reason_code

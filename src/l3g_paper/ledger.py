@@ -3035,7 +3035,7 @@ class PaperLedger:
                 value = PaperSessionKind(str(session_kind)).value
                 clauses.append("json_extract(payload_json, '$.session_kind') = ?"); values.append(value)
             if session_family is not None:
-                if session_family not in {"NEW_YORK", "ASIA", "OFF_SESSION"}:
+                if session_family not in {"NEW_YORK", "EUROPE", "ASIA", "OFF_SESSION"}:
                     raise ValueError("Unknown paper session family.")
                 clauses.append("json_extract(payload_json, '$.session_family') = ?"); values.append(session_family)
             if trade_date is not None:

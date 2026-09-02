@@ -410,6 +410,27 @@ describe("copy control center", () => {
     expect(screen.queryByText(/DO_NOT_RENDER_TAIL_PAYLOAD/)).not.toBeInTheDocument();
   });
 
+  it("renders London as an independent Europe session in the Full Console", async () => {
+    laneIIIPaperOverrides = {
+      current_session: "LONDON",
+      current_session_family: "EUROPE",
+      current_session_id: "MNQU6:LONDON:2026-09-02",
+      trade_date: "2026-09-02",
+      session_timezone: "Europe/London",
+      entry_window: "08:00-11:30 Europe/London",
+      entry_cutoff: "11:30",
+      hard_flat_deadline: "11:30",
+      london_session_pnl: "7.25",
+    };
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Lane III Paper" }));
+    const regime = (await screen.findByText("Session regime")).closest("section") as HTMLElement;
+    expect(regime).toHaveTextContent("LONDON");
+    expect(regime).toHaveTextContent("EUROPE");
+    expect(regime).toHaveTextContent("Europe/London");
+    expect(screen.getByText("London session P&L").nextElementSibling).toHaveTextContent("$7.25");
+  });
+
   it("enables atomic start only for a fresh rehearsal that still matches live readiness", async () => {
     configureReadyLaneIIIUiFixture();
     render(<App />);
@@ -655,6 +676,7 @@ describe("copy control center", () => {
       message: "All canonical paper-start gates are currently satisfied.", can_start: true, paper_active: false,
       ledger_verification: { state: "PASS", completed_at: "2026-09-01T14:00:00Z", message: "Verified" },
       pnl: { state: "CURRENT", total: "10.25", realized: "12.50", unrealized: "-2.25" },
+      session: { session_kind: "LONDON", session_family: "EUROPE", entry_window: "08:00-11:30 Europe/London" },
     };
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
@@ -666,6 +688,7 @@ describe("copy control center", () => {
     await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/lane-iii/paper/operational-start", expect.objectContaining({ method: "POST" })));
     expect(fetch).not.toHaveBeenCalledWith("/api/lane-iii/paper/commissioning-start", expect.anything());
     expect(screen.getByText("$10.25")).toBeInTheDocument();
+    expect(document.querySelector(".slim-session")).toHaveTextContent("LONDON / EUROPE · 08:00-11:30 Europe/London");
   });
 
   it("fails closed when canonical state changes after Slim rendered green", async () => {

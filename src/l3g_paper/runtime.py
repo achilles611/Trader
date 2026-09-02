@@ -56,6 +56,7 @@ from .sessions import (
     PaperSessionResolver,
     UNSPECIFIED_OFF_SESSION_CONTEXT,
     context_from_identity,
+    session_catalog,
 )
 
 
@@ -260,7 +261,8 @@ class LaneIIIPaperRuntime:
         self._armed_session: PaperSessionArmGrant | None = None
         self._session_closed_ids: set[tuple[str, int]] = set()
         # Risk accounting is family-local: NEW_YORK_RTH and NY_AFTER share
-        # one cumulative envelope, while ASIA is independently accounted.
+        # one cumulative envelope, while LONDON/EUROPE and ASIA are each
+        # independently accounted.
         # Evidence and arm grants remain scoped to the exact session below.
         self._family_risk: dict[tuple[str, PaperSessionFamily], _TradeDateRisk] = {}
         self._session_pnl: dict[str, Decimal] = {}
@@ -3456,6 +3458,10 @@ class LaneIIIPaperRuntime:
                 "account_class": "LOCAL_SIMULATION",
                 "maximum_quantity": 1,
                 "live_capital": "DENIED",
+                "entry_profile": "STANDARD",
+                "entry_profile_version": "STANDARD_V1",
+                "effective_confidence_threshold": str(POLICY.entry_support_threshold),
+                "session_definitions": list(session_catalog()),
                 "commissioning_readiness_snapshot_generation": self._commissioning_readiness_generation,
                 "commissioning_authority_epoch": self._commissioning_authority_epoch,
                 "commissioning_readiness_snapshot_token": self._last_commissioning_snapshot_token,
@@ -3486,6 +3492,7 @@ class LaneIIIPaperRuntime:
                 "trade_date": context.trade_date,
                 "session_generation": context.session_generation,
                 "session_state": context.calendar_state.value,
+                "session_timezone": context.timezone,
                 "entry_window": f"{context.entry_start}-{context.entry_cutoff} {context.timezone}",
                 "entry_cutoff": context.entry_cutoff,
                 "hard_flat_deadline": context.hard_flat_deadline,
@@ -3496,6 +3503,7 @@ class LaneIIIPaperRuntime:
                     "session_family": next_context.session_family.value,
                     "session_id": next_context.session_id,
                     "trade_date": next_context.trade_date,
+                    "timezone": next_context.timezone,
                 },
                 "session_evidence_warmup": bool(self._snapshot.evidence_warmed),
                 "strategy_evidence_warmed": bool(self._snapshot.evidence_warmed),
@@ -3534,6 +3542,7 @@ class LaneIIIPaperRuntime:
                     "unrealized": str(trade_risk.unrealized_pnl),
                 },
                 "asia_session_pnl": str(sum(value for key, value in self._session_pnl.items() if ":ASIA:" in key and key.endswith(context.trade_date))),
+                "london_session_pnl": str(sum(value for key, value in self._session_pnl.items() if ":LONDON:" in key and key.endswith(context.trade_date))),
                 "new_york_session_pnl": str(sum(value for key, value in self._session_pnl.items() if (":NEW_YORK_RTH:" in key or ":NY_AFTER:" in key) and key.endswith(context.trade_date))),
                 "family_cumulative_pnl": str(trade_risk.realized_pnl + trade_risk.unrealized_pnl),
                 "combined_trade_date_pnl": str(sum(value.realized_pnl + value.unrealized_pnl for (date_key, _), value in self._family_risk.items() if date_key == context.trade_date)),

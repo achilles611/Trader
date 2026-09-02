@@ -54,6 +54,10 @@ describe("Task Scheduler", () => {
     expect(await screen.findByText(/2030-01-01T17:00:00Z/)).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Trigger type"), { target: { value: "SESSION_RELATIVE" } });
     expect(await screen.findByText(/Missed runs are forced to SKIP/)).toBeInTheDocument();
+    const sessionSelector = screen.getByLabelText("Session") as HTMLSelectElement;
+    expect(Array.from(sessionSelector.options).map((option) => option.value)).toEqual(["ASIA", "LONDON", "NEW_YORK"]);
+    fireEvent.change(sessionSelector, { target: { value: "LONDON" } });
+    expect(sessionSelector.value).toBe("LONDON");
     expect(screen.getByLabelText("Missed-run policy")).toBeDisabled();
     fireEvent.click(screen.getAllByRole("button", { name: "Create schedule" }).at(-1)!);
     await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/scheduler/schedules", expect.objectContaining({ method: "POST" })));

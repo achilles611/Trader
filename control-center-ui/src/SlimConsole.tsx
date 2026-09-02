@@ -32,6 +32,7 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
   const stopAvailable = active || runtimeMayBeActive || status === null || light !== "GREEN";
   const verification = status?.ledger_verification || {};
   const pnl = status?.pnl || { state: "MISSING" };
+  const session = status?.session || {};
   const verificationRunning = verification.state === "IN_PROGRESS" || paper.verificationInFlight;
   const startEnabled = status?.can_start === true && !paper.busy;
   const pnlUnavailable = pnl.state !== "CURRENT";
@@ -54,6 +55,7 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
       </div>
       <h1 id="slim-readiness-heading">{status?.label || "NOT READY"}</h1>
       <p className="slim-message" role="status" aria-live="polite">{status?.message || "Waiting for current canonical paper runtime status."}</p>
+      <p className="slim-session">Session: <strong>{session.session_kind || "OFF_SESSION"}</strong>{session.session_family ? ` / ${session.session_family}` : ""}{session.entry_window ? ` · ${session.entry_window}` : ""}</p>
     </section>
 
     <section className="slim-card slim-pnl" aria-labelledby="slim-pnl-heading">

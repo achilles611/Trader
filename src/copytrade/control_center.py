@@ -33,6 +33,7 @@ from src.l3g_paper.ledger import PaperLedger, resolve_ledger_epoch
 from src.l3g_paper.ninjatrader_login import NinjaTraderLoginBootstrap, NinjaTraderLoginState
 from src.l3g_paper.ninjatrader_transport import PaperExecutionTransport
 from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout
+from src.l3g_paper.sessions import session_catalog
 from src.l3g_paper.slim_status import derive_slim_paper_status, unavailable_slim_status
 from src.l3g_paper.verification import LocalLedgerVerificationController
 from src.l3h_live.status import fail_closed_status
@@ -1519,6 +1520,10 @@ def create_control_center_app(
                 "market_instrument": "MNQ SEP26",
                 "maximum_quantity": 1,
                 "live_capital": "DENIED",
+                "entry_profile": "STANDARD",
+                "entry_profile_version": "STANDARD_V1",
+                "effective_confidence_threshold": "0.65",
+                "session_definitions": list(session_catalog()),
                 "account_balances": observer["account_balances"],
                 "market_observer": observer,
                 "ledger_verification": ledger_verifier.status(),

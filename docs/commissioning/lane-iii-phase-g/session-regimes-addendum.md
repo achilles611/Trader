@@ -67,3 +67,7 @@ arming, and record its outcome under the exact session ID:
 
 An authentic natural decision is required for each regime. Thresholds and
 session windows must not be changed to obtain a trade.
+
+The 2026-09-02 first-class London successor is specified separately in
+[`london-v1.md`](london-v1.md); this historical addendum and its commissioning
+claims remain unchanged.

@@ -95,6 +95,12 @@ present, and Lucid mutation count is zero. Flat broker state alone is never a
 commissioning PASS. BeezConsole reports the exact post-run blocker when any
 condition is absent; the lifecycle remains `COMMISSIONING_INCOMPLETE`.
 
+London V1 authentic commissioning is read-only: during `[08:00, 11:30)
+Europe/London`, wait for the exact `LONDON / EUROPE` generation to warm, run
+the read-only rehearsal, then run a fresh incremental verification. Do not use
+ARM, Atomic Commissioning Start, or Start Paper Trading to establish London
+session commissioning.
+
 PowerShell and direct API calls are diagnostic fallback only. They are not part
 of the normal operator workflow and must never be used to bypass a displayed
 gate.
@@ -106,4 +112,5 @@ generation change, `OFF_SESSION`, local or execution bridge disconnect/reconnect
 market-data disconnect/reconnect, observation-session change, sequence gap,
 rejected or malformed observation, timestamp reversal, depth reset/recovery
 boundary, contract mismatch, or process restart. Family evidence never carries
-from New York RTH to NY After, NY After to Asia, or across generations.
+from Asia to London, London to New York RTH, New York RTH to NY After, NY After
+to Asia, or across generations.
