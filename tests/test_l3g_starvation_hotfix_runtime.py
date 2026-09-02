@@ -37,7 +37,9 @@ class LaneIIIStarvationHotfixRuntimeTests(unittest.TestCase):
         self, directory: str,
     ) -> tuple[PaperLedger, LaneIIIPaperRuntime]:
         context = PaperSessionResolver().resolve(NOW, generation=1).context
-        ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+        ledger = PaperLedger(
+            Path(directory) / "paper.sqlite3", persist_high_frequency_records=True,
+        )
         runtime = LaneIIIPaperRuntime(ledger)
         transport = PaperExecutionTransport(ledger, port=48341)
         runtime.bind_transport(transport)
@@ -231,7 +233,9 @@ class LaneIIIStarvationHotfixRuntimeTests(unittest.TestCase):
 
     def test_sequence_gap_reset_returns_while_the_deferred_writer_is_blocked(self) -> None:
         with TemporaryDirectory() as directory:
-            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            ledger = PaperLedger(
+                Path(directory) / "paper.sqlite3", persist_high_frequency_records=True,
+            )
             runtime = LaneIIIPaperRuntime(ledger)
             factory = ObservationFactory(
                 start=datetime.fromisoformat(NOW.replace("Z", "+00:00")),

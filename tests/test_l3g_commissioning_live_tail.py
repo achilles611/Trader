@@ -707,7 +707,7 @@ class CommissioningLiveTailTests(unittest.TestCase):
     def test_deferred_batches_preserve_separate_watermarks_and_restart(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "paper.sqlite3"
-            with PaperLedger(path) as ledger:
+            with PaperLedger(path, persist_high_frequency_records=True) as ledger:
                 ledger.append("SESSION_AUTHORITY", {"reason": "verified anchor"})
                 anchor = int(ledger.health_status()["highest_sequence"])
                 for number in range(1, 521):
@@ -729,7 +729,7 @@ class CommissioningLiveTailTests(unittest.TestCase):
                         "last_unknown_sequence", "classified_through_sequence", "classified_through_hash",
                     )
                 }
-            with PaperLedger(path) as reopened:
+            with PaperLedger(path, persist_high_frequency_records=True) as reopened:
                 snapshot = reopened.commissioning_tail_snapshot(anchor, last_full_verified_sequence=anchor)
                 for key, value in expected.items():
                     self.assertEqual(snapshot[key], value)

@@ -208,6 +208,33 @@ class PaperRuntimeTests(unittest.TestCase):
             finally:
                 runtime.stop(); ledger.close()
 
+    def test_open_paper_position_updates_unrealized_pnl_without_quote_persistence(self) -> None:
+        now = "2026-08-24T22:10:00Z"
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.operational_runtime(directory, now=now)
+            factory = ObservationFactory(
+                start=datetime(2026, 8, 24, 22, 10, tzinfo=timezone.utc)
+            )
+            try:
+                runtime._state = PaperRuntimeState.LONG
+                runtime._position = PaperDirection.LONG
+                runtime._position_quantity = 1
+                runtime._entry_fill_price = Decimal("100")
+                runtime._entry_fill_quantity = 1
+                runtime._entry_direction = PaperDirection.LONG
+                runtime._entry_session_context = runtime._session_context
+                runtime._snapshot = replace(
+                    runtime._snapshot,
+                    current_position=PaperDirection.LONG,
+                    current_position_quantity=1,
+                )
+                runtime.ingest(factory.quote(101))
+                status = runtime.status()
+                self.assertEqual(status["paper_session_pnl"]["unrealized"], "2")
+                self.assertEqual(ledger.health_status()["counts"].get("OBSERVATION", 0), 0)
+            finally:
+                runtime.stop(); ledger.close()
+
     def test_operational_stop_is_idempotent_and_requires_clean_flat_reconciliation(self) -> None:
         now = "2026-08-24T22:10:00Z"
         with TemporaryDirectory() as directory:
@@ -436,6 +463,38 @@ class PaperRuntimeTests(unittest.TestCase):
                 )
             self.assertNotIn("authority_effect", records[3]["payload"])
             runtime.stop(); ledger.close()
+
+    def test_default_authority_ledger_suppresses_unbounded_market_traffic(self) -> None:
+        """Raw market traffic stays in memory and cannot grow the authority ledger."""
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            runtime = LaneIIIPaperRuntime(ledger)
+            factory = ObservationFactory(
+                start=datetime(2026, 8, 24, 14, 0, tzinfo=timezone.utc)
+            )
+            try:
+                for index in range(200):
+                    quote = factory.quote(100 + (index % 2))
+                    runtime.ingest(quote)
+                    runtime.ingest(factory.trade(quote, quote.payload["ask"]))
+                    runtime.ingest(factory.depth("UPDATE", 10 + (index % 2)))
+                ledger.flush_deferred()
+
+                health = ledger.health_status()
+                self.assertEqual(health["counts"].get("OBSERVATION", 0), 0)
+                self.assertEqual(health["counts"].get("EVIDENCE", 0), 0)
+                self.assertEqual(health["counts"].get("DECISION", 0), 0)
+                policy = health["persistence_policy"]
+                self.assertEqual(policy["raw_market_observations"], "DISABLED")
+                self.assertEqual(policy["derived_evidence"], "DISABLED")
+                self.assertEqual(policy["no_effect_decisions"], "DISABLED")
+                self.assertGreaterEqual(policy["suppressed_records_total"], 600)
+                self.assertEqual(
+                    policy["scientific_bulk_persistence"],
+                    "DISABLED_UNTIL_SEPARATE_BOUNDED_STORE",
+                )
+            finally:
+                runtime.stop(); ledger.close()
 
     def test_addon_provenance_denies_arm_but_not_observation_or_exit_safety(self) -> None:
         with TemporaryDirectory() as directory:

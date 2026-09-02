@@ -94,7 +94,9 @@ class _ContinuousListenerLoad:
 
     def __init__(self, root: Path) -> None:
         self.root = root
-        self.ledger = PaperLedger(root / "Epoch-002" / "paper.sqlite3")
+        self.ledger = PaperLedger(
+            root / "Epoch-002" / "paper.sqlite3", persist_high_frequency_records=True,
+        )
         self.runtime = LaneIIIPaperRuntime(self.ledger)
         self.ledger.append(
             "SESSION_AUTHORITY",

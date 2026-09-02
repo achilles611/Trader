@@ -54,3 +54,11 @@ returns structured `404 application/json` (`API_ENDPOINT_NOT_FOUND`), never
 the SPA `index.html`. The browser validates both HTTP status and JSON content
 type before parsing; an HTML response is shown as the concise, fail-closed
 operator message `Status unavailable — backend endpoint returned HTML`.
+
+## Authority-ledger storage
+
+The paper authority ledger follows
+[`lane-iii-authority-ledger-storage.md`](lane-iii-authority-ledger-storage.md):
+raw market frames, derived evidence, and no-effect decisions remain in memory
+and cannot grow the permanent safety ledger. Slim readiness fails closed on
+the ledger's database-size, free-space, or measured-runway warnings.

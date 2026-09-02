@@ -223,6 +223,16 @@ _WAL_PASSIVE_CHECKPOINT_START_DELAY_SECONDS = 5.0
 # exhaust admission solely because SQLite kept reusable WAL space allocated.
 _WAL_UNCHECKPOINTED_CAPACITY_CEILING_BYTES = 134_217_728
 _WAL_FILE_CAPACITY_CEILING_BYTES = 1_073_741_824
+# The authority ledger is intentionally compact.  Production suppresses the
+# raw market/evidence/no-effect decision firehose below, but a separate hard
+# database runway gate remains necessary in case a future producer regresses.
+_AUTHORITY_LEDGER_WARNING_BYTES = 32 * 1024**3
+_AUTHORITY_LEDGER_CAPACITY_BYTES = 40 * 1024**3
+_AUTHORITY_LEDGER_DISK_WARNING_FREE_BYTES = 8 * 1024**3
+_AUTHORITY_LEDGER_DISK_MINIMUM_FREE_BYTES = 4 * 1024**3
+_AUTHORITY_LEDGER_RUNWAY_WARNING_SECONDS = 24 * 60 * 60
+_AUTHORITY_LEDGER_CAPACITY_SAMPLE_SECONDS = 1.0
+_AUTHORITY_LEDGER_GROWTH_WINDOW_SECONDS = 120.0
 
 
 class LedgerCapacityError(RuntimeError):
@@ -913,6 +923,7 @@ class PaperLedger:
         catch_up_threshold: int = _DEFERRED_CATCH_UP_THRESHOLD,
         degraded_queue_depth: int | None = None,
         max_pending_barriers: int | None = None,
+        persist_high_frequency_records: bool = False,
     ) -> None:
         if type(max_deferred_records) is not int or max_deferred_records < 1:
             raise ValueError("Paper ledger deferred capacity must be a positive integer.")
@@ -931,7 +942,10 @@ class PaperLedger:
             raise ValueError(
                 "Paper ledger pending barrier capacity must be a positive integer within deferred capacity."
             )
+        if type(persist_high_frequency_records) is not bool:
+            raise ValueError("Paper ledger high-frequency persistence policy must be boolean.")
         self.path = Path(path).resolve()
+        self._persist_high_frequency_records = persist_high_frequency_records
         self._creation_epoch = resolve_ledger_epoch(self.path, epoch_id)
         existing_accessibility = _read_only_accessibility_check(self.path) if self.path.exists() else None
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1016,6 +1030,18 @@ class PaperLedger:
             else min(_DEFERRED_DEGRADED_RECORDS, max_deferred_records),
         )
         self._capacity_fault_latched = False
+        self._database_capacity_fault_latched = False
+        self._database_capacity_fault_reason: str | None = None
+        self._database_size_bytes: int | None = None
+        self._database_free_bytes: int | None = None
+        self._database_capacity_last_sample_at: float | None = None
+        self._database_growth_samples: deque[tuple[float, int]] = deque(
+            maxlen=_WRITER_TELEMETRY_HISTORY
+        )
+        self._suppressed_high_frequency_records = 0
+        self._suppressed_high_frequency_by_domain: dict[str, int] = {
+            "OBSERVATION": 0, "EVIDENCE": 0, "DECISION": 0,
+        }
         self._capacity_degraded_since: float | None = None
         self._negative_headroom_since: float | None = None
         self._admitted_records_total = 0
@@ -1055,6 +1081,7 @@ class PaperLedger:
         self._checkpoint_state_snapshot: dict[str, object] = {}
         with self._checkpoint_condition:
             self._publish_passive_checkpoint_state_locked()
+        self._sample_database_capacity_locked(time.perf_counter(), force=True)
         self._shutdown_receipt: dict[str, object] | None = None
         self._next_barrier_token = 0
         self._last_barrier_token: int | None = None
@@ -1138,11 +1165,115 @@ class PaperLedger:
             return pending
         return oldest if pending is None else min(oldest, pending)
 
+    def _current_database_size_bytes(self) -> int | None:
+        try:
+            return self.path.stat().st_size
+        except OSError:
+            return None
+
+    def _current_database_free_bytes(self) -> int | None:
+        try:
+            return shutil.disk_usage(self.path.parent).free
+        except OSError:
+            return None
+
+    def _sample_database_capacity_locked(self, now: float, *, force: bool = False) -> dict[str, object]:
+        """Sample bounded authority-ledger runway without statting every callback."""
+        if (
+            force
+            or self._database_capacity_last_sample_at is None
+            or now - self._database_capacity_last_sample_at >= _AUTHORITY_LEDGER_CAPACITY_SAMPLE_SECONDS
+        ):
+            self._database_capacity_last_sample_at = now
+            self._database_size_bytes = self._current_database_size_bytes()
+            self._database_free_bytes = self._current_database_free_bytes()
+            if self._database_size_bytes is not None:
+                self._database_growth_samples.append((now, self._database_size_bytes))
+            cutoff = now - _AUTHORITY_LEDGER_GROWTH_WINDOW_SECONDS
+            while (
+                len(self._database_growth_samples) > 1
+                and self._database_growth_samples[0][0] < cutoff
+            ):
+                self._database_growth_samples.popleft()
+
+        growth = 0.0
+        if len(self._database_growth_samples) >= 2:
+            first_at, first_size = self._database_growth_samples[0]
+            last_at, last_size = self._database_growth_samples[-1]
+            elapsed = last_at - first_at
+            if elapsed > 0:
+                growth = max(0.0, (last_size - first_size) / elapsed)
+
+        size_headroom = (
+            None if self._database_size_bytes is None
+            else max(0, _AUTHORITY_LEDGER_CAPACITY_BYTES - self._database_size_bytes)
+        )
+        disk_headroom = (
+            None if self._database_free_bytes is None
+            else max(0, self._database_free_bytes - _AUTHORITY_LEDGER_DISK_MINIMUM_FREE_BYTES)
+        )
+        headroom_candidates = [value for value in (size_headroom, disk_headroom) if value is not None]
+        effective_headroom = min(headroom_candidates) if headroom_candidates else None
+        runway_seconds = (
+            None if growth <= 0 or effective_headroom is None
+            else effective_headroom / growth
+        )
+
+        current_fault_reason = None
+        if (
+            self._database_size_bytes is not None
+            and self._database_size_bytes >= _AUTHORITY_LEDGER_CAPACITY_BYTES
+        ):
+            current_fault_reason = "AUTHORITY_LEDGER_DATABASE_CAPACITY_EXCEEDED"
+        elif (
+            self._database_free_bytes is not None
+            and self._database_free_bytes <= _AUTHORITY_LEDGER_DISK_MINIMUM_FREE_BYTES
+        ):
+            current_fault_reason = "AUTHORITY_LEDGER_DISK_RUNWAY_EXHAUSTED"
+        if current_fault_reason is not None:
+            self._database_capacity_fault_latched = True
+            self._database_capacity_fault_reason = current_fault_reason
+
+        warning_reasons: list[str] = []
+        if (
+            self._database_size_bytes is not None
+            and self._database_size_bytes >= _AUTHORITY_LEDGER_WARNING_BYTES
+        ):
+            warning_reasons.append("AUTHORITY_LEDGER_DATABASE_SIZE_WARNING")
+        if (
+            self._database_free_bytes is not None
+            and self._database_free_bytes <= _AUTHORITY_LEDGER_DISK_WARNING_FREE_BYTES
+        ):
+            warning_reasons.append("AUTHORITY_LEDGER_DISK_FREE_WARNING")
+        if runway_seconds is not None and runway_seconds <= _AUTHORITY_LEDGER_RUNWAY_WARNING_SECONDS:
+            warning_reasons.append("AUTHORITY_LEDGER_RUNWAY_UNDER_24_HOURS")
+
+        return {
+            "database_size_bytes": self._database_size_bytes,
+            "database_warning_bytes": _AUTHORITY_LEDGER_WARNING_BYTES,
+            "database_capacity_bytes": _AUTHORITY_LEDGER_CAPACITY_BYTES,
+            "database_free_bytes": self._database_free_bytes,
+            "database_disk_warning_free_bytes": _AUTHORITY_LEDGER_DISK_WARNING_FREE_BYTES,
+            "database_disk_minimum_free_bytes": _AUTHORITY_LEDGER_DISK_MINIMUM_FREE_BYTES,
+            "database_growth_bytes_per_second": round(growth, 3),
+            "database_effective_headroom_bytes": effective_headroom,
+            "database_runway_seconds": None if runway_seconds is None else round(runway_seconds, 3),
+            "database_runway_state": (
+                "EXHAUSTED" if self._database_capacity_fault_latched
+                else "WARNING" if warning_reasons else "HEALTHY"
+            ),
+            "database_capacity_fault_latched": self._database_capacity_fault_latched,
+            "database_capacity_fault_reason": self._database_capacity_fault_reason,
+            "database_warning_reasons": warning_reasons,
+        }
+
     def _capacity_snapshot_locked(self, now: float) -> dict[str, object]:
         """Return bounded O(1) writer capacity facts while the queue is stable."""
         checkpoint_state = self._passive_checkpoint_snapshot()
         checkpoint_error = checkpoint_state["passive_checkpoint_worker_error"]
         wal_capacity_fault = checkpoint_state["wal_capacity_fault_latched"] is True
+        database_capacity = self._sample_database_capacity_locked(now)
+        database_capacity_fault = database_capacity["database_capacity_fault_latched"] is True
         backlog = self._deferred_backlog_depth_locked()
         pending_barriers = self._deferred_barrier_count
         barrier_capacity_exhausted = pending_barriers >= self._max_pending_barriers
@@ -1170,13 +1301,14 @@ class PaperLedger:
             state = "FAILED"
         elif self._deferred_stopping or not self._admission_open:
             state = "SHUTTING_DOWN"
-        elif self._capacity_fault_latched or wal_capacity_fault:
+        elif self._capacity_fault_latched or wal_capacity_fault or database_capacity_fault:
             state = "EXHAUSTED"
         elif (
             backlog >= self._degraded_queue_depth
             or barrier_capacity_exhausted
             or negative_sustained
             or checkpoint_error is not None
+            or database_capacity["database_warning_reasons"]
         ):
             state = "DEGRADED"
         else:
@@ -1191,6 +1323,7 @@ class PaperLedger:
             and not self._deferred_stopping
             and not self._capacity_fault_latched
             and not wal_capacity_fault
+            and not database_capacity_fault
             and state == "HEALTHY"
         )
         return {
@@ -1206,6 +1339,7 @@ class PaperLedger:
                 "wal_uncheckpointed_capacity_ceiling_bytes"
             ],
             "wal_file_capacity_ceiling_bytes": checkpoint_state["wal_file_capacity_ceiling_bytes"],
+            **database_capacity,
             "negative_headroom_sustained": negative_sustained,
             "admitted_records_per_second": round(admitted_rate, 3),
             "durable_records_per_second": round(durable_rate, 3),
@@ -1230,6 +1364,11 @@ class PaperLedger:
             "admitted_records_total": self._admitted_records_total,
             "durable_records_total": self._durable_records_total,
             "admission_rejections_total": self._admission_rejections_total,
+            "high_frequency_persistence_enabled": self._persist_high_frequency_records,
+            "suppressed_high_frequency_records_total": self._suppressed_high_frequency_records,
+            "suppressed_high_frequency_records_by_domain": dict(
+                self._suppressed_high_frequency_by_domain
+            ),
             "writer_error": None if self._deferred_error is None else type(self._deferred_error).__name__,
             "degraded_since_seconds": (
                 None if self._capacity_degraded_since is None
@@ -1273,6 +1412,10 @@ class PaperLedger:
         """Return an atomic capacity snapshot without touching SQLite or runtime locks."""
         with self._deferred_condition:
             return self._capacity_snapshot_locked(time.perf_counter())
+
+    @property
+    def ledger_identity(self) -> str:
+        return self._ledger_uuid
 
     def capacity_allows_authority(self) -> bool:
         """Fail closed for new authority when durable writer headroom is inadequate."""
@@ -2485,6 +2628,29 @@ class PaperLedger:
             )
             if classification.category is CommissioningTailCategory.AUTHORITY_MUTATION:
                 raise ValueError("Authority-capable decisions may not use deferred persistence.")
+        domain = str(prepared["domain"])
+        common = prepared.get("common")
+        stored_payload = common.get("payload") if isinstance(common, Mapping) else None
+        observation_type = (
+            stored_payload.get("observation_type") if isinstance(stored_payload, Mapping) else None
+        )
+        suppress = (
+            not self._persist_high_frequency_records
+            and (
+                domain in {"EVIDENCE", "DECISION"}
+                or (domain == "OBSERVATION" and observation_type in _PASSIVE_MARKET_OBSERVATION_TYPES)
+            )
+        )
+        if suppress:
+            with self._deferred_condition:
+                self._suppressed_high_frequency_records += 1
+                self._suppressed_high_frequency_by_domain[domain] += 1
+                receipt = self._capacity_snapshot_locked(time.perf_counter())
+                receipt.update({
+                    "persistence_action": "SUPPRESSED",
+                    "persistence_reason": "AUTHORITY_LEDGER_HIGH_FREQUENCY_DISABLED",
+                })
+                return receipt
         return self._enqueue_deferred_prepared(prepared)
 
     def append_commissioning_attestation_deferred(
@@ -3131,6 +3297,26 @@ class PaperLedger:
             "deferred_capacity": {
                 key: value for key, value in writer_telemetry.items()
                 if key not in {"recent_batches", "last_checkpoint", "last_passive_checkpoint"}
+            },
+            "persistence_policy": {
+                "schema": "l3g-authority-ledger-persistence-policy-v1",
+                "authority_ledger": "PERMANENT_SAFETY_AND_AUTHORITY_RECORDS_ONLY",
+                "raw_market_observations": (
+                    "ENABLED_TEST_ONLY" if self._persist_high_frequency_records else "DISABLED"
+                ),
+                "derived_evidence": (
+                    "ENABLED_TEST_ONLY" if self._persist_high_frequency_records else "DISABLED"
+                ),
+                "no_effect_decisions": (
+                    "ENABLED_TEST_ONLY" if self._persist_high_frequency_records else "DISABLED"
+                ),
+                "scientific_bulk_persistence": "DISABLED_UNTIL_SEPARATE_BOUNDED_STORE",
+                "suppressed_records_total": writer_telemetry[
+                    "suppressed_high_frequency_records_total"
+                ],
+                "suppressed_records_by_domain": writer_telemetry[
+                    "suppressed_high_frequency_records_by_domain"
+                ],
             },
         }
 

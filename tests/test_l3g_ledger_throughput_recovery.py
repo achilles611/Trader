@@ -394,6 +394,7 @@ class LedgerThroughputRecoveryTests(unittest.TestCase):
                 max_deferred_records=4_096,
                 catch_up_batch_size=1_024,
                 catch_up_threshold=64,
+                persist_high_frequency_records=True,
             )
             release_writer = threading.Event()
             writer_started = threading.Event()
@@ -485,7 +486,10 @@ class LedgerThroughputRecoveryTests(unittest.TestCase):
     def test_passive_checkpoint_worker_reports_truth_and_stops_before_shutdown(self) -> None:
         """Checkpoint allocation alone is not an authority failure; pinned frames are."""
         with TemporaryDirectory() as folder:
-            ledger = PaperLedger(Path(folder) / "paper.sqlite3", max_deferred_records=64)
+            ledger = PaperLedger(
+                Path(folder) / "paper.sqlite3", max_deferred_records=64,
+                persist_high_frequency_records=True,
+            )
             receipt: dict[str, object] | None = None
             try:
                 _append_item(ledger, _work_items(1, 1, "passive-worker")[0])
@@ -547,7 +551,10 @@ class LedgerThroughputRecoveryTests(unittest.TestCase):
         """An oversized retained WAL must fail closed before the worker's first pass."""
         with TemporaryDirectory() as folder:
             with patch.object(PaperLedger, "_current_wal_size_bytes", return_value=1_073_741_825):
-                ledger = PaperLedger(Path(folder) / "paper.sqlite3", max_deferred_records=64)
+                ledger = PaperLedger(
+                    Path(folder) / "paper.sqlite3", max_deferred_records=64,
+                    persist_high_frequency_records=True,
+                )
             try:
                 capacity = ledger.deferred_capacity()
                 self.assertEqual(capacity["state"], "EXHAUSTED")
@@ -561,10 +568,35 @@ class LedgerThroughputRecoveryTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_authority_database_capacity_and_runway_fail_closed(self) -> None:
+        """Main-file exhaustion blocks authority even when WAL and queue are healthy."""
+        with TemporaryDirectory() as folder:
+            ledger = PaperLedger(Path(folder) / "paper.sqlite3")
+            try:
+                with (
+                    patch.object(ledger, "_current_database_size_bytes", return_value=40 * 1024**3),
+                    patch.object(ledger, "_current_database_free_bytes", return_value=64 * 1024**3),
+                ):
+                    ledger._database_capacity_last_sample_at = None
+                    capacity = ledger.deferred_capacity()
+                self.assertEqual(capacity["state"], "EXHAUSTED")
+                self.assertFalse(capacity["admission_open"])
+                self.assertTrue(capacity["database_capacity_fault_latched"])
+                self.assertEqual(
+                    capacity["database_capacity_fault_reason"],
+                    "AUTHORITY_LEDGER_DATABASE_CAPACITY_EXCEEDED",
+                )
+                self.assertEqual(capacity["database_runway_state"], "EXHAUSTED")
+            finally:
+                ledger.close()
+
     def test_degraded_capacity_rejects_new_deferred_admission(self) -> None:
         """Telemetry and the actual admission path must enforce the same gate."""
         with TemporaryDirectory() as folder:
-            ledger = PaperLedger(Path(folder) / "paper.sqlite3", max_deferred_records=64)
+            ledger = PaperLedger(
+                Path(folder) / "paper.sqlite3", max_deferred_records=64,
+                persist_high_frequency_records=True,
+            )
             try:
                 with ledger._checkpoint_condition:
                     ledger._checkpoint_worker_error = "OperationalError: test maintenance failure"
@@ -582,7 +614,9 @@ class LedgerThroughputRecoveryTests(unittest.TestCase):
         """The RAM queue cannot silently absorb an unbounded writer deficit."""
         with TemporaryDirectory() as folder:
             path = Path(folder) / "paper.sqlite3"
-            ledger = PaperLedger(path, max_deferred_records=8)
+            ledger = PaperLedger(
+                path, max_deferred_records=8, persist_high_frequency_records=True,
+            )
             release_writer = threading.Event()
             writer_started = threading.Event()
             original_append = ledger._append_prepared
@@ -629,6 +663,7 @@ class LedgerThroughputRecoveryTests(unittest.TestCase):
                 Path(folder) / "paper.sqlite3",
                 max_deferred_records=64,
                 max_pending_barriers=2,
+                persist_high_frequency_records=True,
             )
             release_writer = threading.Event()
             writer_started = threading.Event()
@@ -706,6 +741,7 @@ class LedgerThroughputRecoveryTests(unittest.TestCase):
             max_deferred_records=1_024,
             catch_up_batch_size=1_024,
             catch_up_threshold=64,
+            persist_high_frequency_records=True,
         ) as ledger:
             items = _work_items(1, 96, "duplicate")
             expected = [item.identity for item in items]
@@ -763,7 +799,9 @@ class LedgerThroughputRecoveryTests(unittest.TestCase):
         """A clean close waits for its admitted in-memory suffix and proves it durable."""
         with TemporaryDirectory() as folder:
             path = Path(folder) / "paper.sqlite3"
-            ledger = PaperLedger(path, max_deferred_records=1_024)
+            ledger = PaperLedger(
+                path, max_deferred_records=1_024, persist_high_frequency_records=True,
+            )
             release_writer = threading.Event()
             writer_started = threading.Event()
             close_started = threading.Event()
@@ -820,7 +858,9 @@ class LedgerThroughputRecoveryTests(unittest.TestCase):
                 self.assertTrue(receipt["checkpoint"]["complete"])  # type: ignore[index]
                 closed = True
                 self.assertEqual(_ordered_identities(path), accepted)
-                with PaperLedger(path, max_deferred_records=1_024) as reopened:
+                with PaperLedger(
+                    path, max_deferred_records=1_024, persist_high_frequency_records=True,
+                ) as reopened:
                     self.assertEqual(reopened.verify_chain(), (True, None))
                     health = reopened.health_status()
                     self.assertEqual(health["highest_sequence"], len(accepted))
@@ -835,7 +875,10 @@ class LedgerThroughputRecoveryTests(unittest.TestCase):
 
     def test_controlled_close_records_writer_failure_without_a_clean_claim(self) -> None:
         with TemporaryDirectory() as folder:
-            ledger = PaperLedger(Path(folder) / "paper.sqlite3", max_deferred_records=64)
+            ledger = PaperLedger(
+                Path(folder) / "paper.sqlite3", max_deferred_records=64,
+                persist_high_frequency_records=True,
+            )
             original_append = ledger._append_prepared
             closed = False
             try:
@@ -904,6 +947,7 @@ def _warm_ledger(path: Path, warm_records: int, *, maximum_deferred_records: int
         max_deferred_records=maximum_deferred_records,
         catch_up_batch_size=catch_up_batch_size,
         catch_up_threshold=min(512, catch_up_batch_size),
+        persist_high_frequency_records=True,
     )
     try:
         for item in _work_items(1, warm_records, "warm"):
@@ -964,6 +1008,7 @@ def _benchmark_scenario(
             max_deferred_records=max_deferred_records,
             catch_up_batch_size=catch_up_batch_size,
             catch_up_threshold=min(512, catch_up_batch_size),
+            persist_high_frequency_records=True,
         )
         all_admitted: list[str] = []
         barrier_result: list[dict[str, object]] = []
@@ -1100,6 +1145,7 @@ def _benchmark_scenario(
                 max_deferred_records=max_deferred_records,
                 catch_up_batch_size=catch_up_batch_size,
                 catch_up_threshold=min(512, catch_up_batch_size),
+                persist_high_frequency_records=True,
             ) as reopened:
                 chain_valid, broken_identity = reopened.verify_chain()
                 final_health = reopened.health_status()

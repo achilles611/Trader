@@ -40,7 +40,9 @@ class PaperLedgerTests(unittest.TestCase):
                 self.assertGreater(current["free_bytes"], 0)
 
     def test_high_volume_wal_window_is_bounded_above_default_checkpoint(self) -> None:
-        with TemporaryDirectory() as folder, PaperLedger(Path(folder) / "paper.sqlite3") as ledger:
+        with TemporaryDirectory() as folder, PaperLedger(
+            Path(folder) / "paper.sqlite3", persist_high_frequency_records=True,
+        ) as ledger:
             connection = ledger._connection
             self.assertEqual(connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0], 0)
             self.assertEqual(connection.execute("PRAGMA journal_size_limit").fetchone()[0], 134217728)
@@ -61,7 +63,9 @@ class PaperLedgerTests(unittest.TestCase):
                 self.assertEqual(ledger.health_status()["epoch_id"], "L3G-PAPER-EPOCH-002")
 
     def test_deferred_records_commit_in_order_before_operational_record(self) -> None:
-        with TemporaryDirectory() as folder, PaperLedger(Path(folder) / "paper.sqlite3") as ledger:
+        with TemporaryDirectory() as folder, PaperLedger(
+            Path(folder) / "paper.sqlite3", persist_high_frequency_records=True,
+        ) as ledger:
             ledger.append_deferred("EVIDENCE", {"evidence_id": "l3g-pe-deferred"}, identity="l3g-pe-deferred")
             ledger.append_deferred("DECISION", {"paper_decision_id": "l3g-pd-deferred"}, identity="l3g-pd-deferred")
             ledger.append("COMMAND", {"command_id": "l3g-pc-after-flush"}, identity="l3g-pc-after-flush")
@@ -77,7 +81,7 @@ class PaperLedgerTests(unittest.TestCase):
     def test_close_flushes_deferred_tail(self) -> None:
         with TemporaryDirectory() as folder:
             path = Path(folder) / "paper.sqlite3"
-            ledger = PaperLedger(path)
+            ledger = PaperLedger(path, persist_high_frequency_records=True)
             for index in range(100):
                 ledger.append_deferred(
                     "DECISION",

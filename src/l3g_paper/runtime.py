@@ -1370,6 +1370,8 @@ class LaneIIIPaperRuntime:
             if observation.observation_type == "QUOTE" and self._valid_quote(observation):
                 bid, ask = Decimal(str(observation.payload["bid"])), Decimal(str(observation.payload["ask"]))
                 self._last_quote = (bid, ask, event_at)
+                mark = bid if self._position is PaperDirection.LONG else ask
+                self._update_unrealized_pnl_locked(mark)
                 update["quote_observed_at"] = event_at
                 update["market_price_connected"] = True
             elif observation.observation_type == "TRADE":
@@ -1475,6 +1477,31 @@ class LaneIIIPaperRuntime:
             return bid > 0 and ask > bid and int(observation.payload["bid_size"]) > 0 and int(observation.payload["ask_size"]) > 0
         except Exception:
             return False
+
+    def _update_unrealized_pnl_locked(self, mark_price: Decimal) -> None:
+        """Update in-memory paper mark-to-market without persisting every quote."""
+        if (
+            self._position is PaperDirection.FLAT
+            or self._entry_fill_price is None
+            or self._entry_fill_quantity <= 0
+        ):
+            return
+        points = (
+            mark_price - self._entry_fill_price
+            if self._entry_direction is PaperDirection.LONG
+            else self._entry_fill_price - mark_price
+        )
+        unrealized = points * Decimal("2") * self._entry_fill_quantity
+        entry_context = self._entry_session_context or self._session_context
+        trade_risk = self._family_risk.setdefault(
+            (entry_context.trade_date, entry_context.session_family), _TradeDateRisk()
+        )
+        trade_risk.unrealized_pnl = unrealized
+        self._snapshot = replace(
+            self._snapshot,
+            daily_realized_pnl=trade_risk.realized_pnl,
+            daily_unrealized_pnl=unrealized,
+        )
 
     def _evaluate_risk_exit(self, at: str) -> None:
         if self._position is PaperDirection.FLAT or self._state is PaperRuntimeState.EXIT_PENDING:
@@ -2013,6 +2040,7 @@ class LaneIIIPaperRuntime:
             entry_context = self._entry_session_context or self._session_context
             trade_risk = self._family_risk.setdefault((entry_context.trade_date, entry_context.session_family), _TradeDateRisk())
             trade_risk.realized_pnl += realized
+            trade_risk.unrealized_pnl = Decimal("0")
             trade_risk.consecutive_losses = trade_risk.consecutive_losses + 1 if realized < 0 else 0 if realized > 0 else trade_risk.consecutive_losses
             self._session_pnl[entry_context.session_id] = self._session_pnl.get(entry_context.session_id, Decimal("0")) + realized
             self._snapshot = replace(

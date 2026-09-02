@@ -158,7 +158,7 @@ class LedgerBarrierStarvationHotfixTests(unittest.TestCase):
     def test_deferred_readiness_attestation_is_a_deep_immutable_snapshot(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "paper.sqlite3"
-            ledger = PaperLedger(path)
+            ledger = PaperLedger(path, persist_high_frequency_records=True)
             prefix_release = threading.Event()
             prefix_started = threading.Event()
             original_append_prepared = ledger._append_prepared
@@ -242,7 +242,7 @@ class LedgerBarrierStarvationHotfixTests(unittest.TestCase):
     def test_prefix_barrier_completes_without_draining_blocked_suffix(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "paper.sqlite3"
-            ledger = PaperLedger(path)
+            ledger = PaperLedger(path, persist_high_frequency_records=True)
             prefix_release = threading.Event()
             suffix_release = threading.Event()
             prefix_started = threading.Event()
@@ -380,7 +380,7 @@ class LedgerBarrierStarvationHotfixTests(unittest.TestCase):
     def test_synchronous_operational_append_cannot_leapfrog_barrier_suffix(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "paper.sqlite3"
-            ledger = PaperLedger(path)
+            ledger = PaperLedger(path, persist_high_frequency_records=True)
             prefix_release = threading.Event()
             suffix_release = threading.Event()
             prefix_started = threading.Event()
