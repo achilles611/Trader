@@ -280,6 +280,14 @@ class NinjaTraderMaintenanceTests(unittest.TestCase):
         self.ledger.value["verified_through_sequence"] = 357
         self.assert_restart_refused("LEDGER_UNVERIFIED_TAIL")
 
+    def test_unverified_ledger_tail_refuses_absent_process_launch(self) -> None:
+        self.ledger.value["verified_through_sequence"] = 357
+        desktop = FakeDesktop(process=False, on_start=lambda value: setattr(value, "control_center", True))
+        status = self.run_service(self.service(desktop))
+        self.assertEqual(status["stage"], "BLOCKED")
+        self.assertIn("LEDGER_UNVERIFIED_TAIL", status["blockers"])
+        self.assertEqual(desktop.start_calls, 0)
+
     def test_unknown_paper_or_live_authority_refuses_restart(self) -> None:
         for mutation, blocker in (
             (("paper", "account_class", "UNKNOWN"), "ACCOUNT_NOT_LOCAL_SIMULATION"),

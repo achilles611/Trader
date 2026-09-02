@@ -736,10 +736,10 @@ class NinjaTraderMaintenanceService:
             if not self._desktop.configure_instrument(instrument):
                 self._transition(MaintenanceStage.BLOCKED, ["CONFIGURED_INSTRUMENT_UNRESOLVED_OR_UNWRITABLE"])
                 return
+            ok, report = self._verify_ledger(MaintenanceStage.VERIFYING_RESTART_LEDGER)
+            if not ok:
+                return
             if probe.process_detected:
-                ok, report = self._verify_ledger(MaintenanceStage.VERIFYING_RESTART_LEDGER)
-                if not ok:
-                    return
                 self._transition(MaintenanceStage.GATE_CHECK)
                 paper = self._paper_status()
                 live = self._live_status()
