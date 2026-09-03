@@ -488,6 +488,7 @@ class NinjaTraderMaintenanceTests(unittest.TestCase):
         self.assertIn("'NTMessageBoxYesButton'", helper)
         self.assertIn("InvokePattern]::Pattern", helper)
         self.assertIn("UNEXPECTED_SAVE_WORKSPACE_UI", helper)
+        self.assertLess(helper.index("if ($null -ne $ControlCenter)"), helper.index("$Process.CloseMainWindow()"))
         self.assertIn("Resolve-NinjaExecutable", helper)
         self.assertIn("request_id", source)
 

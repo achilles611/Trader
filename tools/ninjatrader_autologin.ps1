@@ -56,21 +56,23 @@ function Request-GracefulNinjaShutdown {
         [System.Windows.Automation.AutomationElement] $ControlCenter
     )
     if ($null -eq $Process) { return $true }
-    try {
-        if ($Process.CloseMainWindow()) { return $true }
-    }
-    catch { }
-    if ($null -eq $ControlCenter) { return $false }
-    try {
-        $current = $ControlCenter
-        while ($null -ne $current -and $current.Current.ControlType -ne [System.Windows.Automation.ControlType]::Window) {
-            $current = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($current)
+    if ($null -ne $ControlCenter) {
+        try {
+            $current = $ControlCenter
+            while ($null -ne $current -and $current.Current.ControlType -ne [System.Windows.Automation.ControlType]::Window) {
+                $current = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($current)
+            }
+            if ($null -ne $current) {
+                $windowPattern = $current.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern)
+                $windowPattern.Close()
+                return $true
+            }
         }
-        if ($null -eq $current) { return $false }
-        $windowPattern = $current.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern)
-        $windowPattern.Close()
-        return $true
+        catch { }
     }
+    # MainWindow can be a chart or NinjaScript Editor, so this fallback is used
+    # only when the exact Control Center element is unavailable.
+    try { return $Process.CloseMainWindow() }
     catch { return $false }
 }
 
