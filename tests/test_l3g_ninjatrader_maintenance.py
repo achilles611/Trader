@@ -484,6 +484,10 @@ class NinjaTraderMaintenanceTests(unittest.TestCase):
             self.assertNotIn(forbidden, source + "\n" + helper)
         self.assertIn("CloseMainWindow()", helper)
         self.assertIn("WindowPattern]::Pattern", helper)
+        self.assertIn("'Save Workspace'", helper)
+        self.assertIn("'NTMessageBoxYesButton'", helper)
+        self.assertIn("InvokePattern]::Pattern", helper)
+        self.assertIn("UNEXPECTED_SAVE_WORKSPACE_UI", helper)
         self.assertIn("Resolve-NinjaExecutable", helper)
         self.assertIn("request_id", source)
 

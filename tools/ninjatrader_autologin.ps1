@@ -74,6 +74,32 @@ function Request-GracefulNinjaShutdown {
     catch { return $false }
 }
 
+function Confirm-SaveWorkspaceIfPresent {
+    param([object[]] $Windows)
+    $prompts = @($Windows | Where-Object {
+        $_.Current.AutomationId -eq 'NTMessageBox' -and
+        $_.Current.Name -eq 'Save Workspace' -and
+        $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Window
+    })
+    if ($prompts.Count -eq 0) { return 'NOT_PRESENT' }
+    if ($prompts.Count -ne 1) { return 'UNEXPECTED' }
+    $yesId = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+        'NTMessageBoxYesButton'
+    )
+    $buttons = @(Find-Descendants -Root $prompts[0] -Condition $yesId | Where-Object {
+        $_.Current.Name -eq 'Yes' -and $_.Current.IsEnabled -and -not $_.Current.IsOffscreen -and
+        $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button
+    })
+    if ($buttons.Count -ne 1) { return 'UNEXPECTED' }
+    try {
+        $invoke = $buttons[0].GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+        $invoke.Invoke()
+        return 'CONFIRMED'
+    }
+    catch { return 'UNEXPECTED' }
+}
+
 function Find-Descendants {
     param(
         [System.Windows.Automation.AutomationElement] $Root,
@@ -300,7 +326,26 @@ try {
             Write-SanitizedResult @{ ok = $false; failure_category = 'GRACEFUL_SHUTDOWN_REFUSED' }
             exit 0
         }
-        Write-SanitizedResult @{ ok = $true; result = 'GRACEFUL_CLOSE_REQUESTED'; failure_category = $null }
+        $workspaceConfirmation = 'NOT_PRESENT'
+        for ($attempt = 0; $attempt -lt 20; $attempt++) {
+            Start-Sleep -Milliseconds 250
+            $current = Get-NinjaContext
+            if ($null -ne $current.Failure) {
+                Write-SanitizedResult @{ ok = $false; failure_category = $current.Failure }
+                exit 0
+            }
+            if ($null -eq $current.Process) {
+                Write-SanitizedResult @{ ok = $true; result = 'GRACEFUL_CLOSE_COMPLETED'; workspace_confirmation = $workspaceConfirmation; failure_category = $null }
+                exit 0
+            }
+            $workspaceConfirmation = Confirm-SaveWorkspaceIfPresent -Windows $current.Windows
+            if ($workspaceConfirmation -eq 'UNEXPECTED') {
+                Write-SanitizedResult @{ ok = $false; failure_category = 'UNEXPECTED_SAVE_WORKSPACE_UI' }
+                exit 0
+            }
+            if ($workspaceConfirmation -eq 'CONFIRMED') { break }
+        }
+        Write-SanitizedResult @{ ok = $true; result = 'GRACEFUL_CLOSE_REQUESTED'; workspace_confirmation = $workspaceConfirmation; failure_category = $null }
         exit 0
     }
 
