@@ -805,6 +805,8 @@ class ExperimentalPaperPolicy:
     ) -> PaperDecision:
         at_text = normalized_utc(self._market_event_timestamp(observation), "Paper evaluation time")
         at = self._time(at_text)
+        if self._paper_session_context.session_kind is not self.artifact.entry_session_kind:
+            return self._decision(observation, PaperDecisionKind.NO_TRADE, None, "PROFILE_SESSION_MISMATCH")
         if self._transport_state is not StreamHealth.HEALTHY:
             return self._decision(observation, PaperDecisionKind.NO_TRADE, None, "LOCAL_BRIDGE_UNHEALTHY")
         if not self._price_connected:
@@ -824,6 +826,15 @@ class ExperimentalPaperPolicy:
         dominance = score - scores[loser][0]
         positive = int(families["positive_family_count"])
         blocking = bool(families["blocking_contradiction"])
+        families = {
+            **families,
+            "candidate_support": str(score),
+            "opposing_support": str(scores[loser][0]),
+            "dominance": str(dominance),
+            "required_support": str(self.artifact.entry_support_threshold),
+            "required_dominance": str(self.artifact.entry_dominance_margin),
+            "required_family_count": self.artifact.entry_family_count,
+        }
 
         if current_position is not PaperDirection.FLAT:
             owned = HypothesisKind.BULLISH_REVERSAL if current_position is PaperDirection.LONG else HypothesisKind.BEARISH_CONTINUATION
@@ -873,6 +884,7 @@ class ExperimentalPaperPolicy:
                 "entry_profile": self.artifact.entry_profile,
                 "entry_profile_version": self.artifact.entry_profile_version,
                 "entry_parameters": {
+                    "session_kind": self.artifact.entry_session_kind.value,
                     "support_threshold": str(self.artifact.entry_support_threshold),
                     "dominance_margin": str(self.artifact.entry_dominance_margin),
                     "family_count": self.artifact.entry_family_count,

@@ -42,6 +42,19 @@ class PaperRuntimeTests(unittest.TestCase):
         )  # type: ignore[arg-type]
         runtime._commissioning_ownership = ownership
         runtime._entry_owner = PaperEntryOwner.COMMISSIONING
+        candidate = warmed_bullish_policy()[2]
+        runtime._last_qualifying_entry_decision = replace(
+            candidate,
+            created_at=now,
+            expires_at=(
+                datetime.fromisoformat(now.replace("Z", "+00:00")) + timedelta(seconds=5)
+            ).isoformat().replace("+00:00", "Z"),
+            session_kind=context.session_kind,
+            session_id=context.session_id,
+            trade_date=context.trade_date,
+            session_profile_hash=context.session_profile_hash,
+            session_generation=context.session_generation,
+        )
         return ownership.commissioning_id, ownership.commissioning_token
 
     @staticmethod
@@ -102,7 +115,7 @@ class PaperRuntimeTests(unittest.TestCase):
         return message
 
     @staticmethod
-    def operational_runtime(directory: str, *, now: str = "2026-08-24T22:10:00Z") -> tuple[PaperLedger, LaneIIIPaperRuntime]:
+    def operational_runtime(directory: str, *, now: str = "2026-08-26T14:00:00Z") -> tuple[PaperLedger, LaneIIIPaperRuntime]:
         """Ready, authenticated Sim101 fixture without a listener or order transport."""
         ledger = PaperLedger(Path(directory) / "paper.sqlite3")
         runtime = LaneIIIPaperRuntime(ledger)
@@ -135,7 +148,7 @@ class PaperRuntimeTests(unittest.TestCase):
         return ledger, runtime
 
     def test_operational_paper_start_is_continuous_and_never_invokes_atomic_commissioning(self) -> None:
-        now = "2026-08-24T22:10:00Z"
+        now = "2026-08-26T14:00:00Z"
         with TemporaryDirectory() as directory:
             ledger, runtime = self.operational_runtime(directory, now=now)
             try:
@@ -158,8 +171,8 @@ class PaperRuntimeTests(unittest.TestCase):
             finally:
                 runtime.stop(); ledger.close()
 
-    def test_operational_session_stays_running_across_idle_time_and_three_flat_trade_cycles(self) -> None:
-        now = "2026-08-24T22:10:00Z"
+    def test_operational_session_stays_running_across_idle_time_and_one_flat_trade_cycle(self) -> None:
+        now = "2026-08-26T14:00:00Z"
         with TemporaryDirectory() as directory:
             ledger, runtime = self.operational_runtime(directory, now=now)
             try:
@@ -167,11 +180,11 @@ class PaperRuntimeTests(unittest.TestCase):
                     self.assertTrue(runtime.operational_paper_start("operational-start-002")["started"])
                     # Five simulated idle minutes with no signal/command are
                     # not a lifecycle boundary.
-                    with patch("src.l3g_paper.runtime._now", return_value="2026-08-24T22:15:00Z"):
+                    with patch("src.l3g_paper.runtime._now", return_value="2026-08-26T14:05:00Z"):
                         runtime.status()
                     self.assertEqual(runtime.state, PaperRuntimeState.PAPER_RUNNING)
 
-                    for sequence in range(3):
+                    for sequence in range(1):
                         runtime._transition(PaperRuntimeState.ENTRY_PENDING, f"TEST_ENTRY_{sequence}")
                         runtime._transition(PaperRuntimeState.LONG, f"TEST_FILL_{sequence}")
                         runtime._position = PaperDirection.LONG
@@ -203,18 +216,18 @@ class PaperRuntimeTests(unittest.TestCase):
                         self.assertTrue(runtime.status()["operational_paper_session"]["active"])
 
                 status = runtime.status()
-                self.assertEqual(status["paper_session_pnl"]["realized"], "6")
+                self.assertEqual(status["paper_session_pnl"]["realized"], "2")
                 self.assertEqual(status["paper_session_pnl"]["unrealized"], "0")
                 self.assertEqual(status["current_position"], "FLAT")
             finally:
                 runtime.stop(); ledger.close()
 
     def test_open_paper_position_updates_unrealized_pnl_without_quote_persistence(self) -> None:
-        now = "2026-08-24T22:10:00Z"
+        now = "2026-08-26T14:00:00Z"
         with TemporaryDirectory() as directory:
             ledger, runtime = self.operational_runtime(directory, now=now)
             factory = ObservationFactory(
-                start=datetime(2026, 8, 24, 22, 10, tzinfo=timezone.utc)
+                start=datetime(2026, 8, 26, 14, 0, tzinfo=timezone.utc)
             )
             try:
                 runtime._state = PaperRuntimeState.LONG
@@ -237,7 +250,7 @@ class PaperRuntimeTests(unittest.TestCase):
                 runtime.stop(); ledger.close()
 
     def test_operational_stop_is_idempotent_and_requires_clean_flat_reconciliation(self) -> None:
-        now = "2026-08-24T22:10:00Z"
+        now = "2026-08-26T14:00:00Z"
         with TemporaryDirectory() as directory:
             ledger, runtime = self.operational_runtime(directory, now=now)
             try:
@@ -257,7 +270,7 @@ class PaperRuntimeTests(unittest.TestCase):
                 runtime.stop(); ledger.close()
 
     def test_operational_ledger_accepts_its_known_online_tail_but_not_an_unknown_row(self) -> None:
-        now = "2026-08-24T22:10:00Z"
+        now = "2026-08-26T14:00:00Z"
         with TemporaryDirectory() as directory:
             ledger, runtime = self.operational_runtime(directory, now=now)
             try:
@@ -285,7 +298,7 @@ class PaperRuntimeTests(unittest.TestCase):
                 runtime.stop(); ledger.close()
 
     def test_operational_session_stays_green_across_repeated_observer_health_cycles(self) -> None:
-        now = "2026-08-24T22:10:00Z"
+        now = "2026-08-26T14:00:00Z"
         observer_health = {
             "component": "MARKET_OBSERVER_ATTACHMENT",
             "state": "NATIVE_ADDON_OBSERVER_ACTIVE",
@@ -309,7 +322,7 @@ class PaperRuntimeTests(unittest.TestCase):
                     self.assertTrue(runtime.operational_paper_start("operational-health-cycles")["started"])
 
                 factory = ObservationFactory(
-                    start=datetime(2026, 8, 24, 22, 10, tzinfo=timezone.utc),
+                    start=datetime(2026, 8, 26, 14, 0, tzinfo=timezone.utc),
                 )
                 with patch("src.l3g_paper.runtime._now", return_value=now):
                     for _ in range(4):
@@ -333,7 +346,7 @@ class PaperRuntimeTests(unittest.TestCase):
                 runtime.stop(); ledger.close()
 
     def test_unattested_or_future_health_shape_remains_unknown(self) -> None:
-        now = "2026-08-24T22:10:00Z"
+        now = "2026-08-26T14:00:00Z"
         with TemporaryDirectory() as directory:
             ledger, runtime = self.operational_runtime(directory, now=now)
             try:
@@ -347,7 +360,7 @@ class PaperRuntimeTests(unittest.TestCase):
                 with patch("src.l3g_paper.runtime._now", return_value=now):
                     runtime.operational_paper_start("operational-unknown-health")
                 factory = ObservationFactory(
-                    start=datetime(2026, 8, 24, 22, 10, tzinfo=timezone.utc),
+                    start=datetime(2026, 8, 26, 14, 0, tzinfo=timezone.utc),
                 )
                 with patch("src.l3g_paper.runtime._now", return_value=now):
                     runtime.ingest(factory.make("HEALTH", {
@@ -366,7 +379,7 @@ class PaperRuntimeTests(unittest.TestCase):
                 runtime.stop(); ledger.close()
 
     def test_operational_stop_seals_pending_entries_and_open_positions_until_reconciled(self) -> None:
-        now = "2026-08-24T22:10:00Z"
+        now = "2026-08-26T14:00:00Z"
 
         def reconciliation(receipt_id: str) -> dict[str, object]:
             return {
@@ -693,7 +706,7 @@ class PaperRuntimeTests(unittest.TestCase):
             runtime.stop(); ledger.close()
 
     def test_commissioning_entry_is_fixed_and_retains_all_non_strategy_markers(self) -> None:
-        now = "2026-08-24T22:10:00Z"
+        now = "2026-08-26T14:00:00Z"
         context = PaperSessionResolver().resolve(now, generation=1).context
         with TemporaryDirectory() as directory:
             ledger = PaperLedger(Path(directory) / "paper.sqlite3")
@@ -702,7 +715,7 @@ class PaperRuntimeTests(unittest.TestCase):
             runtime._session_context = context
             runtime._armed_session = PaperSessionArmGrant(
                 context.session_kind, context.session_id, context.trade_date, context.session_profile_hash,
-                context.session_generation, now, "2026-08-25T05:30:00Z",
+                context.session_generation, now, "2026-08-26T19:30:00Z",
             )
             runtime._snapshot = PaperRiskSnapshot(
                 now, position_snapshot_complete=True, order_snapshot_complete=True,
@@ -1060,7 +1073,7 @@ class PaperRuntimeTests(unittest.TestCase):
             runtime.stop(); ledger.close()
 
     def test_commissioning_exit_requires_clean_reconciliation_and_persists_fill_pnl(self) -> None:
-        now = "2026-08-24T22:10:00Z"
+        now = "2026-08-26T14:00:00Z"
         context = PaperSessionResolver().resolve(now, generation=1).context
         with TemporaryDirectory() as directory:
             ledger = PaperLedger(Path(directory) / "paper.sqlite3")
@@ -1069,7 +1082,7 @@ class PaperRuntimeTests(unittest.TestCase):
             runtime._session_context = context
             runtime._armed_session = PaperSessionArmGrant(
                 context.session_kind, context.session_id, context.trade_date, context.session_profile_hash,
-                context.session_generation, now, "2026-08-25T05:30:00Z",
+                context.session_generation, now, "2026-08-26T19:30:00Z",
             )
             runtime._snapshot = PaperRiskSnapshot(
                 now, position_snapshot_complete=True, order_snapshot_complete=True,

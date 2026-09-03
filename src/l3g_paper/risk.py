@@ -200,6 +200,8 @@ class PaperRiskAuthority:
             context = self._context(snapshot, at)
             if context.session_kind is PaperSessionKind.OFF_SESSION:
                 reasons.append("OFF_SESSION")
+            elif context.session_kind is not self.profile.entry_session_kind:
+                reasons.append("PROFILE_SESSION_MISMATCH")
             elif context.calendar_state is PaperCalendarState.HOLIDAY_OVERRIDE_REQUIRED:
                 reasons.append("HOLIDAY_SESSION_UNVERIFIED")
             elif not self._inside_entry_session(moment, snapshot):
@@ -324,6 +326,8 @@ class PaperRiskAuthority:
                     reasons.append("SESSION_IDENTITY_MISMATCH")
                 if context.session_kind is PaperSessionKind.OFF_SESSION:
                     reasons.append("OFF_SESSION")
+                elif context.session_kind is not self.profile.entry_session_kind:
+                    reasons.append("PROFILE_SESSION_MISMATCH")
                 elif context.calendar_state is PaperCalendarState.HOLIDAY_OVERRIDE_REQUIRED:
                     reasons.append("HOLIDAY_SESSION_UNVERIFIED")
                 elif not self._inside_entry_session(moment, snapshot):

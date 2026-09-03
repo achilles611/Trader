@@ -271,6 +271,7 @@ class LaneIIIPaperRuntime:
         self._entry_session_context: PaperSessionContext | None = None
         self._hard_flat_started_for: tuple[str, int] | None = None
         self._last_decision: PaperDecision | None = None
+        self._last_qualifying_entry_decision: PaperDecision | None = None
         self._last_command: PaperExecutionCommand | None = None
         self._last_order_state: Mapping[str, object] | None = None
         self._last_execution: Mapping[str, object] | None = None
@@ -1422,6 +1423,8 @@ class LaneIIIPaperRuntime:
                 self._evaluate_risk_exit(observation.ninja_receipt_time)
                 return
             self._last_decision = decision
+            if decision.decision in {PaperDecisionKind.LONG, PaperDecisionKind.SHORT}:
+                self._last_qualifying_entry_decision = decision
             for evidence in self.policy.active_evidence(event_at):
                 if evidence.evidence_id not in self._recorded_evidence:
                     if not self._append_deferred_or_pause_locked(
@@ -1441,6 +1444,7 @@ class LaneIIIPaperRuntime:
             ) or (
                 decision.decision is PaperDecisionKind.EXIT
                 and self._position is not PaperDirection.FLAT
+                and self._entry_owner is not PaperEntryOwner.COMMISSIONING
             )
             if not can_cause_side_effect:
                 if not self._append_deferred_or_pause_locked(
@@ -1462,7 +1466,7 @@ class LaneIIIPaperRuntime:
             if decision.decision is PaperDecisionKind.NO_TRADE:
                 return
             if decision.decision is PaperDecisionKind.EXIT:
-                if self._position is not PaperDirection.FLAT:
+                if self._position is not PaperDirection.FLAT and self._entry_owner is not PaperEntryOwner.COMMISSIONING:
                     self._request_exit(decision.reason_code)
                 return
             if (
@@ -1472,7 +1476,15 @@ class LaneIIIPaperRuntime:
                 and context.entry_permitted_at(datetime.fromisoformat(normalized_utc(event_at, "Entry event time").replace("Z", "+00:00")))
             ):
                 if self._entry_owner is PaperEntryOwner.COMMISSIONING:
-                    self._record_strategy_suppression(decision, context)
+                    ownership = self._commissioning_ownership
+                    if ownership is not None and not ownership.entry_consumed:
+                        self.commission_entry(
+                            ownership.commissioning_id,
+                            ownership.commissioning_token,
+                            candidate=decision,
+                        )
+                    else:
+                        self._record_strategy_suppression(decision, context)
                     return
                 self._request_entry(decision)
 
@@ -2959,15 +2971,14 @@ class LaneIIIPaperRuntime:
                     "request_id": request_id,
                 }
 
-    def commission_entry(self, commissioning_id: str, commissioning_token: str) -> dict[str, object]:
-        """Submit one sealed, non-strategy commissioning entry through normal safety gates.
-
-        This deliberately has no operator-supplied account, instrument, size, or
-        direction input.  It is a one-contract Sim101 long solely to prove the
-        authenticated execution lifecycle when Trader V0 has not naturally
-        emitted an admissible decision.  The decision provenance is marked as
-        commissioning-only and is excluded from strategy and scientific evidence.
-        """
+    def commission_entry(
+        self,
+        commissioning_id: str,
+        commissioning_token: str,
+        *,
+        candidate: PaperDecision | None = None,
+    ) -> dict[str, object]:
+        """Consume one commissioning entry only from fresh high-confluence policy evidence."""
         with self._lock, self.ledger.commissioning_authority_fence():
             ownership = self._commissioning_ownership
             if ownership is None or self._entry_owner is not PaperEntryOwner.COMMISSIONING:
@@ -2981,6 +2992,8 @@ class LaneIIIPaperRuntime:
                     "submitted": False, "reason_codes": ("COMMISSIONING_ENTRY_ALREADY_CONSUMED",),
                     "decision_id": ownership.entry_decision_id, "state": self._state.value,
                 }
+            selected = candidate or self._last_qualifying_entry_decision
+            now = _now()
             if self._state is not PaperRuntimeState.ARMED_FLAT or self._entries_paused:
                 return {"submitted": False, "reason_codes": ("PAPER_NOT_ARMED_FLAT",), "state": self._state.value}
             expected_checkpoint = (
@@ -3022,7 +3035,6 @@ class LaneIIIPaperRuntime:
                 self._abort_unsubmitted_commissioning(reasons[0])
                 return {"submitted": False, "reason_codes": reasons, "state": self._state.value}
             context = self._session_context
-            now = _now()
             current = self._session_resolver.resolve(now, generation=context.session_generation).context
             if (
                 context.session_kind is PaperSessionKind.OFF_SESSION
@@ -3071,12 +3083,33 @@ class LaneIIIPaperRuntime:
             if not allowed:
                 self._abort_unsubmitted_commissioning("COMMISSIONING_ENTRY_PREFLIGHT_DENIED")
                 return {"submitted": False, "reason_codes": reasons, "state": self._state.value}
-            source = canonical_hash({"commissioning": True, "commissioning_id": ownership.commissioning_id, "at": now, "session_id": context.session_id})
+            if not self._commissioning_candidate_valid(selected, ownership.context, now):
+                if selected is not None and datetime.fromisoformat(
+                    normalized_utc(selected.expires_at, "Commissioning candidate expiry").replace("Z", "+00:00")
+                ) < datetime.fromisoformat(now.replace("Z", "+00:00")):
+                    self._last_qualifying_entry_decision = None
+                return {
+                    "submitted": False,
+                    "commissioning": True,
+                    "commissioning_id": ownership.commissioning_id,
+                    "reason_codes": ("COMMISSIONING_WAITING_FOR_HIGH_CONFLUENCE",),
+                    "state": self._state.value,
+                }
+            assert selected is not None
+            source = canonical_hash({
+                "commissioning": True,
+                "commissioning_id": ownership.commissioning_id,
+                "source_decision_id": selected.paper_decision_id,
+                "at": now,
+                "session_id": context.session_id,
+            })
             payload = {
                 "paper_policy_id": POLICY.policy_id,
                 "paper_policy_hash": POLICY.configuration_hash,
-                "decision": PaperDecisionKind.LONG.value,
+                "decision": selected.decision.value,
                 "created_at": now,
+                "source_decision_id": selected.paper_decision_id,
+                "relative_support": str(selected.relative_support),
                 "session_kind": context.session_kind.value,
                 "session_id": context.session_id,
                 "trade_date": context.trade_date,
@@ -3088,13 +3121,21 @@ class LaneIIIPaperRuntime:
             }
             decision = PaperDecision(
                 deterministic_id("l3g-pd-", payload), POLICY.policy_id, POLICY.configuration_hash,
-                PaperDecisionKind.LONG, now,
+                selected.decision, now,
                 (datetime.fromisoformat(now.replace("Z", "+00:00")) + timedelta(seconds=POLICY.decision_ttl_seconds)).isoformat().replace("+00:00", "Z"),
-                None, PaperDirection.LONG, Decimal("0"), {"commissioning": True},
-                ("commissioning-operator-intent",),
-                (max(0, int(self.policy.status().get("last_local_sequence") or 0)),),
-                (source,), POLICY.sequence_authority, POLICY.book_completeness, False,
-                "COMMISSIONING_OPERATOR_ENTRY", context.session_kind, context.session_id,
+                None, selected.direction, selected.relative_support,
+                {
+                    "commissioning": True,
+                    "qualification": "HIGH_CONFLUENCE_POLICY_SIGNAL",
+                    "source_decision_id": selected.paper_decision_id,
+                    "source_hypothesis": None if selected.hypothesis_kind is None else selected.hypothesis_kind.value,
+                    "source_family_summary": dict(selected.family_summary),
+                },
+                selected.source_observation_ids,
+                selected.source_local_sequences,
+                selected.source_payload_hashes,
+                POLICY.sequence_authority, POLICY.book_completeness, False,
+                "COMMISSIONING_HIGH_CONFLUENCE_ENTRY", context.session_kind, context.session_id,
                 context.trade_date, context.session_profile_hash, context.session_generation,
                 True, False, False,
             )
@@ -3103,8 +3144,17 @@ class LaneIIIPaperRuntime:
                 {
                     **self._ownership_payload(ownership, reason="SINGLE_USE_ENTRY_AUTHORIZED"),
                     "decision_id": decision.paper_decision_id,
-                    "direction": PaperDirection.LONG.value,
+                    "direction": decision.direction.value,
                     "quantity": 1,
+                    "qualification": {
+                        "source_decision_id": selected.paper_decision_id,
+                        "relative_support": str(selected.relative_support),
+                        "required_support": str(POLICY.entry_support_threshold),
+                        "dominance": selected.family_summary.get("dominance"),
+                        "required_dominance": str(POLICY.entry_dominance_margin),
+                        "positive_family_count": selected.family_summary.get("positive_family_count"),
+                        "required_family_count": POLICY.entry_family_count,
+                    },
                     "reference_market_snapshot": {
                         "bid": None if self._last_quote is None else str(self._last_quote[0]),
                         "ask": None if self._last_quote is None else str(self._last_quote[1]),
@@ -3121,6 +3171,7 @@ class LaneIIIPaperRuntime:
                 execution_session_id=self._execution_session_id(),
             )
             self._last_decision = decision
+            self._last_qualifying_entry_decision = None
             self.ledger.append(
                 "DECISION", decision.payload(), identity=decision.paper_decision_id,
                 occurred_at=decision.created_at, execution_session_id=self._execution_session_id(),
@@ -3175,6 +3226,43 @@ class LaneIIIPaperRuntime:
                 "decision_id": decision.paper_decision_id,
                 "state": self._state.value,
             }
+
+    @staticmethod
+    def _commissioning_candidate_valid(
+        candidate: PaperDecision | None,
+        context: PaperSessionContext,
+        at: str,
+    ) -> bool:
+        if type(candidate) is not PaperDecision:
+            return False
+        moment = datetime.fromisoformat(normalized_utc(at, "Commissioning candidate time").replace("Z", "+00:00"))
+        created = datetime.fromisoformat(normalized_utc(candidate.created_at, "Commissioning candidate creation").replace("Z", "+00:00"))
+        expiry = datetime.fromisoformat(normalized_utc(candidate.expires_at, "Commissioning candidate expiry").replace("Z", "+00:00"))
+        family_summary = candidate.family_summary
+        try:
+            dominance = Decimal(str(family_summary.get("dominance")))
+            positive_families = int(family_summary.get("positive_family_count", 0))
+        except Exception:
+            return False
+        return (
+            candidate.decision in {PaperDecisionKind.LONG, PaperDecisionKind.SHORT}
+            and candidate.strategy_generated
+            and not candidate.commissioning
+            and not candidate.scientific_evidence
+            and candidate.paper_policy_id == POLICY.policy_id
+            and candidate.paper_policy_hash == POLICY.configuration_hash
+            and candidate.session_kind is POLICY.entry_session_kind
+            and candidate.session_kind is context.session_kind
+            and candidate.session_id == context.session_id
+            and candidate.trade_date == context.trade_date
+            and candidate.session_profile_hash == context.session_profile_hash
+            and candidate.session_generation == context.session_generation
+            and created <= moment <= expiry
+            and candidate.relative_support >= POLICY.entry_support_threshold
+            and dominance >= POLICY.entry_dominance_margin
+            and positive_families >= POLICY.entry_family_count
+            and family_summary.get("blocking_contradiction") is False
+        )
 
     def commission_exit(self) -> dict[str, object]:
         """Close the active explicit commissioning position with a normal owned exit."""
@@ -3472,11 +3560,14 @@ class LaneIIIPaperRuntime:
                 "live_capital": "DENIED",
                 "entry_profile": POLICY.entry_profile,
                 "entry_profile_version": POLICY.entry_profile_version,
+                "entry_session_kind": POLICY.entry_session_kind.value,
                 "effective_confidence_threshold": str(POLICY.entry_support_threshold),
                 "entry_dominance_margin": str(POLICY.entry_dominance_margin),
                 "entry_family_count": POLICY.entry_family_count,
                 "reentry_cooldown_seconds": POLICY.reentry_cooldown_seconds,
                 "retention_confidence_threshold": str(POLICY.retention_support_threshold),
+                "maximum_position_age_seconds": RISK_PROFILE.maximum_position_age_seconds,
+                "maximum_session_entries": RISK_PROFILE.maximum_session_entries,
                 "session_definitions": list(session_catalog()),
                 "commissioning_readiness_snapshot_generation": self._commissioning_readiness_generation,
                 "commissioning_authority_epoch": self._commissioning_authority_epoch,
@@ -3569,6 +3660,12 @@ class LaneIIIPaperRuntime:
                 "commissioning_lifecycle": {
                     "classification": "EXPLICIT_PAPER_COMMISSIONING" if ownership is not None else "STRATEGY_GENERATED_PAPER",
                     "active": ownership is not None,
+                    "phase": (
+                        "INACTIVE" if ownership is None
+                        else "ENTRY_CONSUMED" if ownership.entry_consumed
+                        else "WAITING_FOR_HIGH_CONFLUENCE"
+                    ),
+                    "waiting_for_high_confluence": ownership is not None and not ownership.entry_consumed,
                     "commissioning_id": None if ownership is None else ownership.commissioning_id,
                     "entry_consumed": False if ownership is None else ownership.entry_consumed,
                     "recovered_after_restart": False if ownership is None else ownership.recovered_after_restart,

@@ -166,7 +166,7 @@ class SessionEvidenceTests(unittest.TestCase):
 
 
 class SessionRiskAndLedgerTests(unittest.TestCase):
-    def test_family_risk_carries_from_new_york_rth_into_ny_after(self) -> None:
+    def test_single_entry_cap_and_ny_rth_only_profile_reject_ny_after(self) -> None:
         ny = resolved("2026-08-25T13:35:00Z").context
         after = resolved("2026-08-25T20:05:00Z").context
         policy_decision = replace(warmed_bullish_policy()[2], created_at="2026-08-25T13:35:00Z", expires_at="2026-08-25T13:35:05Z")
@@ -176,7 +176,7 @@ class SessionRiskAndLedgerTests(unittest.TestCase):
         )
         authority = PaperRiskAuthority()
         intent = authority.make_intent(decision, reference_bid=Decimal("100"), reference_ask=Decimal("100.25"), reference_last=Decimal("100"))
-        ny_snapshot = healthy(ny, "2026-08-25T13:35:00Z", daily_realized_pnl=Decimal("-125"), trade_date_entry_count=1)
+        ny_snapshot = healthy(ny, "2026-08-25T13:35:00Z", daily_realized_pnl=Decimal("-125"), trade_date_entry_count=0)
         self.assertTrue(authority.evaluate(intent, ny_snapshot, at="2026-08-25T13:35:00Z").granted)
         self.assertFalse(authority.evaluate(intent, replace(ny_snapshot, daily_realized_pnl=Decimal("-200")), at="2026-08-25T13:35:00Z").granted)
         self.assertFalse(authority.evaluate(intent, replace(ny_snapshot, trade_date_entry_count=RISK_PROFILE.maximum_session_entries), at="2026-08-25T13:35:00Z").granted)
@@ -184,6 +184,15 @@ class SessionRiskAndLedgerTests(unittest.TestCase):
         self.assertFalse(authority.evaluate(intent, replace(ny_snapshot, unresolved_execution=True), at="2026-08-25T13:35:00Z").granted)
         self.assertEqual(after.trade_date, ny.trade_date)
         self.assertEqual(after.session_family, ny.session_family)
+        after_decision = replace(
+            decision, created_at="2026-08-25T20:05:00Z", expires_at="2026-08-25T20:05:05Z",
+            session_kind=after.session_kind, session_id=after.session_id,
+            session_profile_hash=after.session_profile_hash,
+        )
+        after_intent = authority.make_intent(after_decision, reference_bid=Decimal("100"), reference_ask=Decimal("100.25"), reference_last=Decimal("100"))
+        after_grant = authority.evaluate(after_intent, healthy(after, "2026-08-25T20:05:00Z"), at="2026-08-25T20:05:00Z")
+        self.assertFalse(after_grant.granted)
+        self.assertIn("PROFILE_SESSION_MISMATCH", after_grant.reason_codes)
 
     def test_ledger_filters_preserve_session_dimension(self) -> None:
         asia = resolved("2026-08-24T22:05:00Z").context

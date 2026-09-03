@@ -24,13 +24,13 @@ from .sessions import (
 )
 
 
-PAPER_POLICY_SCHEMA = "lane-iii-phase-g-paper-policy-v2"
-PAPER_RISK_SCHEMA = "lane-iii-phase-g-paper-risk-v1"
+PAPER_POLICY_SCHEMA = "lane-iii-phase-g-paper-policy-v3"
+PAPER_RISK_SCHEMA = "lane-iii-phase-g-paper-risk-v2"
 PAPER_RECORD_SCHEMA = "lane-iii-phase-g-paper-record-v1"
-PAPER_POLICY_ID = "l3g-beelzebub-scalper-policy-v1"
-PAPER_ENTRY_PROFILE = "BEEZELBUB_SCALPER"
-PAPER_ENTRY_PROFILE_VERSION = "BEEZELBUB_SCALPER_V1"
-PAPER_RISK_PROFILE_ID = "lucid-flex-paper-commissioning-v0"
+PAPER_POLICY_ID = "l3g-ny-high-confluence-commissioning-policy-v1"
+PAPER_ENTRY_PROFILE = "NY_HIGH_CONFLUENCE_COMMISSIONING"
+PAPER_ENTRY_PROFILE_VERSION = "NY_HIGH_CONFLUENCE_COMMISSIONING_V1"
+PAPER_RISK_PROFILE_ID = "l3g-ny-high-confluence-commissioning-risk-v1"
 PAPER_MODE = "PAPER_SIM101"
 PAPER_ACCOUNT = "Sim101"
 PAPER_ACCOUNT_CLASS = "LOCAL_SIMULATION"
@@ -163,6 +163,7 @@ class PaperPolicyArtifact:
     native_contract: str = PAPER_NATIVE_CONTRACT
     canonical_contract: str = PAPER_CANONICAL_CONTRACT
     scientific_eligibility: bool = False
+    entry_session_kind: PaperSessionKind = PaperSessionKind.NEW_YORK_RTH
     sequence_authority: SequenceAuthority = SequenceAuthority.LOCAL_CALLBACK_ORDER_ONLY
     book_completeness: BookCompleteness = BookCompleteness.UNVERIFIED
     allowed_hypotheses: tuple[HypothesisKind, ...] = (
@@ -178,14 +179,14 @@ class PaperPolicyArtifact:
     liquidity_evidence_lifetime_seconds: int = 20
     hypothesis_idle_lifetime_seconds: int = 90
     hypothesis_maximum_lifetime_seconds: int = 600
-    entry_support_threshold: Decimal = Decimal("0.55")
-    entry_dominance_margin: Decimal = Decimal("0.025")
-    retention_support_threshold: Decimal = Decimal("0.525")
-    retention_dominance_margin: Decimal = Decimal("0.00")
+    entry_support_threshold: Decimal = Decimal("0.675")
+    entry_dominance_margin: Decimal = Decimal("0.10")
+    retention_support_threshold: Decimal = Decimal("0.55")
+    retention_dominance_margin: Decimal = Decimal("0.025")
     entry_family_count: int = 3
     retention_family_count: int = 2
     decision_ttl_seconds: int = 5
-    reentry_cooldown_seconds: int = 10
+    reentry_cooldown_seconds: int = 3600
     structural_strength: Decimal = Decimal("0.50")
     score_denominator: Decimal = Decimal("10")
     session_timezone: str = "America/New_York"
@@ -209,15 +210,16 @@ class PaperPolicyArtifact:
         ):
             raise ValueError("The paper directional universe is fixed.")
         if (
-            self.entry_support_threshold != Decimal("0.55")
-            or self.entry_dominance_margin != Decimal("0.025")
-            or self.retention_support_threshold != Decimal("0.525")
-            or self.retention_dominance_margin != Decimal("0.00")
+            self.entry_session_kind is not PaperSessionKind.NEW_YORK_RTH
+            or self.entry_support_threshold != Decimal("0.675")
+            or self.entry_dominance_margin != Decimal("0.10")
+            or self.retention_support_threshold != Decimal("0.55")
+            or self.retention_dominance_margin != Decimal("0.025")
             or self.entry_family_count != 3
             or self.retention_family_count != 2
-            or self.reentry_cooldown_seconds != 10
+            or self.reentry_cooldown_seconds != 3600
         ):
-            raise ValueError("The Beelzebub scalper policy tuning is immutable.")
+            raise ValueError("The NY high-confluence commissioning policy tuning is immutable.")
 
     def payload(self) -> dict[str, object]:
         return _jsonable(asdict(self))  # type: ignore[return-value]
@@ -236,6 +238,7 @@ class PaperRiskProfile:
     account_class: str = PAPER_ACCOUNT_CLASS
     instrument: str = PAPER_INSTRUMENT
     canonical_contract: str = PAPER_CANONICAL_CONTRACT
+    entry_session_kind: PaperSessionKind = PaperSessionKind.NEW_YORK_RTH
     maximum_absolute_position: int = 1
     maximum_entry_quantity: int = 1
     maximum_pending_entries: int = 1
@@ -249,14 +252,14 @@ class PaperRiskProfile:
     protective_stop_distance_points: Decimal = Decimal("25.00")
     maximum_trade_risk_dollars: Decimal = Decimal("50.00")
     daily_loss_limit_dollars: Decimal = Decimal("200.00")
-    maximum_position_age_seconds: int = 540
+    maximum_position_age_seconds: int = 3600
     entry_session_start: str = "09:35"
     entry_session_end: str = "15:30"
     hard_flat_deadline: str = "15:58"
     session_timezone: str = "America/New_York"
-    reentry_cooldown_seconds: int = 10
-    maximum_session_entries: int = 12
-    maximum_consecutive_losses: int = 4
+    reentry_cooldown_seconds: int = 3600
+    maximum_session_entries: int = 1
+    maximum_consecutive_losses: int = 1
     maximum_entry_slippage_points: Decimal = Decimal("2.00")
     quote_maximum_age_seconds: int = 2
     classified_trade_maximum_age_seconds: int = 5
@@ -276,8 +279,14 @@ class PaperRiskProfile:
             raise ValueError("The paper risk profile cannot represent live or multi-contract authority.")
         if self.pyramiding or self.averaging or self.same_event_reversal:
             raise ValueError("Pyramiding, averaging, and same-event reversal are forbidden.")
-        if self.reentry_cooldown_seconds != 10:
-            raise ValueError("The Beelzebub scalper risk cooldown is immutable.")
+        if (
+            self.entry_session_kind is not PaperSessionKind.NEW_YORK_RTH
+            or self.maximum_position_age_seconds != 3600
+            or self.reentry_cooldown_seconds != 3600
+            or self.maximum_session_entries != 1
+            or self.maximum_consecutive_losses != 1
+        ):
+            raise ValueError("The NY high-confluence commissioning risk limits are immutable.")
 
     def payload(self) -> dict[str, object]:
         return _jsonable(asdict(self))  # type: ignore[return-value]

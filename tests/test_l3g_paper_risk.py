@@ -52,8 +52,9 @@ class PaperRiskTests(unittest.TestCase):
     def test_freshness_session_stop_slippage_and_max_age(self) -> None:
         authority = PaperRiskAuthority()
         self.assertTrue(authority.hard_flat_due("2026-08-24T19:58:00Z"))
-        aged = replace(healthy_snapshot(), position_opened_at="2026-08-24T13:50:00Z")
+        aged = replace(healthy_snapshot(), position_opened_at="2026-08-24T13:00:00Z")
         self.assertTrue(authority.maximum_age_due(aged, AT))
+        self.assertFalse(authority.maximum_age_due(replace(healthy_snapshot(), position_opened_at="2026-08-24T13:00:00.000001Z"), AT))
         self.assertEqual(authority.protective_stop_price(PaperDirection.LONG, Decimal("20000")), Decimal("19975.00"))
         decision = replace(warmed_bullish_policy()[2], created_at=AT, expires_at="2026-08-24T14:00:05Z")
         intent = authority.make_intent(decision, reference_bid=Decimal("100"), reference_ask=Decimal("100.25"), reference_last=Decimal("100"))

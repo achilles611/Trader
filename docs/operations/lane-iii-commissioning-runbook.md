@@ -69,11 +69,16 @@ broker/runtime reconciliation is clean.
 Use only **Atomic Commissioning Start**. The UI generates and retains one
 idempotency request ID across client timeout/retry. The server revalidates the
 coherent broker/runtime snapshot and verified-anchor/passive-tail gate under the
-runtime admission lock, reserves commissioning ownership, arms, seals the exact
-decision/intent/risk grant/command, and consumes the one-shot authorization at
-transport admission. A duplicate request returns the existing lifecycle and
-cannot create another entry command. The legacy split ARM/entry routes are
-diagnostic-only and are intentionally absent from the operator UI.
+runtime admission lock, reserves commissioning ownership, and arms a single-use
+authorization. Under `NY_HIGH_CONFLUENCE_COMMISSIONING_V1`, the authorization
+waits without submitting an order until the current `NEW_YORK_RTH` generation
+produces a fresh policy decision with support at least `0.675`, dominance at
+least `0.10`, all three required families, and no blocking contradiction. That
+exact decision's sources and confluence summary are sealed into the separate
+commissioning decision/intent/risk grant/command, and the authorization is
+consumed only at transport admission. A duplicate request returns the existing
+lifecycle and cannot create another entry command. The legacy split ARM/entry
+routes are diagnostic-only and are intentionally absent from the operator UI.
 
 After the owned entry fill, require the one-contract protective stop to become
 accepted/working. A missing, rejected, cancelled, duplicate, wrong-account,
@@ -84,6 +89,12 @@ Use **Run Commissioning Exit** for the controlled owned exit. The lifecycle is
 not terminal until NinjaTrader confirms `FLAT`, quantity zero, zero owned
 orders, and a fresh clean reconciliation returns the runtime to
 `READY_DISARMED` with ownership `NONE`.
+
+The NY high-confluence commissioning profile permits at most one entry and a
+maximum position age of 3,600 seconds. Strategy retention/exit fluctuations do
+not close the commissioned position. The accepted protective stop, stale-data
+emergency exit, operator commissioning exit, one-hour maximum age, and 15:58
+America/New_York hard-flat deadline remain authoritative.
 
 ## Post-run closure
 

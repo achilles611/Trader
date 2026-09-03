@@ -9,26 +9,30 @@ from src.l3g_paper.contracts import (
     ExecutionAction, PaperDirection, PaperExecutionCommand, deterministic_id,
     refuse_execution_target,
 )
+from src.l3g_paper.sessions import PaperSessionKind
 
 
 class PaperContractTests(unittest.TestCase):
     def test_artifacts_are_exact_hash_bound_and_never_scientific(self) -> None:
-        self.assertEqual(POLICY.configuration_hash, "c733287dc97966a55ca4ce04ce2b1a1361a5be5359cfb61b4b12f56c3fb50598")
-        self.assertEqual(RISK_PROFILE.configuration_hash, "1194f75fa8a015dece0d0969fea4fd68138d30a81442491b53d407dd9862133f")
-        self.assertEqual(POLICY.policy_id, "l3g-beelzebub-scalper-policy-v1")
-        self.assertEqual((POLICY.entry_profile, POLICY.entry_profile_version), ("BEEZELBUB_SCALPER", "BEEZELBUB_SCALPER_V1"))
-        self.assertEqual(POLICY.entry_support_threshold, Decimal("0.55"))
-        self.assertEqual(POLICY.entry_dominance_margin, Decimal("0.025"))
+        self.assertEqual(POLICY.configuration_hash, "070587789049231d268cb742404eb6dcc21d91014c9529aa109419a563729a91")
+        self.assertEqual(RISK_PROFILE.configuration_hash, "eef09f7b185cc197aced3e7b91dd03f1571be52be3635747d2d209821ebcaa34")
+        self.assertEqual(POLICY.policy_id, "l3g-ny-high-confluence-commissioning-policy-v1")
+        self.assertEqual((POLICY.entry_profile, POLICY.entry_profile_version), ("NY_HIGH_CONFLUENCE_COMMISSIONING", "NY_HIGH_CONFLUENCE_COMMISSIONING_V1"))
+        self.assertIs(POLICY.entry_session_kind, PaperSessionKind.NEW_YORK_RTH)
+        self.assertEqual(POLICY.entry_support_threshold, Decimal("0.675"))
+        self.assertEqual(POLICY.entry_dominance_margin, Decimal("0.10"))
         self.assertEqual(POLICY.entry_family_count, 3)
-        self.assertEqual(POLICY.reentry_cooldown_seconds, 10)
-        self.assertEqual(RISK_PROFILE.reentry_cooldown_seconds, 10)
+        self.assertEqual(POLICY.reentry_cooldown_seconds, 3600)
+        self.assertEqual(RISK_PROFILE.maximum_position_age_seconds, 3600)
+        self.assertEqual(RISK_PROFILE.maximum_session_entries, 1)
+        self.assertEqual(RISK_PROFILE.reentry_cooldown_seconds, 3600)
         self.assertFalse(POLICY.scientific_eligibility)
         self.assertFalse(AUTHORITY.authority_payload()["scientific_eligibility"])
         self.assertEqual(AUTHORITY.authority_payload()["live_capital"], "DENIED")
-        with self.assertRaisesRegex(ValueError, "scalper policy tuning"):
-            replace(POLICY, entry_support_threshold=Decimal("0.551"))
-        with self.assertRaisesRegex(ValueError, "scalper risk cooldown"):
-            replace(RISK_PROFILE, reentry_cooldown_seconds=30)
+        with self.assertRaisesRegex(ValueError, "high-confluence commissioning policy tuning"):
+            replace(POLICY, entry_support_threshold=Decimal("0.65"))
+        with self.assertRaisesRegex(ValueError, "high-confluence commissioning risk limits"):
+            replace(RISK_PROFILE, maximum_session_entries=2)
 
     def test_no_other_account_binding_or_execution_target_is_constructible(self) -> None:
         for account in ("", "Sim102", "Lucid25kflex01"):

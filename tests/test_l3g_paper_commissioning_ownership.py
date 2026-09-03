@@ -9,13 +9,15 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from src.l3g_paper.contracts import PaperDirection, PaperEntryOwner, PaperRuntimeState, PaperSessionArmGrant
+from src.l3g_paper.contracts import (
+    PaperDecisionKind, PaperDirection, PaperEntryOwner, PaperRuntimeState, PaperSessionArmGrant,
+)
 from src.l3g_paper.ledger import PaperLedger
 from src.l3g_paper.ninjatrader_transport import ADDON_PROTOCOL_VERSION, PaperExecutionTransport, expected_addon_source_fingerprint
 from src.l3g_paper.risk import PaperRiskSnapshot
 from src.l3g_paper.runtime import LaneIIIPaperRuntime
 from src.l3g_paper.sessions import PaperSessionResolver, context_from_identity
-from tests.l3g_helpers import warmed_bullish_policy
+from tests.l3g_helpers import ObservationFactory, warmed_bullish_policy
 
 
 class CommissioningOwnershipTests(unittest.TestCase):
@@ -33,6 +35,9 @@ class CommissioningOwnershipTests(unittest.TestCase):
         runtime._execution_session_id = lambda: "l3g-es-ownership-test"  # type: ignore[method-assign]
         runtime._state = PaperRuntimeState.READY_DISARMED
         runtime._session_context = context
+        runtime._session_generation = context.session_generation
+        runtime._commissioning_warmup_context = context
+        runtime._commissioning_warmup_warmed_at = observed_at
         runtime._snapshot = PaperRiskSnapshot(
             observed_at, position_snapshot_complete=True, order_snapshot_complete=True,
             reconciliation_current=True, local_bridge_healthy=True, market_price_connected=True,
@@ -44,6 +49,17 @@ class CommissioningOwnershipTests(unittest.TestCase):
             session_profile_hash=context.session_profile_hash, session_generation=context.session_generation,
         )
         runtime._last_quote = (Decimal("100"), Decimal("100.25"), observed_at)
+        source_candidate = warmed_bullish_policy()[2]
+        runtime._last_qualifying_entry_decision = replace(
+            source_candidate,
+            created_at=observed_at,
+            expires_at=(datetime.fromisoformat(observed_at.replace("Z", "+00:00")) + timedelta(seconds=5)).isoformat().replace("+00:00", "Z"),
+            session_kind=context.session_kind,
+            session_id=context.session_id,
+            trade_date=context.trade_date,
+            session_profile_hash=context.session_profile_hash,
+            session_generation=context.session_generation,
+        )
         return ledger, runtime, context
 
     @staticmethod
@@ -298,6 +314,149 @@ class CommissioningOwnershipTests(unittest.TestCase):
                 "COMMISSIONING_PREFLIGHT_ACCEPTED", "COMMISSIONING_OWNERSHIP_RESERVED",
                 "COMMISSIONING_ENTRY_AUTHORIZED", "COMMISSIONING_ENTRY_SUBMITTED",
             }.issubset(kinds))
+            self.close(runtime, ledger)
+
+    def test_atomic_start_waits_without_a_qualified_signal_and_later_consumes_one(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger, runtime, context = self.ready_runtime(directory)
+            candidate = runtime._last_qualifying_entry_decision
+            runtime._last_qualifying_entry_decision = None
+            commands: list[object] = []
+            runtime._persist_and_send = lambda command, grant: commands.append(command)  # type: ignore[method-assign]
+            with patch("src.l3g_paper.runtime._now", return_value=self.now):
+                waiting = runtime.commissioning_start(
+                    "wait-for-confluence-0001",
+                    lambda commissioning_id, snapshot: {"ledger_trust_state": "TEST_VERIFIED_ANCHOR"},
+                )
+            self.assertTrue(waiting["armed"])
+            self.assertFalse(waiting["submitted"])
+            self.assertEqual(waiting["reason_codes"], ("COMMISSIONING_WAITING_FOR_HIGH_CONFLUENCE",))
+            self.assertEqual(runtime.state, PaperRuntimeState.ARMED_FLAT)
+            self.assertEqual(commands, [])
+            self.assertIsNotNone(candidate)
+            ownership = runtime._commissioning_ownership
+            self.assertIsNotNone(ownership)
+            with patch("src.l3g_paper.runtime._now", return_value=self.now):
+                submitted = runtime.commission_entry(
+                    str(ownership.commissioning_id),  # type: ignore[union-attr]
+                    str(ownership.commissioning_token),  # type: ignore[union-attr]
+                    candidate=candidate,
+                )
+            self.assertTrue(submitted["submitted"])
+            self.assertEqual(len(commands), 1)
+            self.assertTrue(commands[0].commissioning)  # type: ignore[attr-defined]
+            self.assertEqual(commands[0].action.value, "ENTER_LONG")  # type: ignore[attr-defined]
+            authorized = ledger.recent_kinds(("COMMISSIONING_ENTRY_AUTHORIZED",), limit=1)[0]
+            self.assertEqual(authorized["payload"]["qualification"]["required_support"], "0.675")
+            self.assertEqual(authorized["payload"]["qualification"]["required_family_count"], 3)
+            self.assertEqual(authorized["payload"]["session_kind"], context.session_kind.value)
+            self.close(runtime, ledger)
+
+    def test_waiting_atomic_commissioning_auto_consumes_the_next_policy_candidate(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger, runtime, _ = self.ready_runtime(directory)
+            candidate = runtime._last_qualifying_entry_decision
+            self.assertIsNotNone(candidate)
+            runtime._last_qualifying_entry_decision = None
+            commands: list[object] = []
+            runtime._persist_and_send = lambda command, grant: commands.append(command)  # type: ignore[method-assign]
+            with patch("src.l3g_paper.runtime._now", return_value=self.now):
+                waiting = runtime.commissioning_start(
+                    "auto-consume-confluence-0001",
+                    lambda commissioning_id, snapshot: {"ledger_trust_state": "TEST_VERIFIED_ANCHOR"},
+                )
+            self.assertFalse(waiting["submitted"])
+            self.assertEqual(runtime.status()["commissioning_lifecycle"]["phase"], "WAITING_FOR_HIGH_CONFLUENCE")
+
+            factory = ObservationFactory(
+                start=datetime.fromisoformat(self.now.replace("Z", "+00:00")) - timedelta(milliseconds=100),
+            )
+            observation = factory.quote(100)
+            with (
+                patch("src.l3g_paper.runtime._now", return_value=self.now),
+                patch.object(runtime.policy, "ingest_runtime", return_value=candidate),
+                patch.object(runtime.policy, "runtime_gate_state", return_value=(10, True, False)),
+                patch.object(runtime.policy, "active_evidence", return_value=()),
+            ):
+                runtime.ingest(observation)
+
+            self.assertEqual(len(commands), 1)
+            self.assertEqual(commands[0].action.value, "ENTER_LONG")  # type: ignore[attr-defined]
+            self.assertTrue(commands[0].commissioning)  # type: ignore[attr-defined]
+            status = runtime.status()
+            self.assertEqual(status["commissioning_lifecycle"]["phase"], "ENTRY_CONSUMED")
+            self.assertFalse(status["commissioning_lifecycle"]["waiting_for_high_confluence"])
+            self.close(runtime, ledger)
+
+    def test_commissioned_position_ignores_strategy_retention_exit_until_a_safety_exit(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger, runtime, _ = self.ready_runtime(directory)
+            candidate = runtime._last_qualifying_entry_decision
+            self.assertIsNotNone(candidate)
+            commands: list[object] = []
+            runtime._persist_and_send = lambda command, grant: commands.append(command)  # type: ignore[method-assign]
+            with patch("src.l3g_paper.runtime._now", return_value=self.now):
+                started = runtime.commissioning_start(
+                    "longer-hold-commissioning-0001",
+                    lambda commissioning_id, snapshot: {"ledger_trust_state": "TEST_VERIFIED_ANCHOR"},
+                )
+            self.assertTrue(started["submitted"])
+            runtime._state = PaperRuntimeState.LONG
+            runtime._position = PaperDirection.LONG
+            runtime._position_quantity = 1
+            runtime._snapshot = replace(
+                runtime._snapshot,
+                current_position=PaperDirection.LONG,
+                current_position_quantity=1,
+                position_opened_at=self.now,
+                protective_stop_state="WORKING",
+            )
+            exit_decision = replace(
+                candidate,  # type: ignore[arg-type]
+                decision=PaperDecisionKind.EXIT,
+                direction=PaperDirection.FLAT,
+                reason_code="RETENTION_FAILED",
+            )
+            factory = ObservationFactory(
+                start=datetime.fromisoformat(self.now.replace("Z", "+00:00")) - timedelta(milliseconds=100),
+            )
+            with (
+                patch("src.l3g_paper.runtime._now", return_value=self.now),
+                patch.object(runtime.policy, "ingest_runtime", return_value=exit_decision),
+                patch.object(runtime.policy, "runtime_gate_state", return_value=(10, True, False)),
+                patch.object(runtime.policy, "active_evidence", return_value=()),
+            ):
+                runtime.ingest(factory.quote(100))
+
+            self.assertEqual(len(commands), 1)
+            self.assertEqual(runtime.state, PaperRuntimeState.LONG)
+            status = runtime.status()
+            self.assertEqual(status["entry_owner"], PaperEntryOwner.COMMISSIONING.value)
+            self.assertEqual(status["last_paper_decision"]["decision"], "EXIT")
+            self.assertEqual(status["last_paper_decision"]["reason_code"], "RETENTION_FAILED")
+            self.close(runtime, ledger)
+
+    def test_weak_or_stale_candidate_never_consumes_commissioning_authority(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger, runtime, _ = self.ready_runtime(directory)
+            lifecycle = self.commissioning_arm(runtime)
+            candidate = runtime._last_qualifying_entry_decision
+            self.assertIsNotNone(candidate)
+            commands: list[object] = []
+            runtime._persist_and_send = lambda command, grant: commands.append(command)  # type: ignore[method-assign]
+            weak = replace(candidate, relative_support=Decimal("0.65"))  # type: ignore[arg-type]
+            stale = replace(candidate, created_at="2026-08-26T13:59:50Z", expires_at="2026-08-26T13:59:55Z")  # type: ignore[arg-type]
+            with patch("src.l3g_paper.runtime._now", return_value=self.now):
+                weak_result = runtime.commission_entry(
+                    str(lifecycle["commissioning_id"]), str(lifecycle["commissioning_token"]), candidate=weak,
+                )
+                stale_result = runtime.commission_entry(
+                    str(lifecycle["commissioning_id"]), str(lifecycle["commissioning_token"]), candidate=stale,
+                )
+            self.assertEqual(weak_result["reason_codes"], ("COMMISSIONING_WAITING_FOR_HIGH_CONFLUENCE",))
+            self.assertEqual(stale_result["reason_codes"], ("COMMISSIONING_WAITING_FOR_HIGH_CONFLUENCE",))
+            self.assertEqual(commands, [])
+            self.assertFalse(runtime._commissioning_ownership.entry_consumed)  # type: ignore[union-attr]
             self.close(runtime, ledger)
 
     def test_concurrent_duplicate_atomic_starts_emit_at_most_one_entry_command(self) -> None:

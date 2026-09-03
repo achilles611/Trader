@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
 from pathlib import Path
@@ -71,6 +71,19 @@ class LaneIIIStarvationHotfixRuntimeTests(unittest.TestCase):
             session_generation=context.session_generation,
         )
         runtime._last_quote = (Decimal("100"), Decimal("100.25"), NOW)
+        candidate = warmed_bullish_policy()[2]
+        runtime._last_qualifying_entry_decision = replace(
+            candidate,
+            created_at=NOW,
+            expires_at=(
+                datetime.fromisoformat(NOW.replace("Z", "+00:00")) + timedelta(seconds=5)
+            ).isoformat().replace("+00:00", "Z"),
+            session_kind=context.session_kind,
+            session_id=context.session_id,
+            trade_date=context.trade_date,
+            session_profile_hash=context.session_profile_hash,
+            session_generation=context.session_generation,
+        )
         return ledger, runtime
 
     @staticmethod
