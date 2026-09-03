@@ -37,6 +37,8 @@ from .ledger import (
     COMMISSIONING_NO_AUTHORITY_EFFECT,
     COMMISSIONING_READINESS_RECORD_SEMANTICS,
     COMMISSIONING_READINESS_RECORD_SEMANTICS_VERSION,
+    HEALTH_AUTHORITY_OBSERVATION_PAYLOAD_KEY_SETS,
+    HEALTH_AUTHORITY_OBSERVATION_SEMANTICS,
     deferred_capacity_allows_authority,
     LedgerCapacityError,
     PaperLedger,
@@ -1327,6 +1329,16 @@ class LaneIIIPaperRuntime:
                     "observation_payload_keys": sorted(expected_authority_payload_keys),
                     "observation_account_alias": observation.account_alias,
                     "observation_account_class": observation.account_class.value,
+                })
+            health_payload_keys = frozenset(observation.payload)
+            if (
+                observation.observation_type == "HEALTH"
+                and health_payload_keys in HEALTH_AUTHORITY_OBSERVATION_PAYLOAD_KEY_SETS
+            ):
+                raw_payload.update({
+                    "authority_effect": COMMISSIONING_NO_AUTHORITY_EFFECT,
+                    "observation_semantics": HEALTH_AUTHORITY_OBSERVATION_SEMANTICS,
+                    "observation_payload_keys": sorted(health_payload_keys),
                 })
             if not self._append_deferred_or_pause_locked(
                 "OBSERVATION_ENVELOPE", raw_payload,

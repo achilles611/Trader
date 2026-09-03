@@ -12,6 +12,7 @@ from src.l3f_provider.ninjatrader_observation import AccountClass, NinjaTraderOb
 from src.l3f_provider.tradovate_observation import StreamHealth
 from src.l3g_paper.ledger import (
     COMMISSIONING_ACCOUNT_AUTHORITY_OBSERVATION_SEMANTICS,
+    HEALTH_AUTHORITY_OBSERVATION_SEMANTICS,
     PaperLedger,
     CommissioningTailCategory,
     commissioning_tail_classification,
@@ -280,6 +281,87 @@ class PaperRuntimeTests(unittest.TestCase):
                 corrupt = ledger_health_projection(ledger.health_status(), verification, operational_session=active)
                 self.assertFalse(corrupt["operational_ledger"]["online_append_integrity"])
                 self.assertTrue(corrupt["operational_ledger"]["unknown_tail_present"])
+            finally:
+                runtime.stop(); ledger.close()
+
+    def test_operational_session_stays_green_across_repeated_observer_health_cycles(self) -> None:
+        now = "2026-08-24T22:10:00Z"
+        observer_health = {
+            "component": "MARKET_OBSERVER_ATTACHMENT",
+            "state": "NATIVE_ADDON_OBSERVER_ACTIVE",
+            "configured_instrument": "MNQ SEP26",
+            "instrument": "MNQ SEP26",
+            "chart_found": True,
+            "observer_attached": True,
+            "subscription_mode": "NATIVE_ADDON",
+        }
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.operational_runtime(directory, now=now)
+            try:
+                runtime._session_generation = 1
+                anchor = ledger.health_status()
+                verification = {
+                    "status": "PASS", "chain_valid": True, "checkpoint_valid": True,
+                    "verified_through_sequence": anchor["highest_sequence"],
+                    "tip_hash": anchor["final_record_hash"],
+                }
+                with patch("src.l3g_paper.runtime._now", return_value=now):
+                    self.assertTrue(runtime.operational_paper_start("operational-health-cycles")["started"])
+
+                factory = ObservationFactory(
+                    start=datetime(2026, 8, 24, 22, 10, tzinfo=timezone.utc),
+                )
+                with patch("src.l3g_paper.runtime._now", return_value=now):
+                    for _ in range(4):
+                        runtime.ingest(factory.make("HEALTH", observer_health))
+                        ledger.flush_deferred()
+                        projected = ledger_health_projection(
+                            ledger.health_status(), verification,
+                            operational_session=runtime.status()["operational_paper_session"],
+                        )
+                        self.assertTrue(projected["operational_ledger"]["online_append_integrity"])
+                        self.assertFalse(projected["operational_ledger"]["unknown_tail_present"])
+                        self.assertEqual(runtime.state, PaperRuntimeState.PAPER_RUNNING)
+
+                latest = ledger.recent(1)[0]["payload"]
+                self.assertEqual(
+                    latest["observation_semantics"],
+                    HEALTH_AUTHORITY_OBSERVATION_SEMANTICS,
+                )
+                self.assertEqual(latest["authority_effect"], "NONE")
+            finally:
+                runtime.stop(); ledger.close()
+
+    def test_unattested_or_future_health_shape_remains_unknown(self) -> None:
+        now = "2026-08-24T22:10:00Z"
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.operational_runtime(directory, now=now)
+            try:
+                runtime._session_generation = 1
+                anchor = ledger.health_status()
+                verification = {
+                    "status": "PASS", "chain_valid": True, "checkpoint_valid": True,
+                    "verified_through_sequence": anchor["highest_sequence"],
+                    "tip_hash": anchor["final_record_hash"],
+                }
+                with patch("src.l3g_paper.runtime._now", return_value=now):
+                    runtime.operational_paper_start("operational-unknown-health")
+                factory = ObservationFactory(
+                    start=datetime(2026, 8, 24, 22, 10, tzinfo=timezone.utc),
+                )
+                with patch("src.l3g_paper.runtime._now", return_value=now):
+                    runtime.ingest(factory.make("HEALTH", {
+                        "state": "NATIVE_ADDON_OBSERVER_ACTIVE",
+                        "future_authority_field": "must-not-be-accepted",
+                    }))
+                    ledger.flush_deferred()
+                    projected = ledger_health_projection(
+                        ledger.health_status(), verification,
+                        operational_session=runtime.status()["operational_paper_session"],
+                    )
+                self.assertFalse(projected["operational_ledger"]["online_append_integrity"])
+                self.assertTrue(projected["operational_ledger"]["unknown_tail_present"])
+                self.assertEqual(runtime.state, PaperRuntimeState.PAPER_RUNNING)
             finally:
                 runtime.stop(); ledger.close()
 

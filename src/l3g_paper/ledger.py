@@ -59,6 +59,14 @@ COMMISSIONING_ACCOUNT_AUTHORITY_OBSERVATION_PAYLOAD_KEYS = {
     "EXECUTION": frozenset({"native_execution_id", "price", "quantity"}),
     "POSITION": frozenset({"quantity", "direction", "average_price"}),
 }
+HEALTH_AUTHORITY_OBSERVATION_SEMANTICS = "READ_ONLY_LOCAL_HEALTH_OBSERVATION"
+HEALTH_AUTHORITY_OBSERVATION_PAYLOAD_KEY_SETS = frozenset({
+    frozenset({"state"}),
+    frozenset({
+        "component", "state", "configured_instrument", "instrument",
+        "chart_found", "observer_attached", "subscription_mode",
+    }),
+})
 COMMISSIONING_READINESS_RECORD_SEMANTICS = "COMMISSIONING_READINESS_STATE_ATTESTATION"
 COMMISSIONING_READINESS_RECORD_SEMANTICS_VERSION = 1
 COMMISSIONING_WARMUP_REQUIRED_FAMILIES = (
@@ -100,6 +108,9 @@ _OBSERVATION_ENVELOPE_KEYS = _SESSION_CONTEXT_KEYS | frozenset({
 _ACCOUNT_OBSERVATION_KEYS = _OBSERVATION_ENVELOPE_KEYS | frozenset({
     "authority_effect", "observation_semantics", "observation_payload_keys",
     "observation_account_alias", "observation_account_class",
+})
+_HEALTH_OBSERVATION_KEYS = _OBSERVATION_ENVELOPE_KEYS | frozenset({
+    "authority_effect", "observation_semantics", "observation_payload_keys",
 })
 _EVIDENCE_KEYS = frozenset({
     "evidence_id", "hypothesis_kind", "family", "label", "strength", "supports",
@@ -168,6 +179,7 @@ _V3_AUTHORITY_OBSERVATION_CLASSIFICATIONS = frozenset({
     ),
     "AUTHORITY_OBSERVATION:COMMISSIONING_SESSION_WARMED:AUTHORITY_EFFECT_NONE",
     "AUTHORITY_OBSERVATION:COMMISSIONING_SESSION_WARMUP_RESET:AUTHORITY_EFFECT_NONE",
+    "AUTHORITY_OBSERVATION:OBSERVATION_ENVELOPE:HEALTH:AUTHORITY_EFFECT_NONE",
 })
 _SECRET_KEYS = frozenset({"hmac_key", "password", "token", "connection_credentials", "private_key", "secret", "authorization"})
 _EPOCH_DIRECTORY = re.compile(r"^epoch-(\d+)$", re.IGNORECASE)
@@ -534,6 +546,40 @@ def _account_authority_observation_shape(payload: Mapping[str, object]) -> str |
     )
 
 
+def _health_authority_observation_shape(payload: Mapping[str, object]) -> str | None:
+    """Recognize only producer-attested, exact read-only HEALTH shapes.
+
+    HEALTH frames are local observer/transport attestations.  They affect
+    readiness but cannot carry trading authority.  Requiring the producer to
+    bind the exact source-payload key set prevents an arbitrary or future
+    HEALTH payload from being accepted merely because its type is HEALTH.
+    """
+    payload_keys = payload.get("observation_payload_keys")
+    if (
+        payload.get("observation_type") != "HEALTH"
+        or not _exact_keys(payload, _HEALTH_OBSERVATION_KEYS)
+        or not _session_context_matches(payload)
+        or not isinstance(payload.get("observation_id"), str)
+        or not payload.get("observation_id")
+        or type(payload.get("local_monotonic_sequence")) is not int
+        or int(payload["local_monotonic_sequence"]) < 0
+        or not _is_hash(payload.get("source_payload_hash"))
+        or not _is_utc(payload.get("observed_at"))
+        or not _is_utc(payload.get("ninja_receipt_time"))
+        or not all(value is None or _is_utc(value) for value in (
+            payload.get("provider_timestamp"), payload.get("exchange_timestamp"),
+        ))
+        or payload.get("authority_effect") != COMMISSIONING_NO_AUTHORITY_EFFECT
+        or payload.get("observation_semantics") != HEALTH_AUTHORITY_OBSERVATION_SEMANTICS
+        or not isinstance(payload_keys, list)
+        or not all(isinstance(key, str) and key for key in payload_keys)
+        or payload_keys != sorted(payload_keys)
+        or frozenset(payload_keys) not in HEALTH_AUTHORITY_OBSERVATION_PAYLOAD_KEY_SETS
+    ):
+        return None
+    return "AUTHORITY_OBSERVATION:OBSERVATION_ENVELOPE:HEALTH:AUTHORITY_EFFECT_NONE"
+
+
 def _evidence_shape(payload: Mapping[str, object]) -> str | None:
     family = payload.get("family")
     if (
@@ -710,6 +756,11 @@ def commissioning_tail_classification(
         if authority_observation_shape is not None:
             return CommissioningTailClassification(
                 CommissioningTailCategory.AUTHORITY_OBSERVATION, authority_observation_shape,
+            )
+        health_observation_shape = _health_authority_observation_shape(payload)
+        if health_observation_shape is not None:
+            return CommissioningTailClassification(
+                CommissioningTailCategory.AUTHORITY_OBSERVATION, health_observation_shape,
             )
         return CommissioningTailClassification(CommissioningTailCategory.UNKNOWN, f"UNKNOWN:{domain}:{kind}")
     if domain == "EVIDENCE" and kind == "EVIDENCE":
