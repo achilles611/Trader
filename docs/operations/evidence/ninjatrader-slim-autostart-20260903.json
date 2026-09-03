@@ -1,0 +1,129 @@
+{
+  "schema": "beelzebub-ninjatrader-slim-autostart-evidence-v1",
+  "recorded_at": "2026-09-03T01:00:00Z",
+  "scope": "SIM101_PAPER_START_AND_OBSERVER_MAINTENANCE_ONLY",
+  "git": {
+    "required_starting_commit": "03b3d81b26c01be63377b1fc658824e112e9cfd2",
+    "preservation_ref": "archive/ninjatrader-observer-maintenance-baseline-20260902",
+    "feature_branch": "codex/ninjatrader-observer-maintenance-20260902",
+    "implementation_commit": "c6f5395c88f2436dc905640de2eab69f33d3602a"
+  },
+  "phase1": {
+    "evidence_root": "D:\\BeelzebubData\\recovery\\ninjatrader-observer-maintenance-20260902T172141Z",
+    "status": "PASS_REVISED_LEDGER_BASELINE_ESTABLISHED",
+    "commissioning_id": "l3g-commissioning-d3267eacb862d3e2f6a2e17f1026a812",
+    "closure_sequence": 338,
+    "verified_boundary_sequence": 344,
+    "intentional_commissioning_explains_post_263_activity": true,
+    "unknown_authority_mutations": 0,
+    "malformed_records": 0,
+    "contradictory_records": 0,
+    "unauthorized_mutations": 0,
+    "revised_baseline": {
+      "verification_id": "lv-ninjatrader-maintenance-revised-baseline-20260902T172555Z",
+      "sequence": 358,
+      "record_hash": "f26914915e3ebd446b1c37d4a5d366d580fe53737784916a3be5bdc7a586ae05",
+      "chain_valid": true,
+      "checkpoint_valid": true,
+      "unverified_tail_rows": 0
+    },
+    "online_append_integrity_failed_scope": "RUNTIME_OPERATIONAL_HEALTH_PROJECTION_ONLY_WHILE_NO_OPERATIONAL_SESSION_WAS_ACTIVE",
+    "ledger_rows_deleted": 0,
+    "ledger_rows_rewritten": 0,
+    "wal_deleted": false,
+    "epoch_changed": false,
+    "checkpoint_manufactured": false
+  },
+  "implementation": {
+    "slim_primary_action": "Start Paper Trading",
+    "normal_path": [
+      "ensure NinjaTrader without closing a running process",
+      "automatic local DPAPI-backed sign-in",
+      "ensure or create the configured MNQ chart through exact UI Automation identifiers",
+      "verify the chart-independent native AddOn MarketData and MarketDepth observer",
+      "verify authentic market freshness and Sim101 reconciliation",
+      "run a canonical Full ledger verification through its captured tip",
+      "invoke the existing canonical operational-paper start"
+    ],
+    "recovery_only_action": "Hard Reset NinjaTrader + Observer",
+    "forced_termination_implemented": false,
+    "browser_process_or_shell_authority": false,
+    "credential_values_exposed": false,
+    "london_changes": 0
+  },
+  "validation": {
+    "backend": "907 passed, 326 subtests passed",
+    "frontend": "48 passed",
+    "frontend_production_build": "PASS",
+    "windows_packaging": "PASS",
+    "ninjascript_compiler": "NINJATRADER_BUNDLED_ROSLYN_IN_MEMORY",
+    "ninjascript_errors": 0,
+    "ninjascript_warnings": 891,
+    "detached_verifier_transient": "One full run observed the existing detached-process launch-window race; its isolated rerun passed and the subsequent complete 907-test run passed."
+  },
+  "deployment_artifacts": {
+    "beezconsole_exe_sha256": "413b32b82f216ea76a33da41ade11ec30e1de107f26628edd0e440c8b1d2172e",
+    "observer_addon_source_sha256": "c1cf49a743afc35e94f07035112e548ce94c72c357c1d42676370f5ac0b76321",
+    "observer_indicator_source_sha256": "53ed3beac1e0ba74dd3e39a16118ea5b45013f70f7460b08061971b4e28be825",
+    "repository_installed_sources_match": true,
+    "ninjatrader_custom_dll_sha256": "621d0ccc7ef8dde3444d2ed2e512c7be2310d47fa9cb9fa0951187eaf72beef0",
+    "paper_execution_addon_source_fingerprint": "ca43253d190e164a55cde371b148879d369901738ecf282cbe881eaa2f9375ef",
+    "paper_execution_addon_build_fingerprint": "e2200e55f8a9ac71fc80866cf2a37a18ce951306bd217c6605c2f1929063b952",
+    "paper_execution_addon_provenance": "MATCH"
+  },
+  "runtime_proof": {
+    "automatic_login": {
+      "operation_id": "ntm-d12f38e4bd724602b1741ea4b69a3377",
+      "state": "AUTHENTICATED",
+      "attempt_count": 1
+    },
+    "chart": {
+      "instrument": "MNQ SEP26",
+      "automation_id": "ChartWindow",
+      "creation_proof": "CREATED_WITH_EXACT_DATASERIES_UI_AUTOMATION",
+      "final_automation_result": "ALREADY_PRESENT"
+    },
+    "observer": {
+      "state": "ACTIVE",
+      "attached": true,
+      "subscription_mode": "NATIVE_ADDON",
+      "instrument": "MNQ SEP26",
+      "level_one_fresh": true,
+      "depth_fresh": true
+    },
+    "final_implementation_operation_id": "ntm-4b061ce78b2c4554a506ee5bbf2bca45",
+    "maintenance_readiness": "READY",
+    "implementation_proof_sequence": 1479,
+    "implementation_proof_hash": "22dc622bd61de7827c42b4275d601230319543e1aab745f6826d36ee02636e90",
+    "chain_valid": true,
+    "checkpoint_valid": true,
+    "unverified_tail_rows_at_proof": 0,
+    "runtime": "READY_DISARMED",
+    "account_class": "LOCAL_SIMULATION",
+    "instrument": "MNQ SEP26",
+    "position": "FLAT",
+    "quantity": 0,
+    "working_orders": 0,
+    "live_authority": "DISARMED",
+    "live_capital": "DENIED"
+  },
+  "deployment_incident": {
+    "cause": "Hot-compiling the observer DLL left the prior chart-indicator assembly alive until a clean NinjaTrader restart.",
+    "effect": "Fail-closed STALE_PROVIDER_STATE prior_session_callback rejection incidents were appended; no execution command or order was produced.",
+    "quiesced_verification": {
+      "verification_id": "lv-dc2c9c20551940c7b05ae875e7d9d0bb",
+      "verified_through_sequence": 1329,
+      "tip_hash": "9a8aafd0e18564f4eabe8a077f1e863b47a4109dbaab521d748f3f6d34990301",
+      "chain_valid": true,
+      "checkpoint_valid": true
+    },
+    "after_clean_restart_rejection_count": 0
+  },
+  "authority_accounting": {
+    "historical_command_counter_before_task": 3,
+    "execution_commands_sent_by_task": 0,
+    "orders_submitted_by_task": 0,
+    "orders_cancelled_by_task": 0,
+    "paper_trading_started_by_task": false
+  }
+}
