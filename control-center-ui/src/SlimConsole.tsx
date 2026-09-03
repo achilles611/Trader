@@ -19,8 +19,20 @@ const pnlClass = (value: unknown) => {
 
 export function SlimConsole({ paper, onFullConsole }: Props) {
   const status = paper.slimStatus;
-  const light = status?.light || "RED";
-  const active = status?.paper_active === true;
+  const commissioning = paper.status?.commissioning_lifecycle;
+  // Older running backends classify ARMED_FLAT as "not safely disarmed" even
+  // though an intentional one-shot commissioning reservation owns authority.
+  // Render that known lifecycle directly so Slim never calls healthy waiting
+  // a runtime failure while the backend update is awaiting its next restart.
+  const waitingForConfluence = commissioning?.active === true
+    && commissioning?.phase === "WAITING_FOR_HIGH_CONFLUENCE"
+    && paper.status?.state === "ARMED_FLAT";
+  const light = waitingForConfluence ? "YELLOW" : status?.light || "RED";
+  const label = waitingForConfluence ? "WAITING FOR HIGH CONFLUENCE" : status?.label || "NOT READY";
+  const message = waitingForConfluence
+    ? `Commissioning is armed and waiting for a fresh signal meeting ${paper.status?.effective_confidence_threshold || "the configured"} support and ${paper.status?.entry_dominance_margin || "the configured"} dominance.`
+    : status?.message || "Waiting for current canonical paper runtime status.";
+  const active = waitingForConfluence || status?.paper_active === true;
   const runtimeState = String(paper.status?.state || "");
   const runtimeMayBeActive = paper.status?.operational_paper_session?.active === true
     || ["STARTING", "PAPER_RUNNING", "ENTRY_PENDING", "OPEN_POSITION", "EXIT_PENDING", "PAUSED", "RECONCILING", "FAULTED", "LOCKED_OUT"].includes(runtimeState);
@@ -50,8 +62,8 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
       <div className="slim-lights" role="img" aria-label={`Readiness: ${light}`}>
         {(["RED", "YELLOW", "GREEN"] as const).map((item) => <span className={`slim-light ${item.toLowerCase()} ${light === item ? "illuminated" : ""}`} key={item} aria-hidden="true" />)}
       </div>
-      <h1 id="slim-readiness-heading">{status?.label || "NOT READY"}</h1>
-      <p className="slim-message" role="status" aria-live="polite">{status?.message || "Waiting for current canonical paper runtime status."}</p>
+      <h1 id="slim-readiness-heading">{label}</h1>
+      <p className="slim-message" role="status" aria-live="polite">{message}</p>
       <p className="slim-session">Session: <strong>{session.session_kind || "OFF_SESSION"}</strong>{session.session_family ? ` / ${session.session_family}` : ""}{session.entry_window ? ` · ${session.entry_window}` : ""}</p>
       <p className="slim-session">Profile: <strong>{paper.status?.entry_profile || "UNAVAILABLE"}</strong>{paper.status?.effective_confidence_threshold ? ` · ${paper.status.effective_confidence_threshold} threshold` : ""}</p>
     </section>

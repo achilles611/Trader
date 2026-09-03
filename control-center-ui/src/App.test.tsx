@@ -877,6 +877,29 @@ describe("copy control center", () => {
     expect(fetch).not.toHaveBeenCalledWith("/api/lane-iii/paper/operational-start", expect.anything());
   });
 
+  it("renders an armed commissioning wait as active instead of NOT READY", async () => {
+    slimStatusResponse = {
+      generated_at: new Date().toISOString(), light: "RED", label: "NOT READY",
+      message: "Paper runtime is not safely disarmed.", can_start: false, paper_active: false,
+      ledger_verification: { state: "PASS", message: "Verified" },
+      pnl: { state: "CURRENT", total: "0", realized: "0", unrealized: "0" },
+    };
+    laneIIIPaperOverrides = {
+      state: "ARMED_FLAT",
+      entry_profile: "NY_HIGH_CONFLUENCE_COMMISSIONING",
+      effective_confidence_threshold: "0.675",
+      entry_dominance_margin: "0.10",
+      commissioning_lifecycle: { active: true, phase: "WAITING_FOR_HIGH_CONFLUENCE" },
+    };
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+    expect(await screen.findByRole("img", { name: "Readiness: YELLOW" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "WAITING FOR HIGH CONFLUENCE" })).toBeInTheDocument();
+    expect(screen.getByText(/0\.675 support and 0\.10 dominance/)).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "NOT READY" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "STOP TRADING" })).toBeEnabled();
+  });
+
   it("falls back to Full Console for an invalid saved mode preference", async () => {
     localStorage.setItem("beezconsole-console-mode", "unsupported-mode");
     render(<App />);

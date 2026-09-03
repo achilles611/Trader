@@ -154,6 +154,24 @@ class SlimPaperStatusTests(unittest.TestCase):
         self.assertTrue(result["paper_active"])
         self.assertFalse(result["can_start"])
 
+    def test_armed_commissioning_wait_is_yellow_active_not_red_not_ready(self) -> None:
+        paper = runtime(state="ARMED_FLAT")
+        paper["commissioning_lifecycle"] = {
+            "active": True,
+            "phase": "WAITING_FOR_HIGH_CONFLUENCE",
+        }
+        paper["effective_confidence_threshold"] = "0.675"
+        paper["entry_dominance_margin"] = "0.10"
+        result = self.status(
+            paper,
+            {"result": "BLOCKED", "blocking_reasons": ["STATE_NOT_READY_DISARMED"]},
+        )
+        self.assertEqual(result["light"], "YELLOW")
+        self.assertEqual(result["label"], "WAITING FOR HIGH CONFLUENCE")
+        self.assertIn("0.675 support and 0.10 dominance", result["message"])
+        self.assertTrue(result["paper_active"])
+        self.assertFalse(result["can_start"])
+
     def test_operational_session_allows_a_healthy_online_append_tail_but_rejects_corruption(self) -> None:
         healthy = self.status(
             operational_runtime(),

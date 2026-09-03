@@ -314,8 +314,11 @@ def derive_slim_paper_status(
 
     state = str(runtime.get("state") or "UNKNOWN")
     operational = _as_mapping(runtime.get("operational_paper_session"))
+    commissioning = _as_mapping(runtime.get("commissioning_lifecycle"))
+    commissioning_active = commissioning.get("active") is True
     active_state = (
         operational.get("active") is True
+        or commissioning_active
         or state in {"PAPER_RUNNING", "ENTRY_PENDING", "LONG", "SHORT", "EXIT_PENDING", "STOPPING"}
     )
     if active_state:
@@ -327,6 +330,28 @@ def derive_slim_paper_status(
                 "light": "YELLOW",
                 "label": "STOPPING…",
                 "message": "Cancelling owned work and waiting for Sim101 flat reconciliation.",
+                "primary_blocker": None,
+                "can_start": False,
+                "paper_active": True,
+                "ledger_verification": verification_payload,
+                "pnl": pnl,
+            })
+        if (
+            commissioning_active
+            and state == "ARMED_FLAT"
+            and commissioning.get("phase") == "WAITING_FOR_HIGH_CONFLUENCE"
+        ):
+            support = str(runtime.get("effective_confidence_threshold") or "the configured")
+            dominance = str(runtime.get("entry_dominance_margin") or "the configured")
+            return finalize({
+                "schema": SLIM_STATUS_SCHEMA,
+                "generated_at": _timestamp(current),
+                "light": "YELLOW",
+                "label": "WAITING FOR HIGH CONFLUENCE",
+                "message": (
+                    "Commissioning is armed and waiting for a fresh signal meeting "
+                    f"{support} support and {dominance} dominance."
+                ),
                 "primary_blocker": None,
                 "can_start": False,
                 "paper_active": True,
