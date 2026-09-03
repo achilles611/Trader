@@ -116,6 +116,7 @@ class FakeDesktop:
         self.on_start = on_start
         self.probe_calls = 0
         self.configure_calls: list[str] = []
+        self.ensure_chart_calls: list[str] = []
         self.start_calls = 0
         self.close_calls = 0
 
@@ -135,6 +136,10 @@ class FakeDesktop:
         if self.on_start is not None:
             self.on_start(self)
         return True
+
+    def ensure_chart(self, instrument: str) -> dict[str, object]:
+        self.ensure_chart_calls.append(instrument)
+        return {"ok": instrument == "MNQ SEP26", "result": "ALREADY_PRESENT", "instrument": instrument}
 
     def request_graceful_shutdown(self) -> bool:
         self.close_calls += 1
@@ -217,6 +222,7 @@ class NinjaTraderMaintenanceTests(unittest.TestCase):
         self.assertEqual(desktop.start_calls, 1)
         self.assertEqual(desktop.close_calls, 0)
         self.assertEqual(desktop.configure_calls, ["MNQ SEP26"])
+        self.assertEqual(desktop.ensure_chart_calls, ["MNQ SEP26"])
         self.assertEqual(status["button"]["label"], "NinjaTrader Ready")
 
     def test_already_running_healthy_is_idempotent_and_does_not_restart(self) -> None:
@@ -224,6 +230,7 @@ class NinjaTraderMaintenanceTests(unittest.TestCase):
         status = self.run_service(self.service(desktop))
         self.assertEqual(status["stage"], "READY")
         self.assertEqual((desktop.start_calls, desktop.close_calls), (0, 0))
+        self.assertEqual(desktop.ensure_chart_calls, ["MNQ SEP26"])
         self.assertEqual(self.ledger.start_calls, 1)
 
     def test_normal_startup_never_turns_stale_observer_into_an_implicit_restart(self) -> None:
@@ -372,7 +379,7 @@ class NinjaTraderMaintenanceTests(unittest.TestCase):
         self.assertIn("WRONG_OBSERVER_INSTRUMENT", status["blockers"])
         self.assertIsNone(status["manual_action"])
 
-    def test_headless_native_observer_is_ready_without_chart(self) -> None:
+    def test_native_observer_and_automatically_ensured_chart_are_ready(self) -> None:
         observer = self.paper.value["market_observer"]
         assert isinstance(observer, dict)
         observer["observer_attachment"] = {
@@ -383,7 +390,8 @@ class NinjaTraderMaintenanceTests(unittest.TestCase):
         desktop = FakeDesktop(process=False, on_start=lambda value: setattr(value, "control_center", True))
         status = self.run_service(self.service(desktop))
         self.assertEqual(status["stage"], "READY")
-        self.assertFalse(status["chart"]["found"])
+        self.assertTrue(status["chart"]["found"])
+        self.assertEqual(status["chart"]["automation_result"], "ALREADY_PRESENT")
         self.assertEqual(status["observer"]["subscription_mode"], "NATIVE_ADDON")
 
     def test_existing_correct_chart_and_attached_observer_are_reused(self) -> None:
@@ -489,6 +497,11 @@ class NinjaTraderMaintenanceTests(unittest.TestCase):
         self.assertIn("InvokePattern]::Pattern", helper)
         self.assertIn("UNEXPECTED_SAVE_WORKSPACE_UI", helper)
         self.assertLess(helper.index("if ($null -ne $ControlCenter)"), helper.index("$Process.CloseMainWindow()"))
+        self.assertIn("'ensure-chart'", helper)
+        self.assertIn("DataSeriesWindowInstrumentSelector", helper)
+        self.assertIn("DataSeriesWindowOkButton", helper)
+        self.assertIn("ValuePattern]::Pattern", helper)
+        self.assertNotIn("SendKeys", helper)
         self.assertIn("Resolve-NinjaExecutable", helper)
         self.assertIn("request_id", source)
 

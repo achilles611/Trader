@@ -54,6 +54,7 @@ class DesktopProbe:
 class NinjaTraderDesktopAdapter(Protocol):
     def probe(self) -> DesktopProbe: ...
     def configure_instrument(self, instrument: str) -> bool: ...
+    def ensure_chart(self, instrument: str) -> Mapping[str, object]: ...
     def start(self) -> bool: ...
     def request_graceful_shutdown(self) -> bool: ...
 
@@ -77,7 +78,7 @@ class PowerShellNinjaTraderDesktopAdapter:
         self.command_timeout_seconds = command_timeout_seconds
 
     def _run(self, action: str) -> dict[str, object]:
-        if action not in {"probe", "start", "close-gracefully"} or not self.script_path.is_file():
+        if action not in {"probe", "start", "close-gracefully", "ensure-chart"} or not self.script_path.is_file():
             return {"ok": False, "failure_category": "AUTOMATION_PROCESS_FAILED"}
         try:
             completed = subprocess.run(
@@ -91,7 +92,7 @@ class PowerShellNinjaTraderDesktopAdapter:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=self.command_timeout_seconds,
+                timeout=max(self.command_timeout_seconds, 45.0) if action == "ensure-chart" else self.command_timeout_seconds,
                 check=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 env=PowerShellNinjaTraderLoginAdapter._windows_powershell_environment(),
@@ -142,6 +143,14 @@ class PowerShellNinjaTraderDesktopAdapter:
 
     def start(self) -> bool:
         return self._run("start").get("ok") is True
+
+    def ensure_chart(self, instrument: str) -> Mapping[str, object]:
+        if not _INSTRUMENT.fullmatch(instrument):
+            return {"ok": False, "failure_category": "CONFIGURED_INSTRUMENT_UNRESOLVED"}
+        result = self._run("ensure-chart")
+        if result.get("instrument") not in {None, instrument}:
+            return {"ok": False, "failure_category": "WRONG_CHART_INSTRUMENT"}
+        return result
 
     def request_graceful_shutdown(self) -> bool:
         return self._run("close-gracefully").get("ok") is True
@@ -254,6 +263,7 @@ class NinjaTraderMaintenanceService:
         self._baseline_command_count = 0
         self._task_command_count = 0
         self._ledger_result: dict[str, object] = {}
+        self._chart_result: dict[str, object] = {}
         self._last_probe = DesktopProbe()
         self._last_probe_at = float("-inf")
         self._audit_healthy = True
@@ -605,9 +615,10 @@ class NinjaTraderMaintenanceService:
                 "configured_instrument": self._configured_instrument(paper),
                 "chart": {
                     "state": attachment.get("state", "UNKNOWN"),
-                    "found": attachment.get("chart_found") is True,
-                    "created": False,
-                    "instrument": attachment.get("instrument"),
+                    "found": attachment.get("chart_found") is True or self._chart_result.get("ok") is True,
+                    "created": self._chart_result.get("result") == "CREATED",
+                    "instrument": self._chart_result.get("instrument", attachment.get("instrument")),
+                    "automation_result": self._chart_result.get("result"),
                 },
                 "observer": {
                     "state": observer.get("market_observer_state", "NOT_ACTIVE"),
@@ -676,6 +687,7 @@ class NinjaTraderMaintenanceService:
             self._baseline_command_count = self._current_command_count(paper)
             self._task_command_count = 0
             self._ledger_result = {}
+            self._chart_result = {}
             try:
                 self._audit("OPERATION_STARTED")
             except MaintenanceAuditError:
@@ -762,14 +774,16 @@ class NinjaTraderMaintenanceService:
                 self._transition(MaintenanceStage.BLOCKED, [probe.failure_category])
                 return
             paper = self._paper_status()
-            if self._healthy(probe, paper):
-                ok, _ = self._verify_ledger(MaintenanceStage.FINAL_LEDGER_VERIFICATION)
-                if ok:
-                    self._finish_ready()
-                return
             instrument = self._configured_instrument(paper)
             if not self._desktop.configure_instrument(instrument):
                 self._transition(MaintenanceStage.BLOCKED, ["CONFIGURED_INSTRUMENT_UNRESOLVED_OR_UNWRITABLE"])
+                return
+            if self._healthy(probe, paper):
+                if not self._ensure_configured_chart(instrument):
+                    return
+                ok, _ = self._verify_ledger(MaintenanceStage.FINAL_LEDGER_VERIFICATION)
+                if ok:
+                    self._finish_ready()
                 return
             ok, report = self._verify_ledger(MaintenanceStage.VERIFYING_RESTART_LEDGER)
             if not ok:
@@ -847,6 +861,8 @@ class NinjaTraderMaintenanceService:
                     ["NINJATRADER_CONTROL_CENTER_TIMEOUT"],
                 )
                 return
+            if not self._ensure_configured_chart(instrument):
+                return
             self._transition(MaintenanceStage.WAITING_FOR_ADDON)
             if not self._wait_for(lambda: self._addon_ready(self._paper_status()), self._timeouts.addon_seconds):
                 paper = self._paper_status()
@@ -893,6 +909,24 @@ class NinjaTraderMaintenanceService:
                     self._stage = MaintenanceStage.BLOCKED
                     self._stage_started_at = _utc_now()
                     self._blockers = ["MAINTENANCE_AUDIT_UNAVAILABLE"]
+
+    def _ensure_configured_chart(self, instrument: str) -> bool:
+        self._transition(MaintenanceStage.VERIFYING_CHART)
+        value = self._desktop.ensure_chart(instrument)
+        result = dict(value) if isinstance(value, Mapping) else {}
+        with self._lock:
+            self._chart_result = {
+                "ok": result.get("ok") is True,
+                "result": _safe_text(result.get("result"), 80) if result.get("result") is not None else None,
+                "instrument": _safe_text(result.get("instrument"), 40) if result.get("instrument") is not None else None,
+            }
+        if result.get("ok") is not True or result.get("instrument") != instrument:
+            failure = result.get("failure_category")
+            blocker = _safe_text(failure, 80) if isinstance(failure, str) else "MNQ_CHART_AUTOMATION_FAILED"
+            self._transition(MaintenanceStage.BLOCKED, [blocker])
+            return False
+        self._audit("MNQ_CHART_ENSURED")
+        return True
 
     def _final_reconciliation_ready(self) -> bool:
         paper = self._paper_status()

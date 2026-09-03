@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('probe', 'start', 'close-gracefully', 'submit-login', 'connect-lucid')]
+    [ValidateSet('probe', 'start', 'close-gracefully', 'ensure-chart', 'submit-login', 'connect-lucid')]
     [string] $Action
 )
 
@@ -108,6 +108,132 @@ function Find-Descendants {
         [System.Windows.Automation.Condition] $Condition
     )
     return @($Root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $Condition))
+}
+
+function Get-UniqueElements {
+    param([object[]] $Elements)
+    $unique = @{}
+    foreach ($element in $Elements) {
+        $runtimeId = $element.GetRuntimeId() -join '.'
+        if (-not $unique.ContainsKey($runtimeId)) { $unique[$runtimeId] = $element }
+    }
+    return @($unique.Values)
+}
+
+function Resolve-ConfiguredObserverInstrument {
+    $path = Join-Path $credentialRoot 'beelzebub-observer.local.config'
+    if (-not [System.IO.File]::Exists($path)) { return $null }
+    try {
+        $matches = @([System.IO.File]::ReadAllLines($path) | Where-Object {
+            $_ -match '^L3F_NT_MARKET_INSTRUMENT=(MNQ [A-Z]{3}[0-9]{2})$'
+        })
+        if ($matches.Count -ne 1) { return $null }
+        return [regex]::Match($matches[0], '^L3F_NT_MARKET_INSTRUMENT=(MNQ [A-Z]{3}[0-9]{2})$').Groups[1].Value
+    }
+    catch { return $null }
+}
+
+function Get-MatchingChartWindows {
+    param(
+        [object[]] $Windows,
+        [string] $Instrument
+    )
+    return @($Windows | Where-Object {
+        $_.Current.AutomationId -eq 'ChartWindow' -and
+        $_.Current.Name -eq "Chart - $Instrument" -and
+        $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Window
+    })
+}
+
+function Get-ProcessElementById {
+    param(
+        [System.Diagnostics.Process] $Process,
+        [string] $AutomationId,
+        [System.Windows.Automation.ControlType] $ControlType
+    )
+    $processCondition = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ProcessIdProperty,
+        $Process.Id
+    )
+    $idCondition = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+        $AutomationId
+    )
+    $raw = @([System.Windows.Automation.AutomationElement]::RootElement.FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants,
+        (New-Object System.Windows.Automation.AndCondition($processCondition, $idCondition))
+    ) | Where-Object {
+        $_.Current.IsEnabled -and -not $_.Current.IsOffscreen -and
+        $_.Current.ControlType -eq $ControlType
+    })
+    return @(Get-UniqueElements -Elements $raw)
+}
+
+function Ensure-ConfiguredChart {
+    param([hashtable] $Context)
+    $instrument = Resolve-ConfiguredObserverInstrument
+    if ($null -eq $instrument) {
+        return @{ ok = $false; failure_category = 'CONFIGURED_INSTRUMENT_UNRESOLVED' }
+    }
+    $matching = @(Get-MatchingChartWindows -Windows $Context.Windows -Instrument $instrument)
+    if ($matching.Count -gt 0) {
+        return @{ ok = $true; result = 'ALREADY_PRESENT'; instrument = $instrument }
+    }
+    $newMenus = @(Get-ProcessElementById -Process $Context.Process -AutomationId 'ControlCenterMenuItemNew' -ControlType ([System.Windows.Automation.ControlType]::MenuItem))
+    if ($newMenus.Count -ne 1) {
+        return @{ ok = $false; failure_category = 'CONTROL_CENTER_NOT_IDENTIFIED' }
+    }
+    try {
+        $newMenus[0].GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+        Start-Sleep -Milliseconds 400
+        $chartItems = @(Get-ProcessElementById -Process $Context.Process -AutomationId 'ControlCenterMenuItemNewChart' -ControlType ([System.Windows.Automation.ControlType]::MenuItem))
+        if ($chartItems.Count -ne 1) {
+            return @{ ok = $false; failure_category = 'CHART_MENU_NOT_IDENTIFIED' }
+        }
+        $chartItems[0].GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    }
+    catch { return @{ ok = $false; failure_category = 'CHART_MENU_NOT_IDENTIFIED' } }
+
+    $dataSeries = @()
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        Start-Sleep -Milliseconds 250
+        $dataSeries = @(Get-ProcessElementById -Process $Context.Process -AutomationId 'DataSeriesWindow' -ControlType ([System.Windows.Automation.ControlType]::Window))
+        if ($dataSeries.Count -ne 0) { break }
+    }
+    if ($dataSeries.Count -ne 1) {
+        return @{ ok = $false; failure_category = 'DATA_SERIES_WINDOW_NOT_IDENTIFIED' }
+    }
+    $selectors = @(Get-ProcessElementById -Process $Context.Process -AutomationId 'DataSeriesWindowInstrumentSelector' -ControlType ([System.Windows.Automation.ControlType]::Custom))
+    if ($selectors.Count -ne 1) {
+        return @{ ok = $false; failure_category = 'INSTRUMENT_SELECTOR_NOT_IDENTIFIED' }
+    }
+    try {
+        $value = $selectors[0].GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+        $value.SetValue($instrument)
+        if ($value.Current.Value -ne $instrument) {
+            return @{ ok = $false; failure_category = 'INSTRUMENT_SELECTION_FAILED' }
+        }
+        Start-Sleep -Milliseconds 400
+        $okButtons = @(Get-ProcessElementById -Process $Context.Process -AutomationId 'DataSeriesWindowOkButton' -ControlType ([System.Windows.Automation.ControlType]::Button))
+        if ($okButtons.Count -ne 1) {
+            return @{ ok = $false; failure_category = 'DATA_SERIES_CONFIRMATION_NOT_IDENTIFIED' }
+        }
+        $okButtons[0].GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    }
+    catch { return @{ ok = $false; failure_category = 'INSTRUMENT_SELECTION_FAILED' } }
+
+    for ($attempt = 0; $attempt -lt 120; $attempt++) {
+        Start-Sleep -Milliseconds 250
+        $current = Get-NinjaContext
+        if ($null -ne $current.Failure -or $null -eq $current.Process) {
+            return @{ ok = $false; failure_category = 'CHART_CREATION_FAILED' }
+        }
+        $matching = @(Get-MatchingChartWindows -Windows $current.Windows -Instrument $instrument)
+        if ($matching.Count -gt 0) {
+            return @{ ok = $true; result = 'CREATED'; instrument = $instrument }
+        }
+    }
+    return @{ ok = $false; failure_category = 'CHART_CREATION_TIMEOUT' }
 }
 
 function Get-NinjaContext {
@@ -348,6 +474,17 @@ try {
             if ($workspaceConfirmation -eq 'CONFIRMED') { break }
         }
         Write-SanitizedResult @{ ok = $true; result = 'GRACEFUL_CLOSE_REQUESTED'; workspace_confirmation = $workspaceConfirmation; failure_category = $null }
+        exit 0
+    }
+
+    if ($Action -eq 'ensure-chart') {
+        $context = Get-NinjaContext
+        if ($null -ne $context.Failure -or $null -eq $context.Process) {
+            Write-SanitizedResult @{ ok = $false; failure_category = 'CONTROL_CENTER_NOT_IDENTIFIED' }
+            exit 0
+        }
+        $result = Ensure-ConfiguredChart -Context $context
+        Write-SanitizedResult $result
         exit 0
     }
 
