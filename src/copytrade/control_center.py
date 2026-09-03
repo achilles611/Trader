@@ -45,6 +45,7 @@ from src.l3g_paper.paper_autostart import (
     PaperAutoStartService,
 )
 from src.l3g_paper.ninjatrader_transport import PaperExecutionTransport
+from src.l3g_paper.contracts import POLICY
 from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout
 from src.l3g_paper.sessions import session_catalog
 from src.l3g_paper.slim_status import derive_slim_paper_status, unavailable_slim_status
@@ -1545,9 +1546,13 @@ def create_control_center_app(
                 "market_instrument": "MNQ SEP26",
                 "maximum_quantity": 1,
                 "live_capital": "DENIED",
-                "entry_profile": "STANDARD",
-                "entry_profile_version": "STANDARD_V1",
-                "effective_confidence_threshold": "0.65",
+                "entry_profile": POLICY.entry_profile,
+                "entry_profile_version": POLICY.entry_profile_version,
+                "effective_confidence_threshold": str(POLICY.entry_support_threshold),
+                "entry_dominance_margin": str(POLICY.entry_dominance_margin),
+                "entry_family_count": POLICY.entry_family_count,
+                "reentry_cooldown_seconds": POLICY.reentry_cooldown_seconds,
+                "retention_confidence_threshold": str(POLICY.retention_support_threshold),
                 "session_definitions": list(session_catalog()),
                 "account_balances": observer["account_balances"],
                 "market_observer": observer,

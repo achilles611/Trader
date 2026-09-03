@@ -53,6 +53,7 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
       <h1 id="slim-readiness-heading">{status?.label || "NOT READY"}</h1>
       <p className="slim-message" role="status" aria-live="polite">{status?.message || "Waiting for current canonical paper runtime status."}</p>
       <p className="slim-session">Session: <strong>{session.session_kind || "OFF_SESSION"}</strong>{session.session_family ? ` / ${session.session_family}` : ""}{session.entry_window ? ` · ${session.entry_window}` : ""}</p>
+      <p className="slim-session">Profile: <strong>{paper.status?.entry_profile || "UNAVAILABLE"}</strong>{paper.status?.effective_confidence_threshold ? ` · ${paper.status.effective_confidence_threshold} threshold` : ""}</p>
     </section>
 
     <section className="slim-card slim-pnl" aria-labelledby="slim-pnl-heading">

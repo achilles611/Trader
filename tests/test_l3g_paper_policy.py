@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 from src.l3f_provider.tradovate_observation import StreamHealth
 from src.l3g_paper.contracts import PaperDecisionKind, PaperDirection
@@ -42,8 +43,39 @@ class PaperPolicyTests(unittest.TestCase):
         first = warmed_bullish_policy()[2]
         second = warmed_bullish_policy()[2]
         self.assertEqual(first.paper_decision_id, second.paper_decision_id)
+        self.assertEqual(first.paper_policy_id, "l3g-beelzebub-scalper-policy-v1")
         self.assertFalse(first.scientific_eligibility)
         self.assertNotIn("provider_sequence", first.payload())
+
+    def test_aggressive_scalper_parameters_are_reported_by_policy_status(self) -> None:
+        status = ExperimentalPaperPolicy().status()
+        self.assertEqual(status["entry_profile"], "BEEZELBUB_SCALPER")
+        self.assertEqual(status["entry_profile_version"], "BEEZELBUB_SCALPER_V1")
+        self.assertEqual(status["entry_parameters"], {
+            "support_threshold": "0.55",
+            "dominance_margin": "0.025",
+            "family_count": 3,
+            "reentry_cooldown_seconds": 10,
+            "retention_support_threshold": "0.525",
+        })
+
+    def test_three_family_candidate_at_scalper_threshold_and_margin_can_enter(self) -> None:
+        policy = ExperimentalPaperPolicy()
+        policy.on_transport_state(StreamHealth.HEALTHY)
+        factory = ObservationFactory()
+        policy.ingest(factory.make("CONNECTION", {"scope": "MARKET_DATA", "price_status": "Connected"}))
+        policy._depth_recovering = False
+        families = {"positive_family_count": 3, "blocking_contradiction": False}
+
+        def score(_at: str, hypothesis: object) -> tuple[Decimal, dict[str, object]]:
+            value = Decimal("0.575") if getattr(hypothesis, "value", None) == "BULLISH_REVERSAL" else Decimal("0.55")
+            return value, dict(families)
+
+        policy.score = score  # type: ignore[method-assign]
+        decision = policy.evaluate(factory.quote(100))
+        self.assertEqual(decision.decision, PaperDecisionKind.LONG)
+        self.assertEqual(decision.relative_support, Decimal("0.575"))
+        self.assertEqual(decision.reason_code, "ENTRY_AUTHORIZED_DIRECTION")
 
     def test_unknown_aggressor_never_votes(self) -> None:
         policy = ExperimentalPaperPolicy(); policy.on_transport_state(StreamHealth.HEALTHY)

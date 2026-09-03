@@ -219,8 +219,9 @@ class LondonIsolationAndSerializationTests(unittest.TestCase):
             factory = ObservationFactory(start=datetime(2026, 1, 15, 8, 5, tzinfo=UTC))
             runtime.ingest(factory.quote(100))
             status = runtime.status()
-            self.assertEqual(status["entry_profile"], "STANDARD")
-            self.assertEqual(status["effective_confidence_threshold"], "0.65")
+            self.assertEqual(status["entry_profile"], "BEEZELBUB_SCALPER")
+            self.assertEqual(status["entry_profile_version"], "BEEZELBUB_SCALPER_V1")
+            self.assertEqual(status["effective_confidence_threshold"], "0.55")
             self.assertEqual(status["current_session"], "LONDON")
             self.assertEqual(status["current_session_family"], "EUROPE")
             self.assertEqual(status["london_session_pnl"], "0")
@@ -234,9 +235,10 @@ class LondonIsolationAndSerializationTests(unittest.TestCase):
             runtime.stop()
             ledger.close()
 
-    def test_standard_policy_risk_and_addon_fingerprint_remain_sealed(self) -> None:
-        self.assertEqual(POLICY.policy_id, "l3g-paper-policy-v0")
-        self.assertEqual(POLICY.entry_support_threshold, Decimal("0.65"))
+    def test_scalper_policy_risk_and_addon_fingerprint_remain_sealed(self) -> None:
+        self.assertEqual(POLICY.policy_id, "l3g-beelzebub-scalper-policy-v1")
+        self.assertEqual(POLICY.entry_support_threshold, Decimal("0.55"))
+        self.assertEqual(POLICY.entry_dominance_margin, Decimal("0.025"))
         self.assertEqual(RISK_PROFILE.maximum_absolute_position, 1)
         self.assertFalse(RISK_PROFILE.approved_for_live)
         self.assertEqual(expected_addon_source_fingerprint(), EXPECTED_ADDON_SOURCE_FINGERPRINT)

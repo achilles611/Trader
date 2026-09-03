@@ -24,10 +24,12 @@ from .sessions import (
 )
 
 
-PAPER_POLICY_SCHEMA = "lane-iii-phase-g-paper-policy-v1"
+PAPER_POLICY_SCHEMA = "lane-iii-phase-g-paper-policy-v2"
 PAPER_RISK_SCHEMA = "lane-iii-phase-g-paper-risk-v1"
 PAPER_RECORD_SCHEMA = "lane-iii-phase-g-paper-record-v1"
-PAPER_POLICY_ID = "l3g-paper-policy-v0"
+PAPER_POLICY_ID = "l3g-beelzebub-scalper-policy-v1"
+PAPER_ENTRY_PROFILE = "BEEZELBUB_SCALPER"
+PAPER_ENTRY_PROFILE_VERSION = "BEEZELBUB_SCALPER_V1"
 PAPER_RISK_PROFILE_ID = "lucid-flex-paper-commissioning-v0"
 PAPER_MODE = "PAPER_SIM101"
 PAPER_ACCOUNT = "Sim101"
@@ -154,6 +156,8 @@ def _validate_session_identity(
 class PaperPolicyArtifact:
     schema: str = PAPER_POLICY_SCHEMA
     policy_id: str = PAPER_POLICY_ID
+    entry_profile: str = PAPER_ENTRY_PROFILE
+    entry_profile_version: str = PAPER_ENTRY_PROFILE_VERSION
     authority: str = "EXPERIMENTAL_PAPER_DIRECTION_ONLY"
     instrument: str = "MNQ"
     native_contract: str = PAPER_NATIVE_CONTRACT
@@ -174,21 +178,26 @@ class PaperPolicyArtifact:
     liquidity_evidence_lifetime_seconds: int = 20
     hypothesis_idle_lifetime_seconds: int = 90
     hypothesis_maximum_lifetime_seconds: int = 600
-    entry_support_threshold: Decimal = Decimal("0.65")
-    entry_dominance_margin: Decimal = Decimal("0.10")
-    retention_support_threshold: Decimal = Decimal("0.58")
-    retention_dominance_margin: Decimal = Decimal("0.03")
+    entry_support_threshold: Decimal = Decimal("0.55")
+    entry_dominance_margin: Decimal = Decimal("0.025")
+    retention_support_threshold: Decimal = Decimal("0.525")
+    retention_dominance_margin: Decimal = Decimal("0.00")
     entry_family_count: int = 3
     retention_family_count: int = 2
     decision_ttl_seconds: int = 5
-    reentry_cooldown_seconds: int = 30
+    reentry_cooldown_seconds: int = 10
     structural_strength: Decimal = Decimal("0.50")
     score_denominator: Decimal = Decimal("10")
     session_timezone: str = "America/New_York"
     provisional_session_boundary: str = "00:00"
 
     def __post_init__(self) -> None:
-        if self.schema != PAPER_POLICY_SCHEMA or self.policy_id != PAPER_POLICY_ID:
+        if (
+            self.schema != PAPER_POLICY_SCHEMA
+            or self.policy_id != PAPER_POLICY_ID
+            or self.entry_profile != PAPER_ENTRY_PROFILE
+            or self.entry_profile_version != PAPER_ENTRY_PROFILE_VERSION
+        ):
             raise ValueError("The paper policy identity is immutable.")
         if self.authority != "EXPERIMENTAL_PAPER_DIRECTION_ONLY" or self.scientific_eligibility:
             raise ValueError("The paper policy cannot acquire scientific or execution authority.")
@@ -198,7 +207,17 @@ class PaperPolicyArtifact:
             HypothesisKind.BULLISH_REVERSAL,
             HypothesisKind.BEARISH_CONTINUATION,
         ):
-            raise ValueError("The v0 paper directional universe is fixed.")
+            raise ValueError("The paper directional universe is fixed.")
+        if (
+            self.entry_support_threshold != Decimal("0.55")
+            or self.entry_dominance_margin != Decimal("0.025")
+            or self.retention_support_threshold != Decimal("0.525")
+            or self.retention_dominance_margin != Decimal("0.00")
+            or self.entry_family_count != 3
+            or self.retention_family_count != 2
+            or self.reentry_cooldown_seconds != 10
+        ):
+            raise ValueError("The Beelzebub scalper policy tuning is immutable.")
 
     def payload(self) -> dict[str, object]:
         return _jsonable(asdict(self))  # type: ignore[return-value]
@@ -235,7 +254,7 @@ class PaperRiskProfile:
     entry_session_end: str = "15:30"
     hard_flat_deadline: str = "15:58"
     session_timezone: str = "America/New_York"
-    reentry_cooldown_seconds: int = 30
+    reentry_cooldown_seconds: int = 10
     maximum_session_entries: int = 12
     maximum_consecutive_losses: int = 4
     maximum_entry_slippage_points: Decimal = Decimal("2.00")
@@ -257,6 +276,8 @@ class PaperRiskProfile:
             raise ValueError("The paper risk profile cannot represent live or multi-contract authority.")
         if self.pyramiding or self.averaging or self.same_event_reversal:
             raise ValueError("Pyramiding, averaging, and same-event reversal are forbidden.")
+        if self.reentry_cooldown_seconds != 10:
+            raise ValueError("The Beelzebub scalper risk cooldown is immutable.")
 
     def payload(self) -> dict[str, object]:
         return _jsonable(asdict(self))  # type: ignore[return-value]

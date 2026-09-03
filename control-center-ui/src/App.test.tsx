@@ -108,6 +108,12 @@ function payload(path: string) {
   }
   if (path.startsWith("/api/lane-iii/paper")) return {
     state: "READY_DISARMED",
+    entry_profile: "BEEZELBUB_SCALPER",
+    entry_profile_version: "BEEZELBUB_SCALPER_V1",
+    effective_confidence_threshold: "0.55",
+    entry_dominance_margin: "0.025",
+    entry_family_count: 3,
+    reentry_cooldown_seconds: 10,
     ledger_verification: ledgerVerificationResponse,
     ledger: {
       path: "E:\\BeelzebubData\\Hot\\LaneIII\\Epoch-002\\lane_iii_paper.sqlite3",
@@ -740,6 +746,8 @@ describe("copy control center", () => {
     expect(fetch).not.toHaveBeenCalledWith("/api/lane-iii/ninjatrader-maintenance", expect.objectContaining({ method: "POST" }));
     expect(screen.getByText("$10.25")).toBeInTheDocument();
     expect(document.querySelector(".slim-session")).toHaveTextContent("LONDON / EUROPE · 08:00-11:30 Europe/London");
+    expect(screen.getByText("BEEZELBUB_SCALPER")).toBeInTheDocument();
+    expect(screen.getByText(/0.55 threshold/)).toBeInTheDocument();
   });
 
   it("keeps NinjaTrader recovery diagnostics out of Slim Mode", async () => {
