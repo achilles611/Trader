@@ -14,11 +14,11 @@
 - A tied bias holds an existing position. A tied bias while flat records `FIVE_MINUTE_BIAS_TIE_FLAT` and sends no order rather than inventing a direction.
 - Every boundary decision includes both bias scores, both evidence-family summaries, the exact evidence provenance, prior/target position, and the last pre-boundary trade or quote-mid reference mark.
 
-The profile remains subordinate to all existing safety gates: exact `Sim101 / LOCAL_SIMULATION / MNQ SEP26`, quantity 1, authenticated execution bridge, fresh observations, complete reconciliation, one owned position, protective stop, daily loss and consecutive-loss lockouts, 12-entry cap, 540-second maximum position age, configured entry window, session close, and hard-flat deadline. A safety gate may therefore flatten or leave the experiment flat until the next valid boundary. Live capital remains denied.
+The profile remains subordinate to all existing safety gates: exact `Sim101 / LOCAL_SIMULATION / MNQ SEP26`, quantity 1, authenticated execution bridge, fresh observations, complete reconciliation, one owned position, protective stop, daily loss, configured entry window, session close, and hard-flat deadline. Its dedicated risk artifact allows up to 128 session entries and uses an 86,400-second age ceiling, so neither the scalper's 12-entry cap nor its 540-second age limit interrupts an otherwise valid in-session five-minute hold. A safety gate may still flatten or leave the experiment flat until the next valid boundary. Live capital remains denied.
 
 ## Isolated startup
 
-Stop and fully reconcile any existing paper runtime first. Use a new ledger path and a new epoch; the runtime rejects a V2 ledger if this profile is selected.
+The normal operator path is Slim Mode's profile selector. **Switch & Start** automatically stops and fully reconciles the current paper runtime, proves controlled ledger closure, and creates a fresh ledger path, audit root, and epoch before this profile starts. The runtime rejects another profile's ledger epoch.
 
 ```powershell
 .\scripts\start_beezconsole.ps1 `
@@ -28,7 +28,7 @@ Stop and fully reconcile any existing paper runtime first. Use a new ledger path
   -LedgerEpoch L3G-PAPER-EPOCH-FIVE-MINUTE-BIAS-V1-20260904
 ```
 
-Profile selection is process-start configuration. An unknown profile name fails startup. V2 remains the default when the setting is absent.
+The PowerShell command remains a maintenance-only fallback. An unknown profile name fails startup. V2 remains the default when the setting is absent.
 
 ## End-of-session analysis
 

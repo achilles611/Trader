@@ -10,10 +10,12 @@ export type PaperConsoleState = {
   slimStatus: any;
   ninjaTraderMaintenance: any;
   paperAutoStart: any;
+  profileSwitch: any;
   error: string | null;
   busy: boolean;
   maintenanceBusy: boolean;
   autoStartBusy: boolean;
+  profileSwitchBusy: boolean;
   verificationInFlight: boolean;
   verificationMode: string;
   setVerificationMode: (mode: string) => void;
@@ -22,6 +24,7 @@ export type PaperConsoleState = {
   startCommissioning: () => Promise<void>;
   startPaperTrading: () => Promise<void>;
   startPaperAutoStart: () => Promise<void>;
+  switchPaperProfile: (targetProfile: string) => Promise<void>;
   startVerification: () => Promise<void>;
   cancelVerification: () => Promise<void>;
   saveSchedule: () => Promise<void>;
@@ -45,31 +48,36 @@ export function usePaperConsoleState({ active, includeSlim, notify }: Options): 
   const [slimStatus, setSlimStatus] = useState<any>(null);
   const [ninjaTraderMaintenance, setNinjaTraderMaintenance] = useState<any>(null);
   const [paperAutoStart, setPaperAutoStart] = useState<any>(null);
+  const [profileSwitch, setProfileSwitch] = useState<any>(null);
   const [maintenanceRequestId, setMaintenanceRequestId] = useState<string | null>(null);
   const [commissioningRequestId, setCommissioningRequestId] = useState<string | null>(null);
   const [operationalPaperRequestId, setOperationalPaperRequestId] = useState<string | null>(null);
   const [autoStartRequestId, setAutoStartRequestId] = useState<string | null>(null);
+  const [profileSwitchRequestId, setProfileSwitchRequestId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [maintenanceBusy, setMaintenanceBusy] = useState(false);
   const [autoStartBusy, setAutoStartBusy] = useState(false);
+  const [profileSwitchBusy, setProfileSwitchBusy] = useState(false);
   const [verificationInFlight, setVerificationInFlight] = useState(false);
   const [verificationMode, setVerificationMode] = useState("auto");
 
   const load = useCallback(async () => {
     try {
-      const [paper, nextSchedule, nextSlim, maintenance, autoStart] = await Promise.all([
+      const [paper, nextSchedule, nextSlim, maintenance, autoStart, nextProfileSwitch] = await Promise.all([
         api<any>("/api/lane-iii/paper"),
         api<any>("/api/lane-iii/paper/ledger-verification/schedule"),
         includeSlim ? api<any>("/api/lane-iii/paper/slim-status") : Promise.resolve(null),
         api<any>("/api/lane-iii/ninjatrader-maintenance"),
         api<any>("/api/lane-iii/paper/auto-start"),
+        api<any>("/api/lane-iii/paper/profile-switch"),
       ]);
       setStatus(paper);
       setSchedule(nextSchedule);
       setSlimStatus(nextSlim);
       setNinjaTraderMaintenance(maintenance);
       setPaperAutoStart(autoStart);
+      setProfileSwitch(nextProfileSwitch);
       setError(null);
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : "Lane III paper status is unavailable.");
@@ -80,6 +88,7 @@ export function usePaperConsoleState({ active, includeSlim, notify }: Options): 
       setSchedule(null);
       setNinjaTraderMaintenance(null);
       setPaperAutoStart(null);
+      setProfileSwitch(null);
       if (includeSlim) setSlimStatus(null);
     }
   }, [includeSlim]);
@@ -116,6 +125,13 @@ export function usePaperConsoleState({ active, includeSlim, notify }: Options): 
       setAutoStartRequestId(null);
     }
   }, [paperAutoStart]);
+
+  useEffect(() => {
+    if (!profileSwitch || profileSwitch.in_progress === true) return;
+    if (["RUNNING", "BLOCKED_SAFE", "FAILED", "CANCELLED"].includes(String(profileSwitch.stage))) {
+      setProfileSwitchRequestId(null);
+    }
+  }, [profileSwitch]);
 
   const act = useCallback(async (path: string, label: string, body?: Record<string, string>) => {
     if (busy) return undefined;
@@ -184,6 +200,34 @@ export function usePaperConsoleState({ active, includeSlim, notify }: Options): 
       setAutoStartBusy(false);
     }
   }, [autoStartBusy, autoStartRequestId, load, notify, paperAutoStart?.action_token, paperAutoStart?.in_progress]);
+
+  const switchPaperProfile = useCallback(async (targetProfile: string) => {
+    if (profileSwitchBusy || profileSwitch?.in_progress === true) return;
+    if (typeof profileSwitch?.action_token !== "string" || !profileSwitch.action_token) {
+      notify({ tone: "error", message: "Profile-switch authentication is unavailable." });
+      return;
+    }
+    const requestId = profileSwitchRequestId || `profile-switch-ui-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    setProfileSwitchRequestId(requestId);
+    setProfileSwitchBusy(true);
+    try {
+      const result = await api<any>("/api/lane-iii/paper/profile-switch", {
+        method: "POST",
+        headers: {
+          "X-Beelzebub-Profile-Switch-Action": "sim101-profile-switch-v1",
+          "X-Beelzebub-Profile-Switch-Token": profileSwitch.action_token,
+        },
+        body: JSON.stringify({ request_id: requestId, target_profile: targetProfile }),
+      });
+      setProfileSwitch(result);
+      notify({ tone: "success", message: "Profile switch accepted. Beelzebub is closing the current ledger before restart." });
+    } catch (failure) {
+      notify({ tone: "error", message: failure instanceof Error ? failure.message : "Profile switching could not begin." });
+      await load();
+    } finally {
+      setProfileSwitchBusy(false);
+    }
+  }, [load, notify, profileSwitch, profileSwitchBusy, profileSwitchRequestId]);
 
   const startVerification = useCallback(async () => {
     if (busy) return;
@@ -271,10 +315,12 @@ export function usePaperConsoleState({ active, includeSlim, notify }: Options): 
     slimStatus,
     ninjaTraderMaintenance,
     paperAutoStart,
+    profileSwitch,
     error,
     busy,
     maintenanceBusy,
     autoStartBusy,
+    profileSwitchBusy,
     verificationInFlight,
     verificationMode,
     setVerificationMode,
@@ -283,6 +329,7 @@ export function usePaperConsoleState({ active, includeSlim, notify }: Options): 
     startCommissioning,
     startPaperTrading,
     startPaperAutoStart,
+    switchPaperProfile,
     startVerification,
     cancelVerification,
     saveSchedule,

@@ -237,7 +237,7 @@ class LaneIIIPaperRuntime:
             raise ValueError("Paper runtime requires the exact durable ledger.")
         self.ledger = ledger
         self.policy = policy or ExperimentalPaperPolicy(ledger.policy)
-        self.risk = risk or PaperRiskAuthority(policy=self.policy.artifact)
+        self.risk = risk or PaperRiskAuthority(profile=ledger.risk, policy=self.policy.artifact)
         if type(self.policy) is not ExperimentalPaperPolicy or type(self.risk) is not PaperRiskAuthority:
             raise ValueError("Paper runtime components must retain exact authority types.")
         if not (
@@ -246,6 +246,8 @@ class LaneIIIPaperRuntime:
             == self.risk.policy.configuration_hash
         ):
             raise ValueError("Paper runtime, risk, and ledger policy identities must match.")
+        if self.ledger.risk.configuration_hash != self.risk.profile.configuration_hash:
+            raise ValueError("Paper runtime, risk, and ledger risk identities must match.")
         self.authority = PaperAuthorityBundle(
             self.policy.artifact, self.risk.profile, self.risk.binding, CAPABILITY,
         )
@@ -906,6 +908,11 @@ class LaneIIIPaperRuntime:
     def bind_transport(self, transport: PaperExecutionTransport) -> None:
         if type(transport) is not PaperExecutionTransport:
             raise ValueError("Paper runtime accepts only the signed Sim101 transport.")
+        if (
+            transport.policy.configuration_hash != self.policy.artifact.configuration_hash
+            or transport.risk.configuration_hash != self.risk.profile.configuration_hash
+        ):
+            raise ValueError("Paper runtime and transport profile identities must match.")
         with self._lock:
             if self._transport is not None or self._state is not PaperRuntimeState.DISABLED:
                 raise RuntimeError("Paper execution transport may be bound exactly once before startup.")

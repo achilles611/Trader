@@ -26,10 +26,15 @@ from .contracts import (
     ExecutionCapabilityManifest,
     ExecutionVenueAdapter,
     FiveMinutePaperPolicyArtifact,
+    FiveMinutePaperRiskProfile,
+    HighConfidencePaperPolicyArtifact,
+    HighConfidencePaperRiskProfile,
     PaperExecutionCommand,
     PaperPolicyArtifact,
     PaperPolicyArtifactType,
     PaperRiskGrant,
+    PaperRiskProfile,
+    PaperRiskProfileType,
     canonical_json,
 )
 from .ledger import PaperLedger
@@ -178,6 +183,7 @@ class PaperExecutionTransport:
         on_bridge_state: Callable[[str], None] | None = None,
         expected_source_fingerprint: str | None = None,
         policy: PaperPolicyArtifactType = POLICY,
+        risk: PaperRiskProfileType = RISK_PROFILE,
     ) -> None:
         if type(ledger) is not PaperLedger:
             raise ValueError("Execution transport requires the durable paper ledger.")
@@ -187,12 +193,22 @@ class PaperExecutionTransport:
             raise ValueError("Execution transport port is invalid.")
         if type(maximum_frame_bytes) is not int or not 1024 <= maximum_frame_bytes <= 1048576:
             raise ValueError("Maximum execution frame size is invalid.")
-        if type(policy) not in {PaperPolicyArtifact, FiveMinutePaperPolicyArtifact}:
+        if type(policy) not in {
+            PaperPolicyArtifact, HighConfidencePaperPolicyArtifact, FiveMinutePaperPolicyArtifact,
+        }:
             raise ValueError("Execution transport requires a compiled immutable policy.")
-        if ledger.policy.configuration_hash != policy.configuration_hash:
-            raise ValueError("Execution transport and ledger policy identities must match.")
+        if type(risk) not in {
+            PaperRiskProfile, HighConfidencePaperRiskProfile, FiveMinutePaperRiskProfile,
+        }:
+            raise ValueError("Execution transport requires a compiled immutable risk profile.")
+        if (
+            ledger.policy.configuration_hash != policy.configuration_hash
+            or ledger.risk.configuration_hash != risk.configuration_hash
+        ):
+            raise ValueError("Execution transport and ledger profile identities must match.")
         self.ledger = ledger
         self.policy = policy
+        self.risk = risk
         self.secret_provider = secret_provider or LocalPaperSecretProvider()
         self.host = host
         self.port = port
@@ -599,7 +615,7 @@ class PaperExecutionTransport:
             "execution_session_id": session_id,
             "server_nonce": uuid.uuid4().hex,
             "paper_policy_hash": self.policy.configuration_hash,
-            "risk_profile_hash": RISK_PROFILE.configuration_hash,
+            "risk_profile_hash": self.risk.configuration_hash,
             "account_binding_hash": ACCOUNT_BINDING.binding_hash,
             "heartbeat_interval_seconds": HEARTBEAT_INTERVAL_SECONDS,
             "heartbeat_watchdog_seconds": HEARTBEAT_WATCHDOG_SECONDS,
@@ -706,7 +722,7 @@ class PaperExecutionTransport:
                 raise ValueError("Command sequence must be exactly monotonic.")
             if not grant.valid_at(_now()) or grant.grant_id != command.risk_grant_id or grant.intent_id != command.intent_id:
                 raise ValueError("A positive, current, matching paper risk grant is required.")
-            if command.policy_hash != self.policy.configuration_hash or command.risk_profile_hash != RISK_PROFILE.configuration_hash or command.account_binding_hash != ACCOUNT_BINDING.binding_hash:
+            if command.policy_hash != self.policy.configuration_hash or command.risk_profile_hash != self.risk.configuration_hash or command.account_binding_hash != ACCOUNT_BINDING.binding_hash:
                 raise ValueError("Command authority hashes do not match the compiled paper authority.")
             legacy = command.session_kind is PaperSessionKind.OFF_SESSION and command.session_id != UNSPECIFIED_OFF_SESSION_CONTEXT.session_id
             if not legacy and (
@@ -775,7 +791,7 @@ class PaperExecutionTransport:
             "execution_session_id": session_id,
             "armed": bool(armed),
             "paper_policy_hash": self.policy.configuration_hash,
-            "risk_profile_hash": RISK_PROFILE.configuration_hash,
+            "risk_profile_hash": self.risk.configuration_hash,
             "account_binding_hash": ACCOUNT_BINDING.binding_hash,
             "timestamp": _now(),
         })

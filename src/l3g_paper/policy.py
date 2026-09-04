@@ -23,6 +23,7 @@ from .contracts import (
     BookCompleteness,
     EvidenceFamily,
     FiveMinutePaperPolicyArtifact,
+    HighConfidencePaperPolicyArtifact,
     HypothesisKind,
     PaperDecision,
     PaperDecisionKind,
@@ -91,7 +92,9 @@ class ExperimentalPaperPolicy:
     """One deterministic, synchronous, paper-direction-only consumer."""
 
     def __init__(self, artifact: PaperPolicyArtifactType = POLICY) -> None:
-        if type(artifact) not in {PaperPolicyArtifact, FiveMinutePaperPolicyArtifact}:
+        if type(artifact) not in {
+            PaperPolicyArtifact, HighConfidencePaperPolicyArtifact, FiveMinutePaperPolicyArtifact,
+        }:
             raise ValueError("Paper policy requires the exact immutable artifact type.")
         self.artifact = artifact
         self._five_minute_profile = type(artifact) is FiveMinutePaperPolicyArtifact

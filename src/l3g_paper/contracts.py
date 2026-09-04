@@ -30,11 +30,19 @@ PAPER_RECORD_SCHEMA = "lane-iii-phase-g-paper-record-v1"
 PAPER_POLICY_ID = "l3g-beelzebub-scalper-policy-v2"
 PAPER_ENTRY_PROFILE = "BEELZEBUB_SCALPER"
 PAPER_ENTRY_PROFILE_VERSION = "BEELZEBUB_SCALPER_V2"
+HIGH_CONFIDENCE_POLICY_SCHEMA = "lane-iii-phase-g-paper-policy-v3"
+HIGH_CONFIDENCE_POLICY_ID = "l3g-ny-high-confluence-commissioning-policy-v1"
+HIGH_CONFIDENCE_ENTRY_PROFILE = "NY_HIGH_CONFLUENCE_COMMISSIONING"
+HIGH_CONFIDENCE_ENTRY_PROFILE_VERSION = "NY_HIGH_CONFLUENCE_COMMISSIONING_V1"
 FIVE_MINUTE_POLICY_SCHEMA = "lane-iii-phase-g-five-minute-bias-policy-v1"
 FIVE_MINUTE_POLICY_ID = "l3g-beelzebub-five-minute-bias-policy-v1"
 FIVE_MINUTE_ENTRY_PROFILE = "BEELZEBUB_FIVE_MINUTE_BIAS"
 FIVE_MINUTE_ENTRY_PROFILE_VERSION = "BEELZEBUB_FIVE_MINUTE_BIAS_V1"
 PAPER_RISK_PROFILE_ID = "l3g-beelzebub-scalper-risk-v2"
+HIGH_CONFIDENCE_RISK_SCHEMA = "lane-iii-phase-g-paper-risk-v2"
+HIGH_CONFIDENCE_RISK_PROFILE_ID = "l3g-ny-high-confluence-commissioning-risk-v1"
+FIVE_MINUTE_RISK_SCHEMA = "lane-iii-phase-g-five-minute-bias-risk-v1"
+FIVE_MINUTE_RISK_PROFILE_ID = "l3g-beelzebub-five-minute-bias-risk-v1"
 PAPER_MODE = "PAPER_SIM101"
 PAPER_ACCOUNT = "Sim101"
 PAPER_ACCOUNT_CLASS = "LOCAL_SIMULATION"
@@ -244,6 +252,91 @@ class PaperPolicyArtifact:
 
 
 @dataclass(frozen=True)
+class HighConfidencePaperPolicyArtifact:
+    """The exact pre-scalper high-confluence policy, retained as a selectable profile."""
+
+    schema: str = HIGH_CONFIDENCE_POLICY_SCHEMA
+    policy_id: str = HIGH_CONFIDENCE_POLICY_ID
+    entry_profile: str = HIGH_CONFIDENCE_ENTRY_PROFILE
+    entry_profile_version: str = HIGH_CONFIDENCE_ENTRY_PROFILE_VERSION
+    authority: str = "EXPERIMENTAL_PAPER_DIRECTION_ONLY"
+    instrument: str = "MNQ"
+    native_contract: str = PAPER_NATIVE_CONTRACT
+    canonical_contract: str = PAPER_CANONICAL_CONTRACT
+    scientific_eligibility: bool = False
+    entry_session_kind: PaperSessionKind = PaperSessionKind.NEW_YORK_RTH
+    sequence_authority: SequenceAuthority = SequenceAuthority.LOCAL_CALLBACK_ORDER_ONLY
+    book_completeness: BookCompleteness = BookCompleteness.UNVERIFIED
+    allowed_hypotheses: tuple[HypothesisKind, ...] = (
+        HypothesisKind.BULLISH_REVERSAL,
+        HypothesisKind.BEARISH_CONTINUATION,
+    )
+    classified_flow_window: int = 8
+    minimum_classified_trades: int = 3
+    structural_window: int = 8
+    replenishment_count: int = 2
+    structural_evidence_lifetime_seconds: int = 90
+    flow_evidence_lifetime_seconds: int = 30
+    liquidity_evidence_lifetime_seconds: int = 20
+    hypothesis_idle_lifetime_seconds: int = 90
+    hypothesis_maximum_lifetime_seconds: int = 600
+    entry_support_threshold: Decimal = Decimal("0.675")
+    entry_dominance_margin: Decimal = Decimal("0.10")
+    retention_support_threshold: Decimal = Decimal("0.55")
+    retention_dominance_margin: Decimal = Decimal("0.025")
+    entry_family_count: int = 3
+    retention_family_count: int = 2
+    decision_ttl_seconds: int = 5
+    reentry_cooldown_seconds: int = 3600
+    structural_strength: Decimal = Decimal("0.50")
+    score_denominator: Decimal = Decimal("10")
+    session_timezone: str = "America/New_York"
+    provisional_session_boundary: str = "00:00"
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema,
+            self.policy_id,
+            self.entry_profile,
+            self.entry_profile_version,
+        ) != (
+            HIGH_CONFIDENCE_POLICY_SCHEMA,
+            HIGH_CONFIDENCE_POLICY_ID,
+            HIGH_CONFIDENCE_ENTRY_PROFILE,
+            HIGH_CONFIDENCE_ENTRY_PROFILE_VERSION,
+        ):
+            raise ValueError("The high-confidence paper policy identity is immutable.")
+        if self.authority != "EXPERIMENTAL_PAPER_DIRECTION_ONLY" or self.scientific_eligibility:
+            raise ValueError("The high-confidence paper policy cannot acquire scientific or execution authority.")
+        if self.native_contract != PAPER_NATIVE_CONTRACT or self.canonical_contract != PAPER_CANONICAL_CONTRACT:
+            raise ValueError("The high-confidence paper policy requires exact MNQ SEP26 identity.")
+        if (
+            self.entry_session_kind is not PaperSessionKind.NEW_YORK_RTH
+            or self.entry_support_threshold != Decimal("0.675")
+            or self.entry_dominance_margin != Decimal("0.10")
+            or self.retention_support_threshold != Decimal("0.55")
+            or self.retention_dominance_margin != Decimal("0.025")
+            or self.entry_family_count != 3
+            or self.retention_family_count != 2
+            or self.reentry_cooldown_seconds != 3600
+        ):
+            raise ValueError("The NY high-confluence commissioning policy tuning is immutable.")
+
+    @property
+    def entry_session_kinds(self) -> tuple[PaperSessionKind, ...]:
+        return (self.entry_session_kind,)
+
+    def payload(self) -> dict[str, object]:
+        # The singular entry_session_kind is intentional: it preserves the
+        # original deployed V1 payload and configuration hash exactly.
+        return _jsonable(asdict(self))  # type: ignore[return-value]
+
+    @property
+    def configuration_hash(self) -> str:
+        return canonical_hash(self.payload())
+
+
+@dataclass(frozen=True)
 class FiveMinutePaperPolicyArtifact(PaperPolicyArtifact):
     """Closed experimental identity for one decision per completed five-minute bar."""
 
@@ -313,7 +406,7 @@ class FiveMinutePaperPolicyArtifact(PaperPolicyArtifact):
             raise ValueError("The five-minute decision protocol is immutable.")
 
 
-PaperPolicyArtifactType = PaperPolicyArtifact | FiveMinutePaperPolicyArtifact
+PaperPolicyArtifactType = PaperPolicyArtifact | HighConfidencePaperPolicyArtifact | FiveMinutePaperPolicyArtifact
 
 
 def known_paper_policy_identity(policy_id: object, policy_hash: object) -> bool:
@@ -398,6 +491,127 @@ class PaperRiskProfile:
     @property
     def configuration_hash(self) -> str:
         return canonical_hash(self.payload())
+
+
+@dataclass(frozen=True)
+class HighConfidencePaperRiskProfile:
+    """The exact risk artifact paired with the high-confluence V1 policy."""
+
+    schema: str = HIGH_CONFIDENCE_RISK_SCHEMA
+    profile_id: str = HIGH_CONFIDENCE_RISK_PROFILE_ID
+    mode: str = PAPER_MODE
+    account_name: str = PAPER_ACCOUNT
+    account_class: str = PAPER_ACCOUNT_CLASS
+    instrument: str = PAPER_INSTRUMENT
+    canonical_contract: str = PAPER_CANONICAL_CONTRACT
+    entry_session_kind: PaperSessionKind = PaperSessionKind.NEW_YORK_RTH
+    maximum_absolute_position: int = 1
+    maximum_entry_quantity: int = 1
+    maximum_pending_entries: int = 1
+    maximum_simultaneous_thesis: int = 1
+    pyramiding: bool = False
+    averaging: bool = False
+    same_event_reversal: bool = False
+    entry_order_type: str = "MARKET"
+    normal_exit: str = "FLATTEN_OWNED_INSTRUMENT"
+    protective_order_type: str = "STOP_MARKET"
+    protective_stop_distance_points: Decimal = Decimal("25.00")
+    maximum_trade_risk_dollars: Decimal = Decimal("50.00")
+    daily_loss_limit_dollars: Decimal = Decimal("200.00")
+    maximum_position_age_seconds: int = 3600
+    entry_session_start: str = "09:35"
+    entry_session_end: str = "15:30"
+    hard_flat_deadline: str = "15:58"
+    session_timezone: str = "America/New_York"
+    reentry_cooldown_seconds: int = 3600
+    maximum_session_entries: int = 1
+    maximum_consecutive_losses: int = 1
+    maximum_entry_slippage_points: Decimal = Decimal("2.00")
+    quote_maximum_age_seconds: int = 2
+    classified_trade_maximum_age_seconds: int = 5
+    depth_mutation_maximum_age_seconds: int = 5
+    point_value_dollars: Decimal = Decimal("2.00")
+    tick_size: Decimal = Decimal("0.25")
+    tick_value_dollars: Decimal = Decimal("0.50")
+    paper_only: bool = True
+    approved_for_live: bool = False
+
+    def __post_init__(self) -> None:
+        identity = (
+            self.schema, self.profile_id, self.mode, self.account_name,
+            self.account_class, self.instrument, self.canonical_contract,
+        )
+        required = (
+            HIGH_CONFIDENCE_RISK_SCHEMA, HIGH_CONFIDENCE_RISK_PROFILE_ID,
+            PAPER_MODE, PAPER_ACCOUNT, PAPER_ACCOUNT_CLASS, PAPER_INSTRUMENT,
+            PAPER_CANONICAL_CONTRACT,
+        )
+        if identity != required:
+            raise ValueError("The high-confidence risk identity is sealed to Sim101/MNQ SEP26.")
+        if any((self.maximum_absolute_position != 1, self.maximum_entry_quantity != 1, not self.paper_only, self.approved_for_live)):
+            raise ValueError("The high-confidence risk profile cannot represent live or multi-contract authority.")
+        if self.pyramiding or self.averaging or self.same_event_reversal:
+            raise ValueError("Pyramiding, averaging, and same-event reversal are forbidden.")
+        if (
+            self.entry_session_kind is not PaperSessionKind.NEW_YORK_RTH
+            or self.maximum_position_age_seconds != 3600
+            or self.reentry_cooldown_seconds != 3600
+            or self.maximum_session_entries != 1
+            or self.maximum_consecutive_losses != 1
+        ):
+            raise ValueError("The NY high-confluence commissioning risk limits are immutable.")
+
+    @property
+    def entry_session_kinds(self) -> tuple[PaperSessionKind, ...]:
+        return (self.entry_session_kind,)
+
+    def payload(self) -> dict[str, object]:
+        return _jsonable(asdict(self))  # type: ignore[return-value]
+
+    @property
+    def configuration_hash(self) -> str:
+        return canonical_hash(self.payload())
+
+
+@dataclass(frozen=True)
+class FiveMinutePaperRiskProfile(PaperRiskProfile):
+    """A bounded session envelope that does not interrupt a five-minute hold."""
+
+    schema: str = FIVE_MINUTE_RISK_SCHEMA
+    profile_id: str = FIVE_MINUTE_RISK_PROFILE_ID
+    maximum_position_age_seconds: int = 86_400
+    reentry_cooldown_seconds: int = 0
+    maximum_session_entries: int = 128
+    maximum_consecutive_losses: int = 128
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema,
+            self.profile_id,
+            self.maximum_position_age_seconds,
+            self.reentry_cooldown_seconds,
+            self.maximum_session_entries,
+            self.maximum_consecutive_losses,
+        ) != (FIVE_MINUTE_RISK_SCHEMA, FIVE_MINUTE_RISK_PROFILE_ID, 86_400, 0, 128, 128):
+            raise ValueError("The five-minute paper risk envelope is immutable.")
+        if (
+            self.mode != PAPER_MODE
+            or self.account_name != PAPER_ACCOUNT
+            or self.account_class != PAPER_ACCOUNT_CLASS
+            or self.instrument != PAPER_INSTRUMENT
+            or self.canonical_contract != PAPER_CANONICAL_CONTRACT
+            or self.maximum_absolute_position != 1
+            or self.maximum_entry_quantity != 1
+            or not self.paper_only
+            or self.approved_for_live
+            or self.pyramiding
+            or self.averaging
+            or self.same_event_reversal
+        ):
+            raise ValueError("The five-minute risk profile is sealed to one Sim101 MNQ contract.")
+
+
+PaperRiskProfileType = PaperRiskProfile | HighConfidencePaperRiskProfile | FiveMinutePaperRiskProfile
 
 
 @dataclass(frozen=True)
@@ -814,7 +1028,7 @@ class ExecutionAuditSink(Protocol):
 @dataclass(frozen=True)
 class PaperAuthorityBundle:
     policy: PaperPolicyArtifactType = field(default_factory=PaperPolicyArtifact)
-    risk: PaperRiskProfile = field(default_factory=PaperRiskProfile)
+    risk: PaperRiskProfileType = field(default_factory=PaperRiskProfile)
     binding: ExecutionAccountBinding = field(default_factory=ExecutionAccountBinding)
     capability: ExecutionCapabilityManifest = field(default_factory=ExecutionCapabilityManifest)
 
@@ -854,22 +1068,93 @@ def refuse_execution_target(value: object) -> None:
 
 
 POLICY = PaperPolicyArtifact()
+HIGH_CONFIDENCE_POLICY = HighConfidencePaperPolicyArtifact()
 FIVE_MINUTE_POLICY = FiveMinutePaperPolicyArtifact()
 KNOWN_PAPER_POLICY_IDENTITIES = frozenset({
     (POLICY.policy_id, POLICY.configuration_hash),
+    (HIGH_CONFIDENCE_POLICY.policy_id, HIGH_CONFIDENCE_POLICY.configuration_hash),
     (FIVE_MINUTE_POLICY.policy_id, FIVE_MINUTE_POLICY.configuration_hash),
 })
 RISK_PROFILE = PaperRiskProfile()
+HIGH_CONFIDENCE_RISK_PROFILE = HighConfidencePaperRiskProfile()
+FIVE_MINUTE_RISK_PROFILE = FiveMinutePaperRiskProfile()
 ACCOUNT_BINDING = ExecutionAccountBinding()
 CAPABILITY = ExecutionCapabilityManifest()
 AUTHORITY = PaperAuthorityBundle(POLICY, RISK_PROFILE, ACCOUNT_BINDING, CAPABILITY)
 
 
-def resolve_paper_policy_profile(value: str | None) -> PaperPolicyArtifactType:
-    """Resolve one explicit compiled profile; the deployed V2 remains the default."""
+@dataclass(frozen=True)
+class PaperProfileDefinition:
+    selection_key: str
+    display_name: str
+    description: str
+    policy: PaperPolicyArtifactType
+    risk: PaperRiskProfileType
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "selection_key": self.selection_key,
+            "display_name": self.display_name,
+            "description": self.description,
+            "entry_profile": self.policy.entry_profile,
+            "entry_profile_version": self.policy.entry_profile_version,
+            "paper_policy_id": self.policy.policy_id,
+            "paper_policy_hash": self.policy.configuration_hash,
+            "risk_profile_id": self.risk.profile_id,
+            "risk_profile_hash": self.risk.configuration_hash,
+            "maximum_position_age_seconds": self.risk.maximum_position_age_seconds,
+            "maximum_session_entries": self.risk.maximum_session_entries,
+            "paper_only": True,
+            "live_capital": "DENIED",
+        }
+
+
+HIGH_CONFIDENCE_PROFILE = PaperProfileDefinition(
+    HIGH_CONFIDENCE_ENTRY_PROFILE_VERSION,
+    "High confidence",
+    "New York high-confluence entries with one position opportunity per session.",
+    HIGH_CONFIDENCE_POLICY,
+    HIGH_CONFIDENCE_RISK_PROFILE,
+)
+SCALPER_PROFILE = PaperProfileDefinition(
+    PAPER_ENTRY_PROFILE_VERSION,
+    "Scalper",
+    "Multi-session high-confluence scalping with the V2 bounded risk envelope.",
+    POLICY,
+    RISK_PROFILE,
+)
+FIVE_MINUTE_PROFILE = PaperProfileDefinition(
+    FIVE_MINUTE_ENTRY_PROFILE_VERSION,
+    "5-minute perpetual position",
+    "Choose, hold, or reverse one MNQ position at each completed five-minute candle.",
+    FIVE_MINUTE_POLICY,
+    FIVE_MINUTE_RISK_PROFILE,
+)
+PAPER_PROFILE_CATALOG = (
+    HIGH_CONFIDENCE_PROFILE,
+    SCALPER_PROFILE,
+    FIVE_MINUTE_PROFILE,
+)
+
+
+def resolve_paper_profile(value: str | None) -> PaperProfileDefinition:
+    """Resolve one complete compiled policy/risk bundle; scalper V2 is the default."""
     normalized = "" if value is None else value.strip().upper()
-    if normalized in {"", PAPER_ENTRY_PROFILE, PAPER_ENTRY_PROFILE_VERSION}:
-        return POLICY
-    if normalized in {FIVE_MINUTE_ENTRY_PROFILE, FIVE_MINUTE_ENTRY_PROFILE_VERSION}:
-        return FIVE_MINUTE_POLICY
-    raise ValueError(f"Unknown BEELZEBUB_L3G_PAPER_PROFILE: {value!r}")
+    aliases = {
+        "": SCALPER_PROFILE,
+        PAPER_ENTRY_PROFILE: SCALPER_PROFILE,
+        PAPER_ENTRY_PROFILE_VERSION: SCALPER_PROFILE,
+        HIGH_CONFIDENCE_ENTRY_PROFILE: HIGH_CONFIDENCE_PROFILE,
+        HIGH_CONFIDENCE_ENTRY_PROFILE_VERSION: HIGH_CONFIDENCE_PROFILE,
+        FIVE_MINUTE_ENTRY_PROFILE: FIVE_MINUTE_PROFILE,
+        FIVE_MINUTE_ENTRY_PROFILE_VERSION: FIVE_MINUTE_PROFILE,
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        raise ValueError(f"Unknown BEELZEBUB_L3G_PAPER_PROFILE: {value!r}") from exc
+
+
+def resolve_paper_policy_profile(value: str | None) -> PaperPolicyArtifactType:
+    """Compatibility projection for callers that need only the policy artifact."""
+    return resolve_paper_profile(value).policy

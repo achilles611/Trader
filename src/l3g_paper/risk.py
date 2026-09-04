@@ -15,6 +15,9 @@ from .contracts import (
     RISK_PROFILE,
     ExecutionAccountBinding,
     FiveMinutePaperPolicyArtifact,
+    FiveMinutePaperRiskProfile,
+    HighConfidencePaperPolicyArtifact,
+    HighConfidencePaperRiskProfile,
     PaperDecision,
     PaperDecisionKind,
     PaperDirection,
@@ -23,6 +26,7 @@ from .contracts import (
     PaperPolicyArtifactType,
     PaperRiskGrant,
     PaperRiskProfile,
+    PaperRiskProfileType,
     deterministic_id,
     expires_at,
 )
@@ -99,13 +103,17 @@ class PaperRiskAuthority:
 
     def __init__(
         self,
-        profile: PaperRiskProfile = RISK_PROFILE,
+        profile: PaperRiskProfileType = RISK_PROFILE,
         binding: ExecutionAccountBinding = ACCOUNT_BINDING,
         policy: PaperPolicyArtifactType = POLICY,
     ) -> None:
-        if type(profile) is not PaperRiskProfile or type(binding) is not ExecutionAccountBinding:
+        if type(profile) not in {
+            PaperRiskProfile, HighConfidencePaperRiskProfile, FiveMinutePaperRiskProfile,
+        } or type(binding) is not ExecutionAccountBinding:
             raise ValueError("Paper risk authority requires exact immutable inputs.")
-        if type(policy) not in {PaperPolicyArtifact, FiveMinutePaperPolicyArtifact}:
+        if type(policy) not in {
+            PaperPolicyArtifact, HighConfidencePaperPolicyArtifact, FiveMinutePaperPolicyArtifact,
+        }:
             raise ValueError("Paper risk authority requires a compiled immutable policy.")
         self.profile = profile
         self.binding = binding

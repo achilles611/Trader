@@ -3,7 +3,7 @@ param(
     [string]$LedgerPath = "N:\Beelzebub\runtime\hot\lane_iii_paper.sqlite3",
     [string]$AuditRoot = "N:\Beelzebub\runtime\audit",
     [string]$LedgerEpoch = "",
-    [ValidateSet("BEELZEBUB_SCALPER_V2", "BEELZEBUB_FIVE_MINUTE_BIAS_V1")]
+    [ValidateSet("NY_HIGH_CONFLUENCE_COMMISSIONING_V1", "BEELZEBUB_SCALPER_V2", "BEELZEBUB_FIVE_MINUTE_BIAS_V1")]
     [string]$PaperProfile = "BEELZEBUB_SCALPER_V2",
     [int]$Port = 8090
 )

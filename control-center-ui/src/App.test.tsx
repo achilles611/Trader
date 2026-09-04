@@ -37,6 +37,16 @@ let paperAutoStartResponse: Record<string, unknown> = {
   action_token: "fixture-paper-autostart-token", stage: "IDLE", in_progress: false,
   button: { label: "Start Paper Trading", enabled: true, tone: "primary" }, blockers: [],
 };
+let profileSwitchResponse: Record<string, unknown> = {
+  action_token: "fixture-profile-switch-token", stage: "IDLE", in_progress: false,
+  active_profile: "BEELZEBUB_SCALPER_V2", current_profile: "BEELZEBUB_SCALPER_V2",
+  target_profile: null, blockers: [],
+  profiles: [
+    { selection_key: "NY_HIGH_CONFLUENCE_COMMISSIONING_V1", display_name: "High confidence" },
+    { selection_key: "BEELZEBUB_SCALPER_V2", display_name: "Scalper" },
+    { selection_key: "BEELZEBUB_FIVE_MINUTE_BIAS_V1", display_name: "5-minute perpetual position" },
+  ],
+};
 let slimStatusResponse: Record<string, unknown> = {
   generated_at: new Date().toISOString(), light: "RED", label: "NOT READY",
   message: "Paper runtime status is unavailable.", can_start: false, paper_active: false,
@@ -94,6 +104,7 @@ function payload(path: string) {
     paperAutoStartSideEffect?.();
     return paperAutoStartResponse;
   }
+  if (path.startsWith("/api/lane-iii/paper/profile-switch")) return profileSwitchResponse;
   if (path.startsWith("/api/lane-iii/paper/commissioning-rehearsal")) {
     commissioningRehearsalSideEffect?.();
     return commissioningRehearsalResponse || { result: "BLOCKED", blocking_reasons: ["FIXTURE_BLOCKED"] };
@@ -223,6 +234,16 @@ beforeEach(() => {
   paperAutoStartResponse = {
     action_token: "fixture-paper-autostart-token", stage: "IDLE", in_progress: false,
     button: { label: "Start Paper Trading", enabled: true, tone: "primary" }, blockers: [],
+  };
+  profileSwitchResponse = {
+    action_token: "fixture-profile-switch-token", stage: "IDLE", in_progress: false,
+    active_profile: "BEELZEBUB_SCALPER_V2", current_profile: "BEELZEBUB_SCALPER_V2",
+    target_profile: null, blockers: [],
+    profiles: [
+      { selection_key: "NY_HIGH_CONFLUENCE_COMMISSIONING_V1", display_name: "High confidence" },
+      { selection_key: "BEELZEBUB_SCALPER_V2", display_name: "Scalper" },
+      { selection_key: "BEELZEBUB_FIVE_MINUTE_BIAS_V1", display_name: "5-minute perpetual position" },
+    ],
   };
   slimStatusResponse = {
     generated_at: new Date().toISOString(), light: "RED", label: "NOT READY",
@@ -875,6 +896,33 @@ describe("copy control center", () => {
     fireEvent.click(stop);
     await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/lane-iii/paper/flatten-and-disarm", expect.objectContaining({ method: "POST" })));
     expect(fetch).not.toHaveBeenCalledWith("/api/lane-iii/paper/operational-start", expect.anything());
+  });
+
+  it("offers all compiled profiles in Slim Mode and submits one authenticated switch", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+    const selector = await screen.findByRole("combobox", { name: "Paper profile" });
+    expect(within(selector).getByRole("option", { name: "High confidence" })).toBeInTheDocument();
+    expect(within(selector).getByRole("option", { name: "Scalper" })).toBeInTheDocument();
+    expect(within(selector).getByRole("option", { name: "5-minute perpetual position" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Switch & Start" })).toBeDisabled();
+    fireEvent.change(selector, { target: { value: "BEELZEBUB_FIVE_MINUTE_BIAS_V1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Switch & Start" }));
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(
+      "/api/lane-iii/paper/profile-switch",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          "X-Beelzebub-Profile-Switch-Action": "sim101-profile-switch-v1",
+          "X-Beelzebub-Profile-Switch-Token": "fixture-profile-switch-token",
+        }),
+      }),
+    ));
+    const call = vi.mocked(fetch).mock.calls.find(([path, init]) => String(path) === "/api/lane-iii/paper/profile-switch" && init?.method === "POST");
+    expect(JSON.parse(String(call?.[1]?.body))).toEqual({
+      request_id: expect.stringMatching(/^profile-switch-ui-/),
+      target_profile: "BEELZEBUB_FIVE_MINUTE_BIAS_V1",
+    });
   });
 
   it("renders an armed commissioning wait as active instead of NOT READY", async () => {

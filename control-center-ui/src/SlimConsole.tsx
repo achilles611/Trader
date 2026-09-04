@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import type { PaperConsoleState } from "./paperConsole";
 
 type Props = {
@@ -50,12 +51,56 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
     ? autoStartButton.label
     : autoStart?.blockers?.length ? `Blocked: ${autoStart.blockers.join(", ")}`
     : "Launch, sign-in, MNQ observer, reconciliation, and ledger verification are automatic.";
+  const profileSwitch = paper.profileSwitch;
+  const profiles = Array.isArray(profileSwitch?.profiles) ? profileSwitch.profiles : [];
+  const activeProfile = String(profileSwitch?.active_profile || paper.status?.entry_profile_version || "");
+  const [selectedProfile, setSelectedProfile] = useState("");
+  useEffect(() => {
+    if (!profiles.length) return;
+    const exists = profiles.some((profile: any) => profile.selection_key === selectedProfile);
+    if (!exists) setSelectedProfile(activeProfile || String(profiles[0].selection_key));
+  }, [activeProfile, profiles, selectedProfile]);
+  const targetProfile = selectedProfile || activeProfile;
+  const switchInProgress = profileSwitch?.in_progress === true;
+  const switchBlocked = profileSwitch?.stage === "BLOCKED_SAFE";
+  const switchStatus = switchInProgress
+    ? `Switch in progress: ${String(profileSwitch.stage || "PREPARING").replaceAll("_", " ")}`
+    : switchBlocked && profileSwitch?.blockers?.length
+    ? `Switch blocked safely: ${profileSwitch.blockers.join(", ")}`
+    : profileSwitch?.stage === "RUNNING"
+    ? "Selected profile is running."
+    : "A switch closes and verifies the current ledger, creates a fresh run, restarts, verifies, and starts automatically.";
 
   return <main className="slim-console" aria-label="BeezConsole Slim Mode">
     <header className="slim-header">
       <div className="slim-brand"><span className="slim-brand-mark" aria-hidden="true">B</span><span>BeezConsole <b>Slim</b></span></div>
       <button className="slim-mode-button" type="button" onClick={onFullConsole}>Full Console</button>
     </header>
+
+    <section className="slim-card slim-profile" aria-labelledby="slim-profile-heading">
+      <div className="slim-kicker">PAPER PROFILE</div>
+      <h2 id="slim-profile-heading">Select profile</h2>
+      <div className="slim-profile-controls">
+        <select
+          aria-label="Paper profile"
+          value={targetProfile}
+          disabled={!profiles.length || switchInProgress || paper.profileSwitchBusy}
+          onChange={(event) => setSelectedProfile(event.target.value)}
+        >
+          {profiles.map((profile: any) => <option key={profile.selection_key} value={profile.selection_key}>{profile.display_name}</option>)}
+        </select>
+        <button
+          className="slim-profile-switch"
+          type="button"
+          disabled={!targetProfile || targetProfile === activeProfile || switchInProgress || paper.profileSwitchBusy}
+          onClick={() => void paper.switchPaperProfile(targetProfile)}
+        >
+          {paper.profileSwitchBusy ? "Preparing…" : switchInProgress ? "Switching…" : "Switch & Start"}
+        </button>
+      </div>
+      <p className={`slim-verification-result ${switchBlocked ? "negative" : ""}`} role="status" aria-live="polite">{switchStatus}</p>
+      <p className="slim-profile-current">Current: <strong>{profiles.find((profile: any) => profile.selection_key === activeProfile)?.display_name || activeProfile || "UNAVAILABLE"}</strong></p>
+    </section>
 
     <section className="slim-card slim-readiness" aria-labelledby="slim-readiness-heading">
       <div className="slim-kicker">BEELZEBUB READINESS</div>
@@ -79,8 +124,8 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
 
     <section className="slim-actions" aria-label="Paper controls">
       {stopAvailable
-        ? <button className="slim-action stop" type="button" disabled={paper.busy} onClick={() => void paper.stopAndDisarm()}>{paper.busy ? "STOPPING…" : "STOP TRADING"}</button>
-        : <button className="slim-action start" type="button" disabled={!startEnabled} onClick={() => void paper.startPaperAutoStart()} aria-describedby="slim-startup-status">{paper.autoStartBusy ? "Starting…" : autoStartButton.label}</button>}
+        ? <button className="slim-action stop" type="button" disabled={paper.busy || switchInProgress} onClick={() => void paper.stopAndDisarm()}>{paper.busy ? "STOPPING…" : "STOP TRADING"}</button>
+        : <button className="slim-action start" type="button" disabled={!startEnabled || switchInProgress} onClick={() => void paper.startPaperAutoStart()} aria-describedby="slim-startup-status">{paper.autoStartBusy ? "Starting…" : autoStartButton.label}</button>}
       <p id="slim-startup-status" className="slim-verification-result" role="status" aria-live="polite">{startupStatus}</p>
     </section>
     {paper.error && <p className="slim-error" role="alert">Status unavailable — {paper.error}</p>}

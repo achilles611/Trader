@@ -46,7 +46,13 @@ from src.l3g_paper.paper_autostart import (
     PaperAutoStartService,
 )
 from src.l3g_paper.ninjatrader_transport import PaperExecutionTransport
-from src.l3g_paper.contracts import RISK_PROFILE, resolve_paper_policy_profile
+from src.l3g_paper.contracts import resolve_paper_profile
+from src.l3g_paper.profile_switch import (
+    PROFILE_SWITCH_ACTION_HEADER,
+    PROFILE_SWITCH_ACTION_VALUE,
+    PROFILE_SWITCH_TOKEN_HEADER,
+    PaperProfileSwitchService,
+)
 from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout
 from src.l3g_paper.sessions import session_catalog
 from src.l3g_paper.slim_status import derive_slim_paper_status, unavailable_slim_status
@@ -1395,6 +1401,7 @@ def create_control_center_app(
     watcher_runtime: dict[str, Any] = {}
     ninjatrader_runtime: dict[str, Any] = {}
     paper_ledger_shutdown_receipt: dict[str, object] | None = None
+    profile_switch: PaperProfileSwitchService | None = None
     job_runtime: dict[str, asyncio.Task[Any]] = {}
     source = discovery_source or HyperCoreSourceAcquisition(cache_directory(config.artifacts.database_path))
     discovery_orchestrator = CandidateDiscoveryOrchestrator(execution_service, center.store, source)
@@ -1405,9 +1412,11 @@ def create_control_center_app(
         else Path(config.artifacts.database_path).resolve().with_name("lane_iii_paper.sqlite3")
     )
     configured_paper_epoch = os.getenv("BEELZEBUB_L3G_PAPER_LEDGER_EPOCH")
-    selected_paper_policy = resolve_paper_policy_profile(
+    selected_paper_profile = resolve_paper_profile(
         os.getenv("BEELZEBUB_L3G_PAPER_PROFILE")
     )
+    selected_paper_policy = selected_paper_profile.policy
+    selected_paper_risk = selected_paper_profile.risk
     derived_audit_root = paper_path.parent.parent / "audit" if paper_path.parent.name.lower() == "hot" else paper_path.parent / "audit"
     audit_root = Path(os.getenv("BEELZEBUB_LEDGER_AUDIT_ROOT") or derived_audit_root).resolve()
     ledger_verifier = LocalLedgerVerificationController(paper_path, audit_root)
@@ -1421,6 +1430,8 @@ def create_control_center_app(
         "entry_profile": selected_paper_policy.entry_profile,
         "entry_profile_version": selected_paper_policy.entry_profile_version,
         "paper_policy_hash": selected_paper_policy.configuration_hash,
+        "risk_profile_hash": selected_paper_risk.configuration_hash,
+        "ledger_epoch": resolve_ledger_epoch(paper_path, configured_paper_epoch),
     }
 
     def live_watcher_health() -> dict[str, Any] | None:
@@ -1565,8 +1576,8 @@ def create_control_center_app(
                 "entry_family_count": selected_paper_policy.entry_family_count,
                 "reentry_cooldown_seconds": selected_paper_policy.reentry_cooldown_seconds,
                 "retention_confidence_threshold": str(selected_paper_policy.retention_support_threshold),
-                "maximum_position_age_seconds": RISK_PROFILE.maximum_position_age_seconds,
-                "maximum_session_entries": RISK_PROFILE.maximum_session_entries,
+                "maximum_position_age_seconds": selected_paper_risk.maximum_position_age_seconds,
+                "maximum_session_entries": selected_paper_risk.maximum_session_entries,
                 "session_definitions": list(session_catalog()),
                 "account_balances": observer["account_balances"],
                 "market_observer": observer,
@@ -1830,7 +1841,7 @@ def create_control_center_app(
                     "New production paper ledger requires BEELZEBUB_L3G_PAPER_LEDGER_EPOCH or an epoch-N directory."
                 )
             paper_ledger = paper_ledger_factory(paper_path) if paper_ledger_factory is not None else PaperLedger(
-                paper_path, epoch_id=configured_paper_epoch, policy=selected_paper_policy,
+                paper_path, epoch_id=configured_paper_epoch, policy=selected_paper_policy, risk=selected_paper_risk,
             )
             if type(paper_ledger) is not PaperLedger:
                 raise RuntimeError("LANE_III_PAPER ledger factory must return the exact durable ledger")
@@ -1846,6 +1857,7 @@ def create_control_center_app(
                     on_message=paper_runtime.on_execution_message,
                     on_bridge_state=paper_runtime.on_execution_bridge_state,
                     policy=selected_paper_policy,
+                    risk=selected_paper_risk,
                 )
             )
             if type(paper_transport) is not PaperExecutionTransport:
@@ -2099,6 +2111,8 @@ def create_control_center_app(
                                         "L3G paper ledger controlled shutdown: %s",
                                         paper_ledger_shutdown_receipt,
                                     )
+                                    if profile_switch is not None:
+                                        profile_switch.record_shutdown_receipt(paper_ledger_shutdown_receipt)
 
     app = FastAPI(title="Trader Copy Control Center", version="1.0", docs_url=None, redoc_url=None,
                   lifespan=lifespan)
@@ -2115,6 +2129,35 @@ def create_control_center_app(
     app.state.ledger_verifier = ledger_verifier
     app.state.scheduler_engine = None
     app.state.scheduler_service = scheduler_service
+    profile_switch_runtime_root = Path(
+        os.getenv("BEELZEBUB_PROFILE_SWITCH_ROOT")
+        or (paper_path.parent.parent if paper_path.parent.name.lower() == "hot" else paper_path.parent)
+    ).resolve()
+
+    def flatten_current_profile() -> Mapping[str, object]:
+        paper = ninjatrader_runtime.get("paper")
+        if type(paper) is not LaneIIIPaperRuntime:
+            raise RuntimeError("PAPER_RUNTIME_UNAVAILABLE")
+        return paper.flatten_and_disarm()
+
+    def request_profile_switch_shutdown() -> None:
+        callback = app.state.request_server_shutdown
+        if not callable(callback):
+            raise RuntimeError("CONTROLLED_SERVER_SHUTDOWN_UNAVAILABLE")
+        callback()
+
+    profile_switch = PaperProfileSwitchService(
+        current_profile=selected_paper_profile,
+        paper_status=lane_iii_paper_health,
+        flatten_and_disarm=flatten_current_profile,
+        verifier_status=ledger_verifier.status,
+        request_shutdown=request_profile_switch_shutdown,
+        runtime_root=profile_switch_runtime_root,
+        project_root=Path(__file__).resolve().parents[2],
+        python_executable=sys.executable,
+        git_sha=str(runtime_binding["git_sha"]),
+    )
+    app.state.paper_profile_switch = profile_switch
 
     @app.exception_handler(sqlite3.Error)
     async def database_unavailable(_: Any, __: sqlite3.Error) -> Any:
@@ -2594,6 +2637,46 @@ def create_control_center_app(
             return paper_autostart.start(payload["request_id"])
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.get("/api/lane-iii/paper/profile-switch")
+    async def api_lane_iii_paper_profile_switch() -> dict[str, object]:
+        """Return the compiled catalog and durable status of the latest handoff."""
+        assert profile_switch is not None
+        return profile_switch.status()
+
+    @app.post("/api/lane-iii/paper/profile-switch")
+    async def api_start_lane_iii_paper_profile_switch(
+        request: Request,
+        body: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, object]:
+        """Flatten, seal, restart, verify, and start one selected Sim101 profile."""
+        assert profile_switch is not None
+        hostname = (request.url.hostname or "").lower()
+        if hostname not in {"127.0.0.1", "localhost", "::1", "testserver"}:
+            raise HTTPException(status_code=403, detail="Paper profile switching is loopback-only.")
+        origin = request.headers.get("origin")
+        if origin:
+            try:
+                origin_host = (urlsplit(origin).hostname or "").lower()
+            except ValueError:
+                origin_host = ""
+            if origin_host not in {"127.0.0.1", "localhost", "::1", "testserver"}:
+                raise HTTPException(status_code=403, detail="Paper profile switching requires a local same-origin request.")
+        if request.headers.get(PROFILE_SWITCH_ACTION_HEADER) != PROFILE_SWITCH_ACTION_VALUE:
+            raise HTTPException(status_code=403, detail="Paper profile-switch action authentication failed.")
+        if request.headers.get(PROFILE_SWITCH_TOKEN_HEADER) != profile_switch.action_token:
+            raise HTTPException(status_code=403, detail="Paper profile-switch session authentication failed.")
+        payload = body or {}
+        if not isinstance(payload, dict) or set(payload) != {"request_id", "target_profile"}:
+            raise HTTPException(status_code=400, detail="Paper profile switching accepts only request_id and target_profile.")
+        if not callable(app.state.request_server_shutdown):
+            raise HTTPException(status_code=503, detail="This app host does not expose controlled server shutdown.")
+        try:
+            return profile_switch.start(payload["request_id"], payload["target_profile"])
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.get("/api/lane-iii/live")
     async def api_lane_iii_live() -> dict[str, object]:

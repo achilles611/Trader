@@ -29,8 +29,13 @@ from .contracts import (
     POLICY,
     RISK_PROFILE,
     FiveMinutePaperPolicyArtifact,
+    FiveMinutePaperRiskProfile,
+    HighConfidencePaperPolicyArtifact,
+    HighConfidencePaperRiskProfile,
     PaperPolicyArtifact,
     PaperPolicyArtifactType,
+    PaperRiskProfile,
+    PaperRiskProfileType,
     known_paper_policy_identity,
 )
 from .sessions import (
@@ -193,11 +198,8 @@ _V3_AUTHORITY_OBSERVATION_CLASSIFICATIONS = frozenset({
 _SECRET_KEYS = frozenset({"hmac_key", "password", "token", "connection_credentials", "private_key", "secret", "authorization"})
 _EPOCH_DIRECTORY = re.compile(r"^epoch-(\d+)$", re.IGNORECASE)
 _EPOCH_ID = re.compile(r"^L3G-PAPER-EPOCH-[A-Za-z0-9][A-Za-z0-9._-]*$")
-# These three artifacts are module-level frozen contracts.  Retain their
-# exact computed values once, rather than canonicalizing their static payloads
-# for every admitted market callback.  The values remain part of every record
-# envelope and hash-chain document exactly as before.
-_RISK_PROFILE_HASH = RISK_PROFILE.configuration_hash
+# The account binding is common to every compiled profile. Policy and risk
+# hashes are instance-bound because a profile switch always starts a new epoch.
 _ACCOUNT_BINDING_HASH = ACCOUNT_BINDING.binding_hash
 
 # Deferred records are still strictly ordered.  These bounds merely prevent a
@@ -986,6 +988,7 @@ class PaperLedger:
         max_pending_barriers: int | None = None,
         persist_high_frequency_records: bool = False,
         policy: PaperPolicyArtifactType = POLICY,
+        risk: PaperRiskProfileType = RISK_PROFILE,
     ) -> None:
         if type(max_deferred_records) is not int or max_deferred_records < 1:
             raise ValueError("Paper ledger deferred capacity must be a positive integer.")
@@ -1006,11 +1009,19 @@ class PaperLedger:
             )
         if type(persist_high_frequency_records) is not bool:
             raise ValueError("Paper ledger high-frequency persistence policy must be boolean.")
-        if type(policy) not in {PaperPolicyArtifact, FiveMinutePaperPolicyArtifact}:
+        if type(policy) not in {
+            PaperPolicyArtifact, HighConfidencePaperPolicyArtifact, FiveMinutePaperPolicyArtifact,
+        }:
             raise ValueError("Paper ledger policy identity must be a compiled immutable profile.")
+        if type(risk) not in {
+            PaperRiskProfile, HighConfidencePaperRiskProfile, FiveMinutePaperRiskProfile,
+        }:
+            raise ValueError("Paper ledger risk identity must be a compiled immutable profile.")
         self.path = Path(path).resolve()
         self.policy = policy
+        self.risk = risk
         self._paper_policy_hash = policy.configuration_hash
+        self._risk_profile_hash = risk.configuration_hash
         self._path_preexisted = self.path.exists()
         self._persist_high_frequency_records = persist_high_frequency_records
         self._creation_epoch = resolve_ledger_epoch(self.path, epoch_id)
@@ -1539,17 +1550,22 @@ class PaperLedger:
             str(row["metadata_key"]): str(row["metadata_value"])
             for row in self._connection.execute(
                 "SELECT metadata_key, metadata_value FROM lane_iii_paper_ledger_metadata "
-                "WHERE metadata_key IN ('paper_policy_hash','entry_profile','entry_profile_version')"
+                "WHERE metadata_key IN ('paper_policy_hash','risk_profile_hash','entry_profile','entry_profile_version')"
             )
         }
         required = (
             self._paper_policy_hash,
+            self._risk_profile_hash,
             self.policy.entry_profile,
             self.policy.entry_profile_version,
         )
         if metadata:
             identity = (
                 metadata.get("paper_policy_hash"),
+                # Profile-aware ledgers persist this directly. For an older
+                # same-policy epoch, the first/last envelopes below remain the
+                # immutable risk proof.
+                metadata.get("risk_profile_hash", self._risk_profile_hash),
                 metadata.get("entry_profile"),
                 metadata.get("entry_profile_version"),
             )
@@ -1575,6 +1591,7 @@ class PaperLedger:
         identities = {
             (
                 envelope.get("paper_policy_hash") if isinstance(envelope, Mapping) else None,
+                envelope.get("risk_profile_hash") if isinstance(envelope, Mapping) else None,
                 envelope.get("entry_profile") if isinstance(envelope, Mapping) else None,
                 envelope.get("entry_profile_version") if isinstance(envelope, Mapping) else None,
             )
@@ -1675,6 +1692,7 @@ class PaperLedger:
             if not self._path_preexisted:
                 metadata.update({
                     "paper_policy_hash": self._paper_policy_hash,
+                    "risk_profile_hash": self._risk_profile_hash,
                     "entry_profile": self.policy.entry_profile,
                     "entry_profile_version": self.policy.entry_profile_version,
                 })
@@ -2197,7 +2215,7 @@ class PaperLedger:
             "occurred_at": at,
             "execution_session_id": execution_session_id,
             "paper_policy_hash": self._paper_policy_hash,
-            "risk_profile_hash": _RISK_PROFILE_HASH,
+            "risk_profile_hash": self._risk_profile_hash,
             "entry_profile": self.policy.entry_profile,
             "entry_profile_version": self.policy.entry_profile_version,
             "effective_confidence_threshold": str(self.policy.entry_support_threshold),
