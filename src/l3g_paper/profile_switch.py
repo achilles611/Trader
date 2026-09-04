@@ -417,7 +417,7 @@ def _state_update(path: Path, event: str, **updates: object) -> dict[str, object
     return state
 
 
-def _http_json(url: str, *, method: str = "GET", headers: Mapping[str, str] | None = None, body: Mapping[str, object] | None = None, timeout: float = 3.0) -> dict[str, object]:
+def _http_json(url: str, *, method: str = "GET", headers: Mapping[str, str] | None = None, body: Mapping[str, object] | None = None, timeout: float = 15.0) -> dict[str, object]:
     encoded = None if body is None else _canonical(body)
     request = Request(url, data=encoded, method=method, headers={"Content-Type": "application/json", **dict(headers or {})})
     with urlopen(request, timeout=timeout) as response:  # noqa: S310 - fixed loopback endpoint
