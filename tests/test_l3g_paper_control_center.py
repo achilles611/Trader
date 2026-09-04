@@ -10,6 +10,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from fastapi import HTTPException
+from starlette.requests import Request
+
 from src.copytrade.control_center import UnsafePaperExecutionShutdown, create_control_center_app
 from src.copytrade.config import CopyTradeConfig
 from src.l3g_paper.ledger import PaperLedger
@@ -245,6 +248,89 @@ class PaperControlCenterTests(unittest.TestCase):
         ledger_close = lifecycle_source.index("paper_ledger.close()", verifier_refusal)
         self.assertLess(verifier_refusal, ledger_close)
         self.assertIn("VERIFIER_READER_NOT_QUIESCED", lifecycle_source[verifier_refusal:ledger_close])
+
+
+class GracefulShutdownEndpointTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.temporary = TemporaryDirectory()
+        root = Path(self.temporary.name)
+        defaults = CopyTradeConfig()
+        config = replace(
+            defaults,
+            storage=replace(defaults.storage, cold_root=root / "cold"),
+            artifacts=replace(defaults.artifacts, database_path=root / "hot" / "copytrade.sqlite3"),
+        )
+        self.app = create_control_center_app(config)
+        self.endpoint = next(
+            route.endpoint for route in self.app.routes
+            if route.path == "/api/system/graceful-shutdown"
+        )
+        runtime = inspect.getclosurevars(self.endpoint).nonlocals["ninjatrader_runtime"]
+        runtime["paper"] = SimpleNamespace(status=lambda: {
+            "state": "READY_DISARMED",
+            "paper_execution": "DISARMED",
+            "session_armed_state": "DISARMED",
+            "current_position": "FLAT",
+            "current_quantity": 0,
+            "broker_snapshot_position": "FLAT",
+            "broker_snapshot_position_quantity": 0,
+            "working_owned_orders": 0,
+            "working_entry_orders": 0,
+            "unresolved_command": False,
+            "unresolved_native_order": False,
+            "unresolved_execution": False,
+            "entry_owner": "NONE",
+            "operational_paper_session": None,
+            "reconciliation_current": True,
+            "ledger": {
+                "deferred_queue_depth": 0,
+                "deferred_pending_queue_depth": 0,
+                "deferred_inflight_queue_depth": 0,
+                "deferred_pending_barrier_count": 0,
+                "deferred_writer_error": None,
+            },
+        })
+
+    def tearDown(self) -> None:
+        self.app.state.paper_autostart.stop()
+        self.temporary.cleanup()
+
+    @staticmethod
+    def request(*, authenticated: bool = True, host: str = "127.0.0.1:8090") -> Request:
+        headers = [(b"host", host.encode())]
+        if authenticated:
+            headers.append((
+                b"x-beelzebub-graceful-shutdown-action",
+                b"beezconsole-graceful-shutdown-v1",
+            ))
+        return Request({
+            "type": "http", "http_version": "1.1", "method": "POST",
+            "scheme": "http", "path": "/api/system/graceful-shutdown",
+            "raw_path": b"/api/system/graceful-shutdown", "query_string": b"",
+            "headers": headers, "client": ("127.0.0.1", 50000),
+            "server": ("127.0.0.1", 8090),
+        })
+
+    async def test_exact_disarmed_flat_state_requests_lifespan_shutdown(self) -> None:
+        requested = asyncio.Event()
+        self.app.state.request_server_shutdown = requested.set
+        result = await self.endpoint(
+            self.request(), {"request_id": "shutdown-endpoint-test-0001"},
+        )
+        self.assertTrue(result["accepted"])
+        await asyncio.wait_for(requested.wait(), timeout=1)
+
+    async def test_refuses_missing_confirmation_and_uncontrolled_host(self) -> None:
+        for request in (self.request(authenticated=False), self.request(host="example.com")):
+            with self.subTest(headers=dict(request.headers)):
+                with self.assertRaises(HTTPException) as refused:
+                    await self.endpoint(request, {"request_id": "shutdown-endpoint-test-0002"})
+                self.assertEqual(refused.exception.status_code, 403)
+        with self.assertRaises(HTTPException) as unavailable:
+            await self.endpoint(
+                self.request(), {"request_id": "shutdown-endpoint-test-0003"},
+            )
+        self.assertEqual(unavailable.exception.status_code, 503)
 
 
 if __name__ == "__main__":

@@ -435,7 +435,7 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
         self.assertNotIn("ArgumentParser", commission_source)
 
     def test_gui_runtime_starts_exactly_one_listener_and_releases_then_reacquires_port(self):
-        port = 48135
+        port = self._ephemeral_port()
         worker = NinjaTraderListenerWorker(LoopbackBridgeConfig(port=port))
         with tempfile.TemporaryDirectory() as directory:
             config = replace(CopyTradeConfig(), artifacts=replace(
@@ -454,7 +454,7 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
                     netstat = subprocess.run(["netstat", "-ano"], capture_output=True, text=True, check=True)
                     self.assertRegex(
                         netstat.stdout,
-                        r"127\.0\.0\.1:48135\s+\S+\s+LISTENING\s+\d+",
+                        rf"127\.0\.0\.1:{port}\s+\S+\s+LISTENING\s+\d+",
                     )
                     duplicate = worker.start()
                     self.assertEqual(duplicate.state, "LISTENING")
@@ -470,7 +470,7 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
         with self.assertRaises(OSError):
             socket.create_connection(("127.0.0.1", port), timeout=0.1)
         netstat = subprocess.run(["netstat", "-ano"], capture_output=True, text=True, check=True)
-        self.assertNotRegex(netstat.stdout, r"127\.0\.0\.1:48135\s+\S+\s+LISTENING\s+\d+")
+        self.assertNotRegex(netstat.stdout, rf"127\.0\.0\.1:{port}\s+\S+\s+LISTENING\s+\d+")
 
         restarted = NinjaTraderListenerWorker(LoopbackBridgeConfig(port=port))
         try:
@@ -550,7 +550,7 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
         self.assertEqual(workers[0].status().state, "STOPPED")
 
     def test_gui_listener_never_reads_stdin_and_bind_collision_aborts_app_startup(self):
-        port = 48135
+        port = self._ephemeral_port()
         blocker = LoopbackNinjaTraderBridge(LoopbackBridgeConfig(port=port)).open_listener()
         worker = NinjaTraderListenerWorker(LoopbackBridgeConfig(port=port))
         commission_source = (Path(__file__).parents[1] / "src" / "l3f_provider" / "ninjatrader_commission.py").read_text(encoding="utf-8")
@@ -568,7 +568,7 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
 
             try:
                 with self.assertLogs("src.l3f_provider.ninjatrader_commission", level="ERROR") as logs:
-                    with self.assertRaisesRegex(RuntimeError, "NINJATRADER_OBSERVER startup failed at 127.0.0.1:48135"):
+                    with self.assertRaisesRegex(RuntimeError, rf"NINJATRADER_OBSERVER startup failed at 127\.0\.0\.1:{port}"):
                         asyncio.run(attempt_startup())
                 status = worker.status()
                 self.assertIsNone(app.state.ninjatrader_observer)
@@ -577,7 +577,7 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
                 self.assertEqual(status.port, port)
                 self.assertEqual(status.start_attempts, 1)
                 self.assertIsNotNone(status.error)
-                self.assertIn("NINJATRADER_OBSERVER FAILED 127.0.0.1:48135", logs.output[0])
+                self.assertIn(f"NINJATRADER_OBSERVER FAILED 127.0.0.1:{port}", logs.output[0])
                 self.assertEqual(blocker.getsockname(), ("127.0.0.1", port))
                 self.assertFalse(any(thread.name == "NINJATRADER_OBSERVER" and thread.is_alive() for thread in threading.enumerate()))
             finally:

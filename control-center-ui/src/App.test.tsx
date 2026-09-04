@@ -108,8 +108,8 @@ function payload(path: string) {
   }
   if (path.startsWith("/api/lane-iii/paper")) return {
     state: "READY_DISARMED",
-    entry_profile: "BEEZELBUB_SCALPER",
-    entry_profile_version: "BEEZELBUB_SCALPER_V1",
+    entry_profile: "BEELZEBUB_SCALPER",
+    entry_profile_version: "BEELZEBUB_SCALPER_V2",
     effective_confidence_threshold: "0.55",
     entry_dominance_margin: "0.025",
     entry_family_count: 3,
@@ -746,7 +746,7 @@ describe("copy control center", () => {
     expect(fetch).not.toHaveBeenCalledWith("/api/lane-iii/ninjatrader-maintenance", expect.objectContaining({ method: "POST" }));
     expect(screen.getByText("$10.25")).toBeInTheDocument();
     expect(document.querySelector(".slim-session")).toHaveTextContent("LONDON / EUROPE · 08:00-11:30 Europe/London");
-    expect(screen.getByText("BEEZELBUB_SCALPER")).toBeInTheDocument();
+    expect(screen.getByText("BEELZEBUB_SCALPER")).toBeInTheDocument();
     expect(screen.getByText(/0.55 threshold/)).toBeInTheDocument();
   });
 
@@ -886,16 +886,16 @@ describe("copy control center", () => {
     };
     laneIIIPaperOverrides = {
       state: "ARMED_FLAT",
-      entry_profile: "NY_HIGH_CONFLUENCE_COMMISSIONING",
-      effective_confidence_threshold: "0.675",
-      entry_dominance_margin: "0.10",
-      commissioning_lifecycle: { active: true, phase: "WAITING_FOR_HIGH_CONFLUENCE" },
+      entry_profile: "BEELZEBUB_SCALPER",
+      effective_confidence_threshold: "0.55",
+      entry_dominance_margin: "0.025",
+      commissioning_lifecycle: { active: true, phase: "WAITING_FOR_PROFILE_SIGNAL" },
     };
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
     expect(await screen.findByRole("img", { name: "Readiness: YELLOW" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "WAITING FOR HIGH CONFLUENCE" })).toBeInTheDocument();
-    expect(screen.getByText(/0\.675 support and 0\.10 dominance/)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "WAITING FOR PROFILE SIGNAL" })).toBeInTheDocument();
+    expect(screen.getByText(/0\.55 support and 0\.025 dominance/)).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "NOT READY" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "STOP TRADING" })).toBeEnabled();
   });

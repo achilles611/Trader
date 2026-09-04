@@ -70,10 +70,10 @@ Use only **Atomic Commissioning Start**. The UI generates and retains one
 idempotency request ID across client timeout/retry. The server revalidates the
 coherent broker/runtime snapshot and verified-anchor/passive-tail gate under the
 runtime admission lock, reserves commissioning ownership, and arms a single-use
-authorization. Under `NY_HIGH_CONFLUENCE_COMMISSIONING_V1`, the authorization
-waits without submitting an order until the current `NEW_YORK_RTH` generation
-produces a fresh policy decision with support at least `0.675`, dominance at
-least `0.10`, all three required families, and no blocking contradiction. That
+authorization. Under `BEELZEBUB_SCALPER_V2`, the authorization waits without
+submitting an order until the current configured session generation produces a
+fresh policy decision with support at least `0.55`, dominance at least `0.025`,
+all three required families, and no blocking contradiction. That
 exact decision's sources and confluence summary are sealed into the separate
 commissioning decision/intent/risk grant/command, and the authorization is
 consumed only at transport admission. A duplicate request returns the existing
@@ -90,11 +90,12 @@ not terminal until NinjaTrader confirms `FLAT`, quantity zero, zero owned
 orders, and a fresh clean reconciliation returns the runtime to
 `READY_DISARMED` with ownership `NONE`.
 
-The NY high-confluence commissioning profile permits at most one entry and a
-maximum position age of 3,600 seconds. Strategy retention/exit fluctuations do
-not close the commissioned position. The accepted protective stop, stale-data
-emergency exit, operator commissioning exit, one-hour maximum age, and 15:58
-America/New_York hard-flat deadline remain authoritative.
+The Beelzebub scalper profile permits at most twelve entries per session/trade
+date, enforces a ten-second re-entry cooldown, and limits position age to 540
+seconds. Strategy retention/exit fluctuations do not close a position owned by
+explicit commissioning. The accepted protective stop, stale-data emergency
+exit, operator commissioning exit, maximum-age exit, and exact session hard-flat
+deadline remain authoritative.
 
 ## Post-run closure
 

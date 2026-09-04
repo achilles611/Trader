@@ -158,17 +158,17 @@ class SlimPaperStatusTests(unittest.TestCase):
         paper = runtime(state="ARMED_FLAT")
         paper["commissioning_lifecycle"] = {
             "active": True,
-            "phase": "WAITING_FOR_HIGH_CONFLUENCE",
+            "phase": "WAITING_FOR_PROFILE_SIGNAL",
         }
-        paper["effective_confidence_threshold"] = "0.675"
-        paper["entry_dominance_margin"] = "0.10"
+        paper["effective_confidence_threshold"] = "0.55"
+        paper["entry_dominance_margin"] = "0.025"
         result = self.status(
             paper,
             {"result": "BLOCKED", "blocking_reasons": ["STATE_NOT_READY_DISARMED"]},
         )
         self.assertEqual(result["light"], "YELLOW")
-        self.assertEqual(result["label"], "WAITING FOR HIGH CONFLUENCE")
-        self.assertIn("0.675 support and 0.10 dominance", result["message"])
+        self.assertEqual(result["label"], "WAITING FOR PROFILE SIGNAL")
+        self.assertIn("0.55 support and 0.025 dominance", result["message"])
         self.assertTrue(result["paper_active"])
         self.assertFalse(result["can_start"])
 

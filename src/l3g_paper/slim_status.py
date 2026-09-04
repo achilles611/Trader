@@ -339,7 +339,7 @@ def derive_slim_paper_status(
         if (
             commissioning_active
             and state == "ARMED_FLAT"
-            and commissioning.get("phase") == "WAITING_FOR_HIGH_CONFLUENCE"
+            and commissioning.get("phase") == "WAITING_FOR_PROFILE_SIGNAL"
         ):
             support = str(runtime.get("effective_confidence_threshold") or "the configured")
             dominance = str(runtime.get("entry_dominance_margin") or "the configured")
@@ -347,9 +347,9 @@ def derive_slim_paper_status(
                 "schema": SLIM_STATUS_SCHEMA,
                 "generated_at": _timestamp(current),
                 "light": "YELLOW",
-                "label": "WAITING FOR HIGH CONFLUENCE",
+                "label": "WAITING FOR PROFILE SIGNAL",
                 "message": (
-                    "Commissioning is armed and waiting for a fresh signal meeting "
+                    "Commissioning is armed and waiting for a fresh profile-qualified signal meeting "
                     f"{support} support and {dominance} dominance."
                 ),
                 "primary_blocker": None,

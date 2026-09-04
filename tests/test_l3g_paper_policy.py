@@ -43,24 +43,24 @@ class PaperPolicyTests(unittest.TestCase):
         first = warmed_bullish_policy()[2]
         second = warmed_bullish_policy()[2]
         self.assertEqual(first.paper_decision_id, second.paper_decision_id)
-        self.assertEqual(first.paper_policy_id, "l3g-ny-high-confluence-commissioning-policy-v1")
+        self.assertEqual(first.paper_policy_id, "l3g-beelzebub-scalper-policy-v2")
         self.assertFalse(first.scientific_eligibility)
         self.assertNotIn("provider_sequence", first.payload())
 
-    def test_ny_high_confluence_parameters_are_reported_by_policy_status(self) -> None:
+    def test_scalper_parameters_are_reported_by_policy_status(self) -> None:
         status = ExperimentalPaperPolicy().status()
-        self.assertEqual(status["entry_profile"], "NY_HIGH_CONFLUENCE_COMMISSIONING")
-        self.assertEqual(status["entry_profile_version"], "NY_HIGH_CONFLUENCE_COMMISSIONING_V1")
+        self.assertEqual(status["entry_profile"], "BEELZEBUB_SCALPER")
+        self.assertEqual(status["entry_profile_version"], "BEELZEBUB_SCALPER_V2")
         self.assertEqual(status["entry_parameters"], {
-            "session_kind": "NEW_YORK_RTH",
-            "support_threshold": "0.675",
-            "dominance_margin": "0.10",
+            "session_kinds": ["ASIA", "LONDON", "NEW_YORK_RTH", "NY_AFTER"],
+            "support_threshold": "0.55",
+            "dominance_margin": "0.025",
             "family_count": 3,
-            "reentry_cooldown_seconds": 3600,
-            "retention_support_threshold": "0.55",
+            "reentry_cooldown_seconds": 10,
+            "retention_support_threshold": "0.525",
         })
 
-    def test_three_family_candidate_at_high_confidence_threshold_and_margin_can_enter(self) -> None:
+    def test_three_family_candidate_at_scalper_threshold_and_margin_can_enter(self) -> None:
         policy = ExperimentalPaperPolicy()
         policy.on_transport_state(StreamHealth.HEALTHY)
         factory = ObservationFactory()
@@ -69,17 +69,17 @@ class PaperPolicyTests(unittest.TestCase):
         families = {"positive_family_count": 3, "blocking_contradiction": False}
 
         def score(_at: str, hypothesis: object) -> tuple[Decimal, dict[str, object]]:
-            value = Decimal("0.675") if getattr(hypothesis, "value", None) == "BULLISH_REVERSAL" else Decimal("0.575")
+            value = Decimal("0.55") if getattr(hypothesis, "value", None) == "BULLISH_REVERSAL" else Decimal("0.525")
             return value, dict(families)
 
         policy.score = score  # type: ignore[method-assign]
         decision = policy.evaluate(factory.quote(100))
         self.assertEqual(decision.decision, PaperDecisionKind.LONG)
-        self.assertEqual(decision.relative_support, Decimal("0.675"))
-        self.assertEqual(decision.family_summary["dominance"], "0.100")
+        self.assertEqual(decision.relative_support, Decimal("0.55"))
+        self.assertEqual(decision.family_summary["dominance"], "0.025")
         self.assertEqual(decision.reason_code, "ENTRY_AUTHORIZED_DIRECTION")
 
-    def test_scalper_strength_candidate_is_rejected_by_high_confidence_profile(self) -> None:
+    def test_candidate_below_scalper_support_is_rejected(self) -> None:
         policy = ExperimentalPaperPolicy()
         policy.on_transport_state(StreamHealth.HEALTHY)
         factory = ObservationFactory()
@@ -88,7 +88,7 @@ class PaperPolicyTests(unittest.TestCase):
         families = {"positive_family_count": 3, "blocking_contradiction": False}
 
         def score(_at: str, hypothesis: object) -> tuple[Decimal, dict[str, object]]:
-            value = Decimal("0.625") if getattr(hypothesis, "value", None) == "BULLISH_REVERSAL" else Decimal("0.50")
+            value = Decimal("0.525") if getattr(hypothesis, "value", None) == "BULLISH_REVERSAL" else Decimal("0.50")
             return value, dict(families)
 
         policy.score = score  # type: ignore[method-assign]
@@ -96,13 +96,12 @@ class PaperPolicyTests(unittest.TestCase):
         self.assertEqual(decision.decision, PaperDecisionKind.NO_TRADE)
         self.assertEqual(decision.reason_code, "ENTRY_SUPPORT_THRESHOLD")
 
-    def test_profile_rejects_non_new_york_sessions(self) -> None:
+    def test_profile_accepts_configured_asia_session(self) -> None:
         policy = ExperimentalPaperPolicy()
         policy.on_transport_state(StreamHealth.HEALTHY)
         factory = ObservationFactory(start=datetime(2026, 8, 24, 22, 5, tzinfo=timezone.utc))
         decision = policy.ingest(factory.quote(100))
-        self.assertEqual(decision.decision, PaperDecisionKind.NO_TRADE)
-        self.assertEqual(decision.reason_code, "PROFILE_SESSION_MISMATCH")
+        self.assertNotEqual(decision.reason_code, "PROFILE_SESSION_MISMATCH")
 
     def test_unknown_aggressor_never_votes(self) -> None:
         policy = ExperimentalPaperPolicy(); policy.on_transport_state(StreamHealth.HEALTHY)

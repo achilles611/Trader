@@ -14,24 +14,28 @@ from src.l3g_paper.sessions import PaperSessionKind
 
 class PaperContractTests(unittest.TestCase):
     def test_artifacts_are_exact_hash_bound_and_never_scientific(self) -> None:
-        self.assertEqual(POLICY.configuration_hash, "070587789049231d268cb742404eb6dcc21d91014c9529aa109419a563729a91")
-        self.assertEqual(RISK_PROFILE.configuration_hash, "eef09f7b185cc197aced3e7b91dd03f1571be52be3635747d2d209821ebcaa34")
-        self.assertEqual(POLICY.policy_id, "l3g-ny-high-confluence-commissioning-policy-v1")
-        self.assertEqual((POLICY.entry_profile, POLICY.entry_profile_version), ("NY_HIGH_CONFLUENCE_COMMISSIONING", "NY_HIGH_CONFLUENCE_COMMISSIONING_V1"))
-        self.assertIs(POLICY.entry_session_kind, PaperSessionKind.NEW_YORK_RTH)
-        self.assertEqual(POLICY.entry_support_threshold, Decimal("0.675"))
-        self.assertEqual(POLICY.entry_dominance_margin, Decimal("0.10"))
+        self.assertEqual(POLICY.configuration_hash, "7077c30bdeb3b8017b5d8049ed32b92eb3acca67393ef101b217538da30d6659")
+        self.assertEqual(RISK_PROFILE.configuration_hash, "c86c2c2b39f7fef9fcdaed06978ab22141eeacd2cf1590f2a8cddee0c5b17404")
+        self.assertEqual(POLICY.policy_id, "l3g-beelzebub-scalper-policy-v2")
+        self.assertEqual((POLICY.entry_profile, POLICY.entry_profile_version), ("BEELZEBUB_SCALPER", "BEELZEBUB_SCALPER_V2"))
+        self.assertEqual(POLICY.entry_session_kinds, (
+            PaperSessionKind.ASIA, PaperSessionKind.LONDON,
+            PaperSessionKind.NEW_YORK_RTH, PaperSessionKind.NY_AFTER,
+        ))
+        self.assertEqual(POLICY.entry_support_threshold, Decimal("0.55"))
+        self.assertEqual(POLICY.entry_dominance_margin, Decimal("0.025"))
         self.assertEqual(POLICY.entry_family_count, 3)
-        self.assertEqual(POLICY.reentry_cooldown_seconds, 3600)
-        self.assertEqual(RISK_PROFILE.maximum_position_age_seconds, 3600)
-        self.assertEqual(RISK_PROFILE.maximum_session_entries, 1)
-        self.assertEqual(RISK_PROFILE.reentry_cooldown_seconds, 3600)
+        self.assertEqual(POLICY.reentry_cooldown_seconds, 10)
+        self.assertEqual(RISK_PROFILE.maximum_position_age_seconds, 540)
+        self.assertEqual(RISK_PROFILE.maximum_session_entries, 12)
+        self.assertEqual(RISK_PROFILE.reentry_cooldown_seconds, 10)
         self.assertFalse(POLICY.scientific_eligibility)
         self.assertFalse(AUTHORITY.authority_payload()["scientific_eligibility"])
         self.assertEqual(AUTHORITY.authority_payload()["live_capital"], "DENIED")
-        with self.assertRaisesRegex(ValueError, "high-confluence commissioning policy tuning"):
+        self.assertEqual(AUTHORITY.authority_payload()["entry_profile_version"], "BEELZEBUB_SCALPER_V2")
+        with self.assertRaisesRegex(ValueError, "Beelzebub scalper policy tuning"):
             replace(POLICY, entry_support_threshold=Decimal("0.65"))
-        with self.assertRaisesRegex(ValueError, "high-confluence commissioning risk limits"):
+        with self.assertRaisesRegex(ValueError, "Beelzebub scalper risk limits"):
             replace(RISK_PROFILE, maximum_session_entries=2)
 
     def test_no_other_account_binding_or_execution_target_is_constructible(self) -> None:

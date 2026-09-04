@@ -166,7 +166,7 @@ class SessionEvidenceTests(unittest.TestCase):
 
 
 class SessionRiskAndLedgerTests(unittest.TestCase):
-    def test_single_entry_cap_and_ny_rth_only_profile_reject_ny_after(self) -> None:
+    def test_session_caps_and_scalper_profile_accepts_ny_after(self) -> None:
         ny = resolved("2026-08-25T13:35:00Z").context
         after = resolved("2026-08-25T20:05:00Z").context
         policy_decision = replace(warmed_bullish_policy()[2], created_at="2026-08-25T13:35:00Z", expires_at="2026-08-25T13:35:05Z")
@@ -189,10 +189,10 @@ class SessionRiskAndLedgerTests(unittest.TestCase):
             session_kind=after.session_kind, session_id=after.session_id,
             session_profile_hash=after.session_profile_hash,
         )
-        after_intent = authority.make_intent(after_decision, reference_bid=Decimal("100"), reference_ask=Decimal("100.25"), reference_last=Decimal("100"))
-        after_grant = authority.evaluate(after_intent, healthy(after, "2026-08-25T20:05:00Z"), at="2026-08-25T20:05:00Z")
-        self.assertFalse(after_grant.granted)
-        self.assertIn("PROFILE_SESSION_MISMATCH", after_grant.reason_codes)
+        after_authority = PaperRiskAuthority()
+        after_intent = after_authority.make_intent(after_decision, reference_bid=Decimal("100"), reference_ask=Decimal("100.25"), reference_last=Decimal("100"))
+        after_grant = after_authority.evaluate(after_intent, healthy(after, "2026-08-25T20:05:00Z"), at="2026-08-25T20:05:00Z")
+        self.assertTrue(after_grant.granted)
 
     def test_ledger_filters_preserve_session_dimension(self) -> None:
         asia = resolved("2026-08-24T22:05:00Z").context

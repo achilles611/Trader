@@ -24,15 +24,15 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
   // though an intentional one-shot commissioning reservation owns authority.
   // Render that known lifecycle directly so Slim never calls healthy waiting
   // a runtime failure while the backend update is awaiting its next restart.
-  const waitingForConfluence = commissioning?.active === true
-    && commissioning?.phase === "WAITING_FOR_HIGH_CONFLUENCE"
+  const waitingForProfileSignal = commissioning?.active === true
+    && commissioning?.phase === "WAITING_FOR_PROFILE_SIGNAL"
     && paper.status?.state === "ARMED_FLAT";
-  const light = waitingForConfluence ? "YELLOW" : status?.light || "RED";
-  const label = waitingForConfluence ? "WAITING FOR HIGH CONFLUENCE" : status?.label || "NOT READY";
-  const message = waitingForConfluence
-    ? `Commissioning is armed and waiting for a fresh signal meeting ${paper.status?.effective_confidence_threshold || "the configured"} support and ${paper.status?.entry_dominance_margin || "the configured"} dominance.`
+  const light = waitingForProfileSignal ? "YELLOW" : status?.light || "RED";
+  const label = waitingForProfileSignal ? "WAITING FOR PROFILE SIGNAL" : status?.label || "NOT READY";
+  const message = waitingForProfileSignal
+    ? `Commissioning is armed and waiting for a fresh profile-qualified signal meeting ${paper.status?.effective_confidence_threshold || "the configured"} support and ${paper.status?.entry_dominance_margin || "the configured"} dominance.`
     : status?.message || "Waiting for current canonical paper runtime status.";
-  const active = waitingForConfluence || status?.paper_active === true;
+  const active = waitingForProfileSignal || status?.paper_active === true;
   const runtimeState = String(paper.status?.state || "");
   const runtimeMayBeActive = paper.status?.operational_paper_session?.active === true
     || ["STARTING", "PAPER_RUNNING", "ENTRY_PENDING", "OPEN_POSITION", "EXIT_PENDING", "PAUSED", "RECONCILING", "FAULTED", "LOCKED_OUT"].includes(runtimeState);

@@ -2978,7 +2978,7 @@ class LaneIIIPaperRuntime:
         *,
         candidate: PaperDecision | None = None,
     ) -> dict[str, object]:
-        """Consume one commissioning entry only from fresh high-confluence policy evidence."""
+        """Consume one commissioning entry only from fresh profile-qualified policy evidence."""
         with self._lock, self.ledger.commissioning_authority_fence():
             ownership = self._commissioning_ownership
             if ownership is None or self._entry_owner is not PaperEntryOwner.COMMISSIONING:
@@ -3092,7 +3092,7 @@ class LaneIIIPaperRuntime:
                     "submitted": False,
                     "commissioning": True,
                     "commissioning_id": ownership.commissioning_id,
-                    "reason_codes": ("COMMISSIONING_WAITING_FOR_HIGH_CONFLUENCE",),
+                    "reason_codes": ("COMMISSIONING_WAITING_FOR_PROFILE_SIGNAL",),
                     "state": self._state.value,
                 }
             assert selected is not None
@@ -3126,7 +3126,7 @@ class LaneIIIPaperRuntime:
                 None, selected.direction, selected.relative_support,
                 {
                     "commissioning": True,
-                    "qualification": "HIGH_CONFLUENCE_POLICY_SIGNAL",
+                    "qualification": "PROFILE_POLICY_SIGNAL",
                     "source_decision_id": selected.paper_decision_id,
                     "source_hypothesis": None if selected.hypothesis_kind is None else selected.hypothesis_kind.value,
                     "source_family_summary": dict(selected.family_summary),
@@ -3135,7 +3135,7 @@ class LaneIIIPaperRuntime:
                 selected.source_local_sequences,
                 selected.source_payload_hashes,
                 POLICY.sequence_authority, POLICY.book_completeness, False,
-                "COMMISSIONING_HIGH_CONFLUENCE_ENTRY", context.session_kind, context.session_id,
+                "COMMISSIONING_PROFILE_SIGNAL_ENTRY", context.session_kind, context.session_id,
                 context.trade_date, context.session_profile_hash, context.session_generation,
                 True, False, False,
             )
@@ -3251,7 +3251,7 @@ class LaneIIIPaperRuntime:
             and not candidate.scientific_evidence
             and candidate.paper_policy_id == POLICY.policy_id
             and candidate.paper_policy_hash == POLICY.configuration_hash
-            and candidate.session_kind is POLICY.entry_session_kind
+            and candidate.session_kind in POLICY.entry_session_kinds
             and candidate.session_kind is context.session_kind
             and candidate.session_id == context.session_id
             and candidate.trade_date == context.trade_date
@@ -3560,7 +3560,8 @@ class LaneIIIPaperRuntime:
                 "live_capital": "DENIED",
                 "entry_profile": POLICY.entry_profile,
                 "entry_profile_version": POLICY.entry_profile_version,
-                "entry_session_kind": POLICY.entry_session_kind.value,
+                "entry_session_kind": "ALL_CONFIGURED",
+                "entry_session_kinds": [value.value for value in POLICY.entry_session_kinds],
                 "effective_confidence_threshold": str(POLICY.entry_support_threshold),
                 "entry_dominance_margin": str(POLICY.entry_dominance_margin),
                 "entry_family_count": POLICY.entry_family_count,
@@ -3663,9 +3664,9 @@ class LaneIIIPaperRuntime:
                     "phase": (
                         "INACTIVE" if ownership is None
                         else "ENTRY_CONSUMED" if ownership.entry_consumed
-                        else "WAITING_FOR_HIGH_CONFLUENCE"
+                        else "WAITING_FOR_PROFILE_SIGNAL"
                     ),
-                    "waiting_for_high_confluence": ownership is not None and not ownership.entry_consumed,
+                    "waiting_for_profile_signal": ownership is not None and not ownership.entry_consumed,
                     "commissioning_id": None if ownership is None else ownership.commissioning_id,
                     "entry_consumed": False if ownership is None else ownership.entry_consumed,
                     "recovered_after_restart": False if ownership is None else ownership.recovered_after_restart,

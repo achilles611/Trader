@@ -98,6 +98,13 @@ class PaperLedgerTests(unittest.TestCase):
             path = Path(directory) / "paper.sqlite3"
             with PaperLedger(path) as ledger:
                 first = ledger.append("DECISION", {"paper_decision_id": "l3g-pd-a"}, identity="l3g-pd-a")
+                record = ledger.recent(limit=1)[0]
+                self.assertEqual(record["entry_profile"], "BEELZEBUB_SCALPER")
+                self.assertEqual(record["entry_profile_version"], "BEELZEBUB_SCALPER_V2")
+                self.assertEqual(record["effective_confidence_threshold"], "0.55")
+                self.assertEqual(record["entry_dominance_margin"], "0.025")
+                self.assertEqual(record["entry_family_count"], 3)
+                self.assertEqual(record["retention_confidence_threshold"], "0.525")
                 self.assertEqual(
                     first,
                     ledger.append("DECISION", {"paper_decision_id": "l3g-pd-a"}, identity="l3g-pd-a"),

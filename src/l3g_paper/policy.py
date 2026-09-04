@@ -805,7 +805,7 @@ class ExperimentalPaperPolicy:
     ) -> PaperDecision:
         at_text = normalized_utc(self._market_event_timestamp(observation), "Paper evaluation time")
         at = self._time(at_text)
-        if self._paper_session_context.session_kind is not self.artifact.entry_session_kind:
+        if self._paper_session_context.session_kind not in self.artifact.entry_session_kinds:
             return self._decision(observation, PaperDecisionKind.NO_TRADE, None, "PROFILE_SESSION_MISMATCH")
         if self._transport_state is not StreamHealth.HEALTHY:
             return self._decision(observation, PaperDecisionKind.NO_TRADE, None, "LOCAL_BRIDGE_UNHEALTHY")
@@ -884,7 +884,7 @@ class ExperimentalPaperPolicy:
                 "entry_profile": self.artifact.entry_profile,
                 "entry_profile_version": self.artifact.entry_profile_version,
                 "entry_parameters": {
-                    "session_kind": self.artifact.entry_session_kind.value,
+                    "session_kinds": [value.value for value in self.artifact.entry_session_kinds],
                     "support_threshold": str(self.artifact.entry_support_threshold),
                     "dominance_margin": str(self.artifact.entry_dominance_margin),
                     "family_count": self.artifact.entry_family_count,

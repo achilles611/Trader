@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -81,6 +82,9 @@ NINJATRADER_RUNTIME_LOGGER = logging.getLogger("uvicorn.error")
 LEDGER_VERIFICATION_FRESHNESS_SECONDS = 15 * 60
 MARKET_OBSERVER_ACTIVE_FRESHNESS_SECONDS = 15.0
 LEDGER_VERIFIER_SHUTDOWN_WAIT_SECONDS = 30.0
+GRACEFUL_SHUTDOWN_ACTION_HEADER = "X-Beelzebub-Graceful-Shutdown-Action"
+GRACEFUL_SHUTDOWN_ACTION_VALUE = "beezconsole-graceful-shutdown-v1"
+_LOCAL_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 
 
 class UnsafePaperExecutionShutdown(RuntimeError):
@@ -1548,7 +1552,8 @@ def create_control_center_app(
                 "live_capital": "DENIED",
                 "entry_profile": POLICY.entry_profile,
                 "entry_profile_version": POLICY.entry_profile_version,
-                "entry_session_kind": POLICY.entry_session_kind.value,
+                "entry_session_kind": "ALL_CONFIGURED",
+                "entry_session_kinds": [value.value for value in POLICY.entry_session_kinds],
                 "effective_confidence_threshold": str(POLICY.entry_support_threshold),
                 "entry_dominance_margin": str(POLICY.entry_dominance_margin),
                 "entry_family_count": POLICY.entry_family_count,
@@ -2088,6 +2093,9 @@ def create_control_center_app(
 
     app = FastAPI(title="Trader Copy Control Center", version="1.0", docs_url=None, redoc_url=None,
                   lifespan=lifespan)
+    # serve_control_center installs the only production callback. Tests and
+    # embedded app users remain unable to terminate their host implicitly.
+    app.state.request_server_shutdown = None
     app.state.ninjatrader_maintenance = ninjatrader_maintenance
     app.state.paper_autostart = paper_autostart
     app.state.ninjatrader_observer = None
@@ -3003,6 +3011,72 @@ def create_control_center_app(
         """Expose non-secret deployment bindings without granting authority."""
         return dict(runtime_binding)
 
+    @app.post("/api/system/graceful-shutdown")
+    async def api_system_graceful_shutdown(
+        request: Request,
+        body: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, object]:
+        """Request lifespan-owned shutdown only from an exact flat local runtime."""
+        hostname = (request.url.hostname or "").lower()
+        if hostname not in {"127.0.0.1", "localhost", "::1", "testserver"}:
+            raise HTTPException(status_code=403, detail="Graceful shutdown is loopback-only.")
+        origin = request.headers.get("origin")
+        if origin and (urlsplit(origin).hostname or "").lower() not in {"127.0.0.1", "localhost", "::1"}:
+            raise HTTPException(status_code=403, detail="Graceful shutdown origin is not local.")
+        if request.headers.get(GRACEFUL_SHUTDOWN_ACTION_HEADER) != GRACEFUL_SHUTDOWN_ACTION_VALUE:
+            raise HTTPException(status_code=403, detail="Graceful shutdown action confirmation is required.")
+        request_id = body.get("request_id") if isinstance(body, dict) and set(body) == {"request_id"} else None
+        if not isinstance(request_id, str) or not _LOCAL_REQUEST_ID.fullmatch(request_id):
+            raise HTTPException(status_code=400, detail="Graceful shutdown accepts only a valid request_id.")
+        paper = ninjatrader_runtime.get("paper")
+        if paper is None:
+            raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
+        status = paper.status()
+        exact_flat = (
+            status.get("state") == "READY_DISARMED"
+            and status.get("paper_execution") == "DISARMED"
+            and status.get("session_armed_state") == "DISARMED"
+            and status.get("current_position") == "FLAT"
+            and status.get("current_quantity") == 0
+            and status.get("broker_snapshot_position") == "FLAT"
+            and status.get("broker_snapshot_position_quantity") == 0
+            and status.get("working_owned_orders") == 0
+            and status.get("working_entry_orders") == 0
+            and status.get("unresolved_command") is False
+            and status.get("unresolved_native_order") is False
+            and status.get("unresolved_execution") is False
+            and status.get("entry_owner") == "NONE"
+            and status.get("operational_paper_session") is None
+            and status.get("reconciliation_current") is True
+        )
+        ledger_status = status.get("ledger")
+        ledger_status = ledger_status if isinstance(ledger_status, Mapping) else {}
+        queue_drained = (
+            ledger_status.get("deferred_queue_depth") == 0
+            and ledger_status.get("deferred_pending_queue_depth") == 0
+            and ledger_status.get("deferred_inflight_queue_depth") == 0
+            and ledger_status.get("deferred_pending_barrier_count") == 0
+            and ledger_status.get("deferred_writer_error") is None
+        )
+        if not exact_flat or not queue_drained:
+            raise HTTPException(
+                status_code=409,
+                detail="Graceful shutdown requires READY_DISARMED, exact reconciled flat/no-orders truth, and a drained ledger writer.",
+            )
+        if ledger_verifier.status().get("status") == "IN_PROGRESS":
+            raise HTTPException(status_code=409, detail="Graceful shutdown requires the detached ledger verifier to finish first.")
+        shutdown_callback = app.state.request_server_shutdown
+        if not callable(shutdown_callback):
+            raise HTTPException(status_code=503, detail="This app host does not expose controlled server shutdown.")
+        NINJATRADER_RUNTIME_LOGGER.info("BEELZEBUB_GRACEFUL_SHUTDOWN_REQUESTED request_id=%s", request_id)
+        asyncio.get_running_loop().call_later(0.1, shutdown_callback)
+        return {
+            "schema": "beezconsole-graceful-shutdown-v1",
+            "accepted": True,
+            "request_id": request_id,
+            "state": "SHUTDOWN_REQUESTED",
+        }
+
     @app.get("/api/execution")
     async def api_execution() -> dict[str, Any]:
         return center.execution_health()
@@ -3131,5 +3205,11 @@ def serve_control_center(
     if with_watcher and service is None:
         from .service import CopyTradeService
         service = CopyTradeService(config, database)
-    uvicorn.run(create_control_center_app(config, database, watcher_service=service if with_watcher else None),
-                host=host or config.artifacts.dashboard_host, port=port or config.artifacts.dashboard_port)
+    app = create_control_center_app(config, database, watcher_service=service if with_watcher else None)
+    server = uvicorn.Server(uvicorn.Config(
+        app,
+        host=host or config.artifacts.dashboard_host,
+        port=port or config.artifacts.dashboard_port,
+    ))
+    app.state.request_server_shutdown = lambda: setattr(server, "should_exit", True)
+    server.run()

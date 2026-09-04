@@ -330,7 +330,7 @@ class CommissioningOwnershipTests(unittest.TestCase):
                 )
             self.assertTrue(waiting["armed"])
             self.assertFalse(waiting["submitted"])
-            self.assertEqual(waiting["reason_codes"], ("COMMISSIONING_WAITING_FOR_HIGH_CONFLUENCE",))
+            self.assertEqual(waiting["reason_codes"], ("COMMISSIONING_WAITING_FOR_PROFILE_SIGNAL",))
             self.assertEqual(runtime.state, PaperRuntimeState.ARMED_FLAT)
             self.assertEqual(commands, [])
             self.assertIsNotNone(candidate)
@@ -347,7 +347,7 @@ class CommissioningOwnershipTests(unittest.TestCase):
             self.assertTrue(commands[0].commissioning)  # type: ignore[attr-defined]
             self.assertEqual(commands[0].action.value, "ENTER_LONG")  # type: ignore[attr-defined]
             authorized = ledger.recent_kinds(("COMMISSIONING_ENTRY_AUTHORIZED",), limit=1)[0]
-            self.assertEqual(authorized["payload"]["qualification"]["required_support"], "0.675")
+            self.assertEqual(authorized["payload"]["qualification"]["required_support"], "0.55")
             self.assertEqual(authorized["payload"]["qualification"]["required_family_count"], 3)
             self.assertEqual(authorized["payload"]["session_kind"], context.session_kind.value)
             self.close(runtime, ledger)
@@ -366,7 +366,7 @@ class CommissioningOwnershipTests(unittest.TestCase):
                     lambda commissioning_id, snapshot: {"ledger_trust_state": "TEST_VERIFIED_ANCHOR"},
                 )
             self.assertFalse(waiting["submitted"])
-            self.assertEqual(runtime.status()["commissioning_lifecycle"]["phase"], "WAITING_FOR_HIGH_CONFLUENCE")
+            self.assertEqual(runtime.status()["commissioning_lifecycle"]["phase"], "WAITING_FOR_PROFILE_SIGNAL")
 
             factory = ObservationFactory(
                 start=datetime.fromisoformat(self.now.replace("Z", "+00:00")) - timedelta(milliseconds=100),
@@ -385,7 +385,7 @@ class CommissioningOwnershipTests(unittest.TestCase):
             self.assertTrue(commands[0].commissioning)  # type: ignore[attr-defined]
             status = runtime.status()
             self.assertEqual(status["commissioning_lifecycle"]["phase"], "ENTRY_CONSUMED")
-            self.assertFalse(status["commissioning_lifecycle"]["waiting_for_high_confluence"])
+            self.assertFalse(status["commissioning_lifecycle"]["waiting_for_profile_signal"])
             self.close(runtime, ledger)
 
     def test_commissioned_position_ignores_strategy_retention_exit_until_a_safety_exit(self) -> None:
@@ -444,7 +444,7 @@ class CommissioningOwnershipTests(unittest.TestCase):
             self.assertIsNotNone(candidate)
             commands: list[object] = []
             runtime._persist_and_send = lambda command, grant: commands.append(command)  # type: ignore[method-assign]
-            weak = replace(candidate, relative_support=Decimal("0.65"))  # type: ignore[arg-type]
+            weak = replace(candidate, relative_support=Decimal("0.525"))  # type: ignore[arg-type]
             stale = replace(candidate, created_at="2026-08-26T13:59:50Z", expires_at="2026-08-26T13:59:55Z")  # type: ignore[arg-type]
             with patch("src.l3g_paper.runtime._now", return_value=self.now):
                 weak_result = runtime.commission_entry(
@@ -453,8 +453,8 @@ class CommissioningOwnershipTests(unittest.TestCase):
                 stale_result = runtime.commission_entry(
                     str(lifecycle["commissioning_id"]), str(lifecycle["commissioning_token"]), candidate=stale,
                 )
-            self.assertEqual(weak_result["reason_codes"], ("COMMISSIONING_WAITING_FOR_HIGH_CONFLUENCE",))
-            self.assertEqual(stale_result["reason_codes"], ("COMMISSIONING_WAITING_FOR_HIGH_CONFLUENCE",))
+            self.assertEqual(weak_result["reason_codes"], ("COMMISSIONING_WAITING_FOR_PROFILE_SIGNAL",))
+            self.assertEqual(stale_result["reason_codes"], ("COMMISSIONING_WAITING_FOR_PROFILE_SIGNAL",))
             self.assertEqual(commands, [])
             self.assertFalse(runtime._commissioning_ownership.entry_consumed)  # type: ignore[union-attr]
             self.close(runtime, ledger)
