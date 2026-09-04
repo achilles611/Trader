@@ -140,6 +140,7 @@ class ProfileSwitchServiceTests(unittest.TestCase):
         self.assertTrue(self.shutdown.wait(1))
         status = self.service.status()
         self.assertEqual(status["stage"], "SHUTDOWN_REQUESTED")
+        self.assertEqual(status["runtime_root"], str((self.root / "runtime").resolve()))
         self.assertEqual(len(self.launched), 1)
         manifest_path, parent_pid = self.launched[0]
         self.assertEqual(parent_pid, 12345)

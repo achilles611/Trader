@@ -180,6 +180,7 @@ class PaperProfileSwitchService:
         return {
             **state,
             "active_profile": self.current_profile.selection_key,
+            "runtime_root": str(self.runtime_root),
             "action_token": self._token,
             "profiles": profile_catalog(),
             "authority": "PAPER_SIM101_PROFILE_SELECTION_ONLY",
