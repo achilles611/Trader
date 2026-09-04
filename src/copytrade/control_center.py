@@ -1365,6 +1365,17 @@ def discovery_job_configuration(body: dict[str, Any] | None) -> dict[str, Any]:
             "window_hours": window_hours}
 
 
+def profile_switch_runtime_root(paper_path: Path, configured_root: str | None = None) -> Path:
+    """Keep every generated profile run under one stable runtime ancestor."""
+    if configured_root:
+        return Path(configured_root).expanduser().resolve()
+    resolved = paper_path.resolve()
+    for parent in resolved.parents:
+        if parent.name.lower() == "runtime":
+            return parent
+    return resolved.parent.parent if resolved.parent.name.lower() == "hot" else resolved.parent
+
+
 def create_control_center_app(
     config: CopyTradeConfig, database: CopyTradeDatabase | None = None, watcher_health: dict[str, Any] | Any | None = None,
     *, watcher_service: Any | None = None, watcher_factory: Any | None = None,
@@ -2129,10 +2140,9 @@ def create_control_center_app(
     app.state.ledger_verifier = ledger_verifier
     app.state.scheduler_engine = None
     app.state.scheduler_service = scheduler_service
-    profile_switch_runtime_root = Path(
-        os.getenv("BEELZEBUB_PROFILE_SWITCH_ROOT")
-        or (paper_path.parent.parent if paper_path.parent.name.lower() == "hot" else paper_path.parent)
-    ).resolve()
+    resolved_profile_switch_runtime_root = profile_switch_runtime_root(
+        paper_path, os.getenv("BEELZEBUB_PROFILE_SWITCH_ROOT"),
+    )
 
     def flatten_current_profile() -> Mapping[str, object]:
         paper = ninjatrader_runtime.get("paper")
@@ -2152,7 +2162,7 @@ def create_control_center_app(
         flatten_and_disarm=flatten_current_profile,
         verifier_status=ledger_verifier.status,
         request_shutdown=request_profile_switch_shutdown,
-        runtime_root=profile_switch_runtime_root,
+        runtime_root=resolved_profile_switch_runtime_root,
         project_root=Path(__file__).resolve().parents[2],
         python_executable=sys.executable,
         git_sha=str(runtime_binding["git_sha"]),

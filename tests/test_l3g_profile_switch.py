@@ -10,7 +10,7 @@ import unittest
 from fastapi import HTTPException, Request
 
 from src.copytrade.config import CopyTradeConfig
-from src.copytrade.control_center import create_control_center_app
+from src.copytrade.control_center import create_control_center_app, profile_switch_runtime_root
 from src.l3g_paper.contracts import (
     FIVE_MINUTE_PROFILE,
     HIGH_CONFIDENCE_POLICY,
@@ -59,6 +59,10 @@ def flat_status() -> dict[str, object]:
 
 
 class ProfileCatalogTests(unittest.TestCase):
+    def test_switch_storage_stays_anchored_to_runtime_for_nested_profile_runs(self) -> None:
+        nested = Path("N:/Beelzebub/runtime/profiles/beelzebub_scalper_v2/runs/run-1/hot/lane_iii_paper.sqlite3")
+        self.assertEqual(profile_switch_runtime_root(nested), Path("N:/Beelzebub/runtime").resolve())
+
     def test_catalog_contains_three_closed_policy_and_risk_bundles(self) -> None:
         self.assertEqual(
             tuple(profile.selection_key for profile in PAPER_PROFILE_CATALOG),
