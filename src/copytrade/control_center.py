@@ -46,7 +46,7 @@ from src.l3g_paper.paper_autostart import (
     PaperAutoStartService,
 )
 from src.l3g_paper.ninjatrader_transport import PaperExecutionTransport
-from src.l3g_paper.contracts import POLICY, RISK_PROFILE
+from src.l3g_paper.contracts import RISK_PROFILE, resolve_paper_policy_profile
 from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout
 from src.l3g_paper.sessions import session_catalog
 from src.l3g_paper.slim_status import derive_slim_paper_status, unavailable_slim_status
@@ -1405,6 +1405,9 @@ def create_control_center_app(
         else Path(config.artifacts.database_path).resolve().with_name("lane_iii_paper.sqlite3")
     )
     configured_paper_epoch = os.getenv("BEELZEBUB_L3G_PAPER_LEDGER_EPOCH")
+    selected_paper_policy = resolve_paper_policy_profile(
+        os.getenv("BEELZEBUB_L3G_PAPER_PROFILE")
+    )
     derived_audit_root = paper_path.parent.parent / "audit" if paper_path.parent.name.lower() == "hot" else paper_path.parent / "audit"
     audit_root = Path(os.getenv("BEELZEBUB_LEDGER_AUDIT_ROOT") or derived_audit_root).resolve()
     ledger_verifier = LocalLedgerVerificationController(paper_path, audit_root)
@@ -1415,6 +1418,9 @@ def create_control_center_app(
         "python": sys.executable,
         "pid": os.getpid(),
         "git_sha": _runtime_git_sha(),
+        "entry_profile": selected_paper_policy.entry_profile,
+        "entry_profile_version": selected_paper_policy.entry_profile_version,
+        "paper_policy_hash": selected_paper_policy.configuration_hash,
     }
 
     def live_watcher_health() -> dict[str, Any] | None:
@@ -1550,15 +1556,15 @@ def create_control_center_app(
                 "market_instrument": "MNQ SEP26",
                 "maximum_quantity": 1,
                 "live_capital": "DENIED",
-                "entry_profile": POLICY.entry_profile,
-                "entry_profile_version": POLICY.entry_profile_version,
+                "entry_profile": selected_paper_policy.entry_profile,
+                "entry_profile_version": selected_paper_policy.entry_profile_version,
                 "entry_session_kind": "ALL_CONFIGURED",
-                "entry_session_kinds": [value.value for value in POLICY.entry_session_kinds],
-                "effective_confidence_threshold": str(POLICY.entry_support_threshold),
-                "entry_dominance_margin": str(POLICY.entry_dominance_margin),
-                "entry_family_count": POLICY.entry_family_count,
-                "reentry_cooldown_seconds": POLICY.reentry_cooldown_seconds,
-                "retention_confidence_threshold": str(POLICY.retention_support_threshold),
+                "entry_session_kinds": [value.value for value in selected_paper_policy.entry_session_kinds],
+                "effective_confidence_threshold": str(selected_paper_policy.entry_support_threshold),
+                "entry_dominance_margin": str(selected_paper_policy.entry_dominance_margin),
+                "entry_family_count": selected_paper_policy.entry_family_count,
+                "reentry_cooldown_seconds": selected_paper_policy.reentry_cooldown_seconds,
+                "retention_confidence_threshold": str(selected_paper_policy.retention_support_threshold),
                 "maximum_position_age_seconds": RISK_PROFILE.maximum_position_age_seconds,
                 "maximum_session_entries": RISK_PROFILE.maximum_session_entries,
                 "session_definitions": list(session_catalog()),
@@ -1823,7 +1829,9 @@ def create_control_center_app(
                 raise RuntimeError(
                     "New production paper ledger requires BEELZEBUB_L3G_PAPER_LEDGER_EPOCH or an epoch-N directory."
                 )
-            paper_ledger = paper_ledger_factory(paper_path) if paper_ledger_factory is not None else PaperLedger(paper_path, epoch_id=configured_paper_epoch)
+            paper_ledger = paper_ledger_factory(paper_path) if paper_ledger_factory is not None else PaperLedger(
+                paper_path, epoch_id=configured_paper_epoch, policy=selected_paper_policy,
+            )
             if type(paper_ledger) is not PaperLedger:
                 raise RuntimeError("LANE_III_PAPER ledger factory must return the exact durable ledger")
             paper_runtime = lane_iii_paper_factory(paper_ledger) if lane_iii_paper_factory is not None else LaneIIIPaperRuntime(paper_ledger)
@@ -1837,6 +1845,7 @@ def create_control_center_app(
                     paper_ledger,
                     on_message=paper_runtime.on_execution_message,
                     on_bridge_state=paper_runtime.on_execution_bridge_state,
+                    policy=selected_paper_policy,
                 )
             )
             if type(paper_transport) is not PaperExecutionTransport:

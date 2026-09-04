@@ -30,6 +30,10 @@ PAPER_RECORD_SCHEMA = "lane-iii-phase-g-paper-record-v1"
 PAPER_POLICY_ID = "l3g-beelzebub-scalper-policy-v2"
 PAPER_ENTRY_PROFILE = "BEELZEBUB_SCALPER"
 PAPER_ENTRY_PROFILE_VERSION = "BEELZEBUB_SCALPER_V2"
+FIVE_MINUTE_POLICY_SCHEMA = "lane-iii-phase-g-five-minute-bias-policy-v1"
+FIVE_MINUTE_POLICY_ID = "l3g-beelzebub-five-minute-bias-policy-v1"
+FIVE_MINUTE_ENTRY_PROFILE = "BEELZEBUB_FIVE_MINUTE_BIAS"
+FIVE_MINUTE_ENTRY_PROFILE_VERSION = "BEELZEBUB_FIVE_MINUTE_BIAS_V1"
 PAPER_RISK_PROFILE_ID = "l3g-beelzebub-scalper-risk-v2"
 PAPER_MODE = "PAPER_SIM101"
 PAPER_ACCOUNT = "Sim101"
@@ -237,6 +241,86 @@ class PaperPolicyArtifact:
     @property
     def configuration_hash(self) -> str:
         return canonical_hash(self.payload())
+
+
+@dataclass(frozen=True)
+class FiveMinutePaperPolicyArtifact(PaperPolicyArtifact):
+    """Closed experimental identity for one decision per completed five-minute bar."""
+
+    schema: str = FIVE_MINUTE_POLICY_SCHEMA
+    policy_id: str = FIVE_MINUTE_POLICY_ID
+    entry_profile: str = FIVE_MINUTE_ENTRY_PROFILE
+    entry_profile_version: str = FIVE_MINUTE_ENTRY_PROFILE_VERSION
+    entry_support_threshold: Decimal = Decimal("0")
+    entry_dominance_margin: Decimal = Decimal("0")
+    retention_support_threshold: Decimal = Decimal("0")
+    retention_dominance_margin: Decimal = Decimal("0")
+    entry_family_count: int = 0
+    retention_family_count: int = 0
+    decision_ttl_seconds: int = 30
+    reentry_cooldown_seconds: int = 0
+    decision_interval_seconds: int = 300
+    decision_clock: str = "UTC_EPOCH_ALIGNED_FIRST_ADMITTED_CALLBACK"
+    initial_partial_candle: str = "WAIT_FOR_NEXT_BOUNDARY"
+    tie_while_flat: str = "NO_TRADE"
+    tie_while_positioned: str = "HOLD"
+    reversal_protocol: str = "EXIT_RECONCILE_THEN_ENTER"
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema,
+            self.policy_id,
+            self.entry_profile,
+            self.entry_profile_version,
+        ) != (
+            FIVE_MINUTE_POLICY_SCHEMA,
+            FIVE_MINUTE_POLICY_ID,
+            FIVE_MINUTE_ENTRY_PROFILE,
+            FIVE_MINUTE_ENTRY_PROFILE_VERSION,
+        ):
+            raise ValueError("The five-minute paper policy identity is immutable.")
+        if self.authority != "EXPERIMENTAL_PAPER_DIRECTION_ONLY" or self.scientific_eligibility:
+            raise ValueError("The five-minute policy cannot acquire scientific or execution authority.")
+        if self.native_contract != PAPER_NATIVE_CONTRACT or self.canonical_contract != PAPER_CANONICAL_CONTRACT:
+            raise ValueError("The five-minute policy requires exact MNQ SEP26 identity.")
+        if self.allowed_hypotheses != (
+            HypothesisKind.BULLISH_REVERSAL,
+            HypothesisKind.BEARISH_CONTINUATION,
+        ):
+            raise ValueError("The five-minute directional universe is fixed.")
+        if (
+            self.entry_session_kinds != (
+                PaperSessionKind.ASIA,
+                PaperSessionKind.LONDON,
+                PaperSessionKind.NEW_YORK_RTH,
+                PaperSessionKind.NY_AFTER,
+            )
+            or self.decision_interval_seconds != 300
+            or self.entry_support_threshold != Decimal("0")
+            or self.entry_dominance_margin != Decimal("0")
+            or self.retention_support_threshold != Decimal("0")
+            or self.retention_dominance_margin != Decimal("0")
+            or self.entry_family_count != 0
+            or self.retention_family_count != 0
+            or self.decision_ttl_seconds != 30
+            or self.reentry_cooldown_seconds != 0
+            or self.decision_clock != "UTC_EPOCH_ALIGNED_FIRST_ADMITTED_CALLBACK"
+            or self.initial_partial_candle != "WAIT_FOR_NEXT_BOUNDARY"
+            or self.tie_while_flat != "NO_TRADE"
+            or self.tie_while_positioned != "HOLD"
+            or self.reversal_protocol != "EXIT_RECONCILE_THEN_ENTER"
+        ):
+            raise ValueError("The five-minute decision protocol is immutable.")
+
+
+PaperPolicyArtifactType = PaperPolicyArtifact | FiveMinutePaperPolicyArtifact
+
+
+def known_paper_policy_identity(policy_id: object, policy_hash: object) -> bool:
+    """Recognize only compiled profile identities; never accept caller-defined policy hashes."""
+    if not isinstance(policy_id, str) or not isinstance(policy_hash, str):
+        return False
+    return (policy_id, policy_hash) in KNOWN_PAPER_POLICY_IDENTITIES
 
 
 @dataclass(frozen=True)
@@ -450,7 +534,7 @@ class PaperDecision:
     def __post_init__(self) -> None:
         if not self.paper_decision_id.startswith("l3g-pd-"):
             raise ValueError("Paper decisions require the l3g-pd namespace.")
-        if self.paper_policy_id != PAPER_POLICY_ID or not self.paper_policy_hash:
+        if not known_paper_policy_identity(self.paper_policy_id, self.paper_policy_hash):
             raise ValueError("Paper decision policy identity is required.")
         _utc(self.created_at, "Paper decision time")
         _utc(self.expires_at, "Paper decision expiry")
@@ -729,7 +813,7 @@ class ExecutionAuditSink(Protocol):
 
 @dataclass(frozen=True)
 class PaperAuthorityBundle:
-    policy: PaperPolicyArtifact = field(default_factory=PaperPolicyArtifact)
+    policy: PaperPolicyArtifactType = field(default_factory=PaperPolicyArtifact)
     risk: PaperRiskProfile = field(default_factory=PaperRiskProfile)
     binding: ExecutionAccountBinding = field(default_factory=ExecutionAccountBinding)
     capability: ExecutionCapabilityManifest = field(default_factory=ExecutionCapabilityManifest)
@@ -770,7 +854,22 @@ def refuse_execution_target(value: object) -> None:
 
 
 POLICY = PaperPolicyArtifact()
+FIVE_MINUTE_POLICY = FiveMinutePaperPolicyArtifact()
+KNOWN_PAPER_POLICY_IDENTITIES = frozenset({
+    (POLICY.policy_id, POLICY.configuration_hash),
+    (FIVE_MINUTE_POLICY.policy_id, FIVE_MINUTE_POLICY.configuration_hash),
+})
 RISK_PROFILE = PaperRiskProfile()
 ACCOUNT_BINDING = ExecutionAccountBinding()
 CAPABILITY = ExecutionCapabilityManifest()
 AUTHORITY = PaperAuthorityBundle(POLICY, RISK_PROFILE, ACCOUNT_BINDING, CAPABILITY)
+
+
+def resolve_paper_policy_profile(value: str | None) -> PaperPolicyArtifactType:
+    """Resolve one explicit compiled profile; the deployed V2 remains the default."""
+    normalized = "" if value is None else value.strip().upper()
+    if normalized in {"", PAPER_ENTRY_PROFILE, PAPER_ENTRY_PROFILE_VERSION}:
+        return POLICY
+    if normalized in {FIVE_MINUTE_ENTRY_PROFILE, FIVE_MINUTE_ENTRY_PROFILE_VERSION}:
+        return FIVE_MINUTE_POLICY
+    raise ValueError(f"Unknown BEELZEBUB_L3G_PAPER_PROFILE: {value!r}")

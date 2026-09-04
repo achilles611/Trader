@@ -22,12 +22,14 @@ from .contracts import (
     POLICY,
     BookCompleteness,
     EvidenceFamily,
+    FiveMinutePaperPolicyArtifact,
     HypothesisKind,
     PaperDecision,
     PaperDecisionKind,
     PaperDirection,
     PaperEvidence,
     PaperPolicyArtifact,
+    PaperPolicyArtifactType,
     PaperSourceQuality,
     SequenceAuthority,
     deterministic_id,
@@ -88,10 +90,11 @@ class DepthMutation:
 class ExperimentalPaperPolicy:
     """One deterministic, synchronous, paper-direction-only consumer."""
 
-    def __init__(self, artifact: PaperPolicyArtifact = POLICY) -> None:
-        if type(artifact) is not PaperPolicyArtifact:
+    def __init__(self, artifact: PaperPolicyArtifactType = POLICY) -> None:
+        if type(artifact) not in {PaperPolicyArtifact, FiveMinutePaperPolicyArtifact}:
             raise ValueError("Paper policy requires the exact immutable artifact type.")
         self.artifact = artifact
+        self._five_minute_profile = type(artifact) is FiveMinutePaperPolicyArtifact
         self._policy_hash = artifact.configuration_hash
         self._lock = threading.RLock()
         self._market_session_id: str | None = None
@@ -119,6 +122,8 @@ class ExperimentalPaperPolicy:
         self._last_input_fault: dict[str, object] | None = None
         self._used_hypothesis_instances: set[str] = set()
         self._last_flat_confirmation: datetime | None = None
+        self._next_five_minute_boundary: datetime | None = None
+        self._last_five_minute_boundary: dict[str, object] | None = None
         self._reset_count = 0
         self._counters: dict[str, int] = {
             "quotes": 0,
@@ -171,6 +176,7 @@ class ExperimentalPaperPolicy:
         self._vwap_volume = 0
         self._vwap_session_date = None
         self._last_receipt_time = None
+        self._next_five_minute_boundary = None
         self._depth_recovering = True
         self._reset_count += 1
         self._counters["resets"] += 1
@@ -371,6 +377,19 @@ class ExperimentalPaperPolicy:
             if not self._contract_matches(observation):
                 self._clear_provisional()
                 return self._decision(observation, PaperDecisionKind.NO_TRADE, None, "CONTRACT_MISMATCH")
+            five_minute_boundary = (
+                self._claim_five_minute_boundary(observation)
+                if self._five_minute_profile else None
+            )
+            five_minute_decision = (
+                self._evaluate_five_minute_boundary(
+                    observation,
+                    five_minute_boundary,
+                    current_position=current_position,
+                    pending_order=pending_order,
+                )
+                if five_minute_boundary is not None else None
+            )
             evidence_before = len(self._evidence)
             if observation.observation_type == "QUOTE":
                 reason = self._ingest_quote(observation)
@@ -385,11 +404,165 @@ class ExperimentalPaperPolicy:
             # needed after a local bridge restart because the NinjaTrader
             # observer's connection transition may predate the new socket.
             self._price_connected = True
+            if self._five_minute_profile:
+                if five_minute_decision is not None:
+                    return five_minute_decision
+                if evaluate_passive:
+                    return self._decision(
+                        observation, PaperDecisionKind.NO_TRADE, None,
+                        "FIVE_MINUTE_WAITING_FOR_BOUNDARY",
+                    )
+                return None
             if not evaluate_passive and observation.observation_type == "QUOTE":
                 return None
             if not evaluate_passive and observation.observation_type == "DEPTH" and len(self._evidence) == evidence_before:
                 return None
             return self.evaluate(observation, current_position=current_position, pending_order=pending_order)
+
+    def _claim_five_minute_boundary(
+        self, observation: NinjaTraderObservation,
+    ) -> dict[str, object] | None:
+        """Claim at most one exact UTC-aligned decision boundary per callback."""
+        artifact = self.artifact
+        if type(artifact) is not FiveMinutePaperPolicyArtifact:
+            return None
+        observed = self._event_time(observation)
+        interval = artifact.decision_interval_seconds
+        epoch_seconds = int(observed.timestamp())
+        current_boundary = datetime.fromtimestamp(
+            epoch_seconds - (epoch_seconds % interval), tz=timezone.utc,
+        )
+        if self._next_five_minute_boundary is None:
+            self._next_five_minute_boundary = current_boundary + timedelta(seconds=interval)
+            return None
+        if observed < self._next_five_minute_boundary:
+            return None
+        scheduled = current_boundary
+        missed = max(
+            0,
+            int((scheduled - self._next_five_minute_boundary).total_seconds()) // interval,
+        )
+        candle_open = scheduled - timedelta(seconds=interval)
+        self._next_five_minute_boundary = scheduled + timedelta(seconds=interval)
+        boundary = {
+            "candle_open_utc": candle_open.isoformat().replace("+00:00", "Z"),
+            "candle_close_utc": scheduled.isoformat().replace("+00:00", "Z"),
+            "decision_observed_at": observed.isoformat().replace("+00:00", "Z"),
+            "decision_latency_ms": max(0, int((observed - scheduled).total_seconds() * 1000)),
+            "missed_boundary_count": missed,
+            "decision_interval_seconds": interval,
+            "decision_clock": artifact.decision_clock,
+        }
+        self._last_five_minute_boundary = dict(boundary)
+        return boundary
+
+    def _evaluate_five_minute_boundary(
+        self,
+        observation: NinjaTraderObservation,
+        boundary: Mapping[str, object],
+        *,
+        current_position: PaperDirection,
+        pending_order: bool,
+    ) -> PaperDecision:
+        """Choose enter, hold, or staged reversal once for the closed candle."""
+        at_text = normalized_utc(self._market_event_timestamp(observation), "Five-minute evaluation time")
+        common: dict[str, object] = {
+            **boundary,
+            "decision_protocol": "EXIT_RECONCILE_THEN_ENTER",
+            "prior_position": current_position.value,
+        }
+        if self._trades:
+            reference = self._trades[-1]
+            common.update({
+                "decision_reference_price": str(reference.price),
+                "decision_reference_kind": "LAST_TRADE_BEFORE_BOUNDARY",
+                "decision_reference_observation_id": reference.observation_id,
+            })
+        elif self._quote_order:
+            reference_quote = self._quotes.get(self._quote_order[-1])
+            if reference_quote is not None:
+                common.update({
+                    "decision_reference_price": str((reference_quote.bid + reference_quote.ask) / Decimal("2")),
+                    "decision_reference_kind": "QUOTE_MID_BEFORE_BOUNDARY",
+                    "decision_reference_observation_id": reference_quote.observation_id,
+                })
+        if self._paper_session_context.session_kind not in self.artifact.entry_session_kinds:
+            return self._decision(
+                observation, PaperDecisionKind.NO_TRADE, None, "PROFILE_SESSION_MISMATCH",
+                family_summary={**common, "action": "BLOCKED", "target_position": current_position.value},
+            )
+        if self._transport_state is not StreamHealth.HEALTHY:
+            return self._decision(
+                observation, PaperDecisionKind.NO_TRADE, None, "LOCAL_BRIDGE_UNHEALTHY",
+                family_summary={**common, "action": "BLOCKED", "target_position": current_position.value},
+            )
+        if not self._price_connected:
+            return self._decision(
+                observation, PaperDecisionKind.NO_TRADE, None, "MARKET_PRICE_STATE_NOT_CONNECTED",
+                family_summary={**common, "action": "BLOCKED", "target_position": current_position.value},
+            )
+        if self._depth_recovering:
+            return self._decision(
+                observation, PaperDecisionKind.NO_TRADE, None, "DEPTH_RESET_RECOVERY",
+                family_summary={**common, "action": "BLOCKED", "target_position": current_position.value},
+            )
+
+        bull_score, bull_families = self.score(at_text, HypothesisKind.BULLISH_REVERSAL)
+        bear_score, bear_families = self.score(at_text, HypothesisKind.BEARISH_CONTINUATION)
+        common.update({
+            "bullish_support": str(bull_score),
+            "bearish_support": str(bear_score),
+            "score_delta": str(bull_score - bear_score),
+            "bullish_families": bull_families,
+            "bearish_families": bear_families,
+        })
+        if pending_order:
+            return self._decision(
+                observation, PaperDecisionKind.NO_TRADE, None, "FIVE_MINUTE_PENDING_ORDER",
+                family_summary={**common, "action": "BLOCKED", "target_position": current_position.value},
+            )
+
+        if bull_score == bear_score:
+            target = current_position
+            action = "HOLD" if target is not PaperDirection.FLAT else "BLOCKED"
+            hypothesis = (
+                HypothesisKind.BULLISH_REVERSAL if target is PaperDirection.LONG
+                else HypothesisKind.BEARISH_CONTINUATION if target is PaperDirection.SHORT
+                else None
+            )
+            return self._decision(
+                observation, PaperDecisionKind.NO_TRADE, hypothesis,
+                "FIVE_MINUTE_BIAS_TIE_HOLD" if target is not PaperDirection.FLAT else "FIVE_MINUTE_BIAS_TIE_FLAT",
+                score=bull_score,
+                family_summary={**common, "action": action, "target_position": target.value, "bias": "TIE"},
+            )
+
+        winner = (
+            HypothesisKind.BULLISH_REVERSAL
+            if bull_score > bear_score else HypothesisKind.BEARISH_CONTINUATION
+        )
+        target = (
+            PaperDirection.LONG
+            if winner is HypothesisKind.BULLISH_REVERSAL else PaperDirection.SHORT
+        )
+        score = bull_score if target is PaperDirection.LONG else bear_score
+        bias = "LONG" if target is PaperDirection.LONG else "SHORT"
+        if current_position is target:
+            return self._decision(
+                observation, PaperDecisionKind.NO_TRADE, winner, f"FIVE_MINUTE_HOLD_{bias}",
+                score=score,
+                family_summary={**common, "action": "HOLD", "target_position": target.value, "bias": bias},
+            )
+        if current_position is PaperDirection.FLAT:
+            kind = PaperDecisionKind.LONG if target is PaperDirection.LONG else PaperDecisionKind.SHORT
+            return self._decision(
+                observation, kind, winner, f"FIVE_MINUTE_ENTER_{bias}", score=score,
+                family_summary={**common, "action": "ENTER", "target_position": target.value, "bias": bias},
+            )
+        return self._decision(
+            observation, PaperDecisionKind.EXIT, winner, f"FIVE_MINUTE_REVERSE_TO_{bias}", score=score,
+            family_summary={**common, "action": "REVERSE", "target_position": target.value, "bias": bias},
+        )
 
     def _ingest_quote(self, observation: NinjaTraderObservation) -> str | None:
         bid = self._decimal(observation.payload.get("bid"))
@@ -890,6 +1063,11 @@ class ExperimentalPaperPolicy:
                     "family_count": self.artifact.entry_family_count,
                     "reentry_cooldown_seconds": self.artifact.reentry_cooldown_seconds,
                     "retention_support_threshold": str(self.artifact.retention_support_threshold),
+                },
+                "five_minute_schedule": {
+                    "enabled": self._five_minute_profile,
+                    "next_boundary_utc": None if self._next_five_minute_boundary is None else self._next_five_minute_boundary.isoformat().replace("+00:00", "Z"),
+                    "last_boundary": self._last_five_minute_boundary,
                 },
                 "authority": self.artifact.authority,
                 "quality": PaperSourceQuality.PROVISIONAL_CONTIGUOUS_LOCAL_CALLBACKS.value if self._market_session_id and not self._depth_recovering else PaperSourceQuality.UNUSABLE.value,

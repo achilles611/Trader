@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 import threading
 import time
 from typing import Callable, Mapping
@@ -15,10 +16,7 @@ from src.l3f_provider.tradovate_observation import StreamHealth
 from src.lane_iii.contracts import canonical_hash, normalized_utc
 
 from .contracts import (
-    ACCOUNT_BINDING,
-    AUTHORITY,
-    POLICY,
-    RISK_PROFILE,
+    CAPABILITY,
     EvidenceFamily,
     ExecutionAction,
     HypothesisKind,
@@ -27,6 +25,7 @@ from .contracts import (
     PaperDirection,
     PaperEntryOwner,
     PaperExecutionCommand,
+    PaperAuthorityBundle,
     PaperRuntimeState,
     PaperSessionArmGrant,
     deterministic_id,
@@ -237,10 +236,19 @@ class LaneIIIPaperRuntime:
         if type(ledger) is not PaperLedger:
             raise ValueError("Paper runtime requires the exact durable ledger.")
         self.ledger = ledger
-        self.policy = policy or ExperimentalPaperPolicy()
-        self.risk = risk or PaperRiskAuthority()
+        self.policy = policy or ExperimentalPaperPolicy(ledger.policy)
+        self.risk = risk or PaperRiskAuthority(policy=self.policy.artifact)
         if type(self.policy) is not ExperimentalPaperPolicy or type(self.risk) is not PaperRiskAuthority:
             raise ValueError("Paper runtime components must retain exact authority types.")
+        if not (
+            self.ledger.policy.configuration_hash
+            == self.policy.artifact.configuration_hash
+            == self.risk.policy.configuration_hash
+        ):
+            raise ValueError("Paper runtime, risk, and ledger policy identities must match.")
+        self.authority = PaperAuthorityBundle(
+            self.policy.artifact, self.risk.profile, self.risk.binding, CAPABILITY,
+        )
         self._lock = threading.RLock()
         self._state = PaperRuntimeState.DISABLED
         self._position = PaperDirection.FLAT
@@ -302,6 +310,8 @@ class LaneIIIPaperRuntime:
         self._protective_order_id: str | None = None
         self._lifecycle_realized_pnl = Decimal("0")
         self._post_exit_reconciliation_pending = False
+        self._pending_five_minute_reversal: PaperDecision | None = None
+        self._last_five_minute_analysis: dict[str, object] | None = None
         self._command_sequence = 0
         # A venue callback can arrive synchronously while a durable exit is
         # being sent.  It must not create a second exit before EXIT_PENDING is
@@ -355,9 +365,9 @@ class LaneIIIPaperRuntime:
             "entry_consumed": ownership.entry_consumed,
             "entry_decision_id": ownership.entry_decision_id,
             "request_id": ownership.request_id,
-            "account": ACCOUNT_BINDING.account_name,
-            "account_class": ACCOUNT_BINDING.account_class,
-            "instrument": ACCOUNT_BINDING.instrument,
+            "account": self.risk.binding.account_name,
+            "account_class": self.risk.binding.account_class,
+            "instrument": self.risk.binding.instrument,
             # The record envelope owns its event timestamp. Keeping this
             # lifecycle value stable makes a same-identity retry exact rather
             # than fabricating a conflict solely because wall time advanced.
@@ -422,8 +432,55 @@ class LaneIIIPaperRuntime:
             }),
             execution_session_id=self._execution_session_id(),
         )
+        self._export_five_minute_analysis_locked(session.context)
         self._operational_session = None
         self._disarm_after_flat = False
+
+    def _export_five_minute_analysis_locked(self, context: PaperSessionContext) -> None:
+        """Produce the immutable experiment log after exact flat stop evidence."""
+        if self.policy.artifact.entry_profile_version != "BEELZEBUB_FIVE_MINUTE_BIAS_V1":
+            return
+        try:
+            from .five_minute_analysis import export_session_analysis
+
+            audit_value = self._runtime_identity.get("audit")
+            if not isinstance(audit_value, str) or not audit_value or audit_value == "UNKNOWN":
+                raise RuntimeError("RUNTIME_AUDIT_ROOT_UNAVAILABLE")
+            result = export_session_analysis(
+                self.ledger.path,
+                Path(audit_value) / "five-minute-session-analysis",
+                session_id=context.session_id,
+            )
+            self._last_five_minute_analysis = {"status": "EXPORTED", **result}
+            self.ledger.append(
+                "SESSION_FIVE_MINUTE_ANALYSIS_EXPORTED",
+                {**context.payload(), **result},
+                identity="l3g-five-minute-analysis-export-" + str(result["analysis_id"]),
+                execution_session_id=self._execution_session_id(),
+            )
+        except Exception as error:
+            self._last_five_minute_analysis = {
+                "status": "FAILED", "error_type": type(error).__name__, "error": str(error),
+                "session_id": context.session_id,
+            }
+            try:
+                self.ledger.append(
+                    "INCIDENT_FIVE_MINUTE_ANALYSIS_EXPORT_FAILED",
+                    {
+                        **context.payload(),
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                    },
+                    identity="l3g-five-minute-analysis-failed-" + canonical_hash({
+                        "session_id": context.session_id,
+                        "session_generation": context.session_generation,
+                        "error_type": type(error).__name__,
+                    }),
+                    execution_session_id=self._execution_session_id(),
+                )
+            except Exception:
+                # Reporting never weakens the already completed flat/disarmed stop.
+                pass
 
     @staticmethod
     def _commissioning_transport_guard(status: ExecutionTransportStatus | None) -> dict[str, object] | None:
@@ -778,6 +835,7 @@ class LaneIIIPaperRuntime:
         self._session_closed_ids.add(marker)
         self._armed_session = None
         self._entries_paused = True
+        self._pending_five_minute_reversal = None
         self.ledger.append(
             "SESSION_CLOSED", {
                 **context.payload(), "reason": reason,
@@ -902,7 +960,7 @@ class LaneIIIPaperRuntime:
                 raise RuntimeError("Paper execution transport must be bound before startup.")
             self._transition(PaperRuntimeState.STARTING, "PROCESS_START")
             self._transition(PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, "STARTS_DISARMED")
-            self.ledger.append("SESSION_AUTHORITY", AUTHORITY.authority_payload(), identity="l3g-authority-" + canonical_hash({"started_at": _now(), "object": id(self)}))
+            self.ledger.append("SESSION_AUTHORITY", self.authority.authority_payload(), identity="l3g-authority-" + canonical_hash({"started_at": _now(), "object": id(self)}))
             self._heartbeat_stop = threading.Event()
             self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, name="L3GPaperHeartbeat", daemon=True)
             self._heartbeat_thread.start()
@@ -1467,6 +1525,12 @@ class LaneIIIPaperRuntime:
                 return
             if decision.decision is PaperDecisionKind.EXIT:
                 if self._position is not PaperDirection.FLAT and self._entry_owner is not PaperEntryOwner.COMMISSIONING:
+                    if (
+                        self._state is not PaperRuntimeState.EXIT_PENDING
+                        and decision.reason_code.startswith("FIVE_MINUTE_REVERSE_TO_")
+                        and decision.family_summary.get("action") == "REVERSE"
+                    ):
+                        self._pending_five_minute_reversal = decision
                     self._request_exit(decision.reason_code)
                 return
             if (
@@ -1536,7 +1600,7 @@ class LaneIIIPaperRuntime:
         if self._snapshot.foreign_activity:
             self._request_operational_stop_locked("FOREIGN_ACTIVITY")
             self._request_exit("FOREIGN_ACTIVITY", emergency=True)
-        elif pnl <= -RISK_PROFILE.daily_loss_limit_dollars:
+        elif pnl <= -self.risk.profile.daily_loss_limit_dollars:
             self.risk.lock_out("DAILY_LOSS_LIMIT")
             self._request_operational_stop_locked("DAILY_LOSS_LIMIT")
             self._request_exit("DAILY_LOSS_LIMIT", emergency=True)
@@ -1549,9 +1613,9 @@ class LaneIIIPaperRuntime:
         else:
             now = datetime.fromisoformat(normalized_utc(at, "Risk exit time").replace("Z", "+00:00"))
             stale = (
-                (self._snapshot.quote_observed_at, RISK_PROFILE.quote_maximum_age_seconds, "QUOTE_STALE"),
-                (self._snapshot.classified_trade_observed_at, RISK_PROFILE.classified_trade_maximum_age_seconds, "CLASSIFIED_TRADE_STALE"),
-                (self._snapshot.depth_mutation_observed_at, RISK_PROFILE.depth_mutation_maximum_age_seconds, "DEPTH_STALE"),
+                (self._snapshot.quote_observed_at, self.risk.profile.quote_maximum_age_seconds, "QUOTE_STALE"),
+                (self._snapshot.classified_trade_observed_at, self.risk.profile.classified_trade_maximum_age_seconds, "CLASSIFIED_TRADE_STALE"),
+                (self._snapshot.depth_mutation_observed_at, self.risk.profile.depth_mutation_maximum_age_seconds, "DEPTH_STALE"),
             )
             for source, seconds, reason in stale:
                 if source is None or now - datetime.fromisoformat(source.replace("Z", "+00:00")) > timedelta(seconds=seconds):
@@ -1659,6 +1723,8 @@ class LaneIIIPaperRuntime:
         emergency: bool = False,
         stop_operational: bool | None = None,
     ) -> None:
+        if not reason.startswith("FIVE_MINUTE_REVERSE_TO_"):
+            self._pending_five_minute_reversal = None
         if stop_operational is None:
             stop_operational = emergency
         if stop_operational:
@@ -1684,10 +1750,10 @@ class LaneIIIPaperRuntime:
         # independently risk-evaluated flat intent.
         pseudo = PaperDecision(
             "l3g-pd-" + canonical_hash({"reason": reason, "decision": decision_id, "at": created_at})[:32],
-            POLICY.policy_id, POLICY.configuration_hash, PaperDecisionKind.EXIT, created_at,
+            self.policy.artifact.policy_id, self.policy.artifact.configuration_hash, PaperDecisionKind.EXIT, created_at,
             (datetime.fromisoformat(normalized_utc(created_at, "Exit decision time").replace("Z", "+00:00")) + timedelta(seconds=5)).isoformat().replace("+00:00", "Z"),
             None, PaperDirection.FLAT, Decimal("1"), {"risk_exit": reason}, (decision_id,), (max(0, self.policy.status().get("last_local_sequence") or 0),), (canonical_hash({"reason": reason}),),
-            POLICY.sequence_authority, POLICY.book_completeness, False, reason,
+            self.policy.artifact.sequence_authority, self.policy.artifact.book_completeness, False, reason,
             self._session_context.session_kind, self._session_context.session_id,
             self._session_context.trade_date, self._session_context.session_profile_hash,
             self._session_context.session_generation,
@@ -1756,16 +1822,16 @@ class LaneIIIPaperRuntime:
             "intent_id": intent_id,
             "decision_id": decision_id,
             "action": action,
-            "account_name": ACCOUNT_BINDING.account_name,
-            "account_class": ACCOUNT_BINDING.account_class,
-            "instrument": ACCOUNT_BINDING.instrument,
+            "account_name": self.risk.binding.account_name,
+            "account_class": self.risk.binding.account_class,
+            "instrument": self.risk.binding.instrument,
             "quantity": quantity,
             "expected_position": expected,
             "created_at": created,
-            "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=POLICY.decision_ttl_seconds)).isoformat().replace("+00:00", "Z"),
-            "policy_hash": POLICY.configuration_hash,
-            "risk_profile_hash": RISK_PROFILE.configuration_hash,
-            "account_binding_hash": ACCOUNT_BINDING.binding_hash,
+            "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=self.policy.artifact.decision_ttl_seconds)).isoformat().replace("+00:00", "Z"),
+            "policy_hash": self.policy.artifact.configuration_hash,
+            "risk_profile_hash": self.risk.profile.configuration_hash,
+            "account_binding_hash": self.risk.binding.binding_hash,
             "reason_code": reason,
             "risk_grant_id": grant_id,
             "commissioning": commissioning,
@@ -1822,9 +1888,9 @@ class LaneIIIPaperRuntime:
                     instrument = inbound.get("instrument")
                     quantity = inbound.get("quantity")
                     native_order_id = inbound.get("native_order_id")
-                    if account is not None and account != ACCOUNT_BINDING.account_name:
+                    if account is not None and account != self.risk.binding.account_name:
                         protective_reason = "PROTECTIVE_STOP_WRONG_ACCOUNT"
-                    elif instrument is not None and instrument != ACCOUNT_BINDING.instrument:
+                    elif instrument is not None and instrument != self.risk.binding.instrument:
                         protective_reason = "PROTECTIVE_STOP_WRONG_INSTRUMENT"
                     elif quantity is not None and quantity != self._position_quantity:
                         protective_reason = "PROTECTIVE_STOP_WRONG_QUANTITY"
@@ -2006,8 +2072,8 @@ class LaneIIIPaperRuntime:
         supplied_account = message.get("account_name")
         supplied_instrument = message.get("instrument")
         if (
-            (supplied_account is not None and supplied_account != ACCOUNT_BINDING.account_name)
-            or (supplied_instrument is not None and supplied_instrument != ACCOUNT_BINDING.instrument)
+            (supplied_account is not None and supplied_account != self.risk.binding.account_name)
+            or (supplied_instrument is not None and supplied_instrument != self.risk.binding.instrument)
         ):
             self._fault_reason = "FOREIGN_EXECUTION_CLASSIFICATION"
             self._snapshot = replace(self._snapshot, foreign_activity=True, observed_at=_now())
@@ -2153,13 +2219,13 @@ class LaneIIIPaperRuntime:
         commissioning = self._commissioning_ownership is not None
         decision = PaperDecision(
             "l3g-pd-" + canonical_hash({"reason": "POST_EXIT_RECONCILIATION", "at": created_at})[:32],
-            POLICY.policy_id, POLICY.configuration_hash, PaperDecisionKind.EXIT, created_at,
+            self.policy.artifact.policy_id, self.policy.artifact.configuration_hash, PaperDecisionKind.EXIT, created_at,
             (datetime.fromisoformat(normalized_utc(created_at, "Post-exit reconciliation time").replace("Z", "+00:00")) + timedelta(seconds=5)).isoformat().replace("+00:00", "Z"),
             None, PaperDirection.FLAT, Decimal("1"), {"safety": "POST_EXIT_RECONCILIATION"},
             ((self._last_decision.paper_decision_id if self._last_decision is not None else "post-exit-safety"),),
             (max(0, self.policy.status().get("last_local_sequence") or 0),),
-            (canonical_hash({"reason": "POST_EXIT_RECONCILIATION"}),), POLICY.sequence_authority,
-            POLICY.book_completeness, False, "POST_EXIT_RECONCILIATION",
+            (canonical_hash({"reason": "POST_EXIT_RECONCILIATION"}),), self.policy.artifact.sequence_authority,
+            self.policy.artifact.book_completeness, False, "POST_EXIT_RECONCILIATION",
             self._session_context.session_kind, self._session_context.session_id,
             self._session_context.trade_date, self._session_context.session_profile_hash,
             self._session_context.session_generation,
@@ -2189,6 +2255,8 @@ class LaneIIIPaperRuntime:
         commissioning = ownership is not None and ownership.entry_consumed
         operational_stopping = self._operational_session_is_stopping_locked()
         operational_active = self._operational_session is not None
+        pending_reversal = self._pending_five_minute_reversal
+        self._pending_five_minute_reversal = None
         self.policy.confirm_flat(str(reconciliation.get("timestamp", _now())))
         self._pending_intent = None
         self._pending_grant = None
@@ -2302,6 +2370,93 @@ class LaneIIIPaperRuntime:
         self._disarm_after_flat = False
         if operational_stopping:
             self._complete_operational_stop_locked("OPERATIONAL_STOP_FLAT_RECONCILIATION_COMPLETE")
+        elif (
+            pending_reversal is not None
+            and operational_active
+            and not self._entries_paused
+            and self._armed_session is not None
+            and self._armed_session.valid_at(_now())
+            and self._armed_session.session_id == self._session_context.session_id
+            and self._session_context.entry_permitted_at(datetime.now(timezone.utc))
+            and pending_reversal.session_id == self._session_context.session_id
+            and pending_reversal.session_generation == self._session_context.session_generation
+        ):
+            self._request_five_minute_reversal_entry(pending_reversal)
+
+    def _request_five_minute_reversal_entry(self, reversal: PaperDecision) -> None:
+        """Enter the opposite side only after signed flat/order reconciliation."""
+        target_value = reversal.family_summary.get("target_position")
+        target = (
+            PaperDirection.LONG if target_value == PaperDirection.LONG.value
+            else PaperDirection.SHORT if target_value == PaperDirection.SHORT.value
+            else None
+        )
+        if target is None:
+            self.ledger.append(
+                "INCIDENT_FIVE_MINUTE_REVERSAL_REFUSED",
+                {"reason": "INVALID_REVERSAL_TARGET", "source_decision_id": reversal.paper_decision_id},
+                identity="l3g-five-minute-reversal-refused-" + reversal.paper_decision_id,
+                execution_session_id=self._execution_session_id(),
+            )
+            return
+        created = _now()
+        kind = PaperDecisionKind.LONG if target is PaperDirection.LONG else PaperDecisionKind.SHORT
+        hypothesis = (
+            HypothesisKind.BULLISH_REVERSAL
+            if target is PaperDirection.LONG else HypothesisKind.BEARISH_CONTINUATION
+        )
+        summary = {
+            **dict(reversal.family_summary),
+            "action": "REVERSE_ENTRY",
+            "reversal_stage": "FLAT_RECONCILED",
+            "source_reversal_decision_id": reversal.paper_decision_id,
+            "reconciliation_timestamp": reconciliation_timestamp
+            if (reconciliation_timestamp := self._last_reconciliation_timestamp()) is not None
+            else created,
+        }
+        payload = {
+            "source_reversal_decision_id": reversal.paper_decision_id,
+            "created_at": created,
+            "target_position": target.value,
+            "session_id": self._session_context.session_id,
+            "session_generation": self._session_context.session_generation,
+            "policy_hash": self.policy.artifact.configuration_hash,
+        }
+        decision = PaperDecision(
+            deterministic_id("l3g-pd-", payload),
+            self.policy.artifact.policy_id,
+            self.policy.artifact.configuration_hash,
+            kind,
+            created,
+            (datetime.fromisoformat(created.replace("Z", "+00:00")) + timedelta(seconds=self.policy.artifact.decision_ttl_seconds)).isoformat().replace("+00:00", "Z"),
+            hypothesis,
+            target,
+            reversal.relative_support,
+            summary,
+            (reversal.paper_decision_id,),
+            (max(0, self.policy.status().get("last_local_sequence") or 0),),
+            (canonical_hash(reversal.payload()),),
+            self.policy.artifact.sequence_authority,
+            self.policy.artifact.book_completeness,
+            False,
+            f"FIVE_MINUTE_REVERSE_ENTRY_{target.value}",
+            self._session_context.session_kind,
+            self._session_context.session_id,
+            self._session_context.trade_date,
+            self._session_context.session_profile_hash,
+            self._session_context.session_generation,
+        )
+        self._last_decision = decision
+        self._last_qualifying_entry_decision = decision
+        self.ledger.append(
+            "DECISION", decision.payload(), identity=decision.paper_decision_id,
+            occurred_at=decision.created_at, execution_session_id=self._execution_session_id(),
+        )
+        self._request_entry(decision)
+
+    def _last_reconciliation_timestamp(self) -> str | None:
+        value = None if self._last_reconciliation is None else self._last_reconciliation.get("timestamp")
+        return str(value) if isinstance(value, str) else None
 
     def _abort_unsubmitted_commissioning(self, reason: str) -> None:
         """Release only the pre-broker, provably flat commissioning failure."""
@@ -2423,15 +2578,15 @@ class LaneIIIPaperRuntime:
             blocking.append(ledger_blocker)
         freshness = {
             "quote": self._freshness_gate(
-                self._snapshot.quote_observed_at, RISK_PROFILE.quote_maximum_age_seconds, at,
+                self._snapshot.quote_observed_at, self.risk.profile.quote_maximum_age_seconds, at,
             ),
             "classified_trade": self._freshness_gate(
                 self._snapshot.classified_trade_observed_at,
-                RISK_PROFILE.classified_trade_maximum_age_seconds, at,
+                self.risk.profile.classified_trade_maximum_age_seconds, at,
             ),
             "depth_mutation": self._freshness_gate(
                 self._snapshot.depth_mutation_observed_at,
-                RISK_PROFILE.depth_mutation_maximum_age_seconds, at,
+                self.risk.profile.depth_mutation_maximum_age_seconds, at,
             ),
         }
         family_progress = {
@@ -2712,10 +2867,10 @@ class LaneIIIPaperRuntime:
         current = PaperSessionResolver().resolve(now, generation=context.session_generation)
         if context.session_kind is PaperSessionKind.OFF_SESSION or current.context.session_id != context.session_id:
             reasons = ("NO_CURRENT_EVENT_SESSION",)
-            self.ledger.append("RISK_EVENT_ARM_ATTEMPT", {**context.payload(), "allowed": False, "reason_codes": reasons, "authority_hash": canonical_hash(AUTHORITY.authority_payload())})
+            self.ledger.append("RISK_EVENT_ARM_ATTEMPT", {**context.payload(), "allowed": False, "reason_codes": reasons, "authority_hash": canonical_hash(self.authority.authority_payload())})
             return {"armed": False, "reason_codes": reasons, "state": self._state.value}
         allowed, reasons = self.risk.preflight(self._snapshot, at=now)
-        self.ledger.append("RISK_EVENT_ARM_ATTEMPT", {**context.payload(), "allowed": allowed, "reason_codes": reasons, "authority_hash": canonical_hash(AUTHORITY.authority_payload())})
+        self.ledger.append("RISK_EVENT_ARM_ATTEMPT", {**context.payload(), "allowed": allowed, "reason_codes": reasons, "authority_hash": canonical_hash(self.authority.authority_payload())})
         if not allowed:
             return {"armed": False, "reason_codes": reasons, "state": self._state.value}
         self._armed_session = PaperSessionArmGrant(
@@ -2833,7 +2988,7 @@ class LaneIIIPaperRuntime:
             "RISK_EVENT_COMMISSIONING_ARM_ATTEMPT",
             {
                 **context.payload(), "allowed": allowed, "reason_codes": reasons,
-                "authority_hash": canonical_hash(AUTHORITY.authority_payload()),
+                "authority_hash": canonical_hash(self.authority.authority_payload()),
                 "readiness_snapshot_hash": readiness["snapshot_hash"],
             },
             execution_session_id=self._execution_session_id(),
@@ -3078,9 +3233,9 @@ class LaneIIIPaperRuntime:
             if self._snapshot.working_owned_orders != 0 or self._snapshot.working_entry_orders != 0:
                 explicit_identity_reasons.append("COMMISSIONING_WORKING_ORDERS_PRESENT")
             if (
-                self._snapshot.account_name != ACCOUNT_BINDING.account_name
-                or self._snapshot.account_class != ACCOUNT_BINDING.account_class
-                or self._snapshot.instrument != ACCOUNT_BINDING.instrument
+                self._snapshot.account_name != self.risk.binding.account_name
+                or self._snapshot.account_class != self.risk.binding.account_class
+                or self._snapshot.instrument != self.risk.binding.instrument
             ):
                 explicit_identity_reasons.append("COMMISSIONING_ACCOUNT_INSTRUMENT_MISMATCH")
             allowed, preflight_reasons = self.risk.preflight(
@@ -3118,8 +3273,8 @@ class LaneIIIPaperRuntime:
                 "session_id": context.session_id,
             })
             payload = {
-                "paper_policy_id": POLICY.policy_id,
-                "paper_policy_hash": POLICY.configuration_hash,
+                "paper_policy_id": self.policy.artifact.policy_id,
+                "paper_policy_hash": self.policy.artifact.configuration_hash,
                 "decision": selected.decision.value,
                 "created_at": now,
                 "source_decision_id": selected.paper_decision_id,
@@ -3134,9 +3289,9 @@ class LaneIIIPaperRuntime:
                 "scientific_evidence": False,
             }
             decision = PaperDecision(
-                deterministic_id("l3g-pd-", payload), POLICY.policy_id, POLICY.configuration_hash,
+                deterministic_id("l3g-pd-", payload), self.policy.artifact.policy_id, self.policy.artifact.configuration_hash,
                 selected.decision, now,
-                (datetime.fromisoformat(now.replace("Z", "+00:00")) + timedelta(seconds=POLICY.decision_ttl_seconds)).isoformat().replace("+00:00", "Z"),
+                (datetime.fromisoformat(now.replace("Z", "+00:00")) + timedelta(seconds=self.policy.artifact.decision_ttl_seconds)).isoformat().replace("+00:00", "Z"),
                 None, selected.direction, selected.relative_support,
                 {
                     "commissioning": True,
@@ -3148,7 +3303,7 @@ class LaneIIIPaperRuntime:
                 selected.source_observation_ids,
                 selected.source_local_sequences,
                 selected.source_payload_hashes,
-                POLICY.sequence_authority, POLICY.book_completeness, False,
+                self.policy.artifact.sequence_authority, self.policy.artifact.book_completeness, False,
                 "COMMISSIONING_PROFILE_SIGNAL_ENTRY", context.session_kind, context.session_id,
                 context.trade_date, context.session_profile_hash, context.session_generation,
                 True, False, False,
@@ -3163,11 +3318,11 @@ class LaneIIIPaperRuntime:
                     "qualification": {
                         "source_decision_id": selected.paper_decision_id,
                         "relative_support": str(selected.relative_support),
-                        "required_support": str(POLICY.entry_support_threshold),
+                        "required_support": str(self.policy.artifact.entry_support_threshold),
                         "dominance": selected.family_summary.get("dominance"),
-                        "required_dominance": str(POLICY.entry_dominance_margin),
+                        "required_dominance": str(self.policy.artifact.entry_dominance_margin),
                         "positive_family_count": selected.family_summary.get("positive_family_count"),
-                        "required_family_count": POLICY.entry_family_count,
+                        "required_family_count": self.policy.artifact.entry_family_count,
                     },
                     "reference_market_snapshot": {
                         "bid": None if self._last_quote is None else str(self._last_quote[0]),
@@ -3241,8 +3396,8 @@ class LaneIIIPaperRuntime:
                 "state": self._state.value,
             }
 
-    @staticmethod
     def _commissioning_candidate_valid(
+        self,
         candidate: PaperDecision | None,
         context: PaperSessionContext,
         at: str,
@@ -3263,18 +3418,18 @@ class LaneIIIPaperRuntime:
             and candidate.strategy_generated
             and not candidate.commissioning
             and not candidate.scientific_evidence
-            and candidate.paper_policy_id == POLICY.policy_id
-            and candidate.paper_policy_hash == POLICY.configuration_hash
-            and candidate.session_kind in POLICY.entry_session_kinds
+            and candidate.paper_policy_id == self.policy.artifact.policy_id
+            and candidate.paper_policy_hash == self.policy.artifact.configuration_hash
+            and candidate.session_kind in self.policy.artifact.entry_session_kinds
             and candidate.session_kind is context.session_kind
             and candidate.session_id == context.session_id
             and candidate.trade_date == context.trade_date
             and candidate.session_profile_hash == context.session_profile_hash
             and candidate.session_generation == context.session_generation
             and created <= moment <= expiry
-            and candidate.relative_support >= POLICY.entry_support_threshold
-            and dominance >= POLICY.entry_dominance_margin
-            and positive_families >= POLICY.entry_family_count
+            and candidate.relative_support >= self.policy.artifact.entry_support_threshold
+            and dominance >= self.policy.artifact.entry_dominance_margin
+            and positive_families >= self.policy.artifact.entry_family_count
             and family_summary.get("blocking_contradiction") is False
         )
 
@@ -3412,12 +3567,12 @@ class LaneIIIPaperRuntime:
         created = _now()
         decision = PaperDecision(
             "l3g-pd-" + canonical_hash({"reason": "CANCEL_PENDING_AND_DISARM", "at": created})[:32],
-            POLICY.policy_id, POLICY.configuration_hash, PaperDecisionKind.EXIT, created,
+            self.policy.artifact.policy_id, self.policy.artifact.configuration_hash, PaperDecisionKind.EXIT, created,
             (datetime.fromisoformat(created.replace("Z", "+00:00")) + timedelta(seconds=5)).isoformat().replace("+00:00", "Z"),
             None, PaperDirection.FLAT, Decimal("1"), {"safety": "CANCEL_PENDING_AND_DISARM"},
             ("pending-order-safety-control",), (max(0, self.policy.status().get("last_local_sequence") or 0),),
-            (canonical_hash({"reason": "CANCEL_PENDING_AND_DISARM"}),), POLICY.sequence_authority,
-            POLICY.book_completeness, False, "CANCEL_PENDING_AND_DISARM",
+            (canonical_hash({"reason": "CANCEL_PENDING_AND_DISARM"}),), self.policy.artifact.sequence_authority,
+            self.policy.artifact.book_completeness, False, "CANCEL_PENDING_AND_DISARM",
             self._session_context.session_kind, self._session_context.session_id,
             self._session_context.trade_date, self._session_context.session_profile_hash,
             self._session_context.session_generation,
@@ -3541,19 +3696,19 @@ class LaneIIIPaperRuntime:
             status_now = _now()
             arm_valid = self._armed_session is not None and self._armed_session.valid_at(status_now)
             ownership = self._commissioning_ownership
-            loss_remaining = max(Decimal("0"), RISK_PROFILE.daily_loss_limit_dollars + min(Decimal("0"), trade_risk.realized_pnl + trade_risk.unrealized_pnl))
+            loss_remaining = max(Decimal("0"), self.risk.profile.daily_loss_limit_dollars + min(Decimal("0"), trade_risk.realized_pnl + trade_risk.unrealized_pnl))
             next_context = PaperSessionResolver().next_valid_session(status_now, generation=context.session_generation)
             market_freshness = {
                 "quote": self._freshness_gate(
-                    self._snapshot.quote_observed_at, RISK_PROFILE.quote_maximum_age_seconds, status_now,
+                    self._snapshot.quote_observed_at, self.risk.profile.quote_maximum_age_seconds, status_now,
                 ),
                 "classified_trade": self._freshness_gate(
                     self._snapshot.classified_trade_observed_at,
-                    RISK_PROFILE.classified_trade_maximum_age_seconds, status_now,
+                    self.risk.profile.classified_trade_maximum_age_seconds, status_now,
                 ),
                 "depth_mutation": self._freshness_gate(
                     self._snapshot.depth_mutation_observed_at,
-                    RISK_PROFILE.depth_mutation_maximum_age_seconds, status_now,
+                    self.risk.profile.depth_mutation_maximum_age_seconds, status_now,
                 ),
             }
             status = {
@@ -3572,17 +3727,17 @@ class LaneIIIPaperRuntime:
                 "account_class": "LOCAL_SIMULATION",
                 "maximum_quantity": 1,
                 "live_capital": "DENIED",
-                "entry_profile": POLICY.entry_profile,
-                "entry_profile_version": POLICY.entry_profile_version,
+                "entry_profile": self.policy.artifact.entry_profile,
+                "entry_profile_version": self.policy.artifact.entry_profile_version,
                 "entry_session_kind": "ALL_CONFIGURED",
-                "entry_session_kinds": [value.value for value in POLICY.entry_session_kinds],
-                "effective_confidence_threshold": str(POLICY.entry_support_threshold),
-                "entry_dominance_margin": str(POLICY.entry_dominance_margin),
-                "entry_family_count": POLICY.entry_family_count,
-                "reentry_cooldown_seconds": POLICY.reentry_cooldown_seconds,
-                "retention_confidence_threshold": str(POLICY.retention_support_threshold),
-                "maximum_position_age_seconds": RISK_PROFILE.maximum_position_age_seconds,
-                "maximum_session_entries": RISK_PROFILE.maximum_session_entries,
+                "entry_session_kinds": [value.value for value in self.policy.artifact.entry_session_kinds],
+                "effective_confidence_threshold": str(self.policy.artifact.entry_support_threshold),
+                "entry_dominance_margin": str(self.policy.artifact.entry_dominance_margin),
+                "entry_family_count": self.policy.artifact.entry_family_count,
+                "reentry_cooldown_seconds": self.policy.artifact.reentry_cooldown_seconds,
+                "retention_confidence_threshold": str(self.policy.artifact.retention_support_threshold),
+                "maximum_position_age_seconds": self.risk.profile.maximum_position_age_seconds,
+                "maximum_session_entries": self.risk.profile.maximum_session_entries,
                 "session_definitions": list(session_catalog()),
                 "commissioning_readiness_snapshot_generation": self._commissioning_readiness_generation,
                 "commissioning_authority_epoch": self._commissioning_authority_epoch,
@@ -3690,6 +3845,12 @@ class LaneIIIPaperRuntime:
                     "scientific_evidence": False,
                 },
                 "operational_paper_session": self._operational_session_payload(),
+                "pending_five_minute_reversal": None if self._pending_five_minute_reversal is None else {
+                    "decision_id": self._pending_five_minute_reversal.paper_decision_id,
+                    "target_position": self._pending_five_minute_reversal.family_summary.get("target_position"),
+                    "candle_close_utc": self._pending_five_minute_reversal.family_summary.get("candle_close_utc"),
+                },
+                "last_five_minute_analysis": self._last_five_minute_analysis,
                 "last_paper_decision": None if self._last_decision is None else self._last_decision.payload(),
                 "last_risk_result": risk.get("last_risk_result"),
                 "last_command": None if self._last_command is None else self._last_command.payload(),
@@ -3721,7 +3882,7 @@ class LaneIIIPaperRuntime:
                         3,
                     ),
                 },
-                "authority": AUTHORITY.authority_payload(),
+                "authority": self.authority.authority_payload(),
                 "policy": policy,
                 "risk": risk,
                 "transport": transport,

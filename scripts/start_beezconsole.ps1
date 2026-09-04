@@ -3,6 +3,8 @@ param(
     [string]$LedgerPath = "N:\Beelzebub\runtime\hot\lane_iii_paper.sqlite3",
     [string]$AuditRoot = "N:\Beelzebub\runtime\audit",
     [string]$LedgerEpoch = "",
+    [ValidateSet("BEELZEBUB_SCALPER_V2", "BEELZEBUB_FIVE_MINUTE_BIAS_V1")]
+    [string]$PaperProfile = "BEELZEBUB_SCALPER_V2",
     [int]$Port = 8090
 )
 
@@ -18,6 +20,7 @@ if (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyCon
 
 $env:BEELZEBUB_L3G_PAPER_LEDGER = $LedgerPath
 $env:BEELZEBUB_LEDGER_AUDIT_ROOT = $AuditRoot
+$env:BEELZEBUB_L3G_PAPER_PROFILE = $PaperProfile
 if ($LedgerEpoch) { $env:BEELZEBUB_L3G_PAPER_LEDGER_EPOCH = $LedgerEpoch }
 $env:BEELZEBUB_GIT_SHA = (git -C $root rev-parse HEAD).Trim()
 New-Item -ItemType Directory -Force -Path $AuditRoot | Out-Null

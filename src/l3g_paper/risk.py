@@ -14,10 +14,13 @@ from .contracts import (
     POLICY,
     RISK_PROFILE,
     ExecutionAccountBinding,
+    FiveMinutePaperPolicyArtifact,
     PaperDecision,
     PaperDecisionKind,
     PaperDirection,
     PaperExecutionIntent,
+    PaperPolicyArtifact,
+    PaperPolicyArtifactType,
     PaperRiskGrant,
     PaperRiskProfile,
     deterministic_id,
@@ -98,11 +101,15 @@ class PaperRiskAuthority:
         self,
         profile: PaperRiskProfile = RISK_PROFILE,
         binding: ExecutionAccountBinding = ACCOUNT_BINDING,
+        policy: PaperPolicyArtifactType = POLICY,
     ) -> None:
         if type(profile) is not PaperRiskProfile or type(binding) is not ExecutionAccountBinding:
             raise ValueError("Paper risk authority requires exact immutable inputs.")
+        if type(policy) not in {PaperPolicyArtifact, FiveMinutePaperPolicyArtifact}:
+            raise ValueError("Paper risk authority requires a compiled immutable policy.")
         self.profile = profile
         self.binding = binding
+        self.policy = policy
         self._lock = threading.RLock()
         self._locked_out = False
         self._lockout_reason: str | None = None
@@ -283,7 +290,7 @@ class PaperRiskAuthority:
             moment = self._time(at)
             reasons = self._identity_reasons(snapshot)
             context = self._context(snapshot, at)
-            if intent.instrument != self.binding.instrument or intent.requested_quantity != 1 or intent.policy_hash != POLICY.configuration_hash:
+            if intent.instrument != self.binding.instrument or intent.requested_quantity != 1 or intent.policy_hash != self.policy.configuration_hash:
                 reasons.append("INTENT_AUTHORITY_MISMATCH")
             if self._time(intent.expires_at) < moment:
                 reasons.append("INTENT_EXPIRED")

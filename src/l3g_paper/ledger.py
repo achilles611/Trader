@@ -23,7 +23,16 @@ from uuid import uuid4
 
 from src.lane_iii.contracts import canonical_hash, normalized_utc
 
-from .contracts import ACCOUNT_BINDING, PAPER_RECORD_SCHEMA, POLICY, RISK_PROFILE
+from .contracts import (
+    ACCOUNT_BINDING,
+    PAPER_RECORD_SCHEMA,
+    POLICY,
+    RISK_PROFILE,
+    FiveMinutePaperPolicyArtifact,
+    PaperPolicyArtifact,
+    PaperPolicyArtifactType,
+    known_paper_policy_identity,
+)
 from .sessions import (
     PaperCalendarState, PaperSessionContext, PaperSessionKind,
     UNSPECIFIED_OFF_SESSION_CONTEXT, context_from_identity,
@@ -188,7 +197,6 @@ _EPOCH_ID = re.compile(r"^L3G-PAPER-EPOCH-[A-Za-z0-9][A-Za-z0-9._-]*$")
 # exact computed values once, rather than canonicalizing their static payloads
 # for every admitted market callback.  The values remain part of every record
 # envelope and hash-chain document exactly as before.
-_PAPER_POLICY_HASH = POLICY.configuration_hash
 _RISK_PROFILE_HASH = RISK_PROFILE.configuration_hash
 _ACCOUNT_BINDING_HASH = ACCOUNT_BINDING.binding_hash
 
@@ -628,8 +636,9 @@ def _passive_decision_shape(payload: Mapping[str, object]) -> str | None:
         or payload.get("book_completeness") != "UNVERIFIED"
         or not isinstance(payload.get("paper_decision_id"), str)
         or not str(payload["paper_decision_id"]).startswith("l3g-pd-")
-        or payload.get("paper_policy_id") != POLICY.policy_id
-        or payload.get("paper_policy_hash") != _PAPER_POLICY_HASH
+        or not known_paper_policy_identity(
+            payload.get("paper_policy_id"), payload.get("paper_policy_hash"),
+        )
         or not isinstance(payload.get("family_summary"), Mapping)
         or not isinstance(payload.get("reason_code"), str)
         or not _is_utc(payload.get("created_at"))
@@ -660,8 +669,9 @@ def _authority_decision_shape(payload: Mapping[str, object]) -> bool:
         and payload.get("book_completeness") == "UNVERIFIED"
         and isinstance(payload.get("paper_decision_id"), str)
         and str(payload["paper_decision_id"]).startswith("l3g-pd-")
-        and payload.get("paper_policy_id") == POLICY.policy_id
-        and payload.get("paper_policy_hash") == _PAPER_POLICY_HASH
+        and known_paper_policy_identity(
+            payload.get("paper_policy_id"), payload.get("paper_policy_hash"),
+        )
         and isinstance(payload.get("family_summary"), Mapping)
         and isinstance(payload.get("reason_code"), str)
         and type(payload.get("commissioning")) is bool
@@ -975,6 +985,7 @@ class PaperLedger:
         degraded_queue_depth: int | None = None,
         max_pending_barriers: int | None = None,
         persist_high_frequency_records: bool = False,
+        policy: PaperPolicyArtifactType = POLICY,
     ) -> None:
         if type(max_deferred_records) is not int or max_deferred_records < 1:
             raise ValueError("Paper ledger deferred capacity must be a positive integer.")
@@ -995,7 +1006,12 @@ class PaperLedger:
             )
         if type(persist_high_frequency_records) is not bool:
             raise ValueError("Paper ledger high-frequency persistence policy must be boolean.")
+        if type(policy) not in {PaperPolicyArtifact, FiveMinutePaperPolicyArtifact}:
+            raise ValueError("Paper ledger policy identity must be a compiled immutable profile.")
         self.path = Path(path).resolve()
+        self.policy = policy
+        self._paper_policy_hash = policy.configuration_hash
+        self._path_preexisted = self.path.exists()
         self._persist_high_frequency_records = persist_high_frequency_records
         self._creation_epoch = resolve_ledger_epoch(self.path, epoch_id)
         existing_accessibility = _read_only_accessibility_check(self.path) if self.path.exists() else None
@@ -1040,6 +1056,7 @@ class PaperLedger:
         self._highest_sequence = 0 if latest is None else int(latest["ledger_sequence"])
         self._last_record_time = None if latest is None else str(latest["occurred_at"])
         self._final_record_hash = None if latest is None else str(latest["record_hash"])
+        self._assert_policy_epoch_identity()
         self._authority_watermark = self._load_or_rebuild_authority_watermark(
             metadata.get(_COMMISSIONING_WATERMARK_METADATA_KEY)
         )
@@ -1516,6 +1533,60 @@ class PaperLedger:
         with self._transaction(metrics) as connection:
             yield connection
 
+    def _assert_policy_epoch_identity(self) -> None:
+        """Refuse to mix a profile with an existing ledger hash-chain epoch."""
+        metadata = {
+            str(row["metadata_key"]): str(row["metadata_value"])
+            for row in self._connection.execute(
+                "SELECT metadata_key, metadata_value FROM lane_iii_paper_ledger_metadata "
+                "WHERE metadata_key IN ('paper_policy_hash','entry_profile','entry_profile_version')"
+            )
+        }
+        required = (
+            self._paper_policy_hash,
+            self.policy.entry_profile,
+            self.policy.entry_profile_version,
+        )
+        if metadata:
+            identity = (
+                metadata.get("paper_policy_hash"),
+                metadata.get("entry_profile"),
+                metadata.get("entry_profile_version"),
+            )
+            if identity == required:
+                return
+            self._connection.close()
+            raise RuntimeError(
+                "PAPER_PROFILE_LEDGER_EPOCH_MISMATCH: select a new ledger path and epoch for "
+                f"{self.policy.entry_profile_version}."
+            )
+        rows = self._connection.execute(
+            "SELECT payload_json FROM lane_iii_paper_audit "
+            "WHERE ledger_sequence IN ((SELECT MIN(ledger_sequence) FROM lane_iii_paper_audit), "
+            "(SELECT MAX(ledger_sequence) FROM lane_iii_paper_audit))"
+        ).fetchall()
+        if not rows:
+            return
+        try:
+            envelopes = [json.loads(str(row["payload_json"])) for row in rows]
+        except (TypeError, json.JSONDecodeError) as exc:
+            self._connection.close()
+            raise RuntimeError("Existing paper ledger policy identity is unreadable.") from exc
+        identities = {
+            (
+                envelope.get("paper_policy_hash") if isinstance(envelope, Mapping) else None,
+                envelope.get("entry_profile") if isinstance(envelope, Mapping) else None,
+                envelope.get("entry_profile_version") if isinstance(envelope, Mapping) else None,
+            )
+            for envelope in envelopes
+        }
+        if identities != {required}:
+            self._connection.close()
+            raise RuntimeError(
+                "PAPER_PROFILE_LEDGER_EPOCH_MISMATCH: select a new ledger path and epoch for "
+                f"{self.policy.entry_profile_version}."
+            )
+
     def _create_schema(self) -> None:
         with self._lock, self._transaction() as connection:
             connection.execute(
@@ -1601,6 +1672,12 @@ class PaperLedger:
                 "schema_version": PAPER_RECORD_SCHEMA,
                 "created_at": _now(),
             }
+            if not self._path_preexisted:
+                metadata.update({
+                    "paper_policy_hash": self._paper_policy_hash,
+                    "entry_profile": self.policy.entry_profile,
+                    "entry_profile_version": self.policy.entry_profile_version,
+                })
             for key, value in metadata.items():
                 connection.execute(
                     "INSERT OR IGNORE INTO lane_iii_paper_ledger_metadata(metadata_key, metadata_value) VALUES (?, ?)",
@@ -2119,14 +2196,14 @@ class PaperLedger:
             "kind": kind,
             "occurred_at": at,
             "execution_session_id": execution_session_id,
-            "paper_policy_hash": _PAPER_POLICY_HASH,
+            "paper_policy_hash": self._paper_policy_hash,
             "risk_profile_hash": _RISK_PROFILE_HASH,
-            "entry_profile": POLICY.entry_profile,
-            "entry_profile_version": POLICY.entry_profile_version,
-            "effective_confidence_threshold": str(POLICY.entry_support_threshold),
-            "entry_dominance_margin": str(POLICY.entry_dominance_margin),
-            "entry_family_count": POLICY.entry_family_count,
-            "retention_confidence_threshold": str(POLICY.retention_support_threshold),
+            "entry_profile": self.policy.entry_profile,
+            "entry_profile_version": self.policy.entry_profile_version,
+            "effective_confidence_threshold": str(self.policy.entry_support_threshold),
+            "entry_dominance_margin": str(self.policy.entry_dominance_margin),
+            "entry_family_count": self.policy.entry_family_count,
+            "retention_confidence_threshold": str(self.policy.retention_support_threshold),
             "account_binding_hash": _ACCOUNT_BINDING_HASH,
             "scientific_eligibility": False,
             "paper_only": True,

@@ -19,14 +19,16 @@ from src.lane_iii.contracts import normalized_utc
 
 from .contracts import (
     ACCOUNT_BINDING,
-    AUTHORITY,
     CAPABILITY,
     POLICY,
     RISK_PROFILE,
     ExecutionAction,
     ExecutionCapabilityManifest,
     ExecutionVenueAdapter,
+    FiveMinutePaperPolicyArtifact,
     PaperExecutionCommand,
+    PaperPolicyArtifact,
+    PaperPolicyArtifactType,
     PaperRiskGrant,
     canonical_json,
 )
@@ -175,6 +177,7 @@ class PaperExecutionTransport:
         on_message: Callable[[Mapping[str, object]], None] | None = None,
         on_bridge_state: Callable[[str], None] | None = None,
         expected_source_fingerprint: str | None = None,
+        policy: PaperPolicyArtifactType = POLICY,
     ) -> None:
         if type(ledger) is not PaperLedger:
             raise ValueError("Execution transport requires the durable paper ledger.")
@@ -184,7 +187,12 @@ class PaperExecutionTransport:
             raise ValueError("Execution transport port is invalid.")
         if type(maximum_frame_bytes) is not int or not 1024 <= maximum_frame_bytes <= 1048576:
             raise ValueError("Maximum execution frame size is invalid.")
+        if type(policy) not in {PaperPolicyArtifact, FiveMinutePaperPolicyArtifact}:
+            raise ValueError("Execution transport requires a compiled immutable policy.")
+        if ledger.policy.configuration_hash != policy.configuration_hash:
+            raise ValueError("Execution transport and ledger policy identities must match.")
         self.ledger = ledger
+        self.policy = policy
         self.secret_provider = secret_provider or LocalPaperSecretProvider()
         self.host = host
         self.port = port
@@ -590,12 +598,12 @@ class PaperExecutionTransport:
             "message_type": "SESSION_GRANT",
             "execution_session_id": session_id,
             "server_nonce": uuid.uuid4().hex,
-            "paper_policy_hash": POLICY.configuration_hash,
+            "paper_policy_hash": self.policy.configuration_hash,
             "risk_profile_hash": RISK_PROFILE.configuration_hash,
             "account_binding_hash": ACCOUNT_BINDING.binding_hash,
             "heartbeat_interval_seconds": HEARTBEAT_INTERVAL_SECONDS,
             "heartbeat_watchdog_seconds": HEARTBEAT_WATCHDOG_SECONDS,
-            "command_ttl_seconds": POLICY.decision_ttl_seconds,
+            "command_ttl_seconds": self.policy.decision_ttl_seconds,
             "mode": "PAPER_SIM101",
             "live_capital": False,
             "timestamp": _now(),
@@ -698,7 +706,7 @@ class PaperExecutionTransport:
                 raise ValueError("Command sequence must be exactly monotonic.")
             if not grant.valid_at(_now()) or grant.grant_id != command.risk_grant_id or grant.intent_id != command.intent_id:
                 raise ValueError("A positive, current, matching paper risk grant is required.")
-            if command.policy_hash != POLICY.configuration_hash or command.risk_profile_hash != RISK_PROFILE.configuration_hash or command.account_binding_hash != ACCOUNT_BINDING.binding_hash:
+            if command.policy_hash != self.policy.configuration_hash or command.risk_profile_hash != RISK_PROFILE.configuration_hash or command.account_binding_hash != ACCOUNT_BINDING.binding_hash:
                 raise ValueError("Command authority hashes do not match the compiled paper authority.")
             legacy = command.session_kind is PaperSessionKind.OFF_SESSION and command.session_id != UNSPECIFIED_OFF_SESSION_CONTEXT.session_id
             if not legacy and (
@@ -766,7 +774,7 @@ class PaperExecutionTransport:
             "message_type": "HEARTBEAT",
             "execution_session_id": session_id,
             "armed": bool(armed),
-            "paper_policy_hash": POLICY.configuration_hash,
+            "paper_policy_hash": self.policy.configuration_hash,
             "risk_profile_hash": RISK_PROFILE.configuration_hash,
             "account_binding_hash": ACCOUNT_BINDING.binding_hash,
             "timestamp": _now(),
