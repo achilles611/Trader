@@ -53,7 +53,9 @@ _TERMINAL_PROBE_FAILURES = frozenset({
     "MULTIPLE_NINJATRADER_PROCESSES",
     "UNEXPECTED_LOGIN_UI",
 })
-_FAULT_PROBE_FAILURES = frozenset({"AUTOMATION_PROCESS_FAILED", "POWERSHELL_HELPER_INVALID_RESPONSE"})
+_FAULT_PROBE_FAILURES = frozenset({"POWERSHELL_HELPER_INVALID_RESPONSE"})
+_TRANSIENT_PROBE_FAILURE = "AUTOMATION_PROCESS_FAILED"
+_MAXIMUM_CONSECUTIVE_PROBE_FAILURES = 2
 
 
 @dataclass(frozen=True)
@@ -274,9 +276,23 @@ class NinjaTraderLoginBootstrap:
         process_seen = False
         lucid_connect_requested = False
         last_attempt_at = float("-inf")
+        consecutive_probe_failures = 0
         while not self._stop.is_set() and self._clock() < deadline:
             probe = self._adapter.probe()
             self._update_probe(probe)
+            if probe.failure_category == _TRANSIENT_PROBE_FAILURE:
+                # A Windows UI Automation probe is read-only and can outlive
+                # its helper timeout while NinjaTrader is constructing the
+                # Control Center. Tolerate one such process failure, then
+                # require a fresh exact probe; this never retries a credential
+                # submission or treats inferred state as authentication.
+                consecutive_probe_failures += 1
+                if consecutive_probe_failures >= _MAXIMUM_CONSECUTIVE_PROBE_FAILURES:
+                    self._transition(NinjaTraderLoginState.FAULTED, probe.failure_category)
+                    return
+                self._wait(self._poll_interval_seconds)
+                continue
+            consecutive_probe_failures = 0
             if probe.failure_category in _FAULT_PROBE_FAILURES:
                 self._transition(NinjaTraderLoginState.FAULTED, probe.failure_category)
                 return

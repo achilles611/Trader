@@ -99,6 +99,27 @@ class NinjaTraderLoginBootstrapTests(unittest.TestCase):
         self.assertEqual(adapter.start_calls, 1)
         self.assertEqual(adapter.submit_calls, 0)
 
+    def test_one_read_only_probe_process_failure_is_tolerated_before_authenticated_truth(self) -> None:
+        adapter = FakeLoginAdapter([
+            NinjaTraderLoginProbe(failure_category="AUTOMATION_PROCESS_FAILED"),
+            NinjaTraderLoginProbe(True, False, True, "CONNECTED"),
+        ])
+        bootstrap = run_bootstrap(adapter)
+        self.assertEqual(bootstrap.state, NinjaTraderLoginState.AUTHENTICATED)
+        self.assertEqual(adapter.probe_calls, 2)
+        self.assertEqual((adapter.start_calls, adapter.submit_calls, adapter.connect_calls), (0, 0, 0))
+
+    def test_two_consecutive_probe_process_failures_fault_without_actions(self) -> None:
+        adapter = FakeLoginAdapter([
+            NinjaTraderLoginProbe(failure_category="AUTOMATION_PROCESS_FAILED"),
+            NinjaTraderLoginProbe(failure_category="AUTOMATION_PROCESS_FAILED"),
+        ])
+        bootstrap = run_bootstrap(adapter)
+        self.assertEqual(bootstrap.state, NinjaTraderLoginState.FAULTED)
+        self.assertEqual(bootstrap.status()["failure_category"], "AUTOMATION_PROCESS_FAILED")
+        self.assertEqual(adapter.probe_calls, 2)
+        self.assertEqual((adapter.start_calls, adapter.submit_calls, adapter.connect_calls), (0, 0, 0))
+
     def test_exact_login_window_advances_to_control_center(self) -> None:
         adapter = FakeLoginAdapter([
             NinjaTraderLoginProbe(True, True, False, "UNKNOWN"),
