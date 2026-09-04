@@ -33,11 +33,12 @@ class FakeLoginAdapter:
         start_result: bool = True,
         submit_results: list[str] | None = None,
         connect_result: bool = True,
+        connect_results: list[bool] | None = None,
     ) -> None:
         self.probes = list(probes)
         self.start_result = start_result
         self.submit_results = list(submit_results or ["SUBMITTED"])
-        self.connect_result = connect_result
+        self.connect_results = list(connect_results or [connect_result])
         self.probe_calls = 0
         self.start_calls = 0
         self.submit_calls = 0
@@ -58,8 +59,9 @@ class FakeLoginAdapter:
         return self.submit_results[index]
 
     def connect_lucid(self) -> bool:
+        index = min(self.connect_calls, len(self.connect_results) - 1)
         self.connect_calls += 1
-        return self.connect_result
+        return self.connect_results[index]
 
 
 def run_bootstrap(
@@ -201,6 +203,35 @@ class NinjaTraderLoginBootstrapTests(unittest.TestCase):
         self.assertEqual(bootstrap.state, NinjaTraderLoginState.AUTHENTICATED)
         self.assertEqual(adapter.connect_calls, 1)
         self.assertEqual(adapter.submit_calls, 0)
+
+    def test_lucid_connection_waits_for_exact_disconnected_state(self) -> None:
+        adapter = FakeLoginAdapter([
+            NinjaTraderLoginProbe(True, False, True, "UNKNOWN"),
+            NinjaTraderLoginProbe(True, False, True, "DISCONNECTED"),
+            NinjaTraderLoginProbe(True, False, True, "CONNECTED"),
+        ])
+        bootstrap = run_bootstrap(adapter)
+        self.assertEqual(bootstrap.state, NinjaTraderLoginState.AUTHENTICATED)
+        self.assertEqual(adapter.connect_calls, 1)
+
+    def test_non_invoking_lucid_connect_failure_is_retried_after_fresh_disconnected_probe(self) -> None:
+        adapter = FakeLoginAdapter([
+            NinjaTraderLoginProbe(True, False, True, "DISCONNECTED"),
+            NinjaTraderLoginProbe(True, False, True, "DISCONNECTED"),
+            NinjaTraderLoginProbe(True, False, True, "CONNECTED"),
+        ], connect_results=[False, True])
+        bootstrap = run_bootstrap(adapter)
+        self.assertEqual(bootstrap.state, NinjaTraderLoginState.AUTHENTICATED)
+        self.assertEqual(adapter.connect_calls, 2)
+
+    def test_two_non_invoking_lucid_connect_failures_block_without_more_actions(self) -> None:
+        adapter = FakeLoginAdapter([
+            NinjaTraderLoginProbe(True, False, True, "DISCONNECTED"),
+        ], connect_result=False)
+        bootstrap = run_bootstrap(adapter)
+        self.assertEqual(bootstrap.state, NinjaTraderLoginState.BLOCKED)
+        self.assertEqual(bootstrap.status()["failure_category"], "CONTROL_CENTER_NOT_IDENTIFIED")
+        self.assertEqual(adapter.connect_calls, 2)
 
     def test_credential_values_cannot_enter_status_or_helper_output_contract(self) -> None:
         username_marker = "username-must-not-appear"

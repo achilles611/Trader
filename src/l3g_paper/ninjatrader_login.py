@@ -56,6 +56,7 @@ _TERMINAL_PROBE_FAILURES = frozenset({
 _FAULT_PROBE_FAILURES = frozenset({"POWERSHELL_HELPER_INVALID_RESPONSE"})
 _TRANSIENT_PROBE_FAILURE = "AUTOMATION_PROCESS_FAILED"
 _MAXIMUM_CONSECUTIVE_PROBE_FAILURES = 2
+_MAXIMUM_LUCID_CONNECT_FAILURES = 2
 
 
 @dataclass(frozen=True)
@@ -275,6 +276,7 @@ class NinjaTraderLoginBootstrap:
         process_started = False
         process_seen = False
         lucid_connect_requested = False
+        lucid_connect_failures = 0
         last_attempt_at = float("-inf")
         consecutive_probe_failures = 0
         while not self._stop.is_set() and self._clock() < deadline:
@@ -329,10 +331,23 @@ class NinjaTraderLoginBootstrap:
                     self._transition(NinjaTraderLoginState.AUTHENTICATED)
                     return
                 self._transition(NinjaTraderLoginState.WAITING_FOR_LUCID_CONNECTION)
+                if probe.lucid_connection_state == "UNKNOWN":
+                    # The Control Center shell can appear before its Accounts
+                    # grid and Connections menu are stable. Require an exact
+                    # DISCONNECTED observation before attempting a connection.
+                    self._wait(self._poll_interval_seconds)
+                    continue
                 if not lucid_connect_requested:
                     if not self._adapter.connect_lucid():
-                        self._blocked("CONTROL_CENTER_NOT_IDENTIFIED")
-                        return
+                        # A false result means the helper did not invoke the
+                        # connection item. Permit one later attempt only after
+                        # the next fresh probe again proves DISCONNECTED.
+                        lucid_connect_failures += 1
+                        if lucid_connect_failures >= _MAXIMUM_LUCID_CONNECT_FAILURES:
+                            self._blocked("CONTROL_CENTER_NOT_IDENTIFIED")
+                            return
+                        self._wait(self._poll_interval_seconds)
+                        continue
                     lucid_connect_requested = True
                 self._wait(self._poll_interval_seconds)
                 continue
