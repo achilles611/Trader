@@ -1555,7 +1555,13 @@ class LaneIIIPaperRuntime:
             )
             for source, seconds, reason in stale:
                 if source is None or now - datetime.fromisoformat(source.replace("Z", "+00:00")) > timedelta(seconds=seconds):
-                    self._request_exit(reason, emergency=True)
+                    # Source-specific freshness can lapse briefly even while
+                    # the authenticated bridge and the other feeds remain
+                    # healthy.  Flatten with the emergency transport action,
+                    # but preserve persistent-paper ownership.  The ordinary
+                    # entry risk gate still refuses a replacement entry until
+                    # quote, classified-trade, and depth freshness all recover.
+                    self._request_exit(reason, emergency=True, stop_operational=False)
                     break
 
     def _references(self) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
@@ -1646,8 +1652,16 @@ class LaneIIIPaperRuntime:
         self._persist_and_send(command, grant)
         return True
 
-    def _request_exit(self, reason: str, *, emergency: bool = False) -> None:
-        if emergency:
+    def _request_exit(
+        self,
+        reason: str,
+        *,
+        emergency: bool = False,
+        stop_operational: bool | None = None,
+    ) -> None:
+        if stop_operational is None:
+            stop_operational = emergency
+        if stop_operational:
             self._request_operational_stop_locked(reason)
         if self._position is PaperDirection.FLAT or self._state in {
             PaperRuntimeState.EXIT_PENDING, PaperRuntimeState.LOCKED_OUT,

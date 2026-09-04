@@ -297,6 +297,68 @@ class PaperRuntimeTests(unittest.TestCase):
             finally:
                 runtime.stop(); ledger.close()
 
+    def test_stale_market_source_emergency_flattens_without_ending_persistent_session(self) -> None:
+        now = "2026-08-26T14:00:00Z"
+        stale_at = "2026-08-26T14:00:03Z"
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.operational_runtime(directory, now=now)
+            submitted: list[object] = []
+            runtime._persist_and_send = lambda command, _grant: submitted.append(command)  # type: ignore[method-assign]
+            try:
+                with patch("src.l3g_paper.runtime._now", return_value=now):
+                    self.assertTrue(runtime.operational_paper_start("operational-start-stale-source")["started"])
+                runtime._transition(PaperRuntimeState.ENTRY_PENDING, "TEST_STALE_ENTRY")
+                runtime._transition(PaperRuntimeState.LONG, "TEST_STALE_FILL")
+                runtime._position = PaperDirection.LONG
+                runtime._position_quantity = 1
+                runtime._entry_owner = PaperEntryOwner.STRATEGY
+                runtime._entry_fill_price = Decimal("100")
+                runtime._entry_fill_quantity = 1
+                runtime._entry_direction = PaperDirection.LONG
+                runtime._entry_execution = {"native_execution_id": "stale-entry", "timestamp": now}
+                runtime._entry_session_context = runtime._session_context
+                runtime._snapshot = replace(
+                    runtime._snapshot,
+                    current_position=PaperDirection.LONG,
+                    current_position_quantity=1,
+                    quote_observed_at=now,
+                    classified_trade_observed_at=stale_at,
+                    depth_mutation_observed_at=stale_at,
+                    protective_stop_state="WORKING",
+                )
+
+                with patch("src.l3g_paper.runtime._now", return_value=stale_at):
+                    runtime._evaluate_risk_exit(stale_at)
+
+                self.assertEqual(runtime.state, PaperRuntimeState.EXIT_PENDING)
+                self.assertEqual(submitted[-1].action.value, "EMERGENCY_FLATTEN")  # type: ignore[attr-defined]
+                active = runtime.status()["operational_paper_session"]
+                self.assertTrue(active["active"])
+                self.assertFalse(active["stopping"])
+
+                runtime.on_execution_message({
+                    "message_type": "EXECUTION_EVENT", "order_role": "EXIT", "price": "100",
+                    "quantity": 1, "native_execution_id": "stale-exit", "timestamp": stale_at,
+                })
+                runtime.on_execution_message({
+                    "message_type": "POSITION_EVENT", "quantity": 0, "timestamp": stale_at,
+                })
+                runtime.on_execution_message({
+                    "message_type": "RECONCILIATION", "receipt_id": "stale-flat",
+                    "account_name": "Sim101", "account_class": "LOCAL_SIMULATION", "instrument": "MNQ SEP26",
+                    "position_quantity": 0, "working_order_count": 0, "working_entry_count": 0,
+                    "position_snapshot_complete": True, "order_snapshot_complete": True,
+                    "foreign_activity": False, "timestamp": stale_at,
+                })
+                self.assertEqual(runtime.state, PaperRuntimeState.PAPER_RUNNING)
+                self.assertTrue(runtime.status()["operational_paper_session"]["active"])
+                self.assertNotIn(
+                    "SESSION_OPERATIONAL_PAPER_STOPPED",
+                    [record["kind"] for record in ledger.recent(50)],
+                )
+            finally:
+                runtime.stop(); ledger.close()
+
     def test_operational_session_stays_green_across_repeated_observer_health_cycles(self) -> None:
         now = "2026-08-26T14:00:00Z"
         observer_health = {
