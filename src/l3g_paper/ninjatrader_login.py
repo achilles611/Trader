@@ -331,17 +331,15 @@ class NinjaTraderLoginBootstrap:
                     self._transition(NinjaTraderLoginState.AUTHENTICATED)
                     return
                 self._transition(NinjaTraderLoginState.WAITING_FOR_LUCID_CONNECTION)
-                if probe.lucid_connection_state == "UNKNOWN":
-                    # The Control Center shell can appear before its Accounts
-                    # grid and Connections menu are stable. Require an exact
-                    # DISCONNECTED observation before attempting a connection.
-                    self._wait(self._poll_interval_seconds)
-                    continue
                 if not lucid_connect_requested:
                     if not self._adapter.connect_lucid():
                         # A false result means the helper did not invoke the
                         # connection item. Permit one later attempt only after
-                        # the next fresh probe again proves DISCONNECTED.
+                        # another fresh probe still identifies the exact
+                        # Control Center. UNKNOWN is allowed here because the
+                        # Accounts grid can stay unpopulated until Lucid is
+                        # connected; the helper independently requires one
+                        # exact enabled fixed Connections menu item.
                         lucid_connect_failures += 1
                         if lucid_connect_failures >= _MAXIMUM_LUCID_CONNECT_FAILURES:
                             self._blocked("CONTROL_CENTER_NOT_IDENTIFIED")

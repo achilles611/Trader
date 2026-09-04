@@ -204,10 +204,9 @@ class NinjaTraderLoginBootstrapTests(unittest.TestCase):
         self.assertEqual(adapter.connect_calls, 1)
         self.assertEqual(adapter.submit_calls, 0)
 
-    def test_lucid_connection_waits_for_exact_disconnected_state(self) -> None:
+    def test_lucid_connection_can_be_requested_before_accounts_grid_populates(self) -> None:
         adapter = FakeLoginAdapter([
             NinjaTraderLoginProbe(True, False, True, "UNKNOWN"),
-            NinjaTraderLoginProbe(True, False, True, "DISCONNECTED"),
             NinjaTraderLoginProbe(True, False, True, "CONNECTED"),
         ])
         bootstrap = run_bootstrap(adapter)
@@ -216,7 +215,7 @@ class NinjaTraderLoginBootstrapTests(unittest.TestCase):
 
     def test_non_invoking_lucid_connect_failure_is_retried_after_fresh_disconnected_probe(self) -> None:
         adapter = FakeLoginAdapter([
-            NinjaTraderLoginProbe(True, False, True, "DISCONNECTED"),
+            NinjaTraderLoginProbe(True, False, True, "UNKNOWN"),
             NinjaTraderLoginProbe(True, False, True, "DISCONNECTED"),
             NinjaTraderLoginProbe(True, False, True, "CONNECTED"),
         ], connect_results=[False, True])
