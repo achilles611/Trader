@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from src.copytrade.config import (
     ArtifactConfig,
@@ -257,7 +258,8 @@ class LaneIICohortCopyTests(unittest.TestCase):
                 connection.commit()
             finally:
                 connection.close()
-            service = CopyTradeService(_config(root))
+            config = _config(root)
+            service = CopyTradeService(replace(config, analysis=replace(config.analysis, default_workers=1)))
             service.adapter = PublicOnlyAdapter()  # type: ignore[assignment]
             parent = freeze_lane_ii_research_pass(
                 service, retained_database=retained, output=root / "parent.json", seed_limit=1,
@@ -274,6 +276,31 @@ class LaneIICohortCopyTests(unittest.TestCase):
             self.assertEqual(child["pass_kind"], "deep_batch")
             self.assertEqual(child["policy"]["public_request_budget"], 2)
             self.assertEqual([item["wallet"] for item in child["seeds"]], [WALLET])
+
+            # The immutable deep batch keeps its policy and exact wallet, but
+            # controlled recovery must be able to serialize Phase-B history
+            # acquisition without changing the frozen evidence.
+            with patch("src.copytrade.lane_ii.CandidateAnalysisPipeline.run", return_value={"status": "fixture"}) as analysis_run, patch(
+                "src.copytrade.lane_ii.CandidateAnalysisPipeline.shadow_finalists", return_value=[],
+            ):
+                resumed = refresh_public_cohort(
+                    service, retained_database=retained, output_directory=root / "deep-run", analysis_limit=1,
+                    frozen_research_pass=child["research_pass_path"], public_request_budget=2, analysis_workers=1,
+                )
+            self.assertEqual(resumed["selection_status"], "COMPLETED")
+            self.assertEqual(analysis_run.call_args.kwargs["workers"], 1)
+            self.assertEqual(analysis_run.call_args.kwargs["candidate_wallets"], [WALLET])
+
+            # A caller cannot turn the recovery cap into a concurrency
+            # increase above the configured single-owner limit.
+            with patch("src.copytrade.lane_ii.CandidateAnalysisPipeline.run", return_value={"status": "fixture"}) as capped_run, patch(
+                "src.copytrade.lane_ii.CandidateAnalysisPipeline.shadow_finalists", return_value=[],
+            ):
+                refresh_public_cohort(
+                    service, retained_database=retained, output_directory=root / "capped-run", seed_limit=1,
+                    analysis_limit=2, public_request_budget=2, analysis_workers=99,
+                )
+            self.assertEqual(capped_run.call_args.kwargs["workers"], 1)
 
     def test_lane_ii_only_lifecycle_never_starts_lane_iii_and_live_is_backend_denied(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

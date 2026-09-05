@@ -318,6 +318,7 @@ def refresh_public_cohort(
     frozen_research_pass: str | Path | None = None,
     include_public_account_state: bool = False,
     public_request_budget: int | None = None,
+    analysis_workers: int | None = None,
 ) -> dict[str, Any]:
     """Refresh the current public universe and run the canonical Phase B path.
 
@@ -329,6 +330,8 @@ def refresh_public_cohort(
         raise ValueError("Lane II cohort refresh requires a paper-only configuration.")
     if analysis_limit < 0:
         raise ValueError("Lane II analysis limit must not be negative.")
+    if analysis_workers is not None and analysis_workers < 1:
+        raise ValueError("Lane II analysis workers must be positive when specified.")
     research_pass: dict[str, Any] | None = None
     if frozen_research_pass is not None:
         research_pass = _load_evidence(frozen_research_pass, schema=RESEARCH_PASS_SCHEMA)
@@ -516,9 +519,18 @@ def refresh_public_cohort(
             deep_wallets = [str(seed["wallet"]).lower() for seed in seeds] if research_pass and research_pass.get("pass_kind") == "deep_batch" else None
             if deep_wallets and analysis_limit != len(deep_wallets):
                 raise ValueError("A frozen Lane II deep batch must analyze exactly its pinned wallet count.")
+            # A frozen batch retains its evidence policy and candidate order,
+            # while a controlled recovery can lower concurrency to one so
+            # historical acquisition has exactly one owner.
+            configured_worker_cap = max(1, service.config.analysis.default_workers)
+            worker_count = min(configured_worker_cap, analysis_limit)
+            if analysis_workers is not None:
+                # An invocation may only lower the configured cap.  A
+                # recovery flag must never widen historical acquisition.
+                worker_count = min(worker_count, analysis_workers)
             analysis = CandidateAnalysisPipeline(service).run(
                 limit=analysis_limit, status="new", force=True,
-                workers=min(max(1, service.config.analysis.default_workers), analysis_limit),
+                workers=worker_count,
                 candidate_wallets=deep_wallets,
             )
             pipeline = CandidateAnalysisPipeline(service)

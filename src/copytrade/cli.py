@@ -124,6 +124,7 @@ def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
     lane_ii_refresh.add_argument("--screen-only", action="store_true", help="Persist public screening only; do not start Phase B acquisition or selection.")
     lane_ii_refresh.add_argument("--include-public-account-state", action="store_true", help="Include bounded public portfolio and clearinghouse summaries in the screen.")
     lane_ii_refresh.add_argument("--public-request-budget", type=int, help="Finite no-spend public-info request budget; a frozen pass pins this value.")
+    lane_ii_refresh.add_argument("--analysis-workers", type=int, help="Optional Phase-B backfill worker cap; use 1 for a controlled single-owner recovery.")
 
     lane_ii_freeze = command("copy-lane-ii-freeze-research", "Freeze a bounded no-spend Lane II research batch before public screening.")
     lane_ii_freeze.add_argument("--retained-database", default="artifacts/copytrade.sqlite3", help="Read-only retained Phase A candidate database.")
@@ -488,6 +489,7 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
             frozen_research_pass=args.frozen_research_pass,
             include_public_account_state=args.include_public_account_state,
             public_request_budget=args.public_request_budget,
+            analysis_workers=args.analysis_workers,
         ))
         return 0
     if command == "copy-lane-ii-freeze-research":
