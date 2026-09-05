@@ -22,7 +22,7 @@ WALLET = "0x1111111111111111111111111111111111111111"
 
 
 def fill(
-    tid: int, time_ms: int, side: str, quantity: float, start_position: float, *, order: int | None = None,
+    tid: int, time_ms: int, side: str, quantity: float, start_position: float | str, *, order: int | None = None,
     price: float = 100.0, equity: float = 1000.0,
 ) -> RawFill:
     return RawFill.from_hyperliquid(
@@ -108,6 +108,70 @@ class CopyTradeTests(unittest.TestCase):
         aggregate = aggregate_partial_fills(fills)[0]
         self.assertEqual([item.target_trade_id for item in aggregate.fills], ["1", "5", "9"])
         self.assertEqual((aggregate.position_before, aggregate.signed_quantity), (0, 3))
+
+    def test_decimal_position_alias_is_normalized_ephemerally(self) -> None:
+        timestamp = 1_700_000_000_000
+        # The tail is an alternative binary64 spelling of the source-proven
+        # 0.1 lattice endpoint.  Input raw evidence must remain untouched.
+        fills = [
+            fill(9, timestamp, "B", 0.1, "0.10000000000000001", order=99),
+            fill(1, timestamp, "B", 0.1, "0.0", order=99),
+        ]
+        aggregate = aggregate_partial_fills(fills)[0]
+        self.assertEqual([item.target_trade_id for item in aggregate.fills], ["1", "9"])
+        self.assertEqual(aggregate.fills[1].raw_payload["startPosition"], "0.10000000000000001")
+        self.assertEqual(aggregate.fills[1].raw_payload["_copytrade_canonical_start_position"], "0.1")
+        self.assertEqual(len(PositionReconstructor().reconstruct(fills).events), 1)
+        self.assertEqual(fills[0].raw_payload["startPosition"], "0.10000000000000001")
+
+    def test_decimal_position_alias_cross_timestamp_uses_prior_source_lattice(self) -> None:
+        timestamp = 1_700_000_000_000
+        fills = [
+            fill(1, timestamp, "B", 0.1, "0.0", order=1),
+            fill(2, timestamp + 1, "B", 0.1, "0.10000000000000001", order=2),
+        ]
+        result = PositionReconstructor().reconstruct(fills)
+        self.assertEqual([event.event_type for event in result.events], [PositionEventType.OPEN, PositionEventType.ADD])
+        self.assertEqual(fills[1].raw_payload["startPosition"], "0.10000000000000001")
+
+    def test_decimal_alias_continuity_uses_exact_source_boundaries_not_float_drift(self) -> None:
+        # These values are the same binary64 source spelling / Decimal 0.1
+        # lattice pattern found in saved FARTCOIN evidence.  The original
+        # field remains high precision, so its 5e-11 stated-scale tolerance
+        # must not be widened to conceal the one-ULP float state drift.
+        timestamp = 1_700_000_000_000
+        fills = [
+            fill(1, timestamp, "B", 0.1, "3715129.7999999999", order=1),
+            fill(2, timestamp + 1, "B", 0.1, "3715129.9", order=2),
+        ]
+        aggregate = aggregate_partial_fills(fills)[0]
+        self.assertEqual(aggregate.position_tolerance, 5e-11)
+        result = PositionReconstructor().reconstruct(fills)
+        self.assertEqual([event.event_type for event in result.events], [PositionEventType.ADD, PositionEventType.ADD])
+
+    def test_decimal_alias_continuity_does_not_accept_material_source_gap(self) -> None:
+        timestamp = 1_700_000_000_000
+        fills = [
+            fill(1, timestamp, "B", 0.1, "3715129.7999999999", order=1),
+            # The exact source lattice says the next boundary is 3715129.9,
+            # so this 0.1 gap remains a hard discontinuity.
+            fill(2, timestamp + 1, "B", 0.1, "3715130.0", order=2),
+        ]
+        with self.assertRaises(SourcePositionContinuityError) as raised:
+            PositionReconstructor().reconstruct(fills)
+        self.assertEqual(raised.exception.reason, "UNRESOLVED_SOURCE_POSITION_CONTINUITY")
+
+    def test_decimal_position_alias_does_not_relax_non_alias_gap(self) -> None:
+        timestamp = 1_700_000_000_000
+        # This is close in ordinary decimal terms, but it is not the same
+        # binary64 value as 0.1 and therefore cannot be canonicalized.
+        fills = [
+            fill(1, timestamp, "B", 0.1, "0.0", order=99),
+            fill(2, timestamp, "B", 0.1, "0.1000000001", order=99),
+        ]
+        with self.assertRaises(SourcePositionContinuityError) as raised:
+            aggregate_partial_fills(fills)
+        self.assertEqual(raised.exception.reason, "UNRESOLVED_SOURCE_POSITION_GAP")
 
     def test_same_timestamp_source_ambiguities_fail_closed(self) -> None:
         timestamp = 1_700_000_000_000

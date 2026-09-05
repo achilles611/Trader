@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from dataclasses import dataclass, field, replace
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from datetime import datetime
+from math import gcd, isfinite
 from typing import Iterable
 
 from .models import PositionCampaign, PositionEvent, PositionEventType, RawFill, stable_id
 
 
 EPSILON = 1e-12
+_CANONICAL_SOURCE_POSITION = "_copytrade_canonical_start_position"
 
 
 class SourcePositionContinuityError(ValueError):
@@ -94,6 +96,11 @@ class IncrementalReconstructionState:
 
     positions: dict[tuple[str, str], float]
     active_campaigns: dict[tuple[str, str], PositionCampaign]
+    # Float campaign economics remain separate from exact source continuity.
+    # This is populated only from a source-proven aggregate boundary; restored
+    # legacy state intentionally leaves it empty until fresh source evidence
+    # establishes a new exact boundary.
+    source_positions: dict[tuple[str, str], Decimal] = field(default_factory=dict)
 
 
 def aggregate_partial_fills(fills: Iterable[RawFill]) -> list[FillAggregate]:
@@ -159,11 +166,132 @@ def _causally_ordered_fills(fills: Iterable[RawFill]) -> list[RawFill]:
         key = (fill.target_wallet.lower(), fill.symbol, fill.event_timestamp)
         buckets.setdefault(key, []).append(fill)
     ordered: list[RawFill] = []
+    # A source size lattice is accrued only from source ``sz`` values already
+    # observed for this wallet/symbol.  It is not a configurable tolerance and
+    # is never inferred from price, P&L, or a desired reconstruction outcome.
+    size_lattices: dict[tuple[str, str], Decimal] = {}
     for (wallet, symbol, timestamp), bundle in sorted(
         buckets.items(), key=lambda item: (item[0][2], item[0][0], item[0][1]),
     ):
-        ordered.extend(_order_same_timestamp_bundle(bundle, wallet=wallet, symbol=symbol, timestamp=timestamp))
+        lattice_key = (wallet, symbol)
+        lattice = _update_source_size_lattice(size_lattices.get(lattice_key), bundle)
+        if lattice is not None:
+            size_lattices[lattice_key] = lattice
+        normalized_bundle = _normalize_decimal_position_aliases(bundle, lattice)
+        ordered.extend(_order_same_timestamp_bundle(
+            normalized_bundle, wallet=wallet, symbol=symbol, timestamp=timestamp,
+        ))
     return ordered
+
+
+def _update_source_size_lattice(current: Decimal | None, bundle: Iterable[RawFill]) -> Decimal | None:
+    """Accrue the exact Decimal GCD of observed source sizes.
+
+    A missing, invalid, or zero source size cannot establish a lattice and is
+    deliberately ignored here; the normal reconstruction checks retain their
+    existing fail-closed behavior for the raw fill itself.
+    """
+    lattice = current
+    for fill in bundle:
+        raw = fill.raw_payload.get("sz")
+        if raw in (None, ""):
+            continue
+        try:
+            quantity = abs(Decimal(str(raw)))
+        except InvalidOperation:
+            continue
+        if not quantity.is_finite() or quantity == 0:
+            continue
+        lattice = quantity if lattice is None else _decimal_gcd(lattice, quantity)
+    return lattice
+
+
+def _decimal_gcd(left: Decimal, right: Decimal) -> Decimal:
+    """Return the exact Decimal lattice shared by two positive quantities."""
+    exponent = min(left.as_tuple().exponent, right.as_tuple().exponent)
+    scaled_left = int(left.scaleb(-exponent))
+    scaled_right = int(right.scaleb(-exponent))
+    return Decimal(gcd(scaled_left, scaled_right)).scaleb(exponent)
+
+
+def _normalize_decimal_position_aliases(bundle: list[RawFill], lattice: Decimal | None) -> list[RawFill]:
+    """Canonically replace only source-proven Decimal representation aliases.
+
+    Public source payloads can spell a lattice point with a binary-decimal
+    tail (for example ``1266979.3999999999`` for a 0.1 position lattice).
+    This is not a tolerance relaxation: Decimal arithmetic chooses the unique
+    source-size lattice point, and binary64 equality merely classifies two
+    textual spellings as one representational alias.  The raw
+    ``startPosition`` field and its stated precision are retained; an
+    ephemeral private canonical value is used only for causal ordering when
+    source ordering remains identical.
+    """
+    if lattice is None or not lattice.is_finite() or lattice <= 0:
+        return list(bundle)
+    try:
+        positions = {fill.event_id: _source_position(fill) for fill in bundle}
+    except (InvalidOperation, ValueError):
+        return list(bundle)
+    if any(not position.is_finite() for position in positions.values()):
+        return list(bundle)
+
+    # Do not normalise an ambiguity away.  The existing strict checker emits
+    # the authoritative reason for zero quantities, mixed sides, or duplicate
+    # source boundaries after this helper returns the untouched bundle.
+    signs = {1 if fill.signed_quantity > 0 else -1 if fill.signed_quantity < 0 else 0 for fill in bundle}
+    if 0 in signs or len(signs) != 1 or len(set(positions.values())) != len(bundle):
+        return list(bundle)
+    sign = next(iter(signs))
+    raw_order = sorted(bundle, key=lambda fill: (positions[fill.event_id], fill.event_id), reverse=sign < 0)
+
+    replacements: dict[str, Decimal] = {}
+    for fill in bundle:
+        position = positions[fill.event_id]
+        if position % lattice == 0:
+            continue
+        canonical = (position / lattice).to_integral_value(rounding=ROUND_HALF_EVEN) * lattice
+        if (
+            abs(position - canonical) >= lattice / 2
+            or not _same_binary64(position, canonical)
+        ):
+            continue
+        replacements[fill.event_id] = canonical
+    if not replacements:
+        return list(bundle)
+
+    normalized_positions = {fill.event_id: replacements.get(fill.event_id, positions[fill.event_id]) for fill in bundle}
+    # A correction may not turn distinct raw boundaries into a duplicate or
+    # choose a different causal order.  Leave the source untouched in either
+    # case and let the strict validator fail closed.
+    if len(set(normalized_positions.values())) != len(bundle):
+        return list(bundle)
+    normalized_order = sorted(
+        bundle, key=lambda fill: (normalized_positions[fill.event_id], fill.event_id), reverse=sign < 0,
+    )
+    if [fill.event_id for fill in raw_order] != [fill.event_id for fill in normalized_order]:
+        return list(bundle)
+
+    normalized: list[RawFill] = []
+    for fill in bundle:
+        canonical = replacements.get(fill.event_id)
+        if canonical is None:
+            normalized.append(fill)
+            continue
+        payload = dict(fill.raw_payload)
+        payload[_CANONICAL_SOURCE_POSITION] = format(canonical, "f")
+        normalized.append(replace(
+            fill, raw_payload=payload, target_position_before=float(canonical),
+        ))
+    return normalized
+
+
+def _same_binary64(left: Decimal, right: Decimal) -> bool:
+    """Whether two Decimal spellings identify one finite IEEE-754 value."""
+    try:
+        left_float, right_float = float(left), float(right)
+    except (OverflowError, ValueError):
+        return False
+    return isfinite(left_float) and isfinite(right_float) and left_float == right_float
 
 
 def _order_same_timestamp_bundle(
@@ -205,7 +333,7 @@ def _order_same_timestamp_bundle(
 
 
 def _source_position(fill: RawFill) -> Decimal:
-    raw = fill.raw_payload.get("startPosition")
+    raw = fill.raw_payload.get(_CANONICAL_SOURCE_POSITION, fill.raw_payload.get("startPosition"))
     if raw in (None, ""):
         raise ValueError("missing startPosition")
     return Decimal(str(raw))
@@ -242,6 +370,27 @@ def _source_transition_is_contiguous(previous: RawFill, following: RawFill) -> b
         return abs(expected - actual) <= _source_position_tolerance(following)
     except (InvalidOperation, ValueError):
         return False
+
+
+def _aggregate_source_position_before(aggregate: FillAggregate) -> Decimal | None:
+    """Return the first exact source boundary of a causally ordered aggregate."""
+    if not aggregate.fills:
+        return None
+    try:
+        return _source_position(aggregate.fills[0])
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _aggregate_source_position_after(aggregate: FillAggregate) -> Decimal | None:
+    """Return the final exact source boundary without float accumulation."""
+    if not aggregate.fills:
+        return None
+    try:
+        final = aggregate.fills[-1]
+        return _source_position(final) + _signed_source_quantity(final)
+    except (InvalidOperation, ValueError):
+        return None
 
 
 class PositionReconstructor:
@@ -290,6 +439,8 @@ class PositionReconstructor:
         """
         key = (aggregate.target_wallet.lower(), aggregate.symbol)
         previous = state.positions.get(key, 0.0)
+        source_before = _aggregate_source_position_before(aggregate)
+        source_after = _aggregate_source_position_after(aggregate)
         if aggregate.position_before is None:
             if key in state.positions:
                 raise SourcePositionContinuityError(
@@ -300,12 +451,24 @@ class PositionReconstructor:
             before = previous
         else:
             if key in state.positions:
-                tolerance = aggregate.position_tolerance
-                if tolerance is None or abs(previous - aggregate.position_before) > tolerance:
+                prior_source = state.source_positions.get(key)
+                # Exact Decimal source boundaries prevent an otherwise valid
+                # lattice alias from being rejected solely because binary64
+                # arithmetic accumulated one ULP in the economic state.  The
+                # source field's existing stated-scale tolerance is retained.
+                if prior_source is not None and source_before is not None:
+                    tolerance = _source_position_tolerance(aggregate.fills[0])
+                    discontinuous = abs(prior_source - source_before) > tolerance
+                    expected, reported = prior_source, source_before
+                else:
+                    tolerance = aggregate.position_tolerance
+                    discontinuous = tolerance is None or abs(previous - aggregate.position_before) > tolerance
+                    expected, reported = previous, aggregate.position_before
+                if discontinuous:
                     raise SourcePositionContinuityError(
                         "UNRESOLVED_SOURCE_POSITION_CONTINUITY", wallet=aggregate.target_wallet,
                         symbol=aggregate.symbol, timestamp=aggregate.event_timestamp,
-                        detail=f"expected={previous} reported={aggregate.position_before}",
+                        detail=f"expected={expected} reported={reported}",
                     )
             before = aggregate.position_before
         after = before + aggregate.signed_quantity
@@ -367,6 +530,10 @@ class PositionReconstructor:
             changed[new.campaign_id] = new
 
         state.positions[key] = after
+        if source_after is None:
+            state.source_positions.pop(key, None)
+        else:
+            state.source_positions[key] = source_after
         for campaign in changed.values():
             self._refresh_reconciliation(campaign)
         return tuple(events), tuple(changed.values())
