@@ -26,6 +26,7 @@ from .scientific_scheduler import ScientificScheduler
 from .scientific_worker import ScientificWorker, WorkerStage
 from .data_ignition import DataIgnitionCommissioner, PublicObservationService
 from .lane_ii import refresh_public_cohort, lane_ii_status, run_paper_account_demo
+from .saved_evidence import evaluate_saved_evidence
 
 
 def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -116,6 +117,14 @@ def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
     lane_ii_refresh.add_argument("--seed-limit", type=int, default=24)
     lane_ii_refresh.add_argument("--analysis-limit", type=int, default=10)
     lane_ii_refresh.add_argument("--target-count", type=int, default=7)
+
+    lane_ii_saved = command(
+        "copy-lane-ii-saved-evidence-analysis",
+        "Evaluate one frozen Lane II analysis snapshot without network acquisition or cohort selection.",
+    )
+    lane_ii_saved.add_argument("--snapshot", required=True, help="Verified SQLite snapshot inside the isolated recovery workspace.")
+    lane_ii_saved.add_argument("--run-id", required=True, help="Original frozen analysis run ID to evaluate.")
+    lane_ii_saved.add_argument("--output-directory", required=True, help="New recovery output directory inside the isolated workspace.")
 
     lane_ii_status_parser = command("copy-lane-ii-status", "Show separate public, PAPER, testnet, and live Lane II readiness.")
     lane_ii_status_parser.add_argument("--cohort", default="reports/lane-ii/latest-cohort.json")
@@ -259,6 +268,19 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
                 observer.stop()
                 _print({"state": "STOPPED", "reason": "keyboard_interrupt", "paper_only": True})
             return 0
+    if command == "copy-lane-ii-saved-evidence-analysis":
+        result = evaluate_saved_evidence(
+            config=config,
+            snapshot_database=args.snapshot,
+            output_directory=args.output_directory,
+            original_run_id=args.run_id,
+        )
+        _print({
+            "mode": result["mode"], "report_path": result["report_path"],
+            "summary": result["summary"], "network_guard": result["network_guard"],
+            "input_snapshot": result["input_snapshot"],
+        })
+        return 0
     service = CopyTradeService(config)
     if command == "copy-import":
         targets = service.import_wallets(args.wallet)
