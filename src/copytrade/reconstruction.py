@@ -109,9 +109,11 @@ def aggregate_partial_fills(fills: Iterable[RawFill]) -> list[FillAggregate]:
     Native event IDs provide stable uniqueness but not causal ordering.  For
     fills with an identical wallet/symbol/timestamp, Hyperliquid's reported
     ``startPosition`` is the only admissible ordering input: buys advance it
-    and sells reduce it.  A duplicate boundary, side mix, missing source field,
-    or non-continuous chain is explicitly rejected rather than guessed from
-    lexical IDs, PnL, or desired reconciliation.
+    and sells reduce it.  Same-side bundles retain their monotonic fast path;
+    mixed-side bundles are accepted only when those source transitions prove a
+    unique bounded chain.  Duplicate boundaries, missing source fields,
+    ambiguous chains, and non-continuous chains are explicitly rejected rather
+    than guessed from lexical IDs, PnL, or desired reconciliation.
     """
     ordered = _causally_ordered_fills(fills)
     groups: list[list[RawFill]] = []
@@ -170,6 +172,7 @@ def _causally_ordered_fills(fills: Iterable[RawFill]) -> list[RawFill]:
     # observed for this wallet/symbol.  It is not a configurable tolerance and
     # is never inferred from price, P&L, or a desired reconstruction outcome.
     size_lattices: dict[tuple[str, str], Decimal] = {}
+    source_boundaries: dict[tuple[str, str], Decimal] = {}
     for (wallet, symbol, timestamp), bundle in sorted(
         buckets.items(), key=lambda item: (item[0][2], item[0][0], item[0][1]),
     ):
@@ -178,9 +181,18 @@ def _causally_ordered_fills(fills: Iterable[RawFill]) -> list[RawFill]:
         if lattice is not None:
             size_lattices[lattice_key] = lattice
         normalized_bundle = _normalize_decimal_position_aliases(bundle, lattice)
-        ordered.extend(_order_same_timestamp_bundle(
+        ordered_bundle = _order_same_timestamp_bundle(
             normalized_bundle, wallet=wallet, symbol=symbol, timestamp=timestamp,
-        ))
+            expected_start=source_boundaries.get(lattice_key),
+        )
+        ordered.extend(ordered_bundle)
+        try:
+            final = ordered_bundle[-1]
+            source_boundaries[lattice_key] = _source_position(final) + _signed_source_quantity(final)
+        except (IndexError, InvalidOperation, ValueError):
+            # A later multi-fill bundle cannot borrow an anchor from source
+            # evidence whose final boundary was absent or unparsable.
+            source_boundaries.pop(lattice_key, None)
     return ordered
 
 
@@ -296,6 +308,7 @@ def _same_binary64(left: Decimal, right: Decimal) -> bool:
 
 def _order_same_timestamp_bundle(
     bundle: list[RawFill], *, wallet: str, symbol: str, timestamp: datetime,
+    expected_start: Decimal | None = None,
 ) -> list[RawFill]:
     if len(bundle) <= 1:
         return list(bundle)
@@ -303,10 +316,6 @@ def _order_same_timestamp_bundle(
     if 0 in signs:
         raise SourcePositionContinuityError(
             "UNRESOLVED_SOURCE_POSITION_ZERO_QUANTITY", wallet=wallet, symbol=symbol, timestamp=timestamp,
-        )
-    if len(signs) != 1:
-        raise SourcePositionContinuityError(
-            "UNRESOLVED_SOURCE_POSITION_MIXED_SIDE", wallet=wallet, symbol=symbol, timestamp=timestamp,
         )
     try:
         positions = {fill.event_id: _source_position(fill) for fill in bundle}
@@ -319,8 +328,14 @@ def _order_same_timestamp_bundle(
         raise SourcePositionContinuityError(
             "UNRESOLVED_SOURCE_POSITION_DUPLICATE_BOUNDARY", wallet=wallet, symbol=symbol, timestamp=timestamp,
         )
-    sign = next(iter(signs))
-    ordered = sorted(bundle, key=lambda fill: (positions[fill.event_id], fill.event_id), reverse=sign < 0)
+    if len(signs) == 1:
+        sign = next(iter(signs))
+        ordered = sorted(bundle, key=lambda fill: (positions[fill.event_id], fill.event_id), reverse=sign < 0)
+    else:
+        ordered = _unique_mixed_side_causal_order(
+            bundle, positions, wallet=wallet, symbol=symbol, timestamp=timestamp,
+            expected_start=expected_start,
+        )
     for previous, following in zip(ordered, ordered[1:]):
         expected = positions[previous.event_id] + _signed_source_quantity(previous)
         actual = positions[following.event_id]
@@ -330,6 +345,96 @@ def _order_same_timestamp_bundle(
                 detail=f"expected={expected} reported={actual}",
             )
     return ordered
+
+
+def _unique_mixed_side_causal_order(
+    bundle: list[RawFill], positions: dict[str, Decimal], *, wallet: str, symbol: str,
+    timestamp: datetime, expected_start: Decimal | None,
+) -> list[RawFill]:
+    """Return the sole source-supported mixed-side chain, or fail closed.
+
+    Search stops after a second solution because that is sufficient to prove
+    ambiguity.  The explicit state bound prevents a malformed dense transition
+    graph from turning reconstruction into an unbounded combinatorial search.
+    A prior timestamp's exact final source boundary may select the starting
+    node; event IDs, order IDs, P&L, and API return order never do so.
+    """
+    try:
+        transitions = {
+            fill.event_id: positions[fill.event_id] + _signed_source_quantity(fill)
+            for fill in bundle
+        }
+    except (InvalidOperation, ValueError) as error:
+        raise SourcePositionContinuityError(
+            "UNRESOLVED_SOURCE_POSITION_MISSING_OR_INVALID", wallet=wallet, symbol=symbol,
+            timestamp=timestamp, detail=str(error),
+        ) from error
+    if any(not value.is_finite() for value in (*positions.values(), *transitions.values())):
+        raise SourcePositionContinuityError(
+            "UNRESOLVED_SOURCE_POSITION_MISSING_OR_INVALID", wallet=wallet, symbol=symbol,
+            timestamp=timestamp, detail="non-finite source position or size",
+        )
+
+    by_id = {fill.event_id: fill for fill in bundle}
+    event_ids = sorted(by_id)
+    adjacency = {
+        event_id: [
+            candidate for candidate in event_ids
+            if candidate != event_id
+            and abs(transitions[event_id] - positions[candidate]) <= _source_position_tolerance(by_id[candidate])
+        ]
+        for event_id in event_ids
+    }
+    starts = event_ids
+    if expected_start is not None:
+        starts = [
+            event_id for event_id in event_ids
+            if abs(positions[event_id] - expected_start) <= _source_position_tolerance(by_id[event_id])
+        ]
+        if not starts:
+            raise SourcePositionContinuityError(
+                "UNRESOLVED_SOURCE_POSITION_CONTINUITY", wallet=wallet, symbol=symbol,
+                timestamp=timestamp,
+                detail=f"expected prior source boundary {expected_start}; no fill starts there",
+            )
+
+    solutions: list[list[str]] = []
+    states_examined = 0
+    state_limit = max(4_096, len(bundle) * len(bundle) * 8)
+
+    def visit(path: list[str], used: set[str]) -> None:
+        nonlocal states_examined
+        states_examined += 1
+        if states_examined > state_limit or len(solutions) >= 2:
+            return
+        if len(path) == len(bundle):
+            solutions.append(list(path))
+            return
+        for candidate in adjacency[path[-1]]:
+            if candidate not in used:
+                visit([*path, candidate], {*used, candidate})
+
+    for start in starts:
+        visit([start], {start})
+        if states_examined > state_limit or len(solutions) >= 2:
+            break
+
+    if states_examined > state_limit:
+        raise SourcePositionContinuityError(
+            "UNRESOLVED_SOURCE_POSITION_SEARCH_BOUND", wallet=wallet, symbol=symbol, timestamp=timestamp,
+            detail=f"states_examined>{state_limit}",
+        )
+    if not solutions:
+        raise SourcePositionContinuityError(
+            "UNRESOLVED_SOURCE_POSITION_GAP", wallet=wallet, symbol=symbol, timestamp=timestamp,
+            detail="no source-continuous ordering covers every fill in the bundle",
+        )
+    if len(solutions) != 1:
+        raise SourcePositionContinuityError(
+            "UNRESOLVED_SOURCE_POSITION_AMBIGUOUS_CHAIN", wallet=wallet, symbol=symbol, timestamp=timestamp,
+            detail="more than one source-continuous ordering covers the bundle",
+        )
+    return [by_id[event_id] for event_id in solutions[0]]
 
 
 def _source_position(fill: RawFill) -> Decimal:

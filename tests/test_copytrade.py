@@ -179,7 +179,7 @@ class CopyTradeTests(unittest.TestCase):
             "UNRESOLVED_SOURCE_POSITION_DUPLICATE_BOUNDARY": [
                 fill(1, timestamp, "B", 1, 0, order=99), fill(2, timestamp, "B", 1, 0, order=99),
             ],
-            "UNRESOLVED_SOURCE_POSITION_MIXED_SIDE": [
+            "UNRESOLVED_SOURCE_POSITION_AMBIGUOUS_CHAIN": [
                 fill(1, timestamp, "B", 1, 0, order=99), fill(2, timestamp, "A", 1, 1, order=99),
             ],
             "UNRESOLVED_SOURCE_POSITION_GAP": [
@@ -190,6 +190,51 @@ class CopyTradeTests(unittest.TestCase):
             with self.subTest(expected=expected), self.assertRaises(SourcePositionContinuityError) as raised:
                 aggregate_partial_fills(fills)
             self.assertEqual(raised.exception.reason, expected)
+
+    def test_same_timestamp_mixed_side_unique_chain_preserves_order_interleaving(self) -> None:
+        timestamp = 1_700_000_000_000
+        # startPosition and signed source size prove the only chain:
+        # sell 2 -> 1, buy 1 -> 1.5, sell 1.5 -> 0.5.  The first and last
+        # fills share an order ID, but the intervening order must remain in
+        # causal position rather than being grouped past it.
+        fills = [
+            fill(30, timestamp, "A", 0.5, "1.5", order=10),
+            fill(10, timestamp, "A", 1, "2.0", order=10),
+            fill(20, timestamp, "B", 0.5, "1.0", order=20),
+        ]
+        aggregates = aggregate_partial_fills(fills)
+        self.assertEqual([[item.target_trade_id for item in aggregate.fills] for aggregate in aggregates], [["10"], ["20"], ["30"]])
+        self.assertEqual([event.event_type for event in PositionReconstructor().reconstruct(fills).events], [
+            PositionEventType.REDUCE, PositionEventType.ADD, PositionEventType.REDUCE,
+        ])
+
+    def test_same_timestamp_mixed_side_ambiguity_repetition_gap_and_external_boundary(self) -> None:
+        timestamp = 1_700_000_000_000
+        cases = {
+            "UNRESOLVED_SOURCE_POSITION_AMBIGUOUS_CHAIN": [
+                fill(1, timestamp, "B", 1, 0), fill(2, timestamp, "A", 1, 1),
+            ],
+            "UNRESOLVED_SOURCE_POSITION_DUPLICATE_BOUNDARY": [
+                fill(3, timestamp, "B", 1, 0), fill(4, timestamp, "A", 1, 0),
+            ],
+            "UNRESOLVED_SOURCE_POSITION_GAP": [
+                fill(5, timestamp, "B", 1, 0), fill(6, timestamp, "A", 1, 2),
+            ],
+        }
+        for expected, source in cases.items():
+            with self.subTest(expected=expected), self.assertRaises(SourcePositionContinuityError) as raised:
+                aggregate_partial_fills(source)
+            self.assertEqual(raised.exception.reason, expected)
+
+        # The same 1 -> 0 -> 1 cycle is ambiguous in isolation, but the prior
+        # source boundary proves that the sell must be first.
+        externally_anchored = [
+            fill(7, timestamp - 1, "B", 1, 0),
+            fill(8, timestamp, "B", 1, 0),
+            fill(9, timestamp, "A", 1, 1),
+        ]
+        ordered = aggregate_partial_fills(externally_anchored)
+        self.assertEqual([[item.target_trade_id for item in aggregate.fills] for aggregate in ordered], [["7"], ["9"], ["8"]])
 
     def test_cross_timestamp_source_position_gap_fails_closed(self) -> None:
         fills = [
