@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import gc
 import sqlite3
 import tempfile
 import unittest
@@ -148,3 +149,54 @@ class SavedEvidenceOnlyTests(unittest.TestCase):
                     original_run_id="not-used",
                     workspace=root,
                 )
+
+    def test_unresolved_source_position_is_reported_not_scored_as_performance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = self._config(root)
+            service = CopyTradeService(config)
+            service.import_wallets([GOOD])
+            end = datetime(2026, 9, 5, tzinfo=timezone.utc)
+            start = end - timedelta(days=100)
+            # Same timestamp and same source boundary have no causal ordering.
+            service.database.insert_raw_fills([
+                _fill(GOOD, 1, side="B", when=start, price=100, position=0),
+                _fill(GOOD, 2, side="B", when=start, price=101, position=0),
+            ])
+            service.database.insert_backfill_coverage(GOOD, BackfillCoverage(
+                requested_start=start, requested_end=end, earliest_observed_fill=start,
+                latest_observed_fill=start, source_limit_detected=False,
+                coverage_complete=True, coverage_quality="fixture", coverage_state="PROVEN_COMPLETE",
+            ))
+            run_id = "analysis_saved_evidence_unresolved_fixture"
+            configuration = {
+                "config_fingerprint": _config_fingerprint(config.research_snapshot()),
+                "analysis_window": {"required_start": start.isoformat(), "required_end": end.isoformat()},
+                "candidate_manifest": [self._manifest(GOOD, end - timedelta(days=1))],
+            }
+            service.database.start_analysis_run(AnalysisRun(run_id, start, configuration))
+            service.database.record_analysis_wallet(run_id, GOOD, stage="backfill", status="completed")
+            snapshot = root / "recovery-snapshot.sqlite3"
+            _backup(config.artifacts.database_path, snapshot)
+            source_hash = _sha256(snapshot)
+
+            report = evaluate_saved_evidence(
+                config=config,
+                snapshot_database=snapshot,
+                output_directory=root / "saved-evidence-output",
+                original_run_id=run_id,
+                workspace=root,
+            )
+
+            row = report["wallet_results"][0]
+            self.assertEqual(row["assessment"], "INTEGRITY_UNRESOLVED_SOURCE_POSITION_CONTINUITY")
+            self.assertEqual(row["assessment_reasons"], ["UNRESOLVED_SOURCE_POSITION_DUPLICATE_BOUNDARY"])
+            self.assertEqual(row["campaigns"]["status"], "integrity_unresolved")
+            self.assertFalse(row["replay_performed"])
+            self.assertEqual(report["summary"]["integrity_unresolved_wallets"], 1)
+            self.assertEqual(source_hash, _sha256(snapshot))
+            # Windows keeps an SQLite handle alive until the final local
+            # service reference is collected; make cleanup deterministic.
+            del report
+            del service
+            gc.collect()

@@ -25,7 +25,10 @@ from .science_repository import ScientificRepository
 from .scientific_scheduler import ScientificScheduler
 from .scientific_worker import ScientificWorker, WorkerStage
 from .data_ignition import DataIgnitionCommissioner, PublicObservationService
-from .lane_ii import refresh_public_cohort, lane_ii_status, run_paper_account_demo
+from .lane_ii import (
+    freeze_lane_ii_deep_batch, freeze_lane_ii_research_pass, lane_ii_status,
+    refresh_public_cohort, replay_lane_ii_shared_cohort, run_paper_account_demo,
+)
 from .saved_evidence import evaluate_saved_evidence
 
 
@@ -117,6 +120,24 @@ def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
     lane_ii_refresh.add_argument("--seed-limit", type=int, default=24)
     lane_ii_refresh.add_argument("--analysis-limit", type=int, default=10)
     lane_ii_refresh.add_argument("--target-count", type=int, default=7)
+    lane_ii_refresh.add_argument("--frozen-research-pass", help="Verified frozen Lane II research-pass evidence artifact.")
+    lane_ii_refresh.add_argument("--screen-only", action="store_true", help="Persist public screening only; do not start Phase B acquisition or selection.")
+    lane_ii_refresh.add_argument("--include-public-account-state", action="store_true", help="Include bounded public portfolio and clearinghouse summaries in the screen.")
+    lane_ii_refresh.add_argument("--public-request-budget", type=int, help="Finite no-spend public-info request budget; a frozen pass pins this value.")
+
+    lane_ii_freeze = command("copy-lane-ii-freeze-research", "Freeze a bounded no-spend Lane II research batch before public screening.")
+    lane_ii_freeze.add_argument("--retained-database", default="artifacts/copytrade.sqlite3", help="Read-only retained Phase A candidate database.")
+    lane_ii_freeze.add_argument("--output", required=True, help="New immutable research-pass evidence artifact.")
+    lane_ii_freeze.add_argument("--seed-limit", type=int, default=50)
+    lane_ii_freeze.add_argument("--planned-deep-limit", type=int, default=12)
+    lane_ii_freeze.add_argument("--target-count", type=int, default=7)
+    lane_ii_freeze.add_argument("--public-request-budget", type=int, help="Finite no-spend public-info request budget.")
+
+    lane_ii_deep = command("copy-lane-ii-freeze-deep-batch", "Freeze an exact Phase B subset from completed Lane II screening evidence.")
+    lane_ii_deep.add_argument("--parent-research-pass", required=True, help="Verified parent Lane II research-pass evidence artifact.")
+    lane_ii_deep.add_argument("--candidate-universe", required=True, help="Verified completed Lane II candidate-universe artifact.")
+    lane_ii_deep.add_argument("--wallet", action="append", required=True, help="One exact wallet from the parent screen; repeat in desired deep-analysis order.")
+    lane_ii_deep.add_argument("--output", required=True, help="New immutable deep-batch research-pass artifact.")
 
     lane_ii_saved = command(
         "copy-lane-ii-saved-evidence-analysis",
@@ -124,6 +145,7 @@ def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
     )
     lane_ii_saved.add_argument("--snapshot", required=True, help="Verified SQLite snapshot inside the isolated recovery workspace.")
     lane_ii_saved.add_argument("--run-id", required=True, help="Original frozen analysis run ID to evaluate.")
+    lane_ii_saved.add_argument("--replay-completed", action="store_true", help="Reconstruct completed saved rows separately; never overwrites original results.")
     lane_ii_saved.add_argument("--output-directory", required=True, help="New recovery output directory inside the isolated workspace.")
 
     lane_ii_status_parser = command("copy-lane-ii-status", "Show separate public, PAPER, testnet, and live Lane II readiness.")
@@ -131,6 +153,10 @@ def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
 
     lane_ii_demo = command("copy-lane-ii-paper-demo", "Run a synthetic $100 PAPER sizing/ownership matrix using current public metadata.")
     lane_ii_demo.add_argument("--output", default="reports/lane-ii/paper-demo.json")
+
+    lane_ii_replay = command("copy-lane-ii-shared-replay", "Replay a completed canonical Lane II cohort through one shared $100 PAPER portfolio.")
+    lane_ii_replay.add_argument("--cohort", required=True, help="Verified completed Lane II cohort evidence artifact.")
+    lane_ii_replay.add_argument("--output", required=True, help="New shared-cohort replay evidence artifact.")
 
     sizing = command("copy-size-demo", "Show the configured 5/10/20 percent sizing classification.")
     sizing.add_argument("--fractions", default="0.03,0.10,0.20", help="Comma-separated target entry fractions to classify against a 10% prior-median demo history.")
@@ -274,6 +300,7 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
             snapshot_database=args.snapshot,
             output_directory=args.output_directory,
             original_run_id=args.run_id,
+            replay_completed=args.replay_completed,
         )
         _print({
             "mode": result["mode"], "report_path": result["report_path"],
@@ -456,8 +483,31 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
             retained_database=args.retained_database,
             output_directory=args.output_directory,
             seed_limit=args.seed_limit,
-            analysis_limit=args.analysis_limit,
+            analysis_limit=0 if args.screen_only else args.analysis_limit,
             target_count=args.target_count,
+            frozen_research_pass=args.frozen_research_pass,
+            include_public_account_state=args.include_public_account_state,
+            public_request_budget=args.public_request_budget,
+        ))
+        return 0
+    if command == "copy-lane-ii-freeze-research":
+        _print(freeze_lane_ii_research_pass(
+            service,
+            retained_database=args.retained_database,
+            output=args.output,
+            seed_limit=args.seed_limit,
+            planned_deep_limit=args.planned_deep_limit,
+            target_count=args.target_count,
+            public_request_budget=args.public_request_budget,
+        ))
+        return 0
+    if command == "copy-lane-ii-freeze-deep-batch":
+        _print(freeze_lane_ii_deep_batch(
+            service,
+            parent_research_pass=args.parent_research_pass,
+            candidate_universe=args.candidate_universe,
+            wallets=args.wallet,
+            output=args.output,
         ))
         return 0
     if command == "copy-lane-ii-status":
@@ -465,6 +515,9 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
         return 0
     if command == "copy-lane-ii-paper-demo":
         _print(run_paper_account_demo(service, output=args.output))
+        return 0
+    if command == "copy-lane-ii-shared-replay":
+        _print(replay_lane_ii_shared_cohort(service, cohort_path=args.cohort, output=args.output))
         return 0
     if command == "copy-size-demo":
         fractions = [float(item.strip()) for item in args.fractions.split(",") if item.strip()]

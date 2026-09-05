@@ -16,7 +16,7 @@ from src.copytrade.analytics import calculate_trader_metrics
 from src.copytrade.backtest import CopyTradeBacktester
 from src.copytrade.config import ArtifactConfig, CandidateConfig, CopyTradeConfig, PaperExecutionConfig, RiskConfig, SizingConfig
 from src.copytrade.cli import run_copytrade_command
-from src.copytrade.hyperliquid import HyperliquidPublicAdapter, HyperliquidWatcher
+from src.copytrade.hyperliquid import BackfillRequestBudgetExhausted, HyperliquidPublicAdapter, HyperliquidWatcher
 from src.copytrade.market import HyperliquidMarketData, MarketPrice
 from src.copytrade.models import RawFill, Target, TraderSnapshot, as_utc, stable_id, utc_now
 from src.copytrade.paper import PaperExecutionEngine, TargetSizeClassifier
@@ -33,8 +33,9 @@ T0 = 1_700_000_000_000
 def raw(
     tid: int, side: str, qty: float, before: float, *, price: float = 100.0, fee: float = 0.0,
     closed_pnl: float | None = None, account_value: float | None = None, time_ms: int | None = None,
+    symbol: str = "BTC",
 ) -> RawFill:
-    payload = {"coin": "BTC", "px": str(price), "sz": str(qty), "side": side, "time": time_ms or T0 + tid,
+    payload = {"coin": symbol, "px": str(price), "sz": str(qty), "side": side, "time": time_ms or T0 + tid,
                "startPosition": str(before), "oid": tid, "tid": tid, "hash": f"0x{tid:064x}", "fee": str(fee)}
     if closed_pnl is not None:
         payload["closedPnl"] = str(closed_pnl)
@@ -160,9 +161,12 @@ class CopytradeCorrectnessTests(unittest.TestCase):
             service = CopyTradeService(cfg)
             times = [T0 + offset for offset in (1_000, 2_000, 3_000, 4_000, 5_000)]
             notionals = [100, 100, 30, 100, 200]
-            for index, (when, notional) in enumerate(zip(times, notionals), 1):
+            # These are independent campaigns, so use independent symbols
+            # rather than fabricating five BTC fills that all claim position 0.
+            symbols = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
+            for index, (when, notional, symbol) in enumerate(zip(times, notionals, symbols), 1):
                 service.database.insert_snapshot(TraderSnapshot(f"equity{index}", WALLET, as_utc(when - 1), 1_000, None, None, {}, "live", {}))
-                service.database.insert_raw_fill(raw(index, "B", notional / 100, 0, price=100, time_ms=when))
+                service.database.insert_raw_fill(raw(index, "B", notional / 100, 0, price=100, time_ms=when, symbol=symbol))
             events = service.reconstruct(WALLET)["events"]
             run = CopyTradeBacktester(cfg).run(events=events)
             self.assertEqual([item["allocation_fraction"] for item in run.summary["sizing_decisions"]], [.10, .10, .05, .10, .20])
@@ -339,8 +343,9 @@ class CopytradeCorrectnessTests(unittest.TestCase):
             event = service.reconstruct(WALLET)["events"][0]
             self.assertEqual((event.target_equity, event.equity_source, event.equity_age_seconds), (1_000, "recent_live_snapshot", 1.001))
             service.database.insert_snapshot(TraderSnapshot("old", WALLET, as_utc(T0 - 100_000), 2_000, None, None, {}, "live", {}))
-            # A different target avoids using the recent observation above.
-            second = raw(2, "B", 1, 0, time_ms=T0 + 200_000)
+            # A different symbol avoids claiming a second BTC open at source
+            # position zero while still exercising prior-equity staleness.
+            second = raw(2, "B", 1, 0, time_ms=T0 + 200_000, symbol="ETH")
             service.database.insert_raw_fill(second)
             enriched = service.reconstruct(WALLET)["events"][-1]
             self.assertEqual(enriched.equity_source, "missing")
@@ -464,3 +469,15 @@ class CopytradeCorrectnessTests(unittest.TestCase):
         adapter.fetch_fills_by_time = lambda *args, **kwargs: []  # type: ignore[method-assign]
         adapter.backfill_fills(WALLET, T0, T0 + 1_000)
         self.assertFalse(adapter.last_backfill_coverage.coverage_complete)  # type: ignore[union-attr]
+
+    def test_bounded_backfill_persists_received_page_before_deferral(self) -> None:
+        adapter = HyperliquidPublicAdapter(config(Path(tempfile.gettempdir())).source)
+        dense_page = [raw(index, "B", 1, 0, time_ms=T0 + index) for index in range(2_000)]
+        adapter.fetch_fills_by_time = lambda *args, **kwargs: dense_page  # type: ignore[method-assign]
+        pages: list[list[RawFill]] = []
+        with self.assertRaises(BackfillRequestBudgetExhausted) as raised:
+            adapter.backfill_fills(WALLET, T0, T0 + 3_600_000, max_requests=1, on_page=pages.append)
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(len(pages[0]), 2_000)
+        self.assertEqual(len(raised.exception.fills), 2_000)
+        self.assertEqual(adapter.last_backfill_coverage.coverage_quality, "deferred_public_request_budget")  # type: ignore[union-attr]

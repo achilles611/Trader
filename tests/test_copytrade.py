@@ -12,7 +12,7 @@ from src.copytrade.config import ArtifactConfig, CopyTradeConfig, PaperExecution
 from src.copytrade.hyperliquid import HyperliquidWatcher
 from src.copytrade.models import CopySignal, PositionEventType, RawFill, Target, as_utc, stable_id
 from src.copytrade.paper import PaperExecutionEngine, TargetSizeClassifier
-from src.copytrade.reconstruction import PositionReconstructor, aggregate_partial_fills
+from src.copytrade.reconstruction import PositionReconstructor, SourcePositionContinuityError, aggregate_partial_fills
 from src.copytrade.reporting import ObsidianExporter
 from src.copytrade.service import CopyTradeService
 from src.copytrade.storage import CopyTradeDatabase
@@ -83,6 +83,60 @@ class CopyTradeTests(unittest.TestCase):
         self.assertEqual(result.events[0].event_type, PositionEventType.OPEN)
         self.assertEqual(len(result.events[0].raw_fill_ids), 2)
         self.assertEqual(len(result.campaigns), 1)
+
+    def test_same_timestamp_partials_use_source_position_boundary_not_event_id(self) -> None:
+        # Event IDs sort in the opposite direction to the causal source
+        # positions.  A close-short batch must still begin at -2, not -1.
+        fills = [
+            fill(9, 1_700_000_000_000, "B", 1, -1, order=99),
+            fill(1, 1_700_000_000_000, "B", 1, -2, order=99),
+        ]
+        aggregate = aggregate_partial_fills(fills)[0]
+        self.assertEqual(aggregate.position_before, -2)
+        result = PositionReconstructor().reconstruct(fills)
+        self.assertEqual(result.events[0].event_type, PositionEventType.CLOSE)
+
+    def test_same_timestamp_source_chain_overrides_event_id_order(self) -> None:
+        timestamp = 1_700_000_000_000
+        # The input/unique IDs are deliberately not causal order.  The raw
+        # source positions prove the only A/B/A progression 0 -> 1 -> 2 -> 3.
+        fills = [
+            fill(9, timestamp, "B", 1, 2, order=99),
+            fill(1, timestamp, "B", 1, 0, order=99),
+            fill(5, timestamp, "B", 1, 1, order=99),
+        ]
+        aggregate = aggregate_partial_fills(fills)[0]
+        self.assertEqual([item.target_trade_id for item in aggregate.fills], ["1", "5", "9"])
+        self.assertEqual((aggregate.position_before, aggregate.signed_quantity), (0, 3))
+
+    def test_same_timestamp_source_ambiguities_fail_closed(self) -> None:
+        timestamp = 1_700_000_000_000
+        cases = {
+            "UNRESOLVED_SOURCE_POSITION_DUPLICATE_BOUNDARY": [
+                fill(1, timestamp, "B", 1, 0, order=99), fill(2, timestamp, "B", 1, 0, order=99),
+            ],
+            "UNRESOLVED_SOURCE_POSITION_MIXED_SIDE": [
+                fill(1, timestamp, "B", 1, 0, order=99), fill(2, timestamp, "A", 1, 1, order=99),
+            ],
+            "UNRESOLVED_SOURCE_POSITION_GAP": [
+                fill(1, timestamp, "B", 1, 0, order=99), fill(2, timestamp, "B", 1, 2, order=99),
+            ],
+        }
+        for expected, fills in cases.items():
+            with self.subTest(expected=expected), self.assertRaises(SourcePositionContinuityError) as raised:
+                aggregate_partial_fills(fills)
+            self.assertEqual(raised.exception.reason, expected)
+
+    def test_cross_timestamp_source_position_gap_fails_closed(self) -> None:
+        fills = [
+            fill(1, 1_700_000_000_000, "B", 1, 0, order=1),
+            # Reusing the order ID must not obscure a source-position gap
+            # between its timestamp-separated pieces.
+            fill(2, 1_700_000_000_100, "B", 1, 2, order=1),
+        ]
+        with self.assertRaises(SourcePositionContinuityError) as raised:
+            PositionReconstructor().reconstruct(fills)
+        self.assertEqual(raised.exception.reason, "UNRESOLVED_SOURCE_POSITION_CONTINUITY")
 
     def test_open_add_reduce_close_and_flip_reconstruction(self) -> None:
         sequence = [

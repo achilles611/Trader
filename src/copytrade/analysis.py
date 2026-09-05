@@ -17,6 +17,7 @@ from .contracts import PHASE_A_CHEAP_STATS_FIELDS, PHASE_A_EVIDENCE_SCHEMA_VERSI
 from .hyperliquid import HyperliquidPublicAdapter
 from .market import CachedHistoricalMarketData, HyperliquidMarketData, MarketDataProvider
 from .models import AnalysisRun, CandidateAnalysis, CandidateAnalysisState, CandidateScore, PositionCampaign, PositionEvent, as_utc, new_run_id, utc_now
+from .reconstruction import SourcePositionContinuityError
 from .scoring import FollowerMetrics, score_candidate, select_diverse_targets_with_metadata, suitability_confidence
 from .service import CopyTradeService
 
@@ -59,6 +60,7 @@ class CandidateAnalysisPipeline:
     def run(
         self, *, limit: int = 500, status: str | None = "new", resume: bool = False,
         force: bool = False, workers: int | None = None, cheap_only: bool = False,
+        candidate_wallets: Iterable[str] | None = None,
     ) -> dict[str, object]:
         existing_run = self.database.latest_resumable_analysis_run() if resume else None
         if existing_run:
@@ -81,7 +83,14 @@ class CandidateAnalysisPipeline:
                 candidate_rows = self.database.list_analysis_candidates(wallets=candidate_wallets, limit=len(candidate_wallets))
                 rows_by_wallet = {str(row["wallet"]).lower(): row for row in candidate_rows}
                 candidates = [rows_by_wallet[wallet] for wallet in candidate_wallets if wallet in rows_by_wallet]
-            worker_count = int(invocation["workers"])
+            stored_worker_count = int(invocation["workers"])
+            if workers is not None and workers <= 0:
+                raise ValueError("--workers must be positive.")
+            # The immutable invocation retains its original concurrency for
+            # auditability, but a controlled recovery may only lower it.  This
+            # gives an operator a single-owner acquisition handover without
+            # broadening the frozen request envelope or changing the manifest.
+            worker_count = min(stored_worker_count, workers) if workers is not None else stored_worker_count
             force = bool(invocation["force"])
             cheap_only = bool(invocation["cheap_only"])
             required_start = as_utc(configuration["analysis_window"]["required_start"])
@@ -92,13 +101,25 @@ class CandidateAnalysisPipeline:
             worker_count = workers or self.config.analysis.default_workers
             if worker_count <= 0:
                 raise ValueError("--workers must be positive.")
-            candidates = self.database.list_analysis_candidates(status=status, limit=limit)
+            requested_wallets = tuple(dict.fromkeys(str(wallet).lower() for wallet in (candidate_wallets or ()) if str(wallet)))
+            if requested_wallets:
+                candidate_rows = self.database.list_analysis_candidates(wallets=requested_wallets, limit=len(requested_wallets))
+                rows_by_wallet = {str(row["wallet"]).lower(): row for row in candidate_rows}
+                missing = [wallet for wallet in requested_wallets if wallet not in rows_by_wallet]
+                if missing:
+                    raise ValueError(f"Pinned Phase B candidate(s) were not discovered: {', '.join(missing)}")
+                candidates = [rows_by_wallet[wallet] for wallet in requested_wallets]
+            else:
+                candidates = self.database.list_analysis_candidates(status=status, limit=limit)
             if status is None:
                 candidates = [row for row in candidates if row.get("current_status") not in _OPERATOR_CONTROLLED_TARGET_STATES]
             required_end = utc_now()
             required_start = required_end - timedelta(days=self.config.analysis.history_days)
             configuration = {
-                "invocation": {"limit": limit, "status": status, "force": force, "workers": worker_count, "cheap_only": cheap_only},
+                "invocation": {
+                    "limit": limit, "status": status, "force": force, "workers": worker_count,
+                    "cheap_only": cheap_only, "pinned_candidate_wallets": list(requested_wallets),
+                },
                 "analysis_window": {"required_start": required_start.isoformat(), "required_end": required_end.isoformat()},
                 "history_days": self.config.analysis.history_days,
                 "min_discovery_activity": self.config.analysis.min_discovery_activity,
@@ -131,8 +152,18 @@ class CandidateAnalysisPipeline:
                 if run_wallet and run_wallet["stage"] == "backfill" and run_wallet["status"] == "completed":
                     ready_for_analysis.append(wallet)
                     continue
+                if run_wallet and run_wallet["stage"] == "backfill" and run_wallet["status"] == "deferred":
+                    # A bounded acquisition has already emitted its durable
+                    # checkpoint and outcome.  A resume must not turn that
+                    # finite budget into a fresh, implicit download.
+                    continue
                 if run_wallet and run_wallet["stage"] == "analysis" and run_wallet["status"] == "failed":
                     ready_for_analysis.append(wallet)
+                    continue
+                if run_wallet and run_wallet["stage"] == "analysis" and run_wallet["status"] == "deferred":
+                    # Source-position continuity is a bounded integrity
+                    # outcome.  Resuming a scheduler must not turn it into a
+                    # fresh history download or overwrite its uncertainty.
                     continue
                 if run_wallet and run_wallet["stage"] == "analysis" and run_wallet["status"] == "completed":
                     continue
@@ -140,6 +171,36 @@ class CandidateAnalysisPipeline:
                     continue
                 if run_wallet and run_wallet["stage"] == "prefilter" and run_wallet["status"] == "rejected":
                     continue
+                if (
+                    existing
+                    and existing.lifecycle_status in {
+                        CandidateAnalysisState.BACKFILL_PENDING.value,
+                        CandidateAnalysisState.ANALYSIS_PENDING.value,
+                    }
+                    and existing.last_run_id
+                    and existing.last_run_id != run["run_id"]
+                ):
+                    previous = self.database.get_analysis_wallet(existing.last_run_id, wallet)
+                    if previous and previous["status"] == "deferred" and previous["stage"] in {"backfill", "analysis"}:
+                        # Preserve a prior capped/no-progress acquisition or
+                        # source-continuity integrity outcome when this wallet
+                        # appears in another invocation.  An extension or a
+                        # newly validated normalizer must be explicit; a
+                        # scheduler restart cannot invent either authority.
+                        previous_payload = _json_object(previous.get("payload_json"))
+                        self.database.record_analysis_wallet(
+                            run["run_id"], wallet, stage="resume", status="deferred",
+                            payload={
+                                "reason": (
+                                    "prior_bounded_acquisition_preserved"
+                                    if previous["stage"] == "backfill" else
+                                    "prior_source_position_integrity_outcome_preserved"
+                                ),
+                                "prior_run_id": existing.last_run_id,
+                                "prior_outcome": previous_payload,
+                            },
+                        )
+                        continue
                 phase_a_evidence = _phase_a_evidence_snapshot(candidate)
                 reasons = self._cheap_prefilter(candidate, required_start, required_end, phase_a_evidence=phase_a_evidence)
                 if reasons:
@@ -171,6 +232,19 @@ class CandidateAnalysisPipeline:
                     )
                 return self._finish(run["run_id"], errors, status="completed")
 
+            # A prior process may have durably finished acquisition for one
+            # wallet just before another one stalled.  Score that saved
+            # evidence before scheduling any unfinished backfills: otherwise
+            # the recovery path recreates the very batch barrier this pipeline
+            # is meant to remove.
+            for wallet in ready_for_analysis:
+                coverage = self.database.analysis_window_coverage(wallet, required_start, required_end)
+                if coverage.get("coverage_state") == "KNOWN_INCOMPLETE":
+                    self._save_candidate(wallet, CandidateAnalysisState.QUARANTINED.value, run["run_id"], reasons=("known_incomplete",), summary={"coverage": coverage}, completed=True)
+                    self.database.record_analysis_wallet(run["run_id"], wallet, stage="backfill", status="quarantined", payload={"reason": "known_incomplete", "coverage": coverage})
+                else:
+                    self._complete_analysis_wallet(wallet, run["run_id"], coverage, configuration, required_start, required_end, errors)
+
             for candidate in pending:
                 self.database.record_analysis_wallet(run["run_id"], str(candidate["wallet"]), stage="backfill", status="started")
             outcomes = self._backfill_all(pending, required_start, required_end, worker_count)
@@ -182,6 +256,17 @@ class CandidateAnalysisPipeline:
                     )
                     self.database.record_analysis_wallet(
                         run["run_id"], wallet, stage="backfill", status="failed", attempts=attempts, error=error,
+                    )
+                    continue
+                result = _bounded_no_progress_result(result, attempts=attempts)
+                if result.get("deferred"):
+                    self._save_candidate(
+                        wallet, CandidateAnalysisState.BACKFILL_PENDING.value, run["run_id"],
+                        summary={"backfill": result, "deferred": True}, completed=False,
+                    )
+                    self.database.record_analysis_wallet(
+                        run["run_id"], wallet, stage="backfill", status="deferred", attempts=attempts,
+                        payload=result,
                     )
                     continue
                 coverage = self.database.analysis_window_coverage(wallet, required_start, required_end)
@@ -202,17 +287,16 @@ class CandidateAnalysisPipeline:
                 )
                 self._save_candidate(wallet, CandidateAnalysisState.ANALYSIS_PENDING.value, run["run_id"], completed=False)
                 self._complete_analysis_wallet(wallet, run["run_id"], coverage, configuration, required_start, required_end, errors)
-            for wallet in ready_for_analysis:
-                coverage = self.database.analysis_window_coverage(wallet, required_start, required_end)
-                if coverage.get("coverage_state") == "KNOWN_INCOMPLETE":
-                    self._save_candidate(wallet, CandidateAnalysisState.QUARANTINED.value, run["run_id"], reasons=("known_incomplete",), summary={"coverage": coverage}, completed=True)
-                    self.database.record_analysis_wallet(run["run_id"], wallet, stage="backfill", status="quarantined", payload={"reason": "known_incomplete", "coverage": coverage})
-                else:
-                    self._complete_analysis_wallet(wallet, run["run_id"], coverage, configuration, required_start, required_end, errors)
         except Exception as exc:
             errors.append(f"run failure: {exc}")
             return self._finish(run["run_id"], errors, status="failed")
-        return self._finish(run["run_id"], errors, status="completed_with_errors" if errors else "completed")
+        counters = self.database.analysis_run_counters(run["run_id"])
+        terminal_status = (
+            "completed_with_errors" if errors else
+            "completed_with_deferred" if counters["deferred"] else
+            "completed"
+        )
+        return self._finish(run["run_id"], errors, status=terminal_status)
 
     def status(self, *, limit: int = 1000) -> dict[str, object]:
         rows = self.database.list_analysis_candidates(limit=limit)
@@ -237,7 +321,9 @@ class CandidateAnalysisPipeline:
             "shadow_finalists": finalists,
         }
 
-    def shadow_finalists(self, *, count: int | None = None, persist: bool = False) -> list[dict[str, object]]:
+    def shadow_finalists(
+        self, *, count: int | None = None, persist: bool = False, wallets: Iterable[str] | None = None,
+    ) -> list[dict[str, object]]:
         """Calculate the current cohort; persist only on an explicit authority action.
 
         A status request is an observational operation.  It may calculate a
@@ -248,6 +334,9 @@ class CandidateAnalysisPipeline:
         target_count = count or self.config.analysis.shadow_finalist_count
         current_fingerprint = _config_fingerprint(self.config.research_snapshot())
         scores = self.database.phase_b_qualified_scores(config_fingerprint=current_fingerprint)
+        requested_wallets = {str(wallet).lower() for wallet in (wallets or ())}
+        if requested_wallets:
+            scores = [score for score in scores if score.target_wallet.lower() in requested_wallets]
         candidates = {row["wallet"]: row for row in self.database.list_analysis_candidates(limit=10_000)}
         analysis_by_wallet = {
             score.target_wallet: _json_object(candidates.get(score.target_wallet, {}).get("analysis_summary", {}))
@@ -431,16 +520,17 @@ class CandidateAnalysisPipeline:
 
     def _backfill_all(
         self, candidates: Iterable[dict[str, Any]], start: object, end: object, workers: int,
-    ) -> list[tuple[str, int, dict[str, object], str | None]]:
+    ) -> Iterable[tuple[str, int, dict[str, object], str | None]]:
         items = [str(candidate["wallet"]).lower() for candidate in candidates]
         if not items:
             return []
-        outcomes: list[tuple[str, int, dict[str, object], str | None]] = []
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="copy-analysis") as pool:
             futures = {pool.submit(self._retry_backfill, wallet, start, end): wallet for wallet in items}
             for future in as_completed(futures):
-                outcomes.append(future.result())
-        return sorted(outcomes, key=lambda item: item[0])
+                # Yield as each bounded acquisition closes.  The caller records
+                # and scores a ready wallet before an unrelated dense wallet
+                # can hold the entire batch hostage.
+                yield future.result()
 
     def _retry_backfill(self, wallet: str, start: object, end: object) -> tuple[str, int, dict[str, object], str | None]:
         attempts = self.config.analysis.retry_attempts
@@ -519,6 +609,27 @@ class CandidateAnalysisPipeline:
                 wallet, coverage, run_id=run_id, config_fingerprint=str(configuration["config_fingerprint"]),
                 required_start=required_start, required_end=required_end,
             )
+        except SourcePositionContinuityError as exc:
+            integrity = {
+                "status": "unresolved_source_position_continuity",
+                "reason": exc.reason,
+                "wallet": exc.wallet,
+                "symbol": exc.symbol,
+                "timestamp": exc.timestamp.isoformat(),
+                "detail": exc.detail,
+                "affected_metrics": [
+                    "campaign_count", "pnl", "drawdown", "concentration", "copyability", "liquidation_frequency",
+                ],
+            }
+            self._save_candidate(
+                wallet, CandidateAnalysisState.ANALYSIS_PENDING.value, run_id,
+                reasons=(exc.reason,), summary={"integrity": integrity}, completed=False,
+            )
+            self.database.record_analysis_wallet(
+                run_id, wallet, stage="analysis", status="deferred", error=str(exc),
+                payload={"integrity": integrity, "deferred": True, "reconstructed": False, "scored": False},
+            )
+            return
         except Exception as exc:  # reconstruction/simulation failure remains per-wallet and resumable
             message = str(exc)
             errors.append(f"{wallet}: analysis failed: {message}")
@@ -720,6 +831,44 @@ class CandidateAnalysisPipeline:
             ),
             "diversification_selected": len(finalists), "shadow_finalists": finalists,
         }
+
+
+def _bounded_no_progress_result(result: dict[str, object], *, attempts: int) -> dict[str, object]:
+    """Convert an evidence-free, unproven acquisition into a durable defer.
+
+    The native adapter persists pages before returning.  A successful callback
+    which saved no unique fills and cannot prove the requested range therefore
+    has not made useful progress.  It must not be allowed to masquerade as a
+    completed backfill simply because HTTP itself succeeded.
+
+    Backfill implementations may already return a richer ``deferred`` record
+    (for example a fixed request-budget cap).  Those records are left intact;
+    their complete payload is the acquisition checkpoint for a later,
+    explicitly-authorized extension.
+    """
+    if bool(result.get("deferred")) or bool(result.get("skipped_existing_history")):
+        return result
+    if "new_raw_fills" not in result:
+        return result
+    try:
+        new_raw_fills = int(result["new_raw_fills"])
+    except (TypeError, ValueError):
+        return result
+    coverage = _json_object(result.get("coverage"))
+    coverage_state = str(coverage.get("coverage_state") or "UNPROVEN")
+    if new_raw_fills != 0 or coverage_state == "PROVEN_COMPLETE":
+        return result
+    bounded = dict(result)
+    bounded.update({
+        "deferred": True,
+        "deferred_reason": "no_new_durable_evidence_unproven_coverage",
+        "acquisition_budget": {
+            "retry_attempts_consumed": attempts,
+            "retry_attempts_remaining": 0,
+            "extension_requires_explicit_authority": True,
+        },
+    })
+    return bounded
 
 
 def _follower_summary(

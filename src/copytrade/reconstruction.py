@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from datetime import datetime
 from typing import Iterable
 
@@ -8,6 +9,27 @@ from .models import PositionCampaign, PositionEvent, PositionEventType, RawFill,
 
 
 EPSILON = 1e-12
+
+
+class SourcePositionContinuityError(ValueError):
+    """Source evidence does not prove one causal position path.
+
+    This is intentionally a data-integrity outcome, not a performance result.
+    The caller must preserve saved fills and keep campaign-derived metrics out
+    of selection until a source-backed continuation is available.
+    """
+
+    def __init__(
+        self, reason: str, *, wallet: str, symbol: str, timestamp: datetime,
+        detail: str = "",
+    ) -> None:
+        self.reason = reason
+        self.wallet = wallet.lower()
+        self.symbol = symbol
+        self.timestamp = timestamp
+        self.detail = detail
+        suffix = f" ({detail})" if detail else ""
+        super().__init__(f"{reason}: {self.wallet}/{symbol} at {timestamp.isoformat()}{suffix}")
 
 
 @dataclass(frozen=True)
@@ -22,6 +44,7 @@ class FillAggregate:
     event_timestamp: datetime
     target_equity: float | None
     position_before: float | None
+    position_tolerance: float | None
     source_closed_pnl: float | None
     is_liquidation: bool
 
@@ -74,8 +97,16 @@ class IncrementalReconstructionState:
 
 
 def aggregate_partial_fills(fills: Iterable[RawFill]) -> list[FillAggregate]:
-    """Combine only contiguous partials while preserving source-fill evidence."""
-    ordered = sorted(fills, key=lambda fill: (fill.event_timestamp, fill.event_id))
+    """Aggregate only a source-proven causal fill sequence.
+
+    Native event IDs provide stable uniqueness but not causal ordering.  For
+    fills with an identical wallet/symbol/timestamp, Hyperliquid's reported
+    ``startPosition`` is the only admissible ordering input: buys advance it
+    and sells reduce it.  A duplicate boundary, side mix, missing source field,
+    or non-continuous chain is explicitly rejected rather than guessed from
+    lexical IDs, PnL, or desired reconciliation.
+    """
+    ordered = _causally_ordered_fills(fills)
     groups: list[list[RawFill]] = []
     for fill in ordered:
         if not groups:
@@ -88,6 +119,11 @@ def aggregate_partial_fills(fills: Iterable[RawFill]) -> list[FillAggregate]:
             and fill.target_wallet == previous.target_wallet
             and fill.symbol == previous.symbol
             and (fill.signed_quantity >= 0) == (previous.signed_quantity >= 0)
+            # An order ID is an attribution key, not proof that separate
+            # timestamps form one uninterrupted position transition.  Keeping
+            # a gap in one aggregate would hide it from apply_aggregate's
+            # source-position continuity check.
+            and _source_transition_is_contiguous(previous, fill)
         )
         if same_order:
             groups[-1].append(fill)
@@ -100,16 +136,112 @@ def aggregate_partial_fills(fills: Iterable[RawFill]) -> list[FillAggregate]:
         absolute_quantity = sum(abs(fill.signed_quantity) for fill in group)
         notional = sum(fill.notional for fill in group)
         source_closed = [fill.source_closed_pnl for fill in group if fill.source_closed_pnl is not None]
+        # ``group`` is already source-orderable.  Its first source position is
+        # therefore the causal boundary; taking a min/max alone would hide an
+        # interleaving or source-position gap.
+        position_before = group[0].target_position_before
         aggregates.append(FillAggregate(
             fills=tuple(group), target_wallet=group[0].target_wallet, symbol=group[0].symbol,
             signed_quantity=total_quantity, price=notional / absolute_quantity if absolute_quantity else group[-1].price,
             notional=notional, fee=sum(fill.fee for fill in group), event_timestamp=group[-1].event_timestamp,
             target_equity=next((fill.target_account_equity for fill in reversed(group) if fill.target_account_equity is not None), None),
-            position_before=group[0].target_position_before,
+            position_before=position_before,
+            position_tolerance=float(_source_position_tolerance(group[0])) if position_before is not None else None,
             source_closed_pnl=sum(source_closed) if source_closed else None,
             is_liquidation=any(fill.is_liquidation for fill in group),
         ))
     return aggregates
+
+
+def _causally_ordered_fills(fills: Iterable[RawFill]) -> list[RawFill]:
+    buckets: dict[tuple[str, str, datetime], list[RawFill]] = {}
+    for fill in fills:
+        key = (fill.target_wallet.lower(), fill.symbol, fill.event_timestamp)
+        buckets.setdefault(key, []).append(fill)
+    ordered: list[RawFill] = []
+    for (wallet, symbol, timestamp), bundle in sorted(
+        buckets.items(), key=lambda item: (item[0][2], item[0][0], item[0][1]),
+    ):
+        ordered.extend(_order_same_timestamp_bundle(bundle, wallet=wallet, symbol=symbol, timestamp=timestamp))
+    return ordered
+
+
+def _order_same_timestamp_bundle(
+    bundle: list[RawFill], *, wallet: str, symbol: str, timestamp: datetime,
+) -> list[RawFill]:
+    if len(bundle) <= 1:
+        return list(bundle)
+    signs = {1 if fill.signed_quantity > 0 else -1 if fill.signed_quantity < 0 else 0 for fill in bundle}
+    if 0 in signs:
+        raise SourcePositionContinuityError(
+            "UNRESOLVED_SOURCE_POSITION_ZERO_QUANTITY", wallet=wallet, symbol=symbol, timestamp=timestamp,
+        )
+    if len(signs) != 1:
+        raise SourcePositionContinuityError(
+            "UNRESOLVED_SOURCE_POSITION_MIXED_SIDE", wallet=wallet, symbol=symbol, timestamp=timestamp,
+        )
+    try:
+        positions = {fill.event_id: _source_position(fill) for fill in bundle}
+    except (InvalidOperation, ValueError) as error:
+        raise SourcePositionContinuityError(
+            "UNRESOLVED_SOURCE_POSITION_MISSING_OR_INVALID", wallet=wallet, symbol=symbol, timestamp=timestamp,
+            detail=str(error),
+        ) from error
+    if len(set(positions.values())) != len(bundle):
+        raise SourcePositionContinuityError(
+            "UNRESOLVED_SOURCE_POSITION_DUPLICATE_BOUNDARY", wallet=wallet, symbol=symbol, timestamp=timestamp,
+        )
+    sign = next(iter(signs))
+    ordered = sorted(bundle, key=lambda fill: (positions[fill.event_id], fill.event_id), reverse=sign < 0)
+    for previous, following in zip(ordered, ordered[1:]):
+        expected = positions[previous.event_id] + _signed_source_quantity(previous)
+        actual = positions[following.event_id]
+        if abs(expected - actual) > _source_position_tolerance(following):
+            raise SourcePositionContinuityError(
+                "UNRESOLVED_SOURCE_POSITION_GAP", wallet=wallet, symbol=symbol, timestamp=timestamp,
+                detail=f"expected={expected} reported={actual}",
+            )
+    return ordered
+
+
+def _source_position(fill: RawFill) -> Decimal:
+    raw = fill.raw_payload.get("startPosition")
+    if raw in (None, ""):
+        raise ValueError("missing startPosition")
+    return Decimal(str(raw))
+
+
+def _signed_source_quantity(fill: RawFill) -> Decimal:
+    raw = fill.raw_payload.get("sz")
+    quantity = Decimal(str(raw if raw not in (None, "") else abs(fill.base_quantity)))
+    return quantity if fill.signed_quantity > 0 else -quantity
+
+
+def _source_position_tolerance(fill: RawFill) -> Decimal:
+    raw = fill.raw_payload.get("startPosition")
+    if raw in (None, ""):
+        raise ValueError("missing startPosition")
+    decimal = Decimal(str(raw))
+    # The half-unit of the source field's own stated scale is the only
+    # permitted comparison interval; this is not a global reconciliation
+    # tolerance and cannot be tuned to improve P&L.
+    return Decimal(5).scaleb(decimal.as_tuple().exponent - 1)
+
+
+def _source_transition_is_contiguous(previous: RawFill, following: RawFill) -> bool:
+    """Whether adjacent source fills prove a single aggregate boundary.
+
+    This deliberately returns ``False`` for absent or unparsable source
+    evidence.  The next aggregate then reaches the position reconstructor,
+    which records the precise fail-closed integrity outcome instead of
+    treating a repeated order ID as evidence of continuity.
+    """
+    try:
+        expected = _source_position(previous) + _signed_source_quantity(previous)
+        actual = _source_position(following)
+        return abs(expected - actual) <= _source_position_tolerance(following)
+    except (InvalidOperation, ValueError):
+        return False
 
 
 class PositionReconstructor:
@@ -158,7 +290,24 @@ class PositionReconstructor:
         """
         key = (aggregate.target_wallet.lower(), aggregate.symbol)
         previous = state.positions.get(key, 0.0)
-        before = aggregate.position_before if aggregate.position_before is not None else previous
+        if aggregate.position_before is None:
+            if key in state.positions:
+                raise SourcePositionContinuityError(
+                    "UNRESOLVED_SOURCE_POSITION_MISSING", wallet=aggregate.target_wallet,
+                    symbol=aggregate.symbol, timestamp=aggregate.event_timestamp,
+                    detail=f"expected prior position {previous}",
+                )
+            before = previous
+        else:
+            if key in state.positions:
+                tolerance = aggregate.position_tolerance
+                if tolerance is None or abs(previous - aggregate.position_before) > tolerance:
+                    raise SourcePositionContinuityError(
+                        "UNRESOLVED_SOURCE_POSITION_CONTINUITY", wallet=aggregate.target_wallet,
+                        symbol=aggregate.symbol, timestamp=aggregate.event_timestamp,
+                        detail=f"expected={previous} reported={aggregate.position_before}",
+                    )
+            before = aggregate.position_before
         after = before + aggregate.signed_quantity
         if abs(after) < EPSILON:
             after = 0.0

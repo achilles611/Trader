@@ -11,7 +11,11 @@ from .analytics import calculate_trader_metrics
 from .config import CopyTradeConfig
 from .control_center import ControlCenterStore
 from .discovery import CandidateDiscoveryAdapter, DiscoveryPipeline
-from .hyperliquid import HyperliquidPublicAdapter
+from .hyperliquid import (
+    PUBLIC_BACKFILL_MAX_REQUESTS_PER_WALLET,
+    BackfillRequestBudgetExhausted,
+    HyperliquidPublicAdapter,
+)
 from .equity import is_equity_observation_usable
 from .models import CopySignal, PositionCampaign, PositionEvent, PositionEventType, RawFill, Target, TargetStatus, TraderSnapshot, as_utc, stable_id, utc_now
 from .market import LiveMarketCache
@@ -221,8 +225,33 @@ class CopyTradeService:
         if not target:
             raise KeyError(f"Target must be imported before backfill: {wallet}")
         start_at = start or self.database.latest_fill_time(wallet) or (utc_now() - timedelta(days=90))
+        inserted_during_pages = 0
+
+        def persist_page(page: list[RawFill]) -> None:
+            nonlocal inserted_during_pages
+            inserted_during_pages += self.database.insert_raw_fills(page)
+
         try:
-            fills = adapter.backfill_fills(wallet, start_at, end)
+            fills = adapter.backfill_fills(
+                wallet, start_at, end,
+                max_requests=PUBLIC_BACKFILL_MAX_REQUESTS_PER_WALLET,
+                on_page=persist_page,
+            )
+        except BackfillRequestBudgetExhausted as exc:
+            coverage = adapter.last_backfill_coverage
+            if coverage:
+                self.database.insert_backfill_coverage(wallet, coverage)
+            return {
+                "wallet": wallet.lower(), "deferred": True,
+                "fetched_fills_before_budget": len(exc.fills),
+                "new_raw_fills_before_budget": inserted_during_pages,
+                "coverage": {
+                    "coverage_complete": False,
+                    "coverage_quality": coverage.coverage_quality if coverage else "deferred_public_request_budget",
+                    "coverage_state": coverage.coverage_state if coverage else "UNPROVEN",
+                    "source_limit_detected": coverage.source_limit_detected if coverage else False,
+                },
+            }
         except Exception:
             # Dense public-history intervals explicitly mark coverage known
             # incomplete before raising. Persist that evidence for Phase B's
@@ -234,7 +263,10 @@ class CopyTradeService:
         coverage = adapter.last_backfill_coverage
         if coverage:
             self.database.insert_backfill_coverage(wallet, coverage)
-        inserted = self.database.insert_raw_fills(fills)
+        # ``persist_page`` already inserted each public response.  The final
+        # bulk call is intentionally omitted so the reported count remains a
+        # true number of newly durable fills rather than duplicate attempts.
+        inserted = inserted_during_pages
         snapshot = adapter.fetch_clearinghouse_state(wallet)
         self.database.insert_snapshot(snapshot)
         portfolio = adapter.fetch_portfolio(wallet)

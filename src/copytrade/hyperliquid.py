@@ -17,6 +17,21 @@ class HyperliquidAPIError(RuntimeError):
     pass
 
 
+PUBLIC_BACKFILL_MAX_REQUESTS_PER_WALLET = 64
+
+
+class BackfillRequestBudgetExhausted(HyperliquidAPIError):
+    """A bounded acquisition stopped before it could prove a full interval.
+
+    ``fills`` contains pages which were already durably accepted by the
+    caller's page callback.  It deliberately is not a coverage success.
+    """
+
+    def __init__(self, message: str, fills: Iterable[RawFill]) -> None:
+        super().__init__(message)
+        self.fills = tuple(fills)
+
+
 @dataclass(frozen=True)
 class BackfillCoverage:
     requested_start: object
@@ -90,7 +105,11 @@ class HyperliquidPublicAdapter:
             raise HyperliquidAPIError("Unexpected userFillsByTime response.")
         return self._parse_fills(response, wallet)
 
-    def backfill_fills(self, wallet: str, start: object, end: object | None = None) -> list[RawFill]:
+    def backfill_fills(
+        self, wallet: str, start: object, end: object | None = None, *,
+        max_requests: int | None = None,
+        on_page: Callable[[list[RawFill]], None] | None = None,
+    ) -> list[RawFill]:
         """Fetch a bounded historical range, splitting dense intervals around API limits.
 
         Hyperliquid returns at most 2,000 fills per response.  A range that still
@@ -101,12 +120,40 @@ class HyperliquidPublicAdapter:
         end_at = as_utc(end or utc_now())
         if end_at < start_at:
             raise ValueError("backfill end must not precede start")
+        if max_requests is not None and max_requests < 1:
+            raise ValueError("max_requests must be positive when specified")
         collected: dict[str, RawFill] = {}
         source_limit_detected = False
+        requests_made = 0
 
         def fetch_range(range_start: object, range_end: object) -> None:
-            nonlocal source_limit_detected
+            nonlocal source_limit_detected, requests_made
+            if max_requests is not None and requests_made >= max_requests:
+                partial = sorted(collected.values(), key=lambda fill: (fill.event_timestamp, fill.event_id))
+                self.last_backfill_coverage = BackfillCoverage(
+                    requested_start=start_at, requested_end=end_at,
+                    earliest_observed_fill=partial[0].event_timestamp if partial else None,
+                    latest_observed_fill=partial[-1].event_timestamp if partial else None,
+                    source_limit_detected=source_limit_detected, coverage_complete=False,
+                    coverage_quality="deferred_public_request_budget", coverage_state="UNPROVEN",
+                )
+                raise BackfillRequestBudgetExhausted(
+                    f"Public backfill request budget exhausted after {requests_made} requests (limit {max_requests}).",
+                    partial,
+                )
+            requests_made += 1
             fills = self.fetch_fills_by_time(wallet, range_start, range_end)
+            if on_page is not None and fills:
+                # Persist every received response before recursive splitting so
+                # a stopped dense interval can resume from evidence, not a
+                # discarded in-memory page.  Raw-fill IDs make overlap safe.
+                on_page(fills)
+            # Retain a deterministic de-duplicated partial set before dense
+            # recursion.  If the fixed request budget is reached later, the
+            # raised deferral accurately describes already persisted evidence
+            # instead of reporting an empty in-memory collection.
+            for fill in fills:
+                collected[fill.event_id] = fill
             if len(fills) >= 2000:
                 source_limit_detected = True
                 left = as_utc(range_start)
@@ -126,8 +173,6 @@ class HyperliquidPublicAdapter:
                 # deterministic IDs still protect against endpoint inclusivity.
                 fetch_range(middle + timedelta(milliseconds=1), right)
                 return
-            for fill in fills:
-                collected[fill.event_id] = fill
 
         fetch_range(start_at, end_at)
         result = sorted(collected.values(), key=lambda fill: (fill.event_timestamp, fill.event_id))

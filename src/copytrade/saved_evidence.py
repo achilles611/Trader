@@ -22,6 +22,7 @@ from typing import Any, Iterator
 from .analysis import CandidateAnalysisPipeline, _config_fingerprint
 from .config import CopyTradeConfig
 from .market import MarketPrice
+from .reconstruction import SourcePositionContinuityError
 from .service import CopyTradeService
 from .storage import CopyTradeDatabase
 
@@ -85,6 +86,7 @@ def evaluate_saved_evidence(
     snapshot_database: str | Path,
     output_directory: str | Path,
     original_run_id: str,
+    replay_completed: bool = False,
     workspace: str | Path | None = None,
 ) -> dict[str, Any]:
     """Evaluate one frozen candidate run without any acquisition capability.
@@ -179,12 +181,23 @@ def evaluate_saved_evidence(
                 # can move a candidate out of this pending state.
                 result.update(_pending_result())
             elif stage == "analysis" and state == "completed":
-                result.update(_completed_snapshot_result(by_wallet_analysis.get(wallet), run_wallet, result))
+                if replay_completed:
+                    try:
+                        result.update(_replay_saved_wallet(
+                            pipeline, wallet, coverage, recovery_run_id, expected_fingerprint, required_start, required_end,
+                        ))
+                    except SourcePositionContinuityError as error:
+                        result.update(_integrity_unresolved_result(error))
+                else:
+                    result.update(_completed_snapshot_result(by_wallet_analysis.get(wallet), run_wallet, result))
             elif stage == "backfill" and state == "completed":
-                result.update(_replay_saved_wallet(
-                    pipeline, wallet, coverage, recovery_run_id, expected_fingerprint,
-                    required_start, required_end,
-                ))
+                try:
+                    result.update(_replay_saved_wallet(
+                        pipeline, wallet, coverage, recovery_run_id, expected_fingerprint,
+                        required_start, required_end,
+                    ))
+                except SourcePositionContinuityError as error:
+                    result.update(_integrity_unresolved_result(error))
             else:
                 result.update({
                     "assessment": "PENDING_SAVED_ACQUISITION",
@@ -205,6 +218,7 @@ def evaluate_saved_evidence(
     report = {
         "schema": SAVED_EVIDENCE_SCHEMA,
         "mode": "SAVED_EVIDENCE_ONLY",
+        "replay_completed": replay_completed,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "authority": {
             "cohort_selection_completed": False,
@@ -245,6 +259,7 @@ def evaluate_saved_evidence(
         "summary": {
             "wallet_count": len(wallet_results),
             "replayed_saved_evidence_wallets": sum(item["assessment"] == "INSUFFICIENT_EVIDENCE_TO_QUALIFY" and item.get("replay_performed") for item in wallet_results),
+            "integrity_unresolved_wallets": sum(item["assessment"] == "INTEGRITY_UNRESOLVED_SOURCE_POSITION_CONTINUITY" for item in wallet_results),
             "pending_wallets": sum(item["assessment"] == "PENDING_SAVED_ACQUISITION" for item in wallet_results),
             "quarantined_wallets": sum(item["assessment"] == "QUARANTINED_KNOWN_INCOMPLETE" for item in wallet_results),
             "cohort_selection": "NOT_RUN_PROVISIONAL_INDIVIDUAL_ASSESSMENTS_ONLY",
@@ -252,6 +267,30 @@ def evaluate_saved_evidence(
     }
     _write_json(output / "saved-evidence-evaluation.json", report)
     return {**report, "report_path": str((output / "saved-evidence-evaluation.json").resolve())}
+
+
+def _integrity_unresolved_result(error: SourcePositionContinuityError) -> dict[str, Any]:
+    """Preserve an integrity boundary without mislabelling trader performance."""
+    return {
+        "assessment": "INTEGRITY_UNRESOLVED_SOURCE_POSITION_CONTINUITY",
+        "assessment_reasons": [error.reason],
+        "replay_performed": False,
+        "integrity": {
+            "status": "unresolved_source_position_continuity",
+            "reason": error.reason,
+            "wallet": error.wallet,
+            "symbol": error.symbol,
+            "timestamp": error.timestamp.isoformat(),
+            "detail": error.detail,
+            "affected_metrics": [
+                "campaign_count", "pnl", "drawdown", "concentration", "copyability", "liquidation_frequency",
+            ],
+            "operator_note": "Saved raw evidence is retained; this is not a measured poor-performance finding.",
+        },
+        "campaigns": {"status": "integrity_unresolved", "closed_campaigns": None},
+        "follower": _unavailable_follower("source_position_continuity_unresolved"),
+        "additional_evidence_required": ["source-proven position continuation or a separately validated normalizer"],
+    }
 
 
 def _replay_saved_wallet(

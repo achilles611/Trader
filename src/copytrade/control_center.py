@@ -3083,7 +3083,9 @@ def create_control_center_app(
                                  max_drawdown=max_drawdown, max_follower_drawdown=max_follower_drawdown, coverage=coverage,
                                  copyability_available=copyability_available, recent_days=recent_days, current_only=current_only)
 
-    lane_ii_evidence_root = Path(__file__).resolve().parents[2] / "reports" / "lane-ii"
+    lane_ii_evidence_root = Path(os.getenv("BEELZEBUB_LANE_II_EVIDENCE_ROOT") or (
+        Path(__file__).resolve().parents[2] / "reports" / "lane-ii"
+    )).expanduser().resolve()
     lane_ii_cohort_path = lane_ii_evidence_root / "latest-cohort.json"
 
     @app.get("/api/lane-ii/slim-status")
@@ -3103,18 +3105,22 @@ def create_control_center_app(
                 status_code=409,
                 detail="The prospective cohort is frozen while PAPER members or positions are active. Pause and close PAPER positions before replacing it.",
             )
-        retained = Path(os.getenv("BEELZEBUB_LANE_II_RETAINED_DB") or (
-            Path(__file__).resolve().parents[3] / "Trader" / "artifacts" / "copytrade.sqlite3"
-        ))
+        frozen_research_pass = os.getenv("BEELZEBUB_LANE_II_RESEARCH_PASS")
+        if not frozen_research_pass:
+            raise HTTPException(
+                status_code=409,
+                detail="Lane II refresh requires BEELZEBUB_LANE_II_RESEARCH_PASS; freeze a bounded research pass first.",
+            )
         try:
             return await asyncio.to_thread(
                 refresh_public_cohort,
                 execution_service,
-                retained_database=retained,
+                retained_database=Path(frozen_research_pass),
                 output_directory=lane_ii_evidence_root,
-                seed_limit=24,
-                analysis_limit=10,
+                analysis_limit=0,
                 target_count=7,
+                frozen_research_pass=frozen_research_pass,
+                include_public_account_state=True,
             )
         except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc

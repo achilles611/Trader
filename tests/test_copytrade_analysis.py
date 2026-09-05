@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
 import unittest
 from dataclasses import replace
 from datetime import timedelta
@@ -14,6 +16,7 @@ from src.copytrade.contracts import PHASE_A_EVIDENCE_SCHEMA_VERSION
 from src.copytrade.discovery import DiscoveryPipeline
 from src.copytrade.hyperliquid import BackfillCoverage
 from src.copytrade.models import AnalysisRun, CandidateAnalysis, CandidateScore, DiscoveryObservation, RawFill, as_utc, utc_now
+from src.copytrade.reconstruction import SourcePositionContinuityError
 from src.copytrade.scoring import FollowerMetrics, pairwise_correlation_status, score_candidate
 from src.copytrade.service import CopyTradeService
 
@@ -216,6 +219,223 @@ class PhaseBAnalysisTests(unittest.TestCase):
             self.assertEqual(retry["eligible"], 1)
             self.assertEqual(service.database.get_candidate_analysis(FAILED).lifecycle_status, "qualified")  # type: ignore[union-attr]
 
+    def test_source_position_integrity_outcome_is_deferred_without_refetch_on_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            seed_candidates(service, [GOOD])
+            backfill_calls: list[str] = []
+
+            def backfill(wallet: str, _start: object) -> dict[str, object]:
+                backfill_calls.append(wallet)
+                service.database.insert_raw_fills(fills(wallet))
+                return {"new_raw_fills": 2}
+
+            def unresolved(wallet: str) -> dict[str, object]:
+                raise SourcePositionContinuityError(
+                    "UNRESOLVED_SOURCE_POSITION_GAP", wallet=wallet, symbol="BTC", timestamp=FILL_AT,
+                )
+
+            pipeline = CandidateAnalysisPipeline(
+                service, backfill_wallet=backfill, reconstruct_wallet=unresolved, sleep=lambda _: None,
+            )
+            first = pipeline.run(limit=10, workers=1)
+            self.assertEqual(first["status"], "completed_with_deferred")
+            self.assertEqual(first["errors"], [])
+            self.assertEqual(first["deferred"], 1)
+            row = service.database.get_analysis_wallet(str(first["run_id"]), GOOD)
+            self.assertEqual((row["stage"], row["status"]), ("analysis", "deferred"))  # type: ignore[index]
+            self.assertEqual(json.loads(row["payload_json"])["integrity"]["reason"], "UNRESOLVED_SOURCE_POSITION_GAP")  # type: ignore[index]
+
+            # The next scheduler run preserves the durable integrity result;
+            # it cannot commission a fresh backfill under a new run ID.
+            second = pipeline.run(limit=10, workers=1)
+            self.assertEqual(second["deferred"], 1)
+            self.assertEqual(backfill_calls, [GOOD])
+            resumed = service.database.get_analysis_wallet(str(second["run_id"]), GOOD)
+            self.assertEqual((resumed["stage"], resumed["status"]), ("resume", "deferred"))  # type: ignore[index]
+
+    def test_ready_wallet_is_scored_while_another_acquisition_waits(self) -> None:
+        """A dense wallet must not keep an independent ready wallet unscored."""
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            seed_candidates(service, [GOOD, FAILED])
+            slow_started = threading.Event()
+            release_slow = threading.Event()
+            good_scored = threading.Event()
+            holder: dict[str, object] = {}
+
+            def backfill(wallet: str, _start: object) -> dict[str, object]:
+                if wallet == FAILED:
+                    slow_started.set()
+                    self.assertTrue(release_slow.wait(5), "fixture slow wallet was not released")
+                service.database.insert_raw_fills(fills(wallet))
+                return {"new_raw_fills": 2}
+
+            def reconstruct(wallet: str) -> dict[str, object]:
+                result = service.reconstruct(wallet)
+                if wallet == GOOD:
+                    good_scored.set()
+                return result
+
+            pipeline = CandidateAnalysisPipeline(service, backfill_wallet=backfill, reconstruct_wallet=reconstruct)
+            worker = threading.Thread(
+                target=lambda: holder.setdefault("result", pipeline.run(limit=10, workers=2)), daemon=True,
+            )
+            worker.start()
+            try:
+                self.assertTrue(slow_started.wait(2), "slow fixture did not start")
+                self.assertTrue(good_scored.wait(2), "ready wallet was held behind slow acquisition")
+                self.assertFalse(release_slow.is_set())
+            finally:
+                release_slow.set()
+                worker.join(5)
+            self.assertFalse(worker.is_alive())
+            result = holder["result"]
+            self.assertEqual(result["eligible"], 2)  # type: ignore[index]
+
+    def test_previously_completed_wallet_scores_before_pending_backfill(self) -> None:
+        """Recovery must score durable ready evidence before re-opening unfinished work."""
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            seed_candidates(service, [GOOD, FAILED])
+            service.database.insert_raw_fills(fills(GOOD))
+            started = utc_now()
+            run = AnalysisRun(
+                run_id="analysis_recovery_ready_first",
+                started_at=started,
+                configuration={
+                    "invocation": {"workers": 2, "force": False, "cheap_only": False},
+                    "analysis_window": {
+                        "required_start": (started - timedelta(days=90)).isoformat(),
+                        "required_end": started.isoformat(),
+                    },
+                    "config_fingerprint": _config_fingerprint(service.config.research_snapshot()),
+                    "candidate_wallets": [GOOD, FAILED],
+                },
+            )
+            service.database.start_analysis_run(run)
+            service.database.record_analysis_wallet(run.run_id, GOOD, stage="backfill", status="completed")
+            service.database.record_analysis_wallet(run.run_id, FAILED, stage="backfill", status="started")
+            slow_started = threading.Event()
+            release_slow = threading.Event()
+            good_scored = threading.Event()
+            holder: dict[str, object] = {}
+
+            def backfill(wallet: str, _start: object) -> dict[str, object]:
+                self.assertEqual(wallet, FAILED)
+                slow_started.set()
+                self.assertTrue(release_slow.wait(5), "fixture pending wallet was not released")
+                service.database.insert_raw_fills(fills(wallet))
+                return {"new_raw_fills": 2}
+
+            def reconstruct(wallet: str) -> dict[str, object]:
+                result = service.reconstruct(wallet)
+                if wallet == GOOD:
+                    good_scored.set()
+                return result
+
+            pipeline = CandidateAnalysisPipeline(service, backfill_wallet=backfill, reconstruct_wallet=reconstruct)
+            worker = threading.Thread(target=lambda: holder.setdefault("result", pipeline.run(resume=True)), daemon=True)
+            worker.start()
+            try:
+                self.assertTrue(good_scored.wait(2), "durably completed wallet waited behind pending acquisition")
+                self.assertTrue(slow_started.wait(2), "fixture pending wallet did not start")
+                self.assertFalse(release_slow.is_set())
+            finally:
+                release_slow.set()
+                worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(holder["result"]["eligible"], 2)  # type: ignore[index]
+
+    def test_unproven_no_progress_is_explicitly_deferred_without_reconstruction(self) -> None:
+        """HTTP success without a new durable fill is not acquisition progress."""
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            seed_candidates(service, [GOOD])
+            reconstruct_calls = 0
+
+            def no_progress(_wallet: str, _start: object) -> dict[str, object]:
+                return {"new_raw_fills": 0, "coverage": {"coverage_state": "UNPROVEN"}}
+
+            def reconstruct(wallet: str) -> dict[str, object]:
+                nonlocal reconstruct_calls
+                reconstruct_calls += 1
+                return service.reconstruct(wallet)
+
+            result = CandidateAnalysisPipeline(
+                service, backfill_wallet=no_progress, reconstruct_wallet=reconstruct,
+            ).run(limit=10, workers=1)
+            self.assertEqual((result["status"], result["deferred"], result["scored"]), ("completed_with_deferred", 1, 0))
+            self.assertEqual(reconstruct_calls, 0)
+            candidate = service.database.get_candidate_analysis(GOOD)
+            self.assertEqual(candidate.lifecycle_status, "backfill_pending")  # type: ignore[union-attr]
+            run_wallet = service.database.get_analysis_wallet(str(result["run_id"]), GOOD)
+            self.assertEqual((run_wallet["stage"], run_wallet["status"]), ("backfill", "deferred"))  # type: ignore[index]
+            payload = json.loads(run_wallet["payload_json"])  # type: ignore[index]
+            self.assertEqual(payload["deferred_reason"], "no_new_durable_evidence_unproven_coverage")
+            self.assertEqual(payload["acquisition_budget"]["retry_attempts_remaining"], 0)
+
+    def test_resume_keeps_completed_wallet_and_capped_wallet_budget_without_refetch(self) -> None:
+        """An interruption resumes unfinished work only; it cannot reset a cap."""
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            seed_candidates(service, [GOOD, FAILED, STALE])
+            good_scored = threading.Event()
+            calls: list[str] = []
+
+            def initial_backfill(wallet: str, _start: object) -> dict[str, object]:
+                calls.append(wallet)
+                if wallet == FAILED:
+                    return {
+                        "deferred": True,
+                        "deferred_reason": "public_request_budget_exhausted",
+                        "acquisition_budget": {"requests_consumed": 64, "requests_remaining": 0},
+                    }
+                if wallet == STALE:
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        run = service.database.latest_resumable_analysis_run()
+                        capped = service.database.get_analysis_wallet(run["run_id"], FAILED) if run else None  # type: ignore[index]
+                        if good_scored.is_set() and capped and capped["status"] == "deferred":
+                            raise KeyboardInterrupt("fixture interruption after durable ready/capped outcomes")
+                        time.sleep(0.01)
+                    raise AssertionError("fixture did not observe durable completed and capped outcomes")
+                service.database.insert_raw_fills(fills(wallet))
+                return {"new_raw_fills": 2}
+
+            def reconstruct(wallet: str) -> dict[str, object]:
+                result = service.reconstruct(wallet)
+                if wallet == GOOD:
+                    good_scored.set()
+                return result
+
+            first = CandidateAnalysisPipeline(
+                service, backfill_wallet=initial_backfill, reconstruct_wallet=reconstruct,
+            )
+            with self.assertRaises(KeyboardInterrupt):
+                first.run(limit=10, workers=3)
+            run = service.database.latest_resumable_analysis_run()
+            self.assertIsNotNone(run)
+            run_id = str(run["run_id"])
+            self.assertEqual(service.database.get_candidate_analysis(GOOD).lifecycle_status, "qualified")  # type: ignore[union-attr]
+            capped_before = service.database.get_analysis_wallet(run_id, FAILED)
+            self.assertEqual(capped_before["status"], "deferred")  # type: ignore[index]
+
+            def resumed_backfill(wallet: str, _start: object) -> dict[str, object]:
+                calls.append(f"resume:{wallet}")
+                self.assertEqual(wallet, STALE, "resume must not refetch ready/capped evidence")
+                service.database.insert_raw_fills(fills(wallet))
+                return {"new_raw_fills": 2}
+
+            resumed = CandidateAnalysisPipeline(service, backfill_wallet=resumed_backfill).run(resume=True, workers=3)
+            self.assertEqual(resumed["run_id"], run_id)
+            self.assertEqual(calls.count(GOOD), 1)
+            self.assertEqual(calls.count(FAILED), 1)
+            self.assertEqual(calls.count(STALE), 1)
+            self.assertEqual(calls.count(f"resume:{STALE}"), 1)
+            capped_after = service.database.get_analysis_wallet(run_id, FAILED)
+            self.assertEqual(json.loads(capped_after["payload_json"])["acquisition_budget"], {"requests_consumed": 64, "requests_remaining": 0})  # type: ignore[index]
+
     def test_known_incomplete_coverage_quarantines_without_follower_replay(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             service = CopyTradeService(config(Path(temp)))
@@ -261,9 +481,13 @@ class PhaseBAnalysisTests(unittest.TestCase):
                     "UPDATE copy_discovery_candidates SET metadata_json=? WHERE wallet=?",
                     (json.dumps({"latest_activity_observations": 680}), GOOD),
                 )
-            result = pipeline.run(limit=999, status="all", workers=1, resume=True)
+            with patch.object(pipeline, "_backfill_all", wraps=pipeline._backfill_all) as dispatched:
+                result = pipeline.run(limit=999, status="all", workers=1, resume=True)
             self.assertEqual(result["run_id"], run_id)
             self.assertEqual(result["eligible"], 1)
+            # The immutable run recorded two workers, but recovery may lower
+            # that operational limit to one without changing its evidence.
+            self.assertEqual(dispatched.call_args.args[3], 1)
             with patch("src.copytrade.cli.CopyTradeConfig.from_yaml", return_value=cfg), patch("src.copytrade.cli._print") as printed:
                 from src.copytrade.cli import run_copytrade_command
                 import argparse
