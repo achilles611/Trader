@@ -165,6 +165,24 @@ class HyperliquidPublicAdapter:
     def fetch_spot_state(self, wallet: str) -> Any:
         return self.info({"type": "spotClearinghouseState", "user": wallet.lower()})
 
+    def fetch_quantity_precisions(self) -> dict[str, int]:
+        """Return current public perp lot precision from the canonical meta response."""
+        payload = self.info({"type": "meta"})
+        universe = payload.get("universe") if isinstance(payload, dict) else None
+        if not isinstance(universe, list):
+            raise HyperliquidAPIError("Unexpected meta response.")
+        result: dict[str, int] = {}
+        for asset in universe:
+            if not isinstance(asset, dict) or not asset.get("name"):
+                continue
+            precision = asset.get("szDecimals")
+            if isinstance(precision, bool) or not isinstance(precision, int) or precision < 0:
+                raise HyperliquidAPIError("Hyperliquid meta contains an invalid szDecimals value.")
+            result[str(asset["name"]).upper()] = precision
+        if not result:
+            raise HyperliquidAPIError("Hyperliquid meta contains no instrument precision records.")
+        return result
+
     def fetch_candle_snapshot(self, coin: str, start: object, end: object, interval: str = "1m") -> Any:
         return self.info({
             "type": "candleSnapshot",

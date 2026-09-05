@@ -485,3 +485,41 @@ baseline behaviors.
   future copyability. Treat scores as research inputs, not investment advice.
 - Hyperliquid's historical node buckets may be delayed or incomplete. Discovery
   is only a candidate-universe source; it is not evidence of a trader's edge.
+
+## Lane II Slim and the isolated $100 paper profile
+
+Lane II has a separate Control Center surface and configuration at
+`config/copytrade_lane_ii_100.yaml`. Start it with:
+
+```powershell
+python main.py copy-control-center --config config/copytrade_lane_ii_100.yaml --lane-ii-only --with-watcher --host 127.0.0.1 --port 8092
+```
+
+The `--lane-ii-only` lifecycle does not start the Lane III market-data
+listener, scheduler, commission worker, or NinjaTrader listener factories.
+The UI labels its balance exactly `PAPER — $100 simulated`. Cash App is not a
+connected venue or capital source, and this profile contains no wallet secret,
+API key, deposit route, exchange-write transport, or live-order authority.
+
+Fresh public research is explicit and evidence-producing:
+
+```powershell
+python main.py copy-lane-ii-refresh --config config/copytrade_lane_ii_100.yaml --retained-database artifacts/copytrade.sqlite3 --output-directory reports/lane-ii
+python main.py copy-lane-ii-paper-demo --config config/copytrade_lane_ii_100.yaml --output reports/lane-ii/paper-demo.json
+python main.py copy-lane-ii-status --config config/copytrade_lane_ii_100.yaml
+```
+
+The refresh uses retained addresses only as seeds, then fetches current public
+observations and runs the canonical Phase A and Phase B qualification pipeline.
+An address is selected only when current evidence passes every hard gate and the
+persisted diversified recommendation marks it eligible. Research-watchlist
+addresses remain Shadow and are never silently promoted to Active.
+
+`COHORT_COPY_V1` is a paper-only strategy option. It permits selected Active
+leaders to exercise the existing ownership-aware paper reconstruction and risk
+engine; the default `SCIENTIFIC_SENSOR_V1` behavior remains the earlier
+decision-only signal gate. Both modes remain barred from live execution. The
+Lane II live-start route returns a denial, and paper readiness is reported
+separately from live-trading readiness. U.S. venue eligibility is intentionally
+`UNRESOLVED`: UI access, public-data access, testnet behavior, or an alternate
+interface is not treated as proof of eligibility.

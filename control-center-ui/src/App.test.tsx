@@ -81,8 +81,28 @@ let laneIIILiveResponse: Record<string, unknown> = {
   live_send_count: 0, one_control_start: { enabled: false, reason: "LIVE_ACCOUNT_IDENTITY_UNVERIFIED" },
   components: { LIVE_AUTHORITY: { state: "RED", reason: "DISARMED" } },
 };
+let laneIIStatusResponse: Record<string, unknown> = {
+  generated_at: new Date().toISOString(), display_account: "PAPER — $100 simulated",
+  strategy: { strategy_id: "COHORT_COPY_V1", version: 1 },
+  overall: { state: "RESEARCH_SHORTFALL", next_action: "Continue public observation; fewer than five candidates meet the unchanged evidence gates." },
+  readiness: {
+    public_observation: { state: "CONNECTED", read_only: true },
+    paper: { state: "BLOCKED_COHORT_SHORTFALL", selected_count: 0 },
+    testnet: { state: "BLOCKED_PREREQUISITES" },
+    live: { state: "UNAVAILABLE", eligibility: "UNRESOLVED_US_VENUE_ELIGIBILITY", backend_denied: true },
+  },
+  cohort: { selected_at: "2026-09-05T04:00:00Z", data_cutoff: "2026-09-05T04:00:00Z", selected: [], research_watchlist: [{ ...candidate, qualification_warning: "NOT_SELECTED_NOT_ACTIVE" }] },
+  portfolio: { equity: 100, cash: 100, committed_capital: 0, open_pnl: 0, realized_pnl_total: 0, fees: 0, connected_capital: false },
+  positions: [], recent_actions: [],
+  funnel: [
+    { label: "Discovered", count: 10 }, { label: "Analyzed", count: 10 }, { label: "Qualified", count: 0 },
+    { label: "Selected", count: 0 }, { label: "Observing", count: 0 }, { label: "Active", count: 0 },
+  ],
+  controls: { refresh_candidates_available: true, observe_available: true, start_paper_available: false, pause_new_entries_available: true, close_paper_positions_available: false, live_available: false },
+};
 
 function payload(path: string) {
+  if (path.startsWith("/api/lane-ii/slim-status")) return laneIIStatusResponse;
   if (path.startsWith("/api/overview")) return { counts: { total_discovered: emptyUniverse ? 0 : 20, qualified: 2, shadow: 1, active: 0 }, funnel: [], top_candidates: [candidate], recent_activity: [] };
   if (path.startsWith("/api/portfolio")) return { equity: 210, cash: 190, committed_capital: 10, open_pnl: 1, realized_pnl_total: 9, max_drawdown: 0.02, open_positions: 1 };
   if (path.startsWith("/api/accounts/balances")) return accountBalancesResponse;
@@ -212,6 +232,7 @@ function configureReadyLaneIIIUiFixture() {
 }
 
 beforeEach(() => {
+  window.history.replaceState({}, "", "/");
   localStorage.clear();
   WebSocketStub.instances = [];
   closeAllResponse = null;
@@ -279,6 +300,26 @@ beforeEach(() => {
     live_send_count: 0, one_control_start: { enabled: false, reason: "LIVE_ACCOUNT_IDENTITY_UNVERIFIED" },
     components: { LIVE_AUTHORITY: { state: "RED", reason: "DISARMED" } },
   };
+  laneIIStatusResponse = {
+    generated_at: new Date().toISOString(), display_account: "PAPER — $100 simulated",
+    strategy: { strategy_id: "COHORT_COPY_V1", version: 1 },
+    overall: { state: "RESEARCH_SHORTFALL", next_action: "Continue public observation; fewer than five candidates meet the unchanged evidence gates." },
+    readiness: {
+      public_observation: { state: "CONNECTED", read_only: true },
+      paper: { state: "BLOCKED_COHORT_SHORTFALL", selected_count: 0 },
+      testnet: { state: "BLOCKED_PREREQUISITES" },
+      live: { state: "UNAVAILABLE", eligibility: "UNRESOLVED_US_VENUE_ELIGIBILITY", backend_denied: true },
+    },
+    cohort: { selected_at: "2026-09-05T04:00:00Z", data_cutoff: "2026-09-05T04:00:00Z", selected: [], research_watchlist: [{ ...candidate, qualification_warning: "NOT_SELECTED_NOT_ACTIVE" }] },
+    portfolio: { equity: 100, cash: 100, committed_capital: 0, open_pnl: 0, realized_pnl_total: 0, fees: 0, connected_capital: false },
+    paper_policy: { maximum_total_committed: 60, funding_model: "NOT_MODELED" },
+    positions: [], recent_actions: [],
+    funnel: [
+      { label: "Discovered", count: 10 }, { label: "Analyzed", count: 10 }, { label: "Qualified", count: 0 },
+      { label: "Selected", count: 0 }, { label: "Observing", count: 0 }, { label: "Active", count: 0 },
+    ],
+    controls: { refresh_candidates_available: true, observe_available: true, start_paper_available: false, pause_new_entries_available: true, close_paper_positions_available: false, live_available: false },
+  };
   vi.stubGlobal("WebSocket", WebSocketStub);
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => new Response(JSON.stringify(payload(String(input))), { status: 200, headers: { "Content-Type": "application/json" } })));
 });
@@ -286,6 +327,18 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 describe("copy control center", () => {
+  it("keeps Lane II separate, labels simulated funds, and makes lane navigation observational", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Slim Console" }));
+    fireEvent.click(screen.getByRole("button", { name: "Lane II — Copy Trading" }));
+    expect(await screen.findByText("PAPER — $100 simulated")).toBeInTheDocument();
+    expect(screen.getByText("Evidence shortfall")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start Paper Copying" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Live Trading Unavailable" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Lane III — Futures" }));
+    expect(await screen.findByRole("heading", { name: "Select profile" })).toBeInTheDocument();
+    expect(vi.mocked(fetch).mock.calls.some(([, init]) => String(init?.method || "GET").toUpperCase() !== "GET")).toBe(false);
+  });
   it("separates L3H mechanical commissioning from live authorization and canary state", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Lane III Live" }));

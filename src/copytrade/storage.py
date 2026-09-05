@@ -2227,7 +2227,9 @@ class CopyTradeDatabase:
                 quantity, entry_price, allocated_capital, remaining_capital, entry_fee, realized_pnl, exit_fee,
                 opened_at, updated_at, closed_at, target_entry_price, max_drawdown, current_mark, unrealized_pnl)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(sleeve_id) DO UPDATE SET quantity=excluded.quantity, remaining_capital=excluded.remaining_capital,
+                ON CONFLICT(sleeve_id) DO UPDATE SET quantity=excluded.quantity, entry_price=excluded.entry_price,
+                allocated_capital=excluded.allocated_capital, remaining_capital=excluded.remaining_capital,
+                entry_fee=excluded.entry_fee, target_entry_price=excluded.target_entry_price,
                 realized_pnl=excluded.realized_pnl, exit_fee=excluded.exit_fee, updated_at=excluded.updated_at,
                 closed_at=excluded.closed_at, max_drawdown=excluded.max_drawdown, current_mark=excluded.current_mark,
                 unrealized_pnl=excluded.unrealized_pnl""",
@@ -2536,7 +2538,9 @@ class CopyTradeDatabase:
                         quantity, entry_price, allocated_capital, remaining_capital, entry_fee, realized_pnl, exit_fee,
                         opened_at, updated_at, closed_at, target_entry_price, max_drawdown, current_mark, unrealized_pnl)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(sleeve_id) DO UPDATE SET quantity=excluded.quantity, remaining_capital=excluded.remaining_capital,
+                        ON CONFLICT(sleeve_id) DO UPDATE SET quantity=excluded.quantity, entry_price=excluded.entry_price,
+                        allocated_capital=excluded.allocated_capital, remaining_capital=excluded.remaining_capital,
+                        entry_fee=excluded.entry_fee, target_entry_price=excluded.target_entry_price,
                         realized_pnl=excluded.realized_pnl, exit_fee=excluded.exit_fee, updated_at=excluded.updated_at,
                         closed_at=excluded.closed_at, max_drawdown=excluded.max_drawdown, current_mark=excluded.current_mark,
                         unrealized_pnl=excluded.unrealized_pnl""",

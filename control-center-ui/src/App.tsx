@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, post } from "./api";
 import type { Candidate, CandidatesResponse, ControlState, Portfolio } from "./types";
 import { SlimConsole } from "./SlimConsole";
+import { LaneIISlimConsole } from "./LaneIISlimConsole";
 import { usePaperConsoleState, type PaperConsoleState, type PaperConsoleToast } from "./paperConsole";
 import { AutomatedSciencePage, ConfidencePage, DataIgnitionPage, EcosystemPage, ScienceResourcePage } from "./ScienceViews";
 import { SchedulerPage } from "./SchedulerPage";
@@ -31,7 +32,9 @@ const accountBalanceValue = (account: ReturnType<typeof accountReading>) => acco
 const accountBalanceSubtitle = (account: ReturnType<typeof accountReading>) => account?.cash_value_observed_at ? `NinjaTrader CashValue · ${timeLabel(account.cash_value_observed_at)}` : account?.net_liquidation_observed_at ? `NinjaTrader Net Liquidation · ${timeLabel(account.net_liquidation_observed_at)}` : "Awaiting read-only NinjaTrader account value";
 
 type ConsoleMode = "full" | "slim";
+type SlimLane = "lane-iii" | "lane-ii";
 const CONSOLE_MODE_PREFERENCE = "beezconsole-console-mode";
+const SLIM_LANE_PREFERENCE = "beezconsole-slim-lane";
 
 function initialConsoleMode(): ConsoleMode {
   const query = new URLSearchParams(window.location.search).get("console");
@@ -44,9 +47,18 @@ function initialConsoleMode(): ConsoleMode {
   }
 }
 
+function initialSlimLane(): SlimLane {
+  const query = new URLSearchParams(window.location.search).get("lane");
+  if (query === "ii") return "lane-ii";
+  if (query === "iii") return "lane-iii";
+  try { return window.localStorage.getItem(SLIM_LANE_PREFERENCE) === "lane-ii" ? "lane-ii" : "lane-iii"; }
+  catch { return "lane-iii"; }
+}
+
 export function App() {
   const [page, setPage] = useState<Page>("Overview");
   const [consoleMode, setConsoleMode] = useState<ConsoleMode>(initialConsoleMode);
+  const [slimLane, setSlimLane] = useState<SlimLane>(initialSlimLane);
   const [overview, setOverview] = useState<Record<string, any> | null>(null);
   const [portfolio, setPortfolio] = useState<Portfolio | null>(null);
   const [accountBalances, setAccountBalances] = useState<AccountBalances | null>(null);
@@ -65,8 +77,8 @@ export function App() {
     try { window.localStorage.setItem(CONSOLE_MODE_PREFERENCE, mode); } catch { /* preference persistence is optional */ }
   }, []);
   const paperConsole = usePaperConsoleState({
-    active: consoleMode === "slim" || page === "Lane III Paper",
-    includeSlim: consoleMode === "slim",
+    active: (consoleMode === "slim" && slimLane === "lane-iii") || page === "Lane III Paper",
+    includeSlim: consoleMode === "slim" && slimLane === "lane-iii",
     notify: (value) => setToast(value),
   });
 
@@ -78,8 +90,9 @@ export function App() {
     } catch (error) { reportError(error); }
   }, [reportError]);
 
-  useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => { if (consoleMode === "full") void refresh(); }, [consoleMode, refresh]);
   useEffect(() => {
+    if (consoleMode !== "full") return undefined;
     const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
     ws.onmessage = (event) => {
       const message = JSON.parse(event.data) as { type: string; data: any };
@@ -97,7 +110,22 @@ export function App() {
     };
     ws.onerror = () => undefined;
     return () => ws.close();
-  }, [refresh]);
+  }, [consoleMode, refresh]);
+
+  useEffect(() => {
+    const onPopState = () => setSlimLane(new URLSearchParams(window.location.search).get("lane") === "ii" ? "lane-ii" : "lane-iii");
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  const selectSlimLane = useCallback((lane: SlimLane) => {
+    setSlimLane(lane);
+    try { window.localStorage.setItem(SLIM_LANE_PREFERENCE, lane); } catch { /* optional */ }
+    const url = new URL(window.location.href);
+    url.searchParams.set("console", "slim");
+    url.searchParams.set("lane", lane === "lane-ii" ? "ii" : "iii");
+    window.history.pushState({}, "", url);
+  }, []);
 
   const command = async (path: string, success: string) => {
     try { const result = await post<ControlState & { control?: ControlState }>(path); setControl(result.control || result); setToast({ tone: "success", message: success }); await refresh(); }
@@ -116,7 +144,15 @@ export function App() {
     } catch (error) { reportError(error); }
   };
 
-  if (consoleMode === "slim") return <SlimConsole paper={paperConsole} onFullConsole={() => selectConsoleMode("full")} />;
+  if (consoleMode === "slim") return <div className="slim-lane-shell">
+    <nav className="slim-lane-tabs" aria-label="Trading lanes">
+      <button aria-current={slimLane === "lane-iii" ? "page" : undefined} className={slimLane === "lane-iii" ? "selected" : ""} onClick={() => selectSlimLane("lane-iii")}>Lane III — Futures</button>
+      <button aria-current={slimLane === "lane-ii" ? "page" : undefined} className={slimLane === "lane-ii" ? "selected" : ""} onClick={() => selectSlimLane("lane-ii")}>Lane II — Copy Trading</button>
+    </nav>
+    {slimLane === "lane-iii"
+      ? <SlimConsole paper={paperConsole} onFullConsole={() => selectConsoleMode("full")} />
+      : <LaneIISlimConsole onFullConsole={() => selectConsoleMode("full")} />}
+  </div>;
 
   return <div className="shell">
     <aside className="sidebar">

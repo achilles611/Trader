@@ -25,6 +25,7 @@ from .science_repository import ScientificRepository
 from .scientific_scheduler import ScientificScheduler
 from .scientific_worker import ScientificWorker, WorkerStage
 from .data_ignition import DataIgnitionCommissioner, PublicObservationService
+from .lane_ii import refresh_public_cohort, lane_ii_status, run_paper_account_demo
 
 
 def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -107,6 +108,20 @@ def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
     control_center.add_argument("--host", help="Override control-center host.")
     control_center.add_argument("--port", type=int, help="Override control-center port.")
     control_center.add_argument("--with-watcher", action="store_true", help="Run the paper watcher in the control-center lifecycle.")
+    control_center.add_argument("--lane-ii-only", action="store_true", help="Start only Lane II public observation/PAPER services; never start Lane III runtimes.")
+
+    lane_ii_refresh = command("copy-lane-ii-refresh", "Refresh the Lane II public cohort and run unchanged Phase B evidence gates.")
+    lane_ii_refresh.add_argument("--retained-database", default="artifacts/copytrade.sqlite3", help="Read-only retained Phase A candidate database.")
+    lane_ii_refresh.add_argument("--output-directory", default="reports/lane-ii", help="Immutable candidate/cohort evidence directory.")
+    lane_ii_refresh.add_argument("--seed-limit", type=int, default=24)
+    lane_ii_refresh.add_argument("--analysis-limit", type=int, default=10)
+    lane_ii_refresh.add_argument("--target-count", type=int, default=7)
+
+    lane_ii_status_parser = command("copy-lane-ii-status", "Show separate public, PAPER, testnet, and live Lane II readiness.")
+    lane_ii_status_parser.add_argument("--cohort", default="reports/lane-ii/latest-cohort.json")
+
+    lane_ii_demo = command("copy-lane-ii-paper-demo", "Run a synthetic $100 PAPER sizing/ownership matrix using current public metadata.")
+    lane_ii_demo.add_argument("--output", default="reports/lane-ii/paper-demo.json")
 
     sizing = command("copy-size-demo", "Show the configured 5/10/20 percent sizing classification.")
     sizing.add_argument("--fractions", default="0.03,0.10,0.20", help="Comma-separated target entry fractions to classify against a 10% prior-median demo history.")
@@ -363,7 +378,7 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
     if command == "copy-watch":
         watcher = HyperliquidWatcher(service.adapter)
         async def watch() -> dict[str, int]:
-            return await watcher.run(service.monitored_execution_wallets(), service.ingest_watched_fills, service.ingest_watched_state,
+            return await watcher.run(service.monitored_observation_wallets(), service.ingest_watched_fills, service.ingest_watched_state,
                                      service.ingest_market_update, service.reconcile_monitored_wallets,
                                      duration_seconds=args.duration)
         reconciled = asyncio.run(watch())
@@ -411,7 +426,23 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
         return 0
     if command == "copy-control-center":
         serve_control_center(config, service.database, host=args.host, port=args.port,
-                             with_watcher=args.with_watcher, service=service)
+                             with_watcher=args.with_watcher, service=service, lane_ii_only=args.lane_ii_only)
+        return 0
+    if command == "copy-lane-ii-refresh":
+        _print(refresh_public_cohort(
+            service,
+            retained_database=args.retained_database,
+            output_directory=args.output_directory,
+            seed_limit=args.seed_limit,
+            analysis_limit=args.analysis_limit,
+            target_count=args.target_count,
+        ))
+        return 0
+    if command == "copy-lane-ii-status":
+        _print(lane_ii_status(service, cohort_path=args.cohort))
+        return 0
+    if command == "copy-lane-ii-paper-demo":
+        _print(run_paper_account_demo(service, output=args.output))
         return 0
     if command == "copy-size-demo":
         fractions = [float(item.strip()) for item in args.fractions.split(",") if item.strip()]

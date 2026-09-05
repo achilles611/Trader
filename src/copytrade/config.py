@@ -117,6 +117,20 @@ class PaperExecutionConfig:
 
 
 @dataclass(frozen=True)
+class PaperStrategyConfig:
+    """Named paper-signal admission policy.
+
+    ``SCIENTIFIC_SENSOR_V1`` retains the existing production behavior: raw
+    wallet actions are evidence only. ``COHORT_COPY_V1`` admits position
+    changes from canonically activated cohort wallets to the local PAPER
+    engine. It grants no exchange-adapter or live authority.
+    """
+
+    strategy_id: str = "SCIENTIFIC_SENSOR_V1"
+    version: int = 1
+
+
+@dataclass(frozen=True)
 class BacktestConfig:
     detection_delays_ms: tuple[int, ...] = (100, 250, 500, 1000, 2000, 5000, 15000)
     slippage_scenarios_bps: tuple[float, ...] = (0.0, 1.0, 2.0, 5.0, 10.0, 25.0)
@@ -369,6 +383,7 @@ class CopyTradeConfig:
     sizing: SizingConfig = field(default_factory=SizingConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     paper_execution: PaperExecutionConfig = field(default_factory=PaperExecutionConfig)
+    paper_strategy: PaperStrategyConfig = field(default_factory=PaperStrategyConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     candidates: CandidateConfig = field(default_factory=CandidateConfig)
     prefilter: PrefilterConfig = field(default_factory=PrefilterConfig)
@@ -401,6 +416,7 @@ class CopyTradeConfig:
         sizing = _section(document, "sizing")
         risk = _section(document, "risk")
         paper = _section(document, "paper_execution")
+        paper_strategy = _section(document, "paper_strategy")
         fees = _section(document, "fees")
         slippage = _section(document, "slippage")
         latency = _section(document, "latency")
@@ -466,6 +482,7 @@ class CopyTradeConfig:
                     "order_latency_ms": latency.get("order_ms", latency.get("order_latency_ms", paper.get("order_latency_ms", PaperExecutionConfig().order_latency_ms))),
                 }
             ),
+            paper_strategy=PaperStrategyConfig(**paper_strategy),
             backtest=BacktestConfig(
                 **{
                     **backtest,
@@ -575,6 +592,12 @@ class CopyTradeConfig:
             raise ValueError("paper market-data ages and persistence intervals must be >= 0.")
         if self.paper_execution.stale_exit_market_policy not in {"target_fill_fallback", "skip"}:
             raise ValueError("paper_execution.stale_exit_market_policy must be target_fill_fallback or skip.")
+        if self.paper_strategy.strategy_id not in {"SCIENTIFIC_SENSOR_V1", "COHORT_COPY_V1"}:
+            raise ValueError("paper_strategy.strategy_id must be SCIENTIFIC_SENSOR_V1 or COHORT_COPY_V1.")
+        if self.paper_strategy.version != 1:
+            raise ValueError("paper_strategy.version must be 1.")
+        if self.paper_strategy.strategy_id == "COHORT_COPY_V1" and self.mode != "paper":
+            raise ValueError("COHORT_COPY_V1 is paper-only and cannot be configured in live mode.")
         if not 0 < self.risk.max_total_committed_fraction <= 1:
             raise ValueError("risk.max_total_committed_fraction must be in (0, 1].")
         if self.risk.insufficient_capital_action not in {"scale", "skip"}:

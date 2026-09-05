@@ -140,9 +140,10 @@ class WatcherMembershipSupervisor:
     """Own the one optional execution watcher used by the Control Center.
 
     Membership is intentionally derived from the service on a short local poll:
-    active entry targets plus wallets that still need exit monitoring.  A
-    replacement waits for the previous watcher task to stop before it starts a
-    successor, so public fills are never processed by overlapping watchers.
+    Shadow public-observation targets, Active PAPER entry targets, and wallets
+    that still need exit monitoring. A replacement waits for the previous
+    watcher task to stop before it starts a successor, so public fills are never
+    processed by overlapping watchers.
     """
 
     def __init__(
@@ -196,7 +197,7 @@ class WatcherMembershipSupervisor:
         try:
             while not self._stopping:
                 try:
-                    desired = tuple(sorted({str(wallet).lower() for wallet in self.watcher_service.monitored_execution_wallets()}))
+                    desired = tuple(sorted({str(wallet).lower() for wallet in self.watcher_service.monitored_observation_wallets()}))
                     await self._reconcile(desired)
                 except asyncio.CancelledError:
                     raise
@@ -1388,6 +1389,7 @@ def create_control_center_app(
     paper_ledger_factory: Callable[[Path], PaperLedger] | None = None,
     ninjatrader_login_bootstrap_factory: Callable[[], NinjaTraderLoginBootstrap] | None = None,
     ninjatrader_maintenance_factory: Callable[..., NinjaTraderMaintenanceService] | None = None,
+    lane_ii_only: bool = False,
 ) -> Any:
     """Create the local FastAPI Phase C application; no live-trading routes exist."""
     try:
@@ -1794,6 +1796,35 @@ def create_control_center_app(
         # lifespan. It is deliberately outside routes, views, and websocket
         # connections so refreshes/remounts cannot create another listener.
         nonlocal paper_ledger_shutdown_receipt
+        if lane_ii_only:
+            supervisor: WatcherMembershipSupervisor | None = None
+            task: asyncio.Task[Any] | None = None
+            try:
+                if watcher_service is not None:
+                    if watcher_factory is None:
+                        from .hyperliquid import HyperliquidWatcher
+                        factory = HyperliquidWatcher
+                    else:
+                        factory = watcher_factory
+                    supervisor = WatcherMembershipSupervisor(
+                        watcher_service, factory, center.store,
+                        poll_interval_seconds=watcher_poll_interval_seconds,
+                        retry_delay_seconds=watcher_retry_delay_seconds,
+                        stop_timeout_seconds=watcher_stop_timeout_seconds,
+                    )
+                    watcher_runtime["supervisor"] = supervisor
+                    task = asyncio.create_task(supervisor.run())
+                    watcher_runtime["task"] = task
+                app.state.scheduler_engine = None
+                app.state.scheduler_service = scheduler_service
+                yield
+            finally:
+                if supervisor is not None:
+                    await supervisor.stop()
+                if task is not None:
+                    await asyncio.gather(task, return_exceptions=True)
+                watcher_runtime.clear()
+            return
         if ninjatrader_runtime.get("active"):
             raise RuntimeError("NINJATRADER_OBSERVER duplicate FastAPI lifespan refused")
         ninjatrader_runtime["active"] = True
@@ -3052,6 +3083,122 @@ def create_control_center_app(
                                  max_drawdown=max_drawdown, max_follower_drawdown=max_follower_drawdown, coverage=coverage,
                                  copyability_available=copyability_available, recent_days=recent_days, current_only=current_only)
 
+    lane_ii_evidence_root = Path(__file__).resolve().parents[2] / "reports" / "lane-ii"
+    lane_ii_cohort_path = lane_ii_evidence_root / "latest-cohort.json"
+
+    @app.get("/api/lane-ii/slim-status")
+    async def api_lane_ii_slim_status() -> dict[str, Any]:
+        from .lane_ii import lane_ii_status
+        return lane_ii_status(
+            execution_service,
+            cohort_path=lane_ii_cohort_path,
+            watcher_health=live_watcher_health(),
+        )
+
+    @app.post("/api/lane-ii/candidates/refresh")
+    async def api_lane_ii_refresh_candidates() -> dict[str, Any]:
+        from .lane_ii import refresh_public_cohort
+        if execution_service.database.list_targets("active") or execution_service.database.list_virtual_positions(open_only=True):
+            raise HTTPException(
+                status_code=409,
+                detail="The prospective cohort is frozen while PAPER members or positions are active. Pause and close PAPER positions before replacing it.",
+            )
+        retained = Path(os.getenv("BEELZEBUB_LANE_II_RETAINED_DB") or (
+            Path(__file__).resolve().parents[3] / "Trader" / "artifacts" / "copytrade.sqlite3"
+        ))
+        try:
+            return await asyncio.to_thread(
+                refresh_public_cohort,
+                execution_service,
+                retained_database=retained,
+                output_directory=lane_ii_evidence_root,
+                seed_limit=24,
+                analysis_limit=10,
+                target_count=7,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/lane-ii/observe")
+    async def api_lane_ii_observe() -> dict[str, Any]:
+        from .lane_ii import load_cohort_evidence
+        evidence = load_cohort_evidence(lane_ii_cohort_path)
+        if not evidence:
+            raise HTTPException(status_code=409, detail="No frozen Lane II cohort evidence is available. Refresh candidates first.")
+        selected = list(evidence.get("selected") or [])
+        roster_kind = "selected" if selected else "research_watchlist"
+        roster = selected or list(evidence.get("research_watchlist") or [])
+        wallets = [str(item.get("wallet") or "").lower() for item in roster[:WATCHER_MAX_SUBSCRIPTIONS]]
+        wallets = [wallet for wallet in wallets if wallet.startswith("0x") and len(wallet) == 42]
+        if not wallets:
+            raise HTTPException(status_code=409, detail="The frozen evidence contains no public wallets to observe.")
+        changed = []
+        try:
+            instrument_metadata = await asyncio.to_thread(execution_service.refresh_instrument_metadata)
+            for wallet in wallets:
+                target = execution_service.database.get_target(wallet)
+                if target and target.status != "active":
+                    changed.append(center.set_operator_state(wallet, "shadow", by="lane-ii-observe"))
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        refresh_watcher_membership()
+        return {
+            "state": "OBSERVATION_REQUESTED",
+            "roster_kind": roster_kind,
+            "wallets": wallets,
+            "changed": changed,
+            "read_only": True,
+            "paper_activated": False,
+            "exchange_authority": False,
+            "instrument_metadata": instrument_metadata,
+        }
+
+    @app.post("/api/lane-ii/paper/start")
+    async def api_lane_ii_start_paper() -> dict[str, Any]:
+        from .lane_ii import load_cohort_evidence
+        evidence = load_cohort_evidence(lane_ii_cohort_path)
+        selected = list((evidence or {}).get("selected") or [])
+        if execution_service.config.paper_strategy.strategy_id != "COHORT_COPY_V1":
+            raise HTTPException(status_code=409, detail="COHORT_COPY_V1 is not the configured paper strategy.")
+        if len(selected) < 5:
+            raise HTTPException(
+                status_code=409,
+                detail=f"PAPER start requires at least five unchanged-gate finalists; current selected count is {len(selected)}.",
+            )
+        wallets = [required_wallet(str(item.get("wallet") or "")) for item in selected]
+        try:
+            instrument_metadata = await asyncio.to_thread(execution_service.refresh_instrument_metadata)
+            # Preflight every member before the first status mutation so one
+            # stale recommendation cannot produce a partially active cohort.
+            for wallet in wallets:
+                center._validate_activation_authority(wallet)
+            activated = [center.activate_wallet(wallet, by="lane-ii-paper-start") for wallet in wallets]
+            control = center.resume_entries()
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        refresh_watcher_membership()
+        return {
+            "state": "PAPER_ACTIVE",
+            "display_account": "PAPER — $100 simulated",
+            "strategy_id": "COHORT_COPY_V1",
+            "activated": activated,
+            "control": control,
+            "exchange_authority": False,
+            "instrument_metadata": instrument_metadata,
+        }
+
+    @app.post("/api/lane-ii/live/start")
+    async def api_lane_ii_live_denied() -> Any:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "detail": "Lane II live trading is unavailable: U.S. venue eligibility is unresolved and no live adapter or admission path exists.",
+                "code": "LANE_II_LIVE_UNAVAILABLE",
+                "eligibility": "UNRESOLVED_US_VENUE_ELIGIBILITY",
+                "exchange_authority": False,
+            },
+        )
+
     @app.get("/api/candidates/{wallet}")
     async def api_candidate(wallet: str) -> dict[str, Any]:
         detail = center.candidate_detail(required_wallet(wallet))
@@ -3298,7 +3445,7 @@ def create_control_center_app(
 
 def serve_control_center(
     config: CopyTradeConfig, database: CopyTradeDatabase | None = None, *, host: str | None = None, port: int | None = None,
-    with_watcher: bool = False, service: Any | None = None,
+    with_watcher: bool = False, service: Any | None = None, lane_ii_only: bool = False,
 ) -> None:
     try:
         import uvicorn
@@ -3307,7 +3454,9 @@ def serve_control_center(
     if with_watcher and service is None:
         from .service import CopyTradeService
         service = CopyTradeService(config, database)
-    app = create_control_center_app(config, database, watcher_service=service if with_watcher else None)
+    app = create_control_center_app(
+        config, database, watcher_service=service if with_watcher else None, lane_ii_only=lane_ii_only,
+    )
     server = uvicorn.Server(uvicorn.Config(
         app,
         host=host or config.artifacts.dashboard_host,

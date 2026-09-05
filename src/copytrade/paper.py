@@ -232,7 +232,15 @@ class CopyRiskEngine:
         if portfolio.target_realized(signal.target_wallet) <= -cap_base * self.config.target_loss_stop_fraction: return RiskDecision(False, 0.0, "target_loss_stop")
         if portfolio.daily_realized(now) <= -cap_base * self.config.daily_loss_stop_fraction: return RiskDecision(False, 0.0, "daily_loss_stop")
         if abs(execution_price - signal.target_price) / max(signal.target_price, 1e-12) * 10_000 > self.config.max_price_deviation_bps: return RiskDecision(False, 0.0, "price_deviation")
-        if sum(s.is_open for s in portfolio.sleeves.values()) >= self.config.max_simultaneous_virtual_campaigns: return RiskDecision(False, 0.0, "max_simultaneous_campaigns")
+        existing_owned_campaign = any(
+            sleeve.is_open
+            and sleeve.target_wallet == signal.target_wallet.lower()
+            and sleeve.campaign_id == signal.campaign_id
+            and sleeve.symbol == signal.symbol
+            and sleeve.direction == signal.direction
+            for sleeve in portfolio.sleeves.values()
+        )
+        if not existing_owned_campaign and sum(s.is_open for s in portfolio.sleeves.values()) >= self.config.max_simultaneous_virtual_campaigns: return RiskDecision(False, 0.0, "max_simultaneous_campaigns")
         max_total = cap_base * self.config.max_total_committed_fraction
         max_target = cap_base * self.config.max_capital_per_target_fraction
         max_symbol = cap_base * self.config.max_capital_per_symbol_fraction
@@ -247,11 +255,18 @@ class CopyRiskEngine:
 class PaperExecutionEngine:
     """Deterministic paper-only sleeve execution with transaction-backed replay safety."""
 
-    def __init__(self, config: CopyTradeConfig, store: CopyTradeStore | None = None) -> None:
+    def __init__(
+        self, config: CopyTradeConfig, store: CopyTradeStore | None = None,
+        *, quantity_precision_by_symbol: dict[str, int] | None = None,
+    ) -> None:
         self.config, self.store = config, store
         self.portfolio = PaperPortfolio(config.capital.initial_capital)
         self.equity_history = [self.portfolio.equity]
         self.risk, self.rng = CopyRiskEngine(config.risk), random.Random(config.paper_execution.random_seed)
+        self.quantity_precision_by_symbol = {
+            str(symbol).upper(): int(precision)
+            for symbol, precision in (quantity_precision_by_symbol or {}).items()
+        }
         self._pending_fills: list[ExecutionFill] = []
         # D.2 records every newly committed PAPER economic result in the
         # Phase-D ledger.  The bridge is intentionally absent for lightweight
@@ -349,15 +364,33 @@ class PaperExecutionEngine:
         attempt_id = stable_id("attempt", signal.signal_id, received, "entry")
         if not decision.allowed: return self._attempt(attempt_id, signal, decision.reason, "skipped", received)
         if self.rng.random() < self.config.paper_execution.missed_trade_rate: return self._attempt(attempt_id, signal, "simulated_missed_trade", "missed", received)
-        quantity = self._quantize_quantity(decision.capital / execution_price)
+        quantity = self._quantize_quantity(decision.capital / execution_price, signal.symbol)
         notional, fee = quantity * execution_price, quantity * execution_price * self.config.paper_execution.fee_rate
         if notional < self.config.paper_execution.min_order_notional or quantity <= 0: return self._attempt(attempt_id, signal, "minimum_order_notional", "skipped", received)
         if (self.portfolio.cash or 0.0) + 1e-12 < decision.capital + fee: return self._attempt(attempt_id, signal, "insufficient_cash_after_fee", "skipped", received)
         sleeve_id = stable_id("sleeve", signal.target_wallet, signal.campaign_id or signal.source_event_id, signal.symbol, signal.direction)
-        sleeve = VirtualTargetPosition(sleeve_id=sleeve_id, target_wallet=signal.target_wallet.lower(), campaign_id=signal.campaign_id,
-            symbol=signal.symbol, direction=signal.direction, quantity=quantity, entry_price=execution_price,
-            allocated_capital=decision.capital, remaining_capital=decision.capital, entry_fee=fee, opened_at=as_utc(order_time),
-            updated_at=as_utc(order_time), target_entry_price=signal.target_price, current_mark=price)
+        sleeve = self.portfolio.sleeves.get(sleeve_id)
+        if sleeve is not None and sleeve.is_open:
+            prior_quantity = sleeve.quantity
+            combined_quantity = prior_quantity + quantity
+            sleeve.entry_price = (
+                sleeve.entry_price * prior_quantity + execution_price * quantity
+            ) / max(combined_quantity, 1e-12)
+            sleeve.target_entry_price = (
+                float(sleeve.target_entry_price or signal.target_price) * prior_quantity
+                + signal.target_price * quantity
+            ) / max(combined_quantity, 1e-12)
+            sleeve.quantity = combined_quantity
+            sleeve.allocated_capital += decision.capital
+            sleeve.remaining_capital += decision.capital
+            sleeve.entry_fee += fee
+            sleeve.current_mark = price
+            sleeve.updated_at = as_utc(order_time)
+        else:
+            sleeve = VirtualTargetPosition(sleeve_id=sleeve_id, target_wallet=signal.target_wallet.lower(), campaign_id=signal.campaign_id,
+                symbol=signal.symbol, direction=signal.direction, quantity=quantity, entry_price=execution_price,
+                allocated_capital=decision.capital, remaining_capital=decision.capital, entry_fee=fee, opened_at=as_utc(order_time),
+                updated_at=as_utc(order_time), target_entry_price=signal.target_price, current_mark=price)
         self.portfolio.cash = (self.portfolio.cash or 0.0) - decision.capital - fee
         self.portfolio.sleeves[sleeve_id] = sleeve
         # Entry fees leave cash immediately and are economically realized costs
@@ -378,7 +411,7 @@ class PaperExecutionEngine:
         fraction = 1.0 if signal.action == "close" else min(1.0, signal.target_quantity / max(abs(signal.target_position_before), 1e-12))
         for sleeve in candidates:
             exit_price = self._execution_price(price, sleeve.direction, opening=False)
-            closing_quantity = self._quantize_quantity(sleeve.quantity * fraction)
+            closing_quantity = self._quantize_quantity(sleeve.quantity * fraction, signal.symbol)
             if closing_quantity <= 0: continue
             actual_fraction = min(1.0, closing_quantity / max(sleeve.quantity, 1e-12))
             released = sleeve.remaining_capital * actual_fraction
@@ -421,5 +454,8 @@ class PaperExecutionEngine:
         bps = self.config.paper_execution.slippage_bps / 10_000
         return price * (1 + bps if (direction == "long") == opening else 1 - bps)
 
-    def _quantize_quantity(self, quantity: float) -> float:
-        return float(Decimal(str(quantity)).quantize(Decimal("1").scaleb(-self.config.paper_execution.quantity_precision), rounding=ROUND_DOWN))
+    def _quantize_quantity(self, quantity: float, symbol: str = "") -> float:
+        precision = self.quantity_precision_by_symbol.get(
+            symbol.upper(), self.config.paper_execution.quantity_precision,
+        )
+        return float(Decimal(str(quantity)).quantize(Decimal("1").scaleb(-precision), rounding=ROUND_DOWN))

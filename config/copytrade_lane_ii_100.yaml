@@ -1,0 +1,186 @@
+# Isolated Lane II profile. This file owns no exchange credentials or authority.
+mode: paper
+
+source:
+  venue: hyperliquid
+  network: mainnet
+  info_url: https://api.hyperliquid.xyz/info
+  websocket_url: wss://api.hyperliquid.xyz/ws
+  request_timeout_seconds: 20
+  reconnect_initial_seconds: 1
+  reconnect_max_seconds: 30
+  stale_after_seconds: 60
+  subscribe_order_updates: false
+  subscribe_position_state: true
+  subscribe_market_data: true
+
+targets: []
+
+capital:
+  initial_capital: 100.00
+  currency: USD
+
+# Proposed small-account PAPER policy. It is deliberately separate from the
+# legacy $200 5/10/20 profile and is not approved live risk policy.
+sizing:
+  mode: ratio
+  small_fraction: 0.12
+  medium_fraction: 0.16
+  large_fraction: 0.20
+  small_ratio_max: 0.67
+  large_ratio_min: 1.50
+  min_history: 10
+  fallback_fraction: 0.12
+  quantiles: [0.33, 0.67]
+  copy_initial_entries: true
+  copy_target_adds: true
+  max_equity_age_seconds: 300
+  accepted_equity_sources: [exact, recent_live_snapshot, sampled_prior_proxy]
+
+risk:
+  max_total_committed_fraction: 0.60
+  max_capital_per_target_fraction: 0.25
+  max_capital_per_symbol_fraction: 0.30
+  max_simultaneous_virtual_campaigns: 5
+  daily_loss_stop_fraction: 0.05
+  target_loss_stop_fraction: 0.075
+  max_copy_drawdown_fraction: 0.10
+  max_consecutive_losses: 3
+  kill_switch_path: runtime/lane-ii/state/copytrade_kill_switch.txt
+  max_signal_age_seconds: 30
+  max_price_deviation_bps: 50
+  insufficient_capital_action: scale
+  symbol_allowlist: []
+  symbol_blocklist: []
+  max_leverage: null
+  risk_cap_base: current_equity
+
+paper_strategy:
+  strategy_id: COHORT_COPY_V1
+  version: 1
+
+paper_execution:
+  min_order_notional: 10
+  quantity_precision: 6
+  missed_trade_rate: 0
+  random_seed: 7
+  market_data_max_age_ms: 3000
+  mark_persist_interval_ms: 1000
+  stale_exit_market_policy: target_fill_fallback
+
+fees:
+  paper_fee_rate: 0.00045
+
+slippage:
+  paper_bps: 5
+
+latency:
+  detection_ms: 250
+  order_ms: 100
+
+backtest:
+  detection_delays_ms: [100, 250, 500, 1000, 2000, 5000, 15000]
+  slippage_scenarios_bps: [0, 1, 2, 5, 10, 25]
+  training_windows_days: [30, 60, 90, 180]
+  forward_windows_days: [7, 14, 30]
+  default_training_days: 90
+  default_forward_days: 30
+
+# These retain the current Phase B evidence gates; the cohort target is never
+# filled by weakening them.
+candidates:
+  history_days_min: 90
+  history_days_preferred: 180
+  closed_campaigns_min: 100
+  max_drawdown_preferred: 0.15
+  max_drawdown_hard: 0.25
+  max_follower_drawdown_preferred: 0.15
+  max_follower_drawdown_hard: 0.30
+  liquidation_frequency_hard: 0.10
+  minimum_copyability_hard: 0.05
+  pnl_concentration_preferred: 0.50
+  pnl_concentration_hard: 0.95
+  profit_factor_preferred: 1.40
+  require_positive_expectancy: true
+  require_positive_follower_expectancy: true
+  activity_max_age_days: 30
+  require_proven_history: false
+
+prefilter:
+  min_activity_observations: 2
+  min_distinct_active_days: 1
+  min_distinct_active_hours: 1
+  min_observation_span_hours: 0
+  min_observed_notional: 0
+  min_distinct_symbols: 1
+  exclude_operator_managed: true
+
+confidence:
+  closed_campaigns_reference: 100
+  active_days_reference: 30
+  history_days_reference: 180
+  walk_forward_windows_reference: 4
+  regimes_reference: 2
+
+regimes:
+  enabled: true
+  volatility_move_threshold: 0.03
+  minimum_campaigns_per_regime: 3
+
+finalist_requirements:
+  minimum_confidence_score: 60
+  require_copyability_evidence: true
+  require_walk_forward_evidence: false
+  require_latency_evidence: false
+  require_regime_evidence: false
+
+analysis:
+  default_workers: 4
+  retry_attempts: 3
+  retry_initial_seconds: 0.25
+  api_weight_budget_per_minute: 900
+  rate_limit_backoff_initial_seconds: 2.0
+  rate_limit_backoff_max_seconds: 30.0
+  rate_limit_jitter_seconds: 0.5
+  history_days: 180
+  min_discovery_activity: 2
+  shadow_finalist_count: 7
+  walk_forward_min_windows: 2
+  high_suitability_score: 70
+  market_evidence_enabled: true
+  market_evidence_bucket_seconds: 60
+
+storage:
+  hot_root: runtime/lane-ii/hot
+  cold_root: runtime/lane-ii/cold
+  archive_spool_max_bytes: 134217728
+  archive_spool_max_age_seconds: 604800
+
+scientific_execution:
+  enabled: true
+  max_position_age_seconds: 600
+  entry_min_effective_confidence: 0.60
+  exit_effective_confidence: 0.52
+
+scientific_worker:
+  enabled: false
+
+scheduler:
+  enabled: false
+  default_timezone: America/Denver
+
+commissioning:
+  enabled: false
+
+database:
+  path: runtime/lane-ii/hot/copytrade.sqlite3
+
+obsidian:
+  root: runtime/lane-ii/obsidian
+
+dashboard:
+  host: 127.0.0.1
+  port: 8092
+
+future_live_execution:
+  enabled: false

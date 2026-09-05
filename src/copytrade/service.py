@@ -76,6 +76,8 @@ class CopyTradeService:
         )
         self.adapter = HyperliquidPublicAdapter(config.source, limiter=self.api_limiter)
         self.market_cache = LiveMarketCache()
+        self.instrument_quantity_precision: dict[str, int] = {}
+        self.instrument_metadata_updated_at: object | None = None
         # All services against one SQLite portfolio share this mutable engine
         # and lock.  The application passes one service to the Control Center;
         # this registry additionally makes an in-process fallback unable to
@@ -112,7 +114,10 @@ class CopyTradeService:
         makes the replacement atomic with respect to watcher mutations.
         """
         with self._execution_lock:
-            engine = PaperExecutionEngine(self.config, self.database)
+            engine = PaperExecutionEngine(
+                self.config, self.database,
+                quantity_precision_by_symbol=self.instrument_quantity_precision,
+            )
             engine.restore(
                 self.database.list_virtual_positions(), self.database.latest_portfolio_snapshot(),
                 self.database.list_realized_results(),
@@ -123,6 +128,21 @@ class CopyTradeService:
 
     def _execution_engine(self) -> PaperExecutionEngine:
         return self._live_engine or self.reload_execution_state()
+
+    def refresh_instrument_metadata(self) -> dict[str, object]:
+        """Refresh public lot precision without acquiring execution authority."""
+        precisions = self.adapter.fetch_quantity_precisions()
+        self.instrument_quantity_precision = dict(precisions)
+        self.instrument_metadata_updated_at = utc_now()
+        if self._live_engine is not None:
+            self._live_engine.quantity_precision_by_symbol = dict(precisions)
+        return {
+            "state": "CURRENT",
+            "updated_at": self.instrument_metadata_updated_at.isoformat(),
+            "instrument_count": len(precisions),
+            "source": "hyperliquid_public_meta",
+            "exchange_authority": False,
+        }
 
     def import_wallets(self, wallets: Iterable[str], *, label_prefix: str = "") -> list[Target]:
         imported: list[Target] = []
@@ -552,6 +572,9 @@ class CopyTradeService:
         metadata: dict[str, object] = {
             "target_fill_price": event.price, "source_fill_timestamp": event.event_timestamp.isoformat(),
             "local_receive_timestamp": received_at.isoformat(), "market_reference_age_ms": age_ms,
+            "paper_strategy_id": self.config.paper_strategy.strategy_id,
+            "paper_strategy_version": self.config.paper_strategy.version,
+            "source_leverage_ignored": True,
         }
         if self.scientific_worker is not None:
             # This bridge records evidence and queues feature work only.  It
@@ -563,7 +586,10 @@ class CopyTradeService:
                 payload={"position_event_id": event.event_id, "side": signal.direction, "action": signal.action,
                          "price": event.price, "notional": event.notional, "estimated_cost": self.config.paper_execution.fee_rate},
             )
-        if self.science_repository is not None:
+        if (
+            self.science_repository is not None
+            and self.config.paper_strategy.strategy_id != "COHORT_COPY_V1"
+        ):
             # D.5 production topology: source actions are retained as sensor
             # evidence, never turned directly into PAPER exposure or an exit.
             # A later scientific model router must emit its own decision record
@@ -581,6 +607,12 @@ class CopyTradeService:
             )
             engine.process_signal(signal, received_at=received_at, market_metadata=metadata, forced_reason="scientific_decision_required")
             return
+        if self.config.paper_strategy.strategy_id == "COHORT_COPY_V1":
+            metadata.update({
+                "source_action_role": "paper_cohort_position_change",
+                "execution_mode": "PAPER_ONLY",
+                "exchange_authority": False,
+            })
         entry_block = (
             "source_recovery_not_continuous" if recovery_state != "CONTINUOUS" and signal.action in {"open", "add"}
             else self.control_store.entry_block_reason(signal.target_wallet, signal.action)
@@ -924,9 +956,18 @@ class CopyTradeService:
         exits = {position.target_wallet for position in self.database.list_virtual_positions(open_only=True)}
         return sorted(active | exits)
 
+    def monitored_observation_wallets(self) -> list[str]:
+        """Observe Shadow and Active wallets, retaining open-sleeve exit ownership.
+
+        Shadow membership is deliberately observation-only. Entry authority
+        remains the canonical Active status plus the durable paper controls.
+        """
+        shadow = {target.wallet for target in self.database.list_targets(TargetStatus.SHADOW.value)}
+        return sorted(shadow | set(self.monitored_execution_wallets()))
+
     async def reconcile_monitored_wallets(self) -> dict[str, int]:
         result: dict[str, int] = {}
-        for wallet in self.monitored_execution_wallets():
+        for wallet in self.monitored_observation_wallets():
             result[wallet] = await self.reconcile_wallet(wallet)
         return result
 
