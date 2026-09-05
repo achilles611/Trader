@@ -30,6 +30,14 @@ _FINAL_STATES = {
 }
 _OPERATOR_CONTROLLED_TARGET_STATES = {"approved", "shadow", "active", "muted", "rejected"}
 
+# Historical candle snapshots are optional evidence, not an authority for
+# qualification. Bound their work independently of fill acquisition so an
+# unsupported symbol cannot turn a finite Phase-B run into thousands of
+# duplicate-miss requests. These are implementation safety limits, not
+# configurable eligibility thresholds; frozen policy fingerprints stay intact.
+_MAX_HISTORICAL_MARKET_EVIDENCE_BUCKETS = 128
+_MAX_MISSING_HISTORICAL_MARKET_BUCKETS_PER_SYMBOL = 2
+
 
 class CandidateAnalysisPipeline:
     """Resumable, research-only Phase B orchestration around existing components.
@@ -152,6 +160,40 @@ class CandidateAnalysisPipeline:
                 if run_wallet and run_wallet["stage"] == "backfill" and run_wallet["status"] == "completed":
                     ready_for_analysis.append(wallet)
                     continue
+                if existing_run and run_wallet and run_wallet["stage"] == "backfill" and run_wallet["status"] == "started":
+                    # A controlled interruption can happen after the adapter
+                    # durably writes raw pages and a bounded coverage record,
+                    # but before the scheduler records its lifecycle result.
+                    # Adopt only an exact saved window; never infer a page
+                    # frontier, source response, or per-wallet request count
+                    # from raw fills alone.
+                    adopted_coverage = self._adoptable_started_backfill(wallet, required_start, required_end)
+                    if adopted_coverage is not None:
+                        adoption = {
+                            "recovery_adopted_saved_evidence": True,
+                            "coverage": adopted_coverage,
+                            "recoverability": {
+                                "basis": "durable exact-window coverage record",
+                                "raw_fill_frontier_inferred": False,
+                                "lost_in_memory_request_accounting": "unknown_not_reconstructed",
+                                "new_public_requests_scheduled": 0,
+                            },
+                        }
+                        if str(adopted_coverage.get("coverage_state")) == "KNOWN_INCOMPLETE":
+                            self._save_candidate(
+                                wallet, CandidateAnalysisState.QUARANTINED.value, run["run_id"],
+                                reasons=("known_incomplete",), summary={"coverage": adopted_coverage, **adoption}, completed=True,
+                            )
+                            self.database.record_analysis_wallet(
+                                run["run_id"], wallet, stage="backfill", status="quarantined", payload=adoption,
+                            )
+                        else:
+                            self.database.record_analysis_wallet(
+                                run["run_id"], wallet, stage="backfill", status="completed", payload=adoption,
+                            )
+                            self._save_candidate(wallet, CandidateAnalysisState.ANALYSIS_PENDING.value, run["run_id"], completed=False)
+                            ready_for_analysis.append(wallet)
+                        continue
                 if run_wallet and run_wallet["stage"] == "backfill" and run_wallet["status"] == "deferred":
                     # A bounded acquisition has already emitted its durable
                     # checkpoint and outcome.  A resume must not turn that
@@ -689,6 +731,7 @@ class CandidateAnalysisPipeline:
         metrics.raw["analysis_window_coverage"] = coverage
         self.database.upsert_metrics(metrics)
         market_evidence = self._historical_market_evidence(run_id, events)
+        market_acquisition = market_evidence.acquisition_metadata() if market_evidence else None
         backtester = CopyTradeBacktester(self.config, market_data=market_evidence)
         baseline = backtester.run(events=events, coverage_metadata=coverage)
         slippage = backtester.slippage_scenarios(events=events)
@@ -702,6 +745,16 @@ class CandidateAnalysisPipeline:
         copyability = _copyability(metrics.net_pnl, metrics.raw, baseline.summary, coverage)
         friction = _friction_evidence(slippage)
         latency_evidence = _latency_evidence(latency)
+        if market_acquisition and bool(market_acquisition.get("truncated")):
+            # A deliberately bounded optional candle attempt cannot establish
+            # price-sensitive latency. The policy may treat missing latency as
+            # a warning, but no partial source prefix is presented as a
+            # positive latency result.
+            latency_evidence = {
+                **latency_evidence,
+                "status": "unavailable",
+                "reason": "bounded_incomplete_historical_market_evidence",
+            }
         regime = _regime_evidence(campaigns, self.config)
         pathology = _pathology_evidence(metrics, campaigns, self.config)
         metrics.raw["pathology"] = pathology
@@ -719,7 +772,7 @@ class CandidateAnalysisPipeline:
             profit_factor=float(follower["profit_factor"] or 0.0),
             max_drawdown=float(baseline.summary["max_drawdown_fraction"]),
             missed_trade_rate=float(follower["missed_trade_rate"]),
-            latency_curve=tuple(latency), latency_status="available" if latency else "unavailable",
+            latency_curve=tuple(latency), latency_status=str(latency_evidence["status"]),
             return_fraction=float(follower["return_fraction"]),
             copyability_score=copyability["score"] if copyability["status"] == "available" else None,
             slippage_robustness=friction.get("retention_score"), friction_robustness=friction.get("score"),
@@ -765,9 +818,14 @@ class CandidateAnalysisPipeline:
             "stress_tests": {"slippage": friction, "latency": latency_evidence},
             "latency": {"status": "available" if latency else "unavailable", "curve": latency, **latency_evidence},
             "market_evidence": {
-                "status": "available" if market_evidence and any(item.get("price") is not None for item in market_evidence.evidence_metadata()) else "unavailable",
+                "status": (
+                    "bounded_incomplete" if market_acquisition and bool(market_acquisition.get("truncated")) else
+                    "available" if market_evidence and any(item.get("price") is not None for item in market_evidence.evidence_metadata()) else
+                    "unavailable"
+                ),
                 "resolution": f"{self.config.analysis.market_evidence_bucket_seconds}s" if market_evidence else None,
                 "observations": market_evidence.evidence_metadata() if market_evidence else [],
+                "acquisition": market_acquisition,
                 "quality_note": "Public candle-close proxy only; this is not historical L2/order-book execution evidence.",
             },
             "walk_forward": walk_forward,
@@ -794,6 +852,8 @@ class CandidateAnalysisPipeline:
             self._market_data_factory(), bucket_seconds=self.config.analysis.market_evidence_bucket_seconds,
             load=lambda symbol, bucket: self.database.get_analysis_market_evidence(run_id, symbol, bucket),
             store=lambda item: self.database.insert_analysis_market_evidence(run_id, item),
+            max_observations=_MAX_HISTORICAL_MARKET_EVIDENCE_BUCKETS,
+            max_missing_observations_per_symbol=_MAX_MISSING_HISTORICAL_MARKET_BUCKETS_PER_SYMBOL,
         )
         delays = set(self.config.backtest.detection_delays_ms)
         delays.add(self.config.paper_execution.detection_latency_ms)
@@ -831,6 +891,26 @@ class CandidateAnalysisPipeline:
             ),
             "diversification_selected": len(finalists), "shadow_finalists": finalists,
         }
+
+    def _adoptable_started_backfill(
+        self, wallet: str, required_start: object, required_end: object,
+    ) -> dict[str, Any] | None:
+        """Return only a durable full-window coverage record safe to adopt.
+
+        A started lifecycle row alone is not a resume frontier. The adapter's
+        coverage record, however, is durably written after its bounded fill
+        request returns and names the exact immutable interval. This permits a
+        controlled recovery to analyze saved evidence without commissioning
+        another historical acquisition or claiming lost in-memory details.
+        """
+        coverage = self.database.analysis_window_coverage(wallet, required_start, required_end)
+        start, end = as_utc(required_start), as_utc(required_end)
+        exact_window = any(
+            as_utc(item.get("requested_start")) == start and as_utc(item.get("requested_end")) == end
+            for item in list(coverage.get("segments") or ())
+            if item.get("requested_start") and item.get("requested_end")
+        )
+        return coverage if exact_window else None
 
 
 def _bounded_no_progress_result(result: dict[str, object], *, attempts: int) -> dict[str, object]:

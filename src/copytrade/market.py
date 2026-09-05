@@ -135,16 +135,30 @@ class CachedHistoricalMarketData:
         self, delegate: MarketDataProvider, *, bucket_seconds: int = 60,
         load: Callable[[str, str], Mapping[str, object] | None] | None = None,
         store: Callable[[Mapping[str, object]], None] | None = None,
+        max_observations: int | None = None,
+        max_missing_observations_per_symbol: int | None = None,
     ) -> None:
         if bucket_seconds <= 0:
             raise ValueError("bucket_seconds must be positive.")
+        if max_observations is not None and max_observations <= 0:
+            raise ValueError("max_observations must be positive when provided.")
+        if max_missing_observations_per_symbol is not None and max_missing_observations_per_symbol <= 0:
+            raise ValueError("max_missing_observations_per_symbol must be positive when provided.")
         self.delegate = delegate
         self.bucket_seconds = bucket_seconds
         self._load = load
         self._store = store
+        self._max_observations = max_observations
+        self._max_missing_observations_per_symbol = max_missing_observations_per_symbol
         self._cache: dict[tuple[str, str], MarketPrice | None] = {}
         self._metadata: dict[tuple[str, str], dict[str, object]] = {}
         self._frozen = False
+        self._truncated = False
+        self._requested_bucket_count = 0
+        self._selected_bucket_count = 0
+        self._skipped_by_total_cap = 0
+        self._skipped_by_symbol_missing_cap: dict[str, int] = {}
+        self._missing_by_symbol: dict[str, int] = {}
 
     def prime(self, requests: Iterable[tuple[str, object]]) -> None:
         """Acquire every unique symbol/time bucket once, then disallow fetches."""
@@ -157,11 +171,32 @@ class CachedHistoricalMarketData:
             # choosing a later candle reference when events arrive unordered.
             if key not in requested_by_key or requested_at < requested_by_key[key]:
                 requested_by_key[key] = requested_at
+        self._requested_bucket_count = len(requested_by_key)
         for (symbol, _), requested_at in sorted(requested_by_key.items()):
-            self._get(symbol, requested_at, allow_fetch=True)
+            if (
+                self._max_missing_observations_per_symbol is not None
+                and self._missing_by_symbol.get(symbol, 0) >= self._max_missing_observations_per_symbol
+            ):
+                self._truncated = True
+                self._skipped_by_symbol_missing_cap[symbol] = self._skipped_by_symbol_missing_cap.get(symbol, 0) + 1
+                continue
+            if self._max_observations is not None and self._selected_bucket_count >= self._max_observations:
+                self._truncated = True
+                self._skipped_by_total_cap += 1
+                continue
+            price = self._get(symbol, requested_at, allow_fetch=True)
+            self._selected_bucket_count += 1
+            if price is None:
+                self._missing_by_symbol[symbol] = self._missing_by_symbol.get(symbol, 0) + 1
         self._frozen = True
 
     def historical_price(self, symbol: str, timestamp: object) -> MarketPrice | None:
+        # A partial historical-price population must not affect a simulated
+        # execution path. The source evidence remains durable and explicit,
+        # but replay falls back to its documented non-latency-sensitive model
+        # rather than combining an arbitrary price prefix with target fills.
+        if self._truncated:
+            return None
         return self._get(str(symbol).upper(), as_utc(timestamp), allow_fetch=not self._frozen)
 
     def current_price(self, symbol: str) -> MarketPrice:
@@ -172,6 +207,24 @@ class CachedHistoricalMarketData:
 
     def evidence_metadata(self) -> list[dict[str, object]]:
         return [self._metadata[key] for key in sorted(self._metadata)]
+
+    def acquisition_metadata(self) -> dict[str, object]:
+        """Describe a bounded historical-price attempt without inventing coverage.
+
+        This is separate from individual bucket rows because unrequested
+        buckets are intentionally not written as if the source had answered
+        them. A truncation makes price-based latency evidence unavailable; it
+        is not a price observation or a qualification shortcut.
+        """
+        return {
+            "requested_bucket_count": self._requested_bucket_count,
+            "selected_bucket_count": self._selected_bucket_count,
+            "truncated": self._truncated,
+            "max_observations": self._max_observations,
+            "max_missing_observations_per_symbol": self._max_missing_observations_per_symbol,
+            "skipped_by_total_cap": self._skipped_by_total_cap,
+            "skipped_by_symbol_missing_cap": dict(sorted(self._skipped_by_symbol_missing_cap.items())),
+        }
 
     def _get(self, symbol: str, requested_at: datetime, *, allow_fetch: bool) -> MarketPrice | None:
         bucket = self._bucket_iso(requested_at)

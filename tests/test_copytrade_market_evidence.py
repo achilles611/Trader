@@ -73,6 +73,36 @@ class HistoricalMarketEvidenceTests(unittest.TestCase):
         self.assertEqual(_latency_evidence(curve)["status"], "unavailable")
         self.assertEqual(_latency_evidence(curve)["reason"], "missing_or_insufficient_historical_price_evidence")
 
+    def test_missing_symbol_and_total_caps_bound_optional_price_work_without_partial_replay(self) -> None:
+        provider = CountingHistoricalMarket(available=False)
+        market = CachedHistoricalMarketData(
+            provider, bucket_seconds=60, max_observations=3, max_missing_observations_per_symbol=2,
+        )
+        market.prime([
+            ("BTC", T0),
+            ("BTC", T0 + timedelta(minutes=1)),
+            ("BTC", T0 + timedelta(minutes=2)),
+            ("ETH", T0),
+        ])
+        self.assertEqual(provider.calls, 3)
+        acquisition = market.acquisition_metadata()
+        self.assertEqual(acquisition["requested_bucket_count"], 4)
+        self.assertEqual(acquisition["selected_bucket_count"], 3)
+        self.assertTrue(acquisition["truncated"])
+        self.assertEqual(acquisition["skipped_by_symbol_missing_cap"], {"BTC": 1})
+        self.assertEqual(acquisition["skipped_by_total_cap"], 0)
+        # A bounded prefix cannot influence a replay. It remains an explicit
+        # unavailable-data condition rather than a synthetic market price.
+        self.assertIsNone(market.historical_price("ETH", T0))
+
+    def test_total_cap_invalidates_partial_available_price_prefix(self) -> None:
+        provider = CountingHistoricalMarket()
+        market = CachedHistoricalMarketData(provider, bucket_seconds=60, max_observations=1)
+        market.prime([("BTC", T0), ("BTC", T0 + timedelta(minutes=1))])
+        self.assertEqual(provider.calls, 1)
+        self.assertTrue(market.acquisition_metadata()["truncated"])
+        self.assertIsNone(market.historical_price("BTC", T0))
+
 
 if __name__ == "__main__":
     unittest.main()

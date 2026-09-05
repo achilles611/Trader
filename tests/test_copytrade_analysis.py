@@ -496,6 +496,70 @@ class PhaseBAnalysisTests(unittest.TestCase):
             self.assertIn("candidates", payload)
             self.assertEqual(payload["candidates"][0]["wallet"], GOOD)
 
+    def test_resume_adopts_exact_window_coverage_after_interrupt_without_refetch(self) -> None:
+        """A durable adapter completion may be adopted without inventing its RAM result."""
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            seed_candidates(service, [GOOD])
+            calls: list[str] = []
+
+            def interrupted_backfill(wallet: str, start: object, end: object) -> dict[str, object]:
+                calls.append(wallet)
+                service.database.insert_raw_fills(fills(wallet))
+                service.database.insert_backfill_coverage(wallet, BackfillCoverage(
+                    requested_start=start, requested_end=end,
+                    earliest_observed_fill=FILL_AT, latest_observed_fill=FILL_AT + timedelta(minutes=1),
+                    source_limit_detected=False, coverage_complete=False,
+                    coverage_quality="fixture_saved_unproven", coverage_state="UNPROVEN",
+                ))
+                raise KeyboardInterrupt("fixture stops after durable coverage")
+
+            with self.assertRaises(KeyboardInterrupt):
+                CandidateAnalysisPipeline(service, backfill_wallet=interrupted_backfill).run(limit=1, workers=1)
+            run = service.database.latest_resumable_analysis_run()
+            self.assertIsNotNone(run)
+            run_id = str(run["run_id"])
+
+            def must_not_refetch(*_args: object) -> dict[str, object]:
+                raise AssertionError("durable exact-window coverage must be adopted without another acquisition")
+
+            resumed = CandidateAnalysisPipeline(service, backfill_wallet=must_not_refetch).run(resume=True, workers=1)
+            self.assertEqual(resumed["run_id"], run_id)
+            self.assertEqual(calls, [GOOD])
+            events = service.database.list_analysis_wallet_events(run_id, GOOD)
+            self.assertEqual([event["status"] for event in events], ["accepted", "started", "completed", "completed"])
+            adoption = json.loads(events[2]["payload_json"])
+            self.assertTrue(adoption["recovery_adopted_saved_evidence"])
+            self.assertEqual(adoption["recoverability"]["lost_in_memory_request_accounting"], "unknown_not_reconstructed")
+            self.assertEqual(adoption["recoverability"]["new_public_requests_scheduled"], 0)
+
+    def test_resume_adopts_known_incomplete_coverage_as_quarantine_without_refetch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            seed_candidates(service, [INCOMPLETE])
+
+            def interrupted_backfill(wallet: str, start: object, end: object) -> dict[str, object]:
+                service.database.insert_backfill_coverage(wallet, BackfillCoverage(
+                    requested_start=start, requested_end=end, earliest_observed_fill=None, latest_observed_fill=None,
+                    source_limit_detected=True, coverage_complete=False,
+                    coverage_quality="fixture_dense_cap", coverage_state="KNOWN_INCOMPLETE",
+                ))
+                raise KeyboardInterrupt("fixture stops after durable known-incomplete coverage")
+
+            with self.assertRaises(KeyboardInterrupt):
+                CandidateAnalysisPipeline(service, backfill_wallet=interrupted_backfill).run(limit=1, workers=1)
+
+            def must_not_refetch(*_args: object) -> dict[str, object]:
+                raise AssertionError("known-incomplete durable coverage must not trigger a retry")
+
+            resumed = CandidateAnalysisPipeline(service, backfill_wallet=must_not_refetch).run(resume=True, workers=1)
+            self.assertEqual((resumed["rejected"], resumed["scored"]), (1, 0))
+            analysis = service.database.get_candidate_analysis(INCOMPLETE)
+            self.assertEqual(analysis.lifecycle_status, "quarantined")  # type: ignore[union-attr]
+            row = service.database.get_analysis_wallet(str(resumed["run_id"]), INCOMPLETE)
+            self.assertEqual((row["stage"], row["status"]), ("backfill", "quarantined"))  # type: ignore[index]
+            self.assertTrue(json.loads(row["payload_json"])["recovery_adopted_saved_evidence"])  # type: ignore[index]
+
     def test_finalists_require_current_qualified_phase_b_score_and_respect_operator_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             service = CopyTradeService(config(Path(temp)))
