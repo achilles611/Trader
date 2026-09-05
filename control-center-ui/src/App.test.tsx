@@ -87,7 +87,7 @@ let laneIIStatusResponse: Record<string, unknown> = {
   overall: { state: "RESEARCH_SHORTFALL", next_action: "Continue public observation; fewer than five candidates meet the unchanged evidence gates." },
   readiness: {
     public_observation: { state: "CONNECTED", read_only: true },
-    paper: { state: "BLOCKED_COHORT_SHORTFALL", selected_count: 0 },
+    paper: { state: "BLOCKED_COHORT_SHORTFALL", selected_count: 0, minimum_selected: 5, blocker: "Start is disabled: 0 of 5 unchanged-gate finalists are selected." },
     testnet: { state: "BLOCKED_PREREQUISITES" },
     live: { state: "UNAVAILABLE", eligibility: "UNRESOLVED_US_VENUE_ELIGIBILITY", backend_denied: true },
   },
@@ -306,7 +306,7 @@ beforeEach(() => {
     overall: { state: "RESEARCH_SHORTFALL", next_action: "Continue public observation; fewer than five candidates meet the unchanged evidence gates." },
     readiness: {
       public_observation: { state: "CONNECTED", read_only: true },
-      paper: { state: "BLOCKED_COHORT_SHORTFALL", selected_count: 0 },
+      paper: { state: "BLOCKED_COHORT_SHORTFALL", selected_count: 0, minimum_selected: 5, blocker: "Start is disabled: 0 of 5 unchanged-gate finalists are selected." },
       testnet: { state: "BLOCKED_PREREQUISITES" },
       live: { state: "UNAVAILABLE", eligibility: "UNRESOLVED_US_VENUE_ELIGIBILITY", backend_denied: true },
     },
@@ -334,6 +334,7 @@ describe("copy control center", () => {
     expect(await screen.findByText("PAPER — $100 simulated")).toBeInTheDocument();
     expect(screen.getByText("Evidence shortfall")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Start Paper Copying" })).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("0 of 5 unchanged-gate finalists are selected");
     expect(screen.getByRole("button", { name: "Live Trading Unavailable" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Lane III — Futures" }));
     expect(await screen.findByRole("heading", { name: "Select profile" })).toBeInTheDocument();

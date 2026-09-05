@@ -138,6 +138,30 @@ class LaneIICohortCopyTests(unittest.TestCase):
             self.assertEqual(status["readiness"]["live"]["state"], "UNAVAILABLE")
             self.assertEqual(status["readiness"]["paper"]["state"], "BLOCKED_COHORT_SHORTFALL")
 
+    def test_terminal_shortfall_explains_disabled_paper_start(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            cohort = root / "latest-cohort.json"
+            cohort.write_text(json.dumps({
+                "schema": "beelzebub-lane-ii-cohort-v1",
+                "selection_status": "COHORT_SHORTFALL_EVIDENCE_DEPENDENCY",
+                "selected": [],
+                "research_watchlist": [],
+                "screening": {"available": 100},
+                "shortfall": {
+                    "minimum_required": 5,
+                    "summary": "Zero qualified wallets after the bounded source pilots.",
+                    "paper_start_blocker": "Start is disabled: 0 of 5 required finalists qualified.",
+                    "next_action": "Supply a verified zero-cost historical source or keep Lane II disarmed.",
+                },
+            }), encoding="utf-8")
+            status = lane_ii_status(CopyTradeService(_config(root)), cohort_path=cohort)
+            self.assertEqual(status["overall"]["state"], "RESEARCH_SHORTFALL")
+            self.assertEqual(status["overall"]["next_action"], "Supply a verified zero-cost historical source or keep Lane II disarmed.")
+            self.assertEqual(status["readiness"]["paper"]["blocker"], "Start is disabled: 0 of 5 required finalists qualified.")
+            self.assertEqual(status["cohort"]["shortfall"]["minimum_required"], 5)
+            self.assertFalse(status["controls"]["start_paper_available"])
+
     def test_frozen_no_spend_screen_is_deterministic_and_does_not_start_phase_b(self) -> None:
         class PublicOnlyAdapter:
             def __init__(self) -> None:

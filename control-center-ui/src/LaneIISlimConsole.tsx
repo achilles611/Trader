@@ -55,6 +55,8 @@ export function LaneIISlimConsole({ onFullConsole }: { onFullConsole: () => void
   const portfolio = status?.portfolio || {};
   const policy = status?.paper_policy || {};
   const controls = status?.controls || {};
+  const shortfall = cohort.shortfall || {};
+  const paperStartBlocker = controls.start_paper_blocker || readiness.paper?.blocker;
 
   return <div className="lane-ii-slim">
     <header className="lane-ii-hero">
@@ -89,11 +91,12 @@ export function LaneIISlimConsole({ onFullConsole }: { onFullConsole: () => void
       <section className="lane-ii-controls" aria-label="Lane II controls">
         <button className="button minor" disabled={Boolean(busy) || !controls.refresh_candidates_available} onClick={() => void act("Refresh Candidates", "/api/lane-ii/candidates/refresh", "Candidate evidence refresh completed.")}>{busy === "Refresh Candidates" ? "Refreshing…" : "Refresh Candidates"}</button>
         <button className="button positive" disabled={Boolean(busy) || !controls.observe_available} onClick={() => void act("Observe", "/api/lane-ii/observe", "Read-only public observation requested.")}>{busy === "Observe" ? "Starting…" : "Observe"}</button>
-        <button className="button positive" disabled={Boolean(busy) || !controls.start_paper_available} onClick={() => void act("Start Paper Copying", "/api/lane-ii/paper/start", "Lane II PAPER copying started after backend confirmation.")}>{busy === "Start Paper Copying" ? "Starting…" : "Start Paper Copying"}</button>
+        <button className="button positive" title={!controls.start_paper_available ? paperStartBlocker : undefined} disabled={Boolean(busy) || !controls.start_paper_available} onClick={() => void act("Start Paper Copying", "/api/lane-ii/paper/start", "Lane II PAPER copying started after backend confirmation.")}>{busy === "Start Paper Copying" ? "Starting…" : "Start Paper Copying"}</button>
         <button className="button warning" disabled={Boolean(busy)} onClick={() => void act("Pause New Entries", "/api/controls/pause-entries", "New Lane II PAPER entries paused; exits remain available.")}>Pause New Entries</button>
         <button className="button critical outline" disabled={Boolean(busy) || !controls.close_paper_positions_available} onClick={() => void act("Close Paper Positions", "/api/controls/close-all-paper-positions", "Backend completed the PAPER close request.")}>Close Paper Positions</button>
         <button className="button critical" disabled title="Unavailable: U.S. venue eligibility is unresolved and no live adapter exists.">Live Trading Unavailable</button>
       </section>
+      {!controls.start_paper_available && paperStartBlocker && <p className="lane-ii-control-blocker" role="status">{paperStartBlocker}</p>}
 
       <section className="lane-ii-funnel" aria-label="Lane II discovery funnel">
         {(status.funnel || []).map((item: any) => <div key={item.label}><strong>{Number(item.count || 0).toLocaleString()}</strong><span>{item.label}</span></div>)}
@@ -126,6 +129,7 @@ export function LaneIISlimConsole({ onFullConsole }: { onFullConsole: () => void
 
         <article className="lane-ii-panel lane-ii-cohort">
           <div className="lane-ii-section-title"><div><span>{selected.length ? "FROZEN SELECTED COHORT" : "UNQUALIFIED RESEARCH WATCHLIST"}</span><h2>{selected.length ? `${selected.length} selected traders` : "Evidence shortfall"}</h2></div><small>Cutoff {timeLabel(cohort.data_cutoff)}</small></div>
+          {!selected.length && shortfall.summary && <p className="lane-ii-empty">{shortfall.summary}</p>}
           {!candidates.length && <p className="lane-ii-empty">No fresh cohort evidence is available. Refresh Candidates performs public reads and the unchanged Phase B gates.</p>}
           <div className="lane-ii-candidate-list">{candidates.map((item: any) => <article className="lane-ii-candidate" key={item.wallet}>
             <div><strong title={item.wallet}>{shortWallet(item.wallet)}</strong><span>{selected.length ? "Qualified finalist" : "Research only"}</span></div>

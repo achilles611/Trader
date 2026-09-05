@@ -854,6 +854,10 @@ def lane_ii_status(
     portfolio = center.portfolio_summary()
     selected = list((evidence or {}).get("selected") or [])
     watchlist = list((evidence or {}).get("research_watchlist") or [])
+    raw_shortfall = (evidence or {}).get("shortfall")
+    shortfall = dict(raw_shortfall) if isinstance(raw_shortfall, dict) else {
+        "count": max(0, int(raw_shortfall or 0)),
+    }
     selected_wallets = {str(item.get("wallet", "")).lower() for item in selected}
     targets = service.database.list_targets()
     observing = [target.wallet for target in targets if target.status in {"shadow", "active"}]
@@ -878,8 +882,16 @@ def lane_ii_status(
     acquired = max(0, int(analysis_summary.get("backfill_attempted") or 0) - int(analysis_summary.get("backfill_failed") or 0))
     deferred = int(screening.get("deferred_by_budget") or 0) + int(analysis_summary.get("deferred") or 0)
     selection_completed = str((evidence or {}).get("selection_status") or "") == "COMPLETED"
+    terminal_shortfall = str((evidence or {}).get("selection_status") or "") in {
+        "COHORT_SHORTFALL_EVIDENCE_DEPENDENCY", "COMPLETED_SHORTFALL",
+    }
     has_screen = screened > 0
     generated_at = utc_now()
+    minimum_selected = max(5, int(shortfall.get("minimum_required") or 5))
+    paper_start_blocker = None if len(selected) >= minimum_selected and selection_completed else str(
+        shortfall.get("paper_start_blocker")
+        or f"Start is disabled: {len(selected)} of {minimum_selected} unchanged-gate finalists are selected."
+    )
     return {
         "schema": "beelzebub-lane-ii-slim-status-v1",
         "generated_at": generated_at.isoformat(),
@@ -888,12 +900,15 @@ def lane_ii_status(
         "overall": {
             "state": (
                 "PAPER_READY_DISARMED" if len(selected) >= 5 and selection_completed else
+                "RESEARCH_SHORTFALL" if terminal_shortfall else
                 "RESEARCH_SCREENED" if has_screen else
                 "RESEARCH_SHORTFALL"
             ),
             "next_action": (
                 "Observe the frozen selected cohort; activate PAPER separately when continuity is proven."
                 if len(selected) >= 5 and selection_completed else
+                str(shortfall.get("next_action"))
+                if terminal_shortfall and shortfall.get("next_action") else
                 "Review the frozen public screen and run the separately bounded deep-evaluation batch."
                 if has_screen else
                 "Continue public observation; fewer than five candidates meet the unchanged evidence gates."
@@ -905,7 +920,8 @@ def lane_ii_status(
                 "state": "READY_DISARMED" if len(selected) >= 5 and selection_completed else "BLOCKED_COHORT_SHORTFALL",
                 "simulated": True,
                 "selected_count": len(selected),
-                "minimum_selected": 5,
+                "minimum_selected": minimum_selected,
+                "blocker": paper_start_blocker,
             },
             "testnet": {
                 "state": "BLOCKED_PREREQUISITES" if not all(credentials.values()) else "CONFIG_PRESENT_NOT_COMMISSIONED",
@@ -928,6 +944,7 @@ def lane_ii_status(
             "selected_wallets": sorted(selected_wallets),
             "observing_wallets": sorted(observing),
             "active_wallets": sorted(active),
+            "shortfall": shortfall,
         },
         "portfolio": {**portfolio, "display": "PAPER — $100 simulated", "connected_capital": False},
         "paper_policy": {
@@ -967,6 +984,7 @@ def lane_ii_status(
                 len(selected) >= 5 and selection_completed and
                 service.config.paper_strategy.strategy_id == "COHORT_COPY_V1"
             ),
+            "start_paper_blocker": paper_start_blocker,
             "pause_new_entries_available": True,
             "close_paper_positions_available": bool(service.database.list_virtual_positions(open_only=True)),
             "live_available": False,
