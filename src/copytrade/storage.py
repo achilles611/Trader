@@ -2434,6 +2434,40 @@ class CopyTradeDatabase:
             ).fetchone()
         return dict(row) if row else None
 
+    def exact_backfill_coverage(
+        self, wallet: str, required_start: object, required_end: object,
+    ) -> list[dict[str, Any]]:
+        """Return durable coverage rows whose account and window match exactly.
+
+        Recovery adoption uses this narrower query instead of the interval
+        aggregation below.  Multiple exact rows are deliberately visible so
+        the caller can reject ambiguous/conflicting coverage claims.
+        """
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM copy_backfill_coverage
+                   WHERE target_wallet=? AND requested_start=? AND requested_end=?
+                   ORDER BY coverage_id""",
+                (wallet.lower(), iso(required_start), iso(required_end)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def analysis_window_fill_provenance(
+        self, wallet: str, required_start: object, required_end: object,
+    ) -> dict[str, Any]:
+        """Summarize source/venue/network identity for saved window fills."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT source, venue, chain_network, COUNT(*) AS row_count
+                   FROM copy_raw_fills
+                   WHERE target_wallet=? AND event_timestamp>=? AND event_timestamp<=?
+                   GROUP BY source, venue, chain_network
+                   ORDER BY source, venue, chain_network""",
+                (wallet.lower(), iso(required_start), iso(required_end)),
+            ).fetchall()
+        groups = [dict(row) for row in rows]
+        return {"row_count": sum(int(row["row_count"]) for row in groups), "groups": groups}
+
     def analysis_window_coverage(self, wallet: str, required_start: object, required_end: object) -> dict[str, Any]:
         """Evaluate source-proof coverage over the whole requested interval.
 

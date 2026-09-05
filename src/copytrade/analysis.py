@@ -29,6 +29,13 @@ _FINAL_STATES = {
     CandidateAnalysisState.QUARANTINED.value,
 }
 _OPERATOR_CONTROLLED_TARGET_STATES = {"approved", "shadow", "active", "muted", "rejected"}
+_HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
+_HYPERLIQUID_SAVED_FILL_IDENTITY = {"source": "hyperliquid", "venue": "hyperliquid", "chain_network": "mainnet"}
+_HYPERLIQUID_COVERAGE_QUALITIES = {
+    "deferred_public_request_budget",
+    "incomplete_dense_interval_public_cap",
+    "unproven_public_10000_fill_retention",
+}
 
 # Historical candle snapshots are optional evidence, not an authority for
 # qualification. Bound their work independently of fill acquisition so an
@@ -167,7 +174,9 @@ class CandidateAnalysisPipeline:
                     # Adopt only an exact saved window; never infer a page
                     # frontier, source response, or per-wallet request count
                     # from raw fills alone.
-                    adopted_coverage = self._adoptable_started_backfill(wallet, required_start, required_end)
+                    adopted_coverage = self._adoptable_started_backfill(
+                        wallet, required_start, required_end, configuration=configuration,
+                    )
                     if adopted_coverage is not None:
                         adoption = {
                             "recovery_adopted_saved_evidence": True,
@@ -893,7 +902,8 @@ class CandidateAnalysisPipeline:
         }
 
     def _adoptable_started_backfill(
-        self, wallet: str, required_start: object, required_end: object,
+        self, wallet: str, required_start: object, required_end: object, *,
+        configuration: dict[str, Any],
     ) -> dict[str, Any] | None:
         """Return only a durable full-window coverage record safe to adopt.
 
@@ -903,14 +913,42 @@ class CandidateAnalysisPipeline:
         controlled recovery to analyze saved evidence without commissioning
         another historical acquisition or claiming lost in-memory details.
         """
+        exact_rows = self.database.exact_backfill_coverage(wallet, required_start, required_end)
+        if len(exact_rows) != 1:
+            return None
+        exact = exact_rows[0]
+        if str(exact.get("coverage_quality")) not in _HYPERLIQUID_COVERAGE_QUALITIES:
+            return None
+
+        frozen_config = _json_object(configuration.get("copytrade_config"))
+        frozen_source = _json_object(frozen_config.get("source"))
+        current_source = _json_object(self.config.snapshot().get("source"))
+        if frozen_source != current_source or str(frozen_source.get("info_url")) != _HYPERLIQUID_INFO_URL:
+            return None
+
         coverage = self.database.analysis_window_coverage(wallet, required_start, required_end)
-        start, end = as_utc(required_start), as_utc(required_end)
-        exact_window = any(
-            as_utc(item.get("requested_start")) == start and as_utc(item.get("requested_end")) == end
-            for item in list(coverage.get("segments") or ())
-            if item.get("requested_start") and item.get("requested_end")
-        )
-        return coverage if exact_window else None
+        coverage_state = str(coverage.get("coverage_state") or "UNPROVEN")
+        fill_provenance = self.database.analysis_window_fill_provenance(wallet, required_start, required_end)
+        groups = list(fill_provenance.get("groups") or ())
+        expected_group = {**_HYPERLIQUID_SAVED_FILL_IDENTITY, "row_count": int(fill_provenance.get("row_count") or 0)}
+        if coverage_state != "KNOWN_INCOMPLETE" and (
+            int(fill_provenance.get("row_count") or 0) <= 0 or groups != [expected_group]
+        ):
+            return None
+
+        return {
+            **coverage,
+            "adoption_provenance": {
+                "coverage_id": str(exact["coverage_id"]),
+                "coverage_quality": str(exact["coverage_quality"]),
+                "target_wallet": wallet.lower(),
+                "provider": "hyperliquid_public_info",
+                "provider_url": _HYPERLIQUID_INFO_URL,
+                "network": "mainnet",
+                "config_fingerprint": str(configuration.get("config_fingerprint") or ""),
+                "saved_fill_provenance": fill_provenance,
+            },
+        }
 
 
 def _bounded_no_progress_result(result: dict[str, object], *, attempts: int) -> dict[str, object]:

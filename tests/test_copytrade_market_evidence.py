@@ -103,6 +103,35 @@ class HistoricalMarketEvidenceTests(unittest.TestCase):
         self.assertTrue(market.acquisition_metadata()["truncated"])
         self.assertIsNone(market.historical_price("BTC", T0))
 
+    def test_persisted_missing_rows_preserve_symbol_miss_cap_across_restart(self) -> None:
+        saved: dict[tuple[str, str], dict[str, object]] = {}
+
+        def load(symbol: str, bucket: str) -> dict[str, object] | None:
+            return saved.get((symbol, bucket))
+
+        def store(item: dict[str, object]) -> None:
+            saved[(str(item["symbol"]), str(item["bucket_timestamp"]))] = dict(item)
+
+        requests = [("BTC", T0 + timedelta(minutes=minute)) for minute in range(4)]
+        first_provider = CountingHistoricalMarket(available=False)
+        first = CachedHistoricalMarketData(
+            first_provider, bucket_seconds=60, load=load, store=store,
+            max_observations=8, max_missing_observations_per_symbol=2,
+        )
+        first.prime(requests)
+        self.assertEqual(first_provider.calls, 2)
+        self.assertEqual(len(saved), 2)
+
+        restarted_provider = CountingHistoricalMarket(available=False)
+        restarted = CachedHistoricalMarketData(
+            restarted_provider, bucket_seconds=60, load=load, store=store,
+            max_observations=8, max_missing_observations_per_symbol=2,
+        )
+        restarted.prime(requests)
+        self.assertEqual(restarted_provider.calls, 0)
+        self.assertTrue(restarted.acquisition_metadata()["truncated"])
+        self.assertEqual(restarted.acquisition_metadata()["skipped_by_symbol_missing_cap"], {"BTC": 2})
+
 
 if __name__ == "__main__":
     unittest.main()

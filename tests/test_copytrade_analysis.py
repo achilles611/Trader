@@ -510,7 +510,7 @@ class PhaseBAnalysisTests(unittest.TestCase):
                     requested_start=start, requested_end=end,
                     earliest_observed_fill=FILL_AT, latest_observed_fill=FILL_AT + timedelta(minutes=1),
                     source_limit_detected=False, coverage_complete=False,
-                    coverage_quality="fixture_saved_unproven", coverage_state="UNPROVEN",
+                    coverage_quality="unproven_public_10000_fill_retention", coverage_state="UNPROVEN",
                 ))
                 raise KeyboardInterrupt("fixture stops after durable coverage")
 
@@ -532,6 +532,60 @@ class PhaseBAnalysisTests(unittest.TestCase):
             self.assertTrue(adoption["recovery_adopted_saved_evidence"])
             self.assertEqual(adoption["recoverability"]["lost_in_memory_request_accounting"], "unknown_not_reconstructed")
             self.assertEqual(adoption["recoverability"]["new_public_requests_scheduled"], 0)
+            provenance = adoption["coverage"]["adoption_provenance"]
+            self.assertEqual(provenance["target_wallet"], GOOD)
+            self.assertEqual(provenance["provider"], "hyperliquid_public_info")
+            self.assertEqual(provenance["network"], "mainnet")
+            self.assertEqual(provenance["saved_fill_provenance"]["row_count"], 2)
+
+    def test_started_backfill_adoption_refuses_window_account_provider_and_ambiguous_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            pipeline = CandidateAnalysisPipeline(service)
+            start, end = FILL_AT - timedelta(days=1), FILL_AT + timedelta(days=1)
+            configuration = {
+                "config_fingerprint": _config_fingerprint(service.config.research_snapshot()),
+                "copytrade_config": service.config.snapshot(),
+            }
+            service.database.insert_raw_fills(fills(GOOD))
+            service.database.insert_backfill_coverage(GOOD, BackfillCoverage(
+                requested_start=start, requested_end=end,
+                earliest_observed_fill=FILL_AT, latest_observed_fill=FILL_AT + timedelta(minutes=1),
+                source_limit_detected=True, coverage_complete=False,
+                coverage_quality="unproven_public_10000_fill_retention", coverage_state="UNPROVEN",
+            ))
+            self.assertIsNotNone(pipeline._adoptable_started_backfill(
+                GOOD, start, end, configuration=configuration,
+            ))
+            self.assertIsNone(pipeline._adoptable_started_backfill(
+                GOOD, start - timedelta(seconds=1), end, configuration=configuration,
+            ))
+            self.assertIsNone(pipeline._adoptable_started_backfill(
+                FAILED, start, end, configuration=configuration,
+            ))
+
+            wrong_provider = replace(fills(FAILED)[0], source="other_provider")
+            service.database.insert_raw_fills([wrong_provider])
+            service.database.insert_backfill_coverage(FAILED, BackfillCoverage(
+                requested_start=start, requested_end=end,
+                earliest_observed_fill=wrong_provider.event_timestamp,
+                latest_observed_fill=wrong_provider.event_timestamp,
+                source_limit_detected=True, coverage_complete=False,
+                coverage_quality="unproven_public_10000_fill_retention", coverage_state="UNPROVEN",
+            ))
+            self.assertIsNone(pipeline._adoptable_started_backfill(
+                FAILED, start, end, configuration=configuration,
+            ))
+
+            service.database.insert_backfill_coverage(GOOD, BackfillCoverage(
+                requested_start=start, requested_end=end,
+                earliest_observed_fill=FILL_AT, latest_observed_fill=FILL_AT + timedelta(minutes=1),
+                source_limit_detected=True, coverage_complete=False,
+                coverage_quality="deferred_public_request_budget", coverage_state="UNPROVEN",
+            ))
+            self.assertIsNone(pipeline._adoptable_started_backfill(
+                GOOD, start, end, configuration=configuration,
+            ))
 
     def test_resume_adopts_known_incomplete_coverage_as_quarantine_without_refetch(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -542,7 +596,7 @@ class PhaseBAnalysisTests(unittest.TestCase):
                 service.database.insert_backfill_coverage(wallet, BackfillCoverage(
                     requested_start=start, requested_end=end, earliest_observed_fill=None, latest_observed_fill=None,
                     source_limit_detected=True, coverage_complete=False,
-                    coverage_quality="fixture_dense_cap", coverage_state="KNOWN_INCOMPLETE",
+                    coverage_quality="incomplete_dense_interval_public_cap", coverage_state="KNOWN_INCOMPLETE",
                 ))
                 raise KeyboardInterrupt("fixture stops after durable known-incomplete coverage")
 
