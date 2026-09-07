@@ -1790,6 +1790,14 @@ def finalize_stale_target_cleanup(
         late = cleanup.get("late_revalidation")
         if state.get("stage") == "BLOCKED_SAFE" and isinstance(late, Mapping):
             proof_path = Path(str(late.get("native_proof_path") or "")).resolve()
+            if (
+                proof_path.parent != operation_root.resolve()
+                or re.fullmatch(
+                    r"late-cleanup-native-proof-[0-9a-f]{32}\.json",
+                    proof_path.name,
+                ) is None
+            ):
+                raise RuntimeError("PROFILE_SWITCH_CLEANUP_NATIVE_PROOF_INVALID")
             proof_file = read_bytes(
                 proof_path, "PROFILE_SWITCH_CLEANUP_NATIVE_PROOF_UNREADABLE",
             )
@@ -1881,10 +1889,7 @@ def finalize_stale_target_cleanup(
                 "late_revalidation": dict(late),
             }
             if (
-                proof_path.parent != operation_root.resolve()
-                or not proof_path.name.startswith("late-cleanup-native-proof-")
-                or proof_path.suffix != ".json"
-                or not isinstance(validated_stored_proof, Mapping)
+                not isinstance(validated_stored_proof, Mapping)
                 or validated_stored_proof.get("proof_hash")
                 != late.get("native_proof_hash")
                 or hashlib.sha256(proof_file).hexdigest()

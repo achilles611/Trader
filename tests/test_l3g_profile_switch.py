@@ -2881,6 +2881,35 @@ class ProfileSwitchServiceTests(unittest.TestCase):
 
         terminal_state_bytes = state_path.read_bytes()
 
+        foreign_proof_path = self.root / "do-not-read-ledger.sqlite3"
+        foreign_proof_path.write_bytes(b"immutable foreign evidence")
+        foreign_proof_before = foreign_proof_path.read_bytes()
+        foreign_path_state = json.loads(terminal_state_bytes.decode("utf-8"))
+        foreign_path_state["target_cleanup"]["late_revalidation"][
+            "native_proof_path"
+        ] = str(foreign_proof_path)
+        state_path.write_text(json.dumps(foreign_path_state), encoding="utf-8")
+        original_path_read_bytes = Path.read_bytes
+
+        def reject_foreign_read(path: Path) -> bytes:
+            if path.resolve() == foreign_proof_path.resolve():
+                raise AssertionError("foreign proof path was read before confinement")
+            return original_path_read_bytes(path)
+
+        with patch.object(Path, "read_bytes", reject_foreign_read):
+            with self.assertRaisesRegex(RuntimeError, "NATIVE_PROOF_INVALID"):
+                finalize_stale_target_cleanup(
+                    self.root / "runtime",
+                    str(manifest["operation_id"]),
+                    pid_probe=lambda _pid: False,
+                    native_probe=no_second_probe,
+                    native_proof_validator=validate,
+                    _test_control_endpoint=("127.0.0.1", 0),
+                    _test_attestation_key=b"cleanup-attestation-test-key-32b",
+                )
+        self.assertEqual(foreign_proof_path.read_bytes(), foreign_proof_before)
+        state_path.write_bytes(terminal_state_bytes)
+
         def assert_terminal_tamper_rejected(mutator) -> None:
             tampered = json.loads(terminal_state_bytes.decode("utf-8"))
             mutator(tampered)
