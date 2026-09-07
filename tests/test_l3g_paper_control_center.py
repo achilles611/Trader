@@ -187,6 +187,44 @@ class PaperControlCenterTests(unittest.TestCase):
                 self.assertIn(str(paper_path.resolve()), str(raised.exception))
             self.assertEqual(called, [])
 
+    def test_explicit_new_production_ledger_requires_epoch_before_creation(self) -> None:
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            paper_path = root / "hot" / "fresh-paper.sqlite3"
+            defaults = CopyTradeConfig()
+            config = replace(
+                defaults,
+                storage=replace(defaults.storage, cold_root=root / "cold"),
+                artifacts=replace(defaults.artifacts, database_path=root / "hot" / "copytrade.sqlite3"),
+            )
+            environment = {
+                key: value for key, value in os.environ.items()
+                if not key.startswith("BEELZEBUB_")
+            }
+            environment.update({
+                "BEELZEBUB_L3G_PAPER_LEDGER": str(paper_path),
+                # Make the profile explicit so remembered selector state cannot
+                # replace the ledger path under test.
+                "BEELZEBUB_L3G_PAPER_PROFILE": "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2",
+            })
+            with (
+                patch.dict(os.environ, environment, clear=True),
+                patch("src.copytrade.control_center.PaperLedger") as ledger_constructor,
+            ):
+                app = create_control_center_app(config)
+
+                async def attempt_startup() -> None:
+                    async with app.router.lifespan_context(app):
+                        pass
+
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "New production paper ledger requires BEELZEBUB_L3G_PAPER_LEDGER_EPOCH",
+                ):
+                    asyncio.run(attempt_startup())
+            ledger_constructor.assert_not_called()
+            self.assertFalse(paper_path.exists())
+
     def test_paper_controls_are_closed_and_commission_entry_requires_only_its_lifecycle_credential(self) -> None:
         app = create_control_center_app(CopyTradeConfig())
         routes = {route.path: route for route in app.routes if hasattr(route, "methods")}

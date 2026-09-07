@@ -101,6 +101,7 @@ class PaperTransportTests(unittest.TestCase):
                 working_entry_count=0,
                 position_snapshot_complete=True,
                 order_snapshot_complete=True,
+                foreign_activity=False,
             )
             try:
                 transport._receive_frame(frame)
@@ -314,6 +315,7 @@ class PaperTransportTests(unittest.TestCase):
                 "working_entry_count": 0,
                 "position_snapshot_complete": True,
                 "order_snapshot_complete": True,
+                "foreign_activity": False,
             }
             receipt["signature"] = sign_payload(key, receipt)
             frame = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -365,6 +367,7 @@ class PaperTransportTests(unittest.TestCase):
                 "account_name": "Sim101", "account_class": "LOCAL_SIMULATION", "instrument": "MNQ SEP26",
                 "position_quantity": 0, "working_order_count": 0, "working_entry_count": 0,
                 "position_snapshot_complete": True, "order_snapshot_complete": True,
+                "foreign_activity": False,
             },
         }
         with TemporaryDirectory() as directory:
@@ -482,6 +485,7 @@ class PaperTransportTests(unittest.TestCase):
                 account_name="Sim101", account_class="LOCAL_SIMULATION", instrument="MNQ SEP26",
                 position_quantity=0, working_order_count=0, working_entry_count=0,
                 position_snapshot_complete=True, order_snapshot_complete=True,
+                foreign_activity=False,
             )
             try:
                 with (
@@ -575,6 +579,33 @@ class PaperTransportTests(unittest.TestCase):
                         self.assertEqual(delivered, [])
                         self.assertFalse(transport.status().reconciled)
                         self.assertEqual(transport.status().rejected_frames, rejected_before + 1)
+            finally:
+                ledger.close()
+
+    def test_reconciliation_requires_affirmative_foreign_activity_fact(self) -> None:
+        key = bytes(range(32))
+        delivered: list[dict[str, object]] = []
+        with TemporaryDirectory() as directory:
+            ledger, transport, session_id = self._authenticated_ingress_transport(
+                directory, key, lambda payload: delivered.append(dict(payload)),
+            )
+            receipt_id = "l3g-missing-foreign-activity"
+            frame = self._signed_inbound_receipt(
+                key, session_id, "RECONCILIATION", receipt_id,
+                account_name="Sim101", account_class="LOCAL_SIMULATION",
+                instrument="MNQ SEP26", position_quantity=0,
+                working_order_count=0, working_entry_count=0,
+                position_snapshot_complete=True, order_snapshot_complete=True,
+            )
+            try:
+                rejected_before = transport.status().rejected_frames
+                transport._receive_frame(frame)
+                self.assertEqual(delivered, [])
+                self.assertFalse(transport.status().reconciled)
+                self.assertEqual(
+                    transport.status().rejected_frames, rejected_before + 1,
+                )
+                self.assertFalse(ledger.contains(receipt_id))
             finally:
                 ledger.close()
 

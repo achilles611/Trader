@@ -27,6 +27,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         private static readonly long MinimumPublicationTicks = Math.Max(1L, System.Diagnostics.Stopwatch.Frequency / 2L);
         private static readonly long MinimumAttachmentPublicationTicks = Math.Max(1L, System.Diagnostics.Stopwatch.Frequency * 5L);
         private const string PublicationPolicy = "BOUNDED_LATEST_STATE_2HZ";
+        private readonly object bookLock = new object();
         private readonly SortedDictionary<double, long> bids = new SortedDictionary<double, long>(Comparer<double>.Create((x, y) => y.CompareTo(x)));
         private readonly SortedDictionary<double, long> asks = new SortedDictionary<double, long>();
         private double bestBid = Double.NaN;
@@ -174,36 +175,48 @@ namespace NinjaTrader.NinjaScript.Indicators
             // lifecycle reset is the price connection transition handled by
             // OnConnectionStatusUpdate.  Treat Add/Update/Remove as authentic
             // depth mutations regardless of the column-only flag.
-            SortedDictionary<double, long> book = e.MarketDataType == MarketDataType.Bid ? bids : asks;
-            double mutationPrice = e.Price;
-            if (e.Operation == Operation.Remove && (Double.IsNaN(mutationPrice) || Double.IsInfinity(mutationPrice) || mutationPrice <= 0))
+            string payload;
+            lock (bookLock)
             {
-                if (e.Position < 0 || e.Position >= book.Count)
+                // NinjaTrader can invoke depth callbacks concurrently. Keep
+                // positional remove resolution, mutation, trimming, and the
+                // two-sided snapshot inside one book critical section.
+                SortedDictionary<double, long> book = e.MarketDataType == MarketDataType.Bid ? bids : asks;
+                double mutationPrice = e.Price;
+                if (e.Operation == Operation.Remove && (Double.IsNaN(mutationPrice) || Double.IsInfinity(mutationPrice) || mutationPrice <= 0))
                 {
-                    BeelzebubReadOnlyOutbound.Diagnostic("MARKET_OBSERVER_UNRESOLVED_DEPTH_REMOVE");
-                    return;
+                    if (e.Position < 0 || e.Position >= book.Count)
+                    {
+                        BeelzebubReadOnlyOutbound.Diagnostic("MARKET_OBSERVER_UNRESOLVED_DEPTH_REMOVE");
+                        return;
+                    }
+                    mutationPrice = book.ElementAt(e.Position).Key;
                 }
-                mutationPrice = book.ElementAt(e.Position).Key;
+                if (Double.IsNaN(mutationPrice) || Double.IsInfinity(mutationPrice) || mutationPrice <= 0)
+                    return;
+                if (e.Operation == Operation.Remove) book.Remove(mutationPrice); else book[mutationPrice] = e.Volume;
+                TrimBook(book);
+                if (e.Position >= MaximumPublishedBookLevelsPerSide)
+                    return;
+                if (!TryReservePublication(ref lastDepthPublicationTicks))
+                    return;
+                payload = "{\"contract_id\":\"" + Instrument.FullName
+                    + "\",\"bids\":" + Levels(bids) + ",\"asks\":" + Levels(asks) + ",\"operation\":\"" + e.Operation
+                    + "\",\"side\":\"" + e.MarketDataType + "\",\"mutation_price\":" + mutationPrice.ToString(CultureInfo.InvariantCulture)
+                    + ",\"mutation_volume\":" + e.Volume + ",\"mutation_position\":" + e.Position
+                    + ",\"is_reset\":false,\"publication_policy\":\"" + PublicationPolicy + "\"}";
             }
-            if (Double.IsNaN(mutationPrice) || Double.IsInfinity(mutationPrice) || mutationPrice <= 0)
-                return;
-            if (e.Operation == Operation.Remove) book.Remove(mutationPrice); else book[mutationPrice] = e.Volume;
-            TrimBook(book);
-            if (e.Position >= MaximumPublishedBookLevelsPerSide)
-                return;
-            if (!TryReservePublication(ref lastDepthPublicationTicks))
-                return;
-            BeelzebubReadOnlyOutbound.Publish("DEPTH", null, null, "{\"contract_id\":\"" + Instrument.FullName
-                + "\",\"bids\":" + Levels(bids) + ",\"asks\":" + Levels(asks) + ",\"operation\":\"" + e.Operation
-                + "\",\"side\":\"" + e.MarketDataType + "\",\"mutation_price\":" + mutationPrice.ToString(CultureInfo.InvariantCulture)
-                + ",\"mutation_volume\":" + e.Volume + ",\"mutation_position\":" + e.Position
-                + ",\"is_reset\":false,\"publication_policy\":\"" + PublicationPolicy + "\"}", e.Time);
+            BeelzebubReadOnlyOutbound.Publish(
+                "DEPTH", null, null, payload, e.Time);
         }
 
         private void ClearMarketState()
         {
-            bids.Clear();
-            asks.Clear();
+            lock (bookLock)
+            {
+                bids.Clear();
+                asks.Clear();
+            }
             bestBid = Double.NaN;
             bestAsk = Double.NaN;
             bestBidSize = 0;

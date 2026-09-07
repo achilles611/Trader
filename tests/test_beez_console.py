@@ -55,17 +55,23 @@ class BeezConsoleTests(unittest.TestCase):
     def test_running_server_opens_brave_without_duplicate_backend(self) -> None:
         root = Path(r"C:\\Trader")
         brave = Path(r"C:\\Tools\\brave.exe")
+        binding = Mock()
         with (
             patch("beez_console.project_root", return_value=root),
             patch("beez_console.validate_project_root"),
+            patch("beez_console.resolve_launch_binding", return_value=binding),
             patch("beez_console.port_is_open", return_value=True),
-            patch("beez_console.server_is_responding", return_value=True),
+            patch("beez_console.assert_remembered_launch_is_not_competing") as handoff_guard,
+            patch("beez_console.fetch_runtime_binding", return_value=None),
             patch("beez_console.start_server") as start_server,
+            patch("beez_console.wait_for_server") as wait_for_server,
             patch("beez_console.brave_path", return_value=brave),
             patch("beez_console.open_brave") as open_brave,
         ):
             self.assertEqual(beez_console.main(), 0)
         start_server.assert_not_called()
+        handoff_guard.assert_called_once_with(binding)
+        wait_for_server.assert_called_once_with(None, binding)
         open_brave.assert_called_once_with(brave, root)
 
     def test_brave_open_uses_a_unique_document_url_after_a_restart(self) -> None:
@@ -83,10 +89,15 @@ class BeezConsoleTests(unittest.TestCase):
 
     def test_wait_reports_exited_backend(self) -> None:
         process = Mock()
+        process.pid = 1234
         process.poll.return_value = 1
-        with patch("beez_console.server_is_responding", return_value=False):
+        binding = Mock(expected_pid=None)
+        with (
+            patch("beez_console.fetch_runtime_binding", return_value=None),
+            patch("beez_console.fetch_paper_status", return_value=None),
+        ):
             with self.assertRaisesRegex(RuntimeError, "stopped"):
-                beez_console.wait_for_server(process, timeout_seconds=0.1)
+                beez_console.wait_for_server(process, binding, timeout_seconds=0.1)
 
     def test_missing_project_root_reports_a_gui_startup_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

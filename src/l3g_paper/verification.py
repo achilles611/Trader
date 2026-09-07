@@ -24,6 +24,12 @@ from uuid import uuid4
 from src.lane_iii.contracts import canonical_hash
 
 from .contracts import PAPER_RECORD_SCHEMA
+from .ledger import (
+    RISK_CONTINUITY_KINDS,
+    read_risk_continuity_guard,
+    risk_continuity_anchor_path,
+    risk_continuity_guard_path,
+)
 
 
 VERIFIER_VERSION = "l3g-local-ledger-verifier-v2"
@@ -304,6 +310,78 @@ class LocalLedgerVerifier:
             "SELECT ledger_sequence, record_hash FROM lane_iii_paper_audit ORDER BY ledger_sequence DESC LIMIT 1"
         ).fetchone()
         return (0, None) if row is None else (int(row["ledger_sequence"]), str(row["record_hash"]))
+
+    def _captured_risk_guard(self) -> dict[str, object] | None:
+        guard_path = risk_continuity_guard_path(self.ledger_path)
+        if not guard_path.is_file():
+            if risk_continuity_anchor_path(self.ledger_path).is_file():
+                raise VerificationFailure(
+                    "RISK_CONTINUITY_GUARD_MISSING",
+                    "The ledger's independent risk-continuity guard is missing.",
+                )
+            return None
+        try:
+            return read_risk_continuity_guard(self.ledger_path)
+        except RuntimeError as exc:
+            raise VerificationFailure(
+                "RISK_CONTINUITY_GUARD_INVALID",
+                "The independent risk-continuity guard is invalid.",
+            ) from exc
+
+    def _validate_risk_guard(
+        self,
+        connection: sqlite3.Connection,
+        metadata: Mapping[str, str],
+        guard: Mapping[str, object] | None,
+    ) -> dict[str, object] | None:
+        if guard is None:
+            placeholders = ",".join("?" for _ in RISK_CONTINUITY_KINDS)
+            existing_risk = connection.execute(
+                "SELECT 1 FROM lane_iii_paper_audit "
+                f"WHERE kind IN ({placeholders}) LIMIT 1",
+                RISK_CONTINUITY_KINDS,
+            ).fetchone()
+            if existing_risk is not None:
+                raise VerificationFailure(
+                    "RISK_CONTINUITY_GUARD_ADOPTION_REQUIRED",
+                    "Existing risk history has no independently adopted continuity guard.",
+                )
+            return None
+        sequence = guard.get("risk_boundary_sequence")
+        record_hash = guard.get("risk_boundary_hash")
+        if (
+            guard.get("ledger_path") != str(self.ledger_path)
+            or guard.get("ledger_identity") != metadata["ledger_uuid"]
+            or guard.get("ledger_epoch") != _ledger_epoch(self.ledger_path, metadata)
+            or type(sequence) is not int
+            or sequence < 0
+        ):
+            raise VerificationFailure(
+                "RISK_CONTINUITY_GUARD_MISMATCH",
+                "The independent risk-continuity guard does not match this ledger.",
+            )
+        if sequence == 0:
+            if record_hash is not None:
+                raise VerificationFailure(
+                    "RISK_CONTINUITY_GUARD_MISMATCH",
+                    "The empty risk-continuity guard has a record hash.",
+                )
+        else:
+            row = connection.execute(
+                "SELECT record_hash FROM lane_iii_paper_audit WHERE ledger_sequence=?",
+                (sequence,),
+            ).fetchone()
+            if row is None:
+                raise VerificationFailure(
+                    "RISK_CONTINUITY_GUARD_BEYOND_LEDGER",
+                    "The independent risk-continuity guard is ahead of this ledger image.",
+                )
+            if str(row["record_hash"]) != record_hash:
+                raise VerificationFailure(
+                    "RISK_CONTINUITY_GUARD_MISMATCH",
+                    "The independent risk-continuity guard is not an ancestor of this ledger.",
+                )
+        return dict(guard)
 
     def _checkpoint(self) -> dict[str, Any] | None:
         data = _safe_read_json(self.paths.checkpoint)
@@ -628,6 +706,8 @@ class LocalLedgerVerifier:
             "chain_valid": None,
             "checkpoint_valid": None,
             "checkpoint_start_sequence": None,
+            "risk_continuity_guard_valid": None,
+            "risk_continuity_guard_sequence": None,
             "verified_through_sequence": None,
             "tip_hash": None,
             "rows_scanned": None,
@@ -686,6 +766,7 @@ class LocalLedgerVerifier:
             started = time.perf_counter()
             connection = self._connect()
             report["timings"]["connect_seconds"] = round(time.perf_counter() - started, 6)
+            captured_risk_guard = self._captured_risk_guard()
             self._publish_progress(report, stage="CONNECTED", force=True)
             started = time.perf_counter()
             self._schema(connection)
@@ -736,6 +817,16 @@ class LocalLedgerVerifier:
             else:
                 # Full is the sole forensic structural authority.  It is the
                 # only mode that invokes SQLite's database-wide quick_check.
+                # It may rescan from row one, but it may not erase evidence
+                # that an existing trusted checkpoint was ahead of this image.
+                if checkpoint is not None:
+                    started = time.perf_counter()
+                    prior_checkpoint = self._upgrade_v1_checkpoint(connection, checkpoint, metadata)
+                    self._validate_checkpoint(connection, prior_checkpoint, metadata, tip_sequence)
+                    report["timings"]["checkpoint_validation_seconds"] = round(
+                        time.perf_counter() - started, 6,
+                    )
+                    report["prior_checkpoint_valid"] = True
                 started = time.perf_counter()
                 report["quick_check"] = self._quick_check(connection)
                 report["timings"]["quick_check_seconds"] = round(time.perf_counter() - started, 6)
@@ -746,6 +837,14 @@ class LocalLedgerVerifier:
                     "last_full_verified_hash": None,
                 }
                 self._publish_progress(report, stage="QUICK_CHECK", force=True)
+            validated_risk_guard = self._validate_risk_guard(
+                connection, metadata, captured_risk_guard,
+            )
+            if validated_risk_guard is not None:
+                report["risk_continuity_guard_valid"] = True
+                report["risk_continuity_guard_sequence"] = validated_risk_guard[
+                    "risk_boundary_sequence"
+                ]
             report["rows_scanned"] = 0
             report["bytes_scanned"] = 0
             report["rows_total"] = max(0, tip_sequence - start_sequence + 1)

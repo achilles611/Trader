@@ -200,9 +200,18 @@ class PaperRuntimeTests(unittest.TestCase):
                         )
                         runtime._request_exit("TEST_NORMAL_EXIT")
                         self.assertEqual(runtime.state, PaperRuntimeState.EXIT_PENDING)
+                        exit_command_id = runtime._pending_exit_command_id
+                        self.assertIsInstance(exit_command_id, str)
                         runtime.on_execution_message({
                             "message_type": "EXECUTION_EVENT", "order_role": "EXIT", "price": "101",
-                            "quantity": 1, "native_execution_id": f"exit-{sequence}", "timestamp": now,
+                            "quantity": 1, "command_id": exit_command_id,
+                            "native_order_id": f"exit-order-{sequence}",
+                            "native_execution_id": f"exit-{sequence}", "timestamp": now,
+                        })
+                        runtime.on_execution_message({
+                            "message_type": "ORDER_EVENT", "order_role": "EXIT",
+                            "order_state": "FILLED", "command_id": exit_command_id,
+                            "native_order_id": f"exit-order-{sequence}",
                         })
                         runtime.on_execution_message({"message_type": "POSITION_EVENT", "quantity": 0, "timestamp": now})
                         runtime.on_execution_message({
@@ -332,13 +341,21 @@ class PaperRuntimeTests(unittest.TestCase):
 
                 self.assertEqual(runtime.state, PaperRuntimeState.EXIT_PENDING)
                 self.assertEqual(submitted[-1].action.value, "EMERGENCY_FLATTEN")  # type: ignore[attr-defined]
+                exit_command = submitted[-1]
                 active = runtime.status()["operational_paper_session"]
                 self.assertTrue(active["active"])
                 self.assertFalse(active["stopping"])
 
                 runtime.on_execution_message({
                     "message_type": "EXECUTION_EVENT", "order_role": "EXIT", "price": "100",
-                    "quantity": 1, "native_execution_id": "stale-exit", "timestamp": stale_at,
+                    "quantity": 1, "command_id": exit_command.command_id,
+                    "native_order_id": "stale-exit-order",
+                    "native_execution_id": "stale-exit", "timestamp": stale_at,
+                })
+                runtime.on_execution_message({
+                    "message_type": "ORDER_EVENT", "order_role": "EXIT",
+                    "order_state": "FILLED", "command_id": exit_command.command_id,
+                    "native_order_id": "stale-exit-order",
                 })
                 runtime.on_execution_message({
                     "message_type": "POSITION_EVENT", "quantity": 0, "timestamp": stale_at,
@@ -356,6 +373,49 @@ class PaperRuntimeTests(unittest.TestCase):
                     "SESSION_OPERATIONAL_PAPER_STOPPED",
                     [record["kind"] for record in ledger.recent(50)],
                 )
+            finally:
+                runtime.stop(); ledger.close()
+
+    def test_ny_after_hard_flat_emergency_flattens_once_before_maintenance(self) -> None:
+        now = "2026-08-25T20:05:00Z"
+        deadline = "2026-08-25T20:58:00Z"
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.operational_runtime(directory, now=now)
+            submitted: list[object] = []
+            runtime._persist_and_send = lambda command, _grant: submitted.append(command)  # type: ignore[method-assign]
+            try:
+                with patch("src.l3g_paper.runtime._now", return_value=now):
+                    self.assertTrue(runtime.operational_paper_start("ny-after-hard-flat")["started"])
+                runtime._transition(PaperRuntimeState.ENTRY_PENDING, "TEST_NY_AFTER_ENTRY")
+                runtime._transition(PaperRuntimeState.LONG, "TEST_NY_AFTER_FILL")
+                runtime._position = PaperDirection.LONG
+                runtime._position_quantity = 1
+                runtime._entry_owner = PaperEntryOwner.STRATEGY
+                runtime._entry_fill_price = Decimal("100")
+                runtime._entry_fill_quantity = 1
+                runtime._entry_direction = PaperDirection.LONG
+                runtime._entry_execution = {"native_execution_id": "ny-after-entry", "timestamp": now}
+                runtime._entry_session_context = runtime._session_context
+                runtime._snapshot = replace(
+                    runtime._snapshot,
+                    current_position=PaperDirection.LONG,
+                    current_position_quantity=1,
+                    position_opened_at=now,
+                    quote_observed_at=deadline,
+                    classified_trade_observed_at=deadline,
+                    depth_mutation_observed_at=deadline,
+                    protective_stop_state="WORKING",
+                )
+
+                runtime._evaluate_risk_exit(deadline)
+                runtime._evaluate_risk_exit(deadline)
+
+                self.assertEqual(runtime.state, PaperRuntimeState.EXIT_PENDING)
+                self.assertEqual(len(submitted), 1)
+                self.assertEqual(submitted[0].action.value, "EMERGENCY_FLATTEN")  # type: ignore[attr-defined]
+                active = runtime.status()["operational_paper_session"]
+                self.assertTrue(active["stopping"])
+                self.assertEqual(active["stopping_reason"], "HARD_FLAT_DEADLINE")
             finally:
                 runtime.stop(); ledger.close()
 
@@ -492,9 +552,17 @@ class PaperRuntimeTests(unittest.TestCase):
                     open_stop = runtime.flatten_and_disarm()
                 self.assertTrue(open_stop["stopping"])
                 self.assertEqual(runtime.state, PaperRuntimeState.EXIT_PENDING)
+                exit_command_id = runtime._pending_exit_command_id
+                self.assertIsInstance(exit_command_id, str)
                 runtime.on_execution_message({
                     "message_type": "EXECUTION_EVENT", "order_role": "EXIT", "price": "101", "quantity": 1,
+                    "command_id": exit_command_id, "native_order_id": "open-exit-order",
                     "native_execution_id": "open-exit", "timestamp": now,
+                })
+                runtime.on_execution_message({
+                    "message_type": "ORDER_EVENT", "order_role": "EXIT",
+                    "order_state": "FILLED", "command_id": exit_command_id,
+                    "native_order_id": "open-exit-order",
                 })
                 runtime.on_execution_message({"message_type": "POSITION_EVENT", "quantity": 0, "timestamp": now})
                 runtime.on_execution_message(reconciliation("operational-open-flat"))
@@ -748,7 +816,17 @@ class PaperRuntimeTests(unittest.TestCase):
             runtime.on_execution_message({"message_type": "ORDER_EVENT", "order_role": "PROTECTIVE", "order_state": "WORKING"})
             self.assertEqual(runtime.status()["protective_stop_state"], "WORKING")
             runtime._transition(PaperRuntimeState.EXIT_PENDING, "TEST_EXIT_SENT")
-            runtime.on_execution_message({"message_type": "EXECUTION_EVENT", "order_role": "EXIT", "price": "101", "quantity": 1})
+            runtime._pending_exit_command_id = "test-controlled-exit-command"
+            runtime.on_execution_message({
+                "message_type": "EXECUTION_EVENT", "order_role": "EXIT", "price": "101",
+                "quantity": 1, "command_id": "test-controlled-exit-command",
+                "native_order_id": "test-controlled-exit-order",
+            })
+            runtime.on_execution_message({
+                "message_type": "ORDER_EVENT", "order_role": "EXIT",
+                "order_state": "FILLED", "command_id": "test-controlled-exit-command",
+                "native_order_id": "test-controlled-exit-order",
+            })
             reconciliation_commands: list[object] = []
             runtime._execution_session_id = lambda: "l3g-es-test"  # type: ignore[method-assign]
             runtime._persist_and_send = lambda command, grant: reconciliation_commands.append((command, grant))  # type: ignore[method-assign]
@@ -1180,6 +1258,11 @@ class PaperRuntimeTests(unittest.TestCase):
                     "message_type": "EXECUTION_EVENT", "order_role": "EXIT", "price": "101", "quantity": 1,
                     "command_id": exit_command.command_id, "native_order_id": "exit-order",
                     "native_execution_id": "exit-execution", "timestamp": now,
+                })
+                runtime.on_execution_message({
+                    "message_type": "ORDER_EVENT", "order_role": "EXIT",
+                    "order_state": "FILLED", "command_id": exit_command.command_id,
+                    "native_order_id": "exit-order",
                 })
                 runtime.on_execution_message({"message_type": "POSITION_EVENT", "quantity": 0, "timestamp": now})
                 self.assertEqual(runtime.state, PaperRuntimeState.RECONCILING)

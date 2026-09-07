@@ -214,7 +214,10 @@ NEW_YORK_RTH_PROFILE = PaperSessionProfile(
 )
 NY_AFTER_PROFILE = PaperSessionProfile(
     PaperSessionKind.NY_AFTER, NEW_YORK_TIMEZONE,
-    "16:00", "16:05", "17:30", "17:58", "18:00", (0, 1, 2, 3),
+    # CME Micro E-mini equity index futures close at 16:00 CT / 17:00 ET.
+    # Intersect the former window with the normal 16:15-16:30 ET halt and
+    # preserve the two-minute hard-flat buffer before the 17:00 ET closure.
+    "16:00", "16:05", "16:15", "16:58", "17:00", (0, 1, 2, 3),
 )
 OFF_SESSION_PROFILE = PaperSessionProfile(
     PaperSessionKind.OFF_SESSION, NEW_YORK_TIMEZONE,
@@ -328,6 +331,13 @@ class PaperSessionContext:
         if not self.entry_authorized_by_calendar:
             return False
         current = _aware_utc(moment)
+        if self.session_kind is PaperSessionKind.NY_AFTER:
+            local = current.astimezone(_NY)
+            # CME equity-index futures have a normal 16:15-16:30 ET halt.
+            # The compiled NY_AFTER cutoff and the exchange-open intersection
+            # both end at 16:15.
+            if _clock("16:15") <= local.timetz().replace(tzinfo=None) < _clock("16:30"):
+                return False
         return self.boundary_at("entry_start") <= current < self.boundary_at("entry_cutoff")
 
     def hard_flat_due_at(self, moment: datetime) -> bool:
@@ -413,6 +423,48 @@ def parse_market_event_time(value: str | datetime) -> datetime:
     return _aware_utc(parsed)
 
 
+def perpetual_exchange_blocker(
+    value: str | datetime,
+    context: "PaperSessionContext | None" = None,
+) -> str | None:
+    """Return only an exchange-closure reason, never a strategy-window reason.
+
+    The perpetual profile deliberately ignores the Lane III strategy-session
+    calendar, but it must not convert a recently fresh quote into authority
+    during CME's daily maintenance, weekly close, or equity-index halt.
+    Live connection/freshness/reconciliation remain independent required gates.
+    """
+    moment = parse_market_event_time(value)
+    local = moment.astimezone(_NY)
+    clock = local.timetz().replace(tzinfo=None)
+    daily_maintenance = (
+        local.weekday() in {0, 1, 2, 3}
+        and _clock("17:00") <= clock < _clock("18:00")
+    )
+    weekend_closed = (
+        (local.weekday() == 4 and clock >= _clock("17:00"))
+        or local.weekday() == 5
+        or (local.weekday() == 6 and clock < _clock("18:00"))
+    )
+    intraday_halt = (
+        local.weekday() in {0, 1, 2, 3, 4}
+        and _clock("16:15") <= clock < _clock("16:30")
+    )
+    if daily_maintenance:
+        return "EXCHANGE_DAILY_MAINTENANCE"
+    if weekend_closed:
+        return "EXCHANGE_WEEKEND_CLOSED"
+    if intraday_halt:
+        return "EXCHANGE_INTRADAY_HALT"
+    # A static session-calendar CLOSED value is intentionally not an exchange
+    # closure for the perpetual profile. In particular, holiday rows belong
+    # to the legacy strategy-session fence that this profile removes. Actual
+    # venue unavailability remains covered by the scheduled closures above,
+    # bridge/market health, and an exact AddOn or order rejection.
+    _ = context
+    return None
+
+
 class PaperSessionResolver:
     """Classifies event time only, retaining a fail-closed backward-time fence.
 
@@ -459,11 +511,29 @@ class PaperSessionResolver:
             profile, trade_day = LONDON_PROFILE, london_local.date()
         elif _clock("09:30") <= current < _clock("16:00") and local.weekday() in NEW_YORK_RTH_PROFILE.valid_start_weekdays:
             profile, trade_day = NEW_YORK_RTH_PROFILE, local.date()
-        elif _clock("16:00") <= current < _clock("18:00") and local.weekday() in NY_AFTER_PROFILE.valid_start_weekdays:
+        elif _clock("16:00") <= current < _clock("17:00") and local.weekday() in NY_AFTER_PROFILE.valid_start_weekdays:
             profile, trade_day = NY_AFTER_PROFILE, local.date()
         if profile is None or trade_day is None:
-            closed = PaperCalendarState.CLOSED if local.weekday() == 5 else self.calendar.state_for(local.date())
-            return PaperSessionResolution(self._off_context(local, generation, closed), False, "OFF_SESSION")
+            daily_maintenance = (
+                local.weekday() in {0, 1, 2, 3}
+                and _clock("17:00") <= current < _clock("18:00")
+            )
+            weekend_closed = (
+                (local.weekday() == 4 and current >= _clock("17:00"))
+                or local.weekday() == 5
+                or (local.weekday() == 6 and current < _clock("18:00"))
+            )
+            closed = (
+                PaperCalendarState.CLOSED
+                if daily_maintenance or weekend_closed
+                else self.calendar.state_for(local.date())
+            )
+            reason = (
+                "EXCHANGE_DAILY_MAINTENANCE" if daily_maintenance
+                else "EXCHANGE_WEEKEND_CLOSED" if weekend_closed
+                else "OFF_SESSION"
+            )
+            return PaperSessionResolution(self._off_context(local, generation, closed), False, reason)
         state = self.calendar.state_for(trade_day)
         context = PaperSessionContext(
             profile.session_kind, f"{PAPER_SESSION_CONTRACT}:{profile.session_kind.value}:{trade_day.isoformat()}",
@@ -475,6 +545,11 @@ class PaperSessionResolver:
             return PaperSessionResolution(context, False, "HOLIDAY_SESSION_UNVERIFIED")
         if state is PaperCalendarState.CLOSED:
             return PaperSessionResolution(context, False, "SESSION_CLOSED")
+        if (
+            profile.session_kind is PaperSessionKind.NY_AFTER
+            and _clock("16:15") <= current < _clock("16:30")
+        ):
+            return PaperSessionResolution(context, False, "EXCHANGE_INTRADAY_HALT")
         return PaperSessionResolution(context, context.entry_permitted_at(moment), None)
 
     def next_valid_session(self, after: str | datetime, *, generation: int = 0) -> PaperSessionContext | None:

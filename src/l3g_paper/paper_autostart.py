@@ -20,6 +20,7 @@ PAPER_AUTOSTART_ACTION_HEADER = "X-Beelzebub-Paper-Autostart-Action"
 PAPER_AUTOSTART_ACTION_VALUE = "sim101-paper-autostart-v1"
 PAPER_AUTOSTART_TOKEN_HEADER = "X-Beelzebub-Paper-Autostart-Token"
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
+_PERPETUAL_PROFILE = "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2"
 
 
 def _utc_now() -> str:
@@ -110,6 +111,78 @@ class PaperAutoStartService:
         return isinstance(session, Mapping) and session.get("active") is True
 
     @staticmethod
+    def _requires_position_proof(paper: Mapping[str, object]) -> bool:
+        return paper.get("entry_profile_version") == _PERPETUAL_PROFILE
+
+    @classmethod
+    def _perpetual_position_proven(cls, paper: Mapping[str, object]) -> bool:
+        if not cls._requires_position_proof(paper):
+            return cls._operational_active(paper)
+        position = paper.get("current_position")
+        requirement = paper.get("position_requirement")
+        source = requirement.get("source_signal") if isinstance(requirement, Mapping) else None
+        reasons = requirement.get("blocking_reasons") if isinstance(requirement, Mapping) else None
+        expected_state = position if position in {"LONG", "SHORT"} else None
+        return bool(
+            cls._operational_active(paper)
+            and expected_state is not None
+            and paper.get("state") == expected_state
+            and paper.get("paper_execution") == "POSITIONED"
+            and type(paper.get("current_quantity")) is int
+            and paper.get("current_quantity") == 1
+            and type(paper.get("current_position_quantity")) is int
+            and paper.get("current_position_quantity") == 1
+            and paper.get("broker_snapshot_position") == expected_state
+            and type(paper.get("broker_snapshot_position_quantity")) is int
+            and paper.get("broker_snapshot_position_quantity") == 1
+            and type(paper.get("working_owned_orders")) is int
+            and paper.get("working_owned_orders") == 1
+            and type(paper.get("working_entry_orders")) is int
+            and paper.get("working_entry_orders") == 0
+            and paper.get("protective_stop_state") == "WORKING"
+            and paper.get("foreign_activity") is False
+            and paper.get("position_snapshot_complete") is True
+            and paper.get("order_snapshot_complete") is True
+            and paper.get("reconciliation_current") is True
+            and paper.get("unresolved_command") is False
+            and paper.get("unresolved_native_order") is False
+            and paper.get("unresolved_execution") is False
+            and isinstance(requirement, Mapping)
+            and requirement.get("required") is True
+            and requirement.get("state") == "POSITIONED"
+            and requirement.get("actual_position") == expected_state
+            and type(requirement.get("actual_quantity")) is int
+            and requirement.get("actual_quantity") == 1
+            and requirement.get("desired_position") == expected_state
+            and requirement.get("primary_blocker") is None
+            and isinstance(reasons, (list, tuple))
+            and not reasons
+            and isinstance(source, Mapping)
+            and source.get("direction") == expected_state
+            and isinstance(source.get("candle_close_utc"), str)
+            and bool(str(source.get("candle_close_utc")).strip())
+            and isinstance(source.get("signal_hash"), str)
+            and bool(str(source.get("signal_hash")).strip())
+            and type(source.get("ledger_sequence")) is int
+            and source.get("ledger_sequence", 0) > 0
+            and isinstance(source.get("record_hash"), str)
+            and bool(str(source.get("record_hash")).strip())
+            and source.get("ledger_verified") is True
+        )
+
+    @staticmethod
+    def _position_blocker(paper: Mapping[str, object]) -> str:
+        requirement = paper.get("position_requirement")
+        if isinstance(requirement, Mapping):
+            blocker = requirement.get("primary_blocker")
+            if isinstance(blocker, str) and blocker:
+                return blocker
+        reason = paper.get("lockout_or_fault_reason")
+        if isinstance(reason, str) and reason:
+            return reason
+        return "PERPETUAL_POSITION_NOT_PROVEN"
+
+    @staticmethod
     def _base_start_failures(paper: Mapping[str, object]) -> list[str]:
         checks = (
             (paper.get("paper_execution") == "DISARMED", "PAPER_RUNTIME_NOT_DISARMED"),
@@ -144,8 +217,21 @@ class PaperAutoStartService:
         return list(dict.fromkeys(failures))
 
     def _button(self, paper: Mapping[str, object]) -> dict[str, object]:
-        if self._operational_active(paper):
+        if self._perpetual_position_proven(paper):
             return {"label": "Paper Trading Running", "enabled": False, "tone": "ready"}
+        if self._operational_active(paper) and self._requires_position_proof(paper):
+            blocker = self._position_blocker(paper)
+            requirement = paper.get("position_requirement")
+            requirement_position = (
+                requirement.get("actual_position")
+                if isinstance(requirement, Mapping) else None
+            )
+            flat = paper.get("current_position") == "FLAT" or requirement_position == "FLAT"
+            return {
+                "label": ("FLAT" if flat else "POSITION UNPROVEN") + " — BLOCKED: " + blocker,
+                "enabled": False,
+                "tone": "blocked",
+            }
         if self._stage in _ACTIVE:
             labels = {
                 PaperAutoStartStage.ENSURING_NINJATRADER: "Starting NinjaTrader…",
@@ -163,7 +249,7 @@ class PaperAutoStartService:
         except Exception:
             paper = {}
         with self._lock:
-            if self._operational_active(paper) and self._stage not in _ACTIVE:
+            if self._perpetual_position_proven(paper) and self._stage not in _ACTIVE:
                 stage = PaperAutoStartStage.RUNNING
             elif self._stage == PaperAutoStartStage.RUNNING:
                 stage = PaperAutoStartStage.IDLE
@@ -363,6 +449,34 @@ class PaperAutoStartService:
                 failures = [str(value) for value in reasons] if isinstance(reasons, list) else []
                 self._transition(PaperAutoStartStage.BLOCKED, failures or ["OPERATIONAL_PAPER_START_REFUSED"])
                 return
+            if self._requires_position_proof(paper):
+                terminal: list[str] = []
+
+                def positioned_or_terminal() -> bool:
+                    nonlocal paper, terminal
+                    value = self._paper_status()
+                    paper = value if isinstance(value, Mapping) else {}
+                    if self._perpetual_position_proven(paper):
+                        return True
+                    if (
+                        not self._operational_active(paper)
+                        or paper.get("state") in {
+                            "LOCKED_OUT", "FAULTED", "STOPPING", "STOPPED",
+                        }
+                    ):
+                        terminal = [self._position_blocker(paper)]
+                        return True
+                    return False
+
+                reached = self._wait_for(
+                    positioned_or_terminal, self._startup_timeout_seconds,
+                )
+                if not reached or terminal or not self._perpetual_position_proven(paper):
+                    self._transition(
+                        PaperAutoStartStage.BLOCKED,
+                        terminal or [self._position_blocker(paper)],
+                    )
+                    return
             self._transition(PaperAutoStartStage.RUNNING)
         except RuntimeError as error:
             blocker = str(error) if str(error).isupper() else "PAPER_AUTOSTART_INTERNAL_FAILURE"

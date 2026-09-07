@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Mapping
 
+from .contracts import FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION
+
 
 SLIM_STATUS_SCHEMA = "lane-iii-phase-g-slim-status-v1"
 _ACCEPTED_LEDGER_STATES = frozenset({
@@ -59,6 +61,9 @@ _BLOCKER_MESSAGES = {
     "COMMISSIONING_OWNERSHIP_ACTIVE": "A paper operation is already in progress.",
     "PAPER_SESSION_PNL_UNAVAILABLE": "Current paper-session P&L is unavailable.",
     "OPERATIONAL_LEDGER_INTEGRITY_FAILED": "Online ledger integrity is not confirmed; stop paper trading.",
+    "PERPETUAL_POSITION_REQUIREMENT_UNAVAILABLE": "Perpetual-position status is unavailable or incomplete.",
+    "ACTIVE_POSITION_REQUIREMENT_UNHEALTHY": "Perpetual-position state does not match the verified five-minute target.",
+    "ACTIVE_OWNED_ORDER_SET_UNHEALTHY": "The positioned account does not have exactly one owned protective order.",
 }
 
 
@@ -77,6 +82,75 @@ def _message(reason: str | None, fallback: str) -> str:
 
 def _as_mapping(value: object) -> Mapping[str, object]:
     return value if isinstance(value, Mapping) else {}
+
+
+def _is_perpetual_position_profile(runtime: Mapping[str, object]) -> bool:
+    return runtime.get("entry_profile_version") == FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION
+
+
+def _perpetual_requirement(runtime: Mapping[str, object]) -> Mapping[str, object]:
+    if not _is_perpetual_position_profile(runtime):
+        return {}
+    requirement = _as_mapping(runtime.get("position_requirement"))
+    return requirement if requirement.get("required") is True else {}
+
+
+def _perpetual_flat_blocker(runtime: Mapping[str, object]) -> str | None:
+    """Return the runtime's exact flat reason for the V2 perpetual profile.
+
+    A missing or contradictory projection is itself a fail-closed reason.  The
+    presentation adapter never invents a trading explanation when the runtime
+    has not supplied one.
+    """
+    if not _is_perpetual_position_profile(runtime):
+        return None
+    requirement = _perpetual_requirement(runtime)
+    runtime_flat = runtime.get("current_position") == "FLAT"
+    requirement_flat = requirement.get("actual_position") == "FLAT"
+    if not (runtime_flat or requirement_flat):
+        return None
+    reason = requirement.get("primary_blocker")
+    if isinstance(reason, str) and reason.strip():
+        return reason.strip()
+    return "PERPETUAL_POSITION_REQUIREMENT_UNAVAILABLE"
+
+
+def _perpetual_position_is_proven(
+    runtime: Mapping[str, object], *, direction: object,
+) -> bool:
+    """Require a complete V2 requirement and durable source-signal proof."""
+    requirement = _perpetual_requirement(runtime)
+    reasons = requirement.get("blocking_reasons")
+    signal = _as_mapping(requirement.get("source_signal"))
+    return (
+        direction in {"LONG", "SHORT"}
+        and runtime.get("current_position") == direction
+        and type(runtime.get("current_quantity")) is int
+        and runtime.get("current_quantity") == 1
+        and type(runtime.get("current_position_quantity")) is int
+        and runtime.get("current_position_quantity") == 1
+        and runtime.get("broker_snapshot_position") == direction
+        and type(runtime.get("broker_snapshot_position_quantity")) is int
+        and runtime.get("broker_snapshot_position_quantity") == 1
+        and requirement.get("state") == "POSITIONED"
+        and requirement.get("actual_position") == direction
+        and type(requirement.get("actual_quantity")) is int
+        and requirement.get("actual_quantity") == 1
+        and requirement.get("desired_position") == direction
+        and requirement.get("primary_blocker") is None
+        and isinstance(reasons, (list, tuple))
+        and not reasons
+        and signal.get("direction") == direction
+        and isinstance(signal.get("candle_close_utc"), str)
+        and bool(str(signal.get("candle_close_utc")).strip())
+        and isinstance(signal.get("signal_hash"), str)
+        and bool(str(signal.get("signal_hash")).strip())
+        and type(signal.get("ledger_sequence")) is int
+        and signal.get("ledger_sequence", 0) > 0
+        and isinstance(signal.get("record_hash"), str)
+        and bool(str(signal.get("record_hash")).strip())
+        and signal.get("ledger_verified") is True
+    )
 
 
 def _verification_is_current(
@@ -143,6 +217,14 @@ def _active_blockers(
             blockers.append("ACTIVE_POSITION_UNHEALTHY")
         if runtime.get("protective_stop_state") != "WORKING":
             blockers.append("PROTECTIVE_STOP_REJECTED")
+        if _is_perpetual_position_profile(runtime):
+            if not _perpetual_position_is_proven(runtime, direction=state):
+                blockers.append("ACTIVE_POSITION_REQUIREMENT_UNHEALTHY")
+            if (
+                type(runtime.get("working_owned_orders")) is not int
+                or runtime.get("working_owned_orders") != 1
+            ):
+                blockers.append("ACTIVE_OWNED_ORDER_SET_UNHEALTHY")
     else:
         if (
             state != "PAPER_RUNNING"
@@ -155,8 +237,16 @@ def _active_blockers(
             or runtime.get("protective_stop_state") not in {"NONE", "CANCELLED"}
         ):
             blockers.append("ACTIVE_POSITION_UNHEALTHY")
-    if runtime.get("working_entry_orders") != 0:
+    if (
+        runtime.get("working_entry_orders") != 0
+        or (
+            _is_perpetual_position_profile(runtime)
+            and type(runtime.get("working_entry_orders")) is not int
+        )
+    ):
         blockers.append("ACTIVE_WORKING_ENTRY_ORDER")
+    if _is_perpetual_position_profile(runtime) and runtime.get("foreign_activity") is not False:
+        blockers.append("FOREIGN_ACTIVITY_LOCKOUT")
     if runtime.get("lockout_or_fault_reason") not in (None, ""):
         blockers.append("ACTIVE_LOCKOUT_OR_FAULT")
     if any(runtime.get(name) is not expected for name, expected in {
@@ -331,6 +421,23 @@ def derive_slim_paper_status(
                 "label": "STOPPING…",
                 "message": "Cancelling owned work and waiting for Sim101 flat reconciliation.",
                 "primary_blocker": None,
+                "can_start": False,
+                "paper_active": True,
+                "ledger_verification": verification_payload,
+                "pnl": pnl,
+            })
+        flat_blocker = _perpetual_flat_blocker(runtime)
+        if flat_blocker is not None:
+            return finalize({
+                "schema": SLIM_STATUS_SCHEMA,
+                "generated_at": _timestamp(current),
+                "light": "RED",
+                "label": f"FLAT — BLOCKED: {flat_blocker}",
+                "message": _message(
+                    flat_blocker,
+                    "The perpetual-position requirement is blocked; review Full Console diagnostics.",
+                ),
+                "primary_blocker": flat_blocker,
                 "can_start": False,
                 "paper_active": True,
                 "ledger_verification": verification_payload,

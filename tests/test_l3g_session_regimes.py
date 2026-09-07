@@ -67,7 +67,9 @@ class SessionClassificationTests(unittest.TestCase):
             ("2026-08-25T19:30:00Z", PaperSessionKind.NEW_YORK_RTH, "2026-08-25", False),
             ("2026-08-25T20:00:00Z", PaperSessionKind.NY_AFTER, "2026-08-25", False),
             ("2026-08-25T20:05:00Z", PaperSessionKind.NY_AFTER, "2026-08-25", True),
-            ("2026-08-25T21:30:00Z", PaperSessionKind.NY_AFTER, "2026-08-25", False),
+            ("2026-08-25T20:15:00Z", PaperSessionKind.NY_AFTER, "2026-08-25", False),
+            ("2026-08-25T20:30:00Z", PaperSessionKind.NY_AFTER, "2026-08-25", False),
+            ("2026-08-25T21:30:00Z", PaperSessionKind.OFF_SESSION, "2026-08-25", False),
             ("2026-08-28T22:00:00Z", PaperSessionKind.OFF_SESSION, "2026-08-28", False),  # Friday 18:00
             ("2026-08-29T16:00:00Z", PaperSessionKind.OFF_SESSION, "2026-08-29", False),
         )
@@ -79,9 +81,14 @@ class SessionClassificationTests(unittest.TestCase):
                 self.assertEqual(result.entry_authorized, entry_authorized)
         hard_flat = resolved("2026-08-25T19:58:00Z").context
         self.assertTrue(hard_flat.hard_flat_due_at(datetime(2026, 8, 25, 19, 58, tzinfo=timezone.utc)))
-        ny_after_hard_flat = resolved("2026-08-25T21:58:00Z").context
-        self.assertTrue(ny_after_hard_flat.hard_flat_due_at(datetime(2026, 8, 25, 21, 58, tzinfo=timezone.utc)))
+        ny_after_hard_flat = resolved("2026-08-25T20:58:00Z").context
+        self.assertTrue(ny_after_hard_flat.hard_flat_due_at(datetime(2026, 8, 25, 20, 58, tzinfo=timezone.utc)))
         self.assertEqual(ny_after_hard_flat.session_family.value, "NEW_YORK")
+        maintenance = PaperSessionResolver().resolve("2026-08-25T21:00:00Z")
+        self.assertEqual(maintenance.context.calendar_state, PaperCalendarState.CLOSED)
+        self.assertEqual(maintenance.reason_code, "EXCHANGE_DAILY_MAINTENANCE")
+        intraday_halt = PaperSessionResolver().resolve("2026-08-25T20:15:00Z")
+        self.assertEqual(intraday_halt.reason_code, "EXCHANGE_INTRADAY_HALT")
 
     def test_new_york_to_after_to_asia_are_distinct_local_evidence_domains(self) -> None:
         rth = resolved("2026-08-25T19:59:00Z").context
@@ -103,6 +110,28 @@ class SessionClassificationTests(unittest.TestCase):
         self.assertTrue(summer.entry_authorized)
         self.assertEqual(winter.context.timezone, "America/New_York")
         self.assertEqual(summer.context.timezone, "America/New_York")
+
+        winter_maintenance = PaperSessionResolver().resolve("2026-01-06T22:00:00Z")
+        summer_maintenance = PaperSessionResolver().resolve("2026-07-07T21:00:00Z")
+        self.assertEqual(winter_maintenance.reason_code, "EXCHANGE_DAILY_MAINTENANCE")
+        self.assertEqual(summer_maintenance.reason_code, "EXCHANGE_DAILY_MAINTENANCE")
+        self.assertEqual(winter_maintenance.context.calendar_state, PaperCalendarState.CLOSED)
+        self.assertEqual(summer_maintenance.context.calendar_state, PaperCalendarState.CLOSED)
+
+    def test_ny_after_flattens_before_exchange_close_and_weekend_is_explicit(self) -> None:
+        before_flat = PaperSessionResolver().resolve("2026-08-25T20:57:59.999999Z")
+        at_flat = PaperSessionResolver().resolve("2026-08-25T20:58:00Z")
+        at_close = PaperSessionResolver().resolve("2026-08-25T21:00:00Z")
+        self.assertFalse(before_flat.context.hard_flat_due_at(datetime(2026, 8, 25, 20, 57, 59, 999999, tzinfo=timezone.utc)))
+        self.assertTrue(at_flat.context.hard_flat_due_at(datetime(2026, 8, 25, 20, 58, tzinfo=timezone.utc)))
+        self.assertEqual(at_close.reason_code, "EXCHANGE_DAILY_MAINTENANCE")
+        friday_close = PaperSessionResolver().resolve("2026-08-28T21:00:00Z")
+        sunday_preopen = PaperSessionResolver().resolve("2026-08-30T21:59:59Z")
+        sunday_open = PaperSessionResolver().resolve("2026-08-30T22:00:00Z")
+        self.assertEqual(friday_close.reason_code, "EXCHANGE_WEEKEND_CLOSED")
+        self.assertEqual(sunday_preopen.reason_code, "EXCHANGE_WEEKEND_CLOSED")
+        self.assertEqual(sunday_open.context.session_kind, PaperSessionKind.ASIA)
+        self.assertFalse(sunday_open.entry_authorized)
 
     def test_known_holiday_candidate_requires_verified_override_by_default(self) -> None:
         # Thanksgiving is a candidate fence, not a claim of a particular CME
@@ -213,6 +242,7 @@ class NinjaSessionFenceSourceTests(unittest.TestCase):
             "America/New_York", "ASIA", "NEW_YORK_RTH", "NY_AFTER", "NEW_YORK", "ValidatePaperSessionFence",
             "SESSION_PROFILE_HASH_MISMATCH", "ENTRY_CUTOFF_PASSED", "SESSION_OFF_SESSION",
             "trade_date", "session_generation",
+            "new TimeSpan(16, 15, 0)",
         ):
             self.assertIn(marker, source)
 

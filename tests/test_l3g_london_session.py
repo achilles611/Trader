@@ -139,7 +139,7 @@ class LondonClassificationTests(unittest.TestCase):
         self.assertEqual(LONDON_PROFILE.payload()["session_profile_hash"], "db211b6665e873fc3bf0b93db76210b25d154893ca1d5ca15ef0d7d6bea233cc")
         self.assertEqual(ASIA_PROFILE.profile_hash, "55225b35ccdb289d179bb23afd7f3fdb2c5ab193d53aba21603f17ff9f6d43aa")
         self.assertEqual(NEW_YORK_RTH_PROFILE.profile_hash, "8b8560a08ff41963a7a78d09bc977fbc1faf10f4a11ce58d05f47cacd89e0814")
-        self.assertEqual(NY_AFTER_PROFILE.profile_hash, "e0cea9aa679c24ad4491ad929bcd72832cd3dcb49e2e5a7a64226c8abb5a1db2")
+        self.assertEqual(NY_AFTER_PROFILE.profile_hash, "f4dc8790d7cce0b26a4cedf43bc891907a1fef0a7fd97b4b66f19883907b8c97")
         old_asia = context_from_identity(
             PaperSessionKind.ASIA,
             "MNQU6:ASIA:2026-07-06",

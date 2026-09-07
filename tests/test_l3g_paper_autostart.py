@@ -225,6 +225,125 @@ class PaperAutoStartTests(unittest.TestCase):
         self.assertEqual(status["stage"], "IDLE")
         self.assertEqual(status["button"]["label"], "Start Paper Trading")
 
+    def test_perpetual_autostart_never_completes_while_flat(self) -> None:
+        self.paper.update({
+            "entry_profile_version": "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2",
+            "position_requirement": {
+                "state": "BLOCKED_FLAT",
+                "primary_blocker": "MARKET_DATA_CONNECTION_LOST",
+                "blocking_reasons": ["MARKET_DATA_CONNECTION_LOST"],
+                "source_signal": None,
+            },
+        })
+        service = self.service()
+        service.start("paper-auto-perpetual-flat")
+        service.wait(2)
+        status = service.status()
+        self.assertEqual(status["stage"], "BLOCKED")
+        self.assertEqual(status["blockers"], ["MARKET_DATA_CONNECTION_LOST"])
+        self.assertEqual(
+            status["button"]["label"],
+            "FLAT — BLOCKED: MARKET_DATA_CONNECTION_LOST",
+        )
+
+    def test_perpetual_autostart_completes_only_after_position_and_stop_proof(self) -> None:
+        self.paper["entry_profile_version"] = "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2"
+
+        def operational(request_id: str) -> dict[str, object]:
+            self.operational_requests.append(request_id)
+            self.paper.update({
+                "operational_paper_session": {"active": True},
+                "state": "SHORT",
+                "paper_execution": "POSITIONED",
+                "session_armed_state": "ARMED_PERPETUAL",
+                "current_position": "SHORT",
+                "current_quantity": 1,
+                "current_position_quantity": 1,
+                "broker_snapshot_position": "SHORT",
+                "broker_snapshot_position_quantity": 1,
+                "working_owned_orders": 1,
+                "working_entry_orders": 0,
+                "protective_stop_state": "WORKING",
+                "foreign_activity": False,
+                "position_requirement": {
+                    "required": True,
+                    "state": "POSITIONED",
+                    "actual_position": "SHORT",
+                    "actual_quantity": 1,
+                    "desired_position": "SHORT",
+                    "primary_blocker": None,
+                    "blocking_reasons": [],
+                    "source_signal": {
+                        "direction": "SHORT",
+                        "candle_close_utc": "2026-09-01T20:50:00Z",
+                        "signal_hash": "signal-hash-short",
+                        "ledger_sequence": 126,
+                        "record_hash": "record-hash-short",
+                        "ledger_verified": True,
+                    },
+                },
+            })
+            return {"started": True, "state": "SHORT"}
+
+        service = self.service()
+        service._start_operational_paper = operational
+        service.start("paper-auto-perpetual-positioned")
+        service.wait(2)
+        status = service.status()
+        self.assertEqual(status["stage"], "RUNNING")
+        self.assertEqual(status["button"]["label"], "Paper Trading Running")
+
+    def test_perpetual_autostart_rejects_position_against_wrong_latest_bias(self) -> None:
+        self.paper["entry_profile_version"] = "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2"
+
+        def operational(request_id: str) -> dict[str, object]:
+            self.operational_requests.append(request_id)
+            self.paper.update({
+                "operational_paper_session": {"active": True},
+                "state": "SHORT",
+                "paper_execution": "POSITIONED",
+                "session_armed_state": "ARMED_PERPETUAL",
+                "current_position": "SHORT",
+                "current_quantity": 1,
+                "current_position_quantity": 1,
+                "broker_snapshot_position": "SHORT",
+                "broker_snapshot_position_quantity": 1,
+                "working_owned_orders": 1,
+                "working_entry_orders": 0,
+                "protective_stop_state": "WORKING",
+                "foreign_activity": False,
+                "position_requirement": {
+                    "required": True,
+                    "state": "POSITIONED",
+                    "actual_position": "SHORT",
+                    "actual_quantity": 1,
+                    "desired_position": "LONG",
+                    "primary_blocker": None,
+                    "blocking_reasons": [],
+                    "source_signal": {
+                        "direction": "LONG",
+                        "candle_close_utc": "2026-09-01T20:50:00Z",
+                        "signal_hash": "signal-hash-long",
+                        "ledger_sequence": 126,
+                        "record_hash": "record-hash-long",
+                        "ledger_verified": True,
+                    },
+                },
+            })
+            return {"started": True, "state": "SHORT"}
+
+        service = self.service()
+        service._start_operational_paper = operational
+        service.start("paper-auto-perpetual-wrong-bias")
+        service.wait(2)
+        status = service.status()
+        self.assertEqual(status["stage"], "BLOCKED")
+        self.assertEqual(status["blockers"], ["PERPETUAL_POSITION_NOT_PROVEN"])
+        self.assertEqual(
+            status["button"]["label"],
+            "POSITION UNPROVEN — BLOCKED: PERPETUAL_POSITION_NOT_PROVEN",
+        )
+
 
 class PaperAutoStartEndpointTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:

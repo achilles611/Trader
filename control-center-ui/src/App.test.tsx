@@ -41,6 +41,10 @@ let profileSwitchResponse: Record<string, unknown> = {
   action_token: "fixture-profile-switch-token", stage: "IDLE", in_progress: false,
   active_profile: "BEELZEBUB_SCALPER_V2", current_profile: "BEELZEBUB_SCALPER_V2",
   target_profile: null, blockers: [],
+  selection: {
+    requested: null,
+    established: { profile: "BEELZEBUB_SCALPER_V2" },
+  },
   profiles: [
     { selection_key: "NY_HIGH_CONFLUENCE_COMMISSIONING_V1", display_name: "High confidence" },
     { selection_key: "BEELZEBUB_SCALPER_V2", display_name: "Scalper" },
@@ -239,6 +243,10 @@ beforeEach(() => {
     action_token: "fixture-profile-switch-token", stage: "IDLE", in_progress: false,
     active_profile: "BEELZEBUB_SCALPER_V2", current_profile: "BEELZEBUB_SCALPER_V2",
     target_profile: null, blockers: [],
+    selection: {
+      requested: null,
+      established: { profile: "BEELZEBUB_SCALPER_V2" },
+    },
     profiles: [
       { selection_key: "NY_HIGH_CONFLUENCE_COMMISSIONING_V1", display_name: "High confidence" },
       { selection_key: "BEELZEBUB_SCALPER_V2", display_name: "Scalper" },
@@ -492,7 +500,7 @@ describe("copy control center", () => {
     expect(regime).toHaveTextContent("LONDON");
     expect(regime).toHaveTextContent("EUROPE");
     expect(regime).toHaveTextContent("Europe/London");
-    expect(screen.getByText("London session P&L").nextElementSibling).toHaveTextContent("$7.25");
+    expect(screen.getByText("London account P&L").nextElementSibling).toHaveTextContent("$7.25");
   });
 
   it("enables atomic start only for a fresh rehearsal that still matches live readiness", async () => {
@@ -898,6 +906,154 @@ describe("copy control center", () => {
     expect(fetch).not.toHaveBeenCalledWith("/api/lane-iii/paper/operational-start", expect.anything());
   });
 
+  it("lets current V2 flat truth override a stale green Slim projection", async () => {
+    const perpetualProfile = "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2";
+    profileSwitchResponse = {
+      ...profileSwitchResponse,
+      active_profile: perpetualProfile,
+      current_profile: perpetualProfile,
+      profiles: [
+        ...(profileSwitchResponse.profiles as Record<string, unknown>[]),
+        { selection_key: perpetualProfile, display_name: "5-minute perpetual position" },
+      ],
+    };
+    laneIIIPaperOverrides = {
+      state: "PAPER_RUNNING",
+      paper_execution: "RUNNING",
+      entry_profile: "BEELZEBUB_FIVE_MINUTE_PERPETUAL",
+      entry_profile_version: perpetualProfile,
+      current_position: "FLAT",
+      current_quantity: 0,
+      broker_snapshot_position: "FLAT",
+      broker_snapshot_position_quantity: 0,
+      operational_paper_session: { active: true },
+      position_requirement: {
+        required: true,
+        state: "BLOCKED_FLAT",
+        actual_position: "FLAT",
+        actual_quantity: 0,
+        desired_position: "LONG",
+        primary_blocker: "MARKET_OBSERVER_UNHEALTHY",
+        blocking_reasons: ["MARKET_OBSERVER_UNHEALTHY"],
+      },
+    };
+    slimStatusResponse = {
+      generated_at: new Date(Date.now() - 1_000).toISOString(),
+      light: "GREEN",
+      label: "PAPER TRADING ACTIVE",
+      message: "Sim101 paper operation is healthy and protected.",
+      primary_blocker: null,
+      can_start: false,
+      paper_active: true,
+      pnl: { state: "CURRENT", total: "0", realized: "0", unrealized: "0" },
+    };
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+
+    expect(await screen.findByRole("img", { name: "Readiness: RED" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "FLAT — BLOCKED: MARKET_OBSERVER_UNHEALTHY" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "PAPER TRADING ACTIVE" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "STOP TRADING" })).toBeEnabled();
+  });
+
+  it.each([
+    {
+      caseName: "desired-position mismatch",
+      desiredPosition: "SHORT",
+      sourceDirection: "LONG",
+      blockingReasons: [] as unknown[],
+    },
+    {
+      caseName: "source-signal mismatch",
+      desiredPosition: "LONG",
+      sourceDirection: "SHORT",
+      blockingReasons: [] as unknown[],
+    },
+    {
+      caseName: "malformed nonempty blocker evidence",
+      desiredPosition: "LONG",
+      sourceDirection: "LONG",
+      blockingReasons: [null] as unknown[],
+    },
+  ])("lets a current V2 $caseName override a stale green Slim projection", async ({ desiredPosition, sourceDirection, blockingReasons }) => {
+    const perpetualProfile = "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2";
+    profileSwitchResponse = {
+      ...profileSwitchResponse,
+      active_profile: perpetualProfile,
+      current_profile: perpetualProfile,
+      profiles: [
+        ...(profileSwitchResponse.profiles as Record<string, unknown>[]),
+        { selection_key: perpetualProfile, display_name: "5-minute perpetual position" },
+      ],
+    };
+    laneIIIPaperOverrides = {
+      mode: "PAPER_SIM101",
+      state: "LONG",
+      paper_execution: "POSITIONED",
+      paper_account: "Sim101",
+      account_class: "LOCAL_SIMULATION",
+      market_instrument: "MNQ SEP26",
+      maximum_quantity: 1,
+      live_capital: "DENIED",
+      entry_profile: "BEELZEBUB_FIVE_MINUTE_PERPETUAL",
+      entry_profile_version: perpetualProfile,
+      current_position: "LONG",
+      current_quantity: 1,
+      current_position_quantity: 1,
+      broker_snapshot_position: "LONG",
+      broker_snapshot_position_quantity: 1,
+      working_owned_orders: 1,
+      working_entry_orders: 0,
+      foreign_activity: false,
+      protective_stop_state: "WORKING",
+      position_snapshot_complete: true,
+      order_snapshot_complete: true,
+      reconciliation_current: true,
+      unresolved_command: false,
+      unresolved_native_order: false,
+      unresolved_execution: false,
+      lockout_or_fault_reason: null,
+      operational_paper_session: { active: true },
+      position_requirement: {
+        required: true,
+        state: "POSITIONED",
+        actual_position: "LONG",
+        actual_quantity: 1,
+        desired_position: desiredPosition,
+        primary_blocker: null,
+        blocking_reasons: blockingReasons,
+        source_signal: {
+          direction: sourceDirection,
+          candle_close_utc: "2026-09-07T05:20:00Z",
+          signal_hash: "a".repeat(64),
+          ledger_sequence: 151,
+          record_hash: "b".repeat(64),
+          ledger_verified: true,
+        },
+      },
+    };
+    slimStatusResponse = {
+      generated_at: new Date(Date.now() - 1_000).toISOString(),
+      light: "GREEN",
+      label: "PAPER TRADING ACTIVE",
+      message: "Sim101 paper operation is healthy and protected.",
+      primary_blocker: null,
+      can_start: false,
+      paper_active: true,
+      pnl: { state: "CURRENT", total: "0", realized: "0", unrealized: "0" },
+    };
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+
+    expect(await screen.findByRole("img", { name: "Readiness: RED" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "POSITION UNPROVEN — BLOCKED: ACTIVE_POSITION_REQUIREMENT_UNHEALTHY" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "PAPER TRADING ACTIVE" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/FLAT — BLOCKED/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "STOP TRADING" })).toBeEnabled();
+  });
+
   it("offers all compiled profiles in Slim Mode and submits one authenticated switch", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
@@ -907,6 +1063,15 @@ describe("copy control center", () => {
     expect(within(selector).getByRole("option", { name: "5-minute perpetual position" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Switch & Start" })).toBeDisabled();
     fireEvent.change(selector, { target: { value: "BEELZEBUB_FIVE_MINUTE_BIAS_V1" } });
+    profileSwitchResponse = {
+      ...profileSwitchResponse, stage: "PREPARING", in_progress: true,
+      operation_id: "profile-switch-ui-fixture",
+      target_profile: "BEELZEBUB_FIVE_MINUTE_BIAS_V1",
+      selection: {
+        requested: { profile: "BEELZEBUB_FIVE_MINUTE_BIAS_V1" },
+        established: { profile: "BEELZEBUB_SCALPER_V2" },
+      },
+    };
     fireEvent.click(screen.getByRole("button", { name: "Switch & Start" }));
     await waitFor(() => expect(fetch).toHaveBeenCalledWith(
       "/api/lane-iii/paper/profile-switch",
@@ -922,6 +1087,245 @@ describe("copy control center", () => {
     expect(JSON.parse(String(call?.[1]?.body))).toEqual({
       request_id: expect.stringMatching(/^profile-switch-ui-/),
       target_profile: "BEELZEBUB_FIVE_MINUTE_BIAS_V1",
+    });
+  });
+
+  it("does not let a stale browser preference override the backend-established run", async () => {
+    localStorage.setItem("beezconsole-paper-profile-selection", "NY_HIGH_CONFLUENCE_COMMISSIONING_V1");
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+    const selector = await screen.findByRole("combobox", { name: "Paper profile" });
+    await waitFor(() => expect(selector).toHaveValue("BEELZEBUB_SCALPER_V2"));
+    expect(screen.getByText("Last established:").parentElement).toHaveTextContent("Scalper");
+  });
+
+  it("labels a cached target-start projection as stale when the exact target runtime is running", async () => {
+    profileSwitchResponse = {
+      ...profileSwitchResponse,
+      stage: "STARTING_TARGET",
+      in_progress: true,
+      active_profile: "BEELZEBUB_FIVE_MINUTE_BIAS_V1",
+      current_profile: "BEELZEBUB_SCALPER_V2",
+      target_profile: "BEELZEBUB_FIVE_MINUTE_BIAS_V1",
+    };
+    paperAutoStartResponse = {
+      ...paperAutoStartResponse,
+      stage: "RUNNING",
+      in_progress: false,
+      button: { label: "Paper Trading Running", enabled: false, tone: "ready" },
+    };
+    laneIIIPaperOverrides = {
+      state: "PAPER_RUNNING",
+      paper_execution: "RUNNING",
+      entry_profile: "BEELZEBUB_FIVE_MINUTE_BIAS",
+      entry_profile_version: "BEELZEBUB_FIVE_MINUTE_BIAS_V1",
+      operational_paper_session: { active: true },
+    };
+    slimStatusResponse = {
+      ...slimStatusResponse,
+      light: "GREEN",
+      label: "PAPER TRADING ACTIVE",
+      paper_active: true,
+    };
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+
+    expect(await screen.findByText("Selected profile is running. The prior switch projection is stale.")).toBeInTheDocument();
+    expect(screen.queryByText(/Switch in progress:/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Running" })).toBeDisabled();
+  });
+
+  it.each(["LONG", "SHORT"])(
+    "labels a cached target-start projection as stale when V2 is exactly positioned %s",
+    async (direction) => {
+      const perpetualProfile = "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2";
+      profileSwitchResponse = {
+        ...profileSwitchResponse,
+        stage: "STARTING_TARGET",
+        in_progress: true,
+        active_profile: perpetualProfile,
+        current_profile: "BEELZEBUB_FIVE_MINUTE_BIAS_V1",
+        target_profile: perpetualProfile,
+        profiles: [
+          ...(profileSwitchResponse.profiles as Record<string, unknown>[]),
+          { selection_key: perpetualProfile, display_name: "5-minute perpetual position" },
+        ],
+      };
+      paperAutoStartResponse = {
+        ...paperAutoStartResponse,
+        stage: "RUNNING",
+        in_progress: false,
+        button: { label: "Paper Trading Running", enabled: false, tone: "ready" },
+      };
+      laneIIIPaperOverrides = {
+        mode: "PAPER_SIM101",
+        state: direction,
+        paper_execution: "POSITIONED",
+        paper_account: "Sim101",
+        account_class: "LOCAL_SIMULATION",
+        market_instrument: "MNQ SEP26",
+        maximum_quantity: 1,
+        live_capital: "DENIED",
+        entry_profile: "BEELZEBUB_FIVE_MINUTE_PERPETUAL",
+        entry_profile_version: perpetualProfile,
+        current_position: direction,
+        current_quantity: 1,
+        current_position_quantity: 1,
+        broker_snapshot_position: direction,
+        broker_snapshot_position_quantity: 1,
+        working_owned_orders: 1,
+        working_entry_orders: 0,
+        foreign_activity: false,
+        protective_stop_state: "WORKING",
+        position_snapshot_complete: true,
+        order_snapshot_complete: true,
+        reconciliation_current: true,
+        unresolved_command: false,
+        unresolved_native_order: false,
+        unresolved_execution: false,
+        lockout_or_fault_reason: null,
+        operational_paper_session: { active: true },
+        position_requirement: {
+          required: true,
+          state: "POSITIONED",
+          actual_position: direction,
+          actual_quantity: 1,
+          desired_position: direction,
+          primary_blocker: null,
+          blocking_reasons: [],
+          source_signal: {
+            direction,
+            candle_close_utc: "2026-09-07T05:20:00Z",
+            signal_hash: "a".repeat(64),
+            ledger_sequence: 151,
+            record_hash: "b".repeat(64),
+            ledger_verified: true,
+          },
+        },
+      };
+      slimStatusResponse = {
+        ...slimStatusResponse,
+        light: "GREEN",
+        label: "PAPER TRADING ACTIVE",
+        message: "Sim101 paper operation is healthy and protected.",
+        primary_blocker: null,
+        paper_active: true,
+      };
+
+      render(<App />);
+      fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+
+      expect(await screen.findByText("Selected profile is running. The prior switch projection is stale.")).toBeInTheDocument();
+      expect(screen.getByRole("img", { name: "Readiness: GREEN" })).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: "PAPER TRADING ACTIVE" })).toBeInTheDocument();
+      expect(screen.queryByText(/Switch in progress:/)).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Running" })).toBeDisabled();
+    },
+  );
+
+  it("renders the backend-proven remembered profile as the authoritative selection", async () => {
+    profileSwitchResponse = {
+      ...profileSwitchResponse,
+      operation_id: "profile-switch-established-five-minute",
+      stage: "RUNNING",
+      active_profile: "BEELZEBUB_FIVE_MINUTE_BIAS_V1",
+      current_profile: "BEELZEBUB_FIVE_MINUTE_BIAS_V1",
+      target_profile: "BEELZEBUB_FIVE_MINUTE_BIAS_V1",
+      selection: {
+        requested: { profile: "BEELZEBUB_FIVE_MINUTE_BIAS_V1" },
+        established: { profile: "BEELZEBUB_FIVE_MINUTE_BIAS_V1" },
+      },
+    };
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+    expect(await screen.findByRole("combobox", { name: "Paper profile" })).toHaveValue("BEELZEBUB_FIVE_MINUTE_BIAS_V1");
+    expect(screen.getByText("Last established:").parentElement).toHaveTextContent("5-minute perpetual position");
+  });
+
+  it("does not claim a newly selected target is already running", async () => {
+    profileSwitchResponse = {
+      ...profileSwitchResponse, stage: "RUNNING", in_progress: false,
+      operation_id: "profile-switch-running-scalper",
+      target_profile: "BEELZEBUB_SCALPER_V2",
+    };
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+    const selector = await screen.findByRole("combobox", { name: "Paper profile" });
+    expect(screen.getByText("Current profile is running: BEELZEBUB_SCALPER_V2.")).toBeInTheDocument();
+
+    fireEvent.change(selector, { target: { value: "BEELZEBUB_FIVE_MINUTE_BIAS_V1" } });
+    expect(screen.queryByText("Selected profile is running.")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Switch & Start" })).toBeEnabled();
+  });
+
+  it("reports a backend-safe profile-switch refusal as failure with the exact blocker", async () => {
+    const blocked = {
+      ...profileSwitchResponse, stage: "BLOCKED_SAFE", in_progress: false,
+      operation_id: "profile-switch-blocked-fixture",
+      target_profile: "BEELZEBUB_FIVE_MINUTE_BIAS_V1",
+      blockers: ["RISK_CONTINUITY_ARTIFACT_INTEGRITY_FAILED"],
+      selection: {
+        requested: { profile: "BEELZEBUB_FIVE_MINUTE_BIAS_V1" },
+        established: { profile: "BEELZEBUB_SCALPER_V2" },
+      },
+    };
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      const value = path.startsWith("/api/lane-iii/paper/profile-switch") && init?.method === "POST"
+        ? blocked
+        : payload(path);
+      return new Response(JSON.stringify(value), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+    const selector = await screen.findByRole("combobox", { name: "Paper profile" });
+    fireEvent.change(selector, { target: { value: "BEELZEBUB_FIVE_MINUTE_BIAS_V1" } });
+    const switchButton = screen.getByRole("button", { name: "Switch & Start" });
+    await waitFor(() => expect(switchButton).toBeEnabled());
+    fireEvent.click(switchButton);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Profile switch did not begin: RISK_CONTINUITY_ARTIFACT_INTEGRITY_FAILED");
+    expect(screen.getByText(/Switch blocked safely: RISK_CONTINUITY_ARTIFACT_INTEGRITY_FAILED/)).toBeInTheDocument();
+  });
+
+  it("uses a new request ID after terminal selection-persistence failure", async () => {
+    const terminal = {
+      ...profileSwitchResponse,
+      stage: "RUNNING_SELECTION_PERSISTENCE_FAILED",
+      in_progress: false,
+      operation_id: "profile-switch-persistence-failed",
+      target_profile: "BEELZEBUB_FIVE_MINUTE_BIAS_V1",
+      blockers: ["PROFILE_SELECTION_WRITE_FAILED"],
+    };
+    vi.spyOn(Math, "random").mockReturnValueOnce(0.111).mockReturnValueOnce(0.222);
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      const value = path === "/api/lane-iii/paper/profile-switch" && init?.method === "POST"
+        ? terminal
+        : payload(path);
+      return new Response(JSON.stringify(value), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+    const selector = await screen.findByRole("combobox", { name: "Paper profile" });
+    fireEvent.change(selector, { target: { value: "BEELZEBUB_FIVE_MINUTE_BIAS_V1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Switch & Start" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Profile target is running, but the remembered selection was not persisted: PROFILE_SELECTION_WRITE_FAILED.",
+    );
+    await waitFor(() => expect(screen.getByRole("button", { name: "Switch & Start" })).toBeEnabled());
+
+    fireEvent.change(selector, { target: { value: "NY_HIGH_CONFLUENCE_COMMISSIONING_V1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Switch & Start" }));
+    await waitFor(() => {
+      const posts = vi.mocked(fetch).mock.calls.filter(
+        ([path, init]) => String(path) === "/api/lane-iii/paper/profile-switch" && init?.method === "POST",
+      );
+      expect(posts).toHaveLength(2);
+      const first = JSON.parse(String(posts[0][1]?.body));
+      const second = JSON.parse(String(posts[1][1]?.body));
+      expect(first.request_id).not.toBe(second.request_id);
+      expect(second.target_profile).toBe("NY_HIGH_CONFLUENCE_COMMISSIONING_V1");
     });
   });
 

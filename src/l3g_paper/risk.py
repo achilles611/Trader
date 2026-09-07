@@ -6,16 +6,20 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 import threading
+from typing import Callable
 
 from src.lane_iii.contracts import canonical_hash, normalized_utc
 
 from .contracts import (
     ACCOUNT_BINDING,
     POLICY,
+    PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS,
     RISK_PROFILE,
     ExecutionAccountBinding,
     FiveMinutePaperPolicyArtifact,
+    FiveMinutePerpetualPaperPolicyArtifact,
     FiveMinutePaperRiskProfile,
+    FiveMinutePerpetualPaperRiskProfile,
     HighConfidencePaperPolicyArtifact,
     HighConfidencePaperRiskProfile,
     PaperDecision,
@@ -37,6 +41,7 @@ from .sessions import (
     PaperSessionResolver,
     UNSPECIFIED_OFF_SESSION_CONTEXT,
     context_from_identity,
+    perpetual_exchange_blocker,
 )
 
 
@@ -109,18 +114,28 @@ class PaperRiskAuthority:
     ) -> None:
         if type(profile) not in {
             PaperRiskProfile, HighConfidencePaperRiskProfile, FiveMinutePaperRiskProfile,
+            FiveMinutePerpetualPaperRiskProfile,
         } or type(binding) is not ExecutionAccountBinding:
             raise ValueError("Paper risk authority requires exact immutable inputs.")
         if type(policy) not in {
             PaperPolicyArtifact, HighConfidencePaperPolicyArtifact, FiveMinutePaperPolicyArtifact,
+            FiveMinutePerpetualPaperPolicyArtifact,
         }:
             raise ValueError("Paper risk authority requires a compiled immutable policy.")
         self.profile = profile
         self.binding = binding
         self.policy = policy
+        self._perpetual_position_profile = (
+            type(profile) is FiveMinutePerpetualPaperRiskProfile
+            and type(policy) is FiveMinutePerpetualPaperPolicyArtifact
+            and profile.perpetual_position
+            and policy.perpetual_position
+        )
         self._lock = threading.RLock()
         self._locked_out = False
         self._lockout_reason: str | None = None
+        self._lockout_trade_date: str | None = None
+        self._lockout_recorder: Callable[[bool, str | None, str | None], None] | None = None
         self._last_result: PaperRiskGrant | None = None
         self._arm_attempts = 0
         self._arm_denials = 0
@@ -138,6 +153,22 @@ class PaperRiskAuthority:
     def _context(self, snapshot: PaperRiskSnapshot, at: str):
         if self._legacy_session_identity(snapshot.session_kind, snapshot.session_id):
             return PaperSessionResolver().resolve(at, generation=snapshot.session_generation).context
+        # Compact risk snapshots carry the authenticated session identity but
+        # not the calendar authority. Re-resolve the evaluation instant and
+        # accept its calendar state only when every identity coordinate still
+        # matches the snapshot. This preserves the legacy holiday fence while
+        # preventing a different current session from being substituted.
+        resolved = PaperSessionResolver().resolve(
+            at, generation=snapshot.session_generation,
+        ).context
+        if (
+            resolved.session_kind is snapshot.session_kind
+            and resolved.session_id == snapshot.session_id
+            and resolved.trade_date == snapshot.trade_date
+            and resolved.session_profile_hash == snapshot.session_profile_hash
+            and resolved.session_generation == snapshot.session_generation
+        ):
+            return resolved
         return context_from_identity(
             snapshot.session_kind, snapshot.session_id, snapshot.trade_date,
             snapshot.session_profile_hash, snapshot.session_generation,
@@ -153,7 +184,12 @@ class PaperRiskAuthority:
         return resolution.context.hard_flat_due_at(self._time(at))
 
     def maximum_age_due(self, snapshot: PaperRiskSnapshot, at: str) -> bool:
-        return snapshot.position_opened_at is not None and self._time(at) - self._time(snapshot.position_opened_at) >= timedelta(seconds=self.profile.maximum_position_age_seconds)
+        return (
+            not self._perpetual_position_profile
+            and snapshot.position_opened_at is not None
+            and self._time(at) - self._time(snapshot.position_opened_at)
+            >= timedelta(seconds=self.profile.maximum_position_age_seconds)
+        )
 
     def _identity_reasons(self, snapshot: PaperRiskSnapshot) -> list[str]:
         reasons: list[str] = []
@@ -213,17 +249,22 @@ class PaperRiskAuthority:
                 )
                 reasons.extend(reason for reason in freshness if reason is not None)
             context = self._context(snapshot, at)
-            if context.session_kind is PaperSessionKind.OFF_SESSION:
-                reasons.append("OFF_SESSION")
-            elif context.session_kind not in self.profile.entry_session_kinds:
-                reasons.append("PROFILE_SESSION_MISMATCH")
-            elif context.calendar_state is PaperCalendarState.HOLIDAY_OVERRIDE_REQUIRED:
-                reasons.append("HOLIDAY_SESSION_UNVERIFIED")
-            elif not self._inside_entry_session(moment, snapshot):
-                reasons.append("OUTSIDE_ENTRY_SESSION")
+            if self._perpetual_position_profile and not commissioning:
+                exchange_blocker = perpetual_exchange_blocker(moment, context)
+                if exchange_blocker is not None:
+                    reasons.append(exchange_blocker)
+            else:
+                if context.session_kind is PaperSessionKind.OFF_SESSION:
+                    reasons.append("OFF_SESSION")
+                elif context.session_kind not in self.profile.entry_session_kinds:
+                    reasons.append("PROFILE_SESSION_MISMATCH")
+                elif context.calendar_state is PaperCalendarState.HOLIDAY_OVERRIDE_REQUIRED:
+                    reasons.append("HOLIDAY_SESSION_UNVERIFIED")
+                elif not self._inside_entry_session(moment, snapshot):
+                    reasons.append("OUTSIDE_ENTRY_SESSION")
             if self._locked_out or snapshot.locked_out:
                 reasons.append(self._lockout_reason or snapshot.lockout_reason or "SESSION_LOCKED_OUT")
-            if snapshot.daily_realized_pnl + snapshot.daily_unrealized_pnl <= -self.profile.daily_loss_limit_dollars:
+            if snapshot.daily_realized_pnl + snapshot.daily_unrealized_pnl <= -PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS:
                 reasons.append("DAILY_LOSS_LIMIT")
             if snapshot.session_entry_count >= self.profile.maximum_session_entries:
                 reasons.append("SESSION_ENTRY_CAP")
@@ -307,21 +348,23 @@ class PaperRiskAuthority:
 
             if intent.target_position is PaperDirection.FLAT:
                 # Exits remain available while data is stale or entries are
-                # paused, after a risk lockout, and outside every entry
-                # window. Exact account truth and execution connectivity are
-                # still mandatory.
+                # paused, after a risk lockout, outside every entry window,
+                # and while a fresh aggregate reconciliation is pending. An
+                # authenticated runtime-owned fill is sufficient reduce-only
+                # safety authority; incomplete truth must block new entries,
+                # never the protective flatten which restores exact truth.
+                # Account identity, unresolved execution ambiguity, and
+                # execution connectivity remain mandatory.
                 reasons = [reason for reason in reasons if reason != "FOREIGN_ACTIVITY_LOCKOUT"]
                 if not snapshot.execution_bridge_healthy:
                     reasons.append("EXECUTION_BRIDGE_UNHEALTHY")
-                if not snapshot.reconciliation_current:
-                    reasons.append("RECONCILIATION_INCOMPLETE")
             else:
                 if self._locked_out or snapshot.locked_out:
                     reasons.append(self._lockout_reason or snapshot.lockout_reason or "SESSION_LOCKED_OUT")
                 pnl = snapshot.daily_realized_pnl + snapshot.daily_unrealized_pnl
-                if pnl <= -self.profile.daily_loss_limit_dollars:
+                if pnl <= -PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS:
                     reasons.append("DAILY_LOSS_LIMIT")
-                    self.lock_out("DAILY_LOSS_LIMIT")
+                    self.lock_out("DAILY_LOSS_LIMIT", trade_date=snapshot.trade_date)
                 if snapshot.session_entry_count >= self.profile.maximum_session_entries:
                     reasons.append("SESSION_ENTRY_CAP")
                 if snapshot.trade_date_entry_count >= self.profile.maximum_session_entries:
@@ -339,16 +382,21 @@ class PaperRiskAuthority:
                     or intent.session_generation != context.session_generation
                 ):
                     reasons.append("SESSION_IDENTITY_MISMATCH")
-                if context.session_kind is PaperSessionKind.OFF_SESSION:
-                    reasons.append("OFF_SESSION")
-                elif context.session_kind not in self.profile.entry_session_kinds:
-                    reasons.append("PROFILE_SESSION_MISMATCH")
-                elif context.calendar_state is PaperCalendarState.HOLIDAY_OVERRIDE_REQUIRED:
-                    reasons.append("HOLIDAY_SESSION_UNVERIFIED")
-                elif not self._inside_entry_session(moment, snapshot):
-                    reasons.append("OUTSIDE_ENTRY_SESSION")
-                if context.hard_flat_due_at(moment):
-                    reasons.append("HARD_FLAT_DEADLINE")
+                if self._perpetual_position_profile and not intent.commissioning:
+                    exchange_blocker = perpetual_exchange_blocker(moment, context)
+                    if exchange_blocker is not None:
+                        reasons.append(exchange_blocker)
+                else:
+                    if context.session_kind is PaperSessionKind.OFF_SESSION:
+                        reasons.append("OFF_SESSION")
+                    elif context.session_kind not in self.profile.entry_session_kinds:
+                        reasons.append("PROFILE_SESSION_MISMATCH")
+                    elif context.calendar_state is PaperCalendarState.HOLIDAY_OVERRIDE_REQUIRED:
+                        reasons.append("HOLIDAY_SESSION_UNVERIFIED")
+                    elif not self._inside_entry_session(moment, snapshot):
+                        reasons.append("OUTSIDE_ENTRY_SESSION")
+                    if context.hard_flat_due_at(moment):
+                        reasons.append("HARD_FLAT_DEADLINE")
                 if not snapshot.local_bridge_healthy or not snapshot.market_price_connected:
                     reasons.append("MARKET_BRIDGE_UNHEALTHY")
                 if not snapshot.execution_bridge_healthy:
@@ -423,19 +471,76 @@ class PaperRiskAuthority:
     def enforce_fill(self, direction: PaperDirection, intent: PaperExecutionIntent, actual_fill_price: Decimal) -> tuple[bool, str]:
         slippage = self.slippage_points(direction, intent, actual_fill_price)
         if not slippage.is_finite() or slippage > self.profile.maximum_entry_slippage_points:
-            self.lock_out("ENTRY_SLIPPAGE_LIMIT")
+            self.lock_out("ENTRY_SLIPPAGE_LIMIT", trade_date=intent.trade_date)
             return False, "ENTRY_SLIPPAGE_LIMIT"
         return True, "PROTECTIVE_STOP_REQUIRED"
 
-    def lock_out(self, reason: str) -> None:
+    def set_lockout_recorder(
+        self, recorder: Callable[[bool, str | None, str | None], None] | None,
+    ) -> None:
+        """Install the runtime's durable recorder after recovery is complete."""
         with self._lock:
+            self._lockout_recorder = recorder
+
+    def restore_lockout(
+        self, locked_out: bool, reason: str | None, trade_date: str | None,
+    ) -> None:
+        """Restore already-durable state without emitting duplicate evidence."""
+        if type(locked_out) is not bool or (locked_out and not reason):
+            raise ValueError("Restored paper lockout state is invalid.")
+        with self._lock:
+            self._locked_out = locked_out
+            self._lockout_reason = reason if locked_out else None
+            self._lockout_trade_date = trade_date if locked_out else None
+
+    def lock_out(self, reason: str, *, trade_date: str | None = None) -> None:
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("Paper risk lockout reason is required.")
+        with self._lock:
+            # A daily budget is scoped to one exchange trade date. It must
+            # never replace a safety/integrity lock which has no automatic
+            # expiry; otherwise the next trade-date rollover would silently
+            # release the stronger lockout.
+            if (
+                self._locked_out
+                and self._lockout_reason != "DAILY_LOSS_LIMIT"
+                and reason == "DAILY_LOSS_LIMIT"
+            ):
+                return
+            changed = (
+                not self._locked_out
+                or self._lockout_reason != reason
+                or self._lockout_trade_date != trade_date
+            )
+            recorder = self._lockout_recorder
+            # Publish the durable row/write-ahead fence before exposing the
+            # state transition. A crash during publication therefore cannot
+            # leave an observed in-memory lock with no restart evidence.
+            if changed and recorder is not None:
+                recorder(True, reason, trade_date)
             self._locked_out = True
             self._lockout_reason = reason
+            self._lockout_trade_date = trade_date
 
     def clear_for_new_session(self) -> None:
+        raise RuntimeError("Paper risk lockouts require an explicit durable recovery contract.")
+
+    def clear_trade_date_limit_lockout(self, current_trade_date: str) -> None:
+        """Release only the limit whose scope ended at the exchange trade date."""
         with self._lock:
-            self._locked_out = False
-            self._lockout_reason = None
+            if (
+                self._lockout_reason == "DAILY_LOSS_LIMIT"
+                and self._lockout_trade_date is not None
+                and self._lockout_trade_date != current_trade_date
+            ):
+                recorder = self._lockout_recorder
+                # The dated clear is also durable before the in-memory daily
+                # latch is released.
+                if recorder is not None:
+                    recorder(False, None, current_trade_date)
+                self._locked_out = False
+                self._lockout_reason = None
+                self._lockout_trade_date = None
 
     def status(self) -> dict[str, object]:
         with self._lock:
@@ -447,6 +552,7 @@ class PaperRiskAuthority:
                 "approved_for_live": False,
                 "locked_out": self._locked_out,
                 "lockout_reason": self._lockout_reason,
+                "lockout_trade_date": self._lockout_trade_date,
                 "arm_attempts": self._arm_attempts,
                 "arm_denials": self._arm_denials,
                 "risk_grants": self._risk_grants,

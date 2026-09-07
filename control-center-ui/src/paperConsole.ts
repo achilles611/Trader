@@ -128,7 +128,9 @@ export function usePaperConsoleState({ active, includeSlim, notify }: Options): 
 
   useEffect(() => {
     if (!profileSwitch || profileSwitch.in_progress === true) return;
-    if (["RUNNING", "BLOCKED_SAFE", "FAILED", "CANCELLED"].includes(String(profileSwitch.stage))) {
+    if ([
+      "RUNNING", "BLOCKED_SAFE", "RUNNING_SELECTION_PERSISTENCE_FAILED", "FAILED", "CANCELLED",
+    ].includes(String(profileSwitch.stage))) {
       setProfileSwitchRequestId(null);
     }
   }, [profileSwitch]);
@@ -220,7 +222,23 @@ export function usePaperConsoleState({ active, includeSlim, notify }: Options): 
         body: JSON.stringify({ request_id: requestId, target_profile: targetProfile }),
       });
       setProfileSwitch(result);
-      notify({ tone: "success", message: "Profile switch accepted. Beelzebub is closing the current ledger before restart." });
+      const stage = String(result?.stage || "");
+      const blockers = Array.isArray(result?.blockers) ? result.blockers.map(String) : [];
+      if (result?.target_profile !== targetProfile) {
+        notify({ tone: "error", message: "Profile switch was not accepted: another target owns the current operation." });
+      } else if (stage === "RUNNING_SELECTION_PERSISTENCE_FAILED") {
+        notify({
+          tone: "error",
+          message: `Profile target is running, but the remembered selection was not persisted: ${blockers.length ? blockers.join(", ") : "backend reported no persistence detail"}.`,
+        });
+      } else if (["BLOCKED_SAFE", "FAILED", "CANCELLED"].includes(stage) || result?.in_progress !== true) {
+        notify({
+          tone: "error",
+          message: `Profile switch did not begin: ${blockers.length ? blockers.join(", ") : stage || "backend returned no active operation"}.`,
+        });
+      } else {
+        notify({ tone: "success", message: "Profile switch accepted. Beelzebub is closing the current ledger before restart." });
+      }
     } catch (failure) {
       notify({ tone: "error", message: failure instanceof Error ? failure.message : "Profile switching could not begin." });
       await load();

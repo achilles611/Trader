@@ -26,7 +26,9 @@ from .contracts import (
     ExecutionCapabilityManifest,
     ExecutionVenueAdapter,
     FiveMinutePaperPolicyArtifact,
+    FiveMinutePerpetualPaperPolicyArtifact,
     FiveMinutePaperRiskProfile,
+    FiveMinutePerpetualPaperRiskProfile,
     HighConfidencePaperPolicyArtifact,
     HighConfidencePaperRiskProfile,
     PaperExecutionCommand,
@@ -38,14 +40,20 @@ from .contracts import (
     canonical_json,
 )
 from .ledger import PaperLedger
-from .sessions import PaperSessionKind, PaperSessionResolver, UNSPECIFIED_OFF_SESSION_CONTEXT, context_from_identity
+from .sessions import (
+    PaperSessionKind,
+    PaperSessionResolver,
+    UNSPECIFIED_OFF_SESSION_CONTEXT,
+    context_from_identity,
+    perpetual_exchange_blocker,
+)
 
 
 EXECUTION_HOST = "127.0.0.1"
 EXECUTION_PORT = 48136
 EXECUTION_SCHEMA = "lane-iii-phase-g-paper-execution-v1"
 ADDON_PROTOCOL_VERSION = "l3g-paper-addon-provenance-v1"
-EXPECTED_ADDON_SOURCE_FINGERPRINT = "ca43253d190e164a55cde371b148879d369901738ecf282cbe881eaa2f9375ef"
+EXPECTED_ADDON_SOURCE_FINGERPRINT = "54753846f73d82e9aa06e0167f67ecc9326d92ff99ef5ea65072c5bb0b53e29d"
 MAXIMUM_FRAME_BYTES = 65536
 HELLO_MAXIMUM_AGE_SECONDS = 10
 FUTURE_TOLERANCE_SECONDS = 1
@@ -195,10 +203,12 @@ class PaperExecutionTransport:
             raise ValueError("Maximum execution frame size is invalid.")
         if type(policy) not in {
             PaperPolicyArtifact, HighConfidencePaperPolicyArtifact, FiveMinutePaperPolicyArtifact,
+            FiveMinutePerpetualPaperPolicyArtifact,
         }:
             raise ValueError("Execution transport requires a compiled immutable policy.")
         if type(risk) not in {
             PaperRiskProfile, HighConfidencePaperRiskProfile, FiveMinutePaperRiskProfile,
+            FiveMinutePerpetualPaperRiskProfile,
         }:
             raise ValueError("Execution transport requires a compiled immutable risk profile.")
         if (
@@ -223,6 +233,10 @@ class PaperExecutionTransport:
         self._thread: threading.Thread | None = None
         self._listener: socket.socket | None = None
         self._client: socket.socket | None = None
+        # Cross-thread send failures request retirement; the listener thread
+        # owns the actual close so its local client variable cannot outlive a
+        # silently closed descriptor and fault the whole listener.
+        self._session_invalidation_client: socket.socket | None = None
         self._key: bytes | None = None
         self._state = "NEW"
         self._error: str | None = None
@@ -315,7 +329,13 @@ class PaperExecutionTransport:
             self._ready.set()
             self._notify_bridge("LISTENING")
             while not self._stop.is_set():
-                self._check_acknowledgement_timeouts()
+                if self._consume_session_invalidation(client):
+                    self._close_client(client)
+                    client = None
+                    buffer = bytearray()
+                if self._check_acknowledgement_timeouts():
+                    client = None
+                    buffer = bytearray()
                 readable = [listener]
                 if client is not None:
                     readable.append(client)
@@ -337,6 +357,7 @@ class PaperExecutionTransport:
                             self._state = "CONNECTED"
                             self._authenticated = False
                             self._reconciled = False
+                            self._session_invalidation_client = None
                             self._execution_session_id = None
                             self._addon_protocol_version = None
                             self._addon_source_fingerprint = None
@@ -401,6 +422,8 @@ class PaperExecutionTransport:
         with self._lock:
             if self._client is client:
                 self._client = None
+            if self._session_invalidation_client is client:
+                self._session_invalidation_client = None
             self._authenticated = False
             self._reconciled = False
             self._execution_session_id = None
@@ -411,6 +434,31 @@ class PaperExecutionTransport:
             self._pending_acknowledgements.clear()
             if self._state not in {"STOPPING", "STOPPED", "FAULTED"}:
                 self._state = "LISTENING"
+
+    def _request_session_invalidation(self, client: socket.socket | None) -> bool:
+        """Retire an ambiguously used socket without reusing its sequence."""
+        if client is None:
+            return False
+        with self._lock:
+            if self._client is not client:
+                return False
+            first = self._session_invalidation_client is not client
+            self._session_invalidation_client = client
+            self._authenticated = False
+            self._reconciled = False
+            self._execution_session_id = None
+            self._state = "LISTENING"
+        if first:
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self._notify_bridge("DISCONNECTED")
+        return first
+
+    def _consume_session_invalidation(self, client: socket.socket | None) -> bool:
+        with self._lock:
+            return client is not None and self._session_invalidation_client is client
 
     def _decode(self, frame: bytes) -> Mapping[str, object] | None:
         if not frame or len(frame) > self.maximum_frame_bytes:
@@ -522,8 +570,15 @@ class PaperExecutionTransport:
                 receipt_claimed = bool(receipt_id)
                 if message_type == "RECONCILIATION":
                     reconciliation_valid = self._validate_reconciliation(payload)
+                    reconciliation_safe = (
+                        reconciliation_valid
+                        and abs(int(payload["position_quantity"])) <= 1
+                        and payload.get("foreign_activity") is False
+                    )
                     with self._lock:
-                        self._reconciled = reconciliation_valid
+                        # Shape-valid unsafe account truth is still delivered to
+                        # the runtime, but it never grants entry authority.
+                        self._reconciled = reconciliation_safe
                     if not reconciliation_valid:
                         self._reject_frame("RECONCILIATION_MISMATCH")
                         return
@@ -641,6 +696,7 @@ class PaperExecutionTransport:
             and working_order_count >= 0
             and working_entry_count >= 0
             and working_entry_count <= working_order_count
+            and type(payload.get("foreign_activity")) is bool
             and payload.get("position_snapshot_complete") is True
             and payload.get("order_snapshot_complete") is True
         )
@@ -651,25 +707,41 @@ class PaperExecutionTransport:
             session_id = self._execution_session_id
         self.ledger.append("INCIDENT_PROTOCOL_REJECTION", {"reason": reason}, execution_session_id=session_id)
 
-    def _check_acknowledgement_timeouts(self) -> None:
+    def _check_acknowledgement_timeouts(self) -> bool:
         now = datetime.now(timezone.utc)
         with self._lock:
             expired = [
                 command_id for command_id, deadline in self._pending_acknowledgements.items()
                 if now > deadline
             ]
-            for command_id in expired:
+            if not expired:
+                return False
+            # Once one command has an ambiguous terminal outcome, every
+            # outstanding command on that ordered session is ambiguous too.
+            pending = tuple(self._pending_acknowledgements)
+            expired_set = set(expired)
+            for command_id in pending:
                 self._pending_acknowledgements.pop(command_id, None)
                 self._command_rejections += 1
             session_id = self._execution_session_id
-        for command_id in expired:
+            client = self._client
+        # Retire before callbacks. A callback must not submit a second safety
+        # mutation through the same possibly-partially-acknowledged session.
+        self._close_client(client)
+        self._notify_bridge("DISCONNECTED")
+        for command_id in pending:
+            reason = (
+                "ACKNOWLEDGEMENT_TIMEOUT"
+                if command_id in expired_set
+                else "ACKNOWLEDGEMENT_SESSION_ABORTED"
+            )
             message = {
                 "schema": EXECUTION_SCHEMA,
                 "message_type": "COMMAND_REJECTED",
                 "execution_session_id": session_id,
                 "timestamp": _now(),
                 "command_id": command_id,
-                "reason_code": "ACKNOWLEDGEMENT_TIMEOUT",
+                "reason_code": reason,
             }
             self.ledger.append(
                 "INCIDENT_COMMAND_ACKNOWLEDGEMENT_TIMEOUT",
@@ -683,6 +755,7 @@ class PaperExecutionTransport:
                     callback(message)
                 except Exception as exc:
                     self.ledger.append("INCIDENT_CALLBACK_FAILURE", {"sink": "execution_message", "error_type": type(exc).__name__}, execution_session_id=session_id)
+        return True
 
     def _send_signed(self, payload: Mapping[str, object]) -> None:
         key = self._key
@@ -714,7 +787,7 @@ class PaperExecutionTransport:
             session_id = self._execution_session_id
             if not self._authenticated or session_id is None:
                 raise RuntimeError("The execution bridge is not authenticated.")
-            if not self._reconciled and command.action not in {ExecutionAction.RECONCILE, ExecutionAction.HEARTBEAT}:
+            if not self._reconciled and command.action in {ExecutionAction.ENTER_LONG, ExecutionAction.ENTER_SHORT}:
                 raise RuntimeError("Reconciliation is required before order mutation.")
             if command.execution_session_id != session_id:
                 raise ValueError("Command execution session mismatch.")
@@ -724,14 +797,19 @@ class PaperExecutionTransport:
                 raise ValueError("A positive, current, matching paper risk grant is required.")
             if command.policy_hash != self.policy.configuration_hash or command.risk_profile_hash != self.risk.configuration_hash or command.account_binding_hash != ACCOUNT_BINDING.binding_hash:
                 raise ValueError("Command authority hashes do not match the compiled paper authority.")
+            perpetual = (
+                type(self.policy) is FiveMinutePerpetualPaperPolicyArtifact
+                and self.policy.perpetual_position
+                and not command.commissioning
+            )
             legacy = command.session_kind is PaperSessionKind.OFF_SESSION and command.session_id != UNSPECIFIED_OFF_SESSION_CONTEXT.session_id
-            if not legacy and (
+            if (perpetual or not legacy) and (
                 (grant.session_kind, grant.session_id, grant.trade_date, grant.session_profile_hash, grant.session_generation)
                 != (command.session_kind, command.session_id, command.trade_date, command.session_profile_hash, command.session_generation)
             ):
                 raise ValueError("Command and risk grant session identity mismatch.")
             if command.action in {ExecutionAction.ENTER_LONG, ExecutionAction.ENTER_SHORT}:
-                if legacy:
+                if legacy and not perpetual:
                     # Retained only for pre-regime in-process protocol fixtures;
                     # the compiled AddOn independently rejects this shape.
                     pass
@@ -742,12 +820,17 @@ class PaperExecutionTransport:
                     )
                     current = PaperSessionResolver().resolve(_now(), generation=command.session_generation)
                     if (
-                        not current.entry_authorized or context.session_kind is PaperSessionKind.OFF_SESSION
-                        or current.context.session_kind is not context.session_kind
+                        current.context.session_kind is not context.session_kind
                         or current.context.session_id != context.session_id
                         or current.context.trade_date != context.trade_date
                         or current.context.session_profile_hash != context.session_profile_hash
                     ):
+                        raise ValueError("Entry command session identity is no longer current.")
+                    if perpetual:
+                        blocker = perpetual_exchange_blocker(_now(), context)
+                        if blocker is not None:
+                            raise ValueError("Entry command blocked by " + blocker + ".")
+                    elif not current.entry_authorized or context.session_kind is PaperSessionKind.OFF_SESSION:
                         raise ValueError("Entry command is outside its exact paper session window.")
         signed = command.with_signature(sign_payload(self._key or b"", command.unsigned_payload()))
         wire = {
@@ -778,7 +861,15 @@ class PaperExecutionTransport:
                 client = self._client
             if client is None:
                 raise RuntimeError("The NinjaTrader paper execution bridge is disconnected.")
-            client.sendall(frame)
+            try:
+                client.sendall(frame)
+            except OSError as exc:
+                # sendall failure may follow a partial kernel write. Never
+                # reuse this execution session or its sequence.
+                self._request_session_invalidation(client)
+                raise RuntimeError(
+                    "The NinjaTrader paper execution bridge send was ambiguous."
+                ) from exc
 
     def send_heartbeat(self, *, armed: bool) -> None:
         with self._lock:

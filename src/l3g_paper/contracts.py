@@ -38,16 +38,28 @@ FIVE_MINUTE_POLICY_SCHEMA = "lane-iii-phase-g-five-minute-bias-policy-v1"
 FIVE_MINUTE_POLICY_ID = "l3g-beelzebub-five-minute-bias-policy-v1"
 FIVE_MINUTE_ENTRY_PROFILE = "BEELZEBUB_FIVE_MINUTE_BIAS"
 FIVE_MINUTE_ENTRY_PROFILE_VERSION = "BEELZEBUB_FIVE_MINUTE_BIAS_V1"
+FIVE_MINUTE_PERPETUAL_POLICY_SCHEMA = "lane-iii-phase-g-five-minute-perpetual-policy-v2"
+FIVE_MINUTE_PERPETUAL_POLICY_ID = "l3g-beelzebub-five-minute-perpetual-policy-v2"
+FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE = "BEELZEBUB_FIVE_MINUTE_PERPETUAL"
+FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION = "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2"
 PAPER_RISK_PROFILE_ID = "l3g-beelzebub-scalper-risk-v2"
 HIGH_CONFIDENCE_RISK_SCHEMA = "lane-iii-phase-g-paper-risk-v2"
 HIGH_CONFIDENCE_RISK_PROFILE_ID = "l3g-ny-high-confluence-commissioning-risk-v1"
 FIVE_MINUTE_RISK_SCHEMA = "lane-iii-phase-g-five-minute-bias-risk-v1"
 FIVE_MINUTE_RISK_PROFILE_ID = "l3g-beelzebub-five-minute-bias-risk-v1"
+FIVE_MINUTE_PERPETUAL_RISK_SCHEMA = "lane-iii-phase-g-five-minute-perpetual-risk-v2"
+FIVE_MINUTE_PERPETUAL_RISK_PROFILE_ID = "l3g-beelzebub-five-minute-perpetual-risk-v2"
 PAPER_MODE = "PAPER_SIM101"
 PAPER_ACCOUNT = "Sim101"
 PAPER_ACCOUNT_CLASS = "LOCAL_SIMULATION"
 PAPER_INSTRUMENT = "MNQ SEP26"
 PAPER_CANONICAL_CONTRACT = "MNQU6"
+PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS = Decimal("200.00")
+PAPER_ACCOUNT_DAILY_LOSS_POLICY_ID = "l3g-sim101-account-trade-date-loss-v1"
+PAPER_ACCOUNT_DAILY_LOSS_POLICY_PROVENANCE = (
+    "docs/commissioning/lane-iii-phase-g/paper-risk-v0.json;"
+    "COMMISSIONED_LUCID_PROFILE.internal_daily_loss_ceiling"
+)
 PAPER_NATIVE_CONTRACT = "MNQ SEP26"
 PAPER_MAXIMUM_QUANTITY = 1
 
@@ -406,7 +418,70 @@ class FiveMinutePaperPolicyArtifact(PaperPolicyArtifact):
             raise ValueError("The five-minute decision protocol is immutable.")
 
 
-PaperPolicyArtifactType = PaperPolicyArtifact | HighConfidencePaperPolicyArtifact | FiveMinutePaperPolicyArtifact
+@dataclass(frozen=True)
+class FiveMinutePerpetualPaperPolicyArtifact(FiveMinutePaperPolicyArtifact):
+    """Sealed V2 identity for one continuously held five-minute direction."""
+
+    schema: str = FIVE_MINUTE_PERPETUAL_POLICY_SCHEMA
+    policy_id: str = FIVE_MINUTE_PERPETUAL_POLICY_ID
+    entry_profile: str = FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE
+    entry_profile_version: str = FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION
+    decision_clock: str = "UTC_EPOCH_ALIGNED_LATEST_COMPLETED_BOUNDARY_ON_START"
+    initial_partial_candle: str = "USE_LATEST_NON_TIED_COMPLETED_BOUNDARY"
+    tie_while_flat: str = "USE_LATEST_NON_TIED_OR_BLOCK"
+    perpetual_position: bool = True
+    market_scope: str = "EXCHANGE_TRADEABLE_ONLY"
+    routine_time_flats: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema,
+            self.policy_id,
+            self.entry_profile,
+            self.entry_profile_version,
+        ) != (
+            FIVE_MINUTE_PERPETUAL_POLICY_SCHEMA,
+            FIVE_MINUTE_PERPETUAL_POLICY_ID,
+            FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE,
+            FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
+        ):
+            raise ValueError("The five-minute perpetual paper policy identity is immutable.")
+        if (
+            self.authority != "EXPERIMENTAL_PAPER_DIRECTION_ONLY"
+            or self.scientific_eligibility
+            or self.native_contract != PAPER_NATIVE_CONTRACT
+            or self.canonical_contract != PAPER_CANONICAL_CONTRACT
+            or self.allowed_hypotheses != (
+                HypothesisKind.BULLISH_REVERSAL,
+                HypothesisKind.BEARISH_CONTINUATION,
+            )
+            or self.decision_interval_seconds != 300
+            or self.entry_support_threshold != Decimal("0")
+            or self.entry_dominance_margin != Decimal("0")
+            or self.retention_support_threshold != Decimal("0")
+            or self.retention_dominance_margin != Decimal("0")
+            or self.entry_family_count != 0
+            or self.retention_family_count != 0
+            or self.decision_ttl_seconds != 30
+            or self.reentry_cooldown_seconds != 0
+            or self.decision_clock != "UTC_EPOCH_ALIGNED_LATEST_COMPLETED_BOUNDARY_ON_START"
+            or self.initial_partial_candle != "USE_LATEST_NON_TIED_COMPLETED_BOUNDARY"
+            or self.tie_while_flat != "USE_LATEST_NON_TIED_OR_BLOCK"
+            or self.tie_while_positioned != "HOLD"
+            or self.reversal_protocol != "EXIT_RECONCILE_THEN_ENTER"
+            or self.perpetual_position is not True
+            or self.market_scope != "EXCHANGE_TRADEABLE_ONLY"
+            or self.routine_time_flats is not False
+        ):
+            raise ValueError("The five-minute perpetual decision protocol is immutable.")
+
+
+PaperPolicyArtifactType = (
+    PaperPolicyArtifact
+    | HighConfidencePaperPolicyArtifact
+    | FiveMinutePaperPolicyArtifact
+    | FiveMinutePerpetualPaperPolicyArtifact
+)
 
 
 def known_paper_policy_identity(policy_id: object, policy_hash: object) -> bool:
@@ -443,7 +518,7 @@ class PaperRiskProfile:
     protective_order_type: str = "STOP_MARKET"
     protective_stop_distance_points: Decimal = Decimal("25.00")
     maximum_trade_risk_dollars: Decimal = Decimal("50.00")
-    daily_loss_limit_dollars: Decimal = Decimal("200.00")
+    daily_loss_limit_dollars: Decimal = PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS
     maximum_position_age_seconds: int = 540
     entry_session_start: str = "09:35"
     entry_session_end: str = "15:30"
@@ -478,6 +553,7 @@ class PaperRiskProfile:
                 PaperSessionKind.NEW_YORK_RTH,
                 PaperSessionKind.NY_AFTER,
             )
+            or self.daily_loss_limit_dollars != PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS
             or self.maximum_position_age_seconds != 540
             or self.reentry_cooldown_seconds != 10
             or self.maximum_session_entries != 12
@@ -517,7 +593,7 @@ class HighConfidencePaperRiskProfile:
     protective_order_type: str = "STOP_MARKET"
     protective_stop_distance_points: Decimal = Decimal("25.00")
     maximum_trade_risk_dollars: Decimal = Decimal("50.00")
-    daily_loss_limit_dollars: Decimal = Decimal("200.00")
+    daily_loss_limit_dollars: Decimal = PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS
     maximum_position_age_seconds: int = 3600
     entry_session_start: str = "09:35"
     entry_session_end: str = "15:30"
@@ -554,6 +630,7 @@ class HighConfidencePaperRiskProfile:
             raise ValueError("Pyramiding, averaging, and same-event reversal are forbidden.")
         if (
             self.entry_session_kind is not PaperSessionKind.NEW_YORK_RTH
+            or self.daily_loss_limit_dollars != PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS
             or self.maximum_position_age_seconds != 3600
             or self.reentry_cooldown_seconds != 3600
             or self.maximum_session_entries != 1
@@ -588,11 +665,15 @@ class FiveMinutePaperRiskProfile(PaperRiskProfile):
         if (
             self.schema,
             self.profile_id,
+            self.daily_loss_limit_dollars,
             self.maximum_position_age_seconds,
             self.reentry_cooldown_seconds,
             self.maximum_session_entries,
             self.maximum_consecutive_losses,
-        ) != (FIVE_MINUTE_RISK_SCHEMA, FIVE_MINUTE_RISK_PROFILE_ID, 86_400, 0, 128, 128):
+        ) != (
+            FIVE_MINUTE_RISK_SCHEMA, FIVE_MINUTE_RISK_PROFILE_ID,
+            PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS, 86_400, 0, 128, 128,
+        ):
             raise ValueError("The five-minute paper risk envelope is immutable.")
         if (
             self.mode != PAPER_MODE
@@ -611,7 +692,66 @@ class FiveMinutePaperRiskProfile(PaperRiskProfile):
             raise ValueError("The five-minute risk profile is sealed to one Sim101 MNQ contract.")
 
 
-PaperRiskProfileType = PaperRiskProfile | HighConfidencePaperRiskProfile | FiveMinutePaperRiskProfile
+@dataclass(frozen=True)
+class FiveMinutePerpetualPaperRiskProfile(FiveMinutePaperRiskProfile):
+    """No routine time fence; all non-calendar Sim101 safety gates remain."""
+
+    schema: str = FIVE_MINUTE_PERPETUAL_RISK_SCHEMA
+    profile_id: str = FIVE_MINUTE_PERPETUAL_RISK_PROFILE_ID
+    maximum_position_age_seconds: int = 0
+    maximum_position_age_enforced: bool = False
+    perpetual_position: bool = True
+    enforce_holiday_fence: bool = False
+    enforce_session_entry_window: bool = False
+    enforce_hard_flat_deadline: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema,
+            self.profile_id,
+            self.daily_loss_limit_dollars,
+            self.maximum_position_age_seconds,
+            self.reentry_cooldown_seconds,
+            self.maximum_session_entries,
+            self.maximum_consecutive_losses,
+        ) != (
+            FIVE_MINUTE_PERPETUAL_RISK_SCHEMA,
+            FIVE_MINUTE_PERPETUAL_RISK_PROFILE_ID,
+            PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS,
+            0,
+            0,
+            128,
+            128,
+        ):
+            raise ValueError("The five-minute perpetual risk envelope is immutable.")
+        if (
+            self.mode != PAPER_MODE
+            or self.account_name != PAPER_ACCOUNT
+            or self.account_class != PAPER_ACCOUNT_CLASS
+            or self.instrument != PAPER_INSTRUMENT
+            or self.canonical_contract != PAPER_CANONICAL_CONTRACT
+            or self.maximum_absolute_position != 1
+            or self.maximum_entry_quantity != 1
+            or not self.paper_only
+            or self.approved_for_live
+            or self.pyramiding
+            or self.averaging
+            or self.same_event_reversal
+            or self.perpetual_position is not True
+            or self.enforce_holiday_fence is not False
+            or self.enforce_session_entry_window is not False
+            or self.enforce_hard_flat_deadline is not False
+            or self.maximum_position_age_enforced is not False
+        ):
+            raise ValueError("The perpetual profile is sealed to one Sim101 MNQ contract.")
+
+
+PaperRiskProfileType = (
+    PaperRiskProfile
+    | HighConfidencePaperRiskProfile
+    | FiveMinutePaperRiskProfile
+    | FiveMinutePerpetualPaperRiskProfile
+)
 
 
 @dataclass(frozen=True)
@@ -1070,14 +1210,20 @@ def refuse_execution_target(value: object) -> None:
 POLICY = PaperPolicyArtifact()
 HIGH_CONFIDENCE_POLICY = HighConfidencePaperPolicyArtifact()
 FIVE_MINUTE_POLICY = FiveMinutePaperPolicyArtifact()
+FIVE_MINUTE_PERPETUAL_POLICY = FiveMinutePerpetualPaperPolicyArtifact()
 KNOWN_PAPER_POLICY_IDENTITIES = frozenset({
     (POLICY.policy_id, POLICY.configuration_hash),
     (HIGH_CONFIDENCE_POLICY.policy_id, HIGH_CONFIDENCE_POLICY.configuration_hash),
     (FIVE_MINUTE_POLICY.policy_id, FIVE_MINUTE_POLICY.configuration_hash),
+    (
+        FIVE_MINUTE_PERPETUAL_POLICY.policy_id,
+        FIVE_MINUTE_PERPETUAL_POLICY.configuration_hash,
+    ),
 })
 RISK_PROFILE = PaperRiskProfile()
 HIGH_CONFIDENCE_RISK_PROFILE = HighConfidencePaperRiskProfile()
 FIVE_MINUTE_RISK_PROFILE = FiveMinutePaperRiskProfile()
+FIVE_MINUTE_PERPETUAL_RISK_PROFILE = FiveMinutePerpetualPaperRiskProfile()
 ACCOUNT_BINDING = ExecutionAccountBinding()
 CAPABILITY = ExecutionCapabilityManifest()
 AUTHORITY = PaperAuthorityBundle(POLICY, RISK_PROFILE, ACCOUNT_BINDING, CAPABILITY)
@@ -1125,15 +1271,23 @@ SCALPER_PROFILE = PaperProfileDefinition(
 )
 FIVE_MINUTE_PROFILE = PaperProfileDefinition(
     FIVE_MINUTE_ENTRY_PROFILE_VERSION,
-    "5-minute perpetual position",
-    "Choose, hold, or reverse one MNQ position at each completed five-minute candle.",
+    "5-minute session bias (legacy V1)",
+    "Legacy session-bounded five-minute experiment retained for evidence provenance.",
     FIVE_MINUTE_POLICY,
     FIVE_MINUTE_RISK_PROFILE,
+)
+FIVE_MINUTE_PERPETUAL_PROFILE = PaperProfileDefinition(
+    FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
+    "5-minute perpetual position",
+    "Continuously hold or reverse exactly one Sim101 MNQ from completed five-minute bias.",
+    FIVE_MINUTE_PERPETUAL_POLICY,
+    FIVE_MINUTE_PERPETUAL_RISK_PROFILE,
 )
 PAPER_PROFILE_CATALOG = (
     HIGH_CONFIDENCE_PROFILE,
     SCALPER_PROFILE,
     FIVE_MINUTE_PROFILE,
+    FIVE_MINUTE_PERPETUAL_PROFILE,
 )
 
 
@@ -1148,6 +1302,8 @@ def resolve_paper_profile(value: str | None) -> PaperProfileDefinition:
         HIGH_CONFIDENCE_ENTRY_PROFILE_VERSION: HIGH_CONFIDENCE_PROFILE,
         FIVE_MINUTE_ENTRY_PROFILE: FIVE_MINUTE_PROFILE,
         FIVE_MINUTE_ENTRY_PROFILE_VERSION: FIVE_MINUTE_PROFILE,
+        FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE: FIVE_MINUTE_PERPETUAL_PROFILE,
+        FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION: FIVE_MINUTE_PERPETUAL_PROFILE,
     }
     try:
         return aliases[normalized]

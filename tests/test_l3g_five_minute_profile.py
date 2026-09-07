@@ -77,6 +77,27 @@ class FiveMinuteProfileTests(unittest.TestCase):
         self.assertGreaterEqual(decision.family_summary["decision_latency_ms"], 0)
         self.assertIsNone(policy.ingest_runtime(factory.quote(100)))
 
+    def test_delayed_boundary_callback_excludes_itself_and_reports_latest_evidence_basis(self) -> None:
+        policy, factory = self.ready_policy()
+        self.scores(policy, "0.60", "0.50")
+        factory.start = datetime(2026, 8, 24, 14, 4, 59, 500000, tzinfo=timezone.utc)
+        prior = factory.quote(99)
+        self.assertIsNone(policy.ingest_runtime(prior))
+        factory.start = datetime(2026, 8, 24, 14, 5, 7, tzinfo=timezone.utc)
+        triggering = factory.quote(105)
+        decision = policy.ingest_runtime(triggering)
+        assert decision is not None
+        self.assertEqual(decision.family_summary["candle_close_utc"], "2026-08-24T14:05:00Z")
+        self.assertGreaterEqual(decision.family_summary["decision_latency_ms"], 7_000)
+        self.assertEqual(decision.family_summary["decision_reference_observation_id"], prior.observation_id)
+        self.assertNotEqual(decision.family_summary["decision_reference_observation_id"], triggering.observation_id)
+        self.assertTrue(decision.family_summary["decision_reference_before_scheduled_boundary"])
+        self.assertEqual(
+            decision.family_summary["signal_basis"],
+            "LATEST_AVAILABLE_PRE_CALLBACK_PROVISIONAL_EVIDENCE",
+        )
+        self.assertFalse(decision.family_summary["completed_interval_aggregate"])
+
     def test_holds_same_bias_and_stages_opposite_bias_reversal(self) -> None:
         policy, factory = self.ready_policy()
         self.scores(policy, "0.61", "0.49")

@@ -464,6 +464,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private static readonly long MinimumAttachmentPublicationTicks = Math.Max(1L, System.Diagnostics.Stopwatch.Frequency * 5L);
         private const string PublicationPolicy = "BOUNDED_LATEST_STATE_2HZ";
         private readonly Instrument instrument;
+        private readonly object bookLock = new object();
         private readonly SortedDictionary<double, long> bids = new SortedDictionary<double, long>(Comparer<double>.Create((x, y) => y.CompareTo(x)));
         private readonly SortedDictionary<double, long> asks = new SortedDictionary<double, long>();
         private bool subscribed;
@@ -652,31 +653,39 @@ namespace NinjaTrader.NinjaScript.AddOns
                 reportedDepth = true;
                 BeelzebubReadOnlyOutbound.Diagnostic("NATIVE_ADDON_DEPTH_RECEIVED");
             }
-            SortedDictionary<double, long> book = e.MarketDataType == MarketDataType.Bid ? bids : asks;
-            double mutationPrice = e.Price;
-            if (e.Operation == Operation.Remove && !FinitePositive(mutationPrice))
+            string payload;
+            lock (bookLock)
             {
-                if (e.Position < 0 || e.Position >= book.Count)
+                // MarketDepth callbacks may arrive concurrently. Mutation,
+                // positional remove resolution, trimming, and both-side
+                // serialization must observe one coherent book snapshot.
+                SortedDictionary<double, long> book = e.MarketDataType == MarketDataType.Bid ? bids : asks;
+                double mutationPrice = e.Price;
+                if (e.Operation == Operation.Remove && !FinitePositive(mutationPrice))
+                {
+                    if (e.Position < 0 || e.Position >= book.Count)
+                        return;
+                    mutationPrice = book.ElementAt(e.Position).Key;
+                }
+                if (!FinitePositive(mutationPrice))
                     return;
-                mutationPrice = book.ElementAt(e.Position).Key;
+                if (e.Operation == Operation.Remove)
+                    book.Remove(mutationPrice);
+                else
+                    book[mutationPrice] = e.Volume;
+                TrimBook(book);
+                if (e.Position >= MaximumPublishedBookLevelsPerSide
+                    || !TryReservePublication(ref lastDepthPublicationTicks, MinimumPublicationTicks))
+                    return;
+                payload = "{\"contract_id\":\"" + instrument.FullName + "\",\"bids\":" + Levels(bids)
+                    + ",\"asks\":" + Levels(asks) + ",\"operation\":\"" + e.Operation
+                    + "\",\"side\":\"" + e.MarketDataType + "\",\"mutation_price\":"
+                    + mutationPrice.ToString(CultureInfo.InvariantCulture) + ",\"mutation_volume\":" + e.Volume
+                    + ",\"mutation_position\":" + e.Position
+                    + ",\"is_reset\":false,\"publication_policy\":\"" + PublicationPolicy + "\"}";
             }
-            if (!FinitePositive(mutationPrice))
-                return;
-            if (e.Operation == Operation.Remove)
-                book.Remove(mutationPrice);
-            else
-                book[mutationPrice] = e.Volume;
-            TrimBook(book);
-            if (e.Position >= MaximumPublishedBookLevelsPerSide
-                || !TryReservePublication(ref lastDepthPublicationTicks, MinimumPublicationTicks))
-                return;
-            BeelzebubReadOnlyOutbound.Publish("DEPTH", null, null,
-                "{\"contract_id\":\"" + instrument.FullName + "\",\"bids\":" + Levels(bids)
-                + ",\"asks\":" + Levels(asks) + ",\"operation\":\"" + e.Operation
-                + "\",\"side\":\"" + e.MarketDataType + "\",\"mutation_price\":"
-                + mutationPrice.ToString(CultureInfo.InvariantCulture) + ",\"mutation_volume\":" + e.Volume
-                + ",\"mutation_position\":" + e.Position
-                + ",\"is_reset\":false,\"publication_policy\":\"" + PublicationPolicy + "\"}", e.Time);
+            BeelzebubReadOnlyOutbound.Publish(
+                "DEPTH", null, null, payload, e.Time);
         }
 
         private void PublishMarketConnectedOnce()

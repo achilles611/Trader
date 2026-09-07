@@ -29,7 +29,9 @@ from .contracts import (
     POLICY,
     RISK_PROFILE,
     FiveMinutePaperPolicyArtifact,
+    FiveMinutePerpetualPaperPolicyArtifact,
     FiveMinutePaperRiskProfile,
+    FiveMinutePerpetualPaperRiskProfile,
     HighConfidencePaperPolicyArtifact,
     HighConfidencePaperRiskProfile,
     PaperPolicyArtifact,
@@ -60,6 +62,17 @@ _DOMAIN_TABLES = {
     "INCIDENT": "lane_iii_paper_incidents",
 }
 _HIGH_VOLUME_DOMAINS = frozenset({"OBSERVATION", "EVIDENCE", "DECISION"})
+RISK_CONTINUITY_KINDS = (
+    "EXECUTION",
+    "EXECUTION_REALIZED_PNL",
+    "RISK_EVENT_CONTINUITY_IMPORTED",
+    "RISK_EVENT_ENTRY_ACCOUNTED",
+    "RISK_EVENT_EXIT_ACCOUNTED",
+    "RISK_EVENT_AUTHORITY_LOCKOUT",
+    "RISK_EVENT_AUTHORITY_LOCKOUT_CLEARED",
+)
+RISK_CONTINUITY_ANCHOR_SCHEMA = "lane-iii-risk-continuity-anchor-v2"
+RISK_CONTINUITY_GUARD_SCHEMA = "lane-iii-risk-continuity-guard-v1"
 _DEFERRED_READINESS_ATTESTATION_KINDS = frozenset({
     "COMMISSIONING_SESSION_WARMED",
     "COMMISSIONING_SESSION_WARMUP_RESET",
@@ -303,6 +316,132 @@ def _idempotency_fingerprint(
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def risk_continuity_anchor_path(path: str | Path) -> Path:
+    return Path(str(Path(path).resolve()) + ".risk-continuity-anchor.json")
+
+
+def risk_continuity_guard_path(path: str | Path) -> Path:
+    """Return the stable rollback fence kept outside a profile's run tree."""
+    ledger_path = Path(path).resolve()
+    runtime_root: Path | None = None
+    profiles_root = next(
+        (parent for parent in ledger_path.parents if parent.name.lower() == "profiles"),
+        None,
+    )
+    if profiles_root is not None:
+        runtime_root = profiles_root.parent
+    elif ledger_path.parent.name.lower() == "hot":
+        runtime_root = ledger_path.parent.parent
+    if runtime_root is None:
+        runtime_root = next(
+            (parent for parent in ledger_path.parents if parent.name.lower() == "runtime"),
+            None,
+        )
+    # A ledger with no named runtime/hot/profile layout uses its containing
+    # directory as the selector runtime root (the ordinary default is
+    # ``<project>/artifacts/lane_iii_paper.sqlite3``).  Keep the guard one
+    # level above that root too; colocating it inside ``artifacts`` would let
+    # a tree restore roll back the database, local anchor, and guard together.
+    if runtime_root is None:
+        runtime_root = ledger_path.parent
+    authority_root = runtime_root.parent / "risk-continuity-authority"
+    path_key = canonical_hash({"ledger_path": os.path.normcase(str(ledger_path))})
+    return authority_root / f"{path_key}.jsonl"
+
+
+def read_risk_continuity_guard(path: str | Path) -> dict[str, object]:
+    """Validate the append-only external guard and return its latest boundary."""
+    ledger_path = Path(path).resolve()
+    guard_path = risk_continuity_guard_path(ledger_path)
+    try:
+        lines = guard_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError("RISK_CONTINUITY_GUARD_INVALID") from exc
+    if not lines:
+        raise RuntimeError("RISK_CONTINUITY_GUARD_INVALID")
+    prior_hash: str | None = None
+    prior_sequence = -1
+    ledger_identity: str | None = None
+    ledger_epoch: str | None = None
+    latest: dict[str, object] | None = None
+    required = {
+        "schema", "ledger_path", "ledger_identity", "ledger_epoch",
+        "risk_boundary_sequence", "risk_boundary_hash", "previous_guard_hash",
+        "recorded_at", "guard_hash",
+    }
+    for line in lines:
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("RISK_CONTINUITY_GUARD_INVALID") from exc
+        if not isinstance(value, dict) or set(value) != required:
+            raise RuntimeError("RISK_CONTINUITY_GUARD_INVALID")
+        sequence = value.get("risk_boundary_sequence")
+        record_hash = value.get("risk_boundary_hash")
+        observed_guard_hash = value.get("guard_hash")
+        if (
+            value.get("schema") != RISK_CONTINUITY_GUARD_SCHEMA
+            or value.get("ledger_path") != str(ledger_path)
+            or not isinstance(value.get("ledger_identity"), str)
+            or not isinstance(value.get("ledger_epoch"), str)
+            or type(sequence) is not int
+            or sequence < 0
+            or sequence <= prior_sequence
+            or (sequence == 0 and record_hash is not None)
+            or (
+                sequence > 0
+                and (not isinstance(record_hash, str) or re.fullmatch(r"[0-9a-f]{64}", record_hash) is None)
+            )
+            or value.get("previous_guard_hash") != prior_hash
+            or not isinstance(value.get("recorded_at"), str)
+            or not isinstance(observed_guard_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", observed_guard_hash) is None
+            or observed_guard_hash != canonical_hash({
+                key: item for key, item in value.items() if key != "guard_hash"
+            })
+        ):
+            raise RuntimeError("RISK_CONTINUITY_GUARD_INVALID")
+        if ledger_identity is None:
+            ledger_identity = str(value["ledger_identity"])
+            ledger_epoch = str(value["ledger_epoch"])
+        elif (
+            value.get("ledger_identity") != ledger_identity
+            or value.get("ledger_epoch") != ledger_epoch
+        ):
+            raise RuntimeError("RISK_CONTINUITY_GUARD_INVALID")
+        prior_sequence = sequence
+        prior_hash = observed_guard_hash
+        latest = value
+    assert latest is not None
+    return latest
+
+
+def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        encoded = json.dumps(dict(payload), sort_keys=True, separators=(",", ":")) + "\n"
+        os.write(descriptor, encoded.encode("utf-8"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    temporary.replace(path)
+
+
+def _append_jsonl(path: Path, payload: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        os.write(
+            descriptor,
+            (json.dumps(dict(payload), sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"),
+        )
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _assert_redacted(value: object) -> None:
@@ -1011,10 +1150,12 @@ class PaperLedger:
             raise ValueError("Paper ledger high-frequency persistence policy must be boolean.")
         if type(policy) not in {
             PaperPolicyArtifact, HighConfidencePaperPolicyArtifact, FiveMinutePaperPolicyArtifact,
+            FiveMinutePerpetualPaperPolicyArtifact,
         }:
             raise ValueError("Paper ledger policy identity must be a compiled immutable profile.")
         if type(risk) not in {
             PaperRiskProfile, HighConfidencePaperRiskProfile, FiveMinutePaperRiskProfile,
+            FiveMinutePerpetualPaperRiskProfile,
         }:
             raise ValueError("Paper ledger risk identity must be a compiled immutable profile.")
         self.path = Path(path).resolve()
@@ -1061,6 +1202,7 @@ class PaperLedger:
         metadata = {str(row["metadata_key"]): str(row["metadata_value"]) for row in metadata_rows}
         self._ledger_uuid = metadata["ledger_uuid"]
         self._schema_version = metadata["schema_version"]
+        self._risk_continuity_anchor_cache: tuple[int, str | None] | None = None
         latest = self._connection.execute(
             "SELECT ledger_sequence, occurred_at, record_hash FROM lane_iii_paper_audit ORDER BY ledger_sequence DESC LIMIT 1"
         ).fetchone()
@@ -1166,6 +1308,14 @@ class PaperLedger:
         self._last_barrier_token: int | None = None
         self._last_barrier_sequence: int | None = None
         self._last_barrier_wait_seconds: float | None = None
+        if not self._path_preexisted:
+            try:
+                # Establish the independent zero-tip fence before the first
+                # risk record can make this a non-adoptable existing ledger.
+                self.publish_risk_continuity_anchor()
+            except Exception:
+                self._connection.close()
+                raise
         self._deferred_thread = threading.Thread(
             target=self._deferred_writer,
             name="LaneIIIPaperLedgerWriter",
@@ -1495,6 +1645,11 @@ class PaperLedger:
     @property
     def ledger_identity(self) -> str:
         return self._ledger_uuid
+
+    @property
+    def ledger_epoch(self) -> str:
+        """Return the immutable epoch bound to this open ledger instance."""
+        return self._ledger_epoch
 
     def capacity_allows_authority(self) -> bool:
         """Fail closed for new authority when durable writer headroom is inadequate."""
@@ -2162,7 +2317,10 @@ class PaperLedger:
                     raise RuntimeError("Paper ledger admission is sealed for controlled shutdown.")
             self.flush_deferred(timeout_seconds=30.0)
             with self._lock:
-                return self._append_prepared((prepared,))[0]
+                result = self._append_prepared((prepared,))[0]
+                if kind in RISK_CONTINUITY_KINDS:
+                    self.publish_risk_continuity_anchor()
+                return result
 
     def _prepare(
         self,
@@ -3224,6 +3382,247 @@ class PaperLedger:
             ).fetchall()
             return [json.loads(str(row["payload_json"])) for row in rows]
 
+    def recent_kind_records(
+        self, kinds: tuple[str, ...], limit: int = 100,
+    ) -> list[dict[str, object]]:
+        """Return a bounded exact-kind slice with immutable chain provenance."""
+        if not kinds or not all(isinstance(kind, str) and kind for kind in kinds):
+            raise ValueError("Paper ledger record kinds must be non-empty strings.")
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("Paper ledger query limit is invalid.")
+        with self._ordering_lock:
+            self.flush_deferred()
+        placeholders = ", ".join("?" for _ in kinds)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT ledger_sequence, record_hash, payload_json "
+                "FROM lane_iii_paper_audit WHERE kind IN (" + placeholders
+                + ") ORDER BY ledger_sequence DESC LIMIT ?",
+                (*kinds, limit),
+            ).fetchall()
+            return [
+                {
+                    "ledger_sequence": int(row["ledger_sequence"]),
+                    "record_hash": str(row["record_hash"]),
+                    "record": json.loads(str(row["payload_json"])),
+                }
+                for row in rows
+            ]
+
+    def record_by_identity(self, identity: str) -> dict[str, object] | None:
+        """Return one exact immutable record with its chain coordinates."""
+        if not isinstance(identity, str) or not identity:
+            raise ValueError("Paper ledger identity must be a non-empty string.")
+        with self._ordering_lock:
+            self.flush_deferred()
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT ledger_sequence, record_hash, payload_json "
+                "FROM lane_iii_paper_audit WHERE identity=?",
+                (identity,),
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "ledger_sequence": int(row["ledger_sequence"]),
+                "record_hash": str(row["record_hash"]),
+                "record": json.loads(str(row["payload_json"])),
+            }
+
+    def risk_continuity_records(self) -> list[dict[str, object]]:
+        """Return the narrow ordered record set needed to restore risk limits.
+
+        This deliberately excludes observations and policy evidence. Risk recovery
+        must be complete rather than bounded by a recent-record limit, because a
+        process restart cannot be allowed to reset an older same-trade-date entry
+        or loss merely because the ledger contains high-volume market data.
+        """
+        return self.risk_continuity_evidence()[0]
+
+    def risk_continuity_evidence(self) -> tuple[list[dict[str, object]], dict[str, object]]:
+        """Return records and their exact source-ledger watermark in one read."""
+        with self._ordering_lock:
+            self.flush_deferred()
+        placeholders = ", ".join("?" for _ in RISK_CONTINUITY_KINDS)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT ledger_sequence, record_hash, payload_json FROM lane_iii_paper_audit WHERE kind IN (" + placeholders
+                + ") ORDER BY ledger_sequence",
+                RISK_CONTINUITY_KINDS,
+            ).fetchall()
+            result: list[dict[str, object]] = []
+            for row in rows:
+                record = json.loads(str(row["payload_json"]))
+                record["_ledger_sequence"] = int(row["ledger_sequence"])
+                record["_record_hash"] = str(row["record_hash"])
+                result.append(record)
+            boundary = {
+                "path": str(self.path),
+                "ledger_identity": self._ledger_uuid,
+                "ledger_epoch": self._ledger_epoch,
+                "risk_boundary_sequence": 0 if not rows else int(rows[-1]["ledger_sequence"]),
+                "risk_boundary_hash": None if not rows else str(rows[-1]["record_hash"]),
+            }
+            return result, boundary
+
+    def _risk_continuity_boundary_locked(self) -> dict[str, object]:
+        placeholders = ", ".join("?" for _ in RISK_CONTINUITY_KINDS)
+        row = self._connection.execute(
+            "SELECT ledger_sequence, record_hash FROM lane_iii_paper_audit WHERE kind IN ("
+            + placeholders + ") ORDER BY ledger_sequence DESC LIMIT 1",
+            RISK_CONTINUITY_KINDS,
+        ).fetchone()
+        return {
+            "path": str(self.path),
+            "ledger_identity": self._ledger_uuid,
+            "ledger_epoch": self._ledger_epoch,
+            "risk_boundary_sequence": 0 if row is None else int(row["ledger_sequence"]),
+            "risk_boundary_hash": None if row is None else str(row["record_hash"]),
+        }
+
+    def risk_continuity_boundary(self) -> dict[str, object]:
+        return self.risk_continuity_evidence()[1]
+
+    def publish_risk_continuity_anchor(self) -> dict[str, object]:
+        """Advance the run-local anchor and independent append-only guard."""
+        anchor_path = risk_continuity_anchor_path(self.path)
+        guard_path = risk_continuity_guard_path(self.path)
+        with self._lock:
+            boundary = self._risk_continuity_boundary_locked()
+            sequence = int(boundary["risk_boundary_sequence"])
+            record_hash = boundary["risk_boundary_hash"]
+            current = (sequence, None if record_hash is None else str(record_hash))
+            if (
+                self._risk_continuity_anchor_cache == current
+                and anchor_path.is_file()
+                and guard_path.is_file()
+            ):
+                return {
+                    "anchor_path": str(anchor_path),
+                    "guard_path": str(guard_path),
+                    **boundary,
+                }
+            existing: Mapping[str, object] | None = None
+            if anchor_path.is_file():
+                try:
+                    existing = json.loads(anchor_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError("RISK_CONTINUITY_ANCHOR_INVALID") from exc
+                if not isinstance(existing, Mapping) or set(existing) != {
+                    "schema", "ledger_path", "ledger_identity", "ledger_epoch",
+                    "risk_boundary_sequence", "risk_boundary_hash", "guard_path",
+                    "guard_hash", "updated_at",
+                }:
+                    raise RuntimeError("RISK_CONTINUITY_ANCHOR_INVALID")
+                existing_sequence = existing.get("risk_boundary_sequence")
+                existing_hash = existing.get("risk_boundary_hash")
+                if (
+                    existing.get("schema") != RISK_CONTINUITY_ANCHOR_SCHEMA
+                    or existing.get("ledger_path") != str(self.path)
+                    or existing.get("ledger_identity") != self._ledger_uuid
+                    or existing.get("ledger_epoch") != self._ledger_epoch
+                    or existing.get("guard_path") != str(guard_path)
+                    or not isinstance(existing.get("guard_hash"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", str(existing.get("guard_hash"))) is None
+                    or type(existing_sequence) is not int
+                    or existing_sequence < 0
+                    or (
+                        existing_sequence == 0 and existing_hash is not None
+                    )
+                    or (
+                        existing_sequence > 0
+                        and (not isinstance(existing_hash, str) or re.fullmatch(r"[0-9a-f]{64}", existing_hash) is None)
+                    )
+                ):
+                    raise RuntimeError("RISK_CONTINUITY_ANCHOR_INVALID")
+                if existing_sequence > sequence:
+                    raise RuntimeError("RISK_CONTINUITY_ANCHOR_BEYOND_LEDGER")
+                if existing_sequence > 0:
+                    row = self._connection.execute(
+                        "SELECT record_hash FROM lane_iii_paper_audit WHERE ledger_sequence=?",
+                        (existing_sequence,),
+                    ).fetchone()
+                    if row is None or str(row["record_hash"]) != existing_hash:
+                        raise RuntimeError("RISK_CONTINUITY_ANCHOR_ANCESTRY_MISMATCH")
+                if existing_sequence == sequence:
+                    if existing_hash != record_hash:
+                        raise RuntimeError("RISK_CONTINUITY_ANCHOR_TIP_MISMATCH")
+            elif self._risk_continuity_anchor_cache is not None and not guard_path.is_file():
+                raise RuntimeError("RISK_CONTINUITY_GUARD_MISSING")
+
+            latest_guard: dict[str, object] | None = None
+            if guard_path.is_file():
+                latest_guard = read_risk_continuity_guard(self.path)
+                guarded_sequence = int(latest_guard["risk_boundary_sequence"])
+                guarded_hash = latest_guard["risk_boundary_hash"]
+                if (
+                    latest_guard.get("ledger_identity") != self._ledger_uuid
+                    or latest_guard.get("ledger_epoch") != self._ledger_epoch
+                ):
+                    raise RuntimeError("RISK_CONTINUITY_GUARD_IDENTITY_MISMATCH")
+                if guarded_sequence > sequence:
+                    raise RuntimeError("RISK_CONTINUITY_GUARD_BEYOND_LEDGER")
+                if guarded_sequence > 0:
+                    row = self._connection.execute(
+                        "SELECT record_hash FROM lane_iii_paper_audit WHERE ledger_sequence=?",
+                        (guarded_sequence,),
+                    ).fetchone()
+                    if row is None or str(row["record_hash"]) != guarded_hash:
+                        raise RuntimeError("RISK_CONTINUITY_GUARD_ANCESTRY_MISMATCH")
+                if guarded_sequence == sequence and guarded_hash != record_hash:
+                    raise RuntimeError("RISK_CONTINUITY_GUARD_TIP_MISMATCH")
+                if (
+                    existing is not None
+                    and int(existing["risk_boundary_sequence"]) == guarded_sequence
+                    and existing.get("guard_hash") != latest_guard.get("guard_hash")
+                ):
+                    raise RuntimeError("RISK_CONTINUITY_ANCHOR_GUARD_MISMATCH")
+            elif existing is not None:
+                # Once the local anchor has named its external guard, absence
+                # is evidence loss. Never re-seed a lower allowance.
+                raise RuntimeError("RISK_CONTINUITY_GUARD_MISSING")
+            elif sequence > 0:
+                # Existing risk history needs a separately authorized,
+                # verified one-time adoption. Runtime startup may seed only a
+                # genuinely empty ledger; it cannot bless an unknown old tip.
+                raise RuntimeError("RISK_CONTINUITY_GUARD_ADOPTION_REQUIRED")
+            if latest_guard is None or int(latest_guard["risk_boundary_sequence"]) < sequence:
+                guard_payload: dict[str, object] = {
+                    "schema": RISK_CONTINUITY_GUARD_SCHEMA,
+                    "ledger_path": str(self.path),
+                    "ledger_identity": self._ledger_uuid,
+                    "ledger_epoch": self._ledger_epoch,
+                    "risk_boundary_sequence": sequence,
+                    "risk_boundary_hash": record_hash,
+                    "previous_guard_hash": (
+                        None if latest_guard is None else latest_guard["guard_hash"]
+                    ),
+                    "recorded_at": _now(),
+                }
+                guard_payload["guard_hash"] = canonical_hash(guard_payload)
+                _append_jsonl(guard_path, guard_payload)
+                latest_guard = guard_payload
+            assert latest_guard is not None
+            payload = {
+                "schema": RISK_CONTINUITY_ANCHOR_SCHEMA,
+                "ledger_path": str(self.path),
+                "ledger_identity": self._ledger_uuid,
+                "ledger_epoch": self._ledger_epoch,
+                "risk_boundary_sequence": sequence,
+                "risk_boundary_hash": record_hash,
+                "guard_path": str(guard_path),
+                "guard_hash": latest_guard["guard_hash"],
+                "updated_at": _now(),
+            }
+            if existing is None or any(existing.get(key) != value for key, value in payload.items() if key != "updated_at"):
+                _atomic_json(anchor_path, payload)
+            self._risk_continuity_anchor_cache = current
+            return {
+                "anchor_path": str(anchor_path),
+                "guard_path": str(guard_path),
+                **boundary,
+            }
+
     def unresolved_commissioning_ownership(self) -> tuple[dict[str, object], bool] | None:
         """Read the transactional recovery marker without scanning audit history."""
         self._commissioning_deferred_barrier(())
@@ -3524,6 +3923,7 @@ class PaperLedger:
         writer_stopped = False
         checkpoint_worker_stopped = False
         admitted_prefix_records = 0
+        risk_continuity_boundary: dict[str, object] | None = None
         receipt: dict[str, object]
 
         # Seal admission under the ordering lock, then release it before the
@@ -3601,6 +4001,7 @@ class PaperLedger:
                 try:
                     with self._lock:
                         durable_tip = self._durable_tip_locked()
+                        risk_continuity_boundary = self._risk_continuity_boundary_locked()
                         if failure is None and durable_tip != expected_tip:
                             raise RuntimeError(
                                 "Deferred paper ledger durable tip changed after its shutdown fence."
@@ -3645,6 +4046,7 @@ class PaperLedger:
                     "expected_tip_hash": expected_tip[1],
                     "durable_tip_sequence": durable_tip[0],
                     "durable_tip_hash": durable_tip[1],
+                    "risk_continuity_boundary": risk_continuity_boundary,
                     "writer_stopped": writer_stopped,
                     "checkpoint_worker_stopped": checkpoint_worker_stopped,
                     "last_passive_checkpoint": self._passive_checkpoint_snapshot()["last_passive_checkpoint"],

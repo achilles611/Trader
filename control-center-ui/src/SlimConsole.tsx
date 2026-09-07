@@ -1,5 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { PaperConsoleState } from "./paperConsole";
+
+const PAPER_PROFILE_PREFERENCE = "beezconsole-paper-profile-selection";
+const FIVE_MINUTE_PERPETUAL_PROFILE = "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2";
 
 type Props = {
   paper: PaperConsoleState;
@@ -21,6 +24,87 @@ const pnlClass = (value: unknown) => {
 export function SlimConsole({ paper, onFullConsole }: Props) {
   const status = paper.slimStatus;
   const commissioning = paper.status?.commissioning_lifecycle;
+  const runtimeState = String(paper.status?.state || "");
+  const runtimeMayBeActive = paper.status?.operational_paper_session?.active === true
+    || ["STARTING", "PAPER_RUNNING", "ENTRY_PENDING", "OPEN_POSITION", "LONG", "SHORT", "EXIT_PENDING", "STOPPING", "PAUSED", "RECONCILING", "FAULTED", "LOCKED_OUT"].includes(runtimeState);
+  const positionRequirement = paper.status?.position_requirement;
+  const sourceSignal = positionRequirement?.source_signal;
+  const perpetualRuntimeActive = paper.status?.entry_profile_version === FIVE_MINUTE_PERPETUAL_PROFILE
+    && (runtimeMayBeActive || status?.paper_active === true);
+  const perpetualRuntimeFlat = perpetualRuntimeActive
+    && (paper.status?.current_position === "FLAT" || positionRequirement?.actual_position === "FLAT");
+  const requirementReasonsSupplied = Array.isArray(positionRequirement?.blocking_reasons);
+  const requirementReasons = requirementReasonsSupplied
+    ? positionRequirement.blocking_reasons.filter((reason: unknown) => typeof reason === "string" && reason.trim())
+    : [];
+  const requirementReasonsEmpty = requirementReasonsSupplied
+    && positionRequirement.blocking_reasons.length === 0;
+  const positionedDirection = ["LONG", "SHORT"].includes(runtimeState) ? runtimeState : null;
+  const runtimeIdentityProven = paper.status?.mode === "PAPER_SIM101"
+    && paper.status?.paper_account === "Sim101"
+    && paper.status?.account_class === "LOCAL_SIMULATION"
+    && paper.status?.market_instrument === "MNQ SEP26"
+    && paper.status?.maximum_quantity === 1
+    && paper.status?.live_capital === "DENIED";
+  const runtimePositionProven = positionedDirection !== null
+    && paper.status?.paper_execution === "POSITIONED"
+    && paper.status?.current_position === positionedDirection
+    && paper.status?.current_quantity === 1
+    && paper.status?.current_position_quantity === 1
+    && paper.status?.broker_snapshot_position === positionedDirection
+    && paper.status?.broker_snapshot_position_quantity === 1;
+  const requirementProven = positionRequirement?.required === true
+    && positionRequirement?.state === "POSITIONED"
+    && positionRequirement?.actual_position === positionedDirection
+    && positionRequirement?.actual_quantity === 1
+    && positionRequirement?.desired_position === positionedDirection
+    && positionRequirement?.primary_blocker == null
+    && requirementReasonsEmpty
+    && sourceSignal?.direction === positionedDirection
+    && typeof sourceSignal?.candle_close_utc === "string"
+    && sourceSignal.candle_close_utc.trim().length > 0
+    && typeof sourceSignal?.signal_hash === "string"
+    && sourceSignal.signal_hash.trim().length > 0
+    && Number.isInteger(sourceSignal?.ledger_sequence)
+    && sourceSignal.ledger_sequence > 0
+    && typeof sourceSignal?.record_hash === "string"
+    && sourceSignal.record_hash.trim().length > 0
+    && sourceSignal?.ledger_verified === true;
+  const reconciliationProven = paper.status?.position_snapshot_complete === true
+    && paper.status?.order_snapshot_complete === true
+    && paper.status?.reconciliation_current === true
+    && paper.status?.unresolved_command === false
+    && paper.status?.unresolved_native_order === false
+    && paper.status?.unresolved_execution === false;
+  const perpetualPositionProven = perpetualRuntimeActive
+    && runtimeIdentityProven
+    && runtimePositionProven
+    && paper.status?.working_owned_orders === 1
+    && paper.status?.working_entry_orders === 0
+    && paper.status?.foreign_activity === false
+    && paper.status?.protective_stop_state === "WORKING"
+    && (paper.status?.lockout_or_fault_reason == null || paper.status?.lockout_or_fault_reason === "")
+    && reconciliationProven
+    && requirementProven;
+  const perpetualProjectionUnproved = perpetualRuntimeActive && !perpetualPositionProven;
+  const suppliedRuntimeBlocker = typeof positionRequirement?.primary_blocker === "string"
+    && positionRequirement.primary_blocker.trim()
+    ? positionRequirement.primary_blocker.trim()
+    : requirementReasons.length ? String(requirementReasons[0]).trim()
+    : null;
+  const exactRuntimeBlocker = suppliedRuntimeBlocker
+    || (perpetualRuntimeFlat ? "PERPETUAL_POSITION_REQUIREMENT_UNAVAILABLE"
+    : !runtimeIdentityProven ? "ACTIVE_RUNTIME_IDENTITY_UNHEALTHY"
+    : !runtimePositionProven ? "ACTIVE_POSITION_UNHEALTHY"
+    : paper.status?.protective_stop_state !== "WORKING" ? "PROTECTIVE_STOP_REJECTED"
+    : !requirementProven ? "ACTIVE_POSITION_REQUIREMENT_UNHEALTHY"
+    : paper.status?.working_owned_orders !== 1 ? "ACTIVE_OWNED_ORDER_SET_UNHEALTHY"
+    : paper.status?.working_entry_orders !== 0 ? "ACTIVE_WORKING_ENTRY_ORDER"
+    : paper.status?.foreign_activity !== false ? "FOREIGN_ACTIVITY_LOCKOUT"
+    : typeof paper.status?.lockout_or_fault_reason === "string" && paper.status.lockout_or_fault_reason.trim()
+    ? paper.status.lockout_or_fault_reason.trim()
+    : !reconciliationProven ? "RECONCILIATION_INCOMPLETE"
+    : "PERPETUAL_POSITION_REQUIREMENT_UNAVAILABLE");
   // Older running backends classify ARMED_FLAT as "not safely disarmed" even
   // though an intentional one-shot commissioning reservation owns authority.
   // Render that known lifecycle directly so Slim never calls healthy waiting
@@ -28,15 +112,23 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
   const waitingForProfileSignal = commissioning?.active === true
     && commissioning?.phase === "WAITING_FOR_PROFILE_SIGNAL"
     && paper.status?.state === "ARMED_FLAT";
-  const light = waitingForProfileSignal ? "YELLOW" : status?.light || "RED";
-  const label = waitingForProfileSignal ? "WAITING FOR PROFILE SIGNAL" : status?.label || "NOT READY";
-  const message = waitingForProfileSignal
+  // `/paper` and `/slim-status` are separate reads. If a fill, exit, or
+  // reconciliation lands between them, current V2 position truth must override
+  // a stale green compact projection until the next poll catches up.
+  const light = perpetualProjectionUnproved ? "RED" : waitingForProfileSignal ? "YELLOW" : status?.light || "RED";
+  const label = perpetualProjectionUnproved
+    ? perpetualRuntimeFlat
+      ? `FLAT — BLOCKED: ${exactRuntimeBlocker}`
+      : `POSITION UNPROVEN — BLOCKED: ${exactRuntimeBlocker}`
+    : waitingForProfileSignal ? "WAITING FOR PROFILE SIGNAL" : status?.label || "NOT READY";
+  const message = perpetualProjectionUnproved
+    ? status?.primary_blocker === exactRuntimeBlocker && status?.light !== "GREEN"
+      ? status?.message || "The perpetual-position requirement is blocked; review Full Console diagnostics."
+      : "The perpetual-position requirement is blocked; review Full Console diagnostics."
+    : waitingForProfileSignal
     ? `Commissioning is armed and waiting for a fresh profile-qualified signal meeting ${paper.status?.effective_confidence_threshold || "the configured"} support and ${paper.status?.entry_dominance_margin || "the configured"} dominance.`
     : status?.message || "Waiting for current canonical paper runtime status.";
   const active = waitingForProfileSignal || status?.paper_active === true;
-  const runtimeState = String(paper.status?.state || "");
-  const runtimeMayBeActive = paper.status?.operational_paper_session?.active === true
-    || ["STARTING", "PAPER_RUNNING", "ENTRY_PENDING", "OPEN_POSITION", "EXIT_PENDING", "PAUSED", "RECONCILING", "FAULTED", "LOCKED_OUT"].includes(runtimeState);
   // Keep the idempotent stop path when authority may exist or current runtime
   // truth is unavailable. A known disarmed red/yellow state is a prerequisite
   // condition for the backend-owned start sequence, not a reason to show STOP.
@@ -54,22 +146,67 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
   const profileSwitch = paper.profileSwitch;
   const profiles = Array.isArray(profileSwitch?.profiles) ? profileSwitch.profiles : [];
   const activeProfile = String(profileSwitch?.active_profile || paper.status?.entry_profile_version || "");
-  const [selectedProfile, setSelectedProfile] = useState("");
+  const operationTarget = String(profileSwitch?.target_profile || "");
+  const requestedProfile = String(profileSwitch?.selection?.requested?.profile || operationTarget || "");
+  const establishedProfile = String(profileSwitch?.selection?.established?.profile || activeProfile || "");
+  const [selectedProfile, setSelectedProfile] = useState(() => {
+    try { return window.localStorage.getItem(PAPER_PROFILE_PREFERENCE) || ""; }
+    catch { return ""; }
+  });
+  const authoritativeSelection = `${String(profileSwitch?.operation_id || "")}|${String(profileSwitch?.stage || "IDLE")}|${activeProfile}|${requestedProfile}|${establishedProfile}`;
+  const lastAuthoritativeSelection = useRef("");
   useEffect(() => {
     if (!profiles.length) return;
-    const exists = profiles.some((profile: any) => profile.selection_key === selectedProfile);
-    if (!exists) setSelectedProfile(activeProfile || String(profiles[0].selection_key));
-  }, [activeProfile, profiles, selectedProfile]);
+    const selectedExists = profiles.some((profile: any) => profile.selection_key === selectedProfile);
+    if (lastAuthoritativeSelection.current === authoritativeSelection && selectedExists) return;
+    lastAuthoritativeSelection.current = authoritativeSelection;
+    const operationExists = profiles.some((profile: any) => profile.selection_key === operationTarget);
+    const establishedExists = profiles.some((profile: any) => profile.selection_key === establishedProfile);
+    const activeExists = profiles.some((profile: any) => profile.selection_key === activeProfile);
+    const backendSelection = profileSwitch?.operation_id && operationExists
+      ? operationTarget
+      : establishedExists ? establishedProfile
+      : activeExists ? activeProfile
+      : String(profiles[0].selection_key);
+    if (selectedProfile !== backendSelection) setSelectedProfile(backendSelection);
+  }, [activeProfile, authoritativeSelection, establishedProfile, operationTarget, profileSwitch?.operation_id, profiles, selectedProfile]);
+  useEffect(() => {
+    if (!selectedProfile || !profiles.some((profile: any) => profile.selection_key === selectedProfile)) return;
+    try { window.localStorage.setItem(PAPER_PROFILE_PREFERENCE, selectedProfile); }
+    catch { /* preference persistence is optional */ }
+  }, [profiles, selectedProfile]);
   const targetProfile = selectedProfile || activeProfile;
   const switchInProgress = profileSwitch?.in_progress === true;
-  const switchBlocked = profileSwitch?.stage === "BLOCKED_SAFE";
-  const switchStatus = switchInProgress
+  const switchStage = String(profileSwitch?.stage || "");
+  const exactPositionedTarget = ["LONG", "SHORT"].includes(runtimeState)
+    && paper.status?.paper_execution === "POSITIONED"
+    && paper.status?.current_position === runtimeState
+    && paper.status?.current_quantity === 1
+    && paper.status?.current_position_quantity === 1
+    && paper.status?.broker_snapshot_position === runtimeState
+    && paper.status?.broker_snapshot_position_quantity === 1;
+  const targetRuntimeRunning = (
+    runtimeState === "PAPER_RUNNING" && paper.status?.paper_execution === "RUNNING"
+  ) || exactPositionedTarget;
+  const runningTargetHasStaleSwitchProjection = switchInProgress
+    && operationTarget === activeProfile
+    && paper.status?.entry_profile_version === activeProfile
+    && targetRuntimeRunning
+    && paper.status?.operational_paper_session?.active === true
+    && autoStart?.stage === "RUNNING"
+    && autoStart?.in_progress !== true;
+  const switchBlocked = ["BLOCKED_SAFE", "FAILED", "CANCELLED", "RUNNING_SELECTION_PERSISTENCE_FAILED"].includes(switchStage);
+  const switchStatus = runningTargetHasStaleSwitchProjection
+    ? "Selected profile is running. The prior switch projection is stale."
+    : switchInProgress
     ? `Switch in progress: ${String(profileSwitch.stage || "PREPARING").replaceAll("_", " ")}`
-    : switchBlocked && profileSwitch?.blockers?.length
-    ? `Switch blocked safely: ${profileSwitch.blockers.join(", ")}`
+    : switchStage === "RUNNING_SELECTION_PERSISTENCE_FAILED"
+    ? `Target is running, but its remembered selection was not durably established: ${profileSwitch?.blockers?.join(", ") || "PROFILE_SELECTION_PERSISTENCE_FAILED"}`
+    : switchBlocked
+    ? `Switch blocked safely: ${profileSwitch?.blockers?.length ? profileSwitch.blockers.join(", ") : String(profileSwitch?.stage)}`
     : profileSwitch?.stage === "RUNNING"
-    ? "Selected profile is running."
-    : "A switch closes and verifies the current ledger, creates a fresh run, restarts, verifies, and starts automatically.";
+    ? `Current profile is running: ${activeProfile}.`
+    : "A switch flattens the current profile, seals its ledger and risk counters, creates a fresh run, then verifies and starts the target automatically.";
 
   return <main className="slim-console" aria-label="BeezConsole Slim Mode">
     <header className="slim-header">
@@ -95,11 +232,14 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
           disabled={!targetProfile || targetProfile === activeProfile || switchInProgress || paper.profileSwitchBusy}
           onClick={() => void paper.switchPaperProfile(targetProfile)}
         >
-          {paper.profileSwitchBusy ? "Preparing…" : switchInProgress ? "Switching…" : "Switch & Start"}
+          {paper.profileSwitchBusy ? "Preparing…" : runningTargetHasStaleSwitchProjection ? "Running" : switchInProgress ? "Switching…" : "Switch & Start"}
         </button>
       </div>
       <p className={`slim-verification-result ${switchBlocked ? "negative" : ""}`} role="status" aria-live="polite">{switchStatus}</p>
       <p className="slim-profile-current">Current: <strong>{profiles.find((profile: any) => profile.selection_key === activeProfile)?.display_name || activeProfile || "UNAVAILABLE"}</strong></p>
+      <p className="slim-profile-current">Requested: <strong>{profiles.find((profile: any) => profile.selection_key === requestedProfile)?.display_name || requestedProfile || "NONE"}</strong></p>
+      <p className="slim-profile-current">Last established: <strong>{profiles.find((profile: any) => profile.selection_key === establishedProfile)?.display_name || establishedProfile || "NONE"}</strong></p>
+      {profileSwitch?.selection?.status === "INVALID" && <p className="slim-verification-result negative" role="alert">Remembered profile state is invalid; startup remains blocked.</p>}
     </section>
 
     <section className="slim-card slim-readiness" aria-labelledby="slim-readiness-heading">

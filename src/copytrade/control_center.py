@@ -52,8 +52,16 @@ from src.l3g_paper.profile_switch import (
     PROFILE_SWITCH_ACTION_VALUE,
     PROFILE_SWITCH_TOKEN_HEADER,
     PaperProfileSwitchService,
+    assert_risk_guard_outside_runtime_root,
+    remembered_profile_selection,
+    validated_profile_switch_manifest,
 )
 from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout
+from src.l3g_paper.risk_continuity import read_risk_continuity_artifact
+from src.l3g_paper.perpetual_startup_seed import (
+    read_perpetual_startup_seed_artifact,
+    read_perpetual_startup_seed_proof,
+)
 from src.l3g_paper.sessions import session_catalog
 from src.l3g_paper.slim_status import derive_slim_paper_status, unavailable_slim_status
 from src.l3g_paper.verification import LocalLedgerVerificationController
@@ -1416,6 +1424,7 @@ def create_control_center_app(
     job_runtime: dict[str, asyncio.Task[Any]] = {}
     source = discovery_source or HyperCoreSourceAcquisition(cache_directory(config.artifacts.database_path))
     discovery_orchestrator = CandidateDiscoveryOrchestrator(execution_service, center.store, source)
+    runtime_git_sha = _runtime_git_sha()
     configured_paper_path = os.getenv("BEELZEBUB_L3G_PAPER_LEDGER")
     paper_path = (
         Path(configured_paper_path).expanduser().resolve()
@@ -1423,13 +1432,183 @@ def create_control_center_app(
         else Path(config.artifacts.database_path).resolve().with_name("lane_iii_paper.sqlite3")
     )
     configured_paper_epoch = os.getenv("BEELZEBUB_L3G_PAPER_LEDGER_EPOCH")
+    configured_paper_profile = os.getenv("BEELZEBUB_L3G_PAPER_PROFILE")
+    resolved_profile_switch_runtime_root = profile_switch_runtime_root(
+        paper_path, os.getenv("BEELZEBUB_PROFILE_SWITCH_ROOT"),
+    )
+    profile_selection_source = "EXPLICIT_OR_DEFAULT"
+    if not os.getenv("BEELZEBUB_PROFILE_SWITCH_OPERATION") and not configured_paper_profile:
+        remembered = remembered_profile_selection(
+            resolved_profile_switch_runtime_root, git_sha=runtime_git_sha,
+        )
+        if remembered is not None:
+            paper_path = Path(str(remembered["ledger_path"])).resolve()
+            configured_paper_epoch = str(remembered["ledger_epoch"])
+            configured_paper_profile = str(remembered["profile"])
+            remembered_audit_root = Path(str(remembered["audit_root"])).resolve()
+            profile_selection_source = "REMEMBERED_ESTABLISHED_RUN"
+        else:
+            remembered_audit_root = None
+    else:
+        remembered_audit_root = None
+        if os.getenv("BEELZEBUB_PROFILE_SWITCH_OPERATION"):
+            profile_selection_source = "PROFILE_SWITCH_MANIFEST"
+    # Refuse before PaperLedger construction when an arbitrary configured
+    # selector root would contain the independently derived rollback guard.
+    assert_risk_guard_outside_runtime_root(
+        resolved_profile_switch_runtime_root, paper_path,
+    )
     selected_paper_profile = resolve_paper_profile(
-        os.getenv("BEELZEBUB_L3G_PAPER_PROFILE")
+        configured_paper_profile
     )
     selected_paper_policy = selected_paper_profile.policy
     selected_paper_risk = selected_paper_profile.risk
+    risk_continuity_artifact: Mapping[str, object] | None = None
+    configured_risk_continuity = os.getenv("BEELZEBUB_RISK_CONTINUITY_PATH")
+    if configured_risk_continuity:
+        inherited_operation = os.getenv("BEELZEBUB_PROFILE_SWITCH_OPERATION")
+        if not inherited_operation:
+            raise RuntimeError("RISK_CONTINUITY_OPERATION_UNAVAILABLE")
+        risk_continuity_artifact = read_risk_continuity_artifact(
+            Path(configured_risk_continuity).expanduser().resolve(),
+            operation_id=inherited_operation,
+            target_profile=selected_paper_profile.selection_key,
+        )
+        if lane_iii_paper_factory is not None:
+            raise RuntimeError("RISK_CONTINUITY_CUSTOM_RUNTIME_FACTORY_UNSUPPORTED")
     derived_audit_root = paper_path.parent.parent / "audit" if paper_path.parent.name.lower() == "hot" else paper_path.parent / "audit"
-    audit_root = Path(os.getenv("BEELZEBUB_LEDGER_AUDIT_ROOT") or derived_audit_root).resolve()
+    audit_root = Path(
+        os.getenv("BEELZEBUB_LEDGER_AUDIT_ROOT") or remembered_audit_root or derived_audit_root
+    ).resolve()
+    perpetual_seed_artifact: Mapping[str, object] | None = None
+    perpetual_seed_proof: Mapping[str, object] | None = None
+    perpetual_seed_manifest: Mapping[str, object] | None = None
+    perpetual_seed_required = (
+        os.getenv("BEELZEBUB_PERPETUAL_STARTUP_SEED_REQUIRED") == "1"
+    )
+    perpetual_seed_path = os.getenv("BEELZEBUB_PERPETUAL_STARTUP_SEED_PATH")
+    perpetual_seed_proof_path = os.getenv(
+        "BEELZEBUB_PERPETUAL_STARTUP_SEED_PROOF_PATH",
+    )
+    profile_switch_manifest_sha256 = os.getenv(
+        "BEELZEBUB_PROFILE_SWITCH_MANIFEST_SHA256",
+    )
+    profile_switch_manifest_path = os.getenv(
+        "BEELZEBUB_PROFILE_SWITCH_MANIFEST_PATH",
+    )
+    seed_values_present = any((
+        perpetual_seed_required,
+        perpetual_seed_path,
+        perpetual_seed_proof_path,
+        profile_switch_manifest_sha256,
+        profile_switch_manifest_path,
+    ))
+    if (
+        os.getenv("BEELZEBUB_PROFILE_SWITCH_OPERATION")
+        and selected_paper_profile.selection_key
+        == "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2"
+        and not seed_values_present
+    ):
+        raise RuntimeError("PERPETUAL_STARTUP_SEED_ENVIRONMENT_INVALID")
+    if seed_values_present:
+        inherited_operation = os.getenv("BEELZEBUB_PROFILE_SWITCH_OPERATION")
+        if not (
+            perpetual_seed_required
+            and inherited_operation
+            and perpetual_seed_path
+            and perpetual_seed_proof_path
+            and profile_switch_manifest_sha256
+            and profile_switch_manifest_path
+            and risk_continuity_artifact is not None
+            and configured_risk_continuity
+            and selected_paper_profile.selection_key
+            == "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2"
+        ):
+            raise RuntimeError("PERPETUAL_STARTUP_SEED_ENVIRONMENT_INVALID")
+        manifest_path = Path(profile_switch_manifest_path).expanduser().resolve()
+        perpetual_seed_manifest = validated_profile_switch_manifest(
+            manifest_path,
+        )
+        project_root = Path(__file__).resolve().parents[2]
+        operation_root = manifest_path.parent
+        expected_continuity_path = operation_root / "risk-continuity.json"
+        if (
+            perpetual_seed_manifest.get("manifest_sha256")
+            != profile_switch_manifest_sha256
+            or perpetual_seed_manifest.get("operation_id")
+            != inherited_operation
+            or perpetual_seed_manifest.get("current_profile")
+            != "BEELZEBUB_FIVE_MINUTE_BIAS_V1"
+            or perpetual_seed_manifest.get("target_profile")
+            != selected_paper_profile.selection_key
+            or perpetual_seed_manifest.get("paper_policy_hash")
+            != selected_paper_policy.configuration_hash
+            or perpetual_seed_manifest.get("risk_profile_hash")
+            != selected_paper_risk.configuration_hash
+            or Path(str(perpetual_seed_manifest.get("ledger_path"))).resolve()
+            != paper_path
+            or perpetual_seed_manifest.get("ledger_epoch")
+            != configured_paper_epoch
+            or Path(str(perpetual_seed_manifest.get("audit_root"))).resolve()
+            != audit_root
+            or Path(str(perpetual_seed_manifest.get("runtime_root"))).resolve()
+            != resolved_profile_switch_runtime_root
+            or Path(str(perpetual_seed_manifest.get("project_root"))).resolve()
+            != project_root
+            or Path(str(perpetual_seed_manifest.get("python_executable"))).resolve()
+            != Path(sys.executable).resolve()
+            or perpetual_seed_manifest.get("git_sha") != runtime_git_sha
+            or Path(perpetual_seed_path).expanduser().resolve()
+            != Path(str(perpetual_seed_manifest.get(
+                "perpetual_startup_seed_path",
+            ))).resolve()
+            or Path(perpetual_seed_proof_path).expanduser().resolve()
+            != Path(str(perpetual_seed_manifest.get(
+                "perpetual_startup_seed_proof_path",
+            ))).resolve()
+            or Path(configured_risk_continuity).expanduser().resolve()
+            != expected_continuity_path.resolve()
+        ):
+            raise RuntimeError("PERPETUAL_STARTUP_SEED_TARGET_BINDING_MISMATCH")
+        perpetual_seed_artifact = read_perpetual_startup_seed_artifact(
+            Path(perpetual_seed_path).expanduser().resolve(),
+            operation_id=inherited_operation,
+            expected_at=datetime.now(timezone.utc).isoformat().replace(
+                "+00:00", "Z",
+            ),
+        )
+        perpetual_seed_proof = read_perpetual_startup_seed_proof(
+            Path(perpetual_seed_proof_path).expanduser().resolve(),
+            artifact=perpetual_seed_artifact,
+            operation_id=inherited_operation,
+            expected_at=datetime.now(timezone.utc).isoformat().replace(
+                "+00:00", "Z",
+            ),
+        )
+        if perpetual_seed_proof.get(
+            "manifest_sha256",
+        ) != profile_switch_manifest_sha256:
+            raise RuntimeError("PERPETUAL_STARTUP_SEED_MANIFEST_MISMATCH")
+        seed_source = perpetual_seed_artifact["core"]["source_ledger"]  # type: ignore[index]
+        continuity_snapshot = risk_continuity_artifact["snapshot"]
+        continuity_source = continuity_snapshot.get("source_ledger")  # type: ignore[union-attr]
+        if (
+            not isinstance(continuity_source, Mapping)
+            or seed_source.get("path") != continuity_source.get("path")
+            or seed_source.get("ledger_identity")
+            != continuity_source.get("ledger_identity")
+            or seed_source.get("ledger_epoch")
+            != continuity_source.get("ledger_epoch")
+            or seed_source.get("path")
+            != perpetual_seed_manifest.get("source_ledger_path")
+            or seed_source.get("ledger_identity")
+            != perpetual_seed_manifest.get("source_ledger_identity")
+            or seed_source.get("ledger_epoch")
+            != perpetual_seed_manifest.get("source_ledger_epoch")
+        ):
+            raise RuntimeError("PERPETUAL_STARTUP_SEED_SOURCE_BOUNDARY_MISMATCH")
+        if lane_iii_paper_factory is not None:
+            raise RuntimeError("PERPETUAL_STARTUP_SEED_CUSTOM_RUNTIME_FACTORY_UNSUPPORTED")
     ledger_verifier = LocalLedgerVerificationController(paper_path, audit_root)
     runtime_binding = {
         "ledger": str(paper_path),
@@ -1437,12 +1616,33 @@ def create_control_center_app(
         "control_center": "127.0.0.1:8090",
         "python": sys.executable,
         "pid": os.getpid(),
-        "git_sha": _runtime_git_sha(),
+        "git_sha": runtime_git_sha,
         "entry_profile": selected_paper_policy.entry_profile,
         "entry_profile_version": selected_paper_policy.entry_profile_version,
         "paper_policy_hash": selected_paper_policy.configuration_hash,
         "risk_profile_hash": selected_paper_risk.configuration_hash,
         "ledger_epoch": resolve_ledger_epoch(paper_path, configured_paper_epoch),
+        "risk_continuity_artifact_sha256": (
+            None if risk_continuity_artifact is None
+            else risk_continuity_artifact["artifact_sha256"]
+        ),
+        "profile_selection_source": profile_selection_source,
+        "perpetual_startup_seed_operation_id": (
+            None
+            if perpetual_seed_artifact is None
+            else perpetual_seed_artifact["core"]["operation_id"]  # type: ignore[index]
+        ),
+        "perpetual_startup_seed_artifact_sha256": (
+            None
+            if perpetual_seed_artifact is None
+            else perpetual_seed_artifact["artifact_sha256"]
+        ),
+        "perpetual_startup_seed_proof_sha256": (
+            None
+            if perpetual_seed_proof is None
+            else perpetual_seed_proof["proof_sha256"]
+        ),
+        "profile_switch_manifest_sha256": profile_switch_manifest_sha256,
     }
 
     def live_watcher_health() -> dict[str, Any] | None:
@@ -1847,7 +2047,7 @@ def create_control_center_app(
             ninjatrader_runtime["shadow"] = shadow
             app.state.lane_iii_shadow = shadow
             _assert_hot_paper_ledger_path(paper_path, config.storage.cold_root)
-            if paper_ledger_factory is None and not paper_path.exists and configured_paper_path and resolve_ledger_epoch(paper_path, configured_paper_epoch) == "UNSPECIFIED":
+            if paper_ledger_factory is None and not paper_path.exists() and configured_paper_path and resolve_ledger_epoch(paper_path, configured_paper_epoch) == "UNSPECIFIED":
                 raise RuntimeError(
                     "New production paper ledger requires BEELZEBUB_L3G_PAPER_LEDGER_EPOCH or an epoch-N directory."
                 )
@@ -1856,10 +2056,40 @@ def create_control_center_app(
             )
             if type(paper_ledger) is not PaperLedger:
                 raise RuntimeError("LANE_III_PAPER ledger factory must return the exact durable ledger")
-            paper_runtime = lane_iii_paper_factory(paper_ledger) if lane_iii_paper_factory is not None else LaneIIIPaperRuntime(paper_ledger)
+            runtime_binding["ledger_identity"] = paper_ledger.risk_continuity_boundary()["ledger_identity"]
+            assert profile_switch is not None
+            profile_switch.bind_current_runtime_binding(runtime_binding)
+            paper_runtime = lane_iii_paper_factory(paper_ledger) if lane_iii_paper_factory is not None else LaneIIIPaperRuntime(
+                paper_ledger,
+                risk_continuity=(
+                    None if risk_continuity_artifact is None
+                    else risk_continuity_artifact["snapshot"]  # type: ignore[arg-type]
+                ),
+            )
             if type(paper_runtime) is not LaneIIIPaperRuntime:
                 raise RuntimeError("LANE_III_PAPER factory must return the exact paper runtime")
             paper_runtime.bind_runtime_identity(runtime_binding)
+            if perpetual_seed_artifact is not None:
+                assert perpetual_seed_proof is not None
+                assert profile_switch_manifest_sha256 is not None
+                inherited_operation = os.getenv("BEELZEBUB_PROFILE_SWITCH_OPERATION")
+                assert inherited_operation is not None
+                imported_seed = paper_runtime.import_perpetual_startup_seed(
+                    perpetual_seed_artifact,
+                    perpetual_seed_proof,
+                    operation_id=inherited_operation,
+                    manifest_sha256=profile_switch_manifest_sha256,
+                    expected_at=datetime.now(timezone.utc).isoformat().replace(
+                        "+00:00", "Z",
+                    ),
+                )
+                if (
+                    imported_seed.get("artifact_sha256")
+                    != runtime_binding["perpetual_startup_seed_artifact_sha256"]
+                    or imported_seed.get("proof_sha256")
+                    != runtime_binding["perpetual_startup_seed_proof_sha256"]
+                ):
+                    raise RuntimeError("PERPETUAL_STARTUP_SEED_IMPORT_BINDING_MISMATCH")
             paper_transport = (
                 paper_execution_transport_factory(paper_ledger, paper_runtime.on_execution_message, paper_runtime.on_execution_bridge_state)
                 if paper_execution_transport_factory is not None
@@ -2140,10 +2370,6 @@ def create_control_center_app(
     app.state.ledger_verifier = ledger_verifier
     app.state.scheduler_engine = None
     app.state.scheduler_service = scheduler_service
-    resolved_profile_switch_runtime_root = profile_switch_runtime_root(
-        paper_path, os.getenv("BEELZEBUB_PROFILE_SWITCH_ROOT"),
-    )
-
     def flatten_current_profile() -> Mapping[str, object]:
         paper = ninjatrader_runtime.get("paper")
         if type(paper) is not LaneIIIPaperRuntime:
@@ -2156,16 +2382,28 @@ def create_control_center_app(
             raise RuntimeError("CONTROLLED_SERVER_SHUTDOWN_UNAVAILABLE")
         callback()
 
+    def export_perpetual_profile_startup_seed(
+        operation_id: str, artifact_path: Path,
+    ) -> Mapping[str, object]:
+        paper = ninjatrader_runtime.get("paper")
+        if type(paper) is not LaneIIIPaperRuntime:
+            raise RuntimeError("PAPER_RUNTIME_UNAVAILABLE")
+        return paper.export_perpetual_startup_seed(
+            operation_id, artifact_path,
+        )
+
     profile_switch = PaperProfileSwitchService(
         current_profile=selected_paper_profile,
         paper_status=lane_iii_paper_health,
         flatten_and_disarm=flatten_current_profile,
         verifier_status=ledger_verifier.status,
+        export_perpetual_startup_seed=export_perpetual_profile_startup_seed,
         request_shutdown=request_profile_switch_shutdown,
         runtime_root=resolved_profile_switch_runtime_root,
         project_root=Path(__file__).resolve().parents[2],
         python_executable=sys.executable,
         git_sha=str(runtime_binding["git_sha"]),
+        current_runtime_binding=runtime_binding,
     )
     app.state.paper_profile_switch = profile_switch
 

@@ -23,6 +23,7 @@ from .contracts import (
     BookCompleteness,
     EvidenceFamily,
     FiveMinutePaperPolicyArtifact,
+    FiveMinutePerpetualPaperPolicyArtifact,
     HighConfidencePaperPolicyArtifact,
     HypothesisKind,
     PaperDecision,
@@ -42,6 +43,7 @@ from .sessions import (
     PaperSessionKind,
     PaperSessionResolver,
     UNSPECIFIED_OFF_SESSION_CONTEXT,
+    perpetual_exchange_blocker,
 )
 
 
@@ -94,10 +96,17 @@ class ExperimentalPaperPolicy:
     def __init__(self, artifact: PaperPolicyArtifactType = POLICY) -> None:
         if type(artifact) not in {
             PaperPolicyArtifact, HighConfidencePaperPolicyArtifact, FiveMinutePaperPolicyArtifact,
+            FiveMinutePerpetualPaperPolicyArtifact,
         }:
             raise ValueError("Paper policy requires the exact immutable artifact type.")
         self.artifact = artifact
-        self._five_minute_profile = type(artifact) is FiveMinutePaperPolicyArtifact
+        self._five_minute_profile = type(artifact) in {
+            FiveMinutePaperPolicyArtifact, FiveMinutePerpetualPaperPolicyArtifact,
+        }
+        self._perpetual_position_profile = (
+            type(artifact) is FiveMinutePerpetualPaperPolicyArtifact
+            and artifact.perpetual_position
+        )
         self._policy_hash = artifact.configuration_hash
         self._lock = threading.RLock()
         self._market_session_id: str | None = None
@@ -118,6 +127,11 @@ class ExperimentalPaperPolicy:
         self._bid_depletions: dict[Decimal, int] = {}
         self._bid_replenishment_cycles: dict[Decimal, int] = {}
         self._evidence: dict[tuple[HypothesisKind, EvidenceFamily, str], PaperEvidence] = {}
+        # Retain bounded revisions so V2 can reconstruct the latest completed
+        # boundary from evidence that actually existed at that boundary.  The
+        # current-value map alone can be overwritten by a later callback.
+        self._evidence_history: deque[PaperEvidence] = deque(maxlen=4096)
+        self._market_observation_history: deque[NinjaTraderObservation] = deque(maxlen=4096)
         self._vwap_notional = Decimal("0")
         self._vwap_volume = 0
         self._vwap_session_date: str | None = None
@@ -175,6 +189,8 @@ class ExperimentalPaperPolicy:
         self._bid_depletions.clear()
         self._bid_replenishment_cycles.clear()
         self._evidence.clear()
+        self._evidence_history.clear()
+        self._market_observation_history.clear()
         self._vwap_notional = Decimal("0")
         self._vwap_volume = 0
         self._vwap_session_date = None
@@ -362,9 +378,6 @@ class ExperimentalPaperPolicy:
                 if time_fault is not None:
                     return self._decision(observation, PaperDecisionKind.NO_TRADE, None, time_fault)
 
-            if context.session_kind is PaperSessionKind.OFF_SESSION:
-                return self._decision(observation, PaperDecisionKind.NO_TRADE, None, "OFF_SESSION")
-
             if observation.observation_type == "CONNECTION" and observation.payload.get("scope") == "MARKET_DATA":
                 state = str(observation.payload.get("price_status", "UNKNOWN")).upper()
                 self._price_connected = state == "CONNECTED"
@@ -374,6 +387,18 @@ class ExperimentalPaperPolicy:
                 # A connection recovery creates a new provisional evidence domain.
                 self._clear_provisional()
                 return self._decision(observation, PaperDecisionKind.NO_TRADE, None, "MARKET_DATA_RECONNECTED")
+
+            if self._perpetual_position_profile:
+                exchange_blocker = perpetual_exchange_blocker(
+                    self._market_event_timestamp(observation), context,
+                )
+                if exchange_blocker is not None:
+                    self._clear_provisional()
+                    return self._decision(
+                        observation, PaperDecisionKind.NO_TRADE, None, exchange_blocker,
+                    )
+            elif context.session_kind is PaperSessionKind.OFF_SESSION:
+                return self._decision(observation, PaperDecisionKind.NO_TRADE, None, "OFF_SESSION")
 
             if observation.observation_type not in {"QUOTE", "TRADE", "DEPTH"}:
                 return self._decision(observation, PaperDecisionKind.NO_TRADE, None, "NON_MARKET_OBSERVATION")
@@ -402,6 +427,7 @@ class ExperimentalPaperPolicy:
                 reason = self._ingest_depth(observation)
             if reason is not None:
                 return self._decision(observation, PaperDecisionKind.NO_TRADE, None, reason)
+            self._market_observation_history.append(observation)
             # An admitted callback for the exact bound instrument is itself
             # truthful evidence that the price stream is delivering.  This is
             # needed after a local bridge restart because the NinjaTrader
@@ -427,7 +453,9 @@ class ExperimentalPaperPolicy:
     ) -> dict[str, object] | None:
         """Claim at most one exact UTC-aligned decision boundary per callback."""
         artifact = self.artifact
-        if type(artifact) is not FiveMinutePaperPolicyArtifact:
+        if type(artifact) not in {
+            FiveMinutePaperPolicyArtifact, FiveMinutePerpetualPaperPolicyArtifact,
+        }:
             return None
         observed = self._event_time(observation)
         interval = artifact.decision_interval_seconds
@@ -435,16 +463,31 @@ class ExperimentalPaperPolicy:
         current_boundary = datetime.fromtimestamp(
             epoch_seconds - (epoch_seconds % interval), tz=timezone.utc,
         )
+        startup_reconstruction = False
         if self._next_five_minute_boundary is None:
+            # Ordinary callbacks initialize the next exact boundary. V2's
+            # special startup reconstruction is invoked explicitly by the
+            # runtime only when operational ownership is starting (or waiting
+            # flat for the first complete warmed boundary).
             self._next_five_minute_boundary = current_boundary + timedelta(seconds=interval)
             return None
-        if observed < self._next_five_minute_boundary:
+        else:
+            if observed < self._next_five_minute_boundary:
+                return None
+            scheduled = current_boundary
+            missed = max(
+                0,
+                int((scheduled - self._next_five_minute_boundary).total_seconds()) // interval,
+            )
+        if (
+            self._perpetual_position_profile
+            and not self._perpetual_boundary_evidence_warmed(scheduled)
+        ):
+            # Do not consume a directional boundary from a partial source
+            # family set. A later callback may skip this boundary and claim a
+            # newer complete one, but the incomplete candle can never become
+            # durable entry/reversal authority.
             return None
-        scheduled = current_boundary
-        missed = max(
-            0,
-            int((scheduled - self._next_five_minute_boundary).total_seconds()) // interval,
-        )
         candle_open = scheduled - timedelta(seconds=interval)
         self._next_five_minute_boundary = scheduled + timedelta(seconds=interval)
         boundary = {
@@ -456,8 +499,100 @@ class ExperimentalPaperPolicy:
             "decision_interval_seconds": interval,
             "decision_clock": artifact.decision_clock,
         }
+        if self._perpetual_position_profile:
+            boundary["startup_reconstruction"] = startup_reconstruction
         self._last_five_minute_boundary = dict(boundary)
         return boundary
+
+    def evaluate_latest_completed_on_start(
+        self,
+        at: str,
+        *,
+        current_position: PaperDirection,
+        pending_order: bool,
+        prior_non_tied_available: bool,
+    ) -> PaperDecision | None:
+        """Evaluate V2's latest closed boundary from admitted pre-close facts.
+
+        No synthetic observation is created: both the fallback envelope and
+        every evidence source were previously admitted from NinjaTrader, and
+        post-boundary callbacks are excluded from the reconstructed score.
+        """
+        if not self._perpetual_position_profile:
+            return None
+        with self._lock:
+            decision_at = normalized_utc(at, "Perpetual startup decision time")
+            observed = self._time(decision_at)
+            if (
+                self._transport_state is not StreamHealth.HEALTHY
+                or not self._price_connected
+                or self._depth_recovering
+                or perpetual_exchange_blocker(decision_at, self._paper_session_context) is not None
+            ):
+                return None
+            artifact = self.artifact
+            assert isinstance(artifact, FiveMinutePerpetualPaperPolicyArtifact)
+            interval = artifact.decision_interval_seconds
+            epoch_seconds = int(observed.timestamp())
+            scheduled = datetime.fromtimestamp(
+                epoch_seconds - (epoch_seconds % interval), tz=timezone.utc,
+            )
+            scheduled_text = scheduled.isoformat().replace("+00:00", "Z")
+            if (
+                self._last_five_minute_boundary is not None
+                and self._last_five_minute_boundary.get("candle_close_utc") == scheduled_text
+            ):
+                return None
+            fallback = next(
+                (
+                    item for item in reversed(self._market_observation_history)
+                    if self._event_time(item) < scheduled
+                ),
+                None,
+            )
+            if fallback is None:
+                return None
+            # A reconstructed boundary is entry authority, not a best-effort
+            # display calculation.  Require an authentic pre-boundary source
+            # from every evidence family before claiming (and therefore
+            # consuming) this candle.  This lets a cold startup retry the same
+            # latest-completed boundary as its retained callback history warms
+            # instead of sealing a direction from an incomplete source set.
+            if not self._perpetual_boundary_evidence_warmed(scheduled):
+                return None
+            candle_open = scheduled - timedelta(seconds=interval)
+            boundary: dict[str, object] = {
+                "candle_open_utc": candle_open.isoformat().replace("+00:00", "Z"),
+                "candle_close_utc": scheduled_text,
+                "decision_observed_at": decision_at,
+                "decision_latency_ms": max(
+                    0, int((observed - scheduled).total_seconds() * 1000),
+                ),
+                "missed_boundary_count": 0,
+                "decision_interval_seconds": interval,
+                "decision_clock": artifact.decision_clock,
+                "startup_reconstruction": True,
+            }
+            self._next_five_minute_boundary = scheduled + timedelta(seconds=interval)
+            self._last_five_minute_boundary = dict(boundary)
+            decision = self._evaluate_five_minute_boundary(
+                fallback,
+                boundary,
+                current_position=current_position,
+                pending_order=pending_order,
+                decision_at=decision_at,
+                source_at=scheduled_text,
+                prior_non_tied_available=prior_non_tied_available,
+            )
+            if (
+                decision.family_summary.get("bias") == "TIE"
+                and current_position is PaperDirection.FLAT
+                and prior_non_tied_available
+            ):
+                # The prior durable direction remains startup authority; do
+                # not repeatedly recalculate this same tied boundary.
+                self._next_five_minute_boundary = scheduled + timedelta(seconds=interval)
+            return decision
 
     def _evaluate_five_minute_boundary(
         self,
@@ -466,48 +601,98 @@ class ExperimentalPaperPolicy:
         *,
         current_position: PaperDirection,
         pending_order: bool,
+        decision_at: str | None = None,
+        source_at: str | None = None,
+        prior_non_tied_available: bool = False,
     ) -> PaperDecision:
         """Choose enter, hold, or staged reversal once for the closed candle."""
-        at_text = normalized_utc(self._market_event_timestamp(observation), "Five-minute evaluation time")
+        at_text = normalized_utc(
+            (
+                source_at or str(boundary["candle_close_utc"])
+                if self._perpetual_position_profile
+                else self._market_event_timestamp(observation)
+            ),
+            "Five-minute score time",
+        )
         common: dict[str, object] = {
             **boundary,
             "decision_protocol": "EXIT_RECONCILE_THEN_ENTER",
             "prior_position": current_position.value,
+            "signal_basis": "LATEST_AVAILABLE_PRE_CALLBACK_PROVISIONAL_EVIDENCE",
+            "completed_interval_aggregate": False,
         }
-        if self._trades:
-            reference = self._trades[-1]
+        scheduled = self._time(str(boundary["candle_close_utc"]))
+        reference = (
+            next(
+                (
+                    item for item in reversed(self._trades)
+                    if self._time(item.observed_at) < scheduled
+                ),
+                None,
+            )
+            if self._perpetual_position_profile
+            else (self._trades[-1] if self._trades else None)
+        )
+        if reference is not None:
             common.update({
                 "decision_reference_price": str(reference.price),
                 "decision_reference_kind": "LAST_TRADE_BEFORE_BOUNDARY",
                 "decision_reference_observation_id": reference.observation_id,
+                "decision_reference_observed_at": reference.observed_at,
+                "decision_reference_before_scheduled_boundary": (
+                    self._time(reference.observed_at) < self._time(str(boundary["candle_close_utc"]))
+                ),
             })
         elif self._quote_order:
-            reference_quote = self._quotes.get(self._quote_order[-1])
+            reference_quote = (
+                next(
+                    (
+                        self._quotes.get(identifier)
+                        for identifier in reversed(self._quote_order)
+                        if self._quotes.get(identifier) is not None
+                        and self._time(self._quotes[identifier].observed_at) < scheduled
+                    ),
+                    None,
+                )
+                if self._perpetual_position_profile
+                else self._quotes.get(self._quote_order[-1])
+            )
             if reference_quote is not None:
                 common.update({
                     "decision_reference_price": str((reference_quote.bid + reference_quote.ask) / Decimal("2")),
                     "decision_reference_kind": "QUOTE_MID_BEFORE_BOUNDARY",
                     "decision_reference_observation_id": reference_quote.observation_id,
+                    "decision_reference_observed_at": reference_quote.observed_at,
+                    "decision_reference_before_scheduled_boundary": (
+                        self._time(reference_quote.observed_at) < self._time(str(boundary["candle_close_utc"]))
+                    ),
                 })
-        if self._paper_session_context.session_kind not in self.artifact.entry_session_kinds:
+        if (
+            not self._perpetual_position_profile
+            and self._paper_session_context.session_kind not in self.artifact.entry_session_kinds
+        ):
             return self._decision(
                 observation, PaperDecisionKind.NO_TRADE, None, "PROFILE_SESSION_MISMATCH",
                 family_summary={**common, "action": "BLOCKED", "target_position": current_position.value},
+                created_at=decision_at, source_at=at_text,
             )
         if self._transport_state is not StreamHealth.HEALTHY:
             return self._decision(
                 observation, PaperDecisionKind.NO_TRADE, None, "LOCAL_BRIDGE_UNHEALTHY",
                 family_summary={**common, "action": "BLOCKED", "target_position": current_position.value},
+                created_at=decision_at, source_at=at_text,
             )
         if not self._price_connected:
             return self._decision(
                 observation, PaperDecisionKind.NO_TRADE, None, "MARKET_PRICE_STATE_NOT_CONNECTED",
                 family_summary={**common, "action": "BLOCKED", "target_position": current_position.value},
+                created_at=decision_at, source_at=at_text,
             )
         if self._depth_recovering:
             return self._decision(
                 observation, PaperDecisionKind.NO_TRADE, None, "DEPTH_RESET_RECOVERY",
                 family_summary={**common, "action": "BLOCKED", "target_position": current_position.value},
+                created_at=decision_at, source_at=at_text,
             )
 
         bull_score, bull_families = self.score(at_text, HypothesisKind.BULLISH_REVERSAL)
@@ -519,10 +704,11 @@ class ExperimentalPaperPolicy:
             "bullish_families": bull_families,
             "bearish_families": bear_families,
         })
-        if pending_order:
+        if pending_order and not self._perpetual_position_profile:
             return self._decision(
                 observation, PaperDecisionKind.NO_TRADE, None, "FIVE_MINUTE_PENDING_ORDER",
                 family_summary={**common, "action": "BLOCKED", "target_position": current_position.value},
+                created_at=decision_at, source_at=at_text,
             )
 
         if bull_score == bear_score:
@@ -538,6 +724,7 @@ class ExperimentalPaperPolicy:
                 "FIVE_MINUTE_BIAS_TIE_HOLD" if target is not PaperDirection.FLAT else "FIVE_MINUTE_BIAS_TIE_FLAT",
                 score=bull_score,
                 family_summary={**common, "action": action, "target_position": target.value, "bias": "TIE"},
+                created_at=decision_at, source_at=at_text,
             )
 
         winner = (
@@ -550,21 +737,34 @@ class ExperimentalPaperPolicy:
         )
         score = bull_score if target is PaperDirection.LONG else bear_score
         bias = "LONG" if target is PaperDirection.LONG else "SHORT"
+        if pending_order:
+            return self._decision(
+                observation, PaperDecisionKind.NO_TRADE, winner,
+                f"FIVE_MINUTE_PENDING_ORDER_{bias}", score=score,
+                family_summary={
+                    **common, "action": "PENDING", "target_position": target.value,
+                    "bias": bias,
+                },
+                created_at=decision_at, source_at=at_text,
+            )
         if current_position is target:
             return self._decision(
                 observation, PaperDecisionKind.NO_TRADE, winner, f"FIVE_MINUTE_HOLD_{bias}",
                 score=score,
                 family_summary={**common, "action": "HOLD", "target_position": target.value, "bias": bias},
+                created_at=decision_at, source_at=at_text,
             )
         if current_position is PaperDirection.FLAT:
             kind = PaperDecisionKind.LONG if target is PaperDirection.LONG else PaperDecisionKind.SHORT
             return self._decision(
                 observation, kind, winner, f"FIVE_MINUTE_ENTER_{bias}", score=score,
                 family_summary={**common, "action": "ENTER", "target_position": target.value, "bias": bias},
+                created_at=decision_at, source_at=at_text,
             )
         return self._decision(
             observation, PaperDecisionKind.EXIT, winner, f"FIVE_MINUTE_REVERSE_TO_{bias}", score=score,
             family_summary={**common, "action": "REVERSE", "target_position": target.value, "bias": bias},
+            created_at=decision_at, source_at=at_text,
         )
 
     def _ingest_quote(self, observation: NinjaTraderObservation) -> str | None:
@@ -701,6 +901,7 @@ class ExperimentalPaperPolicy:
             source_session_ids=source_sessions,
         )
         self._evidence[(hypothesis, family, label)] = evidence
+        self._evidence_history.append(evidence)
         # A structural range claim is mutually exclusive for the two admitted
         # v0 hypotheses at the same instant. Preserve it as one contradiction
         # in the competing family; do not manufacture extra family votes.
@@ -719,6 +920,7 @@ class ExperimentalPaperPolicy:
                 source_session_ids=source_sessions,
             )
             self._evidence[(competitor, family, "CONTRADICTS_" + label)] = contrary
+            self._evidence_history.append(contrary)
 
     def _derive_structural(self, current: ClassifiedTrade) -> None:
         window = tuple(self._trades)[-self.artifact.structural_window:]
@@ -824,14 +1026,42 @@ class ExperimentalPaperPolicy:
                 self._put_evidence(HypothesisKind.BULLISH_REVERSAL, EvidenceFamily.RESTING_LIQUIDITY, "BID_REPLENISHMENT", self.artifact.structural_strength, True, mutation.observed_at, self.artifact.liquidity_evidence_lifetime_seconds, sources)
         return None
 
+    def _perpetual_boundary_evidence_warmed(self, at: datetime) -> bool:
+        if not self._perpetual_position_profile:
+            return True
+        active_families = {
+            evidence.family
+            for hypothesis in (
+                HypothesisKind.BULLISH_REVERSAL,
+                HypothesisKind.BEARISH_CONTINUATION,
+            )
+            for evidence in self._active_evidence(at, hypothesis)
+        }
+        return {
+            EvidenceFamily.STRUCTURAL_CONTEXT,
+            EvidenceFamily.ORDER_FLOW,
+            EvidenceFamily.RESTING_LIQUIDITY,
+        }.issubset(active_families)
+
     def _active_evidence(self, at: datetime, hypothesis: HypothesisKind) -> tuple[PaperEvidence, ...]:
-        active = tuple(
-            value for value in self._evidence.values()
-            if value.hypothesis_kind is hypothesis and self._time(value.expires_at) >= at
-            and value.session_id == self._paper_session_context.session_id
-            and value.session_generation == self._paper_session_context.session_generation
-        )
-        return active
+        if not self._perpetual_position_profile:
+            return tuple(
+                value for value in self._evidence.values()
+                if value.hypothesis_kind is hypothesis
+                and self._time(value.expires_at) >= at
+                and value.session_id == self._paper_session_context.session_id
+                and value.session_generation == self._paper_session_context.session_generation
+            )
+        latest: dict[tuple[EvidenceFamily, str], PaperEvidence] = {}
+        for value in self._evidence_history:
+            if (
+                value.hypothesis_kind is hypothesis
+                and self._time(value.observed_at) <= at <= self._time(value.expires_at)
+                and value.session_id == self._paper_session_context.session_id
+                and value.session_generation == self._paper_session_context.session_generation
+            ):
+                latest[(value.family, value.label)] = value
+        return tuple(latest.values())
 
     def score(self, at: str, hypothesis: HypothesisKind) -> tuple[Decimal, dict[str, object]]:
         moment = self._time(at, "Paper score time")
@@ -862,10 +1092,41 @@ class ExperimentalPaperPolicy:
         """Expose immutable current paper evidence for durable audit only."""
         moment = self._time(at, "Paper evidence audit time")
         with self._lock:
-            return tuple(sorted(
-                (value for value in self._evidence.values() if self._time(value.expires_at) >= moment),
-                key=lambda value: value.evidence_id,
-            ))
+            combined = {
+                value.evidence_id: value
+                for hypothesis in (
+                    HypothesisKind.BULLISH_REVERSAL,
+                    HypothesisKind.BEARISH_CONTINUATION,
+                )
+                for value in self._active_evidence(moment, hypothesis)
+            }
+            return tuple(sorted(combined.values(), key=lambda value: value.evidence_id))
+
+    def startup_seed_provenance_observation_ids(self) -> tuple[str, ...]:
+        """Return the bounded raw roots which can still affect a V2 boundary.
+
+        The passive V1-to-V2 evaluator uses this only to prune its detached
+        raw-wire cache.  It exposes no decision or execution authority.  Every
+        retained collection below is already bounded by the policy itself;
+        unlike a callback counter, this set cannot reset the evaluator merely
+        because a liquid market delivered many irrelevant updates.
+        """
+        if not self._perpetual_position_profile:
+            return ()
+        with self._lock:
+            identifiers = set(self._quote_order)
+            identifiers.update(item.observation_id for item in self._trades)
+            identifiers.update(item.observation_id for item in self._classified)
+            identifiers.update(item.observation_id for item in self._depth)
+            for history in self._depth_by_price.values():
+                identifiers.update(item.observation_id for item in history)
+            for evidence in self._evidence.values():
+                identifiers.update(evidence.source_observation_ids)
+            if self._market_observation_history:
+                # The final pre-boundary callback is the deterministic
+                # fallback/reference used by the next scheduled evaluation.
+                identifiers.add(self._market_observation_history[-1].observation_id)
+            return tuple(sorted(identifiers))
 
     def classified_trade_count(self) -> int:
         """Return the one hot-path counter needed by runtime freshness state."""
@@ -923,10 +1184,16 @@ class ExperimentalPaperPolicy:
         *,
         score: Decimal = Decimal("0.5"),
         family_summary: Mapping[str, object] | None = None,
+        created_at: str | None = None,
+        source_at: str | None = None,
     ) -> PaperDecision:
-        created = normalized_utc(self._market_event_timestamp(observation), "Paper decision time")
-        at = self._time(created)
-        source_ids, sequences, hashes = self._decision_sources(hypothesis, at, observation)
+        created = normalized_utc(
+            created_at or self._market_event_timestamp(observation), "Paper decision time",
+        )
+        source_time = self._time(source_at or created)
+        source_ids, sequences, hashes = self._decision_sources(
+            hypothesis, source_time, observation,
+        )
         direction = PaperDirection.LONG if kind is PaperDecisionKind.LONG else PaperDirection.SHORT if kind is PaperDecisionKind.SHORT else PaperDirection.FLAT
         payload = {
             "policy_id": self.artifact.policy_id,

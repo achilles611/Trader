@@ -180,6 +180,27 @@ class LocalLedgerVerificationTests(unittest.TestCase):
             self.assertEqual(report["status"], "FAIL")
             self.assertEqual(report["errors"][0]["code"], "LEDGER_REPLACED")
 
+    def test_full_verification_cannot_overwrite_a_checkpoint_ahead_of_the_ledger(self) -> None:
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            path = self.make_ledger(root, rows=3)
+            self.assertEqual(self.full(path, root)["status"], "PASS")
+            checkpoint_path = VerificationPaths(root / "runtime" / "audit").checkpoint
+            checkpoint_before = checkpoint_path.read_text(encoding="utf-8")
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute("DELETE FROM lane_iii_paper_audit WHERE ledger_sequence=3")
+                connection.commit()
+            finally:
+                connection.close()
+
+            report = run_local_verification(
+                path, root / "runtime" / "audit", requested_mode="full",
+            )
+            self.assertEqual(report["status"], "FAIL")
+            self.assertEqual(report["errors"][0]["code"], "CHECKPOINT_BEYOND_TIP")
+            self.assertEqual(checkpoint_path.read_text(encoding="utf-8"), checkpoint_before)
+
     def test_corrupted_chain_failure_and_cancelled_run_never_advance_checkpoint(self) -> None:
         with TemporaryDirectory() as folder:
             root = Path(folder); path = self.make_ledger(root, rows=3)

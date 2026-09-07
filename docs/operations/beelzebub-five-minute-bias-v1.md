@@ -13,6 +13,7 @@
 - An opposing bias records `REVERSE`, exits, waits for a signed flat/no-owned-orders reconciliation, then creates a new opposite-side entry decision. Same-event reversal remains forbidden.
 - A tied bias holds an existing position. A tied bias while flat records `FIVE_MINUTE_BIAS_TIE_FLAT` and sends no order rather than inventing a direction.
 - Every boundary decision includes both bias scores, both evidence-family summaries, the exact evidence provenance, prior/target position, and the last pre-boundary trade or quote-mid reference mark.
+- The evidence is explicitly labeled `LATEST_AVAILABLE_PRE_CALLBACK_PROVISIONAL_EVIDENCE`, not a completed interval aggregate. The callback that triggers the boundary is excluded from that decision. A delayed callback therefore uses the latest already-recorded evidence before the callback and reports its latency; it does not retrospectively manufacture a completed candle.
 
 The profile remains subordinate to all existing safety gates: exact `Sim101 / LOCAL_SIMULATION / MNQ SEP26`, quantity 1, authenticated execution bridge, fresh observations, complete reconciliation, one owned position, protective stop, daily loss, configured entry window, session close, and hard-flat deadline. Its dedicated risk artifact allows up to 128 session entries and uses an 86,400-second age ceiling, so neither the scalper's 12-entry cap nor its 540-second age limit interrupts an otherwise valid in-session five-minute hold. A safety gate may still flatten or leave the experiment flat until the next valid boundary. Live capital remains denied.
 
@@ -28,7 +29,7 @@ The normal operator path is Slim Mode's profile selector. **Switch & Start** aut
   -LedgerEpoch L3G-PAPER-EPOCH-FIVE-MINUTE-BIAS-V1-20260904
 ```
 
-The PowerShell command remains a maintenance-only fallback. An unknown profile name fails startup. V2 remains the default when the setting is absent.
+The PowerShell command remains a maintenance-only fallback. An unknown profile name fails startup. With no explicit setting, ordinary startup restores the last backend-proven established run, including its exact profile, ledger, audit root, epoch, and checkout binding. V2 is only the initial default when no established selection exists.
 
 ## End-of-session analysis
 
