@@ -91,7 +91,11 @@ class BeezConsoleTests(unittest.TestCase):
         process = Mock()
         process.pid = 1234
         process.poll.return_value = 1
-        binding = Mock(expected_pid=None)
+        binding = Mock(
+            expected_pid=None,
+            expected_parent_pid=None,
+            expected_launcher_pid=None,
+        )
         with (
             patch("beez_console.fetch_runtime_binding", return_value=None),
             patch("beez_console.fetch_paper_status", return_value=None),

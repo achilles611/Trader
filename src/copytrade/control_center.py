@@ -1616,6 +1616,7 @@ def create_control_center_app(
         "control_center": "127.0.0.1:8090",
         "python": sys.executable,
         "pid": os.getpid(),
+        "parent_pid": os.getppid(),
         "git_sha": runtime_git_sha,
         "entry_profile": selected_paper_policy.entry_profile,
         "entry_profile_version": selected_paper_policy.entry_profile_version,
@@ -2125,9 +2126,10 @@ def create_control_center_app(
             app.state.lane_iii_paper = paper_runtime
             app.state.runtime_binding = runtime_binding
             NINJATRADER_RUNTIME_LOGGER.info(
-                "BEELZEBUB_RUNTIME_BINDING ledger=%s audit=%s control_center=%s python=%s pid=%s git_sha=%s",
+                "BEELZEBUB_RUNTIME_BINDING ledger=%s audit=%s control_center=%s python=%s pid=%s parent_pid=%s git_sha=%s",
                 runtime_binding["ledger"], runtime_binding["audit"], runtime_binding["control_center"],
-                runtime_binding["python"], runtime_binding["pid"], runtime_binding["git_sha"],
+                runtime_binding["python"], runtime_binding["pid"], runtime_binding["parent_pid"],
+                runtime_binding["git_sha"],
             )
             app.state.lane_iii_paper_transport = paper_transport
             listener = (

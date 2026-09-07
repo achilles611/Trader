@@ -1126,6 +1126,17 @@ def _target_binding_matches(
     seed_artifact: Mapping[str, object] | None = None,
     seed_proof: Mapping[str, object] | None = None,
 ) -> bool:
+    runtime_pid = binding.get("pid")
+    runtime_parent_pid = binding.get("parent_pid")
+    process_tree_matches = (
+        type(target_pid) is int
+        and target_pid > 0
+        and type(runtime_pid) is int
+        and runtime_pid > 0
+        and type(runtime_parent_pid) is int
+        and runtime_parent_pid > 0
+        and (runtime_pid == target_pid or runtime_parent_pid == target_pid)
+    )
     seed_matches = (
         manifest.get("perpetual_startup_seed_required") is not True
         or (
@@ -1141,10 +1152,8 @@ def _target_binding_matches(
             == manifest.get("manifest_sha256")
         )
     )
-    return seed_matches and (
-        type(binding.get("pid")) is int
-        and binding.get("pid") == target_pid
-        and binding.get("ledger") == str(manifest["ledger_path"])
+    return seed_matches and process_tree_matches and (
+        binding.get("ledger") == str(manifest["ledger_path"])
         and binding.get("audit") == str(manifest["audit_root"])
         and binding.get("git_sha") == manifest.get("git_sha")
         and binding.get("entry_profile_version") == manifest.get("target_profile")
@@ -1340,8 +1349,9 @@ def _cleanup_spawned_target(
     port_probe: Callable[[], bool],
     wait: Callable[[float], object],
     monotonic: Callable[[], float],
+    target_runtime_pid: int | None = None,
 ) -> dict[str, object]:
-    """Stop one spawned target and prove both process and listener release."""
+    """Stop one spawned target and prove its launcher, runtime, and port released."""
     if timeout_seconds <= 0 or poll_seconds <= 0:
         raise ValueError("Target cleanup timeouts must be positive.")
     deadline = monotonic() + timeout_seconds
@@ -1384,6 +1394,10 @@ def _cleanup_spawned_target(
 
     handle_is_exited = False
     pid_absent = False
+    # A Windows py.exe launcher can exit while its not-yet-bound Python child
+    # keeps starting.  Without the published runtime PID, a dead launcher and a
+    # momentarily free port do not prove that the target process tree is gone.
+    runtime_pid_absent = False
     port_released = False
     while True:
         handle_is_exited = handle_exited()
@@ -1392,24 +1406,32 @@ def _cleanup_spawned_target(
         except Exception as error:  # noqa: BLE001 - failed proof must remain unproven
             errors.append(type(error).__name__)
             pid_absent = False
+        if target_runtime_pid is not None:
+            try:
+                runtime_pid_absent = not pid_probe(target_runtime_pid)
+            except Exception as error:  # noqa: BLE001 - failed proof must remain unproven
+                errors.append(type(error).__name__)
+                runtime_pid_absent = False
         try:
             port_released = port_probe()
         except Exception as error:  # noqa: BLE001 - failed proof must remain unproven
             errors.append(type(error).__name__)
             port_released = False
-        if handle_is_exited and pid_absent and port_released:
+        if handle_is_exited and pid_absent and runtime_pid_absent and port_released:
             break
         remaining = deadline - monotonic()
         if remaining <= 0:
             break
         wait(min(poll_seconds, max(0.001, remaining)))
-    process_dead = handle_is_exited and pid_absent
+    process_dead = handle_is_exited and pid_absent and runtime_pid_absent
     return {
         "target_pid": process.pid,
         "terminate_attempted": terminate_attempted,
         "kill_attempted": kill_attempted,
         "process_handle_exited": handle_is_exited,
         "target_pid_absent": pid_absent,
+        "target_runtime_pid": target_runtime_pid,
+        "target_runtime_pid_absent": runtime_pid_absent,
         "process_dead": process_dead,
         "control_port_released": port_released,
         "cleanup_proven": process_dead and port_released,
@@ -1935,6 +1957,11 @@ def supervise(
             port_probe=port_probe,
             wait=wait,
             monotonic=monotonic,
+            target_runtime_pid=(
+                int(binding["pid"])
+                if binding is not None and type(binding.get("pid")) is int
+                else None
+            ),
         )
         values = list(dict.fromkeys(blockers))
         if cleanup.get("process_dead") is not True:
@@ -1958,6 +1985,8 @@ def supervise(
         }
         if binding is not None:
             updates["target_runtime_binding"] = dict(binding)
+            if type(binding.get("pid")) is int:
+                updates["target_runtime_pid"] = binding["pid"]
         if auto is not None:
             updates["target_autostart"] = dict(auto)
         if paper is not None:
@@ -2003,7 +2032,14 @@ def supervise(
             safe_state_allowed=True,
         )
     pinned_target_binding = dict(binding)
-    _state_update(state_path, "TARGET_AUTOSTARTING", stage="AUTOSTARTING_TARGET")
+    _state_update(
+        state_path,
+        "TARGET_AUTOSTARTING",
+        stage="AUTOSTARTING_TARGET",
+        target_pid=process.pid,
+        target_runtime_pid=binding["pid"],
+        target_runtime_binding=binding,
+    )
     deadline = monotonic() + timeout_seconds
     post_attempted = False
     last_auto: dict[str, object] = {}
@@ -2048,6 +2084,7 @@ def supervise(
             stage=stage,
             blockers=blockers,
             target_pid=process.pid,
+            target_runtime_pid=binding.get("pid"),
             target_runtime_binding=binding,
             target_autostart=last_auto,
             target_paper_status=last_paper,
@@ -2217,6 +2254,7 @@ def supervise(
                     stage="RUNNING_SELECTION_PERSISTENCE_FAILED",
                     blockers=blockers,
                     target_runtime_binding=binding,
+                    target_runtime_pid=binding.get("pid"),
                     target_autostart=last_auto,
                     target_paper_status=last_paper,
                 )
@@ -2249,6 +2287,8 @@ def supervise(
                 stage="RUNNING",
                 blockers=[],
                 target_runtime_binding=binding,
+                target_pid=process.pid,
+                target_runtime_pid=binding.get("pid"),
                 target_autostart=last_auto,
                 target_paper_status=last_paper,
             )

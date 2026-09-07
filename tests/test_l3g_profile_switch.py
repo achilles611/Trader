@@ -1003,7 +1003,8 @@ class ProfileSwitchServiceTests(unittest.TestCase):
 
         continuity = read_risk_continuity_artifact(manifest_path.with_name("risk-continuity.json"))
         binding = {
-            "pid": StubProcess.pid,
+            "pid": StubProcess.pid + 1,
+            "parent_pid": StubProcess.pid,
             "ledger": manifest["ledger_path"], "audit": manifest["audit_root"],
             "git_sha": manifest["git_sha"], "entry_profile_version": manifest["target_profile"],
             "paper_policy_hash": manifest["paper_policy_hash"],
@@ -1039,6 +1040,9 @@ class ProfileSwitchServiceTests(unittest.TestCase):
                         state["stage"],
                         {"AUTOSTARTING_TARGET", "TARGET_ACTIVE_FLAT_BLOCKED"},
                     )
+                    self.assertEqual(state["target_pid"], StubProcess.pid)
+                    self.assertEqual(state["target_runtime_pid"], binding["pid"])
+                    self.assertEqual(state["target_runtime_binding"], binding)
                 return dict(binding)
             if method == "POST":
                 return {"accepted": True}
@@ -1047,11 +1051,20 @@ class ProfileSwitchServiceTests(unittest.TestCase):
             state = json.loads(manifest_path.with_name("state.json").read_text(encoding="utf-8"))
             return {"stage": "RUNNING" if state["stage"] == "AUTOSTARTING_TARGET" else "READY", "action_token": "stub-token"}
 
-        return supervise(
+        result = supervise(
             manifest_path, 2_147_483_647, timeout_seconds=1, poll_seconds=0.001,
             pid_probe=lambda _: False, port_probe=lambda: True, wait=lambda _: None,
             http_json=http, launch_child=launch,
         )
+        if result == 0:
+            state = json.loads(
+                manifest_path.with_name("state.json").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(state["stage"], "RUNNING")
+            self.assertEqual(state["target_pid"], StubProcess.pid)
+            self.assertEqual(state["target_runtime_pid"], binding["pid"])
+            self.assertEqual(state["target_runtime_binding"], binding)
+        return result
 
     def target_launch_fixture(
         self,
@@ -1063,7 +1076,8 @@ class ProfileSwitchServiceTests(unittest.TestCase):
             manifest_path.with_name("risk-continuity.json"),
         )
         binding: dict[str, object] = {
-            "pid": getattr(process, "pid"),
+            "pid": int(getattr(process, "pid")) + 1,
+            "parent_pid": getattr(process, "pid"),
             "ledger": manifest["ledger_path"],
             "audit": manifest["audit_root"],
             "git_sha": manifest["git_sha"],
@@ -1602,12 +1616,12 @@ class ProfileSwitchServiceTests(unittest.TestCase):
             wait=lambda _: None,
             launch_child=lambda command, **_: launches.append(command) or FailedStubProcess(),  # type: ignore[arg-type]
         )
-        self.assertEqual(result, 5)
+        self.assertEqual(result, 12)
         self.assertEqual(len(launches), 1)
-        self.assertEqual(
-            json.loads(manifest_path.with_name("state.json").read_text(encoding="utf-8"))["blockers"],
-            ["TARGET_PROCESS_EXITED_DURING_STARTUP"],
-        )
+        state = json.loads(manifest_path.with_name("state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["stage"], "TARGET_CLEANUP_UNPROVEN")
+        self.assertIn("TARGET_PROCESS_EXITED_DURING_STARTUP", state["blockers"])
+        self.assertFalse(state["target_cleanup"]["target_runtime_pid_absent"])
 
     def test_occupied_control_port_blocks_before_target_creation(self) -> None:
         manifest_path, _ = self.supervisor_ready_manifest("switch-request-occupied-port")
@@ -1695,6 +1709,8 @@ class ProfileSwitchServiceTests(unittest.TestCase):
             remembered["ledger_identity"],
         )
         self.assertEqual(binding["profile_selection_source"], "REMEMBERED_ESTABLISHED_RUN")
+        self.assertEqual(binding["pid"], os.getpid())
+        self.assertEqual(binding["parent_pid"], os.getppid())
         app.state.paper_autostart.stop()
 
     def test_atomic_launch_claim_refuses_concurrent_duplicate_supervisor(self) -> None:
@@ -1726,16 +1742,19 @@ class ProfileSwitchServiceTests(unittest.TestCase):
             pid_probe=lambda _: False, port_probe=lambda: True, wait=lambda _: None,
             launch_child=lambda *_, **__: FailedProcess(),  # type: ignore[arg-type]
             notify_operator=notices.append,
-        ), 5)
+        ), 12)
         state = json.loads(manifest_path.with_name("state.json").read_text(encoding="utf-8"))
-        self.assertEqual(state["stage"], "BLOCKED_SAFE")
+        self.assertEqual(state["stage"], "TARGET_CLEANUP_UNPROVEN")
         self.assertEqual(state["target_pid"], 31337)
-        self.assertEqual(state["blockers"], ["TARGET_PROCESS_EXITED_DURING_STARTUP"])
+        self.assertIn("TARGET_PROCESS_EXITED_DURING_STARTUP", state["blockers"])
+        self.assertIn("TARGET_PROCESS_EXIT_UNPROVEN", state["blockers"])
+        self.assertIsNone(state["target_cleanup"]["target_runtime_pid"])
+        self.assertFalse(state["target_cleanup"]["target_runtime_pid_absent"])
         self.assertEqual(len(notices), 1)
         self.assertIn("BEELZEBUB_FIVE_MINUTE_BIAS_V1", notices[0])
         self.assertIn("No automatic retry or fallback profile was started", notices[0])
 
-    def test_binding_timeout_terminates_and_proves_target_cleanup_before_safe(self) -> None:
+    def test_binding_timeout_cannot_prove_unknown_runtime_child_cleanup(self) -> None:
         manifest_path, manifest = self.supervisor_ready_manifest(
             "switch-request-binding-timeout-cleanup",
         )
@@ -1781,16 +1800,17 @@ class ProfileSwitchServiceTests(unittest.TestCase):
                 "entry_profile_version": "BEELZEBUB_SCALPER_V2",
             },
         )
-        self.assertEqual(result, 6)
+        self.assertEqual(result, 12)
         self.assertEqual(process.terminate_calls, 1)
         self.assertEqual(process.kill_calls, 0)
         state = json.loads(
             manifest_path.with_name("state.json").read_text(encoding="utf-8"),
         )
-        self.assertEqual(state["stage"], "BLOCKED_SAFE")
-        self.assertTrue(state["target_cleanup"]["safe_terminal_proven"])
+        self.assertEqual(state["stage"], "TARGET_CLEANUP_UNPROVEN")
+        self.assertFalse(state["target_cleanup"]["safe_terminal_proven"])
+        self.assertFalse(state["target_cleanup"]["target_runtime_pid_absent"])
 
-    def test_binding_timeout_kills_after_bounded_terminate_wait(self) -> None:
+    def test_binding_timeout_kills_launcher_but_unknown_child_remains_unproven(self) -> None:
         manifest_path, manifest = self.supervisor_ready_manifest(
             "switch-request-binding-kill-fallback",
         )
@@ -1833,14 +1853,15 @@ class ProfileSwitchServiceTests(unittest.TestCase):
             launch_child=launch,  # type: ignore[arg-type]
             http_json=lambda *_args, **_kwargs: {},
         )
-        self.assertEqual(result, 6)
+        self.assertEqual(result, 12)
         self.assertEqual(process.terminate_calls, 1)
         self.assertEqual(process.kill_calls, 1)
         state = json.loads(
             manifest_path.with_name("state.json").read_text(encoding="utf-8"),
         )
         self.assertTrue(state["target_cleanup"]["kill_attempted"])
-        self.assertEqual(state["stage"], "BLOCKED_SAFE")
+        self.assertEqual(state["stage"], "TARGET_CLEANUP_UNPROVEN")
+        self.assertFalse(state["target_cleanup"]["target_runtime_pid_absent"])
 
     def test_exited_wrapper_with_occupied_target_port_is_not_safe(self) -> None:
         manifest_path, manifest = self.supervisor_ready_manifest(
@@ -2572,6 +2593,71 @@ class ProfileSwitchServiceTests(unittest.TestCase):
         self.assertEqual(state["stage"], "BLOCKED_SAFE")
         self.assertTrue(state["target_cleanup"]["native_exposure_absent"])
 
+    def test_cleanup_is_unproven_while_bound_runtime_child_pid_survives(self) -> None:
+        manifest_path, manifest = self.supervisor_ready_manifest(
+            "switch-request-runtime-child-survives",
+        )
+
+        class Process:
+            pid = 31360
+
+            def __init__(self) -> None:
+                self.returncode: int | None = None
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def terminate(self) -> None:
+                self.returncode = 0
+
+            def wait(self, *, timeout: float) -> int:
+                del timeout
+                assert self.returncode is not None
+                return self.returncode
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+        process = Process()
+        binding, launch = self.target_launch_fixture(
+            manifest_path, manifest, process,
+        )
+
+        def http(url: str, *, method: str = "GET", **_kwargs: object) -> dict[str, object]:
+            if url.endswith("/api/runtime-binding"):
+                return dict(binding)
+            if method == "POST":
+                return {"accepted": True}
+            if url.endswith("/api/lane-iii/paper"):
+                return target_paper_status(str(manifest["target_profile"]), operational=False)
+            return {
+                "stage": "BLOCKED",
+                "in_progress": False,
+                "action_token": "target-token",
+                "blockers": ["NINJATRADER_CONNECTION_UNAVAILABLE"],
+            }
+
+        result = supervise(
+            manifest_path,
+            2_147_483_647,
+            timeout_seconds=0.2,
+            poll_seconds=0.001,
+            pid_probe=lambda pid: pid == binding["pid"],
+            port_probe=lambda: True,
+            wait=lambda _seconds: None,
+            launch_child=launch,  # type: ignore[arg-type]
+            http_json=http,
+            target_cleanup_timeout_seconds=0.01,
+        )
+        self.assertEqual(result, 12)
+        state = json.loads(
+            manifest_path.with_name("state.json").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(state["stage"], "TARGET_CLEANUP_UNPROVEN")
+        self.assertEqual(state["target_runtime_pid"], binding["pid"])
+        self.assertFalse(state["target_cleanup"]["target_runtime_pid_absent"])
+        self.assertIn("TARGET_PROCESS_EXIT_UNPROVEN", state["blockers"])
+
     def test_active_autostart_timeout_after_post_is_cleanup_unproven(self) -> None:
         manifest_path, manifest = self.supervisor_ready_manifest(
             "switch-request-active-autostart-timeout",
@@ -3165,9 +3251,11 @@ class ProfileSwitchServiceTests(unittest.TestCase):
             pid_probe=lambda _: False, port_probe=lambda: True, wait=lambda _: None,
             launch_child=lambda *_, **__: RunningProcess(),  # type: ignore[arg-type]
             http_json=lambda *_args, **_kwargs: {"entry_profile_version": "BEELZEBUB_SCALPER_V2"},
-        ), 6)
+        ), 12)
         state = json.loads(manifest_path.with_name("state.json").read_text(encoding="utf-8"))
-        self.assertEqual(state["blockers"], ["TARGET_RUNTIME_BINDING_TIMEOUT"])
+        self.assertEqual(state["stage"], "TARGET_CLEANUP_UNPROVEN")
+        self.assertIn("TARGET_RUNTIME_BINDING_TIMEOUT", state["blockers"])
+        self.assertFalse(state["target_cleanup"]["target_runtime_pid_absent"])
 
     @unittest.skipUnless(os.name == "nt", "Production launcher flags are Windows-specific.")
     def test_production_windows_child_launcher_with_harmless_stub(self) -> None:
@@ -3213,6 +3301,7 @@ class ProfileSwitchServiceTests(unittest.TestCase):
         }
         binding = {
             "pid": 31337,
+            "parent_pid": 31336,
             "ledger": manifest["ledger_path"], "audit": manifest["audit_root"],
             "git_sha": manifest["git_sha"], "entry_profile_version": manifest["target_profile"],
             "paper_policy_hash": manifest["paper_policy_hash"],
@@ -3224,6 +3313,14 @@ class ProfileSwitchServiceTests(unittest.TestCase):
         self.assertTrue(
             _target_binding_matches(
                 binding, manifest, continuity, target_pid=31337,
+            )
+        )
+        self.assertTrue(
+            _target_binding_matches(
+                {**binding, "pid": 31338, "parent_pid": 31337},
+                manifest,
+                continuity,
+                target_pid=31337,
             )
         )
         self.assertFalse(
@@ -3245,6 +3342,14 @@ class ProfileSwitchServiceTests(unittest.TestCase):
         self.assertFalse(
             _target_binding_matches(
                 {**binding, "ledger_identity": None},
+                manifest,
+                continuity,
+                target_pid=31337,
+            )
+        )
+        self.assertFalse(
+            _target_binding_matches(
+                {**binding, "pid": 31338, "parent_pid": 31339},
                 manifest,
                 continuity,
                 target_pid=31337,

@@ -82,6 +82,8 @@ class LaunchBinding:
     ledger_identity: str | None = None
     operation_id: str | None = None
     expected_pid: int | None = None
+    expected_parent_pid: int | None = None
+    expected_launcher_pid: int | None = None
 
     def expected_runtime_binding(self) -> dict[str, object]:
         expected: dict[str, object] = {
@@ -105,6 +107,8 @@ class LaunchBinding:
             expected["ledger_identity"] = self.ledger_identity
         if self.expected_pid is not None:
             expected["pid"] = self.expected_pid
+        if self.expected_parent_pid is not None:
+            expected["parent_pid"] = self.expected_parent_pid
         return expected
 
 
@@ -424,12 +428,25 @@ def adopt_exact_requested_target_listener(
     ):
         raise RuntimeError("BeezConsole requested target identity is inconsistent.")
     target_pid = state.get("target_pid")
+    target_runtime_pid = state.get("target_runtime_pid")
     if (
         type(target_pid) is not int
         or target_pid <= 0
-        or actual.get("pid") != target_pid
+        or type(target_runtime_pid) is not int
+        or target_runtime_pid <= 0
+        or actual.get("pid") != target_runtime_pid
+        or not _runtime_binding_matches_launcher(actual, target_pid)
     ):
         raise RuntimeError("BeezConsole requested target process identity is inconsistent.")
+    target_runtime_binding = state.get("target_runtime_binding")
+    if (
+        not isinstance(target_runtime_binding, Mapping)
+        or dict(target_runtime_binding) != dict(actual)
+    ):
+        raise RuntimeError("BeezConsole requested target runtime binding is inconsistent.")
+    target_parent_pid = actual.get("parent_pid")
+    if type(target_parent_pid) is not int or target_parent_pid <= 0:
+        raise RuntimeError("BeezConsole requested target parent process identity is inconsistent.")
     profile = resolve_paper_profile(str(manifest["target_profile"]))
     ledger_identity = actual.get("ledger_identity")
     if _LEDGER_IDENTITY.fullmatch(str(ledger_identity or "")) is None:
@@ -449,7 +466,9 @@ def adopt_exact_requested_target_listener(
         source="REQUESTED_TARGET_EXISTING_LISTENER",
         ledger_identity=str(ledger_identity),
         operation_id=operation_id,
-        expected_pid=target_pid,
+        expected_pid=target_runtime_pid,
+        expected_parent_pid=target_parent_pid,
+        expected_launcher_pid=target_pid,
     )
     if target.python != validate_project_root(root)[0].resolve():
         raise RuntimeError("BeezConsole requested target Python binding is inconsistent.")
@@ -481,9 +500,19 @@ def binding_for_existing_listener(
             # manifest, runtime binding, and Sim101 authority checks below.
             return adopt_exact_requested_target_listener(root, binding, actual)
         actual_pid = actual.get("pid")
-        if type(actual_pid) is not int or actual_pid <= 0:
+        actual_parent_pid = actual.get("parent_pid")
+        if (
+            type(actual_pid) is not int
+            or actual_pid <= 0
+            or type(actual_parent_pid) is not int
+            or actual_parent_pid <= 0
+        ):
             raise RuntimeError("BeezConsole existing listener process identity is unavailable.")
-        binding = replace(binding, expected_pid=actual_pid)
+        binding = replace(
+            binding,
+            expected_pid=actual_pid,
+            expected_parent_pid=actual_parent_pid,
+        )
     if selection_error is not None:
         raise selection_error
     return binding
@@ -626,6 +655,16 @@ def validate_runtime_binding(actual: Mapping[str, object], expected: LaunchBindi
         and "pid" not in mismatches
     ):
         mismatches.append("pid")
+    if (
+        (type(actual.get("parent_pid")) is not int or int(actual["parent_pid"]) <= 0)
+        and "parent_pid" not in mismatches
+    ):
+        mismatches.append("parent_pid")
+    if (
+        expected.expected_launcher_pid is not None
+        and not _runtime_binding_matches_launcher(actual, expected.expected_launcher_pid)
+    ):
+        mismatches.append("launcher_pid")
     if _LEDGER_IDENTITY.fullmatch(str(actual.get("ledger_identity") or "")) is None:
         if "ledger_identity" not in mismatches:
             mismatches.append("ledger_identity")
@@ -634,6 +673,23 @@ def validate_runtime_binding(actual: Mapping[str, object], expected: LaunchBindi
             "The service on 127.0.0.1:8090 does not match the validated BeezConsole runtime binding "
             f"({', '.join(mismatches)}). Refusing to use or replace it."
         )
+
+
+def _runtime_binding_matches_launcher(
+    actual: Mapping[str, object], launcher_pid: int,
+) -> bool:
+    """Accept a direct interpreter or the Windows py.exe shim it spawned."""
+    runtime_pid = actual.get("pid")
+    parent_pid = actual.get("parent_pid")
+    return (
+        type(launcher_pid) is int
+        and launcher_pid > 0
+        and type(runtime_pid) is int
+        and runtime_pid > 0
+        and type(parent_pid) is int
+        and parent_pid > 0
+        and (runtime_pid == launcher_pid or parent_pid == launcher_pid)
+    )
 
 
 def validate_paper_authority(actual: Mapping[str, object]) -> None:
@@ -715,16 +771,32 @@ def wait_for_server(
 ) -> None:
     deadline = time.monotonic() + timeout_seconds
     pinned_pid = binding.expected_pid
+    pinned_parent_pid = binding.expected_parent_pid
+    pinned_launcher_pid = binding.expected_launcher_pid
     if process is not None:
-        if pinned_pid is not None and pinned_pid != process.pid:
+        if pinned_launcher_pid is not None and pinned_launcher_pid != process.pid:
             raise RuntimeError("BeezConsole launch process identity conflicts with its runtime binding.")
-        pinned_pid = process.pid
+        pinned_launcher_pid = process.pid
     pinned_runtime_binding: dict[str, object] | None = None
 
     def pin_or_validate_runtime_binding(actual: Mapping[str, object]) -> None:
-        nonlocal pinned_runtime_binding
-        assert pinned_pid is not None
-        expected = replace(binding, expected_pid=pinned_pid)
+        nonlocal pinned_parent_pid, pinned_pid, pinned_runtime_binding
+        candidate_pid = actual.get("pid")
+        candidate_parent_pid = actual.get("parent_pid")
+        if type(candidate_pid) is not int or candidate_pid <= 0:
+            raise RuntimeError("The control-center server did not publish a valid process identity.")
+        if type(candidate_parent_pid) is not int or candidate_parent_pid <= 0:
+            raise RuntimeError("The control-center server did not publish a valid parent process identity.")
+        if pinned_pid is None:
+            pinned_pid = candidate_pid
+        if pinned_parent_pid is None:
+            pinned_parent_pid = candidate_parent_pid
+        expected = replace(
+            binding,
+            expected_pid=pinned_pid,
+            expected_parent_pid=pinned_parent_pid,
+            expected_launcher_pid=pinned_launcher_pid,
+        )
         validate_runtime_binding(actual, expected)
         candidate = dict(actual)
         if pinned_runtime_binding is None:
@@ -746,11 +818,6 @@ def wait_for_server(
             raise RuntimeError("The control-center server stopped during startup. See logs\\beez-console-server.log.")
         runtime_binding = fetch_runtime_binding()
         if runtime_binding is not None:
-            if pinned_pid is None:
-                candidate_pid = runtime_binding.get("pid")
-                if type(candidate_pid) is not int or candidate_pid <= 0:
-                    raise RuntimeError("The control-center server did not publish a valid process identity.")
-                pinned_pid = candidate_pid
             pin_or_validate_runtime_binding(runtime_binding)
             paper = fetch_paper_status()
             if paper is not None:

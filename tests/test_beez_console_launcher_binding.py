@@ -49,6 +49,11 @@ def runtime_binding(expected: beez_console.LaunchBinding) -> dict[str, object]:
     return {
         **expected.expected_runtime_binding(),
         "pid": expected.expected_pid if expected.expected_pid is not None else 1234,
+        "parent_pid": (
+            expected.expected_parent_pid
+            if expected.expected_parent_pid is not None
+            else 5678
+        ),
     }
 
 
@@ -101,6 +106,7 @@ def write_operation(
         "manifest_path": str(manifest_path),
         "stage": stage,
         "target_pid": 4321,
+        "target_runtime_pid": 8765,
     }
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     (operation_root / "state.json").write_text(json.dumps(state), encoding="utf-8")
@@ -289,6 +295,43 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "pid"):
                 beez_console.validate_runtime_binding(actual, expected)
 
+    def test_runtime_binding_requires_a_real_parent_process_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            expected = binding(Path(directory))
+            actual = runtime_binding(expected)
+            for invalid in (True, 0, None):
+                with self.subTest(invalid=invalid):
+                    candidate = dict(actual)
+                    if invalid is None:
+                        candidate.pop("parent_pid")
+                    else:
+                        candidate["parent_pid"] = invalid
+                    with self.assertRaisesRegex(RuntimeError, "parent_pid"):
+                        beez_console.validate_runtime_binding(candidate, expected)
+
+    def test_runtime_binding_accepts_direct_or_shim_launcher_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = binding(Path(directory))
+            direct = replace(base, expected_launcher_pid=1234)
+            beez_console.validate_runtime_binding(runtime_binding(direct), direct)
+
+            shim = replace(
+                base,
+                expected_pid=8765,
+                expected_parent_pid=4321,
+                expected_launcher_pid=4321,
+            )
+            beez_console.validate_runtime_binding(runtime_binding(shim), shim)
+
+            wrong = replace(
+                base,
+                expected_pid=8765,
+                expected_parent_pid=9999,
+                expected_launcher_pid=4321,
+            )
+            with self.assertRaisesRegex(RuntimeError, "launcher_pid"):
+                beez_console.validate_runtime_binding(runtime_binding(wrong), wrong)
+
     def test_runtime_binding_requires_remembered_selection_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             expected = binding(Path(directory))
@@ -339,6 +382,48 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "pid"):
                     beez_console.wait_for_server(None, expected, timeout_seconds=1)
             paper_status.assert_called_once_with()
+
+    def test_wait_accepts_and_pins_windows_python_shim_child(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            expected = binding(Path(directory))
+            process = Mock()
+            process.pid = 4321
+            process.poll.return_value = None
+            matching = {
+                **runtime_binding(expected),
+                "pid": 8765,
+                "parent_pid": 4321,
+            }
+            with (
+                patch(
+                    "beez_console.fetch_runtime_binding",
+                    side_effect=[matching, matching],
+                ),
+                patch(
+                    "beez_console.fetch_paper_status",
+                    return_value=dict(beez_console._PAPER_AUTHORITY),
+                ),
+            ):
+                beez_console.wait_for_server(process, expected, timeout_seconds=1)
+
+    def test_wait_rejects_process_unrelated_to_runtime_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            expected = binding(Path(directory))
+            process = Mock()
+            process.pid = 4321
+            process.poll.return_value = None
+            unrelated = {
+                **runtime_binding(expected),
+                "pid": 8765,
+                "parent_pid": 9999,
+            }
+            with (
+                patch("beez_console.fetch_runtime_binding", return_value=unrelated),
+                patch("beez_console.fetch_paper_status") as paper_status,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "launcher_pid"):
+                    beez_console.wait_for_server(process, expected, timeout_seconds=1)
+            paper_status.assert_not_called()
 
     def test_wait_pins_first_ledger_identity_for_explicit_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -447,8 +532,10 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
                 "ledger_epoch": manifest["ledger_epoch"],
                 "ledger_identity": "l3g-ledger-" + "e" * 32,
                 "profile_selection_source": "PROFILE_SWITCH_MANIFEST",
-                "pid": 4321,
+                "pid": 8765,
+                "parent_pid": 4321,
             }
+            state["target_runtime_binding"] = dict(actual)
             selection = {
                 "established": {"profile": established.profile},
                 "requested": requested,
@@ -465,9 +552,11 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
             self.assertEqual(adopted.profile, profile.selection_key)
             self.assertEqual(adopted.operation_id, operation_id)
             self.assertEqual(adopted.ledger_identity, actual["ledger_identity"])
-            self.assertEqual(adopted.expected_pid, 4321)
+            self.assertEqual(adopted.expected_pid, 8765)
+            self.assertEqual(adopted.expected_parent_pid, 4321)
+            self.assertEqual(adopted.expected_launcher_pid, 4321)
 
-            replacement = {**actual, "pid": 4322}
+            replacement = {**actual, "pid": 8766}
             with (
                 patch("beez_console.fetch_runtime_binding", return_value=replacement),
                 patch("beez_console.fetch_paper_status") as paper_status,
@@ -483,7 +572,33 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(RuntimeError, "target process identity"):
                     beez_console.adopt_exact_requested_target_listener(
-                        root, established, {**actual, "pid": 4322},
+                        root, established, {**actual, "parent_pid": 9999},
+                    )
+
+            stale_state = {
+                **state,
+                "target_runtime_binding": {**actual, "ledger_epoch": "STALE-EPOCH"},
+            }
+            with (
+                patch("beez_console.validated_profile_selection", return_value=selection),
+                patch("beez_console._validated_operation", return_value=(manifest, stale_state)),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "target runtime binding"):
+                    beez_console.adopt_exact_requested_target_listener(
+                        root, established, actual,
+                    )
+
+            wrong_runtime_state = {**state, "target_runtime_pid": 9999}
+            with (
+                patch("beez_console.validated_profile_selection", return_value=selection),
+                patch(
+                    "beez_console._validated_operation",
+                    return_value=(manifest, wrong_runtime_state),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "target process identity"):
+                    beez_console.adopt_exact_requested_target_listener(
+                        root, established, actual,
                     )
 
     def test_runtime_binding_enforces_typed_expected_pid(self) -> None:
@@ -531,8 +646,10 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
                 "ledger_epoch": manifest["ledger_epoch"],
                 "ledger_identity": "l3g-ledger-" + "e" * 32,
                 "profile_selection_source": "PROFILE_SWITCH_MANIFEST",
-                "pid": 4321,
+                "pid": 8765,
+                "parent_pid": 4321,
             }
+            state["target_runtime_binding"] = dict(actual)
             selection = {
                 "established": {
                     "profile": established.profile,
