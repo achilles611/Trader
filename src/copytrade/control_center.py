@@ -1873,6 +1873,36 @@ def create_control_center_app(
         bootstrap.start()
         return True
 
+    def begin_startup_observation_pause() -> dict[str, object]:
+        """Freeze paper observation admission, then drain the fixed verifier tip."""
+        fanout = ninjatrader_runtime.get("fanout")
+        ledger = ninjatrader_runtime.get("paper_ledger")
+        if type(fanout) is not ObservationFanout or type(ledger) is not PaperLedger:
+            return {"paused": False, "drained": False, "reason": "STARTUP_LEDGER_WRITER_UNAVAILABLE"}
+        try:
+            pause = fanout.begin_startup_paper_observation_pause()
+        except Exception as error:
+            return {
+                "paused": False,
+                "drained": False,
+                "reason": f"{type(error).__name__}:{error}",
+            }
+        try:
+            ledger.flush_deferred(timeout_seconds=30.0)
+        except Exception as error:
+            return {
+                **pause,
+                "drained": False,
+                "reason": f"{type(error).__name__}:{error}",
+            }
+        return {**pause, "drained": True}
+
+    def end_startup_observation_pause() -> dict[str, object]:
+        fanout = ninjatrader_runtime.get("fanout")
+        if type(fanout) is not ObservationFanout:
+            raise RuntimeError("STARTUP_LEDGER_WRITER_UNAVAILABLE")
+        return fanout.end_startup_paper_observation_pause()
+
     maintenance_arguments = {
         "paper_status": lane_iii_paper_health,
         "live_status": lane_iii_live_health,
@@ -1881,6 +1911,8 @@ def create_control_center_app(
         # freshly allocated profile ledger has no checkpoint yet and must earn
         # its first Full proof before NinjaTrader readiness can pass.
         "start_ledger_verification": lambda: ledger_verifier.start("auto"),
+        "begin_startup_observation_pause": begin_startup_observation_pause,
+        "end_startup_observation_pause": end_startup_observation_pause,
         "historical_command_count": lambda: latest_durable_command_sequence(),
         "begin_automatic_login": begin_automatic_ninjatrader_login,
         "automatic_login_status": ninja_login_health,

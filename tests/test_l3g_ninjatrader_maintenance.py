@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import json
 import threading
 import unittest
 from unittest.mock import patch
@@ -13,12 +14,14 @@ from starlette.requests import Request
 
 from src.copytrade.config import CopyTradeConfig
 from src.copytrade.control_center import create_control_center_app
+from src.l3f_provider.ninjatrader_observation import NinjaTraderObservation
 from src.l3g_paper.ninjatrader_maintenance import (
     DesktopProbe,
     MaintenanceStage,
     MaintenanceTimeouts,
     NinjaTraderMaintenanceService,
 )
+from src.l3g_paper.runtime import ObservationFanout
 
 
 def ready_paper() -> dict[str, object]:
@@ -164,6 +167,104 @@ class LedgerSource:
         return self.status()
 
 
+class StartupLedgerBoundary:
+    """Deterministic model of the failed V2 rows 24/25/26 startup ordering."""
+
+    def __init__(self, audit_path: Path, *, mutation: str | None = None) -> None:
+        self.audit_path = audit_path
+        self.tip = 24
+        self.writer_queue = ["row-25-already-admitted"]
+        self.report = passing_ledger()
+        self.report.update({
+            "verification_id": "lv-v2-row-26-race",
+            "captured_tip_sequence": 25,
+            "verified_through_sequence": 25,
+        })
+        self.mutation = mutation
+        self.events: list[str] = []
+        self.decision_stage_before_resume: str | None = None
+        self.fanout = ObservationFanout(
+            shadow_observation=lambda observation: None,
+            shadow_transport=lambda state: None,
+            shadow_rejection=lambda error: None,
+            shadow_duplicate=lambda: None,
+            paper_observation=self._append_heartbeat,
+            paper_transport=lambda state: None,
+            paper_rejection=lambda error: None,
+            paper_duplicate=lambda: None,
+            record_failure=lambda sink, event, error: None,
+        )
+
+    def paper_status(self) -> dict[str, object]:
+        paper = ready_paper()
+        paper["ledger"] = {
+            "unverified_tail_rows": max(0, self.tip - 25),
+            "operational_ledger": {"tail_tip_sequence": self.tip},
+        }
+        return paper
+
+    def begin(self) -> dict[str, object]:
+        self.events.append("pause")
+        paused = self.fanout.begin_startup_paper_observation_pause()
+        self.events.append("drain")
+        while self.writer_queue:
+            self.writer_queue.pop(0)
+            self.tip += 1
+        return {**paused, "drained": True}
+
+    def start_verification(self) -> dict[str, object]:
+        self.events.append(f"verify-tip-{self.tip}")
+        self.report["captured_tip_sequence"] = self.tip
+        self.report["verified_through_sequence"] = self.tip
+        if self.mutation is None:
+            # This is the authentic failed-epoch shape: the normal read-only
+            # HEALTH heartbeat would have become row 26 during verification.
+            self.fanout.on_observation(NinjaTraderObservation(
+                observation_id="nt-v2-row-26-heartbeat",
+                session_id="nt-v2-startup-session",
+                observation_type="HEALTH",
+                ninja_receipt_time="2026-09-07T15:37:37.002480Z",
+                local_monotonic_sequence=11153,
+                payload={
+                    "component": "MARKET_OBSERVER_ATTACHMENT",
+                    "state": "NATIVE_ADDON_OBSERVER_ACTIVE",
+                    "configured_instrument": "MNQ SEP26",
+                    "instrument": "MNQ SEP26",
+                    "chart_found": True,
+                    "observer_attached": True,
+                    "subscription_mode": "NATIVE_ADDON",
+                },
+            ))
+        else:
+            # Observation pausing must not hide non-observation authority or
+            # unknown ledger mutations. They remain durable and move the tip.
+            self.events.append(self.mutation)
+            self.tip += 1
+        return deepcopy(self.report)
+
+    def ledger_status(self) -> dict[str, object]:
+        return deepcopy(self.report)
+
+    def end(self) -> dict[str, object]:
+        if self.audit_path.is_file():
+            records = [
+                json.loads(line)
+                for line in self.audit_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.decision_stage_before_resume = records[-1]["stage"]
+        self.events.append("resume")
+        return self.fanout.end_startup_paper_observation_pause()
+
+    def _append_heartbeat(self, observation: object) -> None:
+        self.events.append(
+            "row-26-health-heartbeat"
+            if isinstance(observation, NinjaTraderObservation)
+            and observation.observation_type == "HEALTH"
+            else "unexpected-observation"
+        )
+        self.tip += 1
+
+
 FAST_TIMEOUTS = MaintenanceTimeouts(
     process_start_seconds=0.04,
     graceful_shutdown_seconds=0.04,
@@ -193,6 +294,8 @@ class NinjaTraderMaintenanceTests(unittest.TestCase):
             live_status=self.live,
             ledger_status=self.ledger.status,
             start_ledger_verification=self.ledger.start,
+            begin_startup_observation_pause=lambda: {"paused": True, "drained": True},
+            end_startup_observation_pause=lambda: {"paused": False},
             desktop=desktop,
             audit_path=Path(self.temporary.name) / "maintenance.jsonl",
             timeouts=timeouts,
@@ -234,6 +337,131 @@ class NinjaTraderMaintenanceTests(unittest.TestCase):
         self.assertEqual(desktop.ensure_chart_calls, ["MNQ SEP26"])
         self.assertEqual(self.ledger.start_calls, 1)
 
+    def test_v2_row_26_health_heartbeat_waits_until_startup_acceptance_is_durable(self) -> None:
+        audit_path = Path(self.temporary.name) / "v2-row-26-race.jsonl"
+        boundary = StartupLedgerBoundary(audit_path)
+        service = NinjaTraderMaintenanceService(
+            paper_status=boundary.paper_status,
+            live_status=self.live,
+            ledger_status=boundary.ledger_status,
+            start_ledger_verification=boundary.start_verification,
+            begin_startup_observation_pause=boundary.begin,
+            end_startup_observation_pause=boundary.end,
+            desktop=FakeDesktop(process=True),
+            audit_path=audit_path,
+            timeouts=FAST_TIMEOUTS,
+        )
+
+        status = self.run_service(service, "ntm-v2-row-26-heartbeat")
+
+        self.assertEqual(status["stage"], "READY")
+        self.assertNotIn("LEDGER_UNVERIFIED_TAIL", status["blockers"])
+        self.assertEqual(boundary.tip, 26)
+        self.assertEqual(
+            boundary.events,
+            ["pause", "drain", "verify-tip-25", "resume", "row-26-health-heartbeat"],
+        )
+        self.assertEqual(boundary.decision_stage_before_resume, "READY")
+
+    def test_authority_or_unknown_mutation_during_paused_boundary_still_blocks(self) -> None:
+        for mutation in ("AUTHORITY_MUTATION", "UNKNOWN_LEDGER_ROW"):
+            with self.subTest(mutation=mutation):
+                audit_path = Path(self.temporary.name) / f"v2-{mutation.lower()}.jsonl"
+                boundary = StartupLedgerBoundary(audit_path, mutation=mutation)
+                service = NinjaTraderMaintenanceService(
+                    paper_status=boundary.paper_status,
+                    live_status=self.live,
+                    ledger_status=boundary.ledger_status,
+                    start_ledger_verification=boundary.start_verification,
+                    begin_startup_observation_pause=boundary.begin,
+                    end_startup_observation_pause=boundary.end,
+                    desktop=FakeDesktop(process=True),
+                    audit_path=audit_path,
+                    timeouts=FAST_TIMEOUTS,
+                )
+
+                status = self.run_service(service, f"ntm-v2-{mutation.lower()}")
+
+                self.assertEqual(status["stage"], "BLOCKED")
+                self.assertIn("LEDGER_UNVERIFIED_TAIL", status["blockers"])
+                self.assertEqual(boundary.tip, 26)
+                self.assertEqual(boundary.decision_stage_before_resume, "BLOCKED")
+
+    def test_unavailable_pause_or_drain_blocks_before_verification(self) -> None:
+        for pause in (
+            {"paused": False, "drained": False},
+            {"paused": True, "drained": False},
+        ):
+            with self.subTest(pause=pause):
+                ledger = LedgerSource()
+                resumed: list[bool] = []
+                service = NinjaTraderMaintenanceService(
+                    paper_status=self.paper,
+                    live_status=self.live,
+                    ledger_status=ledger.status,
+                    start_ledger_verification=ledger.start,
+                    begin_startup_observation_pause=lambda pause=pause: dict(pause),
+                    end_startup_observation_pause=lambda: (
+                        resumed.append(True) or {"paused": False}
+                    ),
+                    desktop=FakeDesktop(process=True),
+                    audit_path=Path(self.temporary.name) / (
+                        "pause-failed.jsonl" if pause["paused"] is False
+                        else "drain-failed.jsonl"
+                    ),
+                    timeouts=FAST_TIMEOUTS,
+                )
+
+                status = self.run_service(service, "ntm-v2-pause-drain-failure")
+
+                self.assertEqual(status["stage"], "BLOCKED")
+                self.assertEqual(ledger.start_calls, 0)
+                expected = (
+                    "STARTUP_LEDGER_OBSERVATION_PAUSE_FAILED"
+                    if pause["paused"] is False
+                    else "STARTUP_LEDGER_WRITER_DRAIN_FAILED"
+                )
+                self.assertIn(expected, status["blockers"])
+                self.assertEqual(resumed, [True] if pause["paused"] else [])
+
+    def test_verifier_failure_is_blocked_before_observations_resume(self) -> None:
+        audit_path = Path(self.temporary.name) / "verifier-failed-boundary.jsonl"
+        events: list[str] = []
+
+        def verifier_failure() -> dict[str, object]:
+            events.append("verify")
+            raise RuntimeError("synthetic verifier failure")
+
+        def resume() -> dict[str, object]:
+            records = [
+                json.loads(line)
+                for line in audit_path.read_text(encoding="utf-8").splitlines()
+            ]
+            events.append("resume:" + str(records[-1]["stage"]))
+            return {"paused": False}
+
+        service = NinjaTraderMaintenanceService(
+            paper_status=self.paper,
+            live_status=self.live,
+            ledger_status=self.ledger.status,
+            start_ledger_verification=verifier_failure,
+            begin_startup_observation_pause=lambda: (
+                events.append("pause") or {"paused": True, "drained": True}
+            ),
+            end_startup_observation_pause=resume,
+            desktop=FakeDesktop(process=True),
+            audit_path=audit_path,
+            timeouts=FAST_TIMEOUTS,
+        )
+
+        status = self.run_service(service, "ntm-v2-verifier-failure")
+
+        self.assertEqual(status["stage"], "BLOCKED")
+        self.assertEqual(
+            status["blockers"], ["STARTUP_LEDGER_VERIFICATION_BOUNDARY_FAILED"],
+        )
+        self.assertEqual(events, ["pause", "verify", "resume:BLOCKED"])
+
     def test_normal_startup_never_turns_stale_observer_into_an_implicit_restart(self) -> None:
         self.make_observer_unhealthy(self.paper.value)
         desktop = FakeDesktop(process=True)
@@ -253,6 +481,8 @@ class NinjaTraderMaintenanceTests(unittest.TestCase):
             live_status=self.live,
             ledger_status=self.ledger.status,
             start_ledger_verification=self.ledger.start,
+            begin_startup_observation_pause=lambda: {"paused": True, "drained": True},
+            end_startup_observation_pause=lambda: {"paused": False},
             begin_automatic_login=lambda: begin_calls.append(True) is None or True,
             automatic_login_status=lambda: {"state": "AUTHENTICATED", "attempt_count": 1},
             desktop=desktop,
@@ -453,6 +683,8 @@ class NinjaTraderMaintenanceTests(unittest.TestCase):
             live_status=self.live,
             ledger_status=self.ledger.status,
             start_ledger_verification=self.ledger.start,
+            begin_startup_observation_pause=lambda: {"paused": True, "drained": True},
+            end_startup_observation_pause=lambda: {"paused": False},
             historical_command_count=lambda: 3,
             desktop=desktop,
             audit_path=Path(self.temporary.name) / "maintenance.jsonl",
@@ -473,6 +705,8 @@ class NinjaTraderMaintenanceTests(unittest.TestCase):
             live_status=self.live,
             ledger_status=self.ledger.status,
             start_ledger_verification=self.ledger.start,
+            begin_startup_observation_pause=lambda: {"paused": True, "drained": True},
+            end_startup_observation_pause=lambda: {"paused": False},
             desktop=desktop,
             audit_path=audit_directory,
             timeouts=FAST_TIMEOUTS,

@@ -221,6 +221,8 @@ class NinjaTraderMaintenanceService:
         live_status: Callable[[], Mapping[str, object]],
         ledger_status: Callable[[], Mapping[str, object]],
         start_ledger_verification: Callable[[], Mapping[str, object]],
+        begin_startup_observation_pause: Callable[[], Mapping[str, object]],
+        end_startup_observation_pause: Callable[[], Mapping[str, object]],
         historical_command_count: Callable[[], int] | None = None,
         begin_automatic_login: Callable[[], bool] | None = None,
         automatic_login_status: Callable[[], Mapping[str, object]] | None = None,
@@ -234,6 +236,8 @@ class NinjaTraderMaintenanceService:
         self._live_status = live_status
         self._ledger_status = ledger_status
         self._start_ledger_verification = start_ledger_verification
+        self._begin_startup_observation_pause = begin_startup_observation_pause
+        self._end_startup_observation_pause = end_startup_observation_pause
         self._historical_command_count = historical_command_count or (lambda: 0)
         self._begin_automatic_login = begin_automatic_login
         self._automatic_login_status = automatic_login_status
@@ -707,6 +711,86 @@ class NinjaTraderMaintenanceService:
             self._wait(min(self._timeouts.poll_seconds, max(0.001, deadline - self._clock())))
         return False
 
+    def _begin_startup_ledger_boundary(self) -> bool:
+        """Pause new observations, then drain the already-admitted writer prefix."""
+        paused = False
+        try:
+            result = self._begin_startup_observation_pause()
+            paused = isinstance(result, Mapping) and result.get("paused") is True
+            drained = isinstance(result, Mapping) and result.get("drained") is True
+        except Exception:
+            result = {}
+            drained = False
+        if paused and drained:
+            return True
+        blockers = []
+        if not paused:
+            blockers.append("STARTUP_LEDGER_OBSERVATION_PAUSE_FAILED")
+        if not drained:
+            blockers.append("STARTUP_LEDGER_WRITER_DRAIN_FAILED")
+        self._transition(MaintenanceStage.BLOCKED, blockers)
+        if paused:
+            try:
+                self._end_startup_observation_pause()
+            except Exception:
+                pass
+        return False
+
+    def _end_startup_ledger_boundary(self) -> None:
+        try:
+            result = self._end_startup_observation_pause()
+            if not isinstance(result, Mapping) or result.get("paused") is not False:
+                raise RuntimeError("STARTUP_LEDGER_OBSERVATION_RESUME_FAILED")
+        except Exception:
+            self._transition(
+                MaintenanceStage.BLOCKED,
+                ["STARTUP_LEDGER_OBSERVATION_RESUME_FAILED"],
+            )
+
+    def _verify_startup_ledger(
+        self,
+        stage: MaintenanceStage,
+        *,
+        accept: Callable[[], None] | None = None,
+    ) -> tuple[bool, Mapping[str, object]]:
+        """Verify one drained fixed tip and retain the pause through acceptance."""
+        if not self._begin_startup_ledger_boundary():
+            return False, {}
+        try:
+            ok, report = self._verify_ledger(stage)
+            if ok and accept is not None:
+                accept()
+            return ok, report
+        except MaintenanceAuditError:
+            # The operation is abandoned before observations resume even when
+            # the durable decision journal itself has become unavailable.
+            with self._lock:
+                self._stage = MaintenanceStage.BLOCKED
+                self._stage_started_at = _utc_now()
+                self._blockers = ["MAINTENANCE_AUDIT_UNAVAILABLE"]
+                self._manual_action = None
+            return False, {}
+        except Exception as error:
+            with self._lock:
+                self._diagnostics.append({
+                    "at": _utc_now(),
+                    "message": f"startup_ledger_boundary:{type(error).__name__}",
+                })
+            try:
+                self._transition(
+                    MaintenanceStage.BLOCKED,
+                    ["STARTUP_LEDGER_VERIFICATION_BOUNDARY_FAILED"],
+                )
+            except MaintenanceAuditError:
+                with self._lock:
+                    self._stage = MaintenanceStage.BLOCKED
+                    self._stage_started_at = _utc_now()
+                    self._blockers = ["MAINTENANCE_AUDIT_UNAVAILABLE"]
+                    self._manual_action = None
+            return False, {}
+        finally:
+            self._end_startup_ledger_boundary()
+
     def _verify_ledger(self, stage: MaintenanceStage) -> tuple[bool, Mapping[str, object]]:
         self._transition(stage)
         started = self._start_ledger_verification()
@@ -781,11 +865,14 @@ class NinjaTraderMaintenanceService:
             if self._healthy(probe, paper):
                 if not self._ensure_configured_chart(instrument):
                     return
-                ok, _ = self._verify_ledger(MaintenanceStage.FINAL_LEDGER_VERIFICATION)
-                if ok:
-                    self._finish_ready()
+                self._verify_startup_ledger(
+                    MaintenanceStage.FINAL_LEDGER_VERIFICATION,
+                    accept=self._finish_ready,
+                )
                 return
-            ok, report = self._verify_ledger(MaintenanceStage.VERIFYING_RESTART_LEDGER)
+            ok, report = self._verify_startup_ledger(
+                MaintenanceStage.VERIFYING_RESTART_LEDGER,
+            )
             if not ok:
                 return
             if probe.process_detected and self._restart_requested:
@@ -887,9 +974,10 @@ class NinjaTraderMaintenanceService:
             if not self._wait_for(self._final_reconciliation_ready, self._timeouts.reconciliation_seconds):
                 self._transition(MaintenanceStage.BLOCKED, ["SIM101_RECONCILIATION_TIMEOUT"])
                 return
-            ok, _ = self._verify_ledger(MaintenanceStage.FINAL_LEDGER_VERIFICATION)
-            if ok:
-                self._finish_ready()
+            self._verify_startup_ledger(
+                MaintenanceStage.FINAL_LEDGER_VERIFICATION,
+                accept=self._finish_ready,
+            )
         except MaintenanceAuditError:
             with self._lock:
                 self._stage = MaintenanceStage.BLOCKED

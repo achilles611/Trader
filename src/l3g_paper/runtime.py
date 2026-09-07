@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -272,6 +273,43 @@ class ObservationFanout:
         self._paper_duplicate = paper_duplicate
         self._record_failure = record_failure
         self._lock = threading.RLock()
+        # A startup verifier must be able to hold the paper ledger tip still
+        # without disconnecting the sole native observation owner.  Shadow
+        # observation remains live; only the paper sink is delayed, in exact
+        # callback order, until the durable startup decision is recorded.
+        self._paper_observations_paused = False
+        self._paused_paper_observations: deque[NinjaTraderObservation] = deque()
+
+    def begin_startup_paper_observation_pause(self) -> dict[str, object]:
+        """Delay paper observation delivery across one startup-only boundary."""
+        with self._lock:
+            if self._paper_observations_paused:
+                raise RuntimeError("STARTUP_PAPER_OBSERVATION_PAUSE_ALREADY_ACTIVE")
+            if self._paused_paper_observations:
+                raise RuntimeError("STARTUP_PAPER_OBSERVATION_PAUSE_NOT_DRAINED")
+            self._paper_observations_paused = True
+            return {"paused": True, "buffered_observations": 0}
+
+    def end_startup_paper_observation_pause(self) -> dict[str, object]:
+        """Replay held observations only after the startup decision is durable."""
+        with self._lock:
+            if not self._paper_observations_paused:
+                raise RuntimeError("STARTUP_PAPER_OBSERVATION_PAUSE_NOT_ACTIVE")
+            replayed = 0
+            while self._paused_paper_observations:
+                observation = self._paused_paper_observations.popleft()
+                try:
+                    self._paper_observation(observation)
+                except Exception as exc:
+                    try:
+                        self._record_failure(
+                            "EXPERIMENTAL_PAPER", "OBSERVATION", type(exc).__name__,
+                        )
+                    except Exception:
+                        pass
+                replayed += 1
+            self._paper_observations_paused = False
+            return {"paused": False, "replayed_observations": replayed}
 
     def _deliver(self, event: str, shadow: Callable[..., None], paper: Callable[..., None], *args: object) -> None:
         # One lock preserves admitted order across listener callbacks. Each
@@ -295,7 +333,26 @@ class ObservationFanout:
                     pass
 
     def on_observation(self, observation: NinjaTraderObservation) -> None:
-        self._deliver("OBSERVATION", self._shadow_observation, self._paper_observation, observation)
+        with self._lock:
+            try:
+                self._shadow_observation(observation)
+            except Exception as exc:
+                try:
+                    self._record_failure("SHADOW", "OBSERVATION", type(exc).__name__)
+                except Exception:
+                    pass
+            if self._paper_observations_paused:
+                self._paused_paper_observations.append(observation)
+                return
+            try:
+                self._paper_observation(observation)
+            except Exception as exc:
+                try:
+                    self._record_failure(
+                        "EXPERIMENTAL_PAPER", "OBSERVATION", type(exc).__name__,
+                    )
+                except Exception:
+                    pass
 
     def on_transport_state(self, state: StreamHealth) -> None:
         self._deliver("TRANSPORT_STATE", self._shadow_transport, self._paper_transport, state)
