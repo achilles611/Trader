@@ -285,6 +285,122 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertNotIn("heartbeatLost = authenticated && ownedActivity", watchdog)
         self.assertIn('LockAndProtect("HEARTBEAT_WATCHDOG")', watchdog)
 
+    def test_reconciliation_probe_is_signed_status_only_and_stably_double_sampled(self) -> None:
+        source = self._execution_source()
+        process = source[
+            source.index("        private void ProcessFrame"):
+            source.index("        private void AcceptSession")
+        ]
+        probe_dispatch = process.index(
+            'String.Equals(type, "RECONCILIATION_PROBE_GRANT", StringComparison.Ordinal)'
+        )
+        normal_authority = process.index("if (!authenticated", probe_dispatch)
+        self.assertLess(probe_dispatch, normal_authority)
+        self.assertIn("AcceptReconciliationProbeGrant(message);", process)
+
+        probe = source[
+            source.index("        private void AcceptReconciliationProbeGrant"):
+            source.index("        private ProbeNativeSample CaptureProbeNativeSample")
+        ]
+        expected_grant_fields = {
+            "schema", "message_type", "probe_session_id", "server_nonce",
+            "account_binding_hash", "mode", "live_capital", "timestamp", "signature",
+        }
+        grant_array = probe[
+            probe.index("string[] exactFields"):
+            probe.index("DateTime timestamp")
+        ]
+        self.assertEqual(set(re.findall(r'"([a-z_]+)"', grant_array)), expected_grant_fields)
+        self.assertIn(
+            'ExactAccountBindingHash = "28ddf4acc88f1a9e35de79b8306a252e647a5a1dca0a6e9333ce814828e6841e"',
+            source,
+        )
+        self.assertIn('Text(grant, "account_binding_hash"), ExactAccountBindingHash', probe)
+        self.assertIn('Text(grant, "mode"), "PAPER_SIM101"', probe)
+        self.assertIn('Boolean(grant, "live_capital") != false', probe)
+        self.assertIn("lock (nativeMutationGate)", probe)
+        self.assertEqual(probe.count("CaptureProbeNativeSample();"), 2)
+        for fence in (
+            "nativeObservationCallbacksInFlight",
+            "generationBefore = Interlocked.Read(ref nativeObservationGeneration)",
+            "generationAfter = Interlocked.Read(ref nativeObservationGeneration)",
+            "generationBefore == generationAfter",
+            "String.Equals(first.Hash, second.Hash, StringComparison.Ordinal)",
+            "!first.NativeMutationPending",
+            "!second.NativeMutationPending",
+        ):
+            self.assertIn(fence, probe)
+
+        exact_result_fields = {
+            "schema", "message_type", "probe_session_id", "server_nonce",
+            "observation_generation", "first_sample_hash", "second_sample_hash",
+            "snapshot_stable", "timestamp", "receipt_id", "account_name",
+            "account_class", "instrument", "position_quantity",
+            "working_order_count", "working_entry_count",
+            "position_snapshot_complete", "order_snapshot_complete",
+            "foreign_activity", "protective_stop_state",
+        }
+        result_block = probe[
+            probe.index("Dictionary<string, object> result"):
+            probe.index("SendSigned(result);")
+        ]
+        self.assertEqual(
+            set(re.findall(r'result\["([a-z_]+)"\]', result_block)),
+            exact_result_fields,
+        )
+        self.assertIn('result["message_type"] = "RECONCILIATION_PROBE_RESULT"', result_block)
+        self.assertIn('result["position_snapshot_complete"] = stable', result_block)
+        self.assertIn('result["order_snapshot_complete"] = stable', result_block)
+        self.assertNotIn("AcceptSession(", probe)
+        self.assertNotIn("RehydrateOwnedWorkingOrders", probe)
+        self.assertNotIn("EnsureCurrentPositionOwnershipProven", probe)
+        self.assertNotIn("LockAndProtect", probe)
+        self.assertNotIn("CreateOrder", probe)
+        self.assertNotIn(".Submit(", probe)
+        self.assertNotIn(".Cancel(", probe)
+        for forbidden_assignment in (
+            "authenticated =", "reconciled =", "executionSessionId =",
+            "watchdogSafetyAuthorityEstablished =", "lastHeartbeatUtc =",
+            "paperPolicyHash =", "riskProfileHash =", "accountBindingHash =",
+        ):
+            self.assertNotIn(forbidden_assignment, probe)
+
+        capture = source[
+            source.index("        private ProbeNativeSample CaptureProbeNativeSample"):
+            source.index("        private static bool ExactFields")
+        ]
+        self.assertIn("lock (paperAccount.Positions)", capture)
+        self.assertIn("lock (paperAccount.Orders)", capture)
+        self.assertIn("UnresolvedNativeOrderState(order.OrderState)", capture)
+        self.assertIn('hashPayload["native_mutation_pending"]', capture)
+        self.assertIn("Canonical(hashPayload)", capture)
+
+        callback_fence = source[
+            source.index("        private void BeginNativeObservationCallback"):
+            source.index("        private void OnOrderUpdate")
+        ]
+        self.assertIn("Interlocked.Increment(ref nativeObservationCallbacksInFlight)", callback_fence)
+        self.assertEqual(callback_fence.count("Interlocked.Increment(ref nativeObservationGeneration)"), 2)
+        self.assertIn("Interlocked.Decrement(ref nativeObservationCallbacksInFlight)", callback_fence)
+        order_callback = source[
+            source.index("        private void OnOrderUpdate"):
+            source.index("        private void OnExecutionUpdate")
+        ]
+        execution_callback = source[
+            source.index("        private void OnExecutionUpdate"):
+            source.index("        private void OnPositionUpdate")
+        ]
+        position_callback = source[
+            source.index("        private void OnPositionUpdate"):
+            source.index("        private void OnAccountItemUpdate")
+        ]
+        self.assertEqual(order_callback.count("BeginNativeObservationCallback();"), 1)
+        self.assertEqual(order_callback.count("EndNativeObservationCallback();"), 1)
+        self.assertEqual(execution_callback.count("BeginNativeObservationCallback();"), 1)
+        self.assertEqual(execution_callback.count("EndNativeObservationCallback();"), 2)
+        self.assertEqual(position_callback.count("BeginNativeObservationCallback();"), 1)
+        self.assertEqual(position_callback.count("EndNativeObservationCallback();"), 3)
+
     def test_native_quantity_breach_immediately_uses_independent_safety_flatten(self) -> None:
         source = self._execution_source()
         callback = source[

@@ -25,11 +25,12 @@ namespace NinjaTrader.NinjaScript.AddOns
         // Updated from the checked-in source before a NinjaTrader build.  The
         // Python bridge independently fingerprints the same source, so an old
         // compiled AddOn cannot be armed merely because its DLL timestamp is new.
-        private const string AddonSourceFingerprint = "54753846f73d82e9aa06e0167f67ecc9326d92ff99ef5ea65072c5bb0b53e29d";
+        private const string AddonSourceFingerprint = "a0b672a5bce6a88f82adad6c1d6184fb09b4645dcc7811d6241d1445fddb58c3";
         private const string ExactAccountName = "Sim101";
         private const string ExactAccountClass = "LOCAL_SIMULATION";
         private const string ExactInstrumentName = "MNQ SEP26";
         private const string ExactCapability = "PAPER_ONLY";
+        private const string ExactAccountBindingHash = "28ddf4acc88f1a9e35de79b8306a252e647a5a1dca0a6e9333ce814828e6841e";
         private const int Port = 48136;
         private const int MaximumFrameBytes = 65536;
         private const int MaximumQuantity = 1;
@@ -63,6 +64,11 @@ namespace NinjaTrader.NinjaScript.AddOns
         private readonly Dictionary<string, string> protectedEntryExecutionFacts = new Dictionary<string, string>(StringComparer.Ordinal);
         private readonly Dictionary<string, string> protectedEntryCommandExecutions = new Dictionary<string, string>(StringComparer.Ordinal);
         private readonly HashSet<string> failedEntryProtectionCommands = new HashSet<string>(StringComparer.Ordinal);
+        // A probe snapshot is accepted only when no account callback overlaps
+        // either immutable sample. Odd/even generations alone are insufficient
+        // because NinjaTrader may invoke different callback types concurrently.
+        private long nativeObservationGeneration;
+        private int nativeObservationCallbacksInFlight;
         private Account paperAccount;
         private Instrument paperInstrument;
         private bool accountCallbacksAttached;
@@ -714,6 +720,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                 AcceptSession(message);
                 return;
             }
+            if (String.Equals(type, "RECONCILIATION_PROBE_GRANT", StringComparison.Ordinal))
+            {
+                AcceptReconciliationProbeGrant(message);
+                return;
+            }
             lock (stateLock)
             {
                 if (!authenticated || !String.Equals(Text(message, "execution_session_id"), executionSessionId, StringComparison.Ordinal))
@@ -793,6 +804,196 @@ namespace NinjaTrader.NinjaScript.AddOns
             for (int index = 0; index < value.Length; index++)
                 if (!Uri.IsHexDigit(value[index])) return false;
             return true;
+        }
+
+        private void AcceptReconciliationProbeGrant(Dictionary<string, object> grant)
+        {
+            string[] exactFields = {
+                "schema", "message_type", "probe_session_id", "server_nonce",
+                "account_binding_hash", "mode", "live_capital", "timestamp", "signature"
+            };
+            DateTime timestamp;
+            bool normalSessionActive;
+            lock (stateLock)
+                normalSessionActive = authenticated || !String.IsNullOrWhiteSpace(executionSessionId);
+            if (!ExactFields(grant, exactFields)
+                || !ValidTime(Text(grant, "timestamp"), 10, out timestamp)
+                || String.IsNullOrWhiteSpace(Text(grant, "probe_session_id"))
+                || String.IsNullOrWhiteSpace(Text(grant, "server_nonce"))
+                || !String.Equals(Text(grant, "account_binding_hash"), ExactAccountBindingHash, StringComparison.Ordinal)
+                || !String.Equals(Text(grant, "mode"), "PAPER_SIM101", StringComparison.Ordinal)
+                || Boolean(grant, "live_capital") != false
+                || normalSessionActive)
+            {
+                Diagnostic("RECONCILIATION_PROBE_GRANT_REFUSED");
+                return;
+            }
+
+            ProbeNativeSample first;
+            ProbeNativeSample second;
+            long generationBefore;
+            long generationAfter;
+            int callbacksBefore;
+            int callbacksAfter;
+            // This fence blocks every locally dispatched Submit/Cancel while
+            // both immutable account samples are captured. Account callbacks
+            // do not take this gate, so their separate generation/in-flight
+            // fence must also remain unchanged and empty across both samples.
+            lock (nativeMutationGate)
+            {
+                callbacksBefore = Interlocked.CompareExchange(
+                    ref nativeObservationCallbacksInFlight, 0, 0
+                );
+                generationBefore = Interlocked.Read(ref nativeObservationGeneration);
+                first = CaptureProbeNativeSample();
+                Thread.MemoryBarrier();
+                second = CaptureProbeNativeSample();
+                generationAfter = Interlocked.Read(ref nativeObservationGeneration);
+                callbacksAfter = Interlocked.CompareExchange(
+                    ref nativeObservationCallbacksInFlight, 0, 0
+                );
+            }
+            bool stable = callbacksBefore == 0
+                && callbacksAfter == 0
+                && generationBefore == generationAfter
+                && (generationAfter & 1L) == 0L
+                && String.Equals(first.Hash, second.Hash, StringComparison.Ordinal)
+                && first.PositionSnapshotComplete
+                && first.OrderSnapshotComplete
+                && second.PositionSnapshotComplete
+                && second.OrderSnapshotComplete
+                && !first.NativeMutationPending
+                && !second.NativeMutationPending;
+
+            Dictionary<string, object> result = new Dictionary<string, object>();
+            result["schema"] = WireSchema;
+            result["message_type"] = "RECONCILIATION_PROBE_RESULT";
+            result["probe_session_id"] = Text(grant, "probe_session_id");
+            result["server_nonce"] = Text(grant, "server_nonce");
+            result["observation_generation"] = generationAfter;
+            result["first_sample_hash"] = first.Hash;
+            result["second_sample_hash"] = second.Hash;
+            result["snapshot_stable"] = stable;
+            result["timestamp"] = UtcNow();
+            result["receipt_id"] = "l3g-reconciliation-probe-" + Guid.NewGuid().ToString("N");
+            result["account_name"] = ExactAccountName;
+            result["account_class"] = ExactAccountClass;
+            result["instrument"] = ExactInstrumentName;
+            result["position_quantity"] = second.PositionQuantity;
+            result["working_order_count"] = second.WorkingOrderCount;
+            result["working_entry_count"] = second.WorkingEntryCount;
+            result["position_snapshot_complete"] = stable && second.PositionSnapshotComplete;
+            result["order_snapshot_complete"] = stable && second.OrderSnapshotComplete;
+            result["foreign_activity"] = first.ForeignActivity || second.ForeignActivity;
+            result["protective_stop_state"] = second.ProtectiveStopState;
+            SendSigned(result);
+        }
+
+        private ProbeNativeSample CaptureProbeNativeSample()
+        {
+            ProbeNativeSample sample = new ProbeNativeSample();
+            sample.PositionSnapshotComplete = paperAccount != null && ExactInstrument(paperInstrument);
+            sample.OrderSnapshotComplete = sample.PositionSnapshotComplete;
+            sample.ProtectiveStopState = "NONE";
+            List<string> positionFacts = new List<string>();
+            List<string> orderFacts = new List<string>();
+            int exactPositionCount = 0;
+            if (paperAccount != null)
+            {
+                lock (paperAccount.Positions)
+                {
+                    foreach (Position position in paperAccount.Positions)
+                    {
+                        string instrument = position.Instrument == null
+                            ? String.Empty : position.Instrument.FullName ?? String.Empty;
+                        int signedQuantity = position.MarketPosition == MarketPosition.Short
+                            ? -position.Quantity
+                            : position.MarketPosition == MarketPosition.Flat ? 0 : position.Quantity;
+                        positionFacts.Add(String.Join("|", new[] {
+                            instrument,
+                            position.MarketPosition.ToString(),
+                            signedQuantity.ToString(CultureInfo.InvariantCulture)
+                        }));
+                        if (String.Equals(instrument, ExactInstrumentName, StringComparison.Ordinal))
+                        {
+                            exactPositionCount++;
+                            sample.PositionQuantity += signedQuantity;
+                        }
+                        else if (signedQuantity != 0)
+                            sample.ForeignActivity = true;
+                    }
+                }
+                lock (paperAccount.Orders)
+                {
+                    foreach (Order order in paperAccount.Orders)
+                    {
+                        if (!UnresolvedNativeOrderState(order.OrderState)) continue;
+                        string instrument = order.Instrument == null
+                            ? String.Empty : order.Instrument.FullName ?? String.Empty;
+                        string name = order.Name ?? String.Empty;
+                        bool exact = String.Equals(instrument, ExactInstrumentName, StringComparison.Ordinal);
+                        orderFacts.Add(String.Join("|", new[] {
+                            instrument,
+                            name,
+                            order.OrderId ?? String.Empty,
+                            order.OrderState.ToString(),
+                            order.Quantity.ToString(CultureInfo.InvariantCulture),
+                            order.Filled.ToString(CultureInfo.InvariantCulture)
+                        }));
+                        if (exact)
+                        {
+                            sample.WorkingOrderCount++;
+                            if (name.StartsWith("BZ-L3G-E-", StringComparison.Ordinal))
+                                sample.WorkingEntryCount++;
+                        }
+                        if (!exact || !IsOwnedName(name)) sample.ForeignActivity = true;
+                    }
+                }
+            }
+            if (exactPositionCount > 1) sample.ForeignActivity = true;
+            positionFacts.Sort(StringComparer.Ordinal);
+            orderFacts.Sort(StringComparer.Ordinal);
+            lock (queueLock)
+                if (commandQueue.Count != 0) sample.NativeMutationPending = true;
+            lock (stateLock)
+            {
+                sample.ForeignActivity = sample.ForeignActivity || foreignActivity;
+                sample.ProtectiveStopState = protectiveOrder == null
+                    ? "NONE" : protectiveOrder.OrderState.ToString().ToUpperInvariant();
+                sample.NativeMutationPending = sample.NativeMutationPending
+                    || flattenInProgress
+                    || watchdogSafetyActionInFlight
+                    || pendingFlattenRecoveryProtectionDispatchPending
+                    || flatOwnedOrderCancellationDispatchPending
+                    || HasUnsettledEntryLifecycleUnderLock()
+                    || HasAmbiguousOwnedOutcomeUnderLock()
+                    || commandOutcomes.Values.Any(outcome =>
+                        outcome.Status == "PENDING" || outcome.Status == "UNKNOWN");
+            }
+            Dictionary<string, object> hashPayload = new Dictionary<string, object>();
+            hashPayload["position_facts"] = positionFacts;
+            hashPayload["order_facts"] = orderFacts;
+            hashPayload["position_quantity"] = sample.PositionQuantity;
+            hashPayload["working_order_count"] = sample.WorkingOrderCount;
+            hashPayload["working_entry_count"] = sample.WorkingEntryCount;
+            hashPayload["position_snapshot_complete"] = sample.PositionSnapshotComplete;
+            hashPayload["order_snapshot_complete"] = sample.OrderSnapshotComplete;
+            hashPayload["foreign_activity"] = sample.ForeignActivity;
+            hashPayload["protective_stop_state"] = sample.ProtectiveStopState;
+            hashPayload["native_mutation_pending"] = sample.NativeMutationPending;
+            using (SHA256 sha = SHA256.Create())
+                sample.Hash = BitConverter.ToString(
+                    sha.ComputeHash(Encoding.UTF8.GetBytes(Canonical(hashPayload)))
+                ).Replace("-", String.Empty).ToLowerInvariant();
+            return sample;
+        }
+
+        private static bool ExactFields(
+            Dictionary<string, object> message, IEnumerable<string> expected)
+        {
+            if (message == null) return false;
+            string[] names = expected.ToArray();
+            return message.Count == names.Length && names.All(message.ContainsKey);
         }
 
         private void EnqueueCommand(Dictionary<string, object> command)
@@ -2517,9 +2718,22 @@ namespace NinjaTrader.NinjaScript.AddOns
             TryPublishWatchdogSafetyReconciliation();
         }
 
+        private void BeginNativeObservationCallback()
+        {
+            Interlocked.Increment(ref nativeObservationCallbacksInFlight);
+            Interlocked.Increment(ref nativeObservationGeneration);
+        }
+
+        private void EndNativeObservationCallback()
+        {
+            Interlocked.Increment(ref nativeObservationGeneration);
+            Interlocked.Decrement(ref nativeObservationCallbacksInFlight);
+        }
+
         private void OnOrderUpdate(object sender, OrderEventArgs e)
         {
             if (e == null || e.Order == null || e.Order.Account != paperAccount) return;
+            BeginNativeObservationCallback();
             Order order = e.Order;
             // Order is a mutable NinjaTrader core object and can already be
             // ahead of this callback. Drive transitions and receipts only from
@@ -2766,11 +2980,13 @@ namespace NinjaTrader.NinjaScript.AddOns
             Position current = CurrentPosition();
             SettleFlattenOwnershipIfPossible(current != null && current.Quantity != 0);
             TryFinalizeRetainedTermination();
+            EndNativeObservationCallback();
         }
 
         private void OnExecutionUpdate(object sender, ExecutionEventArgs e)
         {
             if (e == null || e.Execution == null || e.Execution.Order == null || e.Execution.Order.Account != paperAccount) return;
+            BeginNativeObservationCallback();
             Order order = e.Execution.Order;
             // Execution is mutable for the same reason as Order. Preserve the
             // callback's immutable execution facts before touching shared state.
@@ -2801,6 +3017,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 lock (stateLock) { foreignActivity = true; lockedOut = true; }
                 LockAndProtect("FOREIGN_EXECUTION_ACTIVITY");
                 TryFinalizeRetainedTermination();
+                EndNativeObservationCallback();
                 return;
             }
             if (owner.Role == "ENTRY")
@@ -2988,11 +3205,13 @@ namespace NinjaTrader.NinjaScript.AddOns
             SettleFlattenOwnershipIfPossible(postExecution != null && postExecution.Quantity != 0);
             TryRearmProtectionAfterDefinitiveFlattenNoFill();
             TryFinalizeRetainedTermination();
+            EndNativeObservationCallback();
         }
 
         private void OnPositionUpdate(object sender, PositionEventArgs e)
         {
             if (e == null || e.Position == null || e.Position.Account != paperAccount) return;
+            BeginNativeObservationCallback();
             Position position = e.Position;
             bool exact = position.Instrument != null && String.Equals(position.Instrument.FullName, ExactInstrumentName, StringComparison.Ordinal);
             int eventQuantity = e.Quantity;
@@ -3002,9 +3221,14 @@ namespace NinjaTrader.NinjaScript.AddOns
             {
                 lock (stateLock) { foreignActivity = true; lockedOut = true; }
                 LockAndProtect("FOREIGN_POSITION_ACTIVITY");
+                EndNativeObservationCallback();
                 return;
             }
-            if (!exact) return;
+            if (!exact)
+            {
+                EndNativeObservationCallback();
+                return;
+            }
             int quantity = eventMarketPosition == MarketPosition.Short ? -eventQuantity
                 : eventMarketPosition == MarketPosition.Flat ? 0 : eventQuantity;
             string entryOwnershipIncident = null;
@@ -3115,6 +3339,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             SettleFlattenOwnershipIfPossible(quantity != 0);
             TryRearmProtectionAfterDefinitiveFlattenNoFill();
             TryFinalizeRetainedTermination();
+            EndNativeObservationCallback();
         }
 
         private void OnAccountItemUpdate(object sender, AccountItemEventArgs e)
@@ -3533,6 +3758,19 @@ namespace NinjaTrader.NinjaScript.AddOns
         private static void Diagnostic(string marker)
         {
             System.Diagnostics.Trace.WriteLine("L3G PAPER " + marker);
+        }
+
+        private sealed class ProbeNativeSample
+        {
+            public int PositionQuantity;
+            public int WorkingOrderCount;
+            public int WorkingEntryCount;
+            public bool PositionSnapshotComplete;
+            public bool OrderSnapshotComplete;
+            public bool ForeignActivity;
+            public string ProtectiveStopState;
+            public bool NativeMutationPending;
+            public string Hash;
         }
 
         private sealed class OwnedOrder

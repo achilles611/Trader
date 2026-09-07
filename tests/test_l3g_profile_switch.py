@@ -7,10 +7,12 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import threading
+from typing import Mapping
 import unittest
 from unittest.mock import patch
 
@@ -40,8 +42,13 @@ from src.l3g_paper.profile_switch import (
     _launch_child,
     _target_binding_matches,
     exact_flat_shutdown_ready,
+    finalize_stale_target_cleanup,
     remembered_profile_selection,
     supervise,
+)
+from src.l3g_paper.ninjatrader_transport import (
+    ADDON_PROTOCOL_VERSION,
+    expected_addon_source_fingerprint,
 )
 from src.l3g_paper.ledger import (
     PaperLedger,
@@ -132,6 +139,7 @@ def target_paper_status(
         "mode": "PAPER_SIM101",
         "state": "PAPER_RUNNING" if operational else "READY_DISARMED",
         "paper_execution": "RUNNING" if operational else "DISARMED",
+        "session_armed_state": "ARMED" if operational else "DISARMED",
         "paper_account": "Sim101",
         "account_class": "LOCAL_SIMULATION",
         "market_instrument": "MNQ SEP26",
@@ -145,6 +153,7 @@ def target_paper_status(
         "broker_snapshot_position_quantity": 0,
         "working_owned_orders": 0,
         "working_entry_orders": 0,
+        "entry_owner": "NONE",
         "foreign_activity": False,
         "protective_stop_state": "NONE",
         "position_snapshot_complete": True,
@@ -158,6 +167,15 @@ def target_paper_status(
             {"active": True, "stopping": False}
             if operational else None
         ),
+        "transport": {
+            "addon_protocol_version": ADDON_PROTOCOL_VERSION,
+            "addon_source_fingerprint": expected_addon_source_fingerprint(),
+            "expected_addon_source_fingerprint": expected_addon_source_fingerprint(),
+            "addon_build_fingerprint": "b" * 64,
+            "addon_build_timestamp": "2026-09-07T00:00:00Z",
+            "addon_provenance_valid": True,
+            "commands_sent": 0,
+        },
     }
     if profile == FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION:
         value["position_requirement"] = {
@@ -2657,6 +2675,246 @@ class ProfileSwitchServiceTests(unittest.TestCase):
         self.assertEqual(state["target_runtime_pid"], binding["pid"])
         self.assertFalse(state["target_cleanup"]["target_runtime_pid_absent"])
         self.assertIn("TARGET_PROCESS_EXIT_UNPROVEN", state["blockers"])
+
+        state_path = manifest_path.with_name("state.json")
+        audit_path = manifest_path.with_name("supervisor-audit.jsonl")
+        state_before_replay = state_path.read_bytes()
+        audit_before_replay = audit_path.read_bytes()
+        self.assertEqual(
+            supervise(
+                manifest_path,
+                2_147_483_647,
+                timeout_seconds=0.01,
+                poll_seconds=0.001,
+                pid_probe=lambda _pid: False,
+                port_probe=lambda: True,
+                wait=lambda _seconds: None,
+            ),
+            12,
+        )
+        self.assertEqual(state_path.read_bytes(), state_before_replay)
+        self.assertEqual(audit_path.read_bytes(), audit_before_replay)
+
+        target_ledger = Path(str(manifest["ledger_path"]))
+        companion_paths = (
+            target_ledger,
+            Path(str(target_ledger) + "-wal"),
+            Path(str(target_ledger) + "-shm"),
+        )
+        companion_paths[1].write_bytes(b"retained-wal-evidence")
+        companion_paths[2].write_bytes(b"retained-shm-evidence")
+        selection_path = self.root / "runtime" / "profile-switch" / "profile-selection.json"
+        selection_before = selection_path.read_bytes()
+
+        def file_identity(path: Path) -> tuple[str, int, int]:
+            value = path.read_bytes()
+            stat = path.stat()
+            return sha256(value).hexdigest(), stat.st_mtime_ns, stat.st_size
+
+        ledger_before = {path: file_identity(path) for path in companion_paths}
+        fake_proof = {
+            "status": "PASS",
+            "commands_sent": 0,
+            "session_count": 2,
+            "proof_hash": "a" * 64,
+            "completed_at": "2026-09-07T00:00:00Z",
+        }
+
+        def probe(**_kwargs: object) -> dict[str, object]:
+            return dict(fake_proof)
+
+        def validate(proof: Mapping[str, object], **_kwargs: object) -> dict[str, object]:
+            return dict(proof)
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
+            occupied.bind(("127.0.0.1", 0))
+            occupied.listen(1)
+            occupied_port = int(occupied.getsockname()[1])
+            with self.assertRaisesRegex(RuntimeError, "PORT_LEASE_UNAVAILABLE"):
+                finalize_stale_target_cleanup(
+                    self.root / "runtime",
+                    str(manifest["operation_id"]),
+                    pid_probe=lambda _pid: False,
+                    native_probe=probe,
+                    native_proof_validator=validate,
+                    _test_control_endpoint=("127.0.0.1", occupied_port),
+                )
+        self.assertEqual(state_path.read_bytes(), state_before_replay)
+
+        missing_parent = json.loads(state_before_replay.decode("utf-8"))
+        missing_parent["target_runtime_binding"].pop("parent_pid")
+        state_path.write_text(json.dumps(missing_parent), encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "STATE_BINDING_INVALID"):
+            finalize_stale_target_cleanup(
+                self.root / "runtime",
+                str(manifest["operation_id"]),
+                pid_probe=lambda _pid: False,
+                native_probe=probe,
+                native_proof_validator=validate,
+                _test_control_endpoint=("127.0.0.1", 0),
+            )
+        state_path.write_bytes(state_before_replay)
+
+        def unavailable_probe(**_kwargs: object) -> Mapping[str, object]:
+            raise RuntimeError("FRESH_NATIVE_RECONCILIATION_UNAVAILABLE")
+
+        with self.assertRaisesRegex(RuntimeError, "FRESH_NATIVE_RECONCILIATION_UNAVAILABLE"):
+            finalize_stale_target_cleanup(
+                self.root / "runtime",
+                str(manifest["operation_id"]),
+                pid_probe=lambda _pid: False,
+                native_probe=unavailable_probe,
+                native_proof_validator=validate,
+                _test_control_endpoint=("127.0.0.1", 0),
+            )
+        self.assertEqual(state_path.read_bytes(), state_before_replay)
+
+        pid_calls: dict[int, int] = {}
+
+        def resurrect_runtime_pid(pid: int) -> bool:
+            pid_calls[pid] = pid_calls.get(pid, 0) + 1
+            return pid == binding["pid"] and pid_calls[pid] == 2
+
+        with self.assertRaisesRegex(RuntimeError, "PROCESS_STILL_ACTIVE"):
+            finalize_stale_target_cleanup(
+                self.root / "runtime",
+                str(manifest["operation_id"]),
+                pid_probe=resurrect_runtime_pid,
+                native_probe=probe,
+                native_proof_validator=validate,
+                _test_control_endpoint=("127.0.0.1", 0),
+            )
+        self.assertEqual(state_path.read_bytes(), state_before_replay)
+
+        def mutate_state(**_kwargs: object) -> dict[str, object]:
+            changed = json.loads(state_before_replay.decode("utf-8"))
+            changed["unexpected_mutation"] = True
+            state_path.write_text(json.dumps(changed), encoding="utf-8")
+            return dict(fake_proof)
+
+        with self.assertRaisesRegex(RuntimeError, "INPUT_CHANGED"):
+            finalize_stale_target_cleanup(
+                self.root / "runtime",
+                str(manifest["operation_id"]),
+                pid_probe=lambda _pid: False,
+                native_probe=mutate_state,
+                native_proof_validator=validate,
+                _test_control_endpoint=("127.0.0.1", 0),
+            )
+        state_path.write_bytes(state_before_replay)
+        self.assertEqual(audit_path.read_bytes(), audit_before_replay)
+
+        final_pid_calls: dict[int, int] = {}
+
+        def mutate_during_final_pid_round(pid: int) -> bool:
+            final_pid_calls[pid] = final_pid_calls.get(pid, 0) + 1
+            if pid == binding["pid"] and final_pid_calls[pid] == 2:
+                changed = json.loads(state_before_replay.decode("utf-8"))
+                changed["mutation_during_final_pid_round"] = True
+                state_path.write_text(json.dumps(changed), encoding="utf-8")
+            return False
+
+        with self.assertRaisesRegex(RuntimeError, "INPUT_CHANGED"):
+            finalize_stale_target_cleanup(
+                self.root / "runtime",
+                str(manifest["operation_id"]),
+                pid_probe=mutate_during_final_pid_round,
+                native_probe=probe,
+                native_proof_validator=validate,
+                _test_control_endpoint=("127.0.0.1", 0),
+            )
+        state_path.write_bytes(state_before_replay)
+        self.assertEqual(audit_path.read_bytes(), audit_before_replay)
+
+        recovered = finalize_stale_target_cleanup(
+            self.root / "runtime",
+            str(manifest["operation_id"]),
+            pid_probe=lambda _pid: False,
+            native_probe=probe,
+            native_proof_validator=validate,
+            _test_control_endpoint=("127.0.0.1", 0),
+            _test_attestation_key=b"cleanup-attestation-test-key-32b",
+        )
+        self.assertEqual(recovered["stage"], "BLOCKED_SAFE")
+        self.assertFalse(recovered["in_progress"])
+        self.assertTrue(recovered["target_cleanup"]["cleanup_proven"])
+        self.assertTrue(recovered["target_cleanup"]["safe_terminal_proven"])
+        self.assertTrue(recovered["target_cleanup"]["native_exposure_absent"])
+        self.assertEqual(
+            recovered["target_cleanup"]["late_revalidation"]["pid_probe_rounds"],
+            2,
+        )
+        self.assertEqual(
+            recovered["target_cleanup"]["late_revalidation"]["native_commands_sent"],
+            0,
+        )
+        self.assertIn(
+            manifest["parent_pid"],
+            recovered["target_cleanup"]["late_revalidation"]["probed_absent_pids"],
+        )
+        self.assertNotIn("TARGET_PROCESS_EXIT_UNPROVEN", recovered["blockers"])
+        self.assertNotIn(
+            "TARGET_NATIVE_EXPOSURE_RELEASE_UNPROVEN", recovered["blockers"],
+        )
+        self.assertNotIn("TARGET_CLEANUP_UNPROVEN", recovered["blockers"])
+        self.assertEqual(selection_path.read_bytes(), selection_before)
+        self.assertEqual(
+            {path: file_identity(path) for path in companion_paths},
+            ledger_before,
+        )
+
+        def no_second_probe(**_kwargs: object) -> Mapping[str, object]:
+            raise AssertionError("idempotent finalization must not probe again")
+
+        repeated = finalize_stale_target_cleanup(
+            self.root / "runtime",
+            str(manifest["operation_id"]),
+            pid_probe=lambda _pid: (_ for _ in ()).throw(
+                AssertionError("idempotent finalization must not probe PIDs again")
+            ),
+            native_probe=no_second_probe,
+            native_proof_validator=validate,
+            _test_control_endpoint=("127.0.0.1", 0),
+            _test_attestation_key=b"cleanup-attestation-test-key-32b",
+        )
+        self.assertEqual(repeated, recovered)
+
+        terminal_state_bytes = state_path.read_bytes()
+
+        def assert_terminal_tamper_rejected(mutator) -> None:
+            tampered = json.loads(terminal_state_bytes.decode("utf-8"))
+            mutator(tampered)
+            state_path.write_text(json.dumps(tampered), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "NATIVE_PROOF_INVALID"):
+                finalize_stale_target_cleanup(
+                    self.root / "runtime",
+                    str(manifest["operation_id"]),
+                    pid_probe=lambda _pid: False,
+                    native_probe=no_second_probe,
+                    native_proof_validator=validate,
+                    _test_control_endpoint=("127.0.0.1", 0),
+                    _test_attestation_key=b"cleanup-attestation-test-key-32b",
+                )
+            state_path.write_bytes(terminal_state_bytes)
+
+        assert_terminal_tamper_rejected(
+            lambda value: value["target_cleanup"]["late_revalidation"].__setitem__(
+                "source_state_sha256", "0" * 64,
+            ),
+        )
+        assert_terminal_tamper_rejected(
+            lambda value: value["target_cleanup"].__setitem__(
+                "target_pid_absent", False,
+            ),
+        )
+        assert_terminal_tamper_rejected(
+            lambda value: value["blockers"].append("TARGET_CLEANUP_UNPROVEN"),
+        )
+        assert_terminal_tamper_rejected(
+            lambda value: value["target_paper_status"].__setitem__(
+                "broker_snapshot_position_quantity", 1,
+            ),
+        )
 
     def test_active_autostart_timeout_after_post_is_cleanup_unproven(self) -> None:
         manifest_path, manifest = self.supervisor_ready_manifest(

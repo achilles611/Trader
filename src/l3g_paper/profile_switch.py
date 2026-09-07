@@ -9,7 +9,9 @@ a complete controlled-ledger-shutdown receipt.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from functools import wraps
 import hashlib
 import json
 import os
@@ -21,7 +23,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Callable, Mapping
+from typing import BinaryIO, Callable, Iterator, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from uuid import uuid4
@@ -41,6 +43,12 @@ from .ledger import (
 from .risk_continuity import (
     read_risk_continuity_artifact,
     write_risk_continuity_artifact,
+)
+from .ninjatrader_transport import (
+    ADDON_PROTOCOL_VERSION,
+    LocalPaperSecretProvider,
+    sign_payload,
+    verify_signature,
 )
 from .perpetual_startup_seed import (
     read_perpetual_startup_seed_artifact,
@@ -101,6 +109,17 @@ def _append_jsonl(path: Path, payload: Mapping[str, object]) -> None:
     descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
     try:
         os.write(descriptor, _canonical(payload) + b"\n")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_exclusive_json(path: Path, payload: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(dict(payload), sort_keys=True, indent=2) + "\n"
+    descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        os.write(descriptor, encoded.encode("utf-8"))
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -1178,6 +1197,85 @@ def _control_port_released(host: str = "127.0.0.1", port: int = 8090) -> bool:
     return True
 
 
+@contextmanager
+def _control_port_lease(
+    host: str = "127.0.0.1", port: int = 8090,
+) -> Iterator[socket.socket]:
+    """Hold exclusive ownership of the control endpoint across finalization."""
+    lease = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if os.name == "nt":
+            lease.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:  # pragma: no cover - production host is Windows
+            lease.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        lease.bind((host, port))
+    except OSError as exc:
+        lease.close()
+        raise RuntimeError("PROFILE_SWITCH_CONTROL_PORT_LEASE_UNAVAILABLE") from exc
+    try:
+        yield lease
+    finally:
+        lease.close()
+
+
+def _lock_operation_file(handle: BinaryIO) -> None:
+    handle.seek(0)
+    if handle.read(1) == b"":
+        handle.write(b"\0")
+        handle.flush()
+        os.fsync(handle.fileno())
+    handle.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:  # pragma: no cover - production host is Windows
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        raise RuntimeError("PROFILE_SWITCH_OPERATION_LOCKED") from exc
+
+
+def _unlock_operation_file(handle: BinaryIO) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:  # pragma: no cover - production host is Windows
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def profile_switch_operation_lock(manifest_path: Path) -> Iterator[None]:
+    """Serialize one supervisor/finalizer pair with an OS-owned lock."""
+    lock_path = manifest_path.resolve().with_name("operation.lock")
+    with lock_path.open("a+b") as handle:
+        _lock_operation_file(handle)
+        try:
+            yield
+        finally:
+            _unlock_operation_file(handle)
+
+
+def _operation_locked(function: Callable[..., int]) -> Callable[..., int]:
+    """Keep the existing supervisor body while holding its operation lock."""
+    @wraps(function)
+    def locked(manifest_path: Path, *args: object, **kwargs: object) -> int:
+        with profile_switch_operation_lock(manifest_path):
+            return function(manifest_path, *args, **kwargs)
+
+    # ``functools.wraps`` intentionally does not copy keyword defaults, while
+    # the supervisor's bounded-budget test and operator diagnostics inspect
+    # them directly.
+    locked.__kwdefaults__ = function.__kwdefaults__
+    return locked
+
+
 def _target_paper_identity_matches(
     paper: Mapping[str, object], manifest: Mapping[str, object],
 ) -> bool:
@@ -1439,6 +1537,572 @@ def _cleanup_spawned_target(
     }
 
 
+def finalize_stale_target_cleanup(
+    runtime_root: str | Path,
+    operation_id: str,
+    *,
+    pid_probe: Callable[[int], bool] = _pid_exists,
+    native_probe: Callable[..., Mapping[str, object]] | None = None,
+    native_proof_validator: Callable[..., Mapping[str, object]] | None = None,
+    timeout_seconds: float = 30.0,
+    _test_control_endpoint: tuple[str, int] | None = None,
+    _test_attestation_key: bytes | None = None,
+) -> dict[str, object]:
+    """Explicitly finalize one stale target only with fresh native flat proof.
+
+    The finalizer is deliberately offline and command-incapable.  It preserves
+    every ledger byte, holds the control port and operation lock throughout the
+    transition, and accepts only two fresh signed AddOn reconciliations showing
+    an exact flat Sim101 account with no working or foreign orders.
+    """
+    if _PROFILE_SWITCH_OPERATION.fullmatch(operation_id) is None:
+        raise RuntimeError("PROFILE_SWITCH_CLEANUP_OPERATION_INVALID")
+    if timeout_seconds <= 0:
+        raise ValueError("Cleanup finalization timeout must be positive.")
+    if _test_control_endpoint is None:
+        control_host, control_port = "127.0.0.1", 8090
+    else:
+        control_host, control_port = _test_control_endpoint
+        if (
+            control_host != "127.0.0.1"
+            or type(control_port) is not int
+            or not 0 <= control_port <= 65535
+        ):
+            raise ValueError("Cleanup test control endpoint is invalid.")
+    root = Path(runtime_root).resolve()
+    operation_root = root / "profile-switch" / "operations" / operation_id
+    manifest_path = operation_root / "manifest.json"
+    state_path = operation_root / "state.json"
+    claim_path = operation_root / "target-launch-claim.json"
+    selection_path = _selection_path(root)
+
+    def read_bytes(path: Path, code: str) -> bytes:
+        try:
+            value = path.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(code) from exc
+        if not value:
+            raise RuntimeError(code)
+        return value
+
+    def prove_absent(pids: tuple[int, ...]) -> None:
+        try:
+            results = [pid_probe(pid) for pid in pids]
+        except Exception as exc:  # noqa: BLE001 - a failed probe is no proof
+            raise RuntimeError("PROFILE_SWITCH_CLEANUP_PID_PROBE_FAILED") from exc
+        if any(result is not False for result in results):
+            raise RuntimeError("PROFILE_SWITCH_CLEANUP_PROCESS_STILL_ACTIVE")
+
+    def attestation_key() -> bytes:
+        candidate = _test_attestation_key
+        if candidate is None:
+            try:
+                candidate = LocalPaperSecretProvider().load_key()
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "PROFILE_SWITCH_CLEANUP_ATTESTATION_KEY_UNAVAILABLE"
+                ) from exc
+        if type(candidate) is not bytes or len(candidate) < 32:
+            raise RuntimeError("PROFILE_SWITCH_CLEANUP_ATTESTATION_KEY_INVALID")
+        return candidate
+
+    with profile_switch_operation_lock(manifest_path):
+        manifest_bytes = read_bytes(
+            manifest_path, "PROFILE_SWITCH_CLEANUP_MANIFEST_UNREADABLE",
+        )
+        manifest = _manifest(manifest_path)
+        if (
+            manifest.get("operation_id") != operation_id
+            or Path(str(manifest.get("runtime_root"))).resolve() != root
+            or manifest_path.resolve()
+            != (root / "profile-switch" / "operations" / operation_id / "manifest.json").resolve()
+        ):
+            raise RuntimeError("PROFILE_SWITCH_CLEANUP_MANIFEST_BINDING_INVALID")
+
+        selection_bytes = read_bytes(
+            selection_path, "PROFILE_SWITCH_CLEANUP_SELECTION_UNREADABLE",
+        )
+        selection = _validated_selection(root, required=True)
+        assert selection is not None
+        requested = selection.get("requested")
+        if not isinstance(requested, Mapping) or dict(requested) != {
+            "profile": manifest.get("target_profile"),
+            "request_id": manifest.get("request_id"),
+            "operation_id": operation_id,
+            "requested_at": manifest.get("created_at"),
+        }:
+            raise RuntimeError("PROFILE_SWITCH_CLEANUP_SELECTION_BINDING_INVALID")
+
+        state_bytes = read_bytes(
+            state_path, "PROFILE_SWITCH_CLEANUP_STATE_UNREADABLE",
+        )
+        state = _read_json(state_path)
+        claim_bytes = read_bytes(
+            claim_path, "PROFILE_SWITCH_CLEANUP_CLAIM_UNREADABLE",
+        )
+        claim = _read_json(claim_path)
+        if (
+            set(claim) != {
+                "schema", "operation_id", "manifest_sha256", "claimed_at",
+                "supervisor_pid",
+            }
+            or claim.get("schema") != PROFILE_SWITCH_SCHEMA
+            or claim.get("operation_id") != operation_id
+            or claim.get("manifest_sha256") != manifest.get("manifest_sha256")
+            or not isinstance(claim.get("claimed_at"), str)
+            or not str(claim.get("claimed_at")).strip()
+            or type(claim.get("supervisor_pid")) is not int
+            or int(claim["supervisor_pid"]) <= 0
+        ):
+            raise RuntimeError("PROFILE_SWITCH_CLEANUP_CLAIM_BINDING_INVALID")
+
+        cleanup = state.get("target_cleanup")
+        binding = state.get("target_runtime_binding")
+        paper = state.get("target_paper_status")
+        blockers = state.get("blockers")
+        target_pid = state.get("target_pid")
+        target_runtime_pid = state.get("target_runtime_pid")
+        supervisor_pid = claim.get("supervisor_pid")
+        source_parent_pid = manifest.get("parent_pid")
+        if (
+            state.get("schema") != PROFILE_SWITCH_SCHEMA
+            or state.get("operation_id") != operation_id
+            or state.get("request_id") != manifest.get("request_id")
+            or state.get("current_profile") != manifest.get("current_profile")
+            or state.get("target_profile") != manifest.get("target_profile")
+            or Path(str(state.get("manifest_path"))).resolve() != manifest_path.resolve()
+            or not isinstance(cleanup, Mapping)
+            or not isinstance(binding, Mapping)
+            or not isinstance(paper, Mapping)
+            or not isinstance(blockers, list)
+            or not all(isinstance(item, str) and item for item in blockers)
+            or type(target_pid) is not int
+            or target_pid <= 0
+            or type(target_runtime_pid) is not int
+            or target_runtime_pid <= 0
+            or type(supervisor_pid) is not int
+            or supervisor_pid <= 0
+            or supervisor_pid in {target_pid, target_runtime_pid}
+            or type(source_parent_pid) is not int
+            or source_parent_pid <= 0
+            or source_parent_pid in {supervisor_pid, target_pid, target_runtime_pid}
+            or cleanup.get("target_pid") != target_pid
+            or cleanup.get("target_runtime_pid") != target_runtime_pid
+            or binding.get("pid") != target_runtime_pid
+            or type(binding.get("parent_pid")) is not int
+            or int(binding["parent_pid"]) <= 0
+            or int(binding["parent_pid"]) not in {target_pid, supervisor_pid}
+        ):
+            raise RuntimeError("PROFILE_SWITCH_CLEANUP_STATE_BINDING_INVALID")
+
+        transport = paper.get("transport")
+        if not isinstance(transport, Mapping):
+            raise RuntimeError("PROFILE_SWITCH_CLEANUP_PROVENANCE_INVALID")
+        build_fingerprint = transport.get("addon_build_fingerprint")
+        build_timestamp = transport.get("addon_build_timestamp")
+        source_fingerprint = transport.get("expected_addon_source_fingerprint")
+        if (
+            transport.get("addon_provenance_valid") is not True
+            or transport.get("addon_protocol_version") != ADDON_PROTOCOL_VERSION
+            or transport.get("addon_source_fingerprint") != source_fingerprint
+            or not isinstance(source_fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", source_fingerprint) is None
+            or not isinstance(build_fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", build_fingerprint) is None
+            or not isinstance(build_timestamp, str)
+            or not build_timestamp.strip()
+            or type(transport.get("commands_sent")) is not int
+            or transport.get("commands_sent") != 0
+        ):
+            raise RuntimeError("PROFILE_SWITCH_CLEANUP_PROVENANCE_INVALID")
+
+        continuity = read_risk_continuity_artifact(
+            manifest_path.with_name("risk-continuity.json"),
+            operation_id=operation_id,
+            target_profile=str(manifest.get("target_profile")),
+        )
+        seed_artifact: Mapping[str, object] | None = None
+        seed_proof: Mapping[str, object] | None = None
+        if manifest.get("perpetual_startup_seed_required") is True:
+            seed_path = Path(
+                str(manifest.get("perpetual_startup_seed_path") or ""),
+            ).resolve()
+            seed_proof_path = Path(
+                str(manifest.get("perpetual_startup_seed_proof_path") or ""),
+            ).resolve()
+            if (
+                seed_path.parent != operation_root.resolve()
+                or seed_proof_path.parent != operation_root.resolve()
+            ):
+                raise RuntimeError("PROFILE_SWITCH_CLEANUP_SEED_BINDING_INVALID")
+            seed_artifact = read_perpetual_startup_seed_artifact(
+                seed_path, operation_id=operation_id,
+            )
+            seed_proof = read_perpetual_startup_seed_proof(
+                seed_proof_path, artifact=seed_artifact,
+                operation_id=operation_id,
+            )
+            if (
+                state.get("perpetual_startup_seed_artifact_sha256")
+                != seed_artifact.get("artifact_sha256")
+                or state.get("perpetual_startup_seed_proof_sha256")
+                != seed_proof.get("proof_sha256")
+                or seed_proof.get("manifest_sha256")
+                != manifest.get("manifest_sha256")
+            ):
+                raise RuntimeError("PROFILE_SWITCH_CLEANUP_SEED_BINDING_INVALID")
+        if not _target_binding_matches(
+            binding,
+            manifest,
+            continuity,
+            target_pid=target_pid,
+            seed_artifact=seed_artifact,
+            seed_proof=seed_proof,
+        ):
+            raise RuntimeError("PROFILE_SWITCH_CLEANUP_RUNTIME_BINDING_INVALID")
+
+        all_pids = tuple(sorted({
+            source_parent_pid,
+            supervisor_pid,
+            target_pid,
+            target_runtime_pid,
+            int(binding["parent_pid"]),
+        }))
+
+        if native_probe is None or native_proof_validator is None:
+            from .ninjatrader_reconciliation_probe import (
+                probe_flat_sim101_reconciliation,
+                validate_flat_sim101_reconciliation_proof,
+            )
+
+            native_probe = native_probe or probe_flat_sim101_reconciliation
+            native_proof_validator = (
+                native_proof_validator
+                or validate_flat_sim101_reconciliation_proof
+            )
+
+        removable_cleanup_blockers = {
+            "TARGET_PROCESS_EXIT_UNPROVEN",
+            "TARGET_CONTROL_PORT_RELEASE_UNPROVEN",
+            "TARGET_NATIVE_EXPOSURE_RELEASE_UNPROVEN",
+            "TARGET_CLEANUP_UNPROVEN",
+        }
+        late = cleanup.get("late_revalidation")
+        if state.get("stage") == "BLOCKED_SAFE" and isinstance(late, Mapping):
+            proof_path = Path(str(late.get("native_proof_path") or "")).resolve()
+            proof_file = read_bytes(
+                proof_path, "PROFILE_SWITCH_CLEANUP_NATIVE_PROOF_UNREADABLE",
+            )
+            try:
+                stored_proof = json.loads(proof_file.decode("utf-8"))
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("PROFILE_SWITCH_CLEANUP_NATIVE_PROOF_INVALID") from exc
+            validated_stored_proof = native_proof_validator(
+                stored_proof,
+                expected_policy_hash=str(manifest["paper_policy_hash"]),
+                expected_risk_hash=str(manifest["risk_profile_hash"]),
+                expected_at=(
+                    stored_proof.get("completed_at")
+                    if isinstance(stored_proof, Mapping) else None
+                ),
+            )
+            prior_attempt = cleanup.get("prior_attempt")
+            cleanup_attestation = late.get("cleanup_attestation")
+            if not isinstance(prior_attempt, Mapping) or not isinstance(
+                cleanup_attestation, Mapping,
+            ):
+                raise RuntimeError("PROFILE_SWITCH_CLEANUP_NATIVE_PROOF_INVALID")
+            terminal_late_core = dict(late)
+            terminal_late_core.pop("cleanup_attestation", None)
+            terminal_cleanup_core = dict(cleanup)
+            terminal_cleanup_core["late_revalidation"] = terminal_late_core
+            terminal_state_core = dict(state)
+            terminal_state_core["target_cleanup"] = terminal_cleanup_core
+            terminal_state_core_sha256 = hashlib.sha256(
+                _canonical(terminal_state_core),
+            ).hexdigest()
+            expected_attestation = {
+                "schema": "lane-iii-profile-switch-late-cleanup-attestation-v1",
+                "operation_id": operation_id,
+                "request_id": manifest.get("request_id"),
+                "manifest_sha256": manifest.get("manifest_sha256"),
+                "source_state_sha256": late.get("source_state_sha256"),
+                "selection_sha256": hashlib.sha256(selection_bytes).hexdigest(),
+                "claim_sha256": hashlib.sha256(claim_bytes).hexdigest(),
+                "prior_attempt_sha256": hashlib.sha256(
+                    _canonical(prior_attempt),
+                ).hexdigest(),
+                "terminal_state_core_sha256": terminal_state_core_sha256,
+                "probed_absent_pids": list(all_pids),
+                "pid_probe_rounds": 2,
+                "control_host": control_host,
+                "control_port_number": control_port,
+                "native_proof_path": str(proof_path),
+                "native_proof_hash": late.get("native_proof_hash"),
+                "native_proof_file_sha256": late.get("native_proof_file_sha256"),
+                "revalidated_at": late.get("revalidated_at"),
+                "final_cleanup": {
+                    "target_pid_absent": True,
+                    "target_runtime_pid_absent": True,
+                    "process_dead": True,
+                    "control_port_released": True,
+                    "native_exposure_absent": True,
+                    "cleanup_proven": True,
+                    "safe_terminal_proven": True,
+                },
+                "retained_blockers": list(blockers),
+            }
+            unsigned_attestation = dict(cleanup_attestation)
+            supplied_attestation_signature = unsigned_attestation.pop(
+                "signature", None,
+            )
+            signed_attestation = dict(unsigned_attestation)
+            signed_attestation["signature"] = supplied_attestation_signature
+            expected_late_fields = {
+                "schema", "revalidated_at", "source_state_sha256",
+                "selection_sha256", "claim_sha256", "manifest_sha256",
+                "probed_absent_pids", "pid_probe_rounds", "control_port",
+                "control_host", "control_port_number",
+                "control_port_lease_held_through_commit", "native_proof_path",
+                "native_proof_hash", "native_proof_file_sha256",
+                "native_session_count", "native_commands_sent",
+                "native_exposure_absent", "cleanup_attestation",
+            }
+            expected_cleanup = {
+                **dict(prior_attempt),
+                "target_pid_absent": True,
+                "target_runtime_pid_absent": True,
+                "process_dead": True,
+                "control_port_released": True,
+                "native_exposure_absent": True,
+                "cleanup_proven": True,
+                "safe_terminal_proven": True,
+                "prior_attempt": dict(prior_attempt),
+                "late_revalidation": dict(late),
+            }
+            if (
+                proof_path.parent != operation_root.resolve()
+                or not proof_path.name.startswith("late-cleanup-native-proof-")
+                or proof_path.suffix != ".json"
+                or not isinstance(validated_stored_proof, Mapping)
+                or validated_stored_proof.get("proof_hash")
+                != late.get("native_proof_hash")
+                or hashlib.sha256(proof_file).hexdigest()
+                != late.get("native_proof_file_sha256")
+                or cleanup.get("cleanup_proven") is not True
+                or cleanup.get("safe_terminal_proven") is not True
+                or cleanup.get("native_exposure_absent") is not True
+                or state.get("in_progress") is not False
+                or late.get("schema")
+                != "lane-iii-profile-switch-late-cleanup-v1"
+                or late.get("manifest_sha256") != manifest.get("manifest_sha256")
+                or late.get("selection_sha256")
+                != hashlib.sha256(selection_bytes).hexdigest()
+                or late.get("claim_sha256")
+                != hashlib.sha256(claim_bytes).hexdigest()
+                or not isinstance(late.get("source_state_sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", str(late.get("source_state_sha256"))) is None
+                or late.get("probed_absent_pids") != list(all_pids)
+                or late.get("pid_probe_rounds") != 2
+                or late.get("control_port_lease_held_through_commit") is not True
+                or not isinstance(late.get("control_host"), str)
+                or not isinstance(late.get("control_port_number"), int)
+                or late.get("control_port")
+                != f"{late.get('control_host')}:{late.get('control_port_number')}"
+                or late.get("native_session_count") != 2
+                or late.get("native_commands_sent") != 0
+                or late.get("native_exposure_absent") is not True
+                or state.get("target_cleanup_revalidated_at")
+                != late.get("revalidated_at")
+                or set(late) != expected_late_fields
+                or dict(cleanup) != expected_cleanup
+                or any(item in removable_cleanup_blockers for item in blockers)
+                or unsigned_attestation != expected_attestation
+                or not isinstance(supplied_attestation_signature, str)
+                or not verify_signature(attestation_key(), signed_attestation)
+            ):
+                raise RuntimeError("PROFILE_SWITCH_CLEANUP_NATIVE_PROOF_INVALID")
+            return state
+        if (
+            state.get("stage") != "TARGET_CLEANUP_UNPROVEN"
+            or state.get("in_progress") is not True
+            or "TARGET_CLEANUP_UNPROVEN" not in blockers
+            or cleanup.get("cleanup_proven") is not False
+            or cleanup.get("safe_terminal_proven") is not False
+            or cleanup.get("process_handle_exited") is not True
+            or paper.get("state") != "READY_DISARMED"
+            or paper.get("paper_execution") != "DISARMED"
+            or paper.get("session_armed_state") != "DISARMED"
+            or paper.get("entry_owner") != "NONE"
+            or paper.get("protective_stop_state") != "NONE"
+            or not _target_non_operational_flat_proven(paper, manifest)
+        ):
+            raise RuntimeError("PROFILE_SWITCH_CLEANUP_NOT_ELIGIBLE")
+
+        with _control_port_lease(control_host, control_port):
+            prove_absent(all_pids)
+            native_proof = native_probe(
+                paper_policy_hash=str(manifest["paper_policy_hash"]),
+                risk_profile_hash=str(manifest["risk_profile_hash"]),
+                timeout_seconds=timeout_seconds,
+            )
+            validated_native_proof = native_proof_validator(
+                native_proof,
+                expected_policy_hash=str(manifest["paper_policy_hash"]),
+                expected_risk_hash=str(manifest["risk_profile_hash"]),
+                expected_at=_utc_now(),
+            )
+            if (
+                not isinstance(validated_native_proof, Mapping)
+                or validated_native_proof.get("status") != "PASS"
+                or validated_native_proof.get("commands_sent") != 0
+                or validated_native_proof.get("session_count") != 2
+                or not isinstance(validated_native_proof.get("proof_hash"), str)
+            ):
+                raise RuntimeError("PROFILE_SWITCH_CLEANUP_NATIVE_PROOF_INVALID")
+
+            proof_path = operation_root / (
+                "late-cleanup-native-proof-" + uuid4().hex + ".json"
+            )
+            _write_exclusive_json(proof_path, validated_native_proof)
+            proof_file_sha256 = hashlib.sha256(proof_path.read_bytes()).hexdigest()
+
+            # Revalidate every mutable input and every PID after the bounded
+            # native observation, while the operation and control-port leases
+            # are still held. Any change leaves the original state untouched.
+            if (
+                read_bytes(manifest_path, "PROFILE_SWITCH_CLEANUP_MANIFEST_UNREADABLE")
+                != manifest_bytes
+                or read_bytes(selection_path, "PROFILE_SWITCH_CLEANUP_SELECTION_UNREADABLE")
+                != selection_bytes
+                or read_bytes(state_path, "PROFILE_SWITCH_CLEANUP_STATE_UNREADABLE")
+                != state_bytes
+                or read_bytes(claim_path, "PROFILE_SWITCH_CLEANUP_CLAIM_UNREADABLE")
+                != claim_bytes
+                or _manifest(manifest_path) != manifest
+                or _validated_selection(root, required=True) != selection
+                or _read_json(state_path) != state
+                or _read_json(claim_path) != claim
+            ):
+                raise RuntimeError("PROFILE_SWITCH_CLEANUP_INPUT_CHANGED")
+            prove_absent(all_pids)
+
+            # The PID probe is an injected boundary in tests and an external
+            # process observation in production. Recheck every captured input
+            # after the final probe round and build the replacement from that
+            # captured value; never reread/merge a potentially changed file.
+            if (
+                read_bytes(manifest_path, "PROFILE_SWITCH_CLEANUP_MANIFEST_UNREADABLE")
+                != manifest_bytes
+                or read_bytes(selection_path, "PROFILE_SWITCH_CLEANUP_SELECTION_UNREADABLE")
+                != selection_bytes
+                or read_bytes(state_path, "PROFILE_SWITCH_CLEANUP_STATE_UNREADABLE")
+                != state_bytes
+                or read_bytes(claim_path, "PROFILE_SWITCH_CLEANUP_CLAIM_UNREADABLE")
+                != claim_bytes
+            ):
+                raise RuntimeError("PROFILE_SWITCH_CLEANUP_INPUT_CHANGED")
+
+            revalidated_at = _utc_now()
+            prior_cleanup = dict(cleanup)
+            retained = [
+                item for item in blockers
+                if item not in removable_cleanup_blockers
+            ]
+            late_revalidation: dict[str, object] = {
+                "schema": "lane-iii-profile-switch-late-cleanup-v1",
+                "revalidated_at": revalidated_at,
+                "source_state_sha256": hashlib.sha256(state_bytes).hexdigest(),
+                "selection_sha256": hashlib.sha256(selection_bytes).hexdigest(),
+                "claim_sha256": hashlib.sha256(claim_bytes).hexdigest(),
+                "manifest_sha256": manifest.get("manifest_sha256"),
+                "probed_absent_pids": list(all_pids),
+                "pid_probe_rounds": 2,
+                "control_port": f"{control_host}:{control_port}",
+                "control_host": control_host,
+                "control_port_number": control_port,
+                "control_port_lease_held_through_commit": True,
+                "native_proof_path": str(proof_path),
+                "native_proof_hash": validated_native_proof["proof_hash"],
+                "native_proof_file_sha256": proof_file_sha256,
+                "native_session_count": 2,
+                "native_commands_sent": 0,
+                "native_exposure_absent": True,
+            }
+            recovered_cleanup = {
+                **prior_cleanup,
+                "target_pid_absent": True,
+                "target_runtime_pid_absent": True,
+                "process_dead": True,
+                "control_port_released": True,
+                "native_exposure_absent": True,
+                "cleanup_proven": True,
+                "safe_terminal_proven": True,
+                "prior_attempt": prior_cleanup,
+                "late_revalidation": late_revalidation,
+            }
+            recovered_state = dict(state)
+            recovered_state.update({
+                "stage": "BLOCKED_SAFE",
+                "blockers": retained,
+                "target_cleanup": recovered_cleanup,
+                "target_cleanup_revalidated_at": revalidated_at,
+                "updated_at": _utc_now(),
+                "in_progress": False,
+            })
+            terminal_state_core_sha256 = hashlib.sha256(
+                _canonical(recovered_state),
+            ).hexdigest()
+            cleanup_attestation: dict[str, object] = {
+                "schema": "lane-iii-profile-switch-late-cleanup-attestation-v1",
+                "operation_id": operation_id,
+                "request_id": manifest.get("request_id"),
+                "manifest_sha256": manifest.get("manifest_sha256"),
+                "source_state_sha256": late_revalidation["source_state_sha256"],
+                "selection_sha256": late_revalidation["selection_sha256"],
+                "claim_sha256": late_revalidation["claim_sha256"],
+                "prior_attempt_sha256": hashlib.sha256(
+                    _canonical(prior_cleanup),
+                ).hexdigest(),
+                "terminal_state_core_sha256": terminal_state_core_sha256,
+                "probed_absent_pids": list(all_pids),
+                "pid_probe_rounds": 2,
+                "control_host": control_host,
+                "control_port_number": control_port,
+                "native_proof_path": str(proof_path),
+                "native_proof_hash": validated_native_proof["proof_hash"],
+                "native_proof_file_sha256": proof_file_sha256,
+                "revalidated_at": revalidated_at,
+                "final_cleanup": {
+                    "target_pid_absent": True,
+                    "target_runtime_pid_absent": True,
+                    "process_dead": True,
+                    "control_port_released": True,
+                    "native_exposure_absent": True,
+                    "cleanup_proven": True,
+                    "safe_terminal_proven": True,
+                },
+                "retained_blockers": retained,
+            }
+            cleanup_attestation["signature"] = sign_payload(
+                attestation_key(), cleanup_attestation,
+            )
+            # The core hash above intentionally excludes this nested
+            # attestation to avoid a circular digest. The HMAC binds that exact
+            # full-state core, and then the attestation is the only insertion.
+            late_revalidation["cleanup_attestation"] = cleanup_attestation
+            _atomic_json(state_path, recovered_state)
+            _append_jsonl(operation_root / "supervisor-audit.jsonl", {
+                "schema": PROFILE_SWITCH_SCHEMA,
+                "event": "TARGET_CLEANUP_LATE_REVALIDATED",
+                "recorded_at": _utc_now(),
+                "operation_id": recovered_state.get("operation_id"),
+                "stage": recovered_state.get("stage"),
+                "blockers": recovered_state.get("blockers"),
+            })
+            return recovered_state
+
+
 def _claim_target_launch(manifest_path: Path, manifest: Mapping[str, object]) -> bool:
     claim_path = manifest_path.with_name("target-launch-claim.json")
     claim = {
@@ -1582,6 +2246,7 @@ def _bounded_full_verification(
     return _exact_verification_report(paths, verification_id)
 
 
+@_operation_locked
 def supervise(
     manifest_path: Path,
     parent_pid: int,
@@ -1604,6 +2269,20 @@ def supervise(
 ) -> int:
     manifest = _manifest(manifest_path)
     state_path = manifest_path.with_name("state.json")
+    try:
+        inherited_state = _read_json(state_path)
+    except (OSError, UnicodeError, ValueError, RuntimeError):
+        inherited_state = None
+    if (
+        isinstance(inherited_state, Mapping)
+        and inherited_state.get("schema") == PROFILE_SWITCH_SCHEMA
+        and inherited_state.get("operation_id") == manifest.get("operation_id")
+        and inherited_state.get("stage") == "TARGET_CLEANUP_UNPROVEN"
+    ):
+        # Only the explicit offline finalizer may add the fresh native proof
+        # needed to close this state. A replayed supervisor must leave both the
+        # projection and its audit bytes untouched.
+        return 12
 
     def notify(blockers: list[str]) -> None:
         if notify_operator is None:

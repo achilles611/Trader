@@ -30,6 +30,7 @@ from src.l3g_paper.profile_switch import (
     PROFILE_SWITCH_SCHEMA,
     _manifest as validated_profile_switch_manifest,
     _validated_selection as validated_profile_selection,
+    finalize_stale_target_cleanup,
     remembered_profile_selection,
 )
 
@@ -187,6 +188,21 @@ def _maintenance_arguments(argv: Sequence[str]) -> dict[str, str] | None:
             "Explicit maintenance launch requires ledger path, audit root, ledger epoch, and paper profile together."
         )
     return {key: str(value).strip() for key, value in values.items()} if all(supplied) else None
+
+
+def _cleanup_finalization_operation(argv: Sequence[str]) -> str | None:
+    """Recognize the one explicit, offline stale-cleanup maintenance mode."""
+    flag = "--finalize-stale-profile-cleanup"
+    if flag not in argv:
+        return None
+    if len(argv) != 2 or argv[0] != flag:
+        raise RuntimeError(
+            "Stale profile cleanup finalization must be invoked alone with one operation id."
+        )
+    operation_id = str(argv[1]).strip()
+    if _PROFILE_SWITCH_OPERATION.fullmatch(operation_id) is None:
+        raise RuntimeError("Stale profile cleanup finalization operation id is invalid.")
+    return operation_id
 
 
 def _remembered_selection_without_ledger(runtime_root: Path, *, git_sha: str) -> dict[str, object] | None:
@@ -923,11 +939,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         root = project_root()
         validate_project_root(root)
         launch_arguments = () if argv is None else argv
+        cleanup_operation = _cleanup_finalization_operation(launch_arguments)
         if getattr(sys, "frozen", False):
             # The executable is a UI wrapper. Runtime selection and startup are
             # always decided by the current checkout source and its exact Git
             # identity, never by PyInstaller-bundled strategy contracts.
-            delegate_frozen_launcher(root, launch_arguments)
+            delegated = delegate_frozen_launcher(root, launch_arguments)
+            if cleanup_operation is not None:
+                # This explicit evidence transition is unlike ordinary UI
+                # startup: the wrapper must remain attached and propagate a
+                # checkout-side failure instead of reporting success while the
+                # authoritative child is still running.
+                return_code = delegated.wait()
+                if return_code != 0:
+                    show_error(
+                        "The authoritative stale-cleanup finalizer failed "
+                        f"with exit code {return_code}."
+                    )
+                return return_code
+            return 0
+
+        if cleanup_operation is not None:
+            runtime_root = profile_switch_root()
+            with direct_launch_reservation(runtime_root):
+                finalized = finalize_stale_target_cleanup(
+                    runtime_root, cleanup_operation,
+                )
+            if finalized.get("stage") != "BLOCKED_SAFE":
+                raise RuntimeError(
+                    "Stale profile cleanup did not reach the exact BLOCKED_SAFE terminal state."
+                )
             return 0
 
         listener_open = port_is_open()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import replace
 from hashlib import sha256
 import json
@@ -793,6 +794,62 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
             with patch("beez_console.validated_profile_selection", return_value=selection):
                 with self.assertRaisesRegex(RuntimeError, "requested profile handoff"):
                     beez_console.assert_remembered_launch_is_not_competing(expected)
+
+    def test_stale_cleanup_finalization_requires_its_explicit_standalone_mode(self) -> None:
+        operation_id = "profile-switch-" + "d" * 32
+        self.assertIsNone(beez_console._cleanup_finalization_operation(()))
+        with self.assertRaisesRegex(RuntimeError, "invoked alone"):
+            beez_console._cleanup_finalization_operation((
+                "--finalize-stale-profile-cleanup",
+                operation_id,
+                "--maintenance-paper-profile",
+            ))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime_root = root / "runtime"
+            with (
+                patch("beez_console.project_root", return_value=root),
+                patch("beez_console.validate_project_root"),
+                patch("beez_console.profile_switch_root", return_value=runtime_root),
+                patch(
+                    "beez_console.direct_launch_reservation",
+                    side_effect=lambda _root: nullcontext(),
+                ),
+                patch(
+                    "beez_console.finalize_stale_target_cleanup",
+                    return_value={"stage": "BLOCKED_SAFE"},
+                ) as finalize,
+                patch("beez_console.port_is_open") as port_open,
+            ):
+                result = beez_console.main((
+                    "--finalize-stale-profile-cleanup", operation_id,
+                ))
+            self.assertEqual(result, 0)
+            finalize.assert_called_once_with(runtime_root, operation_id)
+            port_open.assert_not_called()
+
+        delegated = Mock()
+        delegated.wait.return_value = 9
+        with (
+            patch("beez_console.project_root", return_value=Path("C:/authoritative")),
+            patch("beez_console.validate_project_root"),
+            patch.object(beez_console.sys, "frozen", True, create=True),
+            patch("beez_console.delegate_frozen_launcher", return_value=delegated) as delegate,
+            patch("beez_console.finalize_stale_target_cleanup") as finalize,
+            patch("beez_console.show_error") as show_error,
+        ):
+            result = beez_console.main((
+                "--finalize-stale-profile-cleanup", operation_id,
+            ))
+        self.assertEqual(result, 9)
+        delegate.assert_called_once_with(
+            Path("C:/authoritative"),
+            ("--finalize-stale-profile-cleanup", operation_id),
+        )
+        delegated.wait.assert_called_once_with()
+        finalize.assert_not_called()
+        show_error.assert_called_once()
 
     def test_start_script_routes_explicit_binding_through_launcher_arguments(self) -> None:
         script = (Path(__file__).resolve().parents[1] / "scripts" / "start_beezconsole.ps1").read_text(
