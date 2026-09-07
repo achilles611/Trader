@@ -1130,7 +1130,13 @@ class ExperimentalPaperPolicy:
             identifiers.update(item.observation_id for item in self._depth)
             for history in self._depth_by_price.values():
                 identifiers.update(item.observation_id for item in history)
-            for evidence in self._evidence.values():
+            # V2 evaluates a completed boundary against the bounded evidence
+            # revision history, not only the latest value for each label.  A
+            # callback just after the boundary can replace the current value
+            # before that boundary is reconstructed, so pruning only
+            # ``_evidence`` can discard raw provenance which
+            # ``_active_evidence`` still truthfully selects for the close.
+            for evidence in self._evidence_history:
                 identifiers.update(evidence.source_observation_ids)
             if self._market_observation_history:
                 # The final pre-boundary callback is the deterministic

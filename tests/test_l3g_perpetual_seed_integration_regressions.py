@@ -481,6 +481,64 @@ class PerpetualSeedIntegrationRegressionTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_pruning_retains_historical_evidence_revision_provenance(self) -> None:
+        """Delayed boundary reconstruction keeps every bounded history root."""
+        at = "2026-09-01T14:04:59Z"
+        with TemporaryDirectory() as directory, patch(
+            "src.l3g_paper.runtime._now", return_value=at,
+        ):
+            ledger, runtime, commands = _runtime_fixtures.PerpetualRuntimeTests._runtime(
+                directory,
+                at=at,
+                perpetual=False,
+            )
+            try:
+                runtime.on_observation_transport_state(StreamHealth.HEALTHY)
+                _runtime_fixtures.PerpetualRuntimeTests._warm_bullish_market_evidence(
+                    runtime,
+                    first_sequence=1,
+                    first_at="2026-09-01T14:04:57Z",
+                    connect=True,
+                )
+                shadow = runtime._perpetual_seed_shadow
+                self.assertIsNotNone(shadow)
+                historical_ids = {
+                    identifier
+                    for evidence in shadow._evidence_history  # type: ignore[union-attr]
+                    for identifier in evidence.source_observation_ids
+                }
+                self.assertTrue(historical_ids)
+                self.assertTrue(
+                    historical_ids <= set(runtime._perpetual_seed_observations),
+                )
+
+                # Model the bounded hot indexes rotating to newer revisions
+                # before a delayed completed-boundary reconstruction.  The
+                # evidence revision history remains the scoring authority.
+                with shadow._lock:  # type: ignore[union-attr]
+                    shadow._quotes.clear()  # type: ignore[union-attr]
+                    shadow._quote_order.clear()  # type: ignore[union-attr]
+                    shadow._trades.clear()  # type: ignore[union-attr]
+                    shadow._classified.clear()  # type: ignore[union-attr]
+                    shadow._depth.clear()  # type: ignore[union-attr]
+                    shadow._depth_by_price.clear()  # type: ignore[union-attr]
+                    shadow._evidence.clear()  # type: ignore[union-attr]
+                    shadow._market_observation_history.clear()  # type: ignore[union-attr]
+                with runtime._lock:
+                    runtime._prune_perpetual_seed_capture_locked()
+
+                retained = set(runtime._perpetual_seed_observations)
+                self.assertTrue(historical_ids <= retained)
+                for identifier in historical_ids:
+                    dependency = runtime._perpetual_seed_observations[
+                        identifier
+                    ].payload.get("derivation_quote_observation_id")
+                    if isinstance(dependency, str) and dependency:
+                        self.assertIn(dependency, retained)
+                self.assertEqual(commands.commands, [])
+            finally:
+                ledger.close()
+
     def test_over_nine_thousand_callbacks_preserve_shadow_liveness_and_bounds(self) -> None:
         at = "2026-09-01T14:05:30Z"
         with TemporaryDirectory() as directory, patch(
