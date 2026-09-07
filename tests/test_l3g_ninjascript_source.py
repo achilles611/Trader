@@ -50,6 +50,113 @@ class NinjaScriptSourceTests(unittest.TestCase):
         ):
             self.assertIn(denial, source)
 
+    def test_manual_activity_on_another_account_cannot_reach_sim101_foreign_latch(self) -> None:
+        source = self._execution_source()
+        callbacks = (
+            ("OnOrderUpdate", "OnExecutionUpdate", "e.Order.Account"),
+            ("OnExecutionUpdate", "OnPositionUpdate", "e.Execution.Order.Account"),
+            ("OnPositionUpdate", "OnAccountItemUpdate", "e.Position.Account"),
+        )
+        for start, end, candidate in callbacks:
+            callback = source[
+                source.index(f"        private void {start}"):
+                source.index(f"        private void {end}")
+            ]
+            ingress = callback[:callback.index("BeginNativeObservationCallback();")]
+            self.assertIn(f"!ExactBoundAccount({candidate})", ingress)
+            self.assertIn("return;", ingress)
+            self.assertNotIn("foreignActivity", ingress)
+            self.assertNotIn("LockAndProtect", ingress)
+
+        probe = source[
+            source.index("        private ProbeNativeSample CaptureProbeNativeSample"):
+            source.index("        private static bool ExactFields")
+        ]
+        self.assertIn("!ExactBoundAccount(position.Account)", probe)
+        self.assertIn("!ExactBoundAccount(order.Account)", probe)
+        reconcile = source[
+            source.index("        private bool SendReconciliation"):
+            source.index("        private void TryPublishWatchdogSafetyReconciliation")
+        ]
+        self.assertIn("ExactBoundAccount(order.Account)", reconcile)
+        self.assertIn("ExactBoundAccount(item.Account)", reconcile)
+
+        # LucidFlex25k is the concrete regression case: a same-instrument event
+        # from any non-bound Account instance exits before state observation.
+        self.assertNotEqual("LucidFlex25k", "Sim101")
+
+    def test_foreign_sim101_order_still_latches_and_blocks_immediately(self) -> None:
+        source = self._execution_source()
+        callback = source[
+            source.index("        private void OnOrderUpdate"):
+            source.index("        private void OnExecutionUpdate")
+        ]
+        foreign = callback[
+            callback.index("else if (UnresolvedNativeOrderState(eventState) || eventFilled != 0)"):
+            callback.index("if (!exact && (UnresolvedNativeOrderState(eventState) || eventFilled != 0)")
+        ]
+        self.assertIn("foreignActivity = true", foreign)
+        self.assertIn("lockedOut = true", foreign)
+        self.assertIn("reconciled = false", foreign)
+        self.assertIn('safetyReason = "FOREIGN_ORDER_ACTIVITY"', foreign)
+        self.assertLess(
+            callback.index('safetyReason = "FOREIGN_ORDER_ACTIVITY"'),
+            callback.index("LockAndProtect(safetyReason)"),
+        )
+
+    def test_account_identity_is_present_exact_ordinal_and_reference_bound(self) -> None:
+        source = self._execution_source()
+        binding = source[
+            source.index("        private bool ExactBoundAccount"):
+            source.index("        private void ConnectionLoop")
+        ]
+        self.assertIn("Object.ReferenceEquals(candidate, paperAccount)", binding)
+        self.assertIn("!String.IsNullOrWhiteSpace(candidate.Name)", binding)
+        self.assertIn(
+            "String.Equals(candidate.Name, ExactAccountName, StringComparison.Ordinal)",
+            binding,
+        )
+        self.assertNotIn("OrdinalIgnoreCase", binding)
+        self.assertNotIn(".Trim(", binding)
+        start = source[
+            source.index("        private void StartPaperBoundary"):
+            source.index("        private void StopPaperBoundary")
+        ]
+        self.assertIn(
+            "Account.All.Where(a => String.Equals(a.Name, ExactAccountName, StringComparison.Ordinal))",
+            start,
+        )
+        self.assertIn("if (matches.Count != 1)", start)
+
+    def test_every_native_command_mutation_remains_on_exact_bound_sim101(self) -> None:
+        source = self._execution_source()
+        validation = source[
+            source.index("        private string ValidateReservedCommand"):
+            source.index("        private static string CommandOutcomeKey")
+        ]
+        account_match = validation.index(
+            'String.Equals(Text(command, "account_name"), ExactAccountName, StringComparison.Ordinal)'
+        )
+        binding_match = validation.index("if (!ExactBoundAccount(paperAccount))", account_match)
+        self.assertLess(account_match, binding_match)
+        self.assertIn('return "ACCOUNT_BINDING_LOST"', validation[binding_match:])
+
+        native_mutations = re.findall(
+            r"\b([A-Za-z_][A-Za-z0-9_]*)\.(CreateOrder|Submit|Cancel)\(", source
+        )
+        self.assertTrue(native_mutations)
+        self.assertTrue(all(receiver == "paperAccount" for receiver, _ in native_mutations))
+        self.assertEqual(source.count(".CreateOrder("), source.count("paperAccount.CreateOrder("))
+        self.assertEqual(source.count(".Submit("), source.count("paperAccount.Submit("))
+        self.assertEqual(source.count(".Cancel("), source.count("paperAccount.Cancel("))
+        for mutation in (
+            "paperAccount.CreateOrder(",
+            "paperAccount.Submit(",
+            "paperAccount.Cancel(",
+        ):
+            self.assertIn(mutation, source)
+        self.assertNotIn('Account.All.First', source)
+
     def test_expected_protective_cancellation_is_scoped_to_a_preowned_exit(self) -> None:
         source = self._execution_source()
         self.assertIn("flattenInProgress = true", source)

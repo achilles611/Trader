@@ -25,7 +25,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         // Updated from the checked-in source before a NinjaTrader build.  The
         // Python bridge independently fingerprints the same source, so an old
         // compiled AddOn cannot be armed merely because its DLL timestamp is new.
-        private const string AddonSourceFingerprint = "a0b672a5bce6a88f82adad6c1d6184fb09b4645dcc7811d6241d1445fddb58c3";
+        private const string AddonSourceFingerprint = "43ccc356b48dfb8380da49139434cbdbb92f4cf699179cd4bf3e2c1bc44caed9";
         private const string ExactAccountName = "Sim101";
         private const string ExactAccountClass = "LOCAL_SIMULATION";
         private const string ExactInstrumentName = "MNQ SEP26";
@@ -624,6 +624,18 @@ namespace NinjaTrader.NinjaScript.AddOns
                 && Math.Abs(instrument.MasterInstrument.TickSize - ExactTickSize) < 0.0000001;
         }
 
+        private bool ExactBoundAccount(Account candidate)
+        {
+            // The account object and its native name are both authority facts.
+            // Never normalize, default, or infer a missing account name, and
+            // never accept another Account instance merely because it is active.
+            return candidate != null
+                && paperAccount != null
+                && Object.ReferenceEquals(candidate, paperAccount)
+                && !String.IsNullOrWhiteSpace(candidate.Name)
+                && String.Equals(candidate.Name, ExactAccountName, StringComparison.Ordinal);
+        }
+
         private void ConnectionLoop()
         {
             while (!stopping)
@@ -892,18 +904,19 @@ namespace NinjaTrader.NinjaScript.AddOns
         private ProbeNativeSample CaptureProbeNativeSample()
         {
             ProbeNativeSample sample = new ProbeNativeSample();
-            sample.PositionSnapshotComplete = paperAccount != null && ExactInstrument(paperInstrument);
+            sample.PositionSnapshotComplete = ExactBoundAccount(paperAccount) && ExactInstrument(paperInstrument);
             sample.OrderSnapshotComplete = sample.PositionSnapshotComplete;
             sample.ProtectiveStopState = "NONE";
             List<string> positionFacts = new List<string>();
             List<string> orderFacts = new List<string>();
             int exactPositionCount = 0;
-            if (paperAccount != null)
+            if (ExactBoundAccount(paperAccount))
             {
                 lock (paperAccount.Positions)
                 {
                     foreach (Position position in paperAccount.Positions)
                     {
+                        if (position == null || !ExactBoundAccount(position.Account)) continue;
                         string instrument = position.Instrument == null
                             ? String.Empty : position.Instrument.FullName ?? String.Empty;
                         int signedQuantity = position.MarketPosition == MarketPosition.Short
@@ -927,7 +940,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                 {
                     foreach (Order order in paperAccount.Orders)
                     {
-                        if (!UnresolvedNativeOrderState(order.OrderState)) continue;
+                        if (order == null || !ExactBoundAccount(order.Account)
+                            || !UnresolvedNativeOrderState(order.OrderState)) continue;
                         string instrument = order.Instrument == null
                             ? String.Empty : order.Instrument.FullName ?? String.Empty;
                         string name = order.Name ?? String.Empty;
@@ -1242,6 +1256,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (!String.Equals(Text(command, "account_name"), ExactAccountName, StringComparison.Ordinal)) return "ACCOUNT_MISMATCH";
             if (!String.Equals(Text(command, "account_class"), ExactAccountClass, StringComparison.Ordinal)) return "ACCOUNT_CLASS_MISMATCH";
             if (!String.Equals(Text(command, "instrument"), ExactInstrumentName, StringComparison.Ordinal)) return "INSTRUMENT_MISMATCH";
+            if (!ExactBoundAccount(paperAccount)) return "ACCOUNT_BINDING_LOST";
             if (!ExactInstrument(paperInstrument)) return "INSTRUMENT_BINDING_LOST";
             int quantity = Integer32(command, "quantity", Int32.MinValue);
             bool noQuantity = action == "HEARTBEAT" || action == "RECONCILE" || action == "CANCEL_OWNED_ORDERS";
@@ -1622,6 +1637,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void SubmitEntry(Dictionary<string, object> command, bool enterLong)
         {
+            if (!ExactBoundAccount(paperAccount))
+                throw new InvalidOperationException("ACCOUNT_BINDING_LOST");
             string fragment = Fragment(Text(command, "command_id"));
             string name = "BZ-L3G-E-" + fragment;
             OrderAction orderAction = enterLong ? OrderAction.Buy : OrderAction.SellShort;
@@ -1640,6 +1657,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                 order = paperAccount.CreateOrder(paperInstrument, orderAction, OrderType.Market, OrderEntry.Automated, TimeInForce.Day, MaximumQuantity, 0, 0, String.Empty, name, NinjaTrader.Core.Globals.MaxDate, null);
                 if (order == null)
                     throw new InvalidOperationException("CREATE_ORDER_RETURNED_NULL");
+                if (!ExactBoundAccount(order.Account))
+                    throw new InvalidOperationException("ACCOUNT_BINDING_LOST");
             }
             catch
             {
@@ -1655,6 +1674,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                 throw;
             }
             lock (stateLock) owner.Order = order;
+            if (!ExactBoundAccount(paperAccount) || !ExactBoundAccount(order.Account))
+                throw new InvalidOperationException("ACCOUNT_BINDING_LOST");
             paperAccount.Submit(new[] { order });
         }
 
@@ -1686,6 +1707,12 @@ namespace NinjaTrader.NinjaScript.AddOns
         private void SubmitProtectiveStop(
             Order entryOrder, int executionQuantity, double executionPrice, OwnedOrder entry)
         {
+            if (!ExactBoundAccount(paperAccount)
+                || entryOrder == null || !ExactBoundAccount(entryOrder.Account))
+            {
+                LockAndProtect("ACCOUNT_BINDING_LOST");
+                return;
+            }
             if (entryOrder == null || executionQuantity != MaximumQuantity || executionPrice <= 0)
             {
                 LockAndProtect("INVALID_ENTRY_FILL");
@@ -1706,6 +1733,8 @@ namespace NinjaTrader.NinjaScript.AddOns
             Order stop = paperAccount.CreateOrder(paperInstrument, stopAction, OrderType.StopMarket, OrderEntry.Automated, TimeInForce.Gtc, executionQuantity, 0, stopPrice, oco, name, NinjaTrader.Core.Globals.MaxDate, null);
             if (stop == null)
                 throw new InvalidOperationException("CREATE_ORDER_RETURNED_NULL");
+            if (!ExactBoundAccount(stop.Account))
+                throw new InvalidOperationException("ACCOUNT_BINDING_LOST");
             if (!EntryProtectionPositionMatches(entry, expectedSignedQuantity))
             {
                 LockAndProtect("ENTRY_PROTECTION_POSITION_CHANGED_AFTER_CREATE");
@@ -1729,6 +1758,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                     protectiveDeadlineUtc = DateTime.MaxValue;
                 }
                 LockAndProtect("ENTRY_PROTECTION_POSITION_CHANGED_BEFORE_SUBMIT");
+                return;
+            }
+            if (!ExactBoundAccount(paperAccount) || !ExactBoundAccount(stop.Account))
+            {
+                LockAndProtect("ACCOUNT_BINDING_LOST");
                 return;
             }
             paperAccount.Submit(new[] { stop });
@@ -1797,6 +1831,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private string SubmitOwnedFlattenOrder(
             string commandId, string intentId, string decisionId, bool watchdogSafety)
         {
+            if (!ExactBoundAccount(paperAccount)) return "ACCOUNT_BINDING_LOST";
             if (String.IsNullOrWhiteSpace(commandId))
                 return "FLATTEN_CORRELATION_ID_MISSING";
             Position position = CurrentPosition();
@@ -1913,6 +1948,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                 );
                 if (order == null)
                     throw new InvalidOperationException("CREATE_ORDER_RETURNED_NULL");
+                if (!ExactBoundAccount(order.Account))
+                    throw new InvalidOperationException("ACCOUNT_BINDING_LOST");
             }
             catch (Exception error)
             {
@@ -1961,6 +1998,8 @@ namespace NinjaTrader.NinjaScript.AddOns
             // The working stop and market EXIT share a native OCO group. Keep
             // the stop live through Submit; NinjaTrader cancels the losing leg
             // when either exit fills, avoiding an unprotected submit window.
+            if (!ExactBoundAccount(paperAccount) || !ExactBoundAccount(order.Account))
+                return "ACCOUNT_BINDING_LOST";
             paperAccount.Submit(new[] { order });
             return null;
         }
@@ -2083,6 +2122,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                                 );
                                 if (stop == null)
                                     throw new InvalidOperationException("CREATE_ORDER_RETURNED_NULL");
+                                if (!ExactBoundAccount(stop.Account))
+                                    throw new InvalidOperationException("ACCOUNT_BINDING_LOST");
                             }
                             catch (Exception error)
                             {
@@ -2137,6 +2178,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                             }
                             try
                             {
+                                if (!ExactBoundAccount(paperAccount) || !ExactBoundAccount(stop.Account))
+                                {
+                                    Diagnostic("ACCOUNT_BINDING_LOST");
+                                    return;
+                                }
                                 paperAccount.Submit(new[] { stop });
                                 Diagnostic("FLATTEN_NO_FILL_PROTECTION_REARMED");
                             }
@@ -2167,13 +2213,20 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void CancelOwnedOrders()
         {
+            if (!ExactBoundAccount(paperAccount))
+            {
+                Diagnostic("ACCOUNT_BINDING_LOST");
+                return;
+            }
             List<Order> orders;
             lock (stateLock)
                 orders = ownedByName.Values.Where(value =>
                     value.Order != null
+                    && ExactBoundAccount(value.Order.Account)
                     && UnresolvedNativeOrderState(value.Order.OrderState)
                 ).Select(value => value.Order).Distinct().ToList();
-            if (orders.Count > 0)
+            if (orders.Count > 0 && ExactBoundAccount(paperAccount)
+                && orders.All(order => ExactBoundAccount(order.Account)))
                 paperAccount.Cancel(orders);
         }
 
@@ -2227,7 +2280,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void RehydrateOwnedWorkingOrders()
         {
-            if (paperAccount == null || paperInstrument == null) return;
+            if (!ExactBoundAccount(paperAccount) || paperInstrument == null) return;
             // Do not hold the account collection lock while updating AddOn
             // state: NinjaTrader can deliver OrderUpdate concurrently. The
             // snapshot is used only to restore names this instance already
@@ -2237,6 +2290,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             {
                 restored = paperAccount.Orders
                     .Where(order => order != null
+                        && ExactBoundAccount(order.Account)
                         && UnresolvedNativeOrderState(order.OrderState)
                         && order.Instrument != null
                         && String.Equals(order.Instrument.FullName, ExactInstrumentName, StringComparison.Ordinal)
@@ -2460,9 +2514,12 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private Position CurrentPosition()
         {
-            if (paperAccount == null || paperInstrument == null) return null;
+            if (!ExactBoundAccount(paperAccount) || paperInstrument == null) return null;
             lock (paperAccount.Positions)
-                return paperAccount.Positions.FirstOrDefault(position => position.Instrument != null && String.Equals(position.Instrument.FullName, ExactInstrumentName, StringComparison.Ordinal));
+                return paperAccount.Positions.FirstOrDefault(position => position != null
+                    && ExactBoundAccount(position.Account)
+                    && position.Instrument != null
+                    && String.Equals(position.Instrument.FullName, ExactInstrumentName, StringComparison.Ordinal));
         }
 
         private void SendHello()
@@ -2489,6 +2546,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             string safetyEventId = null, bool requireWatchdogFlat = false,
             bool safetySettlementFinal = false, long safetySettlementSequence = 0)
         {
+            if (!ExactBoundAccount(paperAccount)) return false;
             EnsureCurrentPositionOwnershipProven();
             Position position = CurrentPosition();
             int quantity = 0;
@@ -2503,7 +2561,8 @@ namespace NinjaTrader.NinjaScript.AddOns
             List<Order> orderSnapshot;
             lock (paperAccount.Orders)
                 orderSnapshot = paperAccount.Orders.Where(order =>
-                    UnresolvedNativeOrderState(order.OrderState)).ToList();
+                    order != null && ExactBoundAccount(order.Account)
+                    && UnresolvedNativeOrderState(order.OrderState)).ToList();
             // Process the snapshot outside NinjaTrader's account collection
             // lock. ExpectedFlattenOwner takes stateLock, while watchdog paths
             // can inspect account collections from state-locked code.
@@ -2519,7 +2578,9 @@ namespace NinjaTrader.NinjaScript.AddOns
                 if (exact && owned && owner != null && owner.Role == "ENTRY") entryWorking++;
             }
             lock (paperAccount.Positions)
-                if (paperAccount.Positions.Any(item => item.Quantity != 0 && (item.Instrument == null || !String.Equals(item.Instrument.FullName, ExactInstrumentName, StringComparison.Ordinal)))) foreign = true;
+                if (paperAccount.Positions.Any(item => item != null
+                    && ExactBoundAccount(item.Account) && item.Quantity != 0
+                    && (item.Instrument == null || !String.Equals(item.Instrument.FullName, ExactInstrumentName, StringComparison.Ordinal)))) foreign = true;
             // Position and order collections have separate account locks. A
             // fill can arrive while the order scan runs, so a safety proof
             // must reject a mixed-time snapshot rather than calling it whole.
@@ -2732,7 +2793,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void OnOrderUpdate(object sender, OrderEventArgs e)
         {
-            if (e == null || e.Order == null || e.Order.Account != paperAccount) return;
+            if (e == null || e.Order == null || !ExactBoundAccount(e.Order.Account)) return;
             BeginNativeObservationCallback();
             Order order = e.Order;
             // Order is a mutable NinjaTrader core object and can already be
@@ -2985,7 +3046,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void OnExecutionUpdate(object sender, ExecutionEventArgs e)
         {
-            if (e == null || e.Execution == null || e.Execution.Order == null || e.Execution.Order.Account != paperAccount) return;
+            if (e == null || e.Execution == null || e.Execution.Order == null
+                || !ExactBoundAccount(e.Execution.Order.Account)) return;
             BeginNativeObservationCallback();
             Order order = e.Execution.Order;
             // Execution is mutable for the same reason as Order. Preserve the
@@ -3210,7 +3272,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void OnPositionUpdate(object sender, PositionEventArgs e)
         {
-            if (e == null || e.Position == null || e.Position.Account != paperAccount) return;
+            if (e == null || e.Position == null || !ExactBoundAccount(e.Position.Account)) return;
             BeginNativeObservationCallback();
             Position position = e.Position;
             bool exact = position.Instrument != null && String.Equals(position.Instrument.FullName, ExactInstrumentName, StringComparison.Ordinal);
