@@ -258,6 +258,7 @@ class PaperControlCenterTests(unittest.TestCase):
         lifecycle_source = inspect.getsource(create_control_center_app)
         self.assertIn("OPERATIONAL_FULL_LEDGER_VERIFICATION_REQUIRED", lifecycle_source)
         self.assertIn('ledger_verifier.start("full")', lifecycle_source)
+        self.assertIn('ledger_verifier.start("auto")', lifecycle_source)
         self.assertIn("commissioning_rehearsal", rehearsal_source)
 
     def test_local_ledger_verification_routes_are_separate_from_execution_authority(self) -> None:

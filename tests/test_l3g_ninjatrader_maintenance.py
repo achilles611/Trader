@@ -6,6 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import threading
 import unittest
+from unittest.mock import patch
 
 from fastapi import HTTPException
 from starlette.requests import Request
@@ -536,9 +537,14 @@ class NinjaTraderMaintenanceEndpointTests(unittest.IsolatedAsyncioTestCase):
             artifacts=replace(defaults.artifacts, database_path=root / "hot" / "copytrade.sqlite3"),
         )
         self.service = FakeMaintenanceEndpointService()
+
+        def maintenance_factory(**arguments):
+            self.maintenance_arguments = arguments
+            return self.service
+
         self.app = create_control_center_app(
             config,
-            ninjatrader_maintenance_factory=lambda **_: self.service,
+            ninjatrader_maintenance_factory=maintenance_factory,
         )
         self.get_endpoint = next(
             route.endpoint for route in self.app.routes
@@ -578,6 +584,16 @@ class NinjaTraderMaintenanceEndpointTests(unittest.IsolatedAsyncioTestCase):
                 {"request_id": "ntm-api-test-0002", "path": "C:\\untrusted.exe"},
             )
         self.assertEqual(refused.exception.status_code, 400)
+
+    def test_control_center_maintenance_verifier_auto_selects_first_full_proof(self) -> None:
+        with patch(
+            "src.copytrade.control_center.LocalLedgerVerificationController.start",
+            return_value={"status": "IN_PROGRESS", "verification_id": "lv-first-ledger"},
+        ) as start:
+            result = self.maintenance_arguments["start_ledger_verification"]()
+
+        self.assertEqual(result["verification_id"], "lv-first-ledger")
+        start.assert_called_once_with("auto")
 
     async def test_action_requires_local_origin_and_fixed_authentication_header(self) -> None:
         for request in (

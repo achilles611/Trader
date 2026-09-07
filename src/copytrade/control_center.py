@@ -1877,7 +1877,10 @@ def create_control_center_app(
         "paper_status": lane_iii_paper_health,
         "live_status": lane_iii_live_health,
         "ledger_status": ledger_verifier.status,
-        "start_ledger_verification": lambda: ledger_verifier.start("incremental"),
+        # Auto remains incremental when a trusted checkpoint exists, but a
+        # freshly allocated profile ledger has no checkpoint yet and must earn
+        # its first Full proof before NinjaTrader readiness can pass.
+        "start_ledger_verification": lambda: ledger_verifier.start("auto"),
         "historical_command_count": lambda: latest_durable_command_sequence(),
         "begin_automatic_login": begin_automatic_ninjatrader_login,
         "automatic_login_status": ninja_login_health,
