@@ -595,35 +595,67 @@ def _score(
 def _validate_signal(
     decision: Mapping[str, object], evidence: Sequence[Mapping[str, object]], bias: str,
 ) -> None:
+    raw_summary = decision.get("family_summary")
+    if isinstance(raw_summary, Mapping):
+        summary_fields = set(raw_summary)
+        missing = sorted(_BOUNDARY_SUMMARY_FIELDS - summary_fields)
+        unexpected = sorted(summary_fields - _BOUNDARY_SUMMARY_FIELDS)
+        if missing:
+            raise RuntimeError(
+                "PERPETUAL_STARTUP_SEED_SIGNAL_INVALID:SUMMARY_MISSING_"
+                + str(missing[0]).upper()
+            )
+        if unexpected:
+            raise RuntimeError(
+                "PERPETUAL_STARTUP_SEED_SIGNAL_INVALID:SUMMARY_UNEXPECTED_"
+                + str(unexpected[0]).upper()
+            )
     summary = _exact(
-        decision["family_summary"], _BOUNDARY_SUMMARY_FIELDS,
+        raw_summary, _BOUNDARY_SUMMARY_FIELDS,
         "PERPETUAL_STARTUP_SEED_SIGNAL_INVALID",
     )
     bull, bull_families = _score(evidence, HypothesisKind.BULLISH_REVERSAL)
     bear, bear_families = _score(evidence, HypothesisKind.BEARISH_CONTINUATION)
     computed = "TIE" if bull == bear else "LONG" if bull > bear else "SHORT"
     expected_support = bear if bias == "SHORT" else bull
-    if (
-        bias != computed
-        or decision["relative_support"] != str(expected_support)
-        or summary.get("bias") != bias
-        or summary.get("bullish_support") != str(bull)
-        or summary.get("bearish_support") != str(bear)
-        or summary.get("score_delta") != str(bull - bear)
-        or summary.get("bullish_families") != bull_families
-        or summary.get("bearish_families") != bear_families
-        or summary.get("prior_position") != PaperDirection.FLAT.value
-        or summary.get("decision_protocol") != "EXIT_RECONCILE_THEN_ENTER"
-        or summary.get("completed_interval_aggregate") is not False
-        or summary.get("startup_reconstruction") is not True
-        or summary.get("decision_interval_seconds") != 300
-        or summary.get("decision_clock")
-        != FIVE_MINUTE_PERPETUAL_PROFILE.policy.decision_clock
-        or summary.get("missed_boundary_count") != 0
-        or summary.get("signal_basis")
-        != "LATEST_AVAILABLE_PRE_CALLBACK_PROVISIONAL_EVIDENCE"
-    ):
-        raise RuntimeError("PERPETUAL_STARTUP_SEED_SIGNAL_INVALID")
+    comparisons = (
+        ("BIAS", bias, computed),
+        ("RELATIVE_SUPPORT", decision["relative_support"], str(expected_support)),
+        ("SUMMARY_BIAS", summary.get("bias"), bias),
+        ("BULLISH_SUPPORT", summary.get("bullish_support"), str(bull)),
+        ("BEARISH_SUPPORT", summary.get("bearish_support"), str(bear)),
+        ("SCORE_DELTA", summary.get("score_delta"), str(bull - bear)),
+        ("BULLISH_FAMILIES", summary.get("bullish_families"), bull_families),
+        ("BEARISH_FAMILIES", summary.get("bearish_families"), bear_families),
+        ("PRIOR_POSITION", summary.get("prior_position"), PaperDirection.FLAT.value),
+        (
+            "DECISION_PROTOCOL", summary.get("decision_protocol"),
+            "EXIT_RECONCILE_THEN_ENTER",
+        ),
+        ("DECISION_INTERVAL_SECONDS", summary.get("decision_interval_seconds"), 300),
+        (
+            "DECISION_CLOCK", summary.get("decision_clock"),
+            FIVE_MINUTE_PERPETUAL_PROFILE.policy.decision_clock,
+        ),
+        ("MISSED_BOUNDARY_COUNT", summary.get("missed_boundary_count"), 0),
+        (
+            "SIGNAL_BASIS", summary.get("signal_basis"),
+            "LATEST_AVAILABLE_PRE_CALLBACK_PROVISIONAL_EVIDENCE",
+        ),
+    )
+    for field, actual, expected_value in comparisons:
+        if actual != expected_value:
+            raise RuntimeError(
+                f"PERPETUAL_STARTUP_SEED_SIGNAL_INVALID:{field}"
+            )
+    if summary.get("completed_interval_aggregate") is not False:
+        raise RuntimeError(
+            "PERPETUAL_STARTUP_SEED_SIGNAL_INVALID:COMPLETED_INTERVAL_AGGREGATE"
+        )
+    if summary.get("startup_reconstruction") is not True:
+        raise RuntimeError(
+            "PERPETUAL_STARTUP_SEED_SIGNAL_INVALID:STARTUP_RECONSTRUCTION"
+        )
     try:
         closed = _moment(_utc(
             summary.get("candle_close_utc"), "PERPETUAL_STARTUP_SEED_SIGNAL_INVALID",
@@ -634,28 +666,56 @@ def _validate_signal(
             "PERPETUAL_STARTUP_SEED_SIGNAL_INVALID",
         ))
     except (TypeError, ValueError, RuntimeError) as exc:
-        raise RuntimeError("PERPETUAL_STARTUP_SEED_SIGNAL_INVALID") from exc
-    if (
-        type(summary.get("decision_latency_ms")) is not int
-        or type(summary.get("missed_boundary_count")) is not int
-        or type(summary.get("decision_interval_seconds")) is not int
-        or summary.get("decision_latency_ms")
-        != max(0, int((observed - closed).total_seconds() * 1000))
-        or summary.get("decision_reference_before_scheduled_boundary") is not True
-        or reference_at >= closed
-        or summary.get("decision_reference_kind")
-        not in {"LAST_TRADE_BEFORE_BOUNDARY", "QUOTE_MID_BEFORE_BOUNDARY"}
-        or _decimal(
-            summary.get("decision_reference_price"),
-            "PERPETUAL_STARTUP_SEED_SIGNAL_INVALID",
-        ) <= 0
-        or not isinstance(summary.get("decision_reference_observation_id"), str)
-        or not summary.get("decision_reference_observation_id")
+        raise RuntimeError(
+            "PERPETUAL_STARTUP_SEED_SIGNAL_INVALID:TIMESTAMP"
+        ) from exc
+    for field in (
+        "decision_latency_ms", "missed_boundary_count", "decision_interval_seconds",
     ):
-        raise RuntimeError("PERPETUAL_STARTUP_SEED_SIGNAL_INVALID")
+        if type(summary.get(field)) is not int:
+            raise RuntimeError(
+                "PERPETUAL_STARTUP_SEED_SIGNAL_INVALID:TYPE_" + field.upper()
+            )
+    if summary.get("decision_latency_ms") != max(
+        0, int((observed - closed).total_seconds() * 1000),
+    ):
+        raise RuntimeError(
+            "PERPETUAL_STARTUP_SEED_SIGNAL_INVALID:DECISION_LATENCY_MS"
+        )
+    if summary.get("decision_reference_before_scheduled_boundary") is not True:
+        raise RuntimeError(
+            "PERPETUAL_STARTUP_SEED_SIGNAL_INVALID:REFERENCE_BEFORE_BOUNDARY"
+        )
+    if reference_at >= closed:
+        raise RuntimeError(
+            "PERPETUAL_STARTUP_SEED_SIGNAL_INVALID:REFERENCE_TIMESTAMP"
+        )
+    if summary.get("decision_reference_kind") not in {
+        "LAST_TRADE_BEFORE_BOUNDARY", "QUOTE_MID_BEFORE_BOUNDARY",
+    }:
+        raise RuntimeError(
+            "PERPETUAL_STARTUP_SEED_SIGNAL_INVALID:REFERENCE_KIND"
+        )
+    if _decimal(
+        summary.get("decision_reference_price"),
+        "PERPETUAL_STARTUP_SEED_SIGNAL_INVALID:REFERENCE_PRICE",
+    ) <= 0:
+        raise RuntimeError(
+            "PERPETUAL_STARTUP_SEED_SIGNAL_INVALID:REFERENCE_PRICE"
+        )
+    if not isinstance(summary.get("decision_reference_observation_id"), str):
+        raise RuntimeError(
+            "PERPETUAL_STARTUP_SEED_SIGNAL_INVALID:REFERENCE_OBSERVATION_ID_TYPE"
+        )
+    if not summary.get("decision_reference_observation_id"):
+        raise RuntimeError(
+            "PERPETUAL_STARTUP_SEED_SIGNAL_INVALID:REFERENCE_OBSERVATION_ID"
+        )
     if bias == "TIE":
         if decision["hypothesis_kind"] is not None:
-            raise RuntimeError("PERPETUAL_STARTUP_SEED_SIGNAL_INVALID")
+            raise RuntimeError(
+                "PERPETUAL_STARTUP_SEED_SIGNAL_INVALID:TIE_HYPOTHESIS"
+            )
         expected = (
             PaperDecisionKind.NO_TRADE.value, PaperDirection.FLAT.value,
             "FIVE_MINUTE_BIAS_TIE_FLAT", "BLOCKED", PaperDirection.FLAT.value,
@@ -669,7 +729,7 @@ def _validate_signal(
         summary.get("action"), summary.get("target_position"),
     )
     if actual != expected:
-        raise RuntimeError("PERPETUAL_STARTUP_SEED_SIGNAL_INVALID")
+        raise RuntimeError("PERPETUAL_STARTUP_SEED_SIGNAL_INVALID:DECISION_SHAPE")
 
 
 def _ledger_record(

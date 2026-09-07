@@ -592,6 +592,11 @@ class LaneIIIPaperRuntime:
     def _perpetual_seed_wire(
         observation: NinjaTraderObservation,
     ) -> dict[str, object]:
+        # The source observation and ordinary ledger envelope retain the exact
+        # NinjaTrader text.  Only the detached seed proof is normalized to the
+        # policy's Python UTC precision so its wire and source envelope remain
+        # byte-identical under strict seed validation; callback sequence and
+        # observation identity remain the ordering/provenance authorities.
         account = (
             None
             if observation.account_alias is None
@@ -607,11 +612,27 @@ class LaneIIIPaperRuntime:
             "observation_id": observation.observation_id,
             "session_id": observation.session_id,
             "observation_type": observation.observation_type,
-            "ninja_receipt_time": observation.ninja_receipt_time,
+            "ninja_receipt_time": normalized_utc(
+                observation.ninja_receipt_time, "Perpetual seed Ninja receipt time",
+            ),
             "local_monotonic_sequence": observation.local_monotonic_sequence,
-            "provider_timestamp": observation.provider_timestamp,
+            "provider_timestamp": (
+                None
+                if observation.provider_timestamp is None
+                else normalized_utc(
+                    observation.provider_timestamp,
+                    "Perpetual seed provider timestamp",
+                )
+            ),
             "provider_sequence": observation.provider_sequence,
-            "exchange_timestamp": observation.exchange_timestamp,
+            "exchange_timestamp": (
+                None
+                if observation.exchange_timestamp is None
+                else normalized_utc(
+                    observation.exchange_timestamp,
+                    "Perpetual seed exchange timestamp",
+                )
+            ),
             "account": account,
             "payload": dict(observation.payload),
         }
@@ -3157,8 +3178,19 @@ class LaneIIIPaperRuntime:
                     occurred_at=observation.ninja_receipt_time,
                 )
                 return
+            seed_source_envelope = dict(raw_payload)
+            for timestamp_field in (
+                "observed_at", "ninja_receipt_time", "provider_timestamp",
+                "exchange_timestamp",
+            ):
+                timestamp = seed_source_envelope.get(timestamp_field)
+                if timestamp is not None:
+                    seed_source_envelope[timestamp_field] = normalized_utc(
+                        str(timestamp),
+                        f"Perpetual seed {timestamp_field.replace('_', ' ')}",
+                    )
             self._ingest_perpetual_seed_shadow_locked(
-                observation, context, raw_payload,
+                observation, context, seed_source_envelope,
             )
             before_classified = self.policy.classified_trade_count() if observation.observation_type == "TRADE" else 0
             reset_before = self.policy.reset_count()

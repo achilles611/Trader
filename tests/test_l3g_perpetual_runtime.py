@@ -44,6 +44,7 @@ from src.l3g_paper.risk import PaperRiskAuthority, PaperRiskSnapshot
 from src.l3g_paper.runtime import LaneIIIPaperRuntime
 from src.l3g_paper.perpetual_startup_seed import (
     PERPETUAL_STARTUP_SEED_EXPORT_KIND,
+    build_perpetual_observation_proof,
     write_perpetual_startup_seed_proof,
 )
 from src.l3g_paper.sessions import PaperSessionResolver
@@ -55,6 +56,14 @@ from src.l3g_paper.verification import LocalLedgerVerifier
 # RTH timestamps so profile-window changes cannot silently alter intent.
 NOW = "2026-09-01T20:54:00Z"
 HOLIDAY_NOW = "2026-09-07T14:00:00Z"
+
+
+def _dotnet_roundtrip_utc(moment: datetime) -> str:
+    """Match DateTime.ToString("o") for the AddOn's authentic UTC frames."""
+    return (
+        moment.strftime("%Y-%m-%dT%H:%M:%S.")
+        + f"{moment.microsecond:06d}7Z"
+    )
 
 
 class _CommandCapture:
@@ -1158,6 +1167,120 @@ class PerpetualRuntimeTests(unittest.TestCase):
                     target_ledger.close()
                 if source_ledger.shutdown_status() is None:
                     source_ledger.close()
+
+    def test_v1_shadow_exports_authentic_dotnet_roundtrip_timestamps(self) -> None:
+        switch_at = "2026-09-07T11:45:00.500000Z"
+        operation_id = "profile-switch-" + "7" * 32
+        with TemporaryDirectory() as directory, patch(
+            "src.l3g_paper.runtime._now", return_value=switch_at,
+        ):
+            ledger, runtime, commands = self._runtime(
+                directory, at=switch_at, perpetual=False,
+            )
+            try:
+                runtime.on_observation_transport_state(StreamHealth.HEALTHY)
+                sequence = 1
+                moment = datetime(2026, 9, 7, 11, 44, 57, tzinfo=timezone.utc)
+
+                def next_at() -> str:
+                    nonlocal moment
+                    value = _dotnet_roundtrip_utc(moment)
+                    moment += timedelta(milliseconds=50)
+                    return value
+
+                runtime.ingest(self._connection(sequence, next_at()))
+                sequence += 1
+                last_trade: NinjaTraderObservation | None = None
+                for price in ("100", "99", "100", "100", "99", "100", "99", "100"):
+                    quote = self._quote(sequence, next_at(), price)
+                    runtime.ingest(quote)
+                    sequence += 1
+                    last_trade = self._trade(sequence, next_at(), quote, price)
+                    runtime.ingest(last_trade)
+                    sequence += 1
+                for operation, volume in (("ADD", 10), ("UPDATE", 5)):
+                    runtime.ingest(self._depth(sequence, next_at(), operation, volume))
+                    sequence += 1
+                assert last_trade is not None
+                self.assertEqual(
+                    last_trade.ninja_receipt_time,
+                    "2026-09-07T11:44:57.8000007Z",
+                )
+
+                runtime.ingest(self._quote(
+                    sequence, "2026-09-07T11:45:00.1000007Z", "101",
+                ))
+                status = runtime.status()["perpetual_startup_seed"]
+                self.assertIsNone(status["source_shadow_fault"])
+                self.assertEqual(status["latest_completed_boundary"], "2026-09-07T11:45:00Z")
+                bundle = runtime._perpetual_seed_latest_bundle
+                self.assertIsNotNone(bundle)
+                summary = bundle["decision"]["family_summary"]  # type: ignore[index]
+                self.assertEqual(
+                    summary["decision_reference_observed_at"],
+                    "2026-09-07T11:44:57.800000Z",
+                )
+
+                artifact = runtime.export_perpetual_startup_seed(
+                    operation_id, Path(directory) / "dotnet-roundtrip-seed.json",
+                )
+                proofs = artifact["core"]["observations"]  # type: ignore[index]
+                reference = next(
+                    item for item in proofs
+                    if item["wire"]["observation_id"] == last_trade.observation_id
+                )
+                self.assertEqual(
+                    reference["wire"]["ninja_receipt_time"],
+                    "2026-09-07T11:44:57.800000Z",
+                )
+                self.assertEqual(
+                    reference["wire"]["provider_timestamp"],
+                    "2026-09-07T11:44:57.800000Z",
+                )
+                self.assertEqual(commands.commands, [])
+            finally:
+                ledger.close()
+
+    def test_seed_normalizes_exchange_timestamp_without_mutating_observation(self) -> None:
+        at = "2026-09-01T14:04:58Z"
+        raw = "2026-09-01T14:04:57.1234567Z"
+        normalized = "2026-09-01T14:04:57.123456Z"
+        with TemporaryDirectory() as directory, patch(
+            "src.l3g_paper.runtime._now", return_value=at,
+        ):
+            ledger, runtime, _ = self._runtime(
+                directory, at=at, perpetual=False,
+            )
+            try:
+                runtime.on_observation_transport_state(StreamHealth.HEALTHY)
+                observation = replace(
+                    self._quote(1, raw), exchange_timestamp=raw,
+                )
+                runtime.ingest(observation)
+
+                self.assertEqual(observation.ninja_receipt_time, raw)
+                self.assertEqual(observation.provider_timestamp, raw)
+                self.assertEqual(observation.exchange_timestamp, raw)
+                retained = runtime._perpetual_seed_observations[
+                    observation.observation_id
+                ]
+                self.assertIs(retained, observation)
+                envelope = runtime._perpetual_seed_source_envelopes[
+                    observation.observation_id
+                ]
+                wire = runtime._perpetual_seed_wire(observation)
+                proof = build_perpetual_observation_proof(
+                    wire=wire, source_envelope=envelope,
+                )
+                for field in (
+                    "ninja_receipt_time", "provider_timestamp",
+                    "exchange_timestamp",
+                ):
+                    self.assertEqual(wire[field], normalized)
+                    self.assertEqual(envelope[field], normalized)
+                    self.assertEqual(proof["wire"][field], normalized)  # type: ignore[index]
+            finally:
+                ledger.close()
 
     def test_same_bias_keeps_one_position_without_another_entry_or_exit(self) -> None:
         clock = {"at": NOW}

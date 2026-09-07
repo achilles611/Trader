@@ -638,7 +638,11 @@ class ExperimentalPaperPolicy:
                 "decision_reference_price": str(reference.price),
                 "decision_reference_kind": "LAST_TRADE_BEFORE_BOUNDARY",
                 "decision_reference_observation_id": reference.observation_id,
-                "decision_reference_observed_at": reference.observed_at,
+                "decision_reference_observed_at": (
+                    normalized_utc(reference.observed_at, "Decision reference time")
+                    if self._perpetual_position_profile
+                    else reference.observed_at
+                ),
                 "decision_reference_before_scheduled_boundary": (
                     self._time(reference.observed_at) < self._time(str(boundary["candle_close_utc"]))
                 ),
@@ -662,7 +666,13 @@ class ExperimentalPaperPolicy:
                     "decision_reference_price": str((reference_quote.bid + reference_quote.ask) / Decimal("2")),
                     "decision_reference_kind": "QUOTE_MID_BEFORE_BOUNDARY",
                     "decision_reference_observation_id": reference_quote.observation_id,
-                    "decision_reference_observed_at": reference_quote.observed_at,
+                    "decision_reference_observed_at": (
+                        normalized_utc(
+                            reference_quote.observed_at, "Decision reference time",
+                        )
+                        if self._perpetual_position_profile
+                        else reference_quote.observed_at
+                    ),
                     "decision_reference_before_scheduled_boundary": (
                         self._time(reference_quote.observed_at) < self._time(str(boundary["candle_close_utc"]))
                     ),
