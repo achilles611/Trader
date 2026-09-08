@@ -70,6 +70,7 @@ RISK_CONTINUITY_KINDS = (
     "RISK_EVENT_EXIT_ACCOUNTED",
     "RISK_EVENT_AUTHORITY_LOCKOUT",
     "RISK_EVENT_AUTHORITY_LOCKOUT_CLEARED",
+    "RISK_EVENT_RECONCILIATION_LOCKOUT_CLEARED",
 )
 RISK_CONTINUITY_ANCHOR_SCHEMA = "lane-iii-risk-continuity-anchor-v2"
 RISK_CONTINUITY_GUARD_SCHEMA = "lane-iii-risk-continuity-guard-v1"
@@ -3428,6 +3429,67 @@ class PaperLedger:
                 "record_hash": str(row["record_hash"]),
                 "record": json.loads(str(row["payload_json"])),
             }
+
+    def record_by_sequence(self, ledger_sequence: int) -> dict[str, object] | None:
+        """Return one exact immutable record at a caller-bound chain coordinate."""
+        if type(ledger_sequence) is not int or ledger_sequence <= 0:
+            raise ValueError("Paper ledger sequence must be a positive integer.")
+        with self._ordering_lock:
+            self.flush_deferred()
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT ledger_sequence, record_hash, payload_json "
+                "FROM lane_iii_paper_audit WHERE ledger_sequence=?",
+                (ledger_sequence,),
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "ledger_sequence": int(row["ledger_sequence"]),
+                "record_hash": str(row["record_hash"]),
+                "record": json.loads(str(row["payload_json"])),
+            }
+
+    def authority_records_after(
+        self, ledger_sequence: int, *, limit: int = 512,
+    ) -> list[dict[str, object]]:
+        """Return the bounded side-effect suffix used by a recovery lease.
+
+        High-volume passive market observations and policy evidence are
+        intentionally excluded.  Every order, execution, command, risk,
+        incident, ownership/session, and broker-account projection remains in
+        this ordered slice so a recovery cannot race a new authority effect.
+        """
+        if type(ledger_sequence) is not int or ledger_sequence < 0:
+            raise ValueError("Paper ledger sequence must be a non-negative integer.")
+        if type(limit) is not int or not 1 <= limit <= 4096:
+            raise ValueError("Paper ledger authority query limit is invalid.")
+        domains = (
+            "SESSION", "INTENT", "RISK_GRANT", "COMMAND", "COMMAND_RECEIPT",
+            "ORDER_EVENT", "EXECUTION", "POSITION_SNAPSHOT", "RISK_EVENT", "INCIDENT",
+        )
+        with self._ordering_lock:
+            self.flush_deferred()
+        placeholders = ",".join("?" for _ in domains)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT ledger_sequence, record_hash, domain, kind, payload_json "
+                "FROM lane_iii_paper_audit WHERE ledger_sequence > ? AND domain IN ("
+                + placeholders + ") ORDER BY ledger_sequence ASC LIMIT ?",
+                (ledger_sequence, *domains, limit + 1),
+            ).fetchall()
+        if len(rows) > limit:
+            raise RuntimeError("RECONCILIATION_RECOVERY_AUTHORITY_SUFFIX_TOO_LARGE")
+        return [
+            {
+                "ledger_sequence": int(row["ledger_sequence"]),
+                "record_hash": str(row["record_hash"]),
+                "domain": str(row["domain"]),
+                "kind": str(row["kind"]),
+                "record": json.loads(str(row["payload_json"])),
+            }
+            for row in rows
+        ]
 
     def risk_continuity_records(self) -> list[dict[str, object]]:
         """Return the narrow ordered record set needed to restore risk limits.

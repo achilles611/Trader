@@ -56,6 +56,12 @@ from src.l3g_paper.profile_switch import (
     remembered_profile_selection,
     validated_profile_switch_manifest,
 )
+from src.l3g_paper.reconciliation_recovery import (
+    RECONCILIATION_RECOVERY_ACTION_HEADER,
+    RECONCILIATION_RECOVERY_ACTION_VALUE,
+    RECONCILIATION_RECOVERY_TOKEN_HEADER,
+    ReconciliationRecoveryService,
+)
 from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout
 from src.l3g_paper.risk_continuity import read_risk_continuity_artifact
 from src.l3g_paper.perpetual_startup_seed import (
@@ -1950,6 +1956,12 @@ def create_control_center_app(
         start_operational_paper=start_operational_paper_from_autostart,
         audit_path=audit_root / "paper-autostart-audit.jsonl",
     )
+    reconciliation_recovery = ReconciliationRecoveryService(
+        runtime_provider=lambda: ninjatrader_runtime.get("paper"),
+        transport_provider=lambda: ninjatrader_runtime.get("paper_transport"),
+        ledger_provider=lambda: ninjatrader_runtime.get("paper_ledger"),
+        audit_path=audit_root / "reconciliation-recovery-audit.jsonl",
+    )
 
     async def quiesce_ledger_verifier_for_shutdown() -> dict[str, object]:
         """Release a read-only verifier snapshot before the writer truncates WAL.
@@ -2399,6 +2411,7 @@ def create_control_center_app(
     app.state.request_server_shutdown = None
     app.state.ninjatrader_maintenance = ninjatrader_maintenance
     app.state.paper_autostart = paper_autostart
+    app.state.reconciliation_recovery = reconciliation_recovery
     app.state.ninjatrader_observer = None
     app.state.lane_iii_shadow = None
     app.state.lane_iii_paper = None
@@ -2958,6 +2971,52 @@ def create_control_center_app(
             raise HTTPException(status_code=503, detail="This app host does not expose controlled server shutdown.")
         try:
             return profile_switch.start(payload["request_id"], payload["target_profile"])
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.get("/api/lane-iii/paper/reconciliation-recovery")
+    async def api_lane_iii_paper_reconciliation_recovery() -> dict[str, object]:
+        """Return the incident-8631 recovery contract without changing authority."""
+        return reconciliation_recovery.status()
+
+    @app.post("/api/lane-iii/paper/reconciliation-recovery")
+    async def api_recover_lane_iii_paper_reconciliation(
+        request: Request,
+        body: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, object]:
+        """Acknowledge, freshly probe, and clear only RECONCILIATION_BLOCKED."""
+        hostname = (request.url.hostname or "").lower()
+        if hostname not in {"127.0.0.1", "localhost", "::1", "testserver"}:
+            raise HTTPException(status_code=403, detail="Reconciliation recovery is loopback-only.")
+        origin = request.headers.get("origin")
+        if origin:
+            try:
+                origin_host = (urlsplit(origin).hostname or "").lower()
+            except ValueError:
+                origin_host = ""
+            if origin_host not in {"127.0.0.1", "localhost", "::1", "testserver"}:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Reconciliation recovery requires a local same-origin request.",
+                )
+        if (
+            request.headers.get(RECONCILIATION_RECOVERY_ACTION_HEADER)
+            != RECONCILIATION_RECOVERY_ACTION_VALUE
+        ):
+            raise HTTPException(
+                status_code=403, detail="Reconciliation recovery action authentication failed.",
+            )
+        if (
+            request.headers.get(RECONCILIATION_RECOVERY_TOKEN_HEADER)
+            != reconciliation_recovery.action_token
+        ):
+            raise HTTPException(
+                status_code=403, detail="Reconciliation recovery session authentication failed.",
+            )
+        try:
+            return reconciliation_recovery.recover(body or {})
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         except RuntimeError as error:

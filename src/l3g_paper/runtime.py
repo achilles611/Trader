@@ -553,6 +553,11 @@ class LaneIIIPaperRuntime:
         # watchdog that remains resident in NinjaTrader.
         self._native_watchdog_authority_established = False
         self._execution_message_sequence = 0
+        # A reconciliation recovery lease is deliberately distinct from an
+        # entry owner.  It pauses every normal entry path while an operator
+        # acknowledgement is followed by a server-owned, observation-only
+        # native account probe.  It can never submit or cancel an order.
+        self._reconciliation_recovery_lease_id: str | None = None
         self._transitions = 0
         self._commissioning_readiness_generation = 0
         self._commissioning_authority_epoch = 0
@@ -2684,6 +2689,305 @@ class LaneIIIPaperRuntime:
                 raise RuntimeError("Runtime identity must be bound before Lane III startup.")
             self._runtime_identity = {
                 key: identity.get(key) for key in ("git_sha", "ledger", "audit", "control_center", "python", "pid")
+            }
+
+    def _reconciliation_recovery_authority_locked(self) -> dict[str, object]:
+        transport = None if self._transport is None else self._transport.status()
+        risk = self.risk.status()
+        return {
+            "schema": "lane-iii-reconciliation-recovery-authority-v1",
+            "entry_profile_version": self.policy.artifact.entry_profile_version,
+            "runtime_state": self._state.value,
+            "entries_paused": self._entries_paused,
+            "entry_owner": self._entry_owner.value,
+            "operational_owner_active": self._operational_session is not None,
+            "runtime_position": self._position.value,
+            "runtime_quantity": self._position_quantity,
+            "account": self._snapshot.account_name,
+            "environment": self._snapshot.account_class,
+            "instrument": self._snapshot.instrument,
+            "broker_position": self._snapshot.current_position.value,
+            "broker_quantity": self._snapshot.current_position_quantity,
+            "working_orders": self._snapshot.working_owned_orders,
+            "working_entry_orders": self._snapshot.working_entry_orders,
+            "position_snapshot_complete": self._snapshot.position_snapshot_complete,
+            "order_snapshot_complete": self._snapshot.order_snapshot_complete,
+            "foreign_activity": self._snapshot.foreign_activity,
+            "protective_stop_state": self._snapshot.protective_stop_state,
+            "reconciliation_current": self._snapshot.reconciliation_current,
+            "unresolved_command": self._snapshot.unresolved_command,
+            "unresolved_native_order": self._snapshot.unresolved_native_order,
+            "unresolved_execution": self._snapshot.unresolved_execution,
+            "risk_locked_out": risk.get("locked_out"),
+            "risk_lockout_reason": risk.get("lockout_reason"),
+            "risk_lockout_trade_date": risk.get("lockout_trade_date"),
+            "risk_continuity_fault": self._risk_continuity_fault,
+            "retained_safety_lockout": self._retain_safety_lockout_after_flat,
+            "fault_reason": self._fault_reason,
+            "transport_authenticated": False if transport is None else transport.authenticated_client,
+            "transport_reconciled": False if transport is None else transport.reconciled,
+            "transport_commands_sent": 0 if transport is None else transport.commands_sent,
+            "transport_addon_provenance_valid": False if transport is None else transport.addon_provenance_valid,
+            "execution_message_sequence": self._execution_message_sequence,
+            "paper_only": True,
+            "live_capital": "DENIED",
+            "maximum_quantity": 1,
+        }
+
+    def reconciliation_recovery_authority(self) -> dict[str, object]:
+        """Return the exact, caller-bindable state of the narrow recovery gate."""
+        with self._lock:
+            authority = self._reconciliation_recovery_authority_locked()
+            return {**authority, "authority_state_hash": canonical_hash(authority)}
+
+    @staticmethod
+    def _reconciliation_recovery_safe_snapshot(authority: Mapping[str, object]) -> bool:
+        return all((
+            authority.get("entry_profile_version") == FIVE_MINUTE_ENTRY_PROFILE_VERSION,
+            authority.get("runtime_state") == PaperRuntimeState.READY_DISARMED.value,
+            authority.get("entry_owner") == PaperEntryOwner.NONE.value,
+            authority.get("operational_owner_active") is False,
+            authority.get("runtime_position") == PaperDirection.FLAT.value,
+            authority.get("runtime_quantity") == 0,
+            authority.get("account") == "Sim101",
+            authority.get("environment") == "LOCAL_SIMULATION",
+            authority.get("instrument") == "MNQ SEP26",
+            authority.get("broker_position") == PaperDirection.FLAT.value,
+            authority.get("broker_quantity") == 0,
+            authority.get("working_orders") == 0,
+            authority.get("working_entry_orders") == 0,
+            authority.get("position_snapshot_complete") is True,
+            authority.get("order_snapshot_complete") is True,
+            authority.get("foreign_activity") is False,
+            authority.get("protective_stop_state") == "NONE",
+            authority.get("reconciliation_current") is True,
+            authority.get("unresolved_command") is False,
+            authority.get("unresolved_native_order") is False,
+            authority.get("unresolved_execution") is False,
+            authority.get("risk_locked_out") is True,
+            authority.get("risk_lockout_reason") == "RECONCILIATION_BLOCKED",
+            authority.get("risk_lockout_trade_date") is None,
+            authority.get("risk_continuity_fault") is None,
+            authority.get("retained_safety_lockout") is False,
+            authority.get("fault_reason") in {None, "RECONCILIATION_BLOCKED"},
+            authority.get("transport_authenticated") is True,
+            authority.get("transport_reconciled") is True,
+            authority.get("transport_addon_provenance_valid") is True,
+            authority.get("paper_only") is True,
+            authority.get("live_capital") == "DENIED",
+            authority.get("maximum_quantity") == 1,
+        ))
+
+    def begin_reconciliation_recovery_lease(
+        self, lease_id: str, expected_authority_state_hash: str,
+    ) -> dict[str, object]:
+        """Pause normal entry admission for one exact acknowledged recovery."""
+        if not isinstance(lease_id, str) or not lease_id:
+            raise ValueError("RECONCILIATION_RECOVERY_LEASE_ID_INVALID")
+        with self._lock, self.ledger.commissioning_authority_fence():
+            authority = self._reconciliation_recovery_authority_locked()
+            authority_hash = canonical_hash(authority)
+            if expected_authority_state_hash != authority_hash:
+                raise RuntimeError("RECONCILIATION_RECOVERY_AUTHORITY_STATE_STALE")
+            if not self._reconciliation_recovery_safe_snapshot(authority):
+                raise RuntimeError("RECONCILIATION_RECOVERY_PREFLIGHT_BLOCKED")
+            if self._reconciliation_recovery_lease_id not in {None, lease_id}:
+                raise RuntimeError("RECONCILIATION_RECOVERY_LEASE_ACTIVE")
+            self._reconciliation_recovery_lease_id = lease_id
+            self._entries_paused = True
+            return {
+                "lease_id": lease_id,
+                "authority_state_hash": authority_hash,
+                "transport_commands_sent": authority["transport_commands_sent"],
+            }
+
+    def abort_reconciliation_recovery_lease(self, lease_id: str) -> None:
+        """Release only the named lease; the historical lockout remains active."""
+        with self._lock:
+            if self._reconciliation_recovery_lease_id == lease_id:
+                self._reconciliation_recovery_lease_id = None
+                self._entries_paused = True
+
+    @staticmethod
+    def _recovery_reconciliation_payload_safe(payload: Mapping[str, object]) -> bool:
+        return all((
+            payload.get("account_name") == "Sim101",
+            payload.get("account_class") == "LOCAL_SIMULATION",
+            payload.get("instrument") == "MNQ SEP26",
+            payload.get("position_quantity") == 0,
+            payload.get("working_order_count") == 0,
+            payload.get("working_entry_count") == 0,
+            payload.get("position_snapshot_complete") is True,
+            payload.get("order_snapshot_complete") is True,
+            payload.get("foreign_activity") is False,
+            payload.get("protective_stop_state") == "NONE",
+        ))
+
+    def _assert_reconciliation_recovery_suffix_locked(
+        self, acknowledgement_sequence: int,
+    ) -> None:
+        allowed_transition_pairs = {
+            ("READY_DISARMED", "RECONCILING", "EXECUTION_BRIDGE_AUTHENTICATED"),
+            ("RECONCILING", "READY_DISARMED", "FLAT_RECONCILIATION_COMPLETE"),
+        }
+        for item in self.ledger.authority_records_after(acknowledgement_sequence):
+            kind = item.get("kind")
+            record = item.get("record")
+            payload = record.get("payload") if isinstance(record, Mapping) else None
+            if not isinstance(payload, Mapping):
+                raise RuntimeError("RECONCILIATION_RECOVERY_AUTHORITY_SUFFIX_INVALID")
+            if kind == "SESSION_HANDSHAKE":
+                if (
+                    payload.get("account_name"), payload.get("account_class"),
+                    payload.get("instrument"), payload.get("capability"),
+                ) != ("Sim101", "LOCAL_SIMULATION", "MNQ SEP26", "PAPER_ONLY"):
+                    raise RuntimeError("RECONCILIATION_RECOVERY_CONFLICTING_AUTHORITY")
+                continue
+            if kind == "SESSION_TRANSITION":
+                transition = (
+                    payload.get("prior_state"), payload.get("state"), payload.get("reason"),
+                )
+                if transition not in allowed_transition_pairs:
+                    raise RuntimeError("RECONCILIATION_RECOVERY_CONFLICTING_AUTHORITY")
+                continue
+            if kind in {
+                "COMMAND_RECEIPT_RECONCILIATION", "POSITION_SNAPSHOT_RECONCILIATION",
+            } and self._recovery_reconciliation_payload_safe(payload):
+                continue
+            raise RuntimeError("RECONCILIATION_RECOVERY_CONFLICTING_AUTHORITY")
+
+    def complete_reconciliation_recovery(
+        self,
+        *,
+        lease_id: str,
+        request_id: str,
+        request_hash: str,
+        incident: Mapping[str, object],
+        lockouts: tuple[Mapping[str, object], ...],
+        acknowledgement: Mapping[str, object],
+        proof: Mapping[str, object],
+        evidence_digest: str,
+        commands_before: int,
+    ) -> dict[str, object]:
+        """Persist proof and clear only the incident-8631 reconciliation latch."""
+        with self._lock, self.ledger.commissioning_authority_fence():
+            if self._reconciliation_recovery_lease_id != lease_id:
+                raise RuntimeError("RECONCILIATION_RECOVERY_LEASE_MISMATCH")
+            authority = self._reconciliation_recovery_authority_locked()
+            if not self._reconciliation_recovery_safe_snapshot(authority):
+                raise RuntimeError("RECONCILIATION_RECOVERY_FINAL_PREFLIGHT_BLOCKED")
+            if authority.get("transport_commands_sent") != commands_before:
+                raise RuntimeError("RECONCILIATION_RECOVERY_EXECUTION_COMMAND_RACE")
+            acknowledgement_sequence = acknowledgement.get("ledger_sequence")
+            if type(acknowledgement_sequence) is not int:
+                raise RuntimeError("RECONCILIATION_RECOVERY_ACKNOWLEDGEMENT_INVALID")
+            self._assert_reconciliation_recovery_suffix_locked(acknowledgement_sequence)
+
+            latest_safety = self.ledger.recent_kind_records(("INCIDENT_SAFETY_EVENT",), 1)
+            latest_lockout = self.ledger.recent_kind_records(("RISK_EVENT_AUTHORITY_LOCKOUT",), 1)
+            if (
+                len(latest_safety) != 1
+                or latest_safety[0]["ledger_sequence"] != incident.get("ledger_sequence")
+                or latest_safety[0]["record_hash"] != incident.get("record_hash")
+                or len(latest_lockout) != 1
+                or latest_lockout[0]["ledger_sequence"] != lockouts[-1].get("ledger_sequence")
+                or latest_lockout[0]["record_hash"] != lockouts[-1].get("record_hash")
+            ):
+                raise RuntimeError("RECONCILIATION_RECOVERY_NEWER_SAFETY_AUTHORITY")
+
+            observations = proof.get("observations")
+            if not isinstance(observations, list) or len(observations) != 2:
+                raise RuntimeError("RECONCILIATION_RECOVERY_PROOF_INVALID")
+            for observation in observations:
+                result = observation.get("probe_result") if isinstance(observation, Mapping) else None
+                if not isinstance(result, Mapping) or not self._recovery_reconciliation_payload_safe(result):
+                    raise RuntimeError("RECONCILIATION_RECOVERY_PROOF_UNSAFE")
+            proof_commands = proof.get("commands_sent")
+            if proof_commands != 0:
+                raise RuntimeError("RECONCILIATION_RECOVERY_PROBE_USED_COMMANDS")
+
+            evidence_identity = "l3g-reconciliation-recovery-evidence-" + evidence_digest
+            evidence_payload = {
+                "schema": "lane-iii-reconciliation-recovery-v1",
+                "request_id": request_id,
+                "request_hash": request_hash,
+                "incident": dict(incident),
+                "acknowledgement": dict(acknowledgement),
+                "evidence_digest": evidence_digest,
+                "proof": dict(proof),
+                "transport_commands_before": commands_before,
+                "transport_commands_after": authority["transport_commands_sent"],
+                "transport_command_delta": 0,
+                "effect": "FRESH_SERVER_REQUESTED_FLAT_NO_ORDERS_OBSERVATION",
+            }
+            self.ledger.append(
+                "RISK_EVENT_RECONCILIATION_RECOVERY_EVIDENCE", evidence_payload,
+                identity=evidence_identity, execution_session_id=self._execution_session_id(),
+            )
+            evidence_record = self.ledger.record_by_identity(evidence_identity)
+            if evidence_record is None:
+                raise RuntimeError("RECONCILIATION_RECOVERY_EVIDENCE_NOT_DURABLE")
+            evidence_coordinate = {
+                "identity": evidence_identity,
+                "ledger_sequence": evidence_record["ledger_sequence"],
+                "record_hash": evidence_record["record_hash"],
+                "evidence_digest": evidence_digest,
+                "proof_hash": proof.get("proof_hash"),
+            }
+            clear_payload = {
+                "schema": "lane-iii-reconciliation-recovery-v1",
+                "request_id": request_id,
+                "request_hash": request_hash,
+                "operator": "Joseph",
+                "incident": dict(incident),
+                "preserved_lockouts": [dict(value) for value in lockouts],
+                "acknowledgement": dict(acknowledgement),
+                "reconciliation": evidence_coordinate,
+                "account": "Sim101",
+                "environment": "LOCAL_SIMULATION",
+                "instrument": "MNQ SEP26",
+                "maximum_quantity": 1,
+                "live_capital": "DENIED",
+                "locked_out": False,
+                "cleared_lockout_reason": "RECONCILIATION_BLOCKED",
+                "effect": "ONLY_RECONCILIATION_BLOCKED_CLEARED",
+            }
+            clear_identity = "l3g-reconciliation-lockout-clear-" + canonical_hash(
+                {"request_id": request_id}
+            )
+            self.ledger.append(
+                "RISK_EVENT_RECONCILIATION_LOCKOUT_CLEARED", clear_payload,
+                identity=clear_identity, execution_session_id=self._execution_session_id(),
+            )
+            clear_record = self.ledger.record_by_identity(clear_identity)
+            if clear_record is None:
+                raise RuntimeError("RECONCILIATION_RECOVERY_CLEAR_NOT_DURABLE")
+
+            # The durable clear and its automatically advanced continuity
+            # anchor are committed before in-memory entry authority changes.
+            self.risk.restore_lockout(False, None, None)
+            self._fault_reason = None
+            self._retain_safety_lockout_after_flat = False
+            self._entries_paused = False
+            self._reconciliation_recovery_lease_id = None
+            return {
+                "schema": "lane-iii-reconciliation-recovery-v1",
+                "status": "RECOVERED",
+                "request_id": request_id,
+                "request_hash": request_hash,
+                "idempotent_replay": False,
+                "acknowledgement": dict(acknowledgement),
+                "reconciliation": evidence_coordinate,
+                "clear": {
+                    "identity": clear_identity,
+                    "ledger_sequence": clear_record["ledger_sequence"],
+                    "record_hash": clear_record["record_hash"],
+                },
+                "cleared_lockout_reason": "RECONCILIATION_BLOCKED",
+                "preserved_incident": dict(incident),
+                "risk_locked_out": False,
+                "transport_command_delta": 0,
+                "live_capital": "DENIED",
             }
 
     @property
@@ -5436,6 +5740,92 @@ class LaneIIIPaperRuntime:
                     date.fromisoformat(effective_trade_date)
                 except ValueError as exc:
                     raise RuntimeError("RISK_CONTINUITY_AUTHORITY_LOCKOUT_CLEAR_INVALID") from exc
+                self.risk.restore_lockout(False, None, None)
+                continue
+            if kind == "RISK_EVENT_RECONCILIATION_LOCKOUT_CLEARED":
+                status = self.risk.status()
+                expected_keys = {
+                    "schema", "request_id", "request_hash", "operator", "incident",
+                    "preserved_lockouts", "acknowledgement", "reconciliation",
+                    "account", "environment", "instrument", "maximum_quantity",
+                    "live_capital", "locked_out", "cleared_lockout_reason", "effect",
+                    "session_family",
+                }
+                incident = payload.get("incident")
+                lockouts = payload.get("preserved_lockouts")
+                acknowledgement = payload.get("acknowledgement")
+                reconciliation = payload.get("reconciliation")
+                if (
+                    set(payload) != expected_keys
+                    or payload.get("schema") != "lane-iii-reconciliation-recovery-v1"
+                    or payload.get("operator") != "Joseph"
+                    or payload.get("account") != "Sim101"
+                    or payload.get("environment") != "LOCAL_SIMULATION"
+                    or payload.get("instrument") != "MNQ SEP26"
+                    or payload.get("maximum_quantity") != 1
+                    or payload.get("live_capital") != "DENIED"
+                    or payload.get("locked_out") is not False
+                    or payload.get("cleared_lockout_reason") != "RECONCILIATION_BLOCKED"
+                    or payload.get("effect") != "ONLY_RECONCILIATION_BLOCKED_CLEARED"
+                    or status.get("lockout_reason") != "RECONCILIATION_BLOCKED"
+                    or not isinstance(incident, Mapping)
+                    or not isinstance(lockouts, list) or len(lockouts) != 2
+                    or not all(isinstance(value, Mapping) for value in lockouts)
+                    or not isinstance(acknowledgement, Mapping)
+                    or not isinstance(reconciliation, Mapping)
+                ):
+                    raise RuntimeError("RISK_CONTINUITY_RECONCILIATION_CLEAR_INVALID")
+                assert isinstance(incident, Mapping)
+                assert isinstance(acknowledgement, Mapping)
+                assert isinstance(reconciliation, Mapping)
+                incident_sequence = incident.get("ledger_sequence")
+                lockout_sequences = [value.get("ledger_sequence") for value in lockouts]
+                if (
+                    type(incident_sequence) is not int
+                    or not all(type(value) is int for value in lockout_sequences)
+                    or not incident_sequence < lockout_sequences[0] < lockout_sequences[1]
+                    or lockouts[-1].get("lockout_reason") != "RECONCILIATION_BLOCKED"
+                ):
+                    raise RuntimeError("RISK_CONTINUITY_RECONCILIATION_CLEAR_INVALID")
+                coordinate_sets = (
+                    (incident, self.ledger.record_by_sequence(int(incident_sequence))),
+                    (lockouts[0], self.ledger.record_by_sequence(int(lockout_sequences[0]))),
+                    (lockouts[1], self.ledger.record_by_sequence(int(lockout_sequences[1]))),
+                )
+                if any(
+                    stored is None
+                    or coordinate.get("record_hash") != stored.get("record_hash")
+                    for coordinate, stored in coordinate_sets
+                ):
+                    raise RuntimeError("RISK_CONTINUITY_RECONCILIATION_CLEAR_REFERENCE_INVALID")
+                ack_identity = acknowledgement.get("identity")
+                evidence_identity = reconciliation.get("identity")
+                if not isinstance(ack_identity, str) or not isinstance(evidence_identity, str):
+                    raise RuntimeError("RISK_CONTINUITY_RECONCILIATION_CLEAR_REFERENCE_INVALID")
+                ack_record = self.ledger.record_by_identity(ack_identity)
+                evidence_record = self.ledger.record_by_identity(evidence_identity)
+                if ack_record is None or evidence_record is None:
+                    raise RuntimeError("RISK_CONTINUITY_RECONCILIATION_CLEAR_REFERENCE_INVALID")
+                ack_envelope = ack_record.get("record")
+                evidence_envelope = evidence_record.get("record")
+                ack_payload = ack_envelope.get("payload") if isinstance(ack_envelope, Mapping) else None
+                evidence_payload = (
+                    evidence_envelope.get("payload") if isinstance(evidence_envelope, Mapping) else None
+                )
+                request_hash = payload.get("request_hash")
+                if (
+                    acknowledgement.get("ledger_sequence") != ack_record.get("ledger_sequence")
+                    or acknowledgement.get("record_hash") != ack_record.get("record_hash")
+                    or reconciliation.get("ledger_sequence") != evidence_record.get("ledger_sequence")
+                    or reconciliation.get("record_hash") != evidence_record.get("record_hash")
+                    or not isinstance(ack_payload, Mapping)
+                    or not isinstance(evidence_payload, Mapping)
+                    or ack_payload.get("request_hash") != request_hash
+                    or evidence_payload.get("request_hash") != request_hash
+                    or evidence_payload.get("evidence_digest") != reconciliation.get("evidence_digest")
+                    or evidence_payload.get("transport_command_delta") != 0
+                ):
+                    raise RuntimeError("RISK_CONTINUITY_RECONCILIATION_CLEAR_REFERENCE_INVALID")
                 self.risk.restore_lockout(False, None, None)
                 continue
             if kind == "EXECUTION":
