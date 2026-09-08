@@ -1469,6 +1469,90 @@ def _target_non_operational_flat_proven(
     )
 
 
+def _target_faulted_stopping_flat_proven(
+    paper: Mapping[str, object], manifest: Mapping[str, object],
+) -> bool:
+    """Recognize only the sealed checkpoint-fault snapshot this repair targets.
+
+    An older target can fault after it has sealed entries but before its normal
+    STOP path clears the operational-session marker.  This predicate does not
+    make that snapshot operationally clean: it only lets the offline cleanup
+    finalizer proceed to its independent dead-process and two-session native
+    flat proofs.
+    """
+    fault = "FIVE_MINUTE_SIGNAL_CHECKPOINT_DURABILITY_FAILED"
+    session = paper.get("operational_paper_session")
+    return bool(
+        manifest.get("target_profile")
+        == FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION
+        and _target_paper_identity_matches(paper, manifest)
+        and paper.get("state") == "FAULTED"
+        and paper.get("paper_execution") == "LOCKED"
+        and paper.get("session_armed_state") == "DISARMED"
+        and paper.get("entry_owner") == "NONE"
+        and paper.get("protective_stop_state") == "NONE"
+        and paper.get("lockout_or_fault_reason") == fault
+        and isinstance(session, Mapping)
+        and session.get("active") is True
+        and session.get("stopping") is True
+        and session.get("stopping_reason") == fault
+        and session.get("request_id")
+        == f"profile-switch-{manifest.get('operation_id')}"
+        and isinstance(session.get("started_at"), str)
+        and bool(str(session.get("started_at")).strip())
+        and isinstance(session.get("context"), Mapping)
+        and paper.get("current_position") == "FLAT"
+        and type(paper.get("current_quantity")) is int
+        and paper.get("current_quantity") == 0
+        and type(paper.get("current_position_quantity")) is int
+        and paper.get("current_position_quantity") == 0
+        and paper.get("broker_snapshot_position") == "FLAT"
+        and type(paper.get("broker_snapshot_position_quantity")) is int
+        and paper.get("broker_snapshot_position_quantity") == 0
+        and type(paper.get("working_owned_orders")) is int
+        and paper.get("working_owned_orders") == 0
+        and type(paper.get("working_entry_orders")) is int
+        and paper.get("working_entry_orders") == 0
+        and paper.get("foreign_activity") is False
+        and paper.get("position_snapshot_complete") is True
+        and paper.get("order_snapshot_complete") is True
+        and paper.get("reconciliation_current") is True
+        and paper.get("unresolved_command") is False
+        and paper.get("unresolved_native_order") is False
+        and paper.get("unresolved_execution") is False
+    )
+
+
+def _orphaned_faulted_target_cleanup_eligible(
+    state: Mapping[str, object],
+    paper: Mapping[str, object],
+    manifest: Mapping[str, object],
+) -> bool:
+    """Bind late cleanup to the exact target projection left by its supervisor."""
+    auto = state.get("target_autostart")
+    blockers = state.get("blockers")
+    fault = "FIVE_MINUTE_SIGNAL_CHECKPOINT_DURABILITY_FAILED"
+    return bool(
+        state.get("stage") == "AUTOSTARTING_TARGET"
+        and state.get("in_progress") is True
+        and state.get("target_cleanup") is None
+        and blockers == ["TARGET_NON_OPERATIONAL_FLAT_PROOF_UNAVAILABLE"]
+        and type(state.get("target_pid")) is int
+        and state.get("target_pid", 0) > 0
+        and type(state.get("target_runtime_pid")) is int
+        and state.get("target_runtime_pid", 0) > 0
+        and isinstance(auto, Mapping)
+        and auto.get("schema") == "lane-iii-paper-autostart-v1"
+        and auto.get("authority") == "PERSISTENT_PAPER_SIM101_ONLY"
+        and auto.get("stage") == "BLOCKED"
+        and auto.get("in_progress") is False
+        and auto.get("blockers") == [fault]
+        and auto.get("request_id")
+        == f"profile-switch-{manifest.get('operation_id')}"
+        and _target_faulted_stopping_flat_proven(paper, manifest)
+    )
+
+
 def _cleanup_spawned_target(
     process: subprocess.Popen[bytes],
     *,
@@ -1687,7 +1771,7 @@ def finalize_stale_target_cleanup(
         ):
             raise RuntimeError("PROFILE_SWITCH_CLEANUP_CLAIM_BINDING_INVALID")
 
-        cleanup = state.get("target_cleanup")
+        stored_cleanup = state.get("target_cleanup")
         binding = state.get("target_runtime_binding")
         paper = state.get("target_paper_status")
         blockers = state.get("blockers")
@@ -1695,6 +1779,17 @@ def finalize_stale_target_cleanup(
         target_runtime_pid = state.get("target_runtime_pid")
         supervisor_pid = claim.get("supervisor_pid")
         source_parent_pid = manifest.get("parent_pid")
+        orphaned_faulted_target = bool(
+            isinstance(paper, Mapping)
+            and _orphaned_faulted_target_cleanup_eligible(
+                state, paper, manifest,
+            )
+        )
+        cleanup_binding_valid = bool(
+            isinstance(stored_cleanup, Mapping)
+            and stored_cleanup.get("target_pid") == target_pid
+            and stored_cleanup.get("target_runtime_pid") == target_runtime_pid
+        )
         if (
             state.get("schema") != PROFILE_SWITCH_SCHEMA
             or state.get("operation_id") != operation_id
@@ -1702,7 +1797,7 @@ def finalize_stale_target_cleanup(
             or state.get("current_profile") != manifest.get("current_profile")
             or state.get("target_profile") != manifest.get("target_profile")
             or Path(str(state.get("manifest_path"))).resolve() != manifest_path.resolve()
-            or not isinstance(cleanup, Mapping)
+            or not (cleanup_binding_valid or orphaned_faulted_target)
             or not isinstance(binding, Mapping)
             or not isinstance(paper, Mapping)
             or not isinstance(blockers, list)
@@ -1717,14 +1812,36 @@ def finalize_stale_target_cleanup(
             or type(source_parent_pid) is not int
             or source_parent_pid <= 0
             or source_parent_pid in {supervisor_pid, target_pid, target_runtime_pid}
-            or cleanup.get("target_pid") != target_pid
-            or cleanup.get("target_runtime_pid") != target_runtime_pid
             or binding.get("pid") != target_runtime_pid
             or type(binding.get("parent_pid")) is not int
             or int(binding["parent_pid"]) <= 0
             or int(binding["parent_pid"]) not in {target_pid, supervisor_pid}
         ):
             raise RuntimeError("PROFILE_SWITCH_CLEANUP_STATE_BINDING_INVALID")
+
+        cleanup: Mapping[str, object]
+        if isinstance(stored_cleanup, Mapping):
+            cleanup = stored_cleanup
+        else:
+            # The original supervisor disappeared before it could serialize a
+            # cleanup attempt. Do not invent an exited process handle or an
+            # absence proof here: those facts are established twice below,
+            # under the control-port lease, and signed into late_revalidation.
+            cleanup = {
+                "target_pid": target_pid,
+                "terminate_attempted": False,
+                "kill_attempted": False,
+                "process_handle_exited": False,
+                "target_pid_absent": False,
+                "target_runtime_pid": target_runtime_pid,
+                "target_runtime_pid_absent": False,
+                "process_dead": False,
+                "control_port_released": False,
+                "native_exposure_absent": False,
+                "cleanup_proven": False,
+                "safe_terminal_proven": False,
+                "errors": ["ORIGINAL_SUPERVISOR_CLEANUP_NOT_RECORDED"],
+            }
 
         transport = paper.get("transport")
         if not isinstance(transport, Mapping):
@@ -1959,20 +2076,27 @@ def finalize_stale_target_cleanup(
             ):
                 raise RuntimeError("PROFILE_SWITCH_CLEANUP_NATIVE_PROOF_INVALID")
             return state
-        if (
-            state.get("stage") != "TARGET_CLEANUP_UNPROVEN"
-            or state.get("in_progress") is not True
-            or "TARGET_CLEANUP_UNPROVEN" not in blockers
-            or cleanup.get("cleanup_proven") is not False
-            or cleanup.get("safe_terminal_proven") is not False
-            or cleanup.get("process_handle_exited") is not True
-            or paper.get("state") != "READY_DISARMED"
-            or paper.get("paper_execution") != "DISARMED"
-            or paper.get("session_armed_state") != "DISARMED"
-            or paper.get("entry_owner") != "NONE"
-            or paper.get("protective_stop_state") != "NONE"
-            or not _target_non_operational_flat_proven(paper, manifest)
-        ):
+        clean_non_operational = bool(
+            paper.get("state") == "READY_DISARMED"
+            and paper.get("paper_execution") == "DISARMED"
+            and paper.get("session_armed_state") == "DISARMED"
+            and paper.get("entry_owner") == "NONE"
+            and paper.get("protective_stop_state") == "NONE"
+            and _target_non_operational_flat_proven(paper, manifest)
+        )
+        exact_faulted_stopping = _target_faulted_stopping_flat_proven(
+            paper, manifest,
+        )
+        recorded_cleanup_eligible = bool(
+            state.get("stage") == "TARGET_CLEANUP_UNPROVEN"
+            and state.get("in_progress") is True
+            and "TARGET_CLEANUP_UNPROVEN" in blockers
+            and cleanup.get("cleanup_proven") is False
+            and cleanup.get("safe_terminal_proven") is False
+            and cleanup.get("process_handle_exited") is True
+            and (clean_non_operational or exact_faulted_stopping)
+        )
+        if not (recorded_cleanup_eligible or orphaned_faulted_target):
             raise RuntimeError("PROFILE_SWITCH_CLEANUP_NOT_ELIGIBLE")
 
         with _control_port_lease(control_host, control_port):

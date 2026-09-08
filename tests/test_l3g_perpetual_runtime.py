@@ -757,6 +757,299 @@ class PerpetualRuntimeTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_missed_boundary_invalidates_tie_chain_until_fresh_direction(self) -> None:
+        with TemporaryDirectory() as directory, patch(
+            "src.l3g_paper.runtime._now", return_value=NOW,
+        ):
+            ledger, runtime, _ = self._runtime(directory)
+            try:
+                prior = self._decision(
+                    runtime,
+                    PaperDirection.SHORT,
+                    created_at="2026-09-01T20:53:30Z",
+                    candle_close_utc="2026-09-01T20:53:30Z",
+                    suffix="continuity-prior",
+                )
+                self._commit_signal(runtime, prior)
+
+                missed = self._decision(
+                    runtime,
+                    PaperDirection.SHORT,
+                    created_at="2026-09-01T20:54:00Z",
+                    candle_close_utc="2026-09-01T20:54:00Z",
+                    suffix="continuity-missed",
+                )
+                missed = replace(
+                    missed,
+                    family_summary={
+                        **missed.family_summary,
+                        "missed_boundary_count": 1,
+                    },
+                )
+                ledger.append(
+                    "DECISION", missed.payload(),
+                    identity=missed.paper_decision_id,
+                    occurred_at=missed.created_at,
+                )
+                self.assertFalse(
+                    runtime._record_five_minute_direction_checkpoint_locked(
+                        missed,
+                    ),
+                )
+                self.assertIsNone(
+                    runtime._latest_five_minute_direction_checkpoint,
+                )
+                self.assertFalse(runtime._perpetual_signal_ledger_verified)
+
+                tied_source = self._decision(
+                    runtime,
+                    PaperDirection.LONG,
+                    created_at="2026-09-01T20:54:30Z",
+                    candle_close_utc="2026-09-01T20:54:30Z",
+                    suffix="continuity-tie",
+                )
+                tie = replace(
+                    tied_source,
+                    decision=PaperDecisionKind.NO_TRADE,
+                    direction=PaperDirection.FLAT,
+                    family_summary={
+                        **tied_source.family_summary,
+                        "action": "BLOCKED",
+                        "bias": "TIE",
+                        "target_position": "FLAT",
+                        "missed_boundary_count": 0,
+                    },
+                    reason_code="FIVE_MINUTE_BIAS_TIE_FLAT",
+                )
+                ledger.append(
+                    "DECISION", tie.payload(), identity=tie.paper_decision_id,
+                    occurred_at=tie.created_at,
+                )
+                self.assertTrue(
+                    runtime._record_five_minute_direction_checkpoint_locked(
+                        tie,
+                    ),
+                )
+                self.assertIsNone(
+                    runtime._latest_five_minute_direction_checkpoint,
+                )
+                self.assertEqual(
+                    runtime._perpetual_flat_blocker,
+                    "FIVE_MINUTE_TIE_WITHOUT_PRIOR_NON_TIED_SIGNAL",
+                )
+                self.assertIsNone(runtime._perpetual_signal_fault)
+
+                recovered = self._decision(
+                    runtime,
+                    PaperDirection.LONG,
+                    created_at="2026-09-01T20:55:00Z",
+                    candle_close_utc="2026-09-01T20:55:00Z",
+                    suffix="continuity-recovered",
+                )
+                self._commit_signal(runtime, recovered)
+                checkpoint = runtime._latest_five_minute_direction_checkpoint
+                self.assertIsNotNone(checkpoint)
+                self.assertEqual(
+                    checkpoint["direction"], PaperDirection.LONG.value,  # type: ignore[index]
+                )
+                self.assertTrue(runtime._perpetual_signal_ledger_verified)
+                self.assertIsNone(runtime._perpetual_flat_blocker)
+            finally:
+                ledger.close()
+
+    def test_discontinuous_tie_is_refused_before_append_and_fresh_direction_recovers(self) -> None:
+        with TemporaryDirectory() as directory, patch(
+            "src.l3g_paper.runtime._now", return_value=NOW,
+        ):
+            ledger, runtime, _ = self._runtime(directory)
+            path = ledger.path
+            try:
+                prior = self._decision(
+                    runtime,
+                    PaperDirection.SHORT,
+                    created_at="2026-09-01T20:53:30Z",
+                    candle_close_utc="2026-09-01T20:53:30Z",
+                    suffix="discontinuous-prior",
+                )
+                self._commit_signal(runtime, prior)
+                prior_checkpoint = dict(
+                    runtime._latest_five_minute_direction_checkpoint or {},
+                )
+
+                tied_source = self._decision(
+                    runtime,
+                    PaperDirection.SHORT,
+                    created_at="2026-09-01T20:55:00Z",
+                    candle_close_utc="2026-09-01T20:55:00Z",
+                    suffix="discontinuous-tie",
+                )
+                tie = replace(
+                    tied_source,
+                    decision=PaperDecisionKind.NO_TRADE,
+                    direction=PaperDirection.FLAT,
+                    family_summary={
+                        **tied_source.family_summary,
+                        "action": "BLOCKED",
+                        "bias": "TIE",
+                        "target_position": "FLAT",
+                        # This mirrors the incident: the process-local scheduler
+                        # reported no miss even though the recovered checkpoint
+                        # did not end at this boundary's open.
+                        "missed_boundary_count": 0,
+                    },
+                    reason_code="FIVE_MINUTE_BIAS_TIE_FLAT",
+                )
+                ledger.append(
+                    "DECISION", tie.payload(), identity=tie.paper_decision_id,
+                    occurred_at=tie.created_at,
+                )
+                before = len(ledger.recent_kind_records(
+                    ("RISK_EVENT_FIVE_MINUTE_DIRECTION_CHECKPOINT",),
+                ))
+
+                self.assertFalse(
+                    runtime._record_five_minute_direction_checkpoint_locked(tie),
+                )
+                self.assertEqual(
+                    len(ledger.recent_kind_records(
+                        ("RISK_EVENT_FIVE_MINUTE_DIRECTION_CHECKPOINT",),
+                    )),
+                    before,
+                )
+                self.assertIsNone(
+                    runtime._latest_five_minute_direction_checkpoint,
+                )
+                self.assertFalse(runtime._perpetual_signal_ledger_verified)
+                self.assertEqual(
+                    runtime._perpetual_flat_blocker,
+                    "FIVE_MINUTE_BOUNDARY_CONTINUITY_UNPROVEN",
+                )
+                self.assertIsNone(runtime._perpetual_signal_fault)
+                self.assertFalse(runtime.risk.status()["locked_out"])
+                self.assertIsNone(ledger.record_by_identity(
+                    "l3g-five-minute-direction-" + canonical_hash({
+                        "paper_policy_hash": runtime.policy.artifact.configuration_hash,
+                        "candle_close_utc": "2026-09-01T20:55:00Z",
+                    })[:32],
+                ))
+
+                recovered = self._decision(
+                    runtime,
+                    PaperDirection.LONG,
+                    created_at="2026-09-01T20:55:30Z",
+                    candle_close_utc="2026-09-01T20:55:30Z",
+                    suffix="discontinuous-recovered",
+                )
+                self._commit_signal(runtime, recovered)
+                checkpoint = dict(
+                    runtime._latest_five_minute_direction_checkpoint or {},
+                )
+                self.assertEqual(checkpoint["direction"], "LONG")
+                self.assertGreater(
+                    int(checkpoint["ledger_sequence"]),
+                    int(prior_checkpoint["ledger_sequence"]),
+                )
+            finally:
+                ledger.close()
+
+            reopened = PaperLedger(
+                path,
+                epoch_id="L3G-PAPER-EPOCH-TEST-PERPETUAL",
+                policy=FIVE_MINUTE_PERPETUAL_PROFILE.policy,
+                risk=FIVE_MINUTE_PERPETUAL_PROFILE.risk,
+            )
+            try:
+                recovered_runtime = LaneIIIPaperRuntime(reopened)
+                checkpoint = recovered_runtime._latest_five_minute_direction_checkpoint
+                self.assertIsNotNone(checkpoint)
+                self.assertEqual(checkpoint["direction"], "LONG")  # type: ignore[index]
+                self.assertEqual(
+                    checkpoint["candle_close_utc"],  # type: ignore[index]
+                    "2026-09-01T20:55:30Z",
+                )
+                self.assertTrue(
+                    recovered_runtime._perpetual_signal_requires_start_verification,
+                )
+                self.assertFalse(
+                    recovered_runtime._perpetual_signal_ledger_verified,
+                )
+            finally:
+                reopened.close()
+
+    def test_flat_faulted_operational_stop_completes_once_and_preserves_lockout(self) -> None:
+        with TemporaryDirectory() as directory, patch(
+            "src.l3g_paper.runtime._now", return_value=NOW,
+        ):
+            ledger, runtime, capture = self._runtime(directory)
+            path = ledger.path
+            try:
+                self._ready(runtime)
+                started = runtime.operational_paper_start(
+                    "faulted-stop-regression",
+                )
+                self.assertTrue(started["started"])
+                self.assertEqual(runtime.state, PaperRuntimeState.PAPER_RUNNING)
+
+                runtime._fail_closed_without_ledger_locked(
+                    "FIVE_MINUTE_SIGNAL_CHECKPOINT_DURABILITY_FAILED",
+                )
+                self.assertEqual(runtime.state, PaperRuntimeState.FAULTED)
+                self.assertTrue(runtime.risk.status()["locked_out"])
+                self.assertTrue(
+                    runtime.status()["operational_paper_session"]["stopping"],  # type: ignore[index]
+                )
+
+                first = runtime.flatten_and_disarm()
+                replay = runtime.flatten_and_disarm()
+
+                self.assertTrue(first["flat_confirmed"])
+                self.assertFalse(first["stopping"])
+                self.assertTrue(replay["flat_confirmed"])
+                self.assertEqual(runtime.state, PaperRuntimeState.FAULTED)
+                self.assertIsNone(runtime.status()["operational_paper_session"])
+                self.assertTrue(runtime._entries_paused)
+                self.assertTrue(runtime.risk.status()["locked_out"])
+                self.assertEqual(
+                    runtime.status()["lockout_or_fault_reason"],
+                    "FIVE_MINUTE_SIGNAL_CHECKPOINT_DURABILITY_FAILED",
+                )
+                self.assertEqual(capture.commands, [])
+                stopped = ledger.recent_kind_records(
+                    ("SESSION_OPERATIONAL_PAPER_STOPPED",),
+                )
+                self.assertEqual(len(stopped), 1)
+                self.assertEqual(
+                    stopped[0]["record"]["payload"]["reason"],  # type: ignore[index]
+                    "FIVE_MINUTE_SIGNAL_CHECKPOINT_DURABILITY_FAILED",
+                )
+            finally:
+                ledger.close()
+
+            reopened = PaperLedger(
+                path,
+                epoch_id="L3G-PAPER-EPOCH-TEST-PERPETUAL",
+                policy=FIVE_MINUTE_PERPETUAL_PROFILE.policy,
+                risk=FIVE_MINUTE_PERPETUAL_PROFILE.risk,
+            )
+            try:
+                recovered_runtime = LaneIIIPaperRuntime(reopened)
+                self.assertIsNone(
+                    recovered_runtime.status()["operational_paper_session"],
+                )
+                self.assertTrue(recovered_runtime.risk.status()["locked_out"])
+                self.assertEqual(
+                    recovered_runtime.status()["lockout_or_fault_reason"],
+                    "FIVE_MINUTE_SIGNAL_CHECKPOINT_DURABILITY_FAILED",
+                )
+                self.assertEqual(
+                    len(reopened.recent_kind_records(
+                        ("SESSION_OPERATIONAL_PAPER_STOPPED",),
+                    )),
+                    1,
+                )
+            finally:
+                reopened.close()
+
     def test_v2_start_calculates_just_completed_bias_from_retained_authentic_observations(self) -> None:
         """A fresh V2 derives the latest complete bar before it starts flat.
 
@@ -1491,6 +1784,112 @@ class PerpetualRuntimeTests(unittest.TestCase):
                     self.assertEqual(runtime.state, PaperRuntimeState.RECONCILING)
                 finally:
                     ledger.close()
+
+    def test_early_submitted_protective_waits_for_acceptance_then_reconciles_once(self) -> None:
+        with TemporaryDirectory() as directory, patch(
+            "src.l3g_paper.runtime._now", return_value=NOW,
+        ):
+            ledger, runtime, capture = self._runtime(directory)
+            try:
+                suffix = "submitted-before-entry-fill"
+                signal = self._decision(
+                    runtime,
+                    PaperDirection.LONG,
+                    created_at=NOW,
+                    candle_close_utc=NOW,
+                    suffix=suffix,
+                )
+                self._commit_signal(runtime, signal)
+                self._ready(runtime)
+                self.assertTrue(
+                    runtime.operational_paper_start(
+                        "early-protective-submitted-regression",
+                    )["started"],
+                )
+                self.assertEqual(runtime.state, PaperRuntimeState.ENTRY_PENDING)
+                entry_command = capture.commands[0]
+                protective = {
+                    "message_type": "ORDER_EVENT",
+                    "order_role": "PROTECTIVE",
+                    "order_state": "SUBMITTED",
+                    "native_order_id": suffix + "-protective-order",
+                    "command_id": entry_command.command_id,  # type: ignore[attr-defined]
+                    "account_name": "Sim101",
+                    "instrument": "MNQ SEP26",
+                    "quantity": 1,
+                    "timestamp": NOW,
+                }
+
+                # The native stop exists, but SUBMITTED is not protection.
+                # Preserve the owned callback without competing with the
+                # AddOn's independent acceptance watchdog.
+                runtime.on_execution_message(protective)
+                self.assertEqual(runtime.state, PaperRuntimeState.ENTRY_PENDING)
+                self.assertIsNotNone(runtime._early_protective_order_event)
+                self.assertEqual(
+                    runtime.status()["protective_stop_state"], "SUBMITTED",
+                )
+                self.assertEqual(
+                    [command.action for command in capture.commands],  # type: ignore[attr-defined]
+                    [ExecutionAction.ENTER_LONG],
+                )
+
+                runtime.on_execution_message({
+                    "message_type": "EXECUTION_EVENT",
+                    "order_role": "ENTRY",
+                    "direction": "LONG",
+                    "price": "100.25",
+                    "quantity": 1,
+                    "native_execution_id": suffix + "-entry-execution",
+                    "native_order_id": suffix + "-entry-order",
+                    "account_name": "Sim101",
+                    "instrument": "MNQ SEP26",
+                    "timestamp": NOW,
+                })
+                self.assertEqual(runtime.state, PaperRuntimeState.LONG)
+                self.assertIsNone(runtime._early_protective_order_event)
+                self.assertFalse(runtime.risk.status()["locked_out"])
+                actions = [command.action for command in capture.commands]  # type: ignore[attr-defined]
+                self.assertEqual(actions.count(ExecutionAction.RECONCILE), 0)
+                self.assertEqual(actions.count(ExecutionAction.EMERGENCY_FLATTEN), 0)
+
+                protective["order_state"] = "ACCEPTED"
+                runtime.on_execution_message(protective)
+                runtime.on_execution_message(protective)
+                actions = [command.action for command in capture.commands]  # type: ignore[attr-defined]
+                self.assertEqual(actions.count(ExecutionAction.RECONCILE), 1)
+                self.assertEqual(actions.count(ExecutionAction.EMERGENCY_FLATTEN), 0)
+
+                runtime.on_execution_message({
+                    "message_type": "RECONCILIATION",
+                    "receipt_id": suffix + "-positioned-reconciliation",
+                    "account_name": "Sim101",
+                    "account_class": "LOCAL_SIMULATION",
+                    "instrument": "MNQ SEP26",
+                    "position_quantity": 1,
+                    "working_order_count": 1,
+                    "working_entry_count": 0,
+                    "position_snapshot_complete": True,
+                    "order_snapshot_complete": True,
+                    "foreign_activity": False,
+                    "protective_stop_state": "ACCEPTED",
+                    "timestamp": NOW,
+                })
+                status = runtime.status()
+                self.assertEqual(runtime.state, PaperRuntimeState.LONG)
+                self.assertFalse(runtime.risk.status()["locked_out"])
+                self.assertEqual(
+                    status["position_requirement"]["blocking_reasons"],  # type: ignore[index]
+                    [],
+                )
+                self.assertEqual(
+                    len(ledger.recent_kind_records(
+                        ("RISK_EVENT_POSITIONED_RECONCILIATION",),
+                    )),
+                    1,
+                )
+            finally:
+                ledger.close()
 
     def test_protective_fill_stops_operation_reconciles_and_never_reenters(self) -> None:
         with TemporaryDirectory() as directory, patch(

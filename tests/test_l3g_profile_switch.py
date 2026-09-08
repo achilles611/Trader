@@ -39,9 +39,11 @@ from src.l3g_paper.profile_switch import (
     _bounded_full_verification,
     _claim_target_launch,
     _manifest,
+    _orphaned_faulted_target_cleanup_eligible,
     _launch_child,
     _pid_exists,
     _target_binding_matches,
+    _target_faulted_stopping_flat_proven,
     exact_flat_shutdown_ready,
     finalize_stale_target_cleanup,
     remembered_profile_selection,
@@ -997,6 +999,149 @@ class ProfileSwitchServiceTests(unittest.TestCase):
         self.assertEqual(
             len(list(audit_root.glob("ledger-verification-*.cancel"))), 1,
         )
+
+    def test_faulted_stopping_cleanup_is_exactly_scoped_to_checkpoint_fault(self) -> None:
+        operation_id = "profile-switch-" + "a" * 32
+        manifest = {
+            "operation_id": operation_id,
+            "target_profile": FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
+        }
+        paper = target_paper_status(
+            FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
+        )
+        paper.update({
+            "state": "FAULTED",
+            "paper_execution": "LOCKED",
+            "session_armed_state": "DISARMED",
+            "lockout_or_fault_reason": (
+                "FIVE_MINUTE_SIGNAL_CHECKPOINT_DURABILITY_FAILED"
+            ),
+            "operational_paper_session": {
+                "active": True,
+                "request_id": f"profile-switch-{operation_id}",
+                "started_at": "2026-09-08T05:19:07Z",
+                "context": {"session_id": "MNQU6:ASIA:2026-09-08"},
+                "stopping": True,
+                "stopping_reason": (
+                    "FIVE_MINUTE_SIGNAL_CHECKPOINT_DURABILITY_FAILED"
+                ),
+            },
+        })
+        self.assertTrue(_target_faulted_stopping_flat_proven(paper, manifest))
+
+        mutations = {
+            "wrong_profile": lambda value: value.__setitem__(
+                "entry_profile_version", "BEELZEBUB_FIVE_MINUTE_BIAS_V1",
+            ),
+            "armed": lambda value: value.__setitem__(
+                "session_armed_state", "ARMED",
+            ),
+            "different_fault": lambda value: value.__setitem__(
+                "lockout_or_fault_reason", "DIFFERENT_FAULT",
+            ),
+            "not_stopping": lambda value: value[
+                "operational_paper_session"
+            ].__setitem__("stopping", False),
+            "wrong_request": lambda value: value[
+                "operational_paper_session"
+            ].__setitem__("request_id", "different-request"),
+            "positioned": lambda value: value.__setitem__(
+                "current_position_quantity", 1,
+            ),
+            "working_order": lambda value: value.__setitem__(
+                "working_owned_orders", 1,
+            ),
+            "stale_reconciliation": lambda value: value.__setitem__(
+                "reconciliation_current", False,
+            ),
+            "unresolved_execution": lambda value: value.__setitem__(
+                "unresolved_execution", True,
+            ),
+        }
+        for name, mutation in mutations.items():
+            with self.subTest(name=name):
+                changed = json.loads(json.dumps(paper))
+                mutation(changed)
+                self.assertFalse(
+                    _target_faulted_stopping_flat_proven(changed, manifest),
+                )
+
+    def test_orphaned_faulted_cleanup_requires_exact_supervisor_projection(self) -> None:
+        operation_id = "profile-switch-" + "b" * 32
+        fault = "FIVE_MINUTE_SIGNAL_CHECKPOINT_DURABILITY_FAILED"
+        manifest = {
+            "operation_id": operation_id,
+            "target_profile": FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
+        }
+        paper = target_paper_status(
+            FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
+        )
+        paper.update({
+            "state": "FAULTED",
+            "paper_execution": "LOCKED",
+            "session_armed_state": "DISARMED",
+            "lockout_or_fault_reason": fault,
+            "operational_paper_session": {
+                "active": True,
+                "request_id": f"profile-switch-{operation_id}",
+                "started_at": "2026-09-08T05:19:07Z",
+                "context": {"session_id": "MNQU6:ASIA:2026-09-08"},
+                "stopping": True,
+                "stopping_reason": fault,
+            },
+        })
+        state = {
+            "stage": "AUTOSTARTING_TARGET",
+            "in_progress": True,
+            "target_cleanup": None,
+            "blockers": ["TARGET_NON_OPERATIONAL_FLAT_PROOF_UNAVAILABLE"],
+            "target_pid": 31346,
+            "target_runtime_pid": 31347,
+            "target_autostart": {
+                "schema": "lane-iii-paper-autostart-v1",
+                "authority": "PERSISTENT_PAPER_SIM101_ONLY",
+                "stage": "BLOCKED",
+                "in_progress": False,
+                "blockers": [fault],
+                "request_id": f"profile-switch-{operation_id}",
+            },
+        }
+        self.assertTrue(
+            _orphaned_faulted_target_cleanup_eligible(state, paper, manifest),
+        )
+
+        mutations = {
+            "terminalized": lambda value: value.__setitem__(
+                "stage", "BLOCKED_SAFE",
+            ),
+            "cleanup_present": lambda value: value.__setitem__(
+                "target_cleanup", {},
+            ),
+            "different_blocker": lambda value: value.__setitem__(
+                "blockers", ["DIFFERENT_BLOCKER"],
+            ),
+            "missing_target_pid": lambda value: value.__setitem__(
+                "target_pid", None,
+            ),
+            "autostart_running": lambda value: value[
+                "target_autostart"
+            ].__setitem__("in_progress", True),
+            "autostart_ready": lambda value: value[
+                "target_autostart"
+            ].__setitem__("stage", "RUNNING"),
+            "different_request": lambda value: value[
+                "target_autostart"
+            ].__setitem__("request_id", "different-request"),
+        }
+        for name, mutation in mutations.items():
+            with self.subTest(name=name):
+                changed = json.loads(json.dumps(state))
+                mutation(changed)
+                self.assertFalse(
+                    _orphaned_faulted_target_cleanup_eligible(
+                        changed, paper, manifest,
+                    ),
+                )
 
     def flatten(self) -> dict[str, object]:
         self.flatten_calls += 1
@@ -2633,6 +2778,7 @@ class ProfileSwitchServiceTests(unittest.TestCase):
     def test_cleanup_is_unproven_while_bound_runtime_child_pid_survives(self) -> None:
         manifest_path, manifest = self.supervisor_ready_manifest(
             "switch-request-runtime-child-survives",
+            FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
         )
 
         class Process:
@@ -2844,6 +2990,47 @@ class ProfileSwitchServiceTests(unittest.TestCase):
             )
         state_path.write_bytes(state_before_replay)
         self.assertEqual(audit_path.read_bytes(), audit_before_replay)
+
+        # Recreate the exact durable orphan seen when the original supervisor
+        # disappears after recording the blocked faulted target but before it
+        # serializes a cleanup attempt. The offline finalizer must supply all
+        # missing process/native proofs; this projection supplies none.
+        orphaned = json.loads(state_before_replay.decode("utf-8"))
+        fault = "FIVE_MINUTE_SIGNAL_CHECKPOINT_DURABILITY_FAILED"
+        faulted_paper = target_paper_status(
+            FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
+        )
+        faulted_paper.update({
+            "state": "FAULTED",
+            "paper_execution": "LOCKED",
+            "session_armed_state": "DISARMED",
+            "lockout_or_fault_reason": fault,
+            "operational_paper_session": {
+                "active": True,
+                "request_id": f"profile-switch-{manifest['operation_id']}",
+                "started_at": "2026-09-08T05:19:07Z",
+                "context": {"session_id": "MNQU6:ASIA:2026-09-08"},
+                "stopping": True,
+                "stopping_reason": fault,
+            },
+        })
+        orphaned.update({
+            "stage": "AUTOSTARTING_TARGET",
+            "in_progress": True,
+            "blockers": ["TARGET_NON_OPERATIONAL_FLAT_PROOF_UNAVAILABLE"],
+            "target_cleanup": None,
+            "target_paper_status": faulted_paper,
+            "target_autostart": {
+                "schema": "lane-iii-paper-autostart-v1",
+                "authority": "PERSISTENT_PAPER_SIM101_ONLY",
+                "stage": "BLOCKED",
+                "in_progress": False,
+                "blockers": [fault],
+                "request_id": f"profile-switch-{manifest['operation_id']}",
+            },
+        })
+        state_path.write_text(json.dumps(orphaned), encoding="utf-8")
+        state_before_replay = state_path.read_bytes()
 
         recovered = finalize_stale_target_cleanup(
             self.root / "runtime",

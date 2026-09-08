@@ -109,6 +109,7 @@ _PERPETUAL_SEED_CHECKPOINT_BINDING_SCHEMA = (
 _PERPETUAL_SEED_IMPORT_KIND = (
     "RISK_EVENT_FIVE_MINUTE_PERPETUAL_STARTUP_SEED_IMPORTED"
 )
+_EARLY_PROTECTIVE_PENDING_STATES = frozenset({"SUBMITTED"})
 _PERPETUAL_DEFERRED_ENTRY_REASONS = frozenset({
     "NO_CURRENT_EVENT_SESSION",
     "OFF_SESSION",
@@ -1585,15 +1586,30 @@ class LaneIIIPaperRuntime:
             self._fail_closed_without_ledger_locked(self._perpetual_signal_fault)
             return False
         if summary.get("missed_boundary_count") != 0:
+            self._latest_five_minute_direction_checkpoint = None
+            self._perpetual_signal_ledger_verified = False
             self._perpetual_flat_blocker = "FIVE_MINUTE_BOUNDARY_CONTINUITY_UNPROVEN"
             # The decision was durably observed, but a skipped boundary means
             # it cannot become position authority. Refuse every entry/reversal
-            # side effect until a complete boundary is checkpointed.
+            # side effect and discard the in-memory chain head. A later tie
+            # cannot bridge the gap; only a fresh non-tied boundary may
+            # establish a new directional chain.
             return False
         prior = self._latest_five_minute_direction_checkpoint
         if boundary_bias == "TIE" and prior is None:
             self._perpetual_flat_blocker = "FIVE_MINUTE_TIE_WITHOUT_PRIOR_NON_TIED_SIGNAL"
             return True
+        if (
+            boundary_bias == "TIE"
+            and prior is not None
+            and prior.get("candle_close_utc") != candle_open
+        ):
+            self._latest_five_minute_direction_checkpoint = None
+            self._perpetual_signal_ledger_verified = False
+            self._perpetual_flat_blocker = (
+                "FIVE_MINUTE_BOUNDARY_CONTINUITY_UNPROVEN"
+            )
+            return False
         direction = (
             str(prior["direction"]) if boundary_bias == "TIE" and prior is not None
             else str(boundary_bias)
@@ -1653,18 +1669,20 @@ class LaneIIIPaperRuntime:
             "candle_close_utc": candle_close,
         })[:32]
         try:
-            self.ledger.append(
+            appended_record_hash = self.ledger.append(
                 _PERPETUAL_SIGNAL_KIND,
                 payload,
                 identity=identity,
                 occurred_at=decision.created_at,
                 execution_session_id=self._execution_session_id(),
             )
-            latest = self.ledger.recent_kind_records((_PERPETUAL_SIGNAL_KIND,), limit=1)
-            if not latest:
+            persisted = self.ledger.record_by_identity(identity)
+            if persisted is None:
                 raise RuntimeError("FIVE_MINUTE_SIGNAL_CHECKPOINT_MISSING_AFTER_APPEND")
+            if persisted.get("record_hash") != appended_record_hash:
+                raise RuntimeError("FIVE_MINUTE_SIGNAL_CHECKPOINT_HASH_MISMATCH")
             self._latest_five_minute_direction_checkpoint = (
-                self._validate_five_minute_direction_checkpoint(latest[0])
+                self._validate_five_minute_direction_checkpoint(persisted)
             )
         except Exception as error:
             self._perpetual_signal_fault = (
@@ -2109,6 +2127,19 @@ class LaneIIIPaperRuntime:
     def _operational_session_is_stopping_locked(self) -> bool:
         return self._operational_session is not None and self._operational_session.stopping_reason is not None
 
+    def _entry_lockout_must_be_retained_locked(self) -> bool:
+        """Never let flat settlement silently clear an existing safety fault."""
+        return (
+            self._retain_safety_lockout_after_flat
+            or self._risk_continuity_fault is not None
+            or self._fault_reason is not None
+            or self._state in {
+                PaperRuntimeState.LOCKED_OUT,
+                PaperRuntimeState.FAULTED,
+            }
+            or self.risk.status().get("locked_out") is True
+        )
+
     def _request_operational_stop_locked(self, reason: str) -> None:
         """Seal new entries while retaining backend authority through settlement."""
         session = self._operational_session
@@ -2129,11 +2160,11 @@ class LaneIIIPaperRuntime:
             raise RuntimeError("Operational paper session cannot release before flat reconciliation.")
         self._entries_paused = True
         self._armed_session = None
-        retain_lockout = (
-            self._retain_safety_lockout_after_flat
-            or self._risk_continuity_fault is not None
-        )
-        if retain_lockout and self._state is not PaperRuntimeState.LOCKED_OUT:
+        retain_lockout = self._entry_lockout_must_be_retained_locked()
+        if retain_lockout and self._state not in {
+            PaperRuntimeState.LOCKED_OUT,
+            PaperRuntimeState.FAULTED,
+        }:
             self._transition(PaperRuntimeState.LOCKED_OUT, reason + "_ENTRY_LOCKOUT_RETAINED")
         elif not retain_lockout and self._state is not PaperRuntimeState.READY_DISARMED:
             self._transition(PaperRuntimeState.READY_DISARMED, reason)
@@ -4419,7 +4450,11 @@ class LaneIIIPaperRuntime:
         reason = self._protective_order_identity_reason_locked(
             event, expected_quantity=self._position_quantity,
         )
-        if reason is None and state not in ACTIVE_PROTECTIVE_ORDER_STATES:
+        if (
+            reason is None
+            and state not in ACTIVE_PROTECTIVE_ORDER_STATES
+            and state not in _EARLY_PROTECTIVE_PENDING_STATES
+        ):
             reason = self._native_order_failure_reason(
                 "PROTECTIVE_STOP",
                 state or "UNKNOWN",
@@ -4439,6 +4474,12 @@ class LaneIIIPaperRuntime:
             observed_at=_now(),
             protective_stop_state=state,
         )
+        if state in _EARLY_PROTECTIVE_PENDING_STATES:
+            # SUBMITTED is authenticated and explicitly owned, but it is not
+            # yet active protection. Keep entry authority blocked while the native
+            # acceptance watchdog remains authoritative; a later
+            # ACCEPTED/WORKING callback requests the positioned proof.
+            return False
         return self._request_post_entry_reconciliation_locked()
 
     def _request_post_entry_reconciliation_locked(self) -> bool:
@@ -5350,7 +5391,7 @@ class LaneIIIPaperRuntime:
         self._entry_authority_artifact = None
         target = (
             PaperRuntimeState.LOCKED_OUT
-            if self._retain_safety_lockout_after_flat or self._risk_continuity_fault is not None
+            if self._entry_lockout_must_be_retained_locked()
             else PaperRuntimeState.READY_DISARMED
             if operational_stopping or self._disarm_after_flat or commissioning
             else PaperRuntimeState.PAUSED
