@@ -1978,6 +1978,80 @@ class PerpetualRuntimeTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_safety_exit_reconciles_and_waits_for_a_later_boundary(self) -> None:
+        with TemporaryDirectory() as directory, patch(
+            "src.l3g_paper.runtime._now", return_value=NOW,
+        ):
+            ledger, runtime, capture = self._runtime(directory)
+            try:
+                self._start_and_fill_long(
+                    runtime,
+                    capture,
+                    request_id="perpetual-safety-exit-cadence",
+                    suffix="safety-exit-cadence",
+                )
+                self.assertTrue(runtime._request_exit(
+                    "DEPTH_STALE", emergency=True, stop_operational=False,
+                ))
+                command_id = runtime._pending_exit_command_id
+                runtime.on_execution_message({
+                    "message_type": "EXECUTION_EVENT",
+                    "order_role": "EXIT",
+                    "direction": "FLAT",
+                    "price": "100.00",
+                    "quantity": 1,
+                    "native_execution_id": "safety-exit-cadence-execution",
+                    "native_order_id": "safety-exit-cadence-order",
+                    "command_id": command_id,
+                    "account_name": "Sim101",
+                    "instrument": "MNQ SEP26",
+                    "timestamp": NOW,
+                })
+                runtime.on_execution_message({
+                    "message_type": "POSITION_EVENT",
+                    "quantity": 0,
+                    "timestamp": NOW,
+                })
+                runtime.on_execution_message(self._filled_order(
+                    "EXIT", "safety-exit-cadence-order",
+                    command_id=command_id,
+                ))
+                runtime.on_execution_message(self._flat_reconciliation(
+                    "safety-exit-cadence-flat", NOW,
+                ))
+
+                self.assertEqual(runtime.state, PaperRuntimeState.PAPER_RUNNING)
+                self.assertEqual(
+                    self._entry_actions(capture), [ExecutionAction.ENTER_LONG],
+                )
+                runtime._maintain_perpetual_position_locked(
+                    "SAME_CHECKPOINT_HEALTH_RECOVERED",
+                )
+                self.assertEqual(
+                    self._entry_actions(capture), [ExecutionAction.ENTER_LONG],
+                )
+
+                later = "2026-09-01T20:54:30Z"
+                next_signal = self._decision(
+                    runtime,
+                    PaperDirection.LONG,
+                    created_at=later,
+                    candle_close_utc=later,
+                    suffix="safety-exit-cadence-next-boundary",
+                )
+                with patch("src.l3g_paper.runtime._now", return_value=later):
+                    runtime._snapshot = self._healthy_snapshot(
+                        later, runtime._session_context,
+                    )
+                    self._commit_signal(runtime, next_signal)
+                    runtime._maintain_perpetual_position_locked("LATER_BOUNDARY")
+                self.assertEqual(
+                    self._entry_actions(capture),
+                    [ExecutionAction.ENTER_LONG, ExecutionAction.ENTER_LONG],
+                )
+            finally:
+                ledger.close()
+
     def test_protective_fill_health_recovery_cannot_reuse_stopped_checkpoint(self) -> None:
         with TemporaryDirectory() as directory, patch(
             "src.l3g_paper.runtime._now", return_value=NOW,

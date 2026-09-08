@@ -5693,10 +5693,6 @@ class LaneIIIPaperRuntime:
         operational_stopping = self._operational_session_is_stopping_locked()
         operational_active = self._operational_session is not None
         pending_reversal = self._pending_five_minute_reversal
-        ordinary_protective_exit = (
-            isinstance(self._exit_execution, Mapping)
-            and self._exit_execution.get("order_role") == "PROTECTIVE"
-        )
         self._pending_five_minute_reversal = None
         self.policy.confirm_flat(str(reconciliation.get("timestamp", _now())))
         self._pending_intent = None
@@ -5818,11 +5814,11 @@ class LaneIIIPaperRuntime:
             self._activate_risk_snapshot_context_locked(
                 self._session_context, reset_evidence=False,
             )
-            # A successful protective exit may trade again, but never from the
-            # same durable checkpoint which produced the stopped position.
-            # The next completed decision boundary supplies fresh authority.
-            if not ordinary_protective_exit:
-                self._perpetual_entry_attempted_checkpoint = None
+            # Every completed position lifecycle consumes its entry checkpoint.
+            # Health recovery may restore a flat runtime, but only the next
+            # durable 30-second boundary resets this fence and grants fresh
+            # directional entry authority. Protective exits also retain their
+            # explicit historical fence across restart.
         self._post_exit_reconciliation_pending = False
         self._post_exit_position_flat_observed = False
         self._post_exit_order_terminal_observed = False
