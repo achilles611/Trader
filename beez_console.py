@@ -12,6 +12,7 @@ import argparse
 from contextlib import contextmanager
 import ctypes
 from dataclasses import dataclass, replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -311,7 +312,21 @@ def _validated_operation(
     manifest_path = operation_root / "manifest.json"
     state_path = operation_root / "state.json"
     try:
-        manifest = validated_profile_switch_manifest(manifest_path)
+        try:
+            manifest = validated_profile_switch_manifest(manifest_path)
+        except RuntimeError as exc:
+            if (
+                require_current_git_sha
+                or str(exc) != "PROFILE_SWITCH_MANIFEST_PROFILE_MISMATCH"
+            ):
+                raise
+            # An explicit maintenance launch is the only checkout-upgrade
+            # path. A terminal request sealed by the prior checkout can carry
+            # an older target policy hash after that policy is deliberately
+            # versioned. Validate its immutable envelope and paper-only
+            # boundary without treating its historical hash as current launch
+            # authority; the caller still requires a terminal state below.
+            manifest = _historical_profile_switch_manifest(manifest_path)
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
         raise RuntimeError("BeezConsole cannot validate the durable profile handoff projection.") from exc
@@ -334,6 +349,43 @@ def _validated_operation(
     ):
         raise RuntimeError("BeezConsole cannot validate the durable profile handoff projection.")
     return manifest, state
+
+
+def _historical_profile_switch_manifest(path: Path) -> dict[str, object]:
+    """Validate an intact paper-only manifest without current policy equality."""
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise RuntimeError("PROFILE_SWITCH_MANIFEST_INTEGRITY_FAILED")
+    supplied = value.pop("manifest_sha256", None)
+    actual = hashlib.sha256(
+        json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode("utf-8"),
+    ).hexdigest()
+    if supplied != actual or value.get("schema") != PROFILE_SWITCH_SCHEMA:
+        raise RuntimeError("PROFILE_SWITCH_MANIFEST_INTEGRITY_FAILED")
+    try:
+        current = resolve_paper_profile(str(value.get("current_profile") or ""))
+        target = resolve_paper_profile(str(value.get("target_profile") or ""))
+    except ValueError as exc:
+        raise RuntimeError("PROFILE_SWITCH_MANIFEST_PROFILE_MISMATCH") from exc
+    if (
+        value.get("current_profile") != current.selection_key
+        or value.get("target_profile") != target.selection_key
+        or current.selection_key == target.selection_key
+        or _GIT_SHA.fullmatch(str(value.get("git_sha") or "")) is None
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(value.get("paper_policy_hash") or ""),
+        ) is None
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(value.get("risk_profile_hash") or ""),
+        ) is None
+        or value.get("paper_only") is not True
+        or value.get("live_capital") != "DENIED"
+    ):
+        raise RuntimeError("PROFILE_SWITCH_MANIFEST_PROFILE_MISMATCH")
+    value["manifest_sha256"] = supplied
+    return value
 
 
 def assert_remembered_launch_is_not_competing(binding: LaunchBinding) -> None:

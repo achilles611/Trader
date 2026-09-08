@@ -767,6 +767,50 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "will not compete"):
                     beez_console.assert_remembered_launch_is_not_competing(expected)
 
+    def test_explicit_maintenance_accepts_intact_terminal_prior_policy_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project(root)
+            expected = replace(
+                binding(root),
+                source="EXPLICIT_MAINTENANCE",
+                ledger_identity=None,
+                operation_id=None,
+                git_sha="e" * 40,
+            )
+            operation_id = "profile-switch-" + "d" * 32
+            manifest, _ = write_operation(
+                expected, operation_id, git_sha="f" * 40, stage="BLOCKED_SAFE",
+            )
+            manifest_path = (
+                expected.runtime_root / "profile-switch" / "operations"
+                / operation_id / "manifest.json"
+            )
+            historical = json.loads(manifest_path.read_text(encoding="utf-8"))
+            historical.pop("manifest_sha256")
+            historical["paper_policy_hash"] = "1" * 64
+            without_digest = dict(historical)
+            historical["manifest_sha256"] = sha256(
+                json.dumps(
+                    without_digest,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ).encode("utf-8"),
+            ).hexdigest()
+            manifest_path.write_text(json.dumps(historical), encoding="utf-8")
+            selection = {
+                "established": None,
+                "requested": {
+                    "profile": manifest["target_profile"],
+                    "request_id": manifest["request_id"],
+                    "operation_id": operation_id,
+                    "requested_at": manifest["created_at"],
+                },
+            }
+            with patch("beez_console.validated_profile_selection", return_value=selection):
+                beez_console.assert_remembered_launch_is_not_competing(expected)
+
     def test_explicit_maintenance_prior_commit_still_requires_exact_requested_binding(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
