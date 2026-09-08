@@ -23,6 +23,7 @@ from src.l3f_provider.tradovate_observation import StreamHealth
 from src.lane_iii.contracts import canonical_hash, normalized_utc
 
 from .contracts import (
+    ACTIVE_PROTECTIVE_ORDER_STATES,
     CAPABILITY,
     FIVE_MINUTE_ENTRY_PROFILE_VERSION,
     FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
@@ -4307,7 +4308,7 @@ class LaneIIIPaperRuntime:
                     self._snapshot = replace(self._snapshot, observed_at=_now(), protective_stop_state=order_state or self._snapshot.protective_stop_state)
                     if (
                         self._perpetual_position_profile
-                        and order_state == "WORKING"
+                        and order_state in ACTIVE_PROTECTIVE_ORDER_STATES
                         and self._position in {PaperDirection.LONG, PaperDirection.SHORT}
                         and self._state in {PaperRuntimeState.LONG, PaperRuntimeState.SHORT}
                         and not self._post_entry_reconciliation_pending
@@ -4418,7 +4419,7 @@ class LaneIIIPaperRuntime:
         reason = self._protective_order_identity_reason_locked(
             event, expected_quantity=self._position_quantity,
         )
-        if reason is None and state != "WORKING":
+        if reason is None and state not in ACTIVE_PROTECTIVE_ORDER_STATES:
             reason = self._native_order_failure_reason(
                 "PROTECTIVE_STOP",
                 state or "UNKNOWN",
@@ -4436,7 +4437,7 @@ class LaneIIIPaperRuntime:
         self._snapshot = replace(
             self._snapshot,
             observed_at=_now(),
-            protective_stop_state="WORKING",
+            protective_stop_state=state,
         )
         return self._request_post_entry_reconciliation_locked()
 
@@ -4658,7 +4659,8 @@ class LaneIIIPaperRuntime:
                 and entry_orders == 0
                 and snapshots_complete
                 and not unresolved
-                and self._snapshot.protective_stop_state == "WORKING"
+                and self._snapshot.protective_stop_state
+                in ACTIVE_PROTECTIVE_ORDER_STATES
                 and isinstance(self._protective_order_id, str)
                 and bool(self._protective_order_id)
             )
@@ -7519,7 +7521,8 @@ class LaneIIIPaperRuntime:
         if self._snapshot.working_owned_orders != 1:
             blockers.append("PROTECTIVE_ORDER_COUNT_NOT_ONE")
         if (
-            self._snapshot.protective_stop_state != "WORKING"
+            self._snapshot.protective_stop_state
+            not in ACTIVE_PROTECTIVE_ORDER_STATES
             or not isinstance(self._protective_order_id, str)
             or not self._protective_order_id
         ):

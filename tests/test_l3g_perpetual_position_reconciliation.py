@@ -76,11 +76,15 @@ class PerpetualPositionReconciliationTests(unittest.TestCase):
         self.assertNotIn(ExecutionAction.RECONCILE, self._actions(capture))
 
     @staticmethod
-    def _protective_working(suffix: str) -> dict[str, object]:
+    def _protective_working(
+        suffix: str,
+        *,
+        state: str = "WORKING",
+    ) -> dict[str, object]:
         return {
             "message_type": "ORDER_EVENT",
             "order_role": "PROTECTIVE",
-            "order_state": "WORKING",
+            "order_state": state,
             "account_name": "Sim101",
             "instrument": "MNQ SEP26",
             "quantity": 1,
@@ -229,6 +233,74 @@ class PerpetualPositionReconciliationTests(unittest.TestCase):
                 )
                 requirement = runtime.status()["position_requirement"]
                 self.assertEqual(requirement["blocking_reasons"], [])  # type: ignore[index]
+            finally:
+                ledger.close()
+
+    def test_accepted_protective_is_active_and_proves_position(self) -> None:
+        with TemporaryDirectory() as directory, patch(
+            "src.l3g_paper.runtime._now", return_value=NOW,
+        ):
+            ledger, runtime, capture = perpetual_fixture.PerpetualRuntimeTests._runtime(directory)
+            try:
+                suffix = "accepted-protective"
+                self._start_and_fill(
+                    runtime, capture, PaperDirection.SHORT, suffix=suffix,
+                )
+                runtime.on_execution_message(
+                    self._protective_working(suffix, state="ACCEPTED"),
+                )
+                self.assertEqual(
+                    self._actions(capture).count(ExecutionAction.RECONCILE), 1,
+                )
+                runtime.on_execution_message(
+                    self._positioned_reconciliation(
+                        suffix,
+                        PaperDirection.SHORT,
+                        protective_stop_state="ACCEPTED",
+                    ),
+                )
+                status = runtime.status()
+                self.assertEqual(status["protective_stop_state"], "ACCEPTED")
+                requirement = status["position_requirement"]
+                self.assertEqual(requirement["state"], "POSITIONED")  # type: ignore[index]
+                self.assertEqual(requirement["blocking_reasons"], [])  # type: ignore[index]
+                self.assertNotIn(
+                    ExecutionAction.EMERGENCY_FLATTEN,
+                    self._actions(capture),
+                )
+            finally:
+                ledger.close()
+
+    def test_accepted_protective_before_entry_fill_is_buffered_then_reconciled(self) -> None:
+        with TemporaryDirectory() as directory, patch(
+            "src.l3g_paper.runtime._now", return_value=NOW,
+        ):
+            ledger, runtime, capture = perpetual_fixture.PerpetualRuntimeTests._runtime(directory)
+            try:
+                self._start_and_fill_signal_only(runtime, PaperDirection.LONG)
+                suffix = "accepted-before-entry"
+                runtime.on_execution_message(
+                    self._protective_working(suffix, state="ACCEPTED"),
+                )
+                runtime.on_execution_message({
+                    "message_type": "EXECUTION_EVENT",
+                    "order_role": "ENTRY",
+                    "direction": "LONG",
+                    "price": "100.25",
+                    "quantity": 1,
+                    "native_execution_id": suffix + "-entry-execution",
+                    "native_order_id": suffix + "-entry-order",
+                    "account_name": "Sim101",
+                    "instrument": "MNQ SEP26",
+                    "timestamp": NOW,
+                })
+                self.assertEqual(
+                    self._actions(capture).count(ExecutionAction.RECONCILE), 1,
+                )
+                self.assertEqual(
+                    runtime.status()["protective_stop_state"],
+                    "ACCEPTED",
+                )
             finally:
                 ledger.close()
 

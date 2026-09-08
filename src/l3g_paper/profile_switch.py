@@ -29,6 +29,7 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from .contracts import (
+    ACTIVE_PROTECTIVE_ORDER_STATES,
     FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
     PAPER_PROFILE_CATALOG,
     PaperProfileDefinition,
@@ -1361,7 +1362,7 @@ def _target_perpetual_position_proven(
         and paper.get("working_owned_orders") == 1
         and type(paper.get("working_entry_orders")) is int
         and paper.get("working_entry_orders") == 0
-        and paper.get("protective_stop_state") == "WORKING"
+        and paper.get("protective_stop_state") in ACTIVE_PROTECTIVE_ORDER_STATES
         and paper.get("foreign_activity") is False
         and paper.get("position_snapshot_complete") is True
         and paper.get("order_snapshot_complete") is True

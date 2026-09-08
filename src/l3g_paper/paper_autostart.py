@@ -14,6 +14,8 @@ import time
 from typing import Callable, Mapping
 from uuid import uuid4
 
+from .contracts import ACTIVE_PROTECTIVE_ORDER_STATES
+
 
 PAPER_AUTOSTART_SCHEMA = "lane-iii-paper-autostart-v1"
 PAPER_AUTOSTART_ACTION_HEADER = "X-Beelzebub-Paper-Autostart-Action"
@@ -139,7 +141,7 @@ class PaperAutoStartService:
             and paper.get("working_owned_orders") == 1
             and type(paper.get("working_entry_orders")) is int
             and paper.get("working_entry_orders") == 0
-            and paper.get("protective_stop_state") == "WORKING"
+            and paper.get("protective_stop_state") in ACTIVE_PROTECTIVE_ORDER_STATES
             and paper.get("foreign_activity") is False
             and paper.get("position_snapshot_complete") is True
             and paper.get("order_snapshot_complete") is True

@@ -12,7 +12,10 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Mapping
 
-from .contracts import FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION
+from .contracts import (
+    ACTIVE_PROTECTIVE_ORDER_STATES,
+    FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
+)
 
 
 SLIM_STATUS_SCHEMA = "lane-iii-phase-g-slim-status-v1"
@@ -215,7 +218,7 @@ def _active_blockers(
             blockers.append("ACTIVE_POSITION_UNHEALTHY")
         if runtime.get("broker_snapshot_position_quantity") != 1:
             blockers.append("ACTIVE_POSITION_UNHEALTHY")
-        if runtime.get("protective_stop_state") != "WORKING":
+        if runtime.get("protective_stop_state") not in ACTIVE_PROTECTIVE_ORDER_STATES:
             blockers.append("PROTECTIVE_STOP_REJECTED")
         if _is_perpetual_position_profile(runtime):
             if not _perpetual_position_is_proven(runtime, direction=state):
