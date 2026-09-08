@@ -25,7 +25,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         // Updated from the checked-in source before a NinjaTrader build.  The
         // Python bridge independently fingerprints the same source, so an old
         // compiled AddOn cannot be armed merely because its DLL timestamp is new.
-        private const string AddonSourceFingerprint = "43ccc356b48dfb8380da49139434cbdbb92f4cf699179cd4bf3e2c1bc44caed9";
+        private const string AddonSourceFingerprint = "efe7e57d55884540635b2b63edd9bcadcc082a96745f6b6dc2cc8e95a1b60754";
         private const string ExactAccountName = "Sim101";
         private const string ExactAccountClass = "LOCAL_SIMULATION";
         private const string ExactInstrumentName = "MNQ SEP26";
@@ -2811,6 +2811,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                 if (IsOwnedName(order.Name))
                 {
                     OwnedOrder claimed = null;
+                    bool preSubmitInitialization = exact
+                        && eventState == OrderState.Initialized
+                        && eventFilled == 0
+                        && eventQuantity == MaximumQuantity;
                     if (!exact || !ownedByName.TryGetValue(order.Name, out claimed)
                         || claimed.Order == null
                         || !Object.ReferenceEquals(claimed.Order, order))
@@ -2819,11 +2823,21 @@ namespace NinjaTrader.NinjaScript.AddOns
                         // account snapshot rehydration path may adopt an order
                         // that predates this AddOn instance, and a same-name
                         // different Order must never replace a pre-owned handle.
-                        if (claimed != null) claimed.OutcomeUnknown = true;
-                        foreignActivity = true;
-                        lockedOut = true;
-                        reconciled = false;
-                        safetyReason = "FOREIGN_ORDER_IDENTITY_COLLISION";
+                        // NinjaTrader synchronously publishes INITIALIZED from
+                        // inside CreateOrder, before CreateOrder returns the
+                        // handle that this AddOn can bind. That exact, zero-fill,
+                        // one-contract pre-submit state has no native execution
+                        // authority yet. Ignore only that state; its first later
+                        // transition must match the returned pre-owned handle or
+                        // this remains a hard identity collision.
+                        if (!preSubmitInitialization)
+                        {
+                            if (claimed != null) claimed.OutcomeUnknown = true;
+                            foreignActivity = true;
+                            lockedOut = true;
+                            reconciled = false;
+                            safetyReason = "FOREIGN_ORDER_IDENTITY_COLLISION";
+                        }
                     }
                     else
                     {
