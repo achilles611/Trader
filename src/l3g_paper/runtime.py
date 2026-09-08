@@ -2827,6 +2827,14 @@ class LaneIIIPaperRuntime:
         self, acknowledgement_sequence: int,
     ) -> None:
         allowed_transition_pairs = {
+            (
+                "READY_DISARMED", "WAITING_FOR_EXECUTION_BRIDGE",
+                "EXECUTION_BRIDGE_DISCONNECTED",
+            ),
+            (
+                "WAITING_FOR_EXECUTION_BRIDGE", "RECONCILING",
+                "EXECUTION_BRIDGE_AUTHENTICATED",
+            ),
             ("READY_DISARMED", "RECONCILING", "EXECUTION_BRIDGE_AUTHENTICATED"),
             ("RECONCILING", "READY_DISARMED", "FLAT_RECONCILIATION_COMPLETE"),
         }

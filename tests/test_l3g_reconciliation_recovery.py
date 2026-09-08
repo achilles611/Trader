@@ -241,6 +241,66 @@ class ReconciliationRecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "CONFLICTING_AUTHORITY"):
             runtime._assert_reconciliation_recovery_suffix_locked(10)
 
+    def test_transport_cycle_transitions_are_allowed_during_recovery(self) -> None:
+        runtime = object.__new__(LaneIIIPaperRuntime)
+
+        class Ledger:
+            @staticmethod
+            def authority_records_after(_: int) -> list[dict[str, object]]:
+                return [
+                    {
+                        "kind": "SESSION_TRANSITION",
+                        "record": {"payload": {
+                            "prior_state": "READY_DISARMED",
+                            "state": "WAITING_FOR_EXECUTION_BRIDGE",
+                            "reason": "EXECUTION_BRIDGE_DISCONNECTED",
+                        }},
+                    },
+                    {
+                        "kind": "SESSION_HANDSHAKE",
+                        "record": {"payload": {
+                            "account_name": "Sim101",
+                            "account_class": "LOCAL_SIMULATION",
+                            "instrument": "MNQ SEP26",
+                            "capability": "PAPER_ONLY",
+                        }},
+                    },
+                    {
+                        "kind": "SESSION_TRANSITION",
+                        "record": {"payload": {
+                            "prior_state": "WAITING_FOR_EXECUTION_BRIDGE",
+                            "state": "RECONCILING",
+                            "reason": "EXECUTION_BRIDGE_AUTHENTICATED",
+                        }},
+                    },
+                    {
+                        "kind": "COMMAND_RECEIPT_RECONCILIATION",
+                        "record": {"payload": {
+                            "account_name": "Sim101",
+                            "account_class": "LOCAL_SIMULATION",
+                            "instrument": "MNQ SEP26",
+                            "position_quantity": 0,
+                            "working_order_count": 0,
+                            "working_entry_count": 0,
+                            "position_snapshot_complete": True,
+                            "order_snapshot_complete": True,
+                            "foreign_activity": False,
+                            "protective_stop_state": "NONE",
+                        }},
+                    },
+                    {
+                        "kind": "SESSION_TRANSITION",
+                        "record": {"payload": {
+                            "prior_state": "RECONCILING",
+                            "state": "READY_DISARMED",
+                            "reason": "FLAT_RECONCILIATION_COMPLETE",
+                        }},
+                    },
+                ]
+
+        runtime.ledger = Ledger()  # type: ignore[assignment]
+        runtime._assert_reconciliation_recovery_suffix_locked(10)
+
     def test_persists_acknowledgement_clear_zero_commands_and_replays_after_restart(self) -> None:
         with TemporaryDirectory() as directory:
             ledger, runtime, transport = self.runtime_fixture(directory)
