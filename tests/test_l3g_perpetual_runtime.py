@@ -173,7 +173,10 @@ class PerpetualRuntimeTests(unittest.TestCase):
         suffix: str = "signal",
     ) -> PaperDecision:
         candle_close = datetime.fromisoformat(candle_close_utc.replace("Z", "+00:00"))
-        candle_open_utc = (candle_close - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+        candle_open_utc = (
+            candle_close
+            - timedelta(seconds=runtime.policy.artifact.decision_interval_seconds)
+        ).isoformat().replace("+00:00", "Z")
         if shape == "ENTER":
             decision_kind = (
                 PaperDecisionKind.LONG
@@ -463,8 +466,8 @@ class PerpetualRuntimeTests(unittest.TestCase):
         signal = self._decision(
             runtime,
             PaperDirection.LONG,
-            created_at="2026-09-01T20:51:00Z",
-            candle_close_utc="2026-09-01T20:50:00Z",
+            created_at="2026-09-01T20:54:00Z",
+            candle_close_utc="2026-09-01T20:54:00Z",
             suffix=suffix,
         )
         self._commit_signal(runtime, signal)
@@ -505,7 +508,7 @@ class PerpetualRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(
             FIVE_MINUTE_PERPETUAL_POLICY.configuration_hash,
-            "35666cbb8744689d159706ea027b42d289a9e2e73622c9e663e1eab6c88cdff9",
+            "daf3cc6daacdb32d5629fd6cbd97ef2246172426a00392f59f1246c567658fe7",
         )
         self.assertEqual(
             FIVE_MINUTE_PERPETUAL_RISK_PROFILE.configuration_hash,
@@ -592,8 +595,8 @@ class PerpetualRuntimeTests(unittest.TestCase):
                 latest = self._decision(
                     runtime,
                     PaperDirection.SHORT,
-                    created_at="2026-09-01T20:51:00Z",
-                    candle_close_utc="2026-09-01T20:50:00Z",
+                    created_at="2026-09-01T20:54:00Z",
+                    candle_close_utc="2026-09-01T20:54:00Z",
                     suffix="latest-short",
                 )
                 self._commit_signal(runtime, older)
@@ -641,7 +644,7 @@ class PerpetualRuntimeTests(unittest.TestCase):
                             runtime,
                             target,
                             created_at=NOW,
-                            candle_close_utc="2026-09-01T20:50:00Z",
+                            candle_close_utc="2026-09-01T20:54:00Z",
                             shape=shape,
                             suffix=f"missed-{shape.lower()}",
                         )
@@ -697,8 +700,8 @@ class PerpetualRuntimeTests(unittest.TestCase):
                 signal = self._decision(
                     runtime,
                     PaperDirection.LONG,
-                    created_at="2026-09-01T20:46:00Z",
-                    candle_close_utc="2026-09-01T20:45:00Z",
+                    created_at="2026-09-01T20:53:30Z",
+                    candle_close_utc="2026-09-01T20:53:30Z",
                     suffix="non-tied-long",
                 )
                 self._commit_signal(runtime, signal)
@@ -708,8 +711,8 @@ class PerpetualRuntimeTests(unittest.TestCase):
                     runtime.policy.artifact.policy_id,
                     runtime.policy.artifact.configuration_hash,
                     PaperDecisionKind.NO_TRADE,
-                    "2026-09-01T20:51:00Z",
-                    "2026-09-01T20:51:30Z",
+                    "2026-09-01T20:54:00Z",
+                    "2026-09-01T20:54:30Z",
                     None,
                     PaperDirection.FLAT,
                     Decimal("0"),
@@ -717,8 +720,8 @@ class PerpetualRuntimeTests(unittest.TestCase):
                         "action": "BLOCKED",
                         "bias": "TIE",
                         "target_position": "FLAT",
-                        "candle_open_utc": "2026-09-01T20:45:00Z",
-                        "candle_close_utc": "2026-09-01T20:50:00Z",
+                        "candle_open_utc": "2026-09-01T20:53:30Z",
+                        "candle_close_utc": "2026-09-01T20:54:00Z",
                         "missed_boundary_count": 0,
                     },
                     ("observation-tie",),
@@ -902,7 +905,7 @@ class PerpetualRuntimeTests(unittest.TestCase):
                 ledger.close()
 
     def test_v2_start_evaluates_latest_tie_but_uses_prior_non_tied_checkpoint(self) -> None:
-        start_at = "2026-09-01T14:10:00.500000Z"
+        start_at = "2026-09-01T14:05:30.500000Z"
         with TemporaryDirectory() as directory, patch(
             "src.l3g_paper.runtime._now", return_value=start_at,
         ):
@@ -912,7 +915,7 @@ class PerpetualRuntimeTests(unittest.TestCase):
 
                 def scheduled_score(at: str, hypothesis: object) -> tuple[Decimal, dict[str, object]]:
                     tied = datetime.fromisoformat(at.replace("Z", "+00:00")) >= datetime(
-                        2026, 9, 1, 14, 10, tzinfo=timezone.utc,
+                        2026, 9, 1, 14, 5, 30, tzinfo=timezone.utc,
                     )
                     value = (
                         Decimal("0.50")
@@ -948,7 +951,7 @@ class PerpetualRuntimeTests(unittest.TestCase):
                 self._warm_bullish_market_evidence(
                     runtime,
                     first_sequence=next_sequence,
-                    first_at="2026-09-01T14:09:57Z",
+                    first_at="2026-09-01T14:05:27Z",
                     connect=False,
                 )
                 self.assertEqual(
@@ -972,7 +975,7 @@ class PerpetualRuntimeTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     checkpoint["candle_close_utc"],  # type: ignore[index]
-                    "2026-09-01T14:10:00Z",
+                    "2026-09-01T14:05:30Z",
                 )
                 self.assertEqual(checkpoint["boundary_bias"], "TIE")  # type: ignore[index]
                 self.assertEqual(
@@ -988,7 +991,7 @@ class PerpetualRuntimeTests(unittest.TestCase):
                     payload for payload in decisions
                     if payload.get("reason_code") == "FIVE_MINUTE_BIAS_TIE_FLAT"
                     and payload.get("family_summary", {}).get("candle_close_utc")
-                    == "2026-09-01T14:10:00Z"
+                    == "2026-09-01T14:05:30Z"
                 ]
                 self.assertEqual(len(tied), 1)
             finally:
@@ -1007,8 +1010,8 @@ class PerpetualRuntimeTests(unittest.TestCase):
                 prior = self._decision(
                     runtime,
                     PaperDirection.LONG,
-                    created_at="2026-09-01T14:01:00Z",
-                    candle_close_utc="2026-09-01T14:00:00Z",
+                    created_at="2026-09-01T14:04:30Z",
+                    candle_close_utc="2026-09-01T14:04:30Z",
                     suffix="cold-restart-tie-root",
                 )
                 self._commit_signal(runtime, prior)
@@ -1313,12 +1316,12 @@ class PerpetualRuntimeTests(unittest.TestCase):
                 )
                 capture.commands.clear()
 
-                clock["at"] = "2026-09-01T20:59:00Z"
+                clock["at"] = "2026-09-01T20:54:30Z"
                 held = self._decision(
                     runtime,
                     PaperDirection.LONG,
-                    created_at="2026-09-01T20:56:00Z",
-                    candle_close_utc="2026-09-01T20:55:00Z",
+                    created_at="2026-09-01T20:54:30Z",
+                    candle_close_utc="2026-09-01T20:54:30Z",
                     shape="HOLD",
                     suffix="held-long",
                 )
@@ -1350,7 +1353,7 @@ class PerpetualRuntimeTests(unittest.TestCase):
                     suffix="reversal",
                 )
 
-                clock["at"] = "2026-09-01T20:59:00Z"
+                clock["at"] = "2026-09-01T20:54:30Z"
                 runtime._snapshot = replace(
                     runtime._snapshot,
                     quote_observed_at=clock["at"],
@@ -1360,8 +1363,8 @@ class PerpetualRuntimeTests(unittest.TestCase):
                 reversal = self._decision(
                     runtime,
                     PaperDirection.SHORT,
-                    created_at="2026-09-01T20:56:00Z",
-                    candle_close_utc="2026-09-01T20:55:00Z",
+                    created_at="2026-09-01T20:54:30Z",
+                    candle_close_utc="2026-09-01T20:54:30Z",
                     shape="REVERSE",
                     suffix="reverse-short",
                 )
@@ -1842,8 +1845,8 @@ class PerpetualRuntimeTests(unittest.TestCase):
             signal = self._decision(
                 runtime,
                 PaperDirection.SHORT,
-                created_at="2026-09-01T20:51:00Z",
-                candle_close_utc="2026-09-01T20:50:00Z",
+                created_at="2026-09-01T20:54:00Z",
+                candle_close_utc="2026-09-01T20:54:00Z",
                 suffix="restart-short",
             )
             self._commit_signal(runtime, signal)
@@ -1934,8 +1937,8 @@ class PerpetualRuntimeTests(unittest.TestCase):
             source = self._decision(
                 fake_runtime,
                 PaperDirection.LONG,
-                created_at="2026-09-01T20:51:00Z",
-                candle_close_utc="2026-09-01T20:50:00Z",
+                created_at="2026-09-01T20:54:00Z",
+                candle_close_utc="2026-09-01T20:54:00Z",
                 suffix="missing-source",
             ).payload()
             base: dict[str, object] = {
@@ -1945,8 +1948,8 @@ class PerpetualRuntimeTests(unittest.TestCase):
                 "risk_profile_hash": FIVE_MINUTE_PERPETUAL_RISK_PROFILE.configuration_hash,
                 "entry_profile_version": FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
                 "direction": "LONG",
-                "candle_open_utc": "2026-09-01T20:45:00Z",
-                "candle_close_utc": "2026-09-01T20:50:00Z",
+                "candle_open_utc": "2026-09-01T20:53:30Z",
+                "candle_close_utc": "2026-09-01T20:54:00Z",
                 "source_decision_id": source["paper_decision_id"],
                 "source_decision_ledger_sequence": 1,
                 "source_decision_record_hash": "0" * 64,
@@ -1956,7 +1959,7 @@ class PerpetualRuntimeTests(unittest.TestCase):
                 "RISK_EVENT_FIVE_MINUTE_DIRECTION_CHECKPOINT",
                 {**base, "signal_hash": canonical_hash(base)},
                 identity="dangling-five-minute-checkpoint",
-                occurred_at="2026-09-01T20:51:00Z",
+                occurred_at="2026-09-01T20:54:00Z",
             )
             dangling.close()
             reopened_dangling = PaperLedger(

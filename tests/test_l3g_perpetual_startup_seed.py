@@ -248,7 +248,9 @@ class _SeedFixture:
         self, *, close: str, bias: str, prefix: str,
     ) -> tuple[dict[str, object], list[dict[str, object]]]:
         closed = datetime.fromisoformat(close.replace("Z", "+00:00"))
-        opened = closed - timedelta(minutes=5)
+        opened = closed - timedelta(
+            seconds=FIVE_MINUTE_PERPETUAL_PROFILE.policy.decision_interval_seconds,
+        )
         quote_at = (closed - timedelta(seconds=3)).isoformat().replace("+00:00", "Z")
         trade_at = (closed - timedelta(seconds=2)).isoformat().replace("+00:00", "Z")
         depth_at = (closed - timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
@@ -340,7 +342,9 @@ class _SeedFixture:
             "decision_observed_at": decision_at,
             "decision_latency_ms": 1000,
             "missed_boundary_count": 0,
-            "decision_interval_seconds": 300,
+            "decision_interval_seconds": (
+                FIVE_MINUTE_PERPETUAL_PROFILE.policy.decision_interval_seconds
+            ),
             "decision_clock": FIVE_MINUTE_PERPETUAL_PROFILE.policy.decision_clock,
             "startup_reconstruction": True,
             "decision_protocol": "EXIT_RECONCILE_THEN_ENTER",
@@ -430,10 +434,10 @@ class _SeedFixture:
 
     def complete(self) -> tuple[dict[str, object], dict[str, object]]:
         prior, _ = self.boundary_bundle(
-            close="2026-09-08T14:00:00Z", bias="LONG", prefix="prior",
+            close="2026-09-08T14:09:00Z", bias="LONG", prefix="prior",
         )
         middle, _ = self.boundary_bundle(
-            close="2026-09-08T14:05:00Z", bias="TIE", prefix="middle",
+            close="2026-09-08T14:09:30Z", bias="TIE", prefix="middle",
         )
         latest, _ = self.boundary_bundle(
             close="2026-09-08T14:10:00Z", bias="TIE", prefix="latest",
@@ -515,7 +519,7 @@ class PerpetualStartupSeedTests(unittest.TestCase):
             self.assertEqual(artifact["core"], core)
             loaded = read_perpetual_startup_seed_artifact(
                 fixture.root / "seed.json", operation_id=fixture.operation_id,
-                expected_at="2026-09-08T14:10:59Z",
+                expected_at="2026-09-08T14:10:29Z",
             )
             self.assertEqual(loaded, artifact)
             self.assertEqual(loaded["core"]["latest_completed"]["bias"], "TIE")
@@ -564,7 +568,7 @@ class PerpetualStartupSeedTests(unittest.TestCase):
                 read_perpetual_startup_seed_proof(
                     fixture.root / "proof.json", artifact=artifact,
                     operation_id=fixture.operation_id,
-                    expected_at="2026-09-08T14:10:30Z",
+                    expected_at="2026-09-08T14:10:20Z",
                 ),
                 proof,
             )
@@ -583,7 +587,7 @@ class PerpetualStartupSeedTests(unittest.TestCase):
             core, _artifact = fixture.complete()
             with self.assertRaisesRegex(RuntimeError, "BOUNDARY_STALE"):
                 validate_perpetual_startup_seed_core(
-                    core, expected_at="2026-09-08T14:15:00Z",
+                    core, expected_at="2026-09-08T14:10:30Z",
                 )
 
             wrong_profile = deepcopy(core)
@@ -670,7 +674,7 @@ class PerpetualStartupSeedTests(unittest.TestCase):
 
             directional_fixture = _SeedFixture(Path(folder) / "directional")
             first, _ = directional_fixture.boundary_bundle(
-                close="2026-09-08T14:00:00Z", bias="LONG", prefix="first",
+                close="2026-09-08T14:04:30Z", bias="LONG", prefix="first",
             )
             later, _ = directional_fixture.boundary_bundle(
                 close="2026-09-08T14:05:00Z", bias="LONG", prefix="later",

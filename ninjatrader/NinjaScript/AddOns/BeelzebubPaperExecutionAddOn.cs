@@ -25,7 +25,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         // Updated from the checked-in source before a NinjaTrader build.  The
         // Python bridge independently fingerprints the same source, so an old
         // compiled AddOn cannot be armed merely because its DLL timestamp is new.
-        private const string AddonSourceFingerprint = "d8e9ed6726e86b8f82ed93c4af80e89e866179ab2528e8eccbc7c4c14d2737fc";
+        private const string AddonSourceFingerprint = "46fe2fe5bec4464ad168edcba4be4eeedf2636eeac6ba8c1eca8e5d91fc6178f";
         private const string ExactAccountName = "Sim101";
         private const string ExactAccountClass = "LOCAL_SIMULATION";
         private const string ExactInstrumentName = "MNQ SEP26";
@@ -47,7 +47,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string NewYorkProfileHash = "8b8560a08ff41963a7a78d09bc977fbc1faf10f4a11ce58d05f47cacd89e0814";
         private const string NyAfterProfileHash = "f4dc8790d7cce0b26a4cedf43bc891907a1fef0a7fd97b4b66f19883907b8c97";
         private const string OffSessionProfileHash = "168f289a5847781ccb7a09f2556c4b3aa03e6f767071dc061dc5e3211d3834eb";
-        private const string PerpetualPolicyHash = "35666cbb8744689d159706ea027b42d289a9e2e73622c9e663e1eab6c88cdff9";
+        private const string PerpetualPolicyHash = "daf3cc6daacdb32d5629fd6cbd97ef2246172426a00392f59f1246c567658fe7";
 
         private readonly object stateLock = new object();
         // Serializes the final stopping latch/account snapshot with every

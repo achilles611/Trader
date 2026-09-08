@@ -1352,6 +1352,9 @@ class ExperimentalPaperPolicy:
                 },
                 "five_minute_schedule": {
                     "enabled": self._five_minute_profile,
+                    "decision_interval_seconds": getattr(
+                        self.artifact, "decision_interval_seconds", None,
+                    ),
                     "next_boundary_utc": None if self._next_five_minute_boundary is None else self._next_five_minute_boundary.isoformat().replace("+00:00", "Z"),
                     "last_boundary": self._last_five_minute_boundary,
                 },

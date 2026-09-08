@@ -35,8 +35,8 @@ class PerpetualPositionReconciliationTests(unittest.TestCase):
         signal = perpetual_fixture.PerpetualRuntimeTests._decision(
             runtime,  # type: ignore[arg-type]
             direction,
-            created_at="2026-09-01T20:51:00Z",
-            candle_close_utc="2026-09-01T20:50:00Z",
+            created_at="2026-09-01T20:54:00Z",
+            candle_close_utc="2026-09-01T20:54:00Z",
             suffix=suffix,
         )
         perpetual_fixture.PerpetualRuntimeTests._commit_signal(runtime, signal)  # type: ignore[arg-type]
@@ -513,8 +513,8 @@ class PerpetualPositionReconciliationTests(unittest.TestCase):
                 signal = perpetual_fixture.PerpetualRuntimeTests._decision(
                     runtime,
                     PaperDirection.LONG,
-                    created_at="2026-09-01T20:51:00Z",
-                    candle_close_utc="2026-09-01T20:50:00Z",
+                    created_at="2026-09-01T20:54:00Z",
+                    candle_close_utc="2026-09-01T20:54:00Z",
                     suffix="send-disconnected",
                 )
                 perpetual_fixture.PerpetualRuntimeTests._commit_signal(runtime, signal)
@@ -547,8 +547,8 @@ class PerpetualPositionReconciliationTests(unittest.TestCase):
         signal = perpetual_fixture.PerpetualRuntimeTests._decision(
             runtime,  # type: ignore[arg-type]
             direction,
-            created_at="2026-09-01T20:51:00Z",
-            candle_close_utc="2026-09-01T20:50:00Z",
+            created_at="2026-09-01T20:54:00Z",
+            candle_close_utc="2026-09-01T20:54:00Z",
             suffix="rejected-entry",
         )
         perpetual_fixture.PerpetualRuntimeTests._commit_signal(runtime, signal)  # type: ignore[arg-type]

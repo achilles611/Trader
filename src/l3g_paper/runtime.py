@@ -820,7 +820,7 @@ class LaneIIIPaperRuntime:
                 ).total_seconds() * 1000),
             ),
             "missed_boundary_count": 0,
-            "decision_interval_seconds": 300,
+            "decision_interval_seconds": shadow.artifact.decision_interval_seconds,
             "decision_clock": shadow.artifact.decision_clock,
             "startup_reconstruction": True,
         }
@@ -981,8 +981,9 @@ class LaneIIIPaperRuntime:
                 raise RuntimeError("PERPETUAL_STARTUP_SEED_SOURCE_NOT_EXACT_FLAT")
             now = _now()
             moment = datetime.fromisoformat(now.replace("Z", "+00:00"))
+            interval = self._perpetual_seed_shadow.artifact.decision_interval_seconds
             boundary = datetime.fromtimestamp(
-                int(moment.timestamp()) - int(moment.timestamp()) % 300,
+                int(moment.timestamp()) - int(moment.timestamp()) % interval,
                 tz=timezone.utc,
             ).isoformat().replace("+00:00", "Z")
             latest = self._perpetual_seed_latest_bundle
@@ -1509,9 +1510,10 @@ class LaneIIIPaperRuntime:
             created = datetime.fromisoformat(
                 normalized_utc(str(source["created_at"]), "Five-minute signal decision").replace("Z", "+00:00")
             )
+            interval = self.policy.artifact.decision_interval_seconds
             if (
-                closed - opened != timedelta(seconds=300)
-                or int(closed.timestamp()) % 300 != 0
+                closed - opened != timedelta(seconds=interval)
+                or int(closed.timestamp()) % interval != 0
                 or created < closed
             ):
                 raise ValueError
@@ -1824,8 +1826,9 @@ class LaneIIIPaperRuntime:
             blockers.append("FIVE_MINUTE_SIGNAL_LEDGER_UNVERIFIED")
         else:
             moment = datetime.fromisoformat(now.replace("Z", "+00:00"))
+            interval = self.policy.artifact.decision_interval_seconds
             expected_close = datetime.fromtimestamp(
-                int(moment.timestamp()) - (int(moment.timestamp()) % 300),
+                int(moment.timestamp()) - (int(moment.timestamp()) % interval),
                 tz=timezone.utc,
             ).isoformat().replace("+00:00", "Z")
             if self._latest_five_minute_direction_checkpoint.get("candle_close_utc") != expected_close:

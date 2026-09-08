@@ -84,6 +84,9 @@ _VERIFICATION_ID = re.compile(r"^lv-[0-9a-f]{32}$")
 _LEDGER_ID = re.compile(r"^l3g-ledger-[0-9a-f]{32}$")
 _HASH = re.compile(r"^[0-9a-f]{64}$")
 _EPOCH = re.compile(r"^L3G-PAPER-EPOCH-[A-Za-z0-9][A-Za-z0-9._-]*$")
+_PERPETUAL_INTERVAL_SECONDS = (
+    FIVE_MINUTE_PERPETUAL_PROFILE.policy.decision_interval_seconds
+)
 _MARKET_TYPES = frozenset({"QUOTE", "TRADE", "DEPTH"})
 _REQUIRED_FAMILIES = frozenset({
     EvidenceFamily.STRUCTURAL_CONTEXT.value,
@@ -632,7 +635,11 @@ def _validate_signal(
             "DECISION_PROTOCOL", summary.get("decision_protocol"),
             "EXIT_RECONCILE_THEN_ENTER",
         ),
-        ("DECISION_INTERVAL_SECONDS", summary.get("decision_interval_seconds"), 300),
+        (
+            "DECISION_INTERVAL_SECONDS",
+            summary.get("decision_interval_seconds"),
+            _PERPETUAL_INTERVAL_SECONDS,
+        ),
         (
             "DECISION_CLOCK", summary.get("decision_clock"),
             FIVE_MINUTE_PERPETUAL_PROFILE.policy.decision_clock,
@@ -984,8 +991,9 @@ def build_perpetual_boundary_bundle(
     closed = _utc(candle_close_utc, "PERPETUAL_STARTUP_SEED_BOUNDARY_INVALID")
     observed = _utc(decision_observed_at, "PERPETUAL_STARTUP_SEED_BOUNDARY_INVALID")
     if (
-        (_moment(closed) - _moment(opened)).total_seconds() != 300
-        or int(_moment(closed).timestamp()) % 300 != 0
+        (_moment(closed) - _moment(opened)).total_seconds()
+        != _PERPETUAL_INTERVAL_SECONDS
+        or int(_moment(closed).timestamp()) % _PERPETUAL_INTERVAL_SECONDS != 0
         or _moment(observed) < _moment(closed)
         or bias not in {"LONG", "SHORT", "TIE"}
     ):
@@ -1210,8 +1218,10 @@ def build_perpetual_startup_seed_core(
     boundary_moment = _moment(boundary)
     created_moment = _moment(created)
     if (
-        int(boundary_moment.timestamp()) % 300 != 0
-        or not boundary_moment <= created_moment < boundary_moment + timedelta(seconds=300)
+        int(boundary_moment.timestamp()) % _PERPETUAL_INTERVAL_SECONDS != 0
+        or not boundary_moment <= created_moment < boundary_moment + timedelta(
+            seconds=_PERPETUAL_INTERVAL_SECONDS,
+        )
     ):
         raise RuntimeError("PERPETUAL_STARTUP_SEED_CURRENT_BOUNDARY_INVALID")
     canonical_observations = [_observation_proof(item) for item in observations]
@@ -1314,7 +1324,8 @@ def validate_perpetual_startup_seed_core(
         expected = _utc(expected_at, "PERPETUAL_STARTUP_SEED_EXPECTED_AT_INVALID")
         expected_epoch = int(_moment(expected).timestamp())
         expected_boundary = datetime.fromtimestamp(
-            expected_epoch - expected_epoch % 300, tz=timezone.utc,
+            expected_epoch - expected_epoch % _PERPETUAL_INTERVAL_SECONDS,
+            tz=timezone.utc,
         ).isoformat().replace("+00:00", "Z")
         if rebuilt["current_five_minute_boundary_utc"] != expected_boundary:
             raise RuntimeError("PERPETUAL_STARTUP_SEED_BOUNDARY_STALE")

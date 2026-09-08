@@ -420,12 +420,17 @@ class FiveMinutePaperPolicyArtifact(PaperPolicyArtifact):
 
 @dataclass(frozen=True)
 class FiveMinutePerpetualPaperPolicyArtifact(FiveMinutePaperPolicyArtifact):
-    """Sealed V2 identity for one continuously held five-minute direction."""
+    """Sealed V2 identity for one continuously held 30-second direction.
+
+    The five-minute profile name is retained only as a deployed compatibility
+    identity.  It no longer describes this policy's decision cadence.
+    """
 
     schema: str = FIVE_MINUTE_PERPETUAL_POLICY_SCHEMA
     policy_id: str = FIVE_MINUTE_PERPETUAL_POLICY_ID
     entry_profile: str = FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE
     entry_profile_version: str = FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION
+    decision_interval_seconds: int = 30
     decision_clock: str = "UTC_EPOCH_ALIGNED_LATEST_COMPLETED_BOUNDARY_ON_START"
     initial_partial_candle: str = "USE_LATEST_NON_TIED_COMPLETED_BOUNDARY"
     tie_while_flat: str = "USE_LATEST_NON_TIED_OR_BLOCK"
@@ -455,7 +460,7 @@ class FiveMinutePerpetualPaperPolicyArtifact(FiveMinutePaperPolicyArtifact):
                 HypothesisKind.BULLISH_REVERSAL,
                 HypothesisKind.BEARISH_CONTINUATION,
             )
-            or self.decision_interval_seconds != 300
+            or self.decision_interval_seconds != 30
             or self.entry_support_threshold != Decimal("0")
             or self.entry_dominance_margin != Decimal("0")
             or self.retention_support_threshold != Decimal("0")
@@ -473,7 +478,7 @@ class FiveMinutePerpetualPaperPolicyArtifact(FiveMinutePaperPolicyArtifact):
             or self.market_scope != "EXCHANGE_TRADEABLE_ONLY"
             or self.routine_time_flats is not False
         ):
-            raise ValueError("The five-minute perpetual decision protocol is immutable.")
+            raise ValueError("The legacy-named perpetual decision protocol is immutable.")
 
 
 PaperPolicyArtifactType = (
@@ -1278,8 +1283,8 @@ FIVE_MINUTE_PROFILE = PaperProfileDefinition(
 )
 FIVE_MINUTE_PERPETUAL_PROFILE = PaperProfileDefinition(
     FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
-    "5-minute perpetual position",
-    "Continuously hold or reverse exactly one Sim101 MNQ from completed five-minute bias.",
+    "Perpetual position (legacy 5-minute name)",
+    "Continuously hold or reverse exactly one Sim101 MNQ on each completed 30-second boundary.",
     FIVE_MINUTE_PERPETUAL_POLICY,
     FIVE_MINUTE_PERPETUAL_RISK_PROFILE,
 )

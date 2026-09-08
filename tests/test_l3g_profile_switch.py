@@ -273,6 +273,12 @@ class ProfileCatalogTests(unittest.TestCase):
         self.assertGreaterEqual(FIVE_MINUTE_PROFILE.risk.maximum_session_entries, 96)
         self.assertFalse(FIVE_MINUTE_PROFILE.risk.approved_for_live)
 
+    def test_legacy_named_perpetual_profile_decides_every_thirty_seconds(self) -> None:
+        profile = resolve_paper_profile("BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2")
+        self.assertEqual(profile.policy.decision_interval_seconds, 30)
+        self.assertIn("legacy", profile.display_name.lower())
+        self.assertIn("30-second", profile.description)
+
     def test_policy_and_risk_are_bound_together_in_a_fresh_ledger_epoch(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "paper.sqlite3"

@@ -84,7 +84,7 @@ class PerpetualSeedIntegrationRegressionTests(unittest.TestCase):
         return ledger, runtime, commands
 
     def test_long_two_tie_seed_imports_full_chain_and_entry_provenance(self) -> None:
-        at = "2026-09-08T14:10:30Z"
+        at = "2026-09-08T14:10:29Z"
         with TemporaryDirectory() as directory, patch(
             "src.l3g_paper.runtime._now", return_value=at,
         ):
@@ -123,8 +123,8 @@ class PerpetualSeedIntegrationRegressionTests(unittest.TestCase):
                         for row in checkpoints
                     ],
                     [
-                        "2026-09-08T14:00:00Z",
-                        "2026-09-08T14:05:00Z",
+                        "2026-09-08T14:09:00Z",
+                        "2026-09-08T14:09:30Z",
                         "2026-09-08T14:10:00Z",
                     ],
                 )
@@ -147,7 +147,7 @@ class PerpetualSeedIntegrationRegressionTests(unittest.TestCase):
                 self.assertEqual(summary["continuity_chain_length"], 3)
                 self.assertEqual(
                     summary["directional_source_candle_close_utc"],
-                    "2026-09-08T14:00:00Z",
+                    "2026-09-08T14:09:00Z",
                 )
                 self.assertEqual(
                     summary["continuity_tip_candle_close_utc"],
@@ -195,7 +195,7 @@ class PerpetualSeedIntegrationRegressionTests(unittest.TestCase):
                 )
                 # The first callback after London's 11:30 local close must
                 # first seal the 10:30 completed boundary from the continuous
-                # pre-close evidence domain.  It then opens the adjacent 10:35
+                # pre-close evidence domain. It then opens the adjacent 10:30:30
                 # boundary under the newly resolved OFF_SESSION label.
                 source_runtime.ingest(
                     _runtime_fixtures.PerpetualRuntimeTests._quote(
@@ -209,7 +209,7 @@ class PerpetualSeedIntegrationRegressionTests(unittest.TestCase):
                 self.assertEqual(root["latest_completed_boundary"], "2026-09-01T10:30:00Z")
                 self.assertEqual(root["latest_completed_bias"], "SHORT")
 
-                clock["at"] = "2026-09-01T10:35:00.500000Z"
+                clock["at"] = "2026-09-01T10:30:30.500000Z"
 
                 # London ends at 10:30Z on this date. These entirely fresh
                 # callbacks are classified by the resolver as OFF_SESSION, but
@@ -219,7 +219,7 @@ class PerpetualSeedIntegrationRegressionTests(unittest.TestCase):
                     _runtime_fixtures.PerpetualRuntimeTests._warm_bullish_market_evidence(
                         source_runtime,
                         first_sequence=sequence,
-                        first_at="2026-09-01T10:34:57Z",
+                        first_at="2026-09-01T10:30:27Z",
                         connect=False,
                     )
                 )
@@ -230,7 +230,7 @@ class PerpetualSeedIntegrationRegressionTests(unittest.TestCase):
                 source_runtime.ingest(
                     _runtime_fixtures.PerpetualRuntimeTests._depth(
                         sequence,
-                        "2026-09-01T10:34:58.100000Z",
+                        "2026-09-01T10:30:28.100000Z",
                         "UPDATE",
                         10,
                     )
@@ -239,7 +239,7 @@ class PerpetualSeedIntegrationRegressionTests(unittest.TestCase):
                 source_runtime.ingest(
                     _runtime_fixtures.PerpetualRuntimeTests._depth(
                         sequence,
-                        "2026-09-01T10:34:58.200000Z",
+                        "2026-09-01T10:30:28.200000Z",
                         "UPDATE",
                         5,
                     )
@@ -248,7 +248,7 @@ class PerpetualSeedIntegrationRegressionTests(unittest.TestCase):
                 source_runtime.ingest(
                     _runtime_fixtures.PerpetualRuntimeTests._depth(
                         sequence,
-                        "2026-09-01T10:34:58.300000Z",
+                        "2026-09-01T10:30:28.300000Z",
                         "UPDATE",
                         10,
                     )
@@ -257,12 +257,12 @@ class PerpetualSeedIntegrationRegressionTests(unittest.TestCase):
                 source_runtime.ingest(
                     _runtime_fixtures.PerpetualRuntimeTests._quote(
                         sequence,
-                        "2026-09-01T10:35:00.100000Z",
+                        "2026-09-01T10:30:30.100000Z",
                         "101",
                     )
                 )
                 seeded = source_runtime.status()["perpetual_startup_seed"]
-                self.assertEqual(seeded["latest_completed_boundary"], "2026-09-01T10:35:00Z")
+                self.assertEqual(seeded["latest_completed_boundary"], "2026-09-01T10:30:30Z")
                 self.assertEqual(seeded["latest_completed_bias"], "TIE")
                 self.assertEqual(seeded["latest_non_tied_boundary"], "2026-09-01T10:30:00Z")
                 self.assertEqual(seeded["boundary_chain_length"], 2)
@@ -312,7 +312,7 @@ class PerpetualSeedIntegrationRegressionTests(unittest.TestCase):
                     artifact=artifact,
                     proof=proof,
                     operation_id=operation_id,
-                    at="2026-09-01T10:35:00.500000Z",
+                    at="2026-09-01T10:30:30.500000Z",
                 )
                 started = target_runtime.operational_paper_start(
                     "rollover-tie-seed-start",
