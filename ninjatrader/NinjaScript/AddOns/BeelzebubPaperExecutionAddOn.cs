@@ -25,7 +25,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         // Updated from the checked-in source before a NinjaTrader build.  The
         // Python bridge independently fingerprints the same source, so an old
         // compiled AddOn cannot be armed merely because its DLL timestamp is new.
-        private const string AddonSourceFingerprint = "5573d0b78ddc094e8200f157e6eed38f367881bc2fdf88992054ca54e2d22cab";
+        private const string AddonSourceFingerprint = "d8e9ed6726e86b8f82ed93c4af80e89e866179ab2528e8eccbc7c4c14d2737fc";
         private const string ExactAccountName = "Sim101";
         private const string ExactAccountClass = "LOCAL_SIMULATION";
         private const string ExactInstrumentName = "MNQ SEP26";
@@ -3104,6 +3104,13 @@ namespace NinjaTrader.NinjaScript.AddOns
                 message["quantity"] = eventQuantity;
                 message["filled_quantity"] = eventFilled;
                 message["command_id"] = owner == null ? null : owner.CommandId;
+                // Protective-stop authority is accepted by Python only when
+                // the signed native callback carries the exact account and
+                // instrument observed on this Order instance.  Do not rely on
+                // the authenticated session binding as a substitute for the
+                // per-order identity fact.
+                message["account_name"] = order.Account.Name;
+                message["instrument"] = order.Instrument.FullName;
                 // Preserve NinjaTrader's native rejection diagnostics inside the
                 // authenticated receipt. Python must never replace a real venue or
                 // connection refusal with a generic green/flat projection.

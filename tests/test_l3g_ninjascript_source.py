@@ -787,6 +787,17 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertIn('message["native_error_comment"] = e.Comment ?? String.Empty', callback)
         self.assertLess(callback.index('message["native_error_code"]'), callback.index("SendSigned(message)"))
 
+    def test_native_order_events_sign_exact_order_account_and_instrument(self) -> None:
+        source = self._execution_source()
+        callback = source[
+            source.index("        private void OnOrderUpdate"):
+            source.index("        private void OnExecutionUpdate")
+        ]
+        self.assertIn('message["account_name"] = order.Account.Name', callback)
+        self.assertIn('message["instrument"] = order.Instrument.FullName', callback)
+        self.assertLess(callback.index('message["account_name"]'), callback.index("SendSigned(message)"))
+        self.assertLess(callback.index('message["instrument"]'), callback.index("SendSigned(message)"))
+
     def test_watchdog_requires_a_correlated_settled_reconciliation(self) -> None:
         source = (Path(__file__).parents[1] / "ninjatrader" / "NinjaScript" / "AddOns" / "BeelzebubPaperExecutionAddOn.cs").read_text(encoding="utf-8")
         self.assertIn("pendingWatchdogSafetyEventId", source)
