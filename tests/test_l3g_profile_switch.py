@@ -40,6 +40,7 @@ from src.l3g_paper.profile_switch import (
     _claim_target_launch,
     _manifest,
     _launch_child,
+    _pid_exists,
     _target_binding_matches,
     exact_flat_shutdown_ready,
     finalize_stale_target_cleanup,
@@ -921,6 +922,18 @@ class ProfileSwitchServiceTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    @unittest.skipUnless(os.name == "nt", "Windows process handles are host-specific.")
+    def test_windows_pid_probe_distinguishes_running_and_signaled_processes(self) -> None:
+        child = subprocess.Popen(
+            [sys.executable, "-c", "pass"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.assertTrue(_pid_exists(child.pid))
+        self.assertEqual(child.wait(timeout=10), 0)
+        self.assertFalse(_pid_exists(child.pid))
 
     def test_bounded_source_verifier_returns_its_exact_full_report(self) -> None:
         ledger_path = self.root / "bounded-verifier" / "paper.sqlite3"

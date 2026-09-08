@@ -1155,6 +1155,15 @@ class LaneIIIPaperRuntime:
             self._session_generation = imported_context.session_generation
             self.policy._activate_session(imported_context)
             self.ledger.set_session_context(imported_context)
+            # Seed import installs the current session without going through
+            # _set_session_context(). Project that same identity into the risk
+            # snapshot now; otherwise the first perpetual entry compares the
+            # imported decision against the constructor's generation zero and
+            # is permanently refused as SESSION_IDENTITY_MISMATCH.
+            self._activate_risk_snapshot_context_locked(
+                imported_context,
+                reset_evidence=True,
+            )
             if (
                 not isinstance(chain, list)
                 or not chain

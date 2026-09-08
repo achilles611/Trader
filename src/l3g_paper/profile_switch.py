@@ -1032,6 +1032,36 @@ class PaperProfileSwitchService:
 def _pid_exists(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        # os.kill(pid, 0) is not a read-only existence probe on Windows and can
+        # also report an already-exited process as live. A SYNCHRONIZE handle
+        # lets us distinguish an active process from a signaled exit without
+        # acquiring termination or mutation rights.
+        import ctypes
+        from ctypes import wintypes
+
+        synchronize = 0x00100000
+        wait_timeout = 0x00000102
+        error_invalid_parameter = 87
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        )
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(synchronize, False, pid)
+        if not handle:
+            # Access denied cannot prove absence; an invalid PID can.
+            return ctypes.get_last_error() != error_invalid_parameter
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == wait_timeout
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except OSError:

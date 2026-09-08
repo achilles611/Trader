@@ -1162,6 +1162,22 @@ class PerpetualRuntimeTests(unittest.TestCase):
                     "2026-09-01T14:05:00Z",
                 )
                 self.assertTrue(target_runtime._perpetual_signal_ledger_verified)
+                self.assertEqual(
+                    (
+                        target_runtime._snapshot.session_kind,
+                        target_runtime._snapshot.session_id,
+                        target_runtime._snapshot.trade_date,
+                        target_runtime._snapshot.session_profile_hash,
+                        target_runtime._snapshot.session_generation,
+                    ),
+                    (
+                        target_runtime._session_context.session_kind,
+                        target_runtime._session_context.session_id,
+                        target_runtime._session_context.trade_date,
+                        target_runtime._session_context.session_profile_hash,
+                        target_runtime._session_context.session_generation,
+                    ),
+                )
             finally:
                 if target_ledger is not None:
                     target_ledger.close()
