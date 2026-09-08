@@ -3468,9 +3468,18 @@ def create_control_center_app(
         if paper is None:
             raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
         status = paper.status()
+        shutdown_state_safe = (
+            (
+                status.get("state") == "READY_DISARMED"
+                and status.get("paper_execution") == "DISARMED"
+            )
+            or (
+                status.get("state") == "LOCKED_OUT"
+                and status.get("paper_execution") == "LOCKED"
+            )
+        )
         exact_flat = (
-            status.get("state") == "READY_DISARMED"
-            and status.get("paper_execution") == "DISARMED"
+            shutdown_state_safe
             and status.get("session_armed_state") == "DISARMED"
             and status.get("current_position") == "FLAT"
             and status.get("current_quantity") == 0
@@ -3497,7 +3506,10 @@ def create_control_center_app(
         if not exact_flat or not queue_drained:
             raise HTTPException(
                 status_code=409,
-                detail="Graceful shutdown requires READY_DISARMED, exact reconciled flat/no-orders truth, and a drained ledger writer.",
+                detail=(
+                    "Graceful shutdown requires a disarmed or terminally locked runtime, "
+                    "exact reconciled flat/no-orders truth, and a drained ledger writer."
+                ),
             )
         if ledger_verifier.status().get("status") == "IN_PROGRESS":
             raise HTTPException(status_code=409, detail="Graceful shutdown requires the detached ledger verifier to finish first.")

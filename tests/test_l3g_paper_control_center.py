@@ -304,8 +304,8 @@ class GracefulShutdownEndpointTests(unittest.IsolatedAsyncioTestCase):
             route.endpoint for route in self.app.routes
             if route.path == "/api/system/graceful-shutdown"
         )
-        runtime = inspect.getclosurevars(self.endpoint).nonlocals["ninjatrader_runtime"]
-        runtime["paper"] = SimpleNamespace(status=lambda: {
+        self.runtime = inspect.getclosurevars(self.endpoint).nonlocals["ninjatrader_runtime"]
+        self.status = {
             "state": "READY_DISARMED",
             "paper_execution": "DISARMED",
             "session_armed_state": "DISARMED",
@@ -328,7 +328,8 @@ class GracefulShutdownEndpointTests(unittest.IsolatedAsyncioTestCase):
                 "deferred_pending_barrier_count": 0,
                 "deferred_writer_error": None,
             },
-        })
+        }
+        self.runtime["paper"] = SimpleNamespace(status=lambda: self.status)
 
     def tearDown(self) -> None:
         self.app.state.paper_autostart.stop()
@@ -358,6 +359,25 @@ class GracefulShutdownEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(result["accepted"])
         await asyncio.wait_for(requested.wait(), timeout=1)
+
+    async def test_exact_terminal_locked_flat_state_requests_lifespan_shutdown(self) -> None:
+        self.status["state"] = "LOCKED_OUT"
+        self.status["paper_execution"] = "LOCKED"
+        requested = asyncio.Event()
+        self.app.state.request_server_shutdown = requested.set
+        result = await self.endpoint(
+            self.request(), {"request_id": "shutdown-endpoint-test-locked-0001"},
+        )
+        self.assertTrue(result["accepted"])
+        await asyncio.wait_for(requested.wait(), timeout=1)
+
+    async def test_refuses_inconsistent_terminal_shutdown_state(self) -> None:
+        self.status["state"] = "LOCKED_OUT"
+        with self.assertRaises(HTTPException) as refused:
+            await self.endpoint(
+                self.request(), {"request_id": "shutdown-endpoint-test-locked-0002"},
+            )
+        self.assertEqual(refused.exception.status_code, 409)
 
     async def test_refuses_missing_confirmation_and_uncontrolled_host(self) -> None:
         for request in (self.request(authenticated=False), self.request(host="example.com")):
