@@ -25,7 +25,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         // Updated from the checked-in source before a NinjaTrader build.  The
         // Python bridge independently fingerprints the same source, so an old
         // compiled AddOn cannot be armed merely because its DLL timestamp is new.
-        private const string AddonSourceFingerprint = "efe7e57d55884540635b2b63edd9bcadcc082a96745f6b6dc2cc8e95a1b60754";
+        private const string AddonSourceFingerprint = "5573d0b78ddc094e8200f157e6eed38f367881bc2fdf88992054ca54e2d22cab";
         private const string ExactAccountName = "Sim101";
         private const string ExactAccountClass = "LOCAL_SIMULATION";
         private const string ExactInstrumentName = "MNQ SEP26";
@@ -1768,6 +1768,66 @@ namespace NinjaTrader.NinjaScript.AddOns
             paperAccount.Submit(new[] { stop });
         }
 
+        private void TrySubmitPendingEntryProtection(OwnedOrder owner)
+        {
+            if (owner == null || owner.Role != "ENTRY") return;
+            string commandId = owner.CommandId ?? String.Empty;
+            try
+            {
+                lock (nativeMutationGate)
+                {
+                    Order entryOrder;
+                    int executionQuantity;
+                    double executionPrice;
+                    bool terminationExitClaimed;
+                    lock (stateLock)
+                    {
+                        // NinjaTrader may publish the immutable execution before
+                        // its matching PositionUpdate. Neither callback alone is
+                        // authority to create a reducing stop. Keep one claimed
+                        // pending submission until both exact facts agree.
+                        if (!owner.EntryProtectionPending
+                            || !owner.EntryExecutionObserved
+                            || !owner.EntryPositionObserved)
+                            return;
+                        owner.EntryProtectionPending = false;
+                        entryOrder = owner.Order;
+                        executionQuantity = owner.EntryExecutionQuantity;
+                        executionPrice = owner.EntryExecutionPrice;
+                        // The EXIT may already have fully settled before a
+                        // delayed ENTRY callback pair completes. Retain the
+                        // per-entry handling tombstone so a new stop cannot
+                        // reverse an already-flat account.
+                        terminationExitClaimed = owner.EntryExposureHandled
+                            || (stopping && activeFlattenOwner != null
+                                && activeFlattenOwner.Order != null);
+                        if (terminationExitClaimed)
+                        {
+                            owner.EntryExposureHandled = true;
+                            TrySettleEntryLifecycleUnderLock(owner);
+                        }
+                    }
+                    // If termination already owns one EXIT, a new stop with a
+                    // different OCO could reverse the flat account. Otherwise
+                    // the exact execution receives protection only after its
+                    // matching signed position callback has been observed.
+                    if (!terminationExitClaimed)
+                        SubmitProtectiveStop(
+                            entryOrder, executionQuantity, executionPrice, owner
+                        );
+                }
+            }
+            catch (Exception error)
+            {
+                lock (stateLock)
+                {
+                    owner.EntryProtectionPending = false;
+                    failedEntryProtectionCommands.Add(commandId);
+                }
+                LockAndProtect("PROTECTIVE_STOP_SUBMISSION_FAILED_" + error.GetType().Name);
+            }
+        }
+
         private string FlattenOwnedInstrument(Dictionary<string, object> command, bool emergency)
         {
             bool shutdownWatchdogCorrelation = emergency
@@ -3128,6 +3188,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                         protectedEntryExecutionFacts[executionId] = executionFact;
                         protectedEntryCommandExecutions[commandId] = executionId;
                         owner.EntryExecutionObserved = true;
+                        owner.EntryExecutionQuantity = eventQuantity;
+                        owner.EntryExecutionPrice = eventPrice;
+                        owner.EntryProtectionPending = true;
+                        protectiveDeadlineUtc = DateTime.UtcNow.AddSeconds(ProtectiveAcceptanceSeconds);
                         TryEstablishOwnedPositionUnderLock(owner);
                         TrySettleEntryLifecycleUnderLock(owner);
                         submitProtection = true;
@@ -3145,46 +3209,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 if (conflictingExecution)
                     LockAndProtect("CONFLICTING_OR_UNIDENTIFIED_ENTRY_EXECUTION");
                 else if (submitProtection)
-                {
-                    try
-                    {
-                        // The claim above is made before native submission so
-                        // two concurrent callbacks cannot create two stops.
-                        // A failed first submission is a safety incident, not
-                        // authority to retry blindly from a duplicate callback.
-                        lock (nativeMutationGate)
-                        {
-                            bool terminationExitClaimed;
-                            lock (stateLock)
-                            {
-                                // The EXIT may already have fully settled before
-                                // this delayed ENTRY execution callback arrives.
-                                // Retain the per-entry handling tombstone so a
-                                // new stop cannot reverse an already-flat account.
-                                terminationExitClaimed = owner.EntryExposureHandled
-                                    || (stopping && activeFlattenOwner != null
-                                        && activeFlattenOwner.Order != null);
-                                if (terminationExitClaimed)
-                                {
-                                    owner.EntryExposureHandled = true;
-                                    TrySettleEntryLifecycleUnderLock(owner);
-                                }
-                            }
-                            // If termination already owns one EXIT, a new stop
-                            // with a different OCO could reverse the flat account.
-                            // Otherwise the late fill still receives protection;
-                            // PositionUpdate will claim the one safety EXIT.
-                            if (!terminationExitClaimed)
-                                SubmitProtectiveStop(order, eventQuantity, eventPrice, owner);
-                        }
-                    }
-                    catch (Exception error)
-                    {
-                        lock (stateLock)
-                            failedEntryProtectionCommands.Add(commandId);
-                        LockAndProtect("PROTECTIVE_STOP_SUBMISSION_FAILED_" + error.GetType().Name);
-                    }
-                }
+                    TrySubmitPendingEntryProtection(owner);
             }
             else if (owner.Role == "EXIT")
             {
@@ -3308,6 +3333,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             int quantity = eventMarketPosition == MarketPosition.Short ? -eventQuantity
                 : eventMarketPosition == MarketPosition.Flat ? 0 : eventQuantity;
             string entryOwnershipIncident = null;
+            OwnedOrder entryPendingProtection = null;
             bool flatWithOwnedReducingOrder = false;
             bool flatExpectedDuringFlatten = false;
             bool terminating;
@@ -3362,6 +3388,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                             entry.EntryPositionGeneration = positionOwnershipGeneration;
                             TryEstablishOwnedPositionUnderLock(entry);
                             TrySettleEntryLifecycleUnderLock(entry);
+                            entryPendingProtection = entry;
                         }
                     }
                     else if (pendingEntries.Count > 1)
@@ -3391,6 +3418,8 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
             if (entryOwnershipIncident != null)
                 LockAndProtect(entryOwnershipIncident);
+            else if (entryPendingProtection != null)
+                TrySubmitPendingEntryProtection(entryPendingProtection);
             if (flatWithOwnedReducingOrder)
             {
                 if (flatExpectedDuringFlatten)
@@ -3863,6 +3892,9 @@ namespace NinjaTrader.NinjaScript.AddOns
             public bool EntryNoFillTerminalObserved;
             public bool EntryOrderFilledTerminalObserved;
             public bool EntryExecutionObserved;
+            public int EntryExecutionQuantity;
+            public double EntryExecutionPrice;
+            public bool EntryProtectionPending;
             public bool EntryPositionObserved;
             public int EntryPositionSignedQuantity;
             public long EntryPositionGeneration;

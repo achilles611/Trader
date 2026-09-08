@@ -223,12 +223,22 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertIn("protectedEntryExecutionFacts[executionId] = executionFact", callback)
         self.assertIn("protectedEntryCommandExecutions[commandId] = executionId", callback)
         self.assertIn('LockAndProtect("CONFLICTING_OR_UNIDENTIFIED_ENTRY_EXECUTION")', callback)
-        self.assertEqual(callback.count("SubmitProtectiveStop(order, eventQuantity, eventPrice, owner)"), 1)
+        self.assertIn("owner.EntryProtectionPending = true", callback)
+        self.assertIn("owner.EntryExecutionQuantity = eventQuantity", callback)
+        self.assertIn("owner.EntryExecutionPrice = eventPrice", callback)
+        self.assertIn("TrySubmitPendingEntryProtection(owner)", callback)
         self.assertLess(
             callback.index("protectedEntryExecutionFacts[executionId] = executionFact"),
-            callback.index("SubmitProtectiveStop(order, eventQuantity, eventPrice, owner)"),
+            callback.index("TrySubmitPendingEntryProtection(owner)"),
         )
-        self.assertIn("PROTECTIVE_STOP_SUBMISSION_FAILED_", callback)
+        deferred = source[
+            source.index("        private void TrySubmitPendingEntryProtection"):
+            source.index("        private string FlattenOwnedInstrument")
+        ]
+        self.assertIn("!owner.EntryExecutionObserved", deferred)
+        self.assertIn("!owner.EntryPositionObserved", deferred)
+        self.assertIn("owner.EntryProtectionPending = false", deferred)
+        self.assertIn("PROTECTIVE_STOP_SUBMISSION_FAILED_", deferred)
         self.assertNotIn("protectedEntryExecutionFacts.Remove", source)
         self.assertNotIn("protectedEntryCommandExecutions.Remove", source)
         self.assertNotIn("protectedEntryExecutionFacts.Clear", source)
@@ -730,9 +740,7 @@ class NinjaScriptSourceTests(unittest.TestCase):
             "protectedEntryExecutionFacts.TryGetValue(executionId, out priorFact)"
         )
         execution_claim = callback.index("protectedEntryExecutionFacts[executionId] = executionFact")
-        protective_submit = callback.index(
-            "SubmitProtectiveStop(order, eventQuantity, eventPrice, owner)"
-        )
+        protective_submit = callback.index("TrySubmitPendingEntryProtection(owner)")
         self.assertIn(
             "conflictingExecution = true;",
             callback[missing_id:tombstone_check],
@@ -1076,10 +1084,14 @@ class NinjaScriptSourceTests(unittest.TestCase):
             source.index("        private void OnPositionUpdate")
         ]
         self.assertIn("owner.EntryExecutionObserved = true", execution_callback)
-        self.assertIn("terminationExitClaimed = owner.EntryExposureHandled", execution_callback)
-        self.assertIn("stopping && activeFlattenOwner != null", execution_callback)
-        self.assertIn("activeFlattenOwner.Order != null", execution_callback)
-        self.assertIn("if (!terminationExitClaimed)", execution_callback)
+        deferred = source[
+            source.index("        private void TrySubmitPendingEntryProtection"):
+            source.index("        private string FlattenOwnedInstrument")
+        ]
+        self.assertIn("terminationExitClaimed = owner.EntryExposureHandled", deferred)
+        self.assertIn("stopping && activeFlattenOwner != null", deferred)
+        self.assertIn("activeFlattenOwner.Order != null", deferred)
+        self.assertIn("if (!terminationExitClaimed)", deferred)
         self.assertNotIn("PROTECTIVE_STOP_SUPERSEDED_BY_TERMINATION", execution_callback)
 
         flatten = source[
@@ -1186,10 +1198,7 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertIn("Object.ReferenceEquals(claimed.Order, order)", execution_callback)
         self.assertIn("order.OrderAction != OrderAction.Buy", execution_callback)
         self.assertIn("order.OrderAction != OrderAction.SellShort", execution_callback)
-        self.assertEqual(
-            execution_callback.count("SubmitProtectiveStop(order, eventQuantity, eventPrice, owner)"),
-            1,
-        )
+        self.assertEqual(execution_callback.count("TrySubmitPendingEntryProtection(owner)"), 1)
 
         rehydrate = source[
             source.index("        private void RehydrateOwnedWorkingOrders"):
