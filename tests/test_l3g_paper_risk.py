@@ -49,6 +49,36 @@ class PaperRiskTests(unittest.TestCase):
             with self.subTest(snapshot=snapshot):
                 self.assertFalse(authority.evaluate(intent, snapshot, at=AT).granted)
 
+    def test_entry_requires_enough_daily_allowance_for_immutable_stop_risk(self) -> None:
+        decision = replace(
+            warmed_bullish_policy()[2],
+            created_at=AT,
+            expires_at="2026-08-24T14:00:05Z",
+        )
+        authority = PaperRiskAuthority()
+        intent = authority.make_intent(
+            decision,
+            reference_bid=Decimal("100"),
+            reference_ask=Decimal("100.25"),
+            reference_last=Decimal("100"),
+        )
+
+        exactly_funded = replace(
+            healthy_snapshot(), daily_realized_pnl=Decimal("-150"),
+        )
+        self.assertTrue(authority.preflight(exactly_funded, at=AT)[0])
+        self.assertTrue(authority.evaluate(intent, exactly_funded, at=AT).granted)
+
+        underfunded = replace(
+            healthy_snapshot(), daily_realized_pnl=Decimal("-150.01"),
+        )
+        allowed, reasons = authority.preflight(underfunded, at=AT)
+        self.assertFalse(allowed)
+        self.assertIn("DAILY_LOSS_ALLOWANCE_INSUFFICIENT", reasons)
+        grant = authority.evaluate(intent, underfunded, at=AT)
+        self.assertFalse(grant.granted)
+        self.assertIn("DAILY_LOSS_ALLOWANCE_INSUFFICIENT", grant.reason_codes)
+
     def test_freshness_session_stop_slippage_and_max_age(self) -> None:
         authority = PaperRiskAuthority()
         self.assertTrue(authority.hard_flat_due("2026-08-24T19:58:00Z"))

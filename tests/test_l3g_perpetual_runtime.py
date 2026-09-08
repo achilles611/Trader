@@ -1891,7 +1891,7 @@ class PerpetualRuntimeTests(unittest.TestCase):
             finally:
                 ledger.close()
 
-    def test_protective_fill_stops_operation_reconciles_and_never_reenters(self) -> None:
+    def test_protective_fill_reconciles_and_waits_for_a_later_boundary(self) -> None:
         with TemporaryDirectory() as directory, patch(
             "src.l3g_paper.runtime._now", return_value=NOW,
         ):
@@ -1916,16 +1916,9 @@ class PerpetualRuntimeTests(unittest.TestCase):
                     "timestamp": NOW,
                 })
                 self.assertEqual(runtime.state, PaperRuntimeState.EXIT_PENDING)
-                self.assertTrue(runtime._entries_paused)
-                self.assertTrue(runtime._retain_safety_lockout_after_flat)
-                self.assertTrue(runtime.risk.status()["locked_out"])
-                self.assertEqual(
-                    runtime.risk.status()["lockout_reason"],
-                    "PROTECTIVE_STOP_FILLED",
-                )
-                self.assertTrue(
-                    runtime.status()["operational_paper_session"]["stopping"],  # type: ignore[index]
-                )
+                self.assertFalse(runtime._entries_paused)
+                self.assertFalse(runtime._retain_safety_lockout_after_flat)
+                self.assertFalse(runtime.risk.status()["locked_out"])
                 self.assertEqual(self._entry_actions(capture), [ExecutionAction.ENTER_LONG])
                 # The protective order already supplied the physical exit;
                 # the runtime must not send a second exit command.
@@ -1955,18 +1948,37 @@ class PerpetualRuntimeTests(unittest.TestCase):
                     "protective-reentry-flat", NOW,
                 )
                 runtime.on_execution_message(reconciliation)
-                self.assertEqual(runtime.state, PaperRuntimeState.LOCKED_OUT)
-                self.assertIsNone(runtime.status()["operational_paper_session"])
+                self.assertEqual(runtime.state, PaperRuntimeState.PAPER_RUNNING)
+                self.assertIsNotNone(runtime.status()["operational_paper_session"])
                 self.assertEqual(self._entry_actions(capture), [ExecutionAction.ENTER_LONG])
 
-                # Neither replayed maintenance nor a still-valid directional
-                # checkpoint may override a genuine safety shutdown.
+                # Replayed maintenance and the stopped position's still-valid
+                # checkpoint cannot duplicate an entry.
                 runtime._maintain_perpetual_position_locked("DUPLICATE_PROTECTIVE_SETTLEMENT")
                 self.assertEqual(self._entry_actions(capture), [ExecutionAction.ENTER_LONG])
+
+                later = "2026-09-01T20:54:30Z"
+                next_signal = self._decision(
+                    runtime,
+                    PaperDirection.LONG,
+                    created_at=later,
+                    candle_close_utc=later,
+                    suffix="protective-reentry-later-boundary",
+                )
+                with patch("src.l3g_paper.runtime._now", return_value=later):
+                    runtime._snapshot = self._healthy_snapshot(
+                        later, runtime._session_context,
+                    )
+                    self._commit_signal(runtime, next_signal)
+                    runtime._maintain_perpetual_position_locked("LATER_BOUNDARY")
+                self.assertEqual(
+                    self._entry_actions(capture),
+                    [ExecutionAction.ENTER_LONG, ExecutionAction.ENTER_LONG],
+                )
             finally:
                 ledger.close()
 
-    def test_protective_fill_lockout_survives_market_health_recovery(self) -> None:
+    def test_protective_fill_health_recovery_cannot_reuse_stopped_checkpoint(self) -> None:
         with TemporaryDirectory() as directory, patch(
             "src.l3g_paper.runtime._now", return_value=NOW,
         ):
@@ -2009,9 +2021,9 @@ class PerpetualRuntimeTests(unittest.TestCase):
                     self._flat_reconciliation("protective-health-flat", NOW),
                 )
 
-                self.assertEqual(runtime.state, PaperRuntimeState.LOCKED_OUT)
+                self.assertEqual(runtime.state, PaperRuntimeState.PAPER_RUNNING)
                 self.assertEqual(self._entry_actions(capture), [ExecutionAction.ENTER_LONG])
-                self.assertTrue(runtime.risk.status()["locked_out"])
+                self.assertFalse(runtime.risk.status()["locked_out"])
 
                 runtime._snapshot = self._healthy_snapshot(
                     NOW, runtime._session_context,
@@ -2024,6 +2036,166 @@ class PerpetualRuntimeTests(unittest.TestCase):
                 )
             finally:
                 ledger.close()
+
+    def test_historical_stop_fill_lockout_has_one_scoped_durable_recovery(self) -> None:
+        with TemporaryDirectory() as directory, patch(
+            "src.l3g_paper.runtime._now", return_value=NOW,
+        ):
+            ledger, runtime, capture = self._runtime(directory)
+            path = ledger.path
+            try:
+                self._start_and_fill_long(
+                    runtime,
+                    capture,
+                    request_id="perpetual-historical-protective-lockout",
+                    suffix="historical-protective",
+                )
+                ledger.append(
+                    "EXECUTION",
+                    {
+                        "message_type": "EXECUTION_EVENT",
+                        "order_role": "ENTRY",
+                        "direction": "LONG",
+                        "price": "100.25",
+                        "quantity": 1,
+                        "native_execution_id": "historical-protective-entry-execution",
+                        "native_order_id": "historical-protective-entry-order",
+                        "account_name": "Sim101",
+                        "instrument": "MNQ SEP26",
+                        "timestamp": NOW,
+                    },
+                    identity="historical-protective-entry-transport-receipt",
+                )
+                original_apply = runtime._apply_execution
+
+                def apply_with_retired_lockout(
+                    message: object,
+                    *,
+                    durable_receipt_unavailable: bool = False,
+                ) -> None:
+                    if isinstance(message, dict) and message.get("order_role") == "PROTECTIVE":
+                        ledger.append(
+                            "EXECUTION",
+                            message,
+                            identity="historical-protective-exit-transport-receipt",
+                        )
+                        runtime._retain_safety_lockout_after_flat = True
+                        runtime._fault_reason = "PROTECTIVE_STOP_FILLED"
+                        runtime._risk_continuity_fault = "PROTECTIVE_STOP_FILLED"
+                        runtime._entries_paused = True
+                        runtime.risk.lock_out("PROTECTIVE_STOP_FILLED")
+                        runtime._request_operational_stop_locked("PROTECTIVE_STOP_FILLED")
+                    original_apply(
+                        message,  # type: ignore[arg-type]
+                        durable_receipt_unavailable=durable_receipt_unavailable,
+                    )
+
+                runtime._apply_execution = apply_with_retired_lockout  # type: ignore[method-assign]
+                runtime.on_execution_message({
+                    "message_type": "EXECUTION_EVENT",
+                    "order_role": "PROTECTIVE",
+                    "direction": "FLAT",
+                    "price": "99.75",
+                    "quantity": 1,
+                    "native_execution_id": "historical-protective-exit-execution",
+                    "native_order_id": "historical-protective-protective-order",
+                    "account_name": "Sim101",
+                    "instrument": "MNQ SEP26",
+                    "timestamp": NOW,
+                })
+                runtime.on_execution_message({
+                    "message_type": "POSITION_EVENT",
+                    "quantity": 0,
+                    "timestamp": NOW,
+                })
+                runtime.on_execution_message(self._filled_order(
+                    "PROTECTIVE", "historical-protective-protective-order",
+                ))
+                runtime.on_execution_message(
+                    self._flat_reconciliation("historical-protective-flat", NOW),
+                )
+                self.assertEqual(runtime.state, PaperRuntimeState.LOCKED_OUT)
+                before = runtime.risk_continuity_snapshot()
+                def recovery_readiness(_preflight: object = None) -> dict[str, object]:
+                    tip = int(ledger.health_status()["highest_sequence"])
+                    locked = bool(runtime.risk.status()["locked_out"])
+                    return {
+                        "result": "BLOCKED" if locked else "READY",
+                        "blocking_reasons": ["PROTECTIVE_STOP_FILLED"] if locked else [],
+                        "deferred_entry_reasons": [],
+                        "ledger": {
+                            "ledger_trust_state": "VERIFIED_TO_ARM_SNAPSHOT_TIP",
+                            "verified_through_sequence": tip,
+                            "arm_snapshot_tip": tip,
+                            "unverified_tail_rows": 0,
+                        },
+                    }
+
+                runtime.operational_paper_readiness = recovery_readiness  # type: ignore[method-assign]
+                started = runtime.operational_paper_start(
+                    "historical-protective-recovery",
+                )
+                self.assertTrue(started["started"], started)
+                self.assertEqual(runtime.state, PaperRuntimeState.PAPER_RUNNING)
+                self.assertFalse(runtime.risk.status()["locked_out"])
+                self.assertEqual(
+                    runtime.risk_continuity_snapshot()["trade_dates"],
+                    before["trade_dates"],
+                )
+                self.assertEqual(
+                    runtime.risk_continuity_snapshot()["profile_trade_dates"],
+                    before["profile_trade_dates"],
+                )
+                self.assertEqual(self._entry_actions(capture), [ExecutionAction.ENTER_LONG])
+                clear = ledger.recent_kind_records(
+                    ("RISK_EVENT_AUTHORITY_LOCKOUT_CLEARED",), 1,
+                )[0]
+                payload = clear["record"]["payload"]  # type: ignore[index]
+                self.assertEqual(
+                    payload["effect"],  # type: ignore[index]
+                    "ONLY_SUCCESSFUL_PROTECTIVE_EXIT_LOCKOUT_CLEARED",
+                )
+            finally:
+                ledger.close()
+
+            reopened = PaperLedger(
+                path,
+                epoch_id="L3G-PAPER-EPOCH-TEST-PERPETUAL",
+                policy=FIVE_MINUTE_PERPETUAL_PROFILE.policy,
+                risk=FIVE_MINUTE_PERPETUAL_PROFILE.risk,
+            )
+            try:
+                recovered_runtime = LaneIIIPaperRuntime(reopened)
+                self.assertFalse(
+                    recovered_runtime.risk.status()["locked_out"],
+                    recovered_runtime.risk.status(),
+                )
+                trade_date = runtime._session_context.trade_date
+                self.assertEqual(
+                    recovered_runtime._trade_date_risk[trade_date].realized_pnl,
+                    Decimal("-1.00"),
+                )
+                self.assertEqual(
+                    recovered_runtime._trade_date_risk[trade_date].entry_count,
+                    1,
+                )
+                self.assertEqual(
+                    recovered_runtime._profile_trade_date_risk[
+                        (trade_date, FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION)
+                    ].consecutive_losses,
+                    1,
+                )
+                recovered_runtime.risk.lock_out("PROTECTIVE_STOP_REJECTED")
+                refused, _ = recovered_runtime._recover_completed_protective_exit_locked(
+                    "must-not-clear-a-protection-failure", {},
+                )
+                self.assertFalse(refused)
+                self.assertEqual(
+                    recovered_runtime.risk.status()["lockout_reason"],
+                    "PROTECTIVE_STOP_REJECTED",
+                )
+            finally:
+                reopened.close()
 
     def test_legacy_protective_fill_settles_without_perpetual_reentry(self) -> None:
         at = "2026-09-01T14:00:00Z"

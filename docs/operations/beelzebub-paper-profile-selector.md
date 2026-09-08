@@ -26,6 +26,14 @@ live-capital-denial gates. A flat V2 runtime is never presented as healthy: its
 Slim status is `FLAT — BLOCKED: <exact reason>` until a reconciled `+1` or `-1`
 MNQ position is present.
 
+A successfully filled, runtime-owned protective stop is an ordinary position
+exit: its loss and counters are applied exactly once, signed flat/no-order
+reconciliation is required, and the operation may use a later completed
+30-second boundary if every remaining risk gate permits it. The stopped
+position's checkpoint cannot authorize a replacement entry. Rejected,
+cancelled, missing, mismatched, or unaccountable protection remains a safety
+failure which locks entry authority and invokes the existing emergency path.
+
 ## Operator workflow
 
 1. In Slim Mode, choose a profile and press **Switch & Start**.

@@ -517,6 +517,9 @@ class LaneIIIPaperRuntime:
             if self._perpetual_position_profile else None
         )
         self._perpetual_entry_attempted_checkpoint: str | None = None
+        # A successfully filled stop closes one lifecycle without granting a
+        # second entry from the checkpoint which produced that position.
+        self._perpetual_protective_exit_checkpoint: str | None = None
         # A recovered checkpoint is only a candidate until the operational
         # Full-ledger proof covers its exact chain coordinate. A checkpoint
         # created in this process is linked to an already-durable source
@@ -1905,6 +1908,8 @@ class LaneIIIPaperRuntime:
         checkpoint = self._latest_five_minute_direction_checkpoint
         assert checkpoint is not None
         checkpoint_hash = str(checkpoint["record_hash"])
+        if self._perpetual_protective_exit_checkpoint == checkpoint_hash:
+            return False
         if self._perpetual_entry_attempted_checkpoint == checkpoint_hash:
             return False
         self._perpetual_entry_attempted_checkpoint = checkpoint_hash
@@ -3042,6 +3047,296 @@ class LaneIIIPaperRuntime:
                 "live_capital": "DENIED",
             }
 
+    @staticmethod
+    def _protective_exit_recovery_coordinate(
+        value: Mapping[str, object],
+    ) -> dict[str, object]:
+        return {
+            "ledger_sequence": value["ledger_sequence"],
+            "record_hash": value["record_hash"],
+        }
+
+    @staticmethod
+    def _protective_exit_recovery_record_payload(
+        value: Mapping[str, object],
+    ) -> Mapping[str, object] | None:
+        record = value.get("record")
+        payload = record.get("payload") if isinstance(record, Mapping) else None
+        return payload if isinstance(payload, Mapping) else None
+
+    def _recover_completed_protective_exit_locked(
+        self,
+        request_id: str,
+        readiness: Mapping[str, object],
+    ) -> tuple[bool, tuple[str, ...]]:
+        """Translate only the retired V2 stop-fill lock into ordinary flat state.
+
+        This is not a generic lockout clear. It requires the immutable owned
+        stop fill, its exact-once loss accounting, a later signed flat/no-order
+        reconciliation, current broker agreement, a Full ledger proof, and all
+        remaining entry-risk predicates. The transition itself is durable
+        before in-memory authority changes.
+        """
+        risk_status = self.risk.status()
+        if risk_status.get("lockout_reason") != "PROTECTIVE_STOP_FILLED":
+            return False, ()
+
+        blockers: list[str] = []
+        transport = None if self._transport is None else self._transport.status()
+        if not self._perpetual_position_profile:
+            blockers.append("PROTECTIVE_EXIT_RECOVERY_PROFILE_MISMATCH")
+        if self._state is not PaperRuntimeState.LOCKED_OUT:
+            blockers.append("PROTECTIVE_EXIT_RECOVERY_STATE_MISMATCH")
+        if self._operational_session is not None:
+            blockers.append("PROTECTIVE_EXIT_RECOVERY_OPERATION_ACTIVE")
+        if self._entry_owner is not PaperEntryOwner.NONE:
+            blockers.append("PROTECTIVE_EXIT_RECOVERY_ENTRY_OWNERSHIP_ACTIVE")
+        if (
+            self._position is not PaperDirection.FLAT
+            or self._position_quantity != 0
+            or self._snapshot.current_position is not PaperDirection.FLAT
+            or self._snapshot.current_position_quantity != 0
+        ):
+            blockers.append("SIM101_MNQ_NOT_FLAT")
+        if self._snapshot.working_owned_orders or self._snapshot.working_entry_orders:
+            blockers.append("WORKING_ORDERS_PRESENT")
+        if (
+            self._snapshot.account_name != self.risk.binding.account_name
+            or self._snapshot.account_class != self.risk.binding.account_class
+            or self._snapshot.instrument != self.risk.binding.instrument
+            or self._snapshot.account_match_count != 1
+            or self._snapshot.instrument_match_count != 1
+        ):
+            blockers.append("PROTECTIVE_EXIT_RECOVERY_IDENTITY_MISMATCH")
+        if (
+            not self._snapshot.position_snapshot_complete
+            or not self._snapshot.order_snapshot_complete
+            or not self._snapshot.reconciliation_current
+        ):
+            blockers.append("RECONCILIATION_INCOMPLETE")
+        if (
+            self._snapshot.foreign_activity
+            or self._snapshot.unresolved_command
+            or self._snapshot.unresolved_native_order
+            or self._snapshot.unresolved_execution
+        ):
+            blockers.append("UNRESOLVED_EXECUTION_TRUTH")
+        if self._snapshot.protective_stop_state != "NONE":
+            blockers.append("PROTECTIVE_EXIT_RECOVERY_ORDER_STATE_MISMATCH")
+        if (
+            transport is None
+            or not transport.authenticated_client
+            or not transport.reconciled
+            or not transport.addon_provenance_valid
+        ):
+            blockers.append("EXECUTION_BRIDGE_UNHEALTHY")
+        if self._fault_reason not in {None, "PROTECTIVE_STOP_FILLED"}:
+            blockers.append("PROTECTIVE_EXIT_RECOVERY_NEWER_FAULT")
+        if self._risk_continuity_fault not in {None, "PROTECTIVE_STOP_FILLED"}:
+            blockers.append("PROTECTIVE_EXIT_RECOVERY_CONTINUITY_FAULT")
+
+        now = _now()
+        risk_blockers = tuple(
+            reason for reason in self.risk.preflight_reasons(self._snapshot, at=now)
+            if reason != "PROTECTIVE_STOP_FILLED"
+        )
+        blockers.extend(risk_blockers)
+        for source, maximum, reason in (
+            (
+                self._snapshot.quote_observed_at,
+                self.risk.profile.quote_maximum_age_seconds,
+                "QUOTE_STALE",
+            ),
+            (
+                self._snapshot.classified_trade_observed_at,
+                self.risk.profile.classified_trade_maximum_age_seconds,
+                "CLASSIFIED_TRADE_STALE",
+            ),
+            (
+                self._snapshot.depth_mutation_observed_at,
+                self.risk.profile.depth_mutation_maximum_age_seconds,
+                "DEPTH_MUTATION_STALE",
+            ),
+        ):
+            if self._freshness_gate(source, maximum, now)["fresh"] is not True:
+                blockers.append(reason)
+
+        ledger_proof = readiness.get("ledger")
+        if not isinstance(ledger_proof, Mapping) or (
+            ledger_proof.get("ledger_trust_state")
+            != "VERIFIED_TO_ARM_SNAPSHOT_TIP"
+            or ledger_proof.get("unverified_tail_rows") != 0
+            or type(ledger_proof.get("verified_through_sequence")) is not int
+            or type(ledger_proof.get("arm_snapshot_tip")) is not int
+            or ledger_proof.get("verified_through_sequence")
+            != ledger_proof.get("arm_snapshot_tip")
+        ):
+            blockers.append("PROTECTIVE_EXIT_RECOVERY_LEDGER_UNVERIFIED")
+
+        lockouts = self.ledger.recent_kind_records(
+            ("RISK_EVENT_AUTHORITY_LOCKOUT",), 1,
+        )
+        executions = self.ledger.recent_kind_records(("EXECUTION",), 1000)
+        accounting = self.ledger.recent_kind_records(
+            ("RISK_EVENT_EXIT_ACCOUNTED",), 1000,
+        )
+        reconciliations = self.ledger.recent_kind_records(
+            ("POSITION_SNAPSHOT_RECONCILIATION",), 1000,
+        )
+        stopped = self.ledger.recent_kind_records(
+            ("SESSION_OPERATIONAL_PAPER_STOPPED",), 1,
+        )
+        latest_execution = executions[0] if executions else None
+        latest_execution_payload = (
+            None
+            if latest_execution is None
+            else self._protective_exit_recovery_record_payload(latest_execution)
+        )
+        execution_id = (
+            latest_execution_payload.get("native_execution_id")
+            if isinstance(latest_execution_payload, Mapping) else None
+        )
+        matching_accounting = next((
+            value for value in accounting
+            if (
+                self._protective_exit_recovery_record_payload(value) or {}
+            ).get("exit_execution_id") == execution_id
+        ), None)
+        matching_reconciliation = next((
+            value for value in reconciliations
+            if type(value.get("ledger_sequence")) is int
+            and latest_execution is not None
+            and value["ledger_sequence"] > latest_execution["ledger_sequence"]
+            and self._recovery_reconciliation_payload_safe(
+                self._protective_exit_recovery_record_payload(value) or {},
+            )
+        ), None)
+        lockout = lockouts[0] if lockouts else None
+        lockout_payload = (
+            None if lockout is None
+            else self._protective_exit_recovery_record_payload(lockout)
+        )
+        stop_payload = (
+            None if not stopped
+            else self._protective_exit_recovery_record_payload(stopped[0])
+        )
+        if (
+            latest_execution is None
+            or not isinstance(latest_execution_payload, Mapping)
+            or latest_execution_payload.get("order_role") != "PROTECTIVE"
+            or not isinstance(execution_id, str)
+            or not execution_id
+            or matching_accounting is None
+            or matching_reconciliation is None
+            or lockout is None
+            or not isinstance(lockout_payload, Mapping)
+            or lockout_payload.get("lockout_reason") != "PROTECTIVE_STOP_FILLED"
+            or not stopped
+            or not isinstance(stop_payload, Mapping)
+            or stop_payload.get("reason") != "PROTECTIVE_STOP_FILLED"
+        ):
+            blockers.append("PROTECTIVE_EXIT_RECOVERY_EVIDENCE_MISSING")
+        elif not (
+            latest_execution["ledger_sequence"]
+            < lockout["ledger_sequence"]
+            < matching_accounting["ledger_sequence"]
+            < matching_reconciliation["ledger_sequence"]
+            <= stopped[0]["ledger_sequence"]
+        ):
+            blockers.append("PROTECTIVE_EXIT_RECOVERY_EVIDENCE_ORDER_INVALID")
+
+        if blockers:
+            return False, tuple(dict.fromkeys(blockers))
+
+        assert latest_execution is not None
+        assert matching_accounting is not None
+        assert matching_reconciliation is not None
+        assert lockout is not None
+        trade_date = self._snapshot.trade_date
+        trade_risk = self._trade_date_risk.get(trade_date, _TradeDateRisk())
+        profile_version = self.policy.artifact.entry_profile_version
+        profile_risk = self._profile_trade_date_risk.get(
+            (trade_date, profile_version), _ProfileTradeDateRisk(),
+        )
+        combined_pnl = trade_risk.realized_pnl + trade_risk.unrealized_pnl
+        remaining = max(
+            Decimal("0"),
+            PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS + min(Decimal("0"), combined_pnl),
+        )
+        payload = {
+            "schema": "lane-iii-protective-stop-recovery-v1",
+            "request_id": request_id,
+            "profile": profile_version,
+            "risk_profile_hash": self.risk.profile.configuration_hash,
+            "protective_execution": {
+                **self._protective_exit_recovery_coordinate(latest_execution),
+                "native_execution_id": execution_id,
+            },
+            "exit_accounting": self._protective_exit_recovery_coordinate(
+                matching_accounting,
+            ),
+            "flat_reconciliation": self._protective_exit_recovery_coordinate(
+                matching_reconciliation,
+            ),
+            "preserved_lockout": self._protective_exit_recovery_coordinate(lockout),
+            "risk_counters": {
+                "trade_date": trade_date,
+                "daily_realized_pnl": str(trade_risk.realized_pnl),
+                "daily_unrealized_pnl": str(trade_risk.unrealized_pnl),
+                "account_trade_date_entry_count": trade_risk.entry_count,
+                "profile_trade_date_entry_count": profile_risk.entry_count,
+                "consecutive_losses": profile_risk.consecutive_losses,
+            },
+            "daily_loss_limit_dollars": str(PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS),
+            "remaining_daily_loss_allowance_dollars": str(remaining),
+            "required_next_trade_risk_dollars": str(
+                self.risk.profile.maximum_trade_risk_dollars
+            ),
+            "account": self.risk.binding.account_name,
+            "environment": self.risk.binding.account_class,
+            "instrument": self.risk.binding.instrument,
+            "maximum_quantity": 1,
+            "live_capital": "DENIED",
+            "locked_out": False,
+            "lockout_reason": None,
+            "lockout_trade_date": None,
+            "effective_trade_date": trade_date,
+            "cleared_lockout_reason": "PROTECTIVE_STOP_FILLED",
+            "effect": "ONLY_SUCCESSFUL_PROTECTIVE_EXIT_LOCKOUT_CLEARED",
+        }
+        identity = "l3g-protective-stop-recovery-" + canonical_hash({
+            "request_id": request_id,
+            "execution_id": execution_id,
+        })
+        self.ledger.append(
+            "RISK_EVENT_AUTHORITY_LOCKOUT_CLEARED",
+            payload,
+            identity=identity,
+            execution_session_id=self._execution_session_id(),
+        )
+        if self.ledger.record_by_identity(identity) is None:
+            raise RuntimeError("PROTECTIVE_EXIT_RECOVERY_NOT_DURABLE")
+
+        self.risk.restore_lockout(False, None, None)
+        if self._fault_reason == "PROTECTIVE_STOP_FILLED":
+            self._fault_reason = None
+        if self._risk_continuity_fault == "PROTECTIVE_STOP_FILLED":
+            self._risk_continuity_fault = None
+        self._retain_safety_lockout_after_flat = False
+        self._entries_paused = False
+        checkpoint = self._latest_five_minute_direction_checkpoint
+        self._perpetual_protective_exit_checkpoint = (
+            str(checkpoint["record_hash"])
+            if isinstance(checkpoint, Mapping)
+            and isinstance(checkpoint.get("record_hash"), str)
+            else None
+        )
+        self._transition(
+            PaperRuntimeState.READY_DISARMED,
+            "SUCCESSFUL_PROTECTIVE_EXIT_RECOVERED",
+        )
+        return True, ()
+
     @property
     def state(self) -> PaperRuntimeState:
         with self._lock:
@@ -3064,7 +3359,7 @@ class LaneIIIPaperRuntime:
             PaperRuntimeState.PAUSED: {PaperRuntimeState.PAPER_RUNNING, PaperRuntimeState.ARMED_FLAT, PaperRuntimeState.LONG, PaperRuntimeState.SHORT, PaperRuntimeState.EXIT_PENDING, PaperRuntimeState.READY_DISARMED, PaperRuntimeState.LOCKED_OUT, PaperRuntimeState.FAULTED, PaperRuntimeState.RECONCILING, PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.STOPPING},
             # A lockout revokes entries, never the exact-account emergency
             # flatten path. Only _request_exit(emergency=True) uses these arcs.
-            PaperRuntimeState.LOCKED_OUT: {PaperRuntimeState.EXIT_PENDING, PaperRuntimeState.RECONCILING, PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.STOPPING},
+            PaperRuntimeState.LOCKED_OUT: {PaperRuntimeState.READY_DISARMED, PaperRuntimeState.EXIT_PENDING, PaperRuntimeState.RECONCILING, PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.STOPPING},
             PaperRuntimeState.FAULTED: {PaperRuntimeState.EXIT_PENDING, PaperRuntimeState.RECONCILING, PaperRuntimeState.WAITING_FOR_EXECUTION_BRIDGE, PaperRuntimeState.STOPPING},
             PaperRuntimeState.STOPPING: {PaperRuntimeState.STOPPED},
             PaperRuntimeState.STOPPED: set(),
@@ -5105,8 +5400,9 @@ class LaneIIIPaperRuntime:
             if role == "PROTECTIVE":
                 # The protective order itself already performed the physical
                 # exit. Do not submit a duplicate flatten; move directly into
-                # settlement and retain this genuine safety shutdown after the
-                # signed flat/no-order reconciliation completes.
+                # settlement. A filled, owned stop is successful protection,
+                # not a protection failure. Rejected, cancelled, mismatched,
+                # or unaccountable protection remains fail-closed elsewhere.
                 reason = "PROTECTIVE_STOP_FILLED"
                 self._post_entry_reconciliation_pending = False
                 self._post_entry_reconciliation_complete = False
@@ -5114,12 +5410,13 @@ class LaneIIIPaperRuntime:
                 self._early_protective_order_event = None
                 if self._perpetual_position_profile:
                     self._pending_five_minute_reversal = None
-                    self._retain_safety_lockout_after_flat = True
-                    self._fault_reason = reason
-                    self._risk_continuity_fault = reason
-                    self._entries_paused = True
-                    self.risk.lock_out(reason)
-                    self._request_operational_stop_locked(reason)
+                    checkpoint = self._latest_five_minute_direction_checkpoint
+                    self._perpetual_protective_exit_checkpoint = (
+                        str(checkpoint["record_hash"])
+                        if isinstance(checkpoint, Mapping)
+                        and isinstance(checkpoint.get("record_hash"), str)
+                        else None
+                    )
                 if self._state is not PaperRuntimeState.EXIT_PENDING:
                     self._transition(PaperRuntimeState.EXIT_PENDING, reason)
             # Final flat truth still requires a position event/reconciliation.
@@ -5384,6 +5681,10 @@ class LaneIIIPaperRuntime:
         operational_stopping = self._operational_session_is_stopping_locked()
         operational_active = self._operational_session is not None
         pending_reversal = self._pending_five_minute_reversal
+        ordinary_protective_exit = (
+            isinstance(self._exit_execution, Mapping)
+            and self._exit_execution.get("order_role") == "PROTECTIVE"
+        )
         self._pending_five_minute_reversal = None
         self.policy.confirm_flat(str(reconciliation.get("timestamp", _now())))
         self._pending_intent = None
@@ -5505,7 +5806,11 @@ class LaneIIIPaperRuntime:
             self._activate_risk_snapshot_context_locked(
                 self._session_context, reset_evidence=False,
             )
-            self._perpetual_entry_attempted_checkpoint = None
+            # A successful protective exit may trade again, but never from the
+            # same durable checkpoint which produced the stopped position.
+            # The next completed decision boundary supplies fresh authority.
+            if not ordinary_protective_exit:
+                self._perpetual_entry_attempted_checkpoint = None
         self._post_exit_reconciliation_pending = False
         self._post_exit_position_flat_observed = False
         self._post_exit_order_terminal_observed = False
@@ -5754,6 +6059,7 @@ class LaneIIIPaperRuntime:
 
         imported = False
         open_entry: tuple[Decimal, int, PaperDirection, PaperSessionContext, str] | None = None
+        active_lockout_coordinate: tuple[int, str] | None = None
         for record in self.ledger.risk_continuity_records():
             kind = str(record.get("kind", ""))
             payload = record.get("payload")
@@ -5786,9 +6092,161 @@ class LaneIIIPaperRuntime:
                     except ValueError as exc:
                         raise RuntimeError("RISK_CONTINUITY_AUTHORITY_LOCKOUT_INVALID") from exc
                 self.risk.restore_lockout(True, reason, lockout_trade_date)
+                active_lockout_coordinate = (
+                    int(record["_ledger_sequence"]), str(record["_record_hash"]),
+                )
                 continue
             if kind == "RISK_EVENT_AUTHORITY_LOCKOUT_CLEARED":
                 status = self.risk.status()
+                if (
+                    payload.get("schema")
+                    == "lane-iii-protective-stop-recovery-v1"
+                ):
+                    expected_keys = {
+                        "schema", "request_id", "profile", "risk_profile_hash",
+                        "protective_execution", "exit_accounting",
+                        "flat_reconciliation", "preserved_lockout", "risk_counters",
+                        "daily_loss_limit_dollars",
+                        "remaining_daily_loss_allowance_dollars",
+                        "required_next_trade_risk_dollars", "account", "environment",
+                        "instrument", "maximum_quantity", "live_capital", "locked_out",
+                        "lockout_reason", "lockout_trade_date", "effective_trade_date",
+                        "cleared_lockout_reason", "effect", "session_family",
+                    }
+                    protective = payload.get("protective_execution")
+                    accounting = payload.get("exit_accounting")
+                    reconciliation = payload.get("flat_reconciliation")
+                    preserved = payload.get("preserved_lockout")
+                    counters = payload.get("risk_counters")
+                    coordinates = (protective, preserved, accounting, reconciliation)
+                    if (
+                        set(payload) != expected_keys
+                        or not isinstance(payload.get("request_id"), str)
+                        or payload.get("profile")
+                        != self.policy.artifact.entry_profile_version
+                        or payload.get("risk_profile_hash")
+                        != self.risk.profile.configuration_hash
+                        or payload.get("account") != "Sim101"
+                        or payload.get("environment") != "LOCAL_SIMULATION"
+                        or payload.get("instrument") != "MNQ SEP26"
+                        or payload.get("maximum_quantity") != 1
+                        or payload.get("live_capital") != "DENIED"
+                        or payload.get("locked_out") is not False
+                        or payload.get("lockout_reason") is not None
+                        or payload.get("lockout_trade_date") is not None
+                        or payload.get("cleared_lockout_reason")
+                        != "PROTECTIVE_STOP_FILLED"
+                        or payload.get("effect")
+                        != "ONLY_SUCCESSFUL_PROTECTIVE_EXIT_LOCKOUT_CLEARED"
+                        or status.get("lockout_reason") != "PROTECTIVE_STOP_FILLED"
+                        or active_lockout_coordinate is None
+                        or not all(isinstance(value, Mapping) for value in coordinates)
+                        or not isinstance(counters, Mapping)
+                    ):
+                        raise RuntimeError(
+                            "RISK_CONTINUITY_PROTECTIVE_EXIT_CLEAR_INVALID"
+                        )
+                    assert isinstance(protective, Mapping)
+                    assert isinstance(accounting, Mapping)
+                    assert isinstance(reconciliation, Mapping)
+                    assert isinstance(preserved, Mapping)
+                    assert isinstance(counters, Mapping)
+                    sequences = [
+                        value.get("ledger_sequence") for value in coordinates
+                    ]
+                    if (
+                        not all(type(value) is int for value in sequences)
+                        or not sequences[0] < sequences[1] < sequences[2] < sequences[3]
+                        or sequences[3] >= record.get("_ledger_sequence")
+                        or (
+                            preserved.get("ledger_sequence"),
+                            preserved.get("record_hash"),
+                        ) != active_lockout_coordinate
+                    ):
+                        raise RuntimeError(
+                            "RISK_CONTINUITY_PROTECTIVE_EXIT_CLEAR_INVALID"
+                        )
+                    stored = [
+                        self.ledger.record_by_sequence(int(sequence))
+                        for sequence in sequences
+                    ]
+                    if any(
+                        value is None
+                        or coordinate.get("record_hash") != value.get("record_hash")
+                        for coordinate, value in zip(coordinates, stored, strict=True)
+                    ):
+                        raise RuntimeError(
+                            "RISK_CONTINUITY_PROTECTIVE_EXIT_CLEAR_REFERENCE_INVALID"
+                        )
+                    stored_payloads = [
+                        self._protective_exit_recovery_record_payload(value or {})
+                        for value in stored
+                    ]
+                    execution_id = protective.get("native_execution_id")
+                    if (
+                        not isinstance(execution_id, str)
+                        or not execution_id
+                        or not isinstance(stored_payloads[0], Mapping)
+                        or stored_payloads[0].get("order_role") != "PROTECTIVE"
+                        or stored_payloads[0].get("native_execution_id") != execution_id
+                        or not isinstance(stored_payloads[1], Mapping)
+                        or stored_payloads[1].get("lockout_reason")
+                        != "PROTECTIVE_STOP_FILLED"
+                        or not isinstance(stored_payloads[2], Mapping)
+                        or stored_payloads[2].get("exit_execution_id") != execution_id
+                        or not isinstance(stored_payloads[3], Mapping)
+                        or not self._recovery_reconciliation_payload_safe(
+                            stored_payloads[3]
+                        )
+                    ):
+                        raise RuntimeError(
+                            "RISK_CONTINUITY_PROTECTIVE_EXIT_CLEAR_REFERENCE_INVALID"
+                        )
+                    trade_date = counters.get("trade_date")
+                    if (
+                        not isinstance(trade_date, str)
+                        or payload.get("effective_trade_date") != trade_date
+                    ):
+                        raise RuntimeError(
+                            "RISK_CONTINUITY_PROTECTIVE_EXIT_CLEAR_COUNTER_INVALID"
+                        )
+                    trade_risk = self._trade_date_risk.get(
+                        trade_date, _TradeDateRisk(),
+                    )
+                    profile_risk = self._profile_trade_date_risk.get(
+                        (trade_date, self.policy.artifact.entry_profile_version),
+                        _ProfileTradeDateRisk(),
+                    )
+                    combined = trade_risk.realized_pnl + trade_risk.unrealized_pnl
+                    remaining = max(
+                        Decimal("0"), PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS
+                        + min(Decimal("0"), combined),
+                    )
+                    if (
+                        counters.get("daily_realized_pnl")
+                        != str(trade_risk.realized_pnl)
+                        or counters.get("daily_unrealized_pnl")
+                        != str(trade_risk.unrealized_pnl)
+                        or counters.get("account_trade_date_entry_count")
+                        != trade_risk.entry_count
+                        or counters.get("profile_trade_date_entry_count")
+                        != profile_risk.entry_count
+                        or counters.get("consecutive_losses")
+                        != profile_risk.consecutive_losses
+                        or payload.get("daily_loss_limit_dollars")
+                        != str(PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS)
+                        or payload.get("remaining_daily_loss_allowance_dollars")
+                        != str(remaining)
+                        or payload.get("required_next_trade_risk_dollars")
+                        != str(self.risk.profile.maximum_trade_risk_dollars)
+                        or remaining < self.risk.profile.maximum_trade_risk_dollars
+                    ):
+                        raise RuntimeError(
+                            "RISK_CONTINUITY_PROTECTIVE_EXIT_CLEAR_COUNTER_INVALID"
+                        )
+                    self.risk.restore_lockout(False, None, None)
+                    active_lockout_coordinate = None
+                    continue
                 effective_trade_date = payload.get("effective_trade_date")
                 if (
                     payload.get("locked_out") is not False
@@ -5804,6 +6262,7 @@ class LaneIIIPaperRuntime:
                 except ValueError as exc:
                     raise RuntimeError("RISK_CONTINUITY_AUTHORITY_LOCKOUT_CLEAR_INVALID") from exc
                 self.risk.restore_lockout(False, None, None)
+                active_lockout_coordinate = None
                 continue
             if kind == "RISK_EVENT_RECONCILIATION_LOCKOUT_CLEARED":
                 status = self.risk.status()
@@ -5890,6 +6349,7 @@ class LaneIIIPaperRuntime:
                 ):
                     raise RuntimeError("RISK_CONTINUITY_RECONCILIATION_CLEAR_REFERENCE_INVALID")
                 self.risk.restore_lockout(False, None, None)
+                active_lockout_coordinate = None
                 continue
             if kind == "EXECUTION":
                 role = str(payload.get("order_role", ""))
@@ -6447,6 +6907,25 @@ class LaneIIIPaperRuntime:
                 }
 
         readiness = self.operational_paper_readiness(ledger_preflight)
+        recovery_blockers: tuple[str, ...] = ()
+        recovered = False
+        with self._lock:
+            if self.risk.status().get("lockout_reason") == "PROTECTIVE_STOP_FILLED":
+                try:
+                    with self.ledger.authority_capacity_fence():
+                        recovered, recovery_blockers = (
+                            self._recover_completed_protective_exit_locked(
+                                request_id, readiness,
+                            )
+                        )
+                except LedgerCapacityError as error:
+                    self._pause_for_ledger_capacity_locked(error.capacity)
+                    recovered = False
+                    recovery_blockers = ("LEDGER_CAPACITY_INADEQUATE",)
+        if recovered:
+            # The scoped transition is itself an authority mutation; require
+            # a new Full proof which covers it before start.
+            readiness = self.operational_paper_readiness(ledger_preflight)
         reasons = tuple(str(value) for value in readiness.get("blocking_reasons", []) if isinstance(value, str))
         if readiness.get("result") != "READY" or reasons:
             with self._lock:
@@ -6455,7 +6934,11 @@ class LaneIIIPaperRuntime:
                     "operational_paper": True,
                     "request_id": request_id,
                     "idempotent_replay": False,
-                    "reason_codes": reasons or ("OPERATIONAL_PAPER_PREFLIGHT_FAILED",),
+                    "reason_codes": (
+                        recovery_blockers
+                        or reasons
+                        or ("OPERATIONAL_PAPER_PREFLIGHT_FAILED",)
+                    ),
                     "state": self._state.value,
                     "readiness": readiness,
                 }

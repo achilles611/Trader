@@ -264,8 +264,14 @@ class PaperRiskAuthority:
                     reasons.append("OUTSIDE_ENTRY_SESSION")
             if self._locked_out or snapshot.locked_out:
                 reasons.append(self._lockout_reason or snapshot.lockout_reason or "SESSION_LOCKED_OUT")
-            if snapshot.daily_realized_pnl + snapshot.daily_unrealized_pnl <= -PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS:
+            current_pnl = snapshot.daily_realized_pnl + snapshot.daily_unrealized_pnl
+            if current_pnl <= -PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS:
                 reasons.append("DAILY_LOSS_LIMIT")
+            elif (
+                current_pnl - self.profile.maximum_trade_risk_dollars
+                < -PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS
+            ):
+                reasons.append("DAILY_LOSS_ALLOWANCE_INSUFFICIENT")
             if snapshot.session_entry_count >= self.profile.maximum_session_entries:
                 reasons.append("SESSION_ENTRY_CAP")
             if snapshot.trade_date_entry_count >= self.profile.maximum_session_entries:
@@ -365,6 +371,11 @@ class PaperRiskAuthority:
                 if pnl <= -PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS:
                     reasons.append("DAILY_LOSS_LIMIT")
                     self.lock_out("DAILY_LOSS_LIMIT", trade_date=snapshot.trade_date)
+                elif (
+                    pnl - self.profile.maximum_trade_risk_dollars
+                    < -PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS
+                ):
+                    reasons.append("DAILY_LOSS_ALLOWANCE_INSUFFICIENT")
                 if snapshot.session_entry_count >= self.profile.maximum_session_entries:
                     reasons.append("SESSION_ENTRY_CAP")
                 if snapshot.trade_date_entry_count >= self.profile.maximum_session_entries:
