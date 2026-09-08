@@ -20,6 +20,7 @@ from src.l3g_paper.ninjatrader_maintenance import (
     MaintenanceStage,
     MaintenanceTimeouts,
     NinjaTraderMaintenanceService,
+    PowerShellNinjaTraderDesktopAdapter,
 )
 from src.l3g_paper.runtime import ObservationFanout
 
@@ -715,6 +716,27 @@ class NinjaTraderMaintenanceTests(unittest.TestCase):
         self.assertEqual(status["blockers"], ["MAINTENANCE_AUDIT_UNAVAILABLE"])
         self.assertFalse(status["audit"]["durable"])
         self.assertEqual((desktop.start_calls, desktop.close_calls), (0, 0))
+
+    def test_desktop_probe_allows_bounded_slow_ui_automation_scan(self) -> None:
+        helper = Path(self.temporary.name) / "ninjatrader-helper.ps1"
+        helper.write_text("# inert test helper\n", encoding="utf-8")
+        adapter = PowerShellNinjaTraderDesktopAdapter(
+            script_path=helper,
+            command_timeout_seconds=15.0,
+        )
+        with patch("src.l3g_paper.ninjatrader_maintenance.subprocess.run") as run:
+            run.return_value.returncode = 0
+            run.return_value.stdout = json.dumps({
+                "ok": True,
+                "process_detected": True,
+                "login_window_detected": False,
+                "control_center_detected": True,
+            })
+            run.return_value.stderr = ""
+            probe = adapter.probe()
+
+        self.assertTrue(probe.control_center_detected)
+        self.assertEqual(run.call_args.kwargs["timeout"], 45.0)
 
     def test_maintenance_sources_have_no_execution_login_or_force_kill_path(self) -> None:
         root = Path(__file__).parents[1]

@@ -92,7 +92,11 @@ class PowerShellNinjaTraderDesktopAdapter:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=max(self.command_timeout_seconds, 45.0) if action == "ensure-chart" else self.command_timeout_seconds,
+                timeout=(
+                    max(self.command_timeout_seconds, 45.0)
+                    if action in {"probe", "ensure-chart"}
+                    else self.command_timeout_seconds
+                ),
                 check=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 env=PowerShellNinjaTraderLoginAdapter._windows_powershell_environment(),
