@@ -3085,7 +3085,14 @@ class LaneIIIPaperRuntime:
         transport = None if self._transport is None else self._transport.status()
         if not self._perpetual_position_profile:
             blockers.append("PROTECTIVE_EXIT_RECOVERY_PROFILE_MISMATCH")
-        if self._state is not PaperRuntimeState.LOCKED_OUT:
+        # A cold restart deliberately returns the process-local lifecycle to
+        # READY_DISARMED while restoring the durable risk lock. Both forms are
+        # non-operational and require this exact recovery proof before entry
+        # authority can exist.
+        if self._state not in {
+            PaperRuntimeState.LOCKED_OUT,
+            PaperRuntimeState.READY_DISARMED,
+        }:
             blockers.append("PROTECTIVE_EXIT_RECOVERY_STATE_MISMATCH")
         if self._operational_session is not None:
             blockers.append("PROTECTIVE_EXIT_RECOVERY_OPERATION_ACTIVE")
@@ -3202,24 +3209,28 @@ class LaneIIIPaperRuntime:
                 self._protective_exit_recovery_record_payload(value) or {}
             ).get("exit_execution_id") == execution_id
         ), None)
-        matching_reconciliation = next((
-            value for value in reconciliations
-            if type(value.get("ledger_sequence")) is int
-            and latest_execution is not None
-            and value["ledger_sequence"] > latest_execution["ledger_sequence"]
-            and self._recovery_reconciliation_payload_safe(
-                self._protective_exit_recovery_record_payload(value) or {},
-            )
-        ), None)
         lockout = lockouts[0] if lockouts else None
         lockout_payload = (
             None if lockout is None
             else self._protective_exit_recovery_record_payload(lockout)
         )
+        stop = stopped[0] if stopped else None
         stop_payload = (
-            None if not stopped
-            else self._protective_exit_recovery_record_payload(stopped[0])
+            None if stop is None
+            else self._protective_exit_recovery_record_payload(stop)
         )
+        matching_reconciliation = next((
+            value for value in reconciliations
+            if type(value.get("ledger_sequence")) is int
+            and matching_accounting is not None
+            and stop is not None
+            and matching_accounting["ledger_sequence"]
+            < value["ledger_sequence"]
+            <= stop["ledger_sequence"]
+            and self._recovery_reconciliation_payload_safe(
+                self._protective_exit_recovery_record_payload(value) or {},
+            )
+        ), None)
         if (
             latest_execution is None
             or not isinstance(latest_execution_payload, Mapping)
@@ -3231,7 +3242,7 @@ class LaneIIIPaperRuntime:
             or lockout is None
             or not isinstance(lockout_payload, Mapping)
             or lockout_payload.get("lockout_reason") != "PROTECTIVE_STOP_FILLED"
-            or not stopped
+            or stop is None
             or not isinstance(stop_payload, Mapping)
             or stop_payload.get("reason") != "PROTECTIVE_STOP_FILLED"
         ):
@@ -3241,7 +3252,7 @@ class LaneIIIPaperRuntime:
             < lockout["ledger_sequence"]
             < matching_accounting["ledger_sequence"]
             < matching_reconciliation["ledger_sequence"]
-            <= stopped[0]["ledger_sequence"]
+            <= stop["ledger_sequence"]
         ):
             blockers.append("PROTECTIVE_EXIT_RECOVERY_EVIDENCE_ORDER_INVALID")
 
@@ -3331,10 +3342,11 @@ class LaneIIIPaperRuntime:
             and isinstance(checkpoint.get("record_hash"), str)
             else None
         )
-        self._transition(
-            PaperRuntimeState.READY_DISARMED,
-            "SUCCESSFUL_PROTECTIVE_EXIT_RECOVERED",
-        )
+        if self._state is PaperRuntimeState.LOCKED_OUT:
+            self._transition(
+                PaperRuntimeState.READY_DISARMED,
+                "SUCCESSFUL_PROTECTIVE_EXIT_RECOVERED",
+            )
         return True, ()
 
     @property

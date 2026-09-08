@@ -2115,6 +2115,15 @@ class PerpetualRuntimeTests(unittest.TestCase):
                     self._flat_reconciliation("historical-protective-flat", NOW),
                 )
                 self.assertEqual(runtime.state, PaperRuntimeState.LOCKED_OUT)
+                # Startup records a newer current flat reconciliation and
+                # restores only the durable risk lock; the process-local
+                # lifecycle itself is safely disarmed.
+                runtime.on_execution_message(
+                    self._flat_reconciliation(
+                        "historical-protective-restart-flat", NOW,
+                    ),
+                )
+                runtime._state = PaperRuntimeState.READY_DISARMED
                 before = runtime.risk_continuity_snapshot()
                 def recovery_readiness(_preflight: object = None) -> dict[str, object]:
                     tip = int(ledger.health_status()["highest_sequence"])
