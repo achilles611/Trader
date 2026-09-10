@@ -93,8 +93,10 @@ class PowerShellNinjaTraderDesktopAdapter:
                 encoding="utf-8",
                 errors="replace",
                 timeout=(
-                    max(self.command_timeout_seconds, 45.0)
-                    if action in {"probe", "ensure-chart"}
+                    max(self.command_timeout_seconds, 75.0)
+                    if action == "probe"
+                    else max(self.command_timeout_seconds, 45.0)
+                    if action == "ensure-chart"
                     else self.command_timeout_seconds
                 ),
                 check=False,
@@ -567,7 +569,14 @@ class NinjaTraderMaintenanceService:
             paper = {}
             with self._lock:
                 self._diagnostics.append({"at": _utc_now(), "message": f"paper_status_failed:{type(error).__name__}"})
-        probe = self._probe()
+        # An explicit operation owns the authoritative UI Automation probes.
+        # Once an operation exists, status polling reuses its last completed
+        # result instead of launching competing or post-terminal desktop-tree
+        # scans.  A new operation always force-probes before it can act.
+        with self._lock:
+            refresh_probe = self._stage == MaintenanceStage.IDLE
+            cached_probe = self._last_probe
+        probe = self._probe() if refresh_probe else cached_probe
         transport = self._transport(paper)
         provenance = transport.get("addon_provenance")
         provenance = provenance if isinstance(provenance, Mapping) else {}
@@ -1004,6 +1013,26 @@ class NinjaTraderMaintenanceService:
 
     def _ensure_configured_chart(self, instrument: str) -> bool:
         self._transition(MaintenanceStage.VERIFYING_CHART)
+        paper = self._paper_status()
+        attachment = self._attachment(self._observer(paper))
+        if (
+            self._chart_ready(paper)
+            and attachment.get("subscription_mode") == "NATIVE_ADDON"
+            and attachment.get("chart_found") is not True
+        ):
+            # The authenticated AddOn can own the exact configured MNQ
+            # subscription without exposing a desktop ChartWindow.  Its
+            # signed attachment is canonical runtime evidence; do not let a
+            # redundant UI Automation probe turn that healthy native path
+            # into a false startup blocker.
+            with self._lock:
+                self._chart_result = {
+                    "ok": True,
+                    "result": "NATIVE_ADDON_OBSERVER_ACTIVE",
+                    "instrument": instrument,
+                }
+            self._audit("MNQ_CHART_ENSURED")
+            return True
         value = self._desktop.ensure_chart(instrument)
         result = dict(value) if isinstance(value, Mapping) else {}
         with self._lock:

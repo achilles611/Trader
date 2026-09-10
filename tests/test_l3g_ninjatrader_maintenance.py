@@ -611,7 +611,7 @@ class NinjaTraderMaintenanceTests(unittest.TestCase):
         self.assertIn("WRONG_OBSERVER_INSTRUMENT", status["blockers"])
         self.assertIsNone(status["manual_action"])
 
-    def test_native_observer_and_automatically_ensured_chart_are_ready(self) -> None:
+    def test_native_observer_does_not_require_desktop_chart_probe(self) -> None:
         observer = self.paper.value["market_observer"]
         assert isinstance(observer, dict)
         observer["observer_attachment"] = {
@@ -623,8 +623,9 @@ class NinjaTraderMaintenanceTests(unittest.TestCase):
         status = self.run_service(self.service(desktop))
         self.assertEqual(status["stage"], "READY")
         self.assertTrue(status["chart"]["found"])
-        self.assertEqual(status["chart"]["automation_result"], "ALREADY_PRESENT")
+        self.assertEqual(status["chart"]["automation_result"], "NATIVE_ADDON_OBSERVER_ACTIVE")
         self.assertEqual(status["observer"]["subscription_mode"], "NATIVE_ADDON")
+        self.assertEqual(desktop.ensure_chart_calls, [])
 
     def test_existing_correct_chart_and_attached_observer_are_reused(self) -> None:
         desktop = FakeDesktop(process=False, on_start=lambda value: setattr(value, "control_center", True))
@@ -736,7 +737,35 @@ class NinjaTraderMaintenanceTests(unittest.TestCase):
             probe = adapter.probe()
 
         self.assertTrue(probe.control_center_detected)
-        self.assertEqual(run.call_args.kwargs["timeout"], 45.0)
+        self.assertEqual(run.call_args.kwargs["timeout"], 75.0)
+
+    def test_active_status_reuses_operation_probe_instead_of_competing(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingDesktop(FakeDesktop):
+            def probe(inner_self) -> DesktopProbe:
+                inner_self.probe_calls += 1
+                entered.set()
+                release.wait(1.0)
+                return DesktopProbe(True, False, True, None)
+
+        desktop = BlockingDesktop(process=True)
+        service = self.service(desktop)
+        first = service.ensure_started("ntm-single-probe-0001")
+        self.assertTrue(entered.wait(1.0))
+
+        polled = service.status()
+
+        self.assertEqual(first["operation_id"], polled["operation_id"])
+        self.assertTrue(polled["in_progress"])
+        self.assertEqual(desktop.probe_calls, 1)
+        release.set()
+        service.wait(2)
+        final_probe_count = desktop.probe_calls
+        service.status()
+        self.assertEqual(final_probe_count, 2)
+        self.assertEqual(desktop.probe_calls, final_probe_count)
 
     def test_maintenance_sources_have_no_execution_login_or_force_kill_path(self) -> None:
         root = Path(__file__).parents[1]
