@@ -383,10 +383,41 @@ def derive_slim_paper_status(
         "timezone": runtime.get("session_timezone", "America/New_York"),
         "entry_window": runtime.get("entry_window"),
         "session_generation": runtime.get("session_generation"),
+        "classification_role": (
+            "REPORTING_ONLY"
+            if runtime.get("reporting_sessions_only") is True else "EXECUTION_WINDOW"
+        ),
+    }
+    execution = {
+        "runtime_state": runtime.get("state"),
+        "paper_execution": runtime.get("paper_execution"),
+        "authority_state": runtime.get("session_armed_state"),
+        "schedule": runtime.get("execution_schedule"),
+        "reporting_sessions_only": runtime.get("reporting_sessions_only") is True,
+    }
+    entry_counts = {
+        "reporting_session": runtime.get("session_entries"),
+        "exchange_trade_date": runtime.get("trade_date_entry_count"),
+        "quota_policy": runtime.get("entry_quota_policy"),
+        "session_quota": runtime.get("maximum_session_entries"),
+        "trade_date_quota": runtime.get("maximum_trade_date_entries"),
+    }
+    active_risk = {
+        "daily_loss_limit_dollars": _as_mapping(
+            runtime.get("account_trade_date_loss_policy")
+        ).get("limit_dollars"),
+        "loss_allowance_remaining": runtime.get(
+            "combined_trade_date_loss_allowance_remaining"
+        ),
+        "consecutive_losses": runtime.get("consecutive_losses"),
+        "maximum_consecutive_losses": runtime.get("maximum_consecutive_losses"),
     }
 
     def finalize(payload: dict[str, object]) -> dict[str, object]:
         payload["session"] = session
+        payload["execution"] = execution
+        payload["entry_counts"] = entry_counts
+        payload["active_risk"] = active_risk
         return payload
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:

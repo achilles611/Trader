@@ -68,6 +68,9 @@ _REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 _RECORD_HASH = re.compile(r"^[0-9a-f]{64}$")
 _PROFILE_SWITCH_OPERATION = re.compile(r"^profile-switch-[0-9a-f]{32}$")
 _SOURCE_BEFORE_OPERATION = re.compile(r"^source-before-(profile-switch-[0-9a-f]{32})$")
+_LEGACY_SESSION_BOUND_SCALPER_POLICY_HASH = "7077c30bdeb3b8017b5d8049ed32b92eb3acca67393ef101b217538da30d6659"
+_LEGACY_SESSION_BOUND_SCALPER_RISK_HASH = "c86c2c2b39f7fef9fcdaed06978ab22141eeacd2cf1590f2a8cddee0c5b17404"
+_SCALPER_POLICY_REVISION = "SCALPER_V2_CONTINUOUS_EXECUTION_POLICY_REVISION"
 _ACTIVE_STAGES = frozenset({
     "PREPARING", "STOPPING_CURRENT", "AWAITING_FLAT", "SHUTDOWN_REQUESTED",
     "VERIFYING_STARTUP_SEED", "STARTING_TARGET", "TARGET_PROCESS_CREATED",
@@ -749,7 +752,14 @@ class PaperProfileSwitchService:
             **{key: state.get(key) for key in ("operation_id", "request_id", "stage", "current_profile", "target_profile", "blockers")},
         })
 
-    def _prepare_manifest(self, request_id: str, target: PaperProfileDefinition) -> Path:
+    def _prepare_manifest(
+        self,
+        request_id: str,
+        target: PaperProfileDefinition,
+        *,
+        source_policy_hash: str | None = None,
+        source_risk_hash: str | None = None,
+    ) -> Path:
         operation_id = f"profile-switch-{uuid4().hex}"
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         run_id = f"{timestamp}-{uuid4().hex[:12]}"
@@ -809,6 +819,12 @@ class PaperProfileSwitchService:
             "paper_only": True,
             "live_capital": "DENIED",
         }
+        if target.selection_key == self.current_profile.selection_key:
+            manifest.update({
+                "transition_kind": _SCALPER_POLICY_REVISION,
+                "source_paper_policy_hash": source_policy_hash,
+                "source_risk_profile_hash": source_risk_hash,
+            })
         manifest["manifest_sha256"] = hashlib.sha256(_canonical(manifest)).hexdigest()
         manifest_path = operation_root / "manifest.json"
         descriptor = os.open(manifest_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -882,8 +898,6 @@ class PaperProfileSwitchService:
                 and self._state.get("blockers") == ["PROFILE_SWITCH_STATE_INVALID"]
             ):
                 raise RuntimeError("PROFILE_SWITCH_STATE_INVALID")
-            if target.selection_key == self.current_profile.selection_key:
-                raise ValueError("The selected profile is already active.")
             if (
                 (self._thread is not None and self._thread.is_alive())
                 or self._state.get("stage") in _ACTIVE_STAGES
@@ -901,7 +915,30 @@ class PaperProfileSwitchService:
                 or paper.get("market_instrument") != "MNQ SEP26"
             ):
                 raise RuntimeError("PROFILE_SWITCH_CURRENT_RUNTIME_IDENTITY_MISMATCH")
-            manifest_path = self._prepare_manifest(request_id, target)
+            source_policy_hash: str | None = None
+            source_risk_hash: str | None = None
+            if target.selection_key == self.current_profile.selection_key:
+                authority = paper.get("authority")
+                authority = authority if isinstance(authority, Mapping) else {}
+                source_policy_hash = str(authority.get("paper_policy_hash") or "")
+                source_risk_hash = str(authority.get("risk_profile_hash") or "")
+                if (
+                    source_policy_hash == target.policy.configuration_hash
+                    and source_risk_hash == target.risk.configuration_hash
+                ):
+                    raise ValueError("The selected profile is already active.")
+                if (
+                    target.selection_key != "BEELZEBUB_SCALPER_V2"
+                    or source_policy_hash != _LEGACY_SESSION_BOUND_SCALPER_POLICY_HASH
+                    or source_risk_hash != _LEGACY_SESSION_BOUND_SCALPER_RISK_HASH
+                ):
+                    raise RuntimeError("SCALPER_POLICY_REVISION_SOURCE_AUTHORITY_MISMATCH")
+            manifest_path = self._prepare_manifest(
+                request_id,
+                target,
+                source_policy_hash=source_policy_hash,
+                source_risk_hash=source_risk_hash,
+            )
             self._thread = threading.Thread(
                 target=self._run,
                 args=(manifest_path,),
@@ -1081,10 +1118,34 @@ def _manifest(path: Path) -> dict[str, object]:
         target = resolve_paper_profile(str(value.get("target_profile") or ""))
     except ValueError as exc:
         raise RuntimeError("PROFILE_SWITCH_MANIFEST_PROFILE_MISMATCH") from exc
+    same_profile_revision = current.selection_key == target.selection_key
+    revision_valid = bool(
+        same_profile_revision
+        and target.selection_key == "BEELZEBUB_SCALPER_V2"
+        and value.get("transition_kind") == _SCALPER_POLICY_REVISION
+        and value.get("source_paper_policy_hash")
+        == _LEGACY_SESSION_BOUND_SCALPER_POLICY_HASH
+        and value.get("source_risk_profile_hash")
+        == _LEGACY_SESSION_BOUND_SCALPER_RISK_HASH
+        and value.get("source_paper_policy_hash")
+        != value.get("paper_policy_hash")
+        and value.get("source_risk_profile_hash")
+        != value.get("risk_profile_hash")
+    )
     if (
         value.get("current_profile") != current.selection_key
         or value.get("target_profile") != target.selection_key
-        or current.selection_key == target.selection_key
+        or (same_profile_revision and not revision_valid)
+        or (
+            not same_profile_revision
+            and any(
+                key in value
+                for key in (
+                    "transition_kind", "source_paper_policy_hash",
+                    "source_risk_profile_hash",
+                )
+            )
+        )
         or value.get("paper_policy_hash") != target.policy.configuration_hash
         or value.get("risk_profile_hash") != target.risk.configuration_hash
         or value.get("paper_only") is not True

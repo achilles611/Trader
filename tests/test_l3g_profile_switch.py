@@ -95,6 +95,10 @@ def flat_status() -> dict[str, object]:
         "paper_account": "Sim101",
         "account_class": "LOCAL_SIMULATION",
         "market_instrument": "MNQ SEP26",
+        "authority": {
+            "paper_policy_hash": SCALPER_PROFILE.policy.configuration_hash,
+            "risk_profile_hash": SCALPER_PROFILE.risk.configuration_hash,
+        },
         "risk_continuity": {
             "schema": "lane-iii-paper-risk-continuity-snapshot-v2",
             "generated_at": "2026-09-04T20:00:00Z",
@@ -1312,6 +1316,67 @@ class ProfileSwitchServiceTests(unittest.TestCase):
             target_profile="BEELZEBUB_FIVE_MINUTE_BIAS_V1",
         )
         self.assertEqual(continuity["source_profile"], "BEELZEBUB_SCALPER_V2")
+
+    def test_exact_legacy_scalper_policy_revision_uses_supported_same_profile_handoff(self) -> None:
+        self.status_value["authority"] = {
+            "paper_policy_hash": "7077c30bdeb3b8017b5d8049ed32b92eb3acca67393ef101b217538da30d6659",
+            "risk_profile_hash": "c86c2c2b39f7fef9fcdaed06978ab22141eeacd2cf1590f2a8cddee0c5b17404",
+        }
+        result = self.service.start(
+            "scalper-policy-revision-0001", "BEELZEBUB_SCALPER_V2",
+        )
+        self.assertEqual(result["target_profile"], "BEELZEBUB_SCALPER_V2")
+        self.assertTrue(self.shutdown.wait(1))
+        manifest_path = Path(str(self.service.status()["manifest_path"]))
+        manifest = _manifest(manifest_path)
+        self.assertEqual(
+            manifest["transition_kind"],
+            "SCALPER_V2_CONTINUOUS_EXECUTION_POLICY_REVISION",
+        )
+        self.assertEqual(
+            manifest["source_paper_policy_hash"],
+            self.status_value["authority"]["paper_policy_hash"],
+        )
+        self.assertEqual(manifest["paper_policy_hash"], SCALPER_PROFILE.policy.configuration_hash)
+        continuity = read_risk_continuity_artifact(
+            manifest_path.with_name("risk-continuity.json"),
+        )
+        self.assertEqual(continuity["source_profile"], "BEELZEBUB_SCALPER_V2")
+        self.assertEqual(continuity["target_profile"], "BEELZEBUB_SCALPER_V2")
+        self.service.record_shutdown_receipt(clean_shutdown_receipt())
+        manifest.update({
+            "project_root": str(Path(__file__).resolve().parents[1]),
+            "python_executable": sys.executable,
+            "git_sha": subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip(),
+        })
+        manifest.pop("manifest_sha256")
+        manifest["manifest_sha256"] = sha256(
+            json.dumps(
+                manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+            ).encode("utf-8"),
+        ).hexdigest()
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        launches: list[list[str]] = []
+        self.assertEqual(
+            self.complete_supervisor_with_stubs(manifest_path, manifest, launches),
+            0,
+        )
+        self.assertEqual(len(launches), 1)
+
+    def test_same_profile_handoff_rejects_unrecognized_source_authority(self) -> None:
+        self.status_value["authority"] = {
+            "paper_policy_hash": "1" * 64,
+            "risk_profile_hash": "2" * 64,
+        }
+        with self.assertRaisesRegex(
+            RuntimeError, "SCALPER_POLICY_REVISION_SOURCE_AUTHORITY_MISMATCH",
+        ):
+            self.service.start(
+                "scalper-policy-revision-0002", "BEELZEBUB_SCALPER_V2",
+            )
 
     def test_requested_selection_is_separate_from_last_established_run(self) -> None:
         runtime_root = self.root / "remembered-runtime"

@@ -14,9 +14,9 @@ from src.l3g_paper.sessions import PaperSessionKind
 
 class PaperContractTests(unittest.TestCase):
     def test_artifacts_are_exact_hash_bound_and_never_scientific(self) -> None:
-        self.assertEqual(POLICY.configuration_hash, "7077c30bdeb3b8017b5d8049ed32b92eb3acca67393ef101b217538da30d6659")
-        self.assertEqual(RISK_PROFILE.configuration_hash, "c86c2c2b39f7fef9fcdaed06978ab22141eeacd2cf1590f2a8cddee0c5b17404")
-        self.assertEqual(POLICY.policy_id, "l3g-beelzebub-scalper-policy-v2")
+        self.assertEqual(POLICY.configuration_hash, "872d9079f710ebaa58dbdec88db0d13b34822ed7b49ac69b9af63bffb1b280bf")
+        self.assertEqual(RISK_PROFILE.configuration_hash, "2c0f54dc63da79f1b25e8d7ef3add0e2ae7386705b75e22c4ae8fbb99b060c6c")
+        self.assertEqual(POLICY.policy_id, "l3g-beelzebub-scalper-policy-v3")
         self.assertEqual((POLICY.entry_profile, POLICY.entry_profile_version), ("BEELZEBUB_SCALPER", "BEELZEBUB_SCALPER_V2"))
         self.assertEqual(POLICY.entry_session_kinds, (
             PaperSessionKind.ASIA, PaperSessionKind.LONDON,
@@ -26,8 +26,12 @@ class PaperContractTests(unittest.TestCase):
         self.assertEqual(POLICY.entry_dominance_margin, Decimal("0.025"))
         self.assertEqual(POLICY.entry_family_count, 3)
         self.assertEqual(POLICY.reentry_cooldown_seconds, 10)
+        self.assertEqual(POLICY.execution_schedule, "CONTINUOUS_EXCHANGE_TRADEABLE")
+        self.assertTrue(POLICY.reporting_sessions_only)
         self.assertEqual(RISK_PROFILE.maximum_position_age_seconds, 540)
-        self.assertEqual(RISK_PROFILE.maximum_session_entries, 12)
+        self.assertIsNone(RISK_PROFILE.maximum_session_entries)
+        self.assertIsNone(RISK_PROFILE.maximum_trade_date_entries)
+        self.assertEqual(RISK_PROFILE.entry_quota_policy, "DISABLED_COUNTING_RETAINED")
         self.assertEqual(RISK_PROFILE.reentry_cooldown_seconds, 10)
         self.assertFalse(POLICY.scientific_eligibility)
         self.assertFalse(AUTHORITY.authority_payload()["scientific_eligibility"])

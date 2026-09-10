@@ -815,6 +815,15 @@ class NinjaTraderMaintenanceEndpointTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.temporary = TemporaryDirectory()
         root = Path(self.temporary.name)
+        self.environment = patch.dict(
+            "os.environ",
+            {
+                "BEELZEBUB_L3G_PAPER_LEDGER": str(root / "hot" / "lane_iii_paper.sqlite3"),
+                "BEELZEBUB_PROFILE_SWITCH_ROOT": str(root / "runtime"),
+            },
+            clear=False,
+        )
+        self.environment.start()
         defaults = CopyTradeConfig()
         config = replace(
             defaults,
@@ -841,6 +850,7 @@ class NinjaTraderMaintenanceEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def tearDown(self) -> None:
+        self.environment.stop()
         self.temporary.cleanup()
 
     @staticmethod

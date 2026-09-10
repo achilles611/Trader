@@ -4,7 +4,7 @@ from pathlib import Path
 import re
 import unittest
 
-from src.l3g_paper.contracts import FIVE_MINUTE_PERPETUAL_POLICY
+from src.l3g_paper.contracts import FIVE_MINUTE_PERPETUAL_POLICY, POLICY
 from src.l3g_paper.ninjatrader_transport import (
     EXPECTED_ADDON_SOURCE_FINGERPRINT,
     expected_addon_source_fingerprint,
@@ -771,11 +771,18 @@ class NinjaScriptSourceTests(unittest.TestCase):
             r'private const string PerpetualPolicyHash = "([0-9a-f]{64})";',
             source,
         )
+        continuous_scalper_policy = re.search(
+            r'private const string ContinuousScalperPolicyHash = "([0-9a-f]{64})";',
+            source,
+        )
         self.assertIsNotNone(source_fingerprint)
         self.assertIsNotNone(perpetual_policy)
+        self.assertIsNotNone(continuous_scalper_policy)
         self.assertEqual(expected_addon_source_fingerprint(), EXPECTED_ADDON_SOURCE_FINGERPRINT)
         self.assertEqual(source_fingerprint.group(1), EXPECTED_ADDON_SOURCE_FINGERPRINT)  # type: ignore[union-attr]
         self.assertEqual(perpetual_policy.group(1), FIVE_MINUTE_PERPETUAL_POLICY.configuration_hash)  # type: ignore[union-attr]
+        self.assertEqual(continuous_scalper_policy.group(1), POLICY.configuration_hash)  # type: ignore[union-attr]
+        self.assertIn("bool continuousExecution = perpetual || continuousScalper", source)
 
     def test_native_order_rejection_diagnostics_are_signed_into_order_events(self) -> None:
         source = self._execution_source()

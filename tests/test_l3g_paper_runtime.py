@@ -171,6 +171,95 @@ class PaperRuntimeTests(unittest.TestCase):
             finally:
                 runtime.stop(); ledger.close()
 
+    def test_scalper_starts_off_session_with_retained_count_and_advances_to_thirteen(self) -> None:
+        now = "2026-08-25T06:05:00Z"
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.operational_runtime(directory, now=now)
+            submitted: list[object] = []
+            runtime._persist_and_send = lambda command, _grant: submitted.append(command)  # type: ignore[method-assign]
+            context = runtime._session_context
+            for index in range(12):
+                runtime._account_recovered_entry(
+                    f"historical-entry-{index}", context,
+                    runtime.policy.artifact.entry_profile_version,
+                )
+            runtime._snapshot = replace(
+                runtime._snapshot, session_entry_count=12, trade_date_entry_count=12,
+            )
+            runtime._last_quote = (Decimal("100.00"), Decimal("100.25"), now)
+            runtime._last_trade = (Decimal("100.25"), now)
+            try:
+                with patch("src.l3g_paper.runtime._now", return_value=now):
+                    started = runtime.operational_paper_start("continuous-off-session-start")
+                    candidate = replace(
+                        warmed_bullish_policy()[2],
+                        created_at=now, expires_at="2026-08-25T06:05:05Z",
+                        session_kind=context.session_kind, session_id=context.session_id,
+                        trade_date=context.trade_date,
+                        session_profile_hash=context.session_profile_hash,
+                        session_generation=context.session_generation,
+                    )
+                    runtime._request_entry(candidate)
+                self.assertTrue(started["started"])
+                self.assertEqual(started["reason_codes"], ("CONTINUOUS_PAPER_OPERATION_RUNNING",))
+                self.assertEqual(context.session_kind.value, "OFF_SESSION")
+                self.assertEqual(runtime.state, PaperRuntimeState.ENTRY_PENDING)
+                self.assertEqual(submitted[0].action.value, "ENTER_LONG")  # type: ignore[attr-defined]
+                runtime.on_execution_message({
+                    "message_type": "EXECUTION_EVENT", "order_role": "ENTRY",
+                    "price": "100.25", "quantity": 1, "direction": "LONG",
+                    "native_execution_id": "natural-entry-13", "timestamp": now,
+                })
+                status = runtime.status()
+                self.assertEqual(status["trade_date_entry_count"], 13)
+                self.assertEqual(status["session_entries"], 13)
+                self.assertEqual(status["entry_quota_policy"], "DISABLED_COUNTING_RETAINED")
+                self.assertEqual(status["session_armed_state"], "ARMED_CONTINUOUS")
+                policy_rows = [
+                    row for row in ledger.recent(50, domain="RISK_EVENT")
+                    if row["kind"] == "RISK_EVENT_EXECUTION_POLICY_APPLIED"
+                ]
+                self.assertEqual(len(policy_rows), 1)
+                self.assertEqual(policy_rows[0]["payload"]["historical_trade_date_entry_count"], 12)
+            finally:
+                runtime.stop(); ledger.close()
+
+    def test_trade_date_rollover_changes_accounting_context_without_rearming(self) -> None:
+        now = "2026-08-26T14:00:00Z"
+        with TemporaryDirectory() as directory:
+            ledger, runtime = self.operational_runtime(directory, now=now)
+            prior = runtime._session_context
+            runtime._account_recovered_entry(
+                "prior-trade-date-entry", prior,
+                runtime.policy.artifact.entry_profile_version,
+            )
+            runtime._snapshot = replace(
+                runtime._snapshot, session_entry_count=1, trade_date_entry_count=1,
+                daily_realized_pnl=Decimal("-25"),
+            )
+            try:
+                with patch("src.l3g_paper.runtime._now", return_value=now):
+                    self.assertTrue(runtime.operational_paper_start("continuous-rollover-start")["started"])
+                following = PaperSessionResolver().resolve(
+                    "2026-08-27T22:05:00Z", generation=2,
+                ).context
+                runtime._set_session_context(following, reason="TEST_TRADE_DATE_ROLLOVER")
+                status = runtime.status()
+                self.assertEqual(runtime.state, PaperRuntimeState.PAPER_RUNNING)
+                self.assertTrue(status["operational_paper_session"]["active"])
+                self.assertEqual(status["session_armed_state"], "ARMED_CONTINUOUS")
+                self.assertIsNone(status["session_arm_grant"])
+                self.assertEqual(status["risk_accounting_trade_date"], following.trade_date)
+                self.assertEqual(status["trade_date_entry_count"], 0)
+                self.assertEqual(
+                    runtime._profile_trade_date_risk[(
+                        prior.trade_date, runtime.policy.artifact.entry_profile_version,
+                    )].entry_count,
+                    1,
+                )
+            finally:
+                runtime.stop(); ledger.close()
+
     def test_operational_session_stays_running_across_idle_time_and_one_flat_trade_cycle(self) -> None:
         now = "2026-08-26T14:00:00Z"
         with TemporaryDirectory() as directory:
@@ -198,6 +287,15 @@ class PaperRuntimeTests(unittest.TestCase):
                             runtime._snapshot, current_position=PaperDirection.LONG,
                             current_position_quantity=1, protective_stop_state="WORKING",
                         )
+                        exit_context = PaperSessionResolver().resolve(
+                            "2026-08-26T20:05:00Z", generation=2,
+                        ).context
+                        runtime._set_session_context(
+                            exit_context, reason="TEST_REPORTING_LABEL_TRANSITION",
+                        )
+                        self.assertEqual(runtime.state, PaperRuntimeState.LONG)
+                        self.assertEqual(runtime._snapshot.protective_stop_state, "WORKING")
+                        self.assertTrue(runtime.status()["operational_paper_session"]["active"])
                         runtime._request_exit("TEST_NORMAL_EXIT")
                         self.assertEqual(runtime.state, PaperRuntimeState.EXIT_PENDING)
                         exit_command_id = runtime._pending_exit_command_id
@@ -227,7 +325,19 @@ class PaperRuntimeTests(unittest.TestCase):
                 status = runtime.status()
                 self.assertEqual(status["paper_session_pnl"]["realized"], "2")
                 self.assertEqual(status["paper_session_pnl"]["unrealized"], "0")
+                self.assertEqual(status["current_session"], "NY_AFTER")
+                self.assertEqual(status["profile_session_pnl"], "0")
                 self.assertEqual(status["current_position"], "FLAT")
+                pnl_rows = [
+                    row for row in ledger.recent(100)
+                    if row["kind"] == "EXECUTION_REALIZED_PNL"
+                ]
+                self.assertEqual(len(pnl_rows), 1)
+                self.assertTrue(pnl_rows[0]["payload"]["cross_reporting_session"])
+                self.assertEqual(
+                    pnl_rows[0]["payload"]["session_pnl_attribution"],
+                    "ENTRY_REPORTING_SESSION",
+                )
             finally:
                 runtime.stop(); ledger.close()
 
@@ -376,7 +486,7 @@ class PaperRuntimeTests(unittest.TestCase):
             finally:
                 runtime.stop(); ledger.close()
 
-    def test_ny_after_hard_flat_emergency_flattens_once_before_maintenance(self) -> None:
+    def test_ny_after_reporting_hard_flat_does_not_interrupt_continuous_scalper(self) -> None:
         now = "2026-08-25T20:05:00Z"
         deadline = "2026-08-25T20:58:00Z"
         with TemporaryDirectory() as directory:
@@ -400,7 +510,7 @@ class PaperRuntimeTests(unittest.TestCase):
                     runtime._snapshot,
                     current_position=PaperDirection.LONG,
                     current_position_quantity=1,
-                    position_opened_at=now,
+                    position_opened_at="2026-08-25T20:55:00Z",
                     quote_observed_at=deadline,
                     classified_trade_observed_at=deadline,
                     depth_mutation_observed_at=deadline,
@@ -410,12 +520,11 @@ class PaperRuntimeTests(unittest.TestCase):
                 runtime._evaluate_risk_exit(deadline)
                 runtime._evaluate_risk_exit(deadline)
 
-                self.assertEqual(runtime.state, PaperRuntimeState.EXIT_PENDING)
-                self.assertEqual(len(submitted), 1)
-                self.assertEqual(submitted[0].action.value, "EMERGENCY_FLATTEN")  # type: ignore[attr-defined]
+                self.assertEqual(runtime.state, PaperRuntimeState.LONG)
+                self.assertEqual(len(submitted), 0)
                 active = runtime.status()["operational_paper_session"]
-                self.assertTrue(active["stopping"])
-                self.assertEqual(active["stopping_reason"], "HARD_FLAT_DEADLINE")
+                self.assertTrue(active["active"])
+                self.assertFalse(active["stopping"])
             finally:
                 runtime.stop(); ledger.close()
 
@@ -728,20 +837,27 @@ class PaperRuntimeTests(unittest.TestCase):
             finally:
                 runtime.stop(); ledger.close()
 
-    def test_addon_provenance_denies_arm_but_not_observation_or_exit_safety(self) -> None:
+    def test_addon_provenance_denies_supported_continuous_start(self) -> None:
         with TemporaryDirectory() as directory:
             ledger = PaperLedger(Path(directory) / "paper.sqlite3")
             transport = PaperExecutionTransport(ledger, port=48171)
             runtime = LaneIIIPaperRuntime(ledger); runtime.bind_transport(transport)
             runtime._state = PaperRuntimeState.READY_DISARMED
+            runtime.operational_paper_readiness = lambda _preflight=None: {  # type: ignore[method-assign]
+                "result": "READY", "blocking_reasons": [], "ledger": {"status": "PASS"},
+            }
             transport._addon_protocol_version = ADDON_PROTOCOL_VERSION
             transport._addon_source_fingerprint = "stale"
-            self.assertEqual(runtime.arm()["reason_codes"], ("ADDON_BUILD_MISMATCH",))
-            transport._addon_source_fingerprint = expected_addon_source_fingerprint()
-            # The provenance gate is now clear; an off-session fence, not the
-            # AddOn, is the reason this fixture cannot arm.
-            self.assertEqual(runtime.arm()["reason_codes"], ("NO_CURRENT_EVENT_SESSION",))
-            ledger.close()
+            try:
+                refused = runtime.operational_paper_start("stale-addon-continuous-start")
+                self.assertEqual(refused["reason_codes"], ("ADDON_BUILD_MISMATCH",))
+                transport._addon_source_fingerprint = expected_addon_source_fingerprint()
+                self.assertEqual(
+                    runtime.arm()["reason_codes"],
+                    ("PROFILE_REQUIRES_OPERATIONAL_START",),
+                )
+            finally:
+                runtime.stop(); ledger.close()
 
     def test_backward_provider_timestamp_does_not_close_the_current_paper_session(self) -> None:
         with TemporaryDirectory() as directory:

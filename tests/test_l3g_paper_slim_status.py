@@ -117,6 +117,34 @@ class SlimPaperStatusTests(unittest.TestCase):
         self.assertFalse(result["paper_active"])
         self.assertEqual(result["pnl"]["total"], "10.25")
 
+    def test_scalper_projection_separates_execution_reporting_counts_and_risk(self) -> None:
+        paper = operational_runtime()
+        paper.update({
+            "execution_schedule": "CONTINUOUS_EXCHANGE_TRADEABLE",
+            "reporting_sessions_only": True,
+            "session_armed_state": "ARMED_CONTINUOUS",
+            "current_session": "OFF_SESSION",
+            "current_session_family": "OFF_SESSION",
+            "session_entries": 3,
+            "trade_date_entry_count": 12,
+            "maximum_session_entries": None,
+            "maximum_trade_date_entries": None,
+            "entry_quota_policy": "DISABLED_COUNTING_RETAINED",
+            "combined_trade_date_loss_allowance_remaining": "188.50",
+            "consecutive_losses": 1,
+            "maximum_consecutive_losses": 4,
+            "account_trade_date_loss_policy": {"limit_dollars": "200.00"},
+        })
+        result = self.status(
+            paper, {"result": "BLOCKED", "blocking_reasons": ["STATE_NOT_READY_DISARMED"]},
+        )
+        self.assertEqual(result["execution"]["authority_state"], "ARMED_CONTINUOUS")
+        self.assertEqual(result["session"]["classification_role"], "REPORTING_ONLY")
+        self.assertEqual(result["session"]["session_kind"], "OFF_SESSION")
+        self.assertEqual(result["entry_counts"]["exchange_trade_date"], 12)
+        self.assertEqual(result["entry_counts"]["quota_policy"], "DISABLED_COUNTING_RETAINED")
+        self.assertEqual(result["active_risk"]["loss_allowance_remaining"], "188.50")
+
     def test_representative_blocked_or_unknown_states_are_red(self) -> None:
         cases = {
             "unavailable": (None, None),

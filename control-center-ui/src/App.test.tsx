@@ -774,7 +774,7 @@ describe("copy control center", () => {
     expect(fetch).not.toHaveBeenCalledWith("/api/lane-iii/paper/operational-start", expect.anything());
     expect(fetch).not.toHaveBeenCalledWith("/api/lane-iii/ninjatrader-maintenance", expect.objectContaining({ method: "POST" }));
     expect(screen.getByText("$10.25")).toBeInTheDocument();
-    expect(document.querySelector(".slim-session")).toHaveTextContent("LONDON / EUROPE · 08:00-11:30 Europe/London");
+    expect(screen.getByText(/Reporting session:/)).toHaveTextContent("LONDON / EUROPE · 08:00-11:30 Europe/London");
     expect(screen.getByText("BEELZEBUB_SCALPER")).toBeInTheDocument();
     expect(screen.getByText(/0.55 threshold/)).toBeInTheDocument();
   });

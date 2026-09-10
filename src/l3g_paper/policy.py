@@ -107,6 +107,11 @@ class ExperimentalPaperPolicy:
             type(artifact) is FiveMinutePerpetualPaperPolicyArtifact
             and artifact.perpetual_position
         )
+        self._continuous_scalper_profile = (
+            type(artifact) is PaperPolicyArtifact
+            and artifact.reporting_sessions_only
+            and artifact.execution_schedule == "CONTINUOUS_EXCHANGE_TRADEABLE"
+        )
         self._policy_hash = artifact.configuration_hash
         self._lock = threading.RLock()
         self._market_session_id: str | None = None
@@ -214,10 +219,31 @@ class ExperimentalPaperPolicy:
         prior = self._paper_session_context
         changed = (prior.session_id, prior.session_generation) != (context.session_id, context.session_generation)
         if changed:
-            if prior.session_id != UNSPECIFIED_OFF_SESSION_CONTEXT.session_id:
+            reporting_label_transition = (
+                self._continuous_scalper_profile
+                and prior.session_id != UNSPECIFIED_OFF_SESSION_CONTEXT.session_id
+                and context.session_id != UNSPECIFIED_OFF_SESSION_CONTEXT.session_id
+                and (
+                    prior.session_kind,
+                    prior.session_id,
+                    prior.trade_date,
+                    prior.session_profile_hash,
+                )
+                != (
+                    context.session_kind,
+                    context.session_id,
+                    context.trade_date,
+                    context.session_profile_hash,
+                )
+            )
+            if (
+                not reporting_label_transition
+                and prior.session_id != UNSPECIFIED_OFF_SESSION_CONTEXT.session_id
+            ):
                 self._clear_provisional()
-            self._used_hypothesis_instances.clear()
-            self._last_flat_confirmation = None
+            if not reporting_label_transition:
+                self._used_hypothesis_instances.clear()
+                self._last_flat_confirmation = None
             self._paper_session_context = context
         return changed
 
@@ -242,7 +268,11 @@ class ExperimentalPaperPolicy:
         if type(decision) is not PaperDecision or decision.decision not in {PaperDecisionKind.LONG, PaperDecisionKind.SHORT}:
             raise ValueError("Only an exact entry decision may be marked used.")
         with self._lock:
-            if (decision.session_id, decision.session_generation) != (self._paper_session_context.session_id, self._paper_session_context.session_generation):
+            if (
+                not self._continuous_scalper_profile
+                and (decision.session_id, decision.session_generation)
+                != (self._paper_session_context.session_id, self._paper_session_context.session_generation)
+            ):
                 raise ValueError("Paper hypothesis cannot cross a session boundary.")
             self._used_hypothesis_instances.add(self._hypothesis_instance(decision))
 
@@ -388,7 +418,7 @@ class ExperimentalPaperPolicy:
                 self._clear_provisional()
                 return self._decision(observation, PaperDecisionKind.NO_TRADE, None, "MARKET_DATA_RECONNECTED")
 
-            if self._perpetual_position_profile:
+            if self._perpetual_position_profile or self._continuous_scalper_profile:
                 exchange_blocker = perpetual_exchange_blocker(
                     self._market_event_timestamp(observation), context,
                 )
@@ -880,7 +910,10 @@ class ExperimentalPaperPolicy:
         blocking: bool = False,
     ) -> None:
         ids, sequences, hashes, source_sessions = self._provenance(sources)
-        if not source_sessions or set(source_sessions) != {self._paper_session_context.session_id}:
+        if not source_sessions or (
+            not self._continuous_scalper_profile
+            and set(source_sessions) != {self._paper_session_context.session_id}
+        ):
             raise ValueError("CROSS_SESSION_SOURCE_SET")
         identity = {
             "policy_hash": self._policy_hash,
@@ -909,6 +942,10 @@ class ExperimentalPaperPolicy:
             session_profile_hash=self._paper_session_context.session_profile_hash,
             session_generation=self._paper_session_context.session_generation,
             source_session_ids=source_sessions,
+            cross_reporting_session_sources=(
+                self._continuous_scalper_profile
+                and set(source_sessions) != {self._paper_session_context.session_id}
+            ),
         )
         self._evidence[(hypothesis, family, label)] = evidence
         self._evidence_history.append(evidence)
@@ -928,6 +965,10 @@ class ExperimentalPaperPolicy:
                 session_profile_hash=self._paper_session_context.session_profile_hash,
                 session_generation=self._paper_session_context.session_generation,
                 source_session_ids=source_sessions,
+                cross_reporting_session_sources=(
+                    self._continuous_scalper_profile
+                    and set(source_sessions) != {self._paper_session_context.session_id}
+                ),
             )
             self._evidence[(competitor, family, "CONTRADICTS_" + label)] = contrary
             self._evidence_history.append(contrary)
@@ -1059,8 +1100,13 @@ class ExperimentalPaperPolicy:
                 value for value in self._evidence.values()
                 if value.hypothesis_kind is hypothesis
                 and self._time(value.expires_at) >= at
-                and value.session_id == self._paper_session_context.session_id
-                and value.session_generation == self._paper_session_context.session_generation
+                and (
+                    self._continuous_scalper_profile
+                    or (
+                        value.session_id == self._paper_session_context.session_id
+                        and value.session_generation == self._paper_session_context.session_generation
+                    )
+                )
             )
         latest: dict[tuple[EvidenceFamily, str], PaperEvidence] = {}
         for value in self._evidence_history:
@@ -1185,11 +1231,16 @@ class ExperimentalPaperPolicy:
         return tuple(item[0] for item in combined), tuple(item[1] for item in combined), tuple(item[2] for item in combined)
 
     def _hypothesis_instance(self, decision: PaperDecision) -> str:
-        return canonical_hash({
+        identity: dict[str, object] = {
             "hypothesis": None if decision.hypothesis_kind is None else decision.hypothesis_kind.value,
             "sources": decision.source_observation_ids, "policy": decision.paper_policy_hash,
-            "session_id": decision.session_id, "session_generation": decision.session_generation,
-        })
+        }
+        if not self._continuous_scalper_profile:
+            identity.update({
+                "session_id": decision.session_id,
+                "session_generation": decision.session_generation,
+            })
+        return canonical_hash(identity)
 
     def _decision(
         self,

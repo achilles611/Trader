@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -166,20 +166,29 @@ class SessionEvidenceTests(unittest.TestCase):
             finally:
                 ledger.close()
 
-    def test_transition_resets_evidence_and_generation_changes_hypothesis_identity(self) -> None:
-        asia = resolved("2026-08-24T22:05:00Z").context
-        ny = resolved("2026-08-25T13:35:00Z").context
+    def test_scalper_reporting_transition_preserves_evidence_and_hypothesis_identity(self) -> None:
+        rth = resolved("2026-08-25T19:59:58Z").context
+        after = resolved("2026-08-25T20:00:00Z").context
         policy = ExperimentalPaperPolicy(); policy.on_transport_state(StreamHealth.HEALTHY)
-        factory = ObservationFactory()
-        policy.ingest(factory.make("CONNECTION", {"scope": "MARKET_DATA", "price_status": "Connected"}), session_context=asia)
-        quote = factory.quote(100); policy.ingest(quote, session_context=asia)
+        factory = ObservationFactory(start=datetime(2026, 8, 25, 19, 59, 56, tzinfo=timezone.utc))
+        policy.ingest(factory.make("CONNECTION", {"scope": "MARKET_DATA", "price_status": "Connected"}), session_context=rth)
+        quote = factory.quote(100); policy.ingest(quote, session_context=rth)
         for price in (100, 99, 100):
-            quote = factory.quote(price); policy.ingest(factory.trade(quote, price), session_context=asia)
-        self.assertEqual(policy.session_context.session_id, asia.session_id)
-        policy.ingest(factory.quote(101), session_context=ny)
-        self.assertEqual(policy.session_context.session_id, ny.session_id)
-        self.assertEqual(policy.active_evidence("2026-08-25T13:35:01Z"), ())
-        self.assertNotEqual((asia.session_id, asia.session_generation), (ny.session_id, ny.session_generation))
+            quote = factory.quote(price); policy.ingest(factory.trade(quote, price), session_context=rth)
+        for operation, volume in (("ADD", 10), ("UPDATE", 5), ("UPDATE", 10), ("UPDATE", 5), ("UPDATE", 11)):
+            decision = policy.ingest(factory.depth(operation, volume), session_context=rth)
+        self.assertEqual(policy.session_context.session_id, rth.session_id)
+        policy._used_hypothesis_instances.add("used-before-reporting-transition")
+        reset_count = policy.reset_count()
+        used = set(policy._used_hypothesis_instances)
+        factory.start = datetime(2026, 8, 25, 20, 0, tzinfo=timezone.utc) - timedelta(
+            milliseconds=(factory.sequence + 1) * 100,
+        )
+        policy.ingest(factory.quote(101), session_context=after)
+        self.assertEqual(policy.session_context.session_id, after.session_id)
+        self.assertEqual(policy.reset_count(), reset_count)
+        self.assertEqual(policy._used_hypothesis_instances, used)
+        self.assertTrue(policy.active_evidence("2026-08-25T20:00:00.100000Z"))
 
     def test_mixed_session_evidence_sources_are_refused(self) -> None:
         asia = resolved("2026-08-24T22:05:00Z").context
@@ -195,7 +204,7 @@ class SessionEvidenceTests(unittest.TestCase):
 
 
 class SessionRiskAndLedgerTests(unittest.TestCase):
-    def test_session_caps_and_scalper_profile_accepts_ny_after(self) -> None:
+    def test_scalper_count_history_is_retained_but_quotas_and_windows_are_disabled(self) -> None:
         ny = resolved("2026-08-25T13:35:00Z").context
         after = resolved("2026-08-25T20:05:00Z").context
         policy_decision = replace(warmed_bullish_policy()[2], created_at="2026-08-25T13:35:00Z", expires_at="2026-08-25T13:35:05Z")
@@ -207,10 +216,24 @@ class SessionRiskAndLedgerTests(unittest.TestCase):
         intent = authority.make_intent(decision, reference_bid=Decimal("100"), reference_ask=Decimal("100.25"), reference_last=Decimal("100"))
         ny_snapshot = healthy(ny, "2026-08-25T13:35:00Z", daily_realized_pnl=Decimal("-125"), trade_date_entry_count=0)
         self.assertTrue(authority.evaluate(intent, ny_snapshot, at="2026-08-25T13:35:00Z").granted)
-        self.assertFalse(authority.evaluate(intent, replace(ny_snapshot, daily_realized_pnl=Decimal("-200")), at="2026-08-25T13:35:00Z").granted)
-        self.assertFalse(authority.evaluate(intent, replace(ny_snapshot, trade_date_entry_count=RISK_PROFILE.maximum_session_entries), at="2026-08-25T13:35:00Z").granted)
+        retained = replace(ny_snapshot, session_entry_count=12, trade_date_entry_count=12)
+        self.assertTrue(authority.evaluate(intent, retained, at="2026-08-25T13:35:00Z").granted)
         self.assertFalse(authority.evaluate(intent, replace(ny_snapshot, foreign_activity=True), at="2026-08-25T13:35:00Z").granted)
         self.assertFalse(authority.evaluate(intent, replace(ny_snapshot, unresolved_execution=True), at="2026-08-25T13:35:00Z").granted)
+        self.assertFalse(authority.evaluate(intent, replace(ny_snapshot, consecutive_losses=4), at="2026-08-25T13:35:00Z").granted)
+        self.assertFalse(authority.evaluate(intent, replace(ny_snapshot, reconciliation_current=False), at="2026-08-25T13:35:00Z").granted)
+        stale = authority.evaluate(
+            intent,
+            replace(
+                ny_snapshot, quote_observed_at="2026-08-25T13:34:50Z",
+                classified_trade_observed_at="2026-08-25T13:34:50Z",
+                depth_mutation_observed_at="2026-08-25T13:34:50Z",
+            ),
+            at="2026-08-25T13:35:00Z",
+        )
+        self.assertFalse(stale.granted)
+        self.assertIn("QUOTE_STALE", stale.reason_codes)
+        self.assertFalse(authority.evaluate(intent, replace(ny_snapshot, daily_realized_pnl=Decimal("-200")), at="2026-08-25T13:35:00Z").granted)
         self.assertEqual(after.trade_date, ny.trade_date)
         self.assertEqual(after.session_family, ny.session_family)
         after_decision = replace(
@@ -222,6 +245,26 @@ class SessionRiskAndLedgerTests(unittest.TestCase):
         after_intent = after_authority.make_intent(after_decision, reference_bid=Decimal("100"), reference_ask=Decimal("100.25"), reference_last=Decimal("100"))
         after_grant = after_authority.evaluate(after_intent, healthy(after, "2026-08-25T20:05:00Z"), at="2026-08-25T20:05:00Z")
         self.assertTrue(after_grant.granted)
+
+        off = PaperSessionResolver().resolve("2026-08-25T06:05:00Z", generation=7).context
+        self.assertEqual(off.session_kind, PaperSessionKind.OFF_SESSION)
+        off_decision = replace(
+            decision, created_at="2026-08-25T06:05:00Z", expires_at="2026-08-25T06:05:05Z",
+            session_kind=off.session_kind, session_id=off.session_id,
+            trade_date=off.trade_date, session_profile_hash=off.session_profile_hash,
+            session_generation=off.session_generation,
+        )
+        off_authority = PaperRiskAuthority()
+        off_intent = off_authority.make_intent(
+            off_decision, reference_bid=Decimal("100"), reference_ask=Decimal("100.25"),
+            reference_last=Decimal("100"),
+        )
+        off_grant = off_authority.evaluate(
+            off_intent,
+            healthy(off, "2026-08-25T06:05:00Z", session_entry_count=12, trade_date_entry_count=12),
+            at="2026-08-25T06:05:00Z",
+        )
+        self.assertTrue(off_grant.granted)
 
     def test_ledger_filters_preserve_session_dimension(self) -> None:
         asia = resolved("2026-08-24T22:05:00Z").context

@@ -53,7 +53,7 @@ EXECUTION_HOST = "127.0.0.1"
 EXECUTION_PORT = 48136
 EXECUTION_SCHEMA = "lane-iii-phase-g-paper-execution-v1"
 ADDON_PROTOCOL_VERSION = "l3g-paper-addon-provenance-v1"
-EXPECTED_ADDON_SOURCE_FINGERPRINT = "46fe2fe5bec4464ad168edcba4be4eeedf2636eeac6ba8c1eca8e5d91fc6178f"
+EXPECTED_ADDON_SOURCE_FINGERPRINT = "ded3309410f44aeb56018838fe1e59347c552664c4052cdab2bc56e9a71b2ef0"
 MAXIMUM_FRAME_BYTES = 65536
 HELLO_MAXIMUM_AGE_SECONDS = 10
 FUTURE_TOLERANCE_SECONDS = 1
@@ -802,14 +802,21 @@ class PaperExecutionTransport:
                 and self.policy.perpetual_position
                 and not command.commissioning
             )
+            continuous_scalper = (
+                type(self.policy) is PaperPolicyArtifact
+                and self.policy.reporting_sessions_only
+                and self.policy.execution_schedule == "CONTINUOUS_EXCHANGE_TRADEABLE"
+                and not command.commissioning
+            )
+            continuous_execution = perpetual or continuous_scalper
             legacy = command.session_kind is PaperSessionKind.OFF_SESSION and command.session_id != UNSPECIFIED_OFF_SESSION_CONTEXT.session_id
-            if (perpetual or not legacy) and (
+            if not legacy and (
                 (grant.session_kind, grant.session_id, grant.trade_date, grant.session_profile_hash, grant.session_generation)
                 != (command.session_kind, command.session_id, command.trade_date, command.session_profile_hash, command.session_generation)
             ):
                 raise ValueError("Command and risk grant session identity mismatch.")
             if command.action in {ExecutionAction.ENTER_LONG, ExecutionAction.ENTER_SHORT}:
-                if legacy and not perpetual:
+                if legacy:
                     # Retained only for pre-regime in-process protocol fixtures;
                     # the compiled AddOn independently rejects this shape.
                     pass
@@ -826,7 +833,7 @@ class PaperExecutionTransport:
                         or current.context.session_profile_hash != context.session_profile_hash
                     ):
                         raise ValueError("Entry command session identity is no longer current.")
-                    if perpetual:
+                    if continuous_execution:
                         blocker = perpetual_exchange_blocker(_now(), context)
                         if blocker is not None:
                             raise ValueError("Entry command blocked by " + blocker + ".")

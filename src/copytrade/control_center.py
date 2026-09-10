@@ -1787,7 +1787,12 @@ def create_control_center_app(
                 "live_capital": "DENIED",
                 "entry_profile": selected_paper_policy.entry_profile,
                 "entry_profile_version": selected_paper_policy.entry_profile_version,
-                "entry_session_kind": "ALL_CONFIGURED",
+                "execution_schedule": selected_paper_policy.execution_schedule,
+                "reporting_sessions_only": selected_paper_policy.reporting_sessions_only,
+                "entry_session_kind": (
+                    "REPORTING_ONLY"
+                    if selected_paper_policy.reporting_sessions_only else "ALL_CONFIGURED"
+                ),
                 "entry_session_kinds": [value.value for value in selected_paper_policy.entry_session_kinds],
                 "effective_confidence_threshold": str(selected_paper_policy.entry_support_threshold),
                 "entry_dominance_margin": str(selected_paper_policy.entry_dominance_margin),
@@ -1796,6 +1801,9 @@ def create_control_center_app(
                 "retention_confidence_threshold": str(selected_paper_policy.retention_support_threshold),
                 "maximum_position_age_seconds": selected_paper_risk.maximum_position_age_seconds,
                 "maximum_session_entries": selected_paper_risk.maximum_session_entries,
+                "maximum_trade_date_entries": selected_paper_risk.maximum_trade_date_entries,
+                "entry_quota_policy": selected_paper_risk.entry_quota_policy,
+                "maximum_consecutive_losses": selected_paper_risk.maximum_consecutive_losses,
                 "session_definitions": list(session_catalog()),
                 "account_balances": observer["account_balances"],
                 "market_observer": observer,

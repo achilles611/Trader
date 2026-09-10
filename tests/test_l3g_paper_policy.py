@@ -55,7 +55,7 @@ class PaperPolicyTests(unittest.TestCase):
         first = warmed_bullish_policy()[2]
         second = warmed_bullish_policy()[2]
         self.assertEqual(first.paper_decision_id, second.paper_decision_id)
-        self.assertEqual(first.paper_policy_id, "l3g-beelzebub-scalper-policy-v2")
+        self.assertEqual(first.paper_policy_id, "l3g-beelzebub-scalper-policy-v3")
         self.assertFalse(first.scientific_eligibility)
         self.assertNotIn("provider_sequence", first.payload())
 

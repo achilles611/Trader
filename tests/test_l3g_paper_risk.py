@@ -120,7 +120,7 @@ class PaperRiskTests(unittest.TestCase):
 
     def test_entry_window_and_grant_expiry_are_exact(self) -> None:
         authority = PaperRiskAuthority()
-        self.assertFalse(authority.preflight(healthy_snapshot(), at="2026-08-24T13:34:59Z")[0])
+        self.assertTrue(authority.preflight(healthy_snapshot(), at="2026-08-24T13:34:59Z")[0])
         decision = replace(warmed_bullish_policy()[2], created_at=AT, expires_at="2026-08-24T14:00:05Z")
         intent = authority.make_intent(decision, reference_bid=Decimal("100"), reference_ask=Decimal("100.25"), reference_last=Decimal("100"))
         grant = authority.evaluate(intent, healthy_snapshot(), at=AT)

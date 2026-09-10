@@ -133,6 +133,15 @@ _PERPETUAL_DEFERRED_ENTRY_REASONS = frozenset({
     "CLASSIFIED_TRADE_STALE",
     "DEPTH_MUTATION_STALE",
 })
+_REPORTING_SESSION_ONLY_REASONS = frozenset({
+    "NO_CURRENT_EVENT_SESSION",
+    "OFF_SESSION",
+    "PROFILE_SESSION_MISMATCH",
+    "HOLIDAY_SESSION_UNVERIFIED",
+    "OUTSIDE_ENTRY_SESSION",
+    "HARD_FLAT_DEADLINE",
+    "SESSION_CLOSED",
+})
 
 
 def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
@@ -399,6 +408,18 @@ class LaneIIIPaperRuntime:
         self._perpetual_position_profile = (
             type(self.policy.artifact) is FiveMinutePerpetualPaperPolicyArtifact
             and self.policy.artifact.perpetual_position
+        )
+        self._continuous_scalper_profile = (
+            self.policy.artifact.entry_profile_version == PAPER_ENTRY_PROFILE_VERSION
+            and self.policy.artifact.reporting_sessions_only
+            and self.policy.artifact.execution_schedule
+            == "CONTINUOUS_EXCHANGE_TRADEABLE"
+            and self.risk.profile.reporting_sessions_only
+            and not self.risk.profile.enforce_session_entry_window
+            and not self.risk.profile.enforce_hard_flat_deadline
+        )
+        self._continuous_execution_profile = (
+            self._perpetual_position_profile or self._continuous_scalper_profile
         )
         # V1 may be the source of a controlled switch into the perpetual V2
         # profile.  Its detached V2 evaluator is passive: it owns no adapter,
@@ -1776,7 +1797,11 @@ class LaneIIIPaperRuntime:
             or self._entries_paused
         ):
             return False
-        if self._perpetual_position_profile:
+        if (
+            self._continuous_execution_profile
+            and self._entry_owner is not PaperEntryOwner.COMMISSIONING
+            and self._session_context.trade_date != "1970-01-01"
+        ):
             return (
                 self._operational_session is not None
                 and not self._operational_session_is_stopping_locked()
@@ -2432,9 +2457,16 @@ class LaneIIIPaperRuntime:
     def _observe_commissioning_warmup(self, at: str) -> None:
         """Latch once every required evidence family has appeared in this exact context."""
         context = self._session_context
-        if context.session_kind is PaperSessionKind.OFF_SESSION:
+        if (
+            context.session_kind is PaperSessionKind.OFF_SESSION
+            and not self._continuous_scalper_profile
+        ):
             return
-        if self._context_identity(self._commissioning_warmup_context) != self._context_identity(context):
+        if (
+            not self._continuous_scalper_profile
+            and self._context_identity(self._commissioning_warmup_context)
+            != self._context_identity(context)
+        ):
             self._reset_commissioning_warmup("SESSION_IDENTITY_CHANGED")
             self._commissioning_warmup_context = context
         if self._commissioning_warmup_warmed_at is not None:
@@ -2443,11 +2475,16 @@ class LaneIIIPaperRuntime:
         for evidence in self.policy.active_evidence(at):
             if (
                 evidence.family not in _COMMISSIONING_REQUIRED_FAMILIES
-                or evidence.session_kind is not context.session_kind
-                or evidence.session_id != context.session_id
-                or evidence.trade_date != context.trade_date
-                or evidence.session_profile_hash != context.session_profile_hash
-                or evidence.session_generation != context.session_generation
+                or (
+                    not self._continuous_scalper_profile
+                    and (
+                        evidence.session_kind is not context.session_kind
+                        or evidence.session_id != context.session_id
+                        or evidence.trade_date != context.trade_date
+                        or evidence.session_profile_hash != context.session_profile_hash
+                        or evidence.session_generation != context.session_generation
+                    )
+                )
             ):
                 continue
             self._commissioning_warmup_seen.setdefault(evidence.family.value, {
@@ -2561,7 +2598,7 @@ class LaneIIIPaperRuntime:
     ) -> None:
         """Project current identity without resetting a carried V2 risk epoch.
 
-        A perpetual position can span an exchange trade-date boundary. Until
+        A continuous position can span an exchange trade-date boundary. Until
         signed flat reconciliation, its original trade-date budget remains the
         conservative account envelope; no unproven boundary mark is used to
         manufacture a daily reset. Once flat, the current context becomes the
@@ -2570,7 +2607,7 @@ class LaneIIIPaperRuntime:
         profile = self.policy.artifact.entry_profile_version
         carried = (
             self._entry_session_context
-            if self._perpetual_position_profile and self._entry_session_context is not None
+            if self._continuous_execution_profile and self._entry_session_context is not None
             else None
         )
         risk_context = carried or context
@@ -2610,18 +2647,43 @@ class LaneIIIPaperRuntime:
         prior = self._session_context
         if self._context_identity(prior) == self._context_identity(context):
             return
-        self._advance_commissioning_authority_epoch()
-        self._reset_commissioning_warmup("SESSION_CHANGED:" + reason)
+        reporting_label_transition = (
+            self._continuous_scalper_profile
+            and prior.session_id != UNSPECIFIED_OFF_SESSION_CONTEXT.session_id
+            and context.session_id != UNSPECIFIED_OFF_SESSION_CONTEXT.session_id
+            and (
+                prior.session_kind,
+                prior.session_id,
+                prior.trade_date,
+                prior.session_profile_hash,
+            )
+            != (
+                context.session_kind,
+                context.session_id,
+                context.trade_date,
+                context.session_profile_hash,
+            )
+        )
+        if not reporting_label_transition:
+            self._advance_commissioning_authority_epoch()
+            self._reset_commissioning_warmup("SESSION_CHANGED:" + reason)
         if prior.session_kind is not PaperSessionKind.OFF_SESSION:
             self._close_session(prior, reason)
         self._session_context = context
         self._commissioning_warmup_context = context
         self.ledger.set_session_context(context)
         if context.session_kind is not PaperSessionKind.OFF_SESSION:
-            self._activate_risk_snapshot_context_locked(context, reset_evidence=True)
+            self._activate_risk_snapshot_context_locked(
+                context, reset_evidence=not reporting_label_transition,
+            )
             self.ledger.append("SESSION_OPENED", {**context.payload(), "reason": reason}, identity="l3g-paper-session-open-" + canonical_hash(context.payload()))
-        elif self._perpetual_position_profile:
-            self._activate_risk_snapshot_context_locked(context, reset_evidence=True)
+        elif (
+            self._continuous_execution_profile
+            and context.session_id != UNSPECIFIED_OFF_SESSION_CONTEXT.session_id
+        ):
+            self._activate_risk_snapshot_context_locked(
+                context, reset_evidence=not reporting_label_transition,
+            )
             self.ledger.append(
                 "SESSION_OPENED", {**context.payload(), "reason": reason},
                 identity="l3g-paper-session-open-" + canonical_hash(context.payload()),
@@ -2649,8 +2711,8 @@ class LaneIIIPaperRuntime:
                 "position": self._position.value, "working_owned_orders": self._snapshot.working_owned_orders,
             }, identity="l3g-paper-session-close-" + canonical_hash({**context.payload(), "reason": reason}),
         )
-        if self._perpetual_position_profile:
-            # This is an evidence-domain rollover only. It does not stop the
+        if self._continuous_execution_profile:
+            # This is a reporting-domain rollover only. It does not stop the
             # persistent operation, expire authority, or flatten a position.
             return
         self._armed_session = None
@@ -2705,7 +2767,7 @@ class LaneIIIPaperRuntime:
         return context, resolution.reason_code
 
     def _enforce_session_boundary(self) -> None:
-        if self._perpetual_position_profile:
+        if self._continuous_execution_profile:
             return
         context = self._session_context
         if context.session_kind is PaperSessionKind.OFF_SESSION:
@@ -4213,7 +4275,7 @@ class LaneIIIPaperRuntime:
             self._request_operational_stop_locked("DAILY_LOSS_LIMIT")
             self._request_exit("DAILY_LOSS_LIMIT", emergency=True)
         elif (
-            not self._perpetual_position_profile
+            not self._continuous_execution_profile
             and self._session_context.hard_flat_due_at(
                 datetime.fromisoformat(normalized_utc(at, "Risk exit time").replace("Z", "+00:00"))
             )
@@ -4221,12 +4283,13 @@ class LaneIIIPaperRuntime:
             self._request_operational_stop_locked("HARD_FLAT_DEADLINE")
             self._request_exit("HARD_FLAT_DEADLINE", emergency=True)
         elif not self._perpetual_position_profile and self.risk.maximum_age_due(self._snapshot, at):
-            self._request_operational_stop_locked("MAXIMUM_POSITION_AGE")
+            if not self._continuous_scalper_profile:
+                self._request_operational_stop_locked("MAXIMUM_POSITION_AGE")
             self._request_exit("MAXIMUM_POSITION_AGE")
         else:
             now = datetime.fromisoformat(normalized_utc(at, "Risk exit time").replace("Z", "+00:00"))
             if (
-                self._perpetual_position_profile
+                self._continuous_execution_profile
                 and perpetual_exchange_blocker(now, self._session_context) is not None
             ):
                 # Expected exchange closures naturally stop quote/trade/depth
@@ -5493,6 +5556,25 @@ class LaneIIIPaperRuntime:
             self._exit_execution = dict(message)
             self._lifecycle_realized_pnl = realized
             entry = self._entry_execution or {}
+            exit_context = self._session_context
+            trade_identity = "l3g-paper-trade-" + canonical_hash({
+                "entry_execution_id": entry.get("native_execution_id"),
+                "entry_command_id": entry.get("command_id"),
+                "entry_decision_id": entry.get("decision_id"),
+            })[:32]
+            cross_reporting_session = (
+                entry_context.session_id != exit_context.session_id
+                or entry_context.session_generation != exit_context.session_generation
+            )
+            reporting_metadata = {
+                "trade_identity": trade_identity,
+                "entry_reporting_session_label": entry_context.session_kind.value,
+                "entry_reporting_session_id": entry_context.session_id,
+                "exit_reporting_session_label": exit_context.session_kind.value,
+                "exit_reporting_session_id": exit_context.session_id,
+                "cross_reporting_session": cross_reporting_session,
+                "session_pnl_attribution": "ENTRY_REPORTING_SESSION",
+            }
             try:
                 self.ledger.append(
                     "RISK_EVENT_EXIT_ACCOUNTED",
@@ -5502,6 +5584,7 @@ class LaneIIIPaperRuntime:
                         "exit_execution_id": execution_id,
                         "realized_pnl": str(realized),
                         "effect": "REALIZED_PNL_AND_LOSS_STREAK_APPLIED_ONCE",
+                        **reporting_metadata,
                     },
                     identity="l3g-risk-exit-accounted-" + canonical_hash({"execution_id": execution_id}),
                     execution_session_id=self._execution_session_id(),
@@ -5540,6 +5623,7 @@ class LaneIIIPaperRuntime:
                         "exit_price": str(price),
                         "exit_quantity": quantity,
                         "exit_timestamp": message.get("timestamp"),
+                        **reporting_metadata,
                         "contract_value_per_point": "2",
                         "simulated_fees": "0",
                         "realized_pnl": str(realized),
@@ -5811,7 +5895,10 @@ class LaneIIIPaperRuntime:
         self._early_protective_order_event = None
         self._lifecycle_realized_pnl = Decimal("0")
         self._entry_session_context = None
-        if self._perpetual_position_profile:
+        if (
+            self._continuous_execution_profile
+            and self._session_context.trade_date != "1970-01-01"
+        ):
             self._activate_risk_snapshot_context_locked(
                 self._session_context, reset_evidence=False,
             )
@@ -5911,7 +5998,10 @@ class LaneIIIPaperRuntime:
         if context.session_kind is not PaperSessionKind.OFF_SESSION:
             return True
         return (
-            profile == FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION
+            profile in {
+                PAPER_ENTRY_PROFILE_VERSION,
+                FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
+            }
             and context.trade_date != "1970-01-01"
             and context.session_id
             == f"MNQU6:OFF_SESSION:{context.trade_date}"
@@ -6904,6 +6994,7 @@ class LaneIIIPaperRuntime:
             raw_reasons = [
                 str(value) for value in result.get("blocking_reasons", [])
                 if isinstance(value, str)
+                and str(value) not in _REPORTING_SESSION_ONLY_REASONS
             ]
             blocking = list(dict.fromkeys((*raw_reasons, *operational_reasons)))
             result = {
@@ -7014,6 +7105,36 @@ class LaneIIIPaperRuntime:
                         context=self._session_context,
                         ledger_preflight=dict(readiness.get("ledger") or {}),
                     )
+                    if self._continuous_scalper_profile:
+                        self.ledger.append(
+                            "RISK_EVENT_EXECUTION_POLICY_APPLIED",
+                            {
+                                **session.context.payload(),
+                                "request_id": request_id,
+                                "applied_at": started_at,
+                                "entry_profile_version": self.policy.artifact.entry_profile_version,
+                                "paper_policy_id": self.policy.artifact.policy_id,
+                                "paper_policy_hash": self.policy.artifact.configuration_hash,
+                                "risk_profile_id": self.risk.profile.profile_id,
+                                "risk_profile_hash": self.risk.profile.configuration_hash,
+                                "execution_schedule": self.policy.artifact.execution_schedule,
+                                "reporting_sessions_only": True,
+                                "session_entry_quota": "DISABLED",
+                                "trade_date_entry_quota": "DISABLED",
+                                "historical_session_entry_count": self._snapshot.session_entry_count,
+                                "historical_trade_date_entry_count": self._snapshot.trade_date_entry_count,
+                                "risk_accounting_trade_date": self._snapshot.trade_date,
+                                "reason": "AUTHORIZED_CONTINUOUS_SCALPER_V2_PAPER_POLICY",
+                                "scope": "Sim101 / LOCAL_SIMULATION / MNQ SEP26 / MAXIMUM_QUANTITY_1",
+                                "live_capital": "DENIED",
+                            },
+                            identity="l3g-continuous-scalper-policy-applied-" + canonical_hash({
+                                "request_id": request_id,
+                                "policy_hash": self.policy.artifact.configuration_hash,
+                                "risk_hash": self.risk.profile.configuration_hash,
+                            }),
+                            execution_session_id=self._execution_session_id(),
+                        )
                     self.ledger.append(
                         "SESSION_OPERATIONAL_PAPER_STARTED",
                         {
@@ -7072,7 +7193,7 @@ class LaneIIIPaperRuntime:
 
     def arm(self) -> dict[str, object]:
         with self._lock:
-            if self._perpetual_position_profile:
+            if self._continuous_execution_profile:
                 return {
                     "armed": False,
                     "reason_codes": ("PROFILE_REQUIRES_OPERATIONAL_START",),
@@ -7096,12 +7217,12 @@ class LaneIIIPaperRuntime:
         allow_starting: bool = False,
     ) -> dict[str, object]:
         """Persist an arm outcome while the ledger capacity/order fence is held."""
-        perpetual_operation = (
-            self._perpetual_position_profile
+        continuous_operation = (
+            self._continuous_execution_profile
             and target_state is PaperRuntimeState.PAPER_RUNNING
             and self._operational_session is not None
         )
-        if self._perpetual_position_profile and not perpetual_operation:
+        if self._continuous_execution_profile and not continuous_operation:
             return {
                 "armed": False,
                 "reason_codes": ("PROFILE_REQUIRES_OPERATIONAL_START",),
@@ -7131,7 +7252,7 @@ class LaneIIIPaperRuntime:
         now = _now()
         current = PaperSessionResolver().resolve(now, generation=context.session_generation)
         if (
-            not perpetual_operation
+            not continuous_operation
             and (
                 context.session_kind is PaperSessionKind.OFF_SESSION
                 or current.context.session_id != context.session_id
@@ -7140,7 +7261,7 @@ class LaneIIIPaperRuntime:
             reasons = ("NO_CURRENT_EVENT_SESSION",)
             self.ledger.append("RISK_EVENT_ARM_ATTEMPT", {**context.payload(), "allowed": False, "reason_codes": reasons, "authority_hash": canonical_hash(self.authority.authority_payload())})
             return {"armed": False, "reason_codes": reasons, "state": self._state.value}
-        if perpetual_operation:
+        if self._perpetual_position_profile and continuous_operation:
             all_reasons = self.risk.preflight_reasons(self._snapshot, at=now)
             reasons = tuple(
                 reason for reason in all_reasons
@@ -7164,7 +7285,7 @@ class LaneIIIPaperRuntime:
         )
         if not allowed:
             return {"armed": False, "reason_codes": reasons, "state": self._state.value}
-        self._armed_session = None if perpetual_operation else PaperSessionArmGrant(
+        self._armed_session = None if continuous_operation else PaperSessionArmGrant(
             context.session_kind, context.session_id, context.trade_date,
             context.session_profile_hash, context.session_generation, now,
             context.boundary_at("entry_cutoff").isoformat().replace("+00:00", "Z"),
@@ -7179,13 +7300,21 @@ class LaneIIIPaperRuntime:
         return {
             "armed": True,
             "reason_codes": (
-                ("PERPETUAL_PAPER_OPERATION_RUNNING",)
-                if perpetual_operation else ("PAPER_ARMED",)
+                (
+                    "PERPETUAL_PAPER_OPERATION_RUNNING"
+                    if self._perpetual_position_profile
+                    else "CONTINUOUS_PAPER_OPERATION_RUNNING"
+                ),
+            ) if continuous_operation else (
+                "PAPER_ARMED",
             ),
             "deferred_entry_reasons": deferred_entry_reasons,
             "state": self._state.value,
             "session_armed_state": (
-                "ARMED_PERPETUAL" if perpetual_operation
+                (
+                    "ARMED_PERPETUAL"
+                    if self._perpetual_position_profile else "ARMED_CONTINUOUS"
+                ) if continuous_operation
                 else "ARMED_" + context.session_kind.value
             ),
             "arm_grant": None if self._armed_session is None else self._armed_session.payload(),
@@ -8138,7 +8267,7 @@ class LaneIIIPaperRuntime:
             context = self._session_context
             risk_context = (
                 self._entry_session_context
-                if self._perpetual_position_profile and self._entry_session_context is not None
+                if self._continuous_execution_profile and self._entry_session_context is not None
                 else context
             )
             trade_risk = self._trade_date_risk.get(risk_context.trade_date, _TradeDateRisk())
@@ -8212,7 +8341,12 @@ class LaneIIIPaperRuntime:
                 "live_capital": "DENIED",
                 "entry_profile": self.policy.artifact.entry_profile,
                 "entry_profile_version": self.policy.artifact.entry_profile_version,
-                "entry_session_kind": "ALL_CONFIGURED",
+                "execution_schedule": self.policy.artifact.execution_schedule,
+                "reporting_sessions_only": self.policy.artifact.reporting_sessions_only,
+                "entry_session_kind": (
+                    "REPORTING_ONLY"
+                    if self._continuous_scalper_profile else "ALL_CONFIGURED"
+                ),
                 "entry_session_kinds": [value.value for value in self.policy.artifact.entry_session_kinds],
                 "effective_confidence_threshold": str(self.policy.artifact.entry_support_threshold),
                 "entry_dominance_margin": str(self.policy.artifact.entry_dominance_margin),
@@ -8225,6 +8359,9 @@ class LaneIIIPaperRuntime:
                 ),
                 "maximum_position_age_enforced": not self._perpetual_position_profile,
                 "maximum_session_entries": self.risk.profile.maximum_session_entries,
+                "maximum_trade_date_entries": self.risk.profile.maximum_trade_date_entries,
+                "entry_quota_policy": self.risk.profile.entry_quota_policy,
+                "maximum_consecutive_losses": self.risk.profile.maximum_consecutive_losses,
                 "session_definitions": list(session_catalog()),
                 "commissioning_readiness_snapshot_generation": self._commissioning_readiness_generation,
                 "commissioning_authority_epoch": self._commissioning_authority_epoch,
@@ -8258,12 +8395,20 @@ class LaneIIIPaperRuntime:
                 "session_generation": context.session_generation,
                 "session_state": context.calendar_state.value,
                 "session_timezone": context.timezone,
-                "entry_window": f"{context.entry_start}-{context.entry_cutoff} {context.timezone}",
+                "entry_window": (
+                    "REPORTING_ONLY / EXECUTION_NOT_TIME_GATED"
+                    if self._continuous_scalper_profile
+                    else f"{context.entry_start}-{context.entry_cutoff} {context.timezone}"
+                ),
                 "entry_cutoff": context.entry_cutoff,
                 "hard_flat_deadline": context.hard_flat_deadline,
                 "session_armed_state": (
                     "ARMED_PERPETUAL"
                     if self._perpetual_position_profile
+                    and self._operational_session is not None
+                    and not self._operational_session_is_stopping_locked()
+                    else "ARMED_CONTINUOUS"
+                    if self._continuous_scalper_profile
                     and self._operational_session is not None
                     and not self._operational_session_is_stopping_locked()
                     else "ARMED_" + context.session_kind.value if arm_valid else "DISARMED"
@@ -8327,7 +8472,7 @@ class LaneIIIPaperRuntime:
                 "risk_accounting_trade_date": risk_context.trade_date,
                 "risk_accounting_scope": (
                     "OPEN_LIFECYCLE_STICKY_UNTIL_FLAT"
-                    if self._perpetual_position_profile and self._entry_session_context is not None
+                    if self._continuous_execution_profile and self._entry_session_context is not None
                     else "CURRENT_EXCHANGE_TRADE_DATE"
                 ),
                 "account_trade_date_loss_policy": {

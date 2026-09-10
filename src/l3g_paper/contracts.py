@@ -24,10 +24,10 @@ from .sessions import (
 )
 
 
-PAPER_POLICY_SCHEMA = "lane-iii-phase-g-paper-policy-v4"
-PAPER_RISK_SCHEMA = "lane-iii-phase-g-paper-risk-v3"
+PAPER_POLICY_SCHEMA = "lane-iii-phase-g-paper-policy-v5"
+PAPER_RISK_SCHEMA = "lane-iii-phase-g-paper-risk-v4"
 PAPER_RECORD_SCHEMA = "lane-iii-phase-g-paper-record-v1"
-PAPER_POLICY_ID = "l3g-beelzebub-scalper-policy-v2"
+PAPER_POLICY_ID = "l3g-beelzebub-scalper-policy-v3"
 PAPER_ENTRY_PROFILE = "BEELZEBUB_SCALPER"
 PAPER_ENTRY_PROFILE_VERSION = "BEELZEBUB_SCALPER_V2"
 HIGH_CONFIDENCE_POLICY_SCHEMA = "lane-iii-phase-g-paper-policy-v3"
@@ -42,7 +42,7 @@ FIVE_MINUTE_PERPETUAL_POLICY_SCHEMA = "lane-iii-phase-g-five-minute-perpetual-po
 FIVE_MINUTE_PERPETUAL_POLICY_ID = "l3g-beelzebub-five-minute-perpetual-policy-v2"
 FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE = "BEELZEBUB_FIVE_MINUTE_PERPETUAL"
 FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION = "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2"
-PAPER_RISK_PROFILE_ID = "l3g-beelzebub-scalper-risk-v2"
+PAPER_RISK_PROFILE_ID = "l3g-beelzebub-scalper-risk-v3"
 HIGH_CONFIDENCE_RISK_SCHEMA = "lane-iii-phase-g-paper-risk-v2"
 HIGH_CONFIDENCE_RISK_PROFILE_ID = "l3g-ny-high-confluence-commissioning-risk-v1"
 FIVE_MINUTE_RISK_SCHEMA = "lane-iii-phase-g-five-minute-bias-risk-v1"
@@ -194,6 +194,8 @@ class PaperPolicyArtifact:
         PaperSessionKind.NEW_YORK_RTH,
         PaperSessionKind.NY_AFTER,
     )
+    execution_schedule: str = "CONTINUOUS_EXCHANGE_TRADEABLE"
+    reporting_sessions_only: bool = True
     sequence_authority: SequenceAuthority = SequenceAuthority.LOCAL_CALLBACK_ORDER_ONLY
     book_completeness: BookCompleteness = BookCompleteness.UNVERIFIED
     allowed_hypotheses: tuple[HypothesisKind, ...] = (
@@ -253,6 +255,8 @@ class PaperPolicyArtifact:
             or self.entry_family_count != 3
             or self.retention_family_count != 2
             or self.reentry_cooldown_seconds != 10
+            or self.execution_schedule != "CONTINUOUS_EXCHANGE_TRADEABLE"
+            or self.reporting_sessions_only is not True
         ):
             raise ValueError("The Beelzebub scalper policy tuning is immutable.")
 
@@ -278,6 +282,8 @@ class HighConfidencePaperPolicyArtifact:
     canonical_contract: str = PAPER_CANONICAL_CONTRACT
     scientific_eligibility: bool = False
     entry_session_kind: PaperSessionKind = PaperSessionKind.NEW_YORK_RTH
+    execution_schedule: str = "CONFIGURED_SESSION_WINDOWS"
+    reporting_sessions_only: bool = False
     sequence_authority: SequenceAuthority = SequenceAuthority.LOCAL_CALLBACK_ORDER_ONLY
     book_completeness: BookCompleteness = BookCompleteness.UNVERIFIED
     allowed_hypotheses: tuple[HypothesisKind, ...] = (
@@ -332,6 +338,8 @@ class HighConfidencePaperPolicyArtifact:
             or self.entry_family_count != 3
             or self.retention_family_count != 2
             or self.reentry_cooldown_seconds != 3600
+            or self.execution_schedule != "CONFIGURED_SESSION_WINDOWS"
+            or self.reporting_sessions_only is not False
         ):
             raise ValueError("The NY high-confluence commissioning policy tuning is immutable.")
 
@@ -342,7 +350,10 @@ class HighConfidencePaperPolicyArtifact:
     def payload(self) -> dict[str, object]:
         # The singular entry_session_kind is intentional: it preserves the
         # original deployed V1 payload and configuration hash exactly.
-        return _jsonable(asdict(self))  # type: ignore[return-value]
+        payload = asdict(self)
+        payload.pop("execution_schedule")
+        payload.pop("reporting_sessions_only")
+        return _jsonable(payload)  # type: ignore[return-value]
 
     @property
     def configuration_hash(self) -> str:
@@ -371,6 +382,8 @@ class FiveMinutePaperPolicyArtifact(PaperPolicyArtifact):
     tie_while_flat: str = "NO_TRADE"
     tie_while_positioned: str = "HOLD"
     reversal_protocol: str = "EXIT_RECONCILE_THEN_ENTER"
+    execution_schedule: str = "CONFIGURED_SESSION_WINDOWS"
+    reporting_sessions_only: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -415,8 +428,18 @@ class FiveMinutePaperPolicyArtifact(PaperPolicyArtifact):
             or self.tie_while_flat != "NO_TRADE"
             or self.tie_while_positioned != "HOLD"
             or self.reversal_protocol != "EXIT_RECONCILE_THEN_ENTER"
+            or self.execution_schedule != "CONFIGURED_SESSION_WINDOWS"
+            or self.reporting_sessions_only is not False
         ):
             raise ValueError("The five-minute decision protocol is immutable.")
+
+    def payload(self) -> dict[str, object]:
+        # Scalper V3 metadata must not silently re-version either sealed
+        # five-minute artifact through dataclass inheritance.
+        payload = asdict(self)
+        payload.pop("execution_schedule")
+        payload.pop("reporting_sessions_only")
+        return _jsonable(payload)  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -438,6 +461,8 @@ class FiveMinutePerpetualPaperPolicyArtifact(FiveMinutePaperPolicyArtifact):
     perpetual_position: bool = True
     market_scope: str = "EXCHANGE_TRADEABLE_ONLY"
     routine_time_flats: bool = False
+    execution_schedule: str = "CONTINUOUS_EXCHANGE_TRADEABLE"
+    reporting_sessions_only: bool = True
 
     def __post_init__(self) -> None:
         if (
@@ -478,6 +503,8 @@ class FiveMinutePerpetualPaperPolicyArtifact(FiveMinutePaperPolicyArtifact):
             or self.perpetual_position is not True
             or self.market_scope != "EXCHANGE_TRADEABLE_ONLY"
             or self.routine_time_flats is not False
+            or self.execution_schedule != "CONTINUOUS_EXCHANGE_TRADEABLE"
+            or self.reporting_sessions_only is not True
         ):
             raise ValueError("The legacy-named perpetual decision protocol is immutable.")
 
@@ -531,7 +558,12 @@ class PaperRiskProfile:
     hard_flat_deadline: str = "15:58"
     session_timezone: str = "America/New_York"
     reentry_cooldown_seconds: int = 10
-    maximum_session_entries: int = 12
+    maximum_session_entries: int | None = None
+    maximum_trade_date_entries: int | None = None
+    entry_quota_policy: str = "DISABLED_COUNTING_RETAINED"
+    enforce_session_entry_window: bool = False
+    enforce_hard_flat_deadline: bool = False
+    reporting_sessions_only: bool = True
     maximum_consecutive_losses: int = 4
     maximum_entry_slippage_points: Decimal = Decimal("2.00")
     quote_maximum_age_seconds: int = 2
@@ -562,7 +594,12 @@ class PaperRiskProfile:
             or self.daily_loss_limit_dollars != PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS
             or self.maximum_position_age_seconds != 540
             or self.reentry_cooldown_seconds != 10
-            or self.maximum_session_entries != 12
+            or self.maximum_session_entries is not None
+            or self.maximum_trade_date_entries is not None
+            or self.entry_quota_policy != "DISABLED_COUNTING_RETAINED"
+            or self.enforce_session_entry_window is not False
+            or self.enforce_hard_flat_deadline is not False
+            or self.reporting_sessions_only is not True
             or self.maximum_consecutive_losses != 4
         ):
             raise ValueError("The Beelzebub scalper risk limits are immutable.")
@@ -607,6 +644,11 @@ class HighConfidencePaperRiskProfile:
     session_timezone: str = "America/New_York"
     reentry_cooldown_seconds: int = 3600
     maximum_session_entries: int = 1
+    maximum_trade_date_entries: int = 1
+    entry_quota_policy: str = "BOUNDED"
+    enforce_session_entry_window: bool = True
+    enforce_hard_flat_deadline: bool = True
+    reporting_sessions_only: bool = False
     maximum_consecutive_losses: int = 1
     maximum_entry_slippage_points: Decimal = Decimal("2.00")
     quote_maximum_age_seconds: int = 2
@@ -640,6 +682,11 @@ class HighConfidencePaperRiskProfile:
             or self.maximum_position_age_seconds != 3600
             or self.reentry_cooldown_seconds != 3600
             or self.maximum_session_entries != 1
+            or self.maximum_trade_date_entries != 1
+            or self.entry_quota_policy != "BOUNDED"
+            or self.enforce_session_entry_window is not True
+            or self.enforce_hard_flat_deadline is not True
+            or self.reporting_sessions_only is not False
             or self.maximum_consecutive_losses != 1
         ):
             raise ValueError("The NY high-confluence commissioning risk limits are immutable.")
@@ -649,7 +696,14 @@ class HighConfidencePaperRiskProfile:
         return (self.entry_session_kind,)
 
     def payload(self) -> dict[str, object]:
-        return _jsonable(asdict(self))  # type: ignore[return-value]
+        payload = asdict(self)
+        for key in (
+            "maximum_trade_date_entries", "entry_quota_policy",
+            "enforce_session_entry_window", "enforce_hard_flat_deadline",
+            "reporting_sessions_only",
+        ):
+            payload.pop(key)
+        return _jsonable(payload)  # type: ignore[return-value]
 
     @property
     def configuration_hash(self) -> str:
@@ -665,6 +719,11 @@ class FiveMinutePaperRiskProfile(PaperRiskProfile):
     maximum_position_age_seconds: int = 86_400
     reentry_cooldown_seconds: int = 0
     maximum_session_entries: int = 128
+    maximum_trade_date_entries: int = 128
+    entry_quota_policy: str = "BOUNDED"
+    enforce_session_entry_window: bool = True
+    enforce_hard_flat_deadline: bool = True
+    reporting_sessions_only: bool = False
     maximum_consecutive_losses: int = 128
 
     def __post_init__(self) -> None:
@@ -675,10 +734,11 @@ class FiveMinutePaperRiskProfile(PaperRiskProfile):
             self.maximum_position_age_seconds,
             self.reentry_cooldown_seconds,
             self.maximum_session_entries,
+            self.maximum_trade_date_entries,
             self.maximum_consecutive_losses,
         ) != (
             FIVE_MINUTE_RISK_SCHEMA, FIVE_MINUTE_RISK_PROFILE_ID,
-            PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS, 86_400, 0, 128, 128,
+            PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS, 86_400, 0, 128, 128, 128,
         ):
             raise ValueError("The five-minute paper risk envelope is immutable.")
         if (
@@ -694,8 +754,22 @@ class FiveMinutePaperRiskProfile(PaperRiskProfile):
             or self.pyramiding
             or self.averaging
             or self.same_event_reversal
+            or self.entry_quota_policy != "BOUNDED"
+            or self.enforce_session_entry_window is not True
+            or self.enforce_hard_flat_deadline is not True
+            or self.reporting_sessions_only is not False
         ):
             raise ValueError("The five-minute risk profile is sealed to one Sim101 MNQ contract.")
+
+    def payload(self) -> dict[str, object]:
+        payload = asdict(self)
+        for key in (
+            "maximum_trade_date_entries", "entry_quota_policy",
+            "enforce_session_entry_window", "enforce_hard_flat_deadline",
+            "reporting_sessions_only",
+        ):
+            payload.pop(key)
+        return _jsonable(payload)  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -710,6 +784,7 @@ class FiveMinutePerpetualPaperRiskProfile(FiveMinutePaperRiskProfile):
     enforce_holiday_fence: bool = False
     enforce_session_entry_window: bool = False
     enforce_hard_flat_deadline: bool = False
+    reporting_sessions_only: bool = True
 
     def __post_init__(self) -> None:
         if (
@@ -719,6 +794,7 @@ class FiveMinutePerpetualPaperRiskProfile(FiveMinutePaperRiskProfile):
             self.maximum_position_age_seconds,
             self.reentry_cooldown_seconds,
             self.maximum_session_entries,
+            self.maximum_trade_date_entries,
             self.maximum_consecutive_losses,
         ) != (
             FIVE_MINUTE_PERPETUAL_RISK_SCHEMA,
@@ -726,6 +802,7 @@ class FiveMinutePerpetualPaperRiskProfile(FiveMinutePaperRiskProfile):
             PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS,
             0,
             0,
+            128,
             128,
             128,
         ):
@@ -747,9 +824,19 @@ class FiveMinutePerpetualPaperRiskProfile(FiveMinutePaperRiskProfile):
             or self.enforce_holiday_fence is not False
             or self.enforce_session_entry_window is not False
             or self.enforce_hard_flat_deadline is not False
+            or self.reporting_sessions_only is not True
             or self.maximum_position_age_enforced is not False
         ):
             raise ValueError("The perpetual profile is sealed to one Sim101 MNQ contract.")
+
+    def payload(self) -> dict[str, object]:
+        payload = asdict(self)
+        for key in (
+            "maximum_trade_date_entries", "entry_quota_policy",
+            "reporting_sessions_only",
+        ):
+            payload.pop(key)
+        return _jsonable(payload)  # type: ignore[return-value]
 
 
 PaperRiskProfileType = (
@@ -839,6 +926,7 @@ class PaperEvidence:
     session_profile_hash: str = UNSPECIFIED_OFF_SESSION_CONTEXT.session_profile_hash
     session_generation: int = UNSPECIFIED_OFF_SESSION_CONTEXT.session_generation
     source_session_ids: tuple[str, ...] = ()
+    cross_reporting_session_sources: bool = False
 
     def __post_init__(self) -> None:
         _utc(self.observed_at, "Paper evidence time")
@@ -853,12 +941,19 @@ class PaperEvidence:
             raise ValueError("Provisional paper evidence cannot be promoted to scientific truth.")
         _validate_session_identity(self.session_kind, self.session_id, self.trade_date, self.session_profile_hash, self.session_generation)
         source_sessions = self.source_session_ids or tuple(self.session_id for _ in self.source_observation_ids)
-        if len(source_sessions) != len(self.source_observation_ids) or set(source_sessions) != {self.session_id}:
+        if type(self.cross_reporting_session_sources) is not bool:
+            raise ValueError("Cross-reporting-session evidence marker must be boolean.")
+        if len(source_sessions) != len(self.source_observation_ids):
+            raise ValueError("CROSS_SESSION_SOURCE_SET")
+        mixed = set(source_sessions) != {self.session_id}
+        if mixed and self.cross_reporting_session_sources is not True:
             raise ValueError("CROSS_SESSION_SOURCE_SET")
         object.__setattr__(self, "source_session_ids", tuple(source_sessions))
 
     def payload(self) -> dict[str, object]:
         result = asdict(self)
+        if not self.cross_reporting_session_sources:
+            result.pop("cross_reporting_session_sources")
         result["session_family"] = session_family(self.session_kind).value
         return _jsonable(result)  # type: ignore[return-value]
 
@@ -1256,6 +1351,10 @@ class PaperProfileDefinition:
             "risk_profile_hash": self.risk.configuration_hash,
             "maximum_position_age_seconds": self.risk.maximum_position_age_seconds,
             "maximum_session_entries": self.risk.maximum_session_entries,
+            "maximum_trade_date_entries": self.risk.maximum_trade_date_entries,
+            "entry_quota_policy": self.risk.entry_quota_policy,
+            "execution_schedule": self.policy.execution_schedule,
+            "reporting_sessions_only": self.policy.reporting_sessions_only,
             "paper_only": True,
             "live_capital": "DENIED",
         }
@@ -1271,7 +1370,7 @@ HIGH_CONFIDENCE_PROFILE = PaperProfileDefinition(
 SCALPER_PROFILE = PaperProfileDefinition(
     PAPER_ENTRY_PROFILE_VERSION,
     "Scalper",
-    "Multi-session high-confluence scalping with the V2 bounded risk envelope.",
+    "Continuous exchange-tradeable high-confluence scalping with session-labeled reporting.",
     POLICY,
     RISK_PROFILE,
 )

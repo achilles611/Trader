@@ -7,7 +7,7 @@ Slim Mode exposes four compiled, paper-only Sim101 profiles:
 | Selector label | Immutable version | Behavior |
 | --- | --- | --- |
 | High confidence | `NY_HIGH_CONFLUENCE_COMMISSIONING_V1` | New York high-confluence profile with one entry opportunity per session. |
-| Scalper | `BEELZEBUB_SCALPER_V2` | Multi-session V2 scalper. This is the initial default only when no explicit or established selection exists. |
+| Scalper | `BEELZEBUB_SCALPER_V2` | Continuous exchange-tradeable V2 scalper with session labels used only for reporting. Entry-count quotas are disabled while counts remain durable. This is the initial default only when no explicit or established selection exists. |
 | 5-minute session bias (legacy V1) | `BEELZEBUB_FIVE_MINUTE_BIAS_V1` | Decides once per five-minute boundary, but retains the legacy holiday, session-window, hard-flat, and maximum-age fences. |
 | 5-minute perpetual position | `BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2` | Uses the latest durable non-tied completed five-minute bias, holds exactly one MNQ, and stages an exit, signed-flat reconciliation, then one opposite entry when the bias reverses. |
 
@@ -17,14 +17,17 @@ grant, command validation, status API, and restart proof. All bundles remain
 sealed to `Sim101 / LOCAL_SIMULATION / MNQ SEP26 / quantity 1`; live capital is
 denied.
 
-The perpetual V2 bundle alone removes routine strategy holidays, entry windows,
-hard-flat deadlines, and position-age exits. It still denies entry during the
-exchange's scheduled maintenance, weekend closure, and intraday halt, and it
-retains connection/freshness, complete reconciliation, protective-stop,
-quantity-one, exact `Sim101 / LOCAL_SIMULATION / MNQ SEP26`, daily-loss, and
-live-capital-denial gates. A flat V2 runtime is never presented as healthy: its
-Slim status is `FLAT — BLOCKED: <exact reason>` until a reconciled `+1` or `-1`
-MNQ position is present.
+Scalper V2 and perpetual V2 both remove reporting-session holidays, entry
+windows, and hard-flat deadlines from execution authority. Scalper V2 retains
+its 540-second maximum hold; perpetual V2 alone removes the position-age exit.
+Both still deny entry during the exchange's scheduled maintenance, weekend
+closure, and intraday halt, and retain connection/freshness, complete
+reconciliation, protective-stop, quantity-one, exact
+`Sim101 / LOCAL_SIMULATION / MNQ SEP26`, daily-loss, and live-capital-denial
+gates. A flat perpetual V2 runtime is never presented as healthy: its Slim
+status is `FLAT — BLOCKED: <exact reason>` until a reconciled `+1` or `-1` MNQ
+position is present. A flat continuous Scalper V2 runtime may be healthy while
+waiting for its existing high-confluence signal.
 
 A successfully filled, runtime-owned protective stop is an ordinary position
 exit: its loss and counters are applied exactly once, signed flat/no-order

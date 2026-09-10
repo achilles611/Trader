@@ -137,6 +137,9 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
   const autoStartButton = autoStart?.button || { label: "Checking startup gates…", enabled: false };
   const pnl = status?.pnl || { state: "MISSING" };
   const session = status?.session || {};
+  const execution = status?.execution || {};
+  const entryCounts = status?.entry_counts || {};
+  const activeRisk = status?.active_risk || {};
   const startEnabled = autoStartButton.enabled === true && autoStart?.in_progress !== true && !paper.autoStartBusy;
   const pnlUnavailable = pnl.state !== "CURRENT";
   const autoWarmup = autoStart?.warmup || {};
@@ -257,8 +260,11 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
       </div>
       <h1 id="slim-readiness-heading">{label}</h1>
       <p className="slim-message" role="status" aria-live="polite">{message}</p>
-      <p className="slim-session">Session: <strong>{session.session_kind || "OFF_SESSION"}</strong>{session.session_family ? ` / ${session.session_family}` : ""}{session.entry_window ? ` · ${session.entry_window}` : ""}</p>
+      <p className="slim-session">Execution: <strong>{execution.paper_execution || paper.status?.paper_execution || "DISARMED"}</strong>{execution.authority_state ? ` · ${execution.authority_state}` : ""}</p>
+      <p className="slim-session">Reporting session: <strong>{session.session_kind || "OFF_SESSION"}</strong>{session.session_family ? ` / ${session.session_family}` : ""}{session.classification_role === "REPORTING_ONLY" ? " · label only" : session.entry_window ? ` · ${session.entry_window}` : ""}</p>
       <p className="slim-session">Profile: <strong>{paper.status?.entry_profile || "UNAVAILABLE"}</strong>{paper.status?.effective_confidence_threshold ? ` · ${paper.status.effective_confidence_threshold} threshold` : ""}</p>
+      <p className="slim-session">Entries: <strong>{entryCounts.exchange_trade_date ?? paper.status?.trade_date_entry_count ?? 0}</strong> trade-date · <strong>{entryCounts.reporting_session ?? paper.status?.session_entries ?? 0}</strong> reporting-session · quota <strong>{entryCounts.quota_policy === "DISABLED_COUNTING_RETAINED" ? "DISABLED" : entryCounts.quota_policy || "UNAVAILABLE"}</strong></p>
+      <p className="slim-session">Risk remaining: <strong>{money(activeRisk.loss_allowance_remaining)}</strong> · loss streak <strong>{activeRisk.consecutive_losses ?? paper.status?.consecutive_losses ?? 0}/{activeRisk.maximum_consecutive_losses ?? paper.status?.maximum_consecutive_losses ?? "—"}</strong></p>
     </section>
 
     <section className="slim-card slim-pnl" aria-labelledby="slim-pnl-heading">

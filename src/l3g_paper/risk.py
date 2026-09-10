@@ -131,6 +131,15 @@ class PaperRiskAuthority:
             and profile.perpetual_position
             and policy.perpetual_position
         )
+        self._continuous_scalper_profile = (
+            type(profile) is PaperRiskProfile
+            and type(policy) is PaperPolicyArtifact
+            and profile.reporting_sessions_only
+            and not profile.enforce_session_entry_window
+            and not profile.enforce_hard_flat_deadline
+            and policy.reporting_sessions_only
+            and policy.execution_schedule == "CONTINUOUS_EXCHANGE_TRADEABLE"
+        )
         self._lock = threading.RLock()
         self._locked_out = False
         self._lockout_reason: str | None = None
@@ -249,7 +258,9 @@ class PaperRiskAuthority:
                 )
                 reasons.extend(reason for reason in freshness if reason is not None)
             context = self._context(snapshot, at)
-            if self._perpetual_position_profile and not commissioning:
+            if (
+                self._perpetual_position_profile or self._continuous_scalper_profile
+            ) and not commissioning:
                 exchange_blocker = perpetual_exchange_blocker(moment, context)
                 if exchange_blocker is not None:
                     reasons.append(exchange_blocker)
@@ -272,9 +283,15 @@ class PaperRiskAuthority:
                 < -PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS
             ):
                 reasons.append("DAILY_LOSS_ALLOWANCE_INSUFFICIENT")
-            if snapshot.session_entry_count >= self.profile.maximum_session_entries:
+            if (
+                self.profile.maximum_session_entries is not None
+                and snapshot.session_entry_count >= self.profile.maximum_session_entries
+            ):
                 reasons.append("SESSION_ENTRY_CAP")
-            if snapshot.trade_date_entry_count >= self.profile.maximum_session_entries:
+            if (
+                self.profile.maximum_trade_date_entries is not None
+                and snapshot.trade_date_entry_count >= self.profile.maximum_trade_date_entries
+            ):
                 reasons.append("TRADE_DATE_ENTRY_CAP")
             if snapshot.consecutive_losses >= self.profile.maximum_consecutive_losses:
                 reasons.append("CONSECUTIVE_LOSS_LOCKOUT")
@@ -376,9 +393,15 @@ class PaperRiskAuthority:
                     < -PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS
                 ):
                     reasons.append("DAILY_LOSS_ALLOWANCE_INSUFFICIENT")
-                if snapshot.session_entry_count >= self.profile.maximum_session_entries:
+                if (
+                    self.profile.maximum_session_entries is not None
+                    and snapshot.session_entry_count >= self.profile.maximum_session_entries
+                ):
                     reasons.append("SESSION_ENTRY_CAP")
-                if snapshot.trade_date_entry_count >= self.profile.maximum_session_entries:
+                if (
+                    self.profile.maximum_trade_date_entries is not None
+                    and snapshot.trade_date_entry_count >= self.profile.maximum_trade_date_entries
+                ):
                     reasons.append("TRADE_DATE_ENTRY_CAP")
                 if snapshot.consecutive_losses >= self.profile.maximum_consecutive_losses:
                     reasons.append("CONSECUTIVE_LOSS_LOCKOUT")
@@ -393,7 +416,9 @@ class PaperRiskAuthority:
                     or intent.session_generation != context.session_generation
                 ):
                     reasons.append("SESSION_IDENTITY_MISMATCH")
-                if self._perpetual_position_profile and not intent.commissioning:
+                if (
+                    self._perpetual_position_profile or self._continuous_scalper_profile
+                ) and not intent.commissioning:
                     exchange_blocker = perpetual_exchange_blocker(moment, context)
                     if exchange_blocker is not None:
                         reasons.append(exchange_blocker)
@@ -406,7 +431,7 @@ class PaperRiskAuthority:
                         reasons.append("HOLIDAY_SESSION_UNVERIFIED")
                     elif not self._inside_entry_session(moment, snapshot):
                         reasons.append("OUTSIDE_ENTRY_SESSION")
-                    if context.hard_flat_due_at(moment):
+                    if self.profile.enforce_hard_flat_deadline and context.hard_flat_due_at(moment):
                         reasons.append("HARD_FLAT_DEADLINE")
                 if not snapshot.local_bridge_healthy or not snapshot.market_price_connected:
                     reasons.append("MARKET_BRIDGE_UNHEALTHY")

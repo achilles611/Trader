@@ -221,7 +221,7 @@ class LondonIsolationAndSerializationTests(unittest.TestCase):
             status = runtime.status()
             self.assertEqual(status["entry_profile"], "BEELZEBUB_SCALPER")
             self.assertEqual(status["entry_profile_version"], "BEELZEBUB_SCALPER_V2")
-            self.assertEqual(status["entry_session_kind"], "ALL_CONFIGURED")
+            self.assertEqual(status["entry_session_kind"], "REPORTING_ONLY")
             self.assertIn("LONDON", status["entry_session_kinds"])
             self.assertEqual(status["effective_confidence_threshold"], "0.55")
             self.assertEqual(status["current_session"], "LONDON")
@@ -238,11 +238,12 @@ class LondonIsolationAndSerializationTests(unittest.TestCase):
             ledger.close()
 
     def test_scalper_policy_risk_and_addon_fingerprint_remain_sealed(self) -> None:
-        self.assertEqual(POLICY.policy_id, "l3g-beelzebub-scalper-policy-v2")
+        self.assertEqual(POLICY.policy_id, "l3g-beelzebub-scalper-policy-v3")
         self.assertEqual(POLICY.entry_support_threshold, Decimal("0.55"))
         self.assertEqual(POLICY.entry_dominance_margin, Decimal("0.025"))
         self.assertEqual(RISK_PROFILE.maximum_position_age_seconds, 540)
-        self.assertEqual(RISK_PROFILE.maximum_session_entries, 12)
+        self.assertIsNone(RISK_PROFILE.maximum_session_entries)
+        self.assertIsNone(RISK_PROFILE.maximum_trade_date_entries)
         self.assertEqual(RISK_PROFILE.maximum_absolute_position, 1)
         self.assertFalse(RISK_PROFILE.approved_for_live)
         self.assertEqual(expected_addon_source_fingerprint(), EXPECTED_ADDON_SOURCE_FINGERPRINT)

@@ -73,6 +73,7 @@ def validate_risk_continuity_snapshot(value: object, *, require_flat: bool = Fal
     try:
         from .contracts import (
             FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
+            PAPER_ENTRY_PROFILE_VERSION,
             resolve_paper_profile,
         )
         source_profile = resolve_paper_profile(source_profile).selection_key
@@ -218,9 +219,12 @@ def validate_risk_continuity_snapshot(value: object, *, require_flat: bool = Fal
         except (TypeError, ValueError) as exc:
             raise RuntimeError("RISK_CONTINUITY_SESSION_IDENTITY_INVALID") from exc
         key = (context.session_id, profile)
-        allowed_perpetual_off_session = (
+        allowed_continuous_off_session = (
             context.session_kind is PaperSessionKind.OFF_SESSION
-            and profile == FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION
+            and profile in {
+                PAPER_ENTRY_PROFILE_VERSION,
+                FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
+            }
             and context.trade_date != "1970-01-01"
             and context.session_id
             == f"MNQU6:OFF_SESSION:{context.trade_date}"
@@ -228,7 +232,7 @@ def validate_risk_continuity_snapshot(value: object, *, require_flat: bool = Fal
         if (
             (
                 context.session_kind is PaperSessionKind.OFF_SESSION
-                and not allowed_perpetual_off_session
+                and not allowed_continuous_off_session
             )
             or raw.get("session_family") != context.session_family.value
             or key in session_keys
