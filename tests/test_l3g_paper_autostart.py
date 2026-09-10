@@ -26,6 +26,8 @@ def ready_paper() -> dict[str, object]:
         "account_class": "LOCAL_SIMULATION",
         "market_instrument": "MNQ SEP26",
         "maximum_quantity": 1,
+        "execution_schedule": "CONTINUOUS_EXCHANGE_TRADEABLE",
+        "reporting_sessions_only": True,
         "current_position": "FLAT",
         "current_quantity": 0,
         "broker_snapshot_position": "FLAT",
@@ -340,6 +342,34 @@ class PaperAutoStartTests(unittest.TestCase):
         self.assertEqual(status["warmup"]["covered_family_count"], 3)
         self.assertEqual(status["warmup"]["missing_families"], [])
         self.assertEqual(self.full_starts, 2)
+
+    def test_off_session_reporting_label_can_warm_and_start_continuous_scalper(self) -> None:
+        self.paper["entry_profile_version"] = "BEELZEBUB_SCALPER_V2"
+        clock = ManualClock()
+        warming = warming_operational_readiness()
+        warming["session"] = {
+            "current": True,
+            "session_kind": "OFF_SESSION",
+        }
+        reports = [
+            warming,
+            ready_operational_readiness(),
+            ready_operational_readiness(),
+        ]
+        service = self.service()
+        service._clock = clock
+        service._wait = clock.wait
+        service._custom_wait = clock.wait
+        service._readiness_timeout_seconds = 10.0
+        service._operational_readiness = lambda: deepcopy(
+            reports.pop(0) if len(reports) > 1 else reports[0]
+        )
+        service.start("paper-auto-off-session-warmup")
+        service.wait(2)
+        self.assertEqual(service.status()["stage"], "RUNNING")
+        self.assertEqual(
+            self.operational_requests, ["paper-auto-off-session-warmup"],
+        )
 
     def test_transient_trade_freshness_during_evidence_warmup_keeps_waiting(self) -> None:
         self.paper["entry_profile_version"] = "BEELZEBUB_SCALPER_V2"

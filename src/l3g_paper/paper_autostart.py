@@ -361,11 +361,18 @@ class PaperAutoStartService:
             and reasons
             and set(reasons).issubset(_SCALPER_TRANSIENT_FRESHNESS_REASONS)
         )
+        continuous_reporting_context = bool(
+            paper.get("execution_schedule") == "CONTINUOUS_EXCHANGE_TRADEABLE"
+            and paper.get("reporting_sessions_only") is True
+        )
         common_rewarm_proven = bool(
             readiness.get("schema") == "lane-iii-phase-g-operational-paper-readiness-v1"
             and (evidence_rewarm_pending or freshness_sync_pending)
             and session.get("current") is True
-            and session.get("session_kind") not in {None, "OFF_SESSION"}
+            and (
+                continuous_reporting_context
+                or session.get("session_kind") not in {None, "OFF_SESSION"}
+            )
             and observer.get("status") == "ACTIVE"
             and observer.get("local_bridge_healthy") is True
             and observer.get("market_price_connected") is True
