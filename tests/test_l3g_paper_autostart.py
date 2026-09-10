@@ -341,6 +341,58 @@ class PaperAutoStartTests(unittest.TestCase):
         self.assertEqual(status["warmup"]["missing_families"], [])
         self.assertEqual(self.full_starts, 2)
 
+    def test_transient_trade_freshness_during_evidence_warmup_keeps_waiting(self) -> None:
+        self.paper["entry_profile_version"] = "BEELZEBUB_SCALPER_V2"
+        clock = ManualClock()
+        stale = warming_operational_readiness()
+        stale["blocking_reasons"].append("CLASSIFIED_TRADE_STALE")
+        stale["market_freshness"]["classified_trade"] = {"fresh": False}
+        reports = [stale, ready_operational_readiness(), ready_operational_readiness()]
+        service = self.service()
+        service._clock = clock
+        service._wait = clock.wait
+        service._custom_wait = clock.wait
+        service._operational_readiness = lambda: deepcopy(
+            reports.pop(0) if len(reports) > 1 else reports[0]
+        )
+        service.start("paper-auto-transient-trade-stale")
+        service.wait(2)
+        self.assertEqual(service.status()["stage"], "RUNNING")
+        self.assertEqual(self.operational_requests, ["paper-auto-transient-trade-stale"])
+
+    def test_transient_freshness_after_coverage_waits_for_simultaneous_ready(self) -> None:
+        self.paper["entry_profile_version"] = "BEELZEBUB_SCALPER_V2"
+        clock = ManualClock()
+        stale = ready_operational_readiness()
+        stale["result"] = "BLOCKED"
+        stale["blocking_reasons"] = ["CLASSIFIED_TRADE_STALE"]
+        stale["session"] = {"current": True, "session_kind": "ASIA"}
+        stale["observer"] = {
+            "status": "ACTIVE", "continuity_healthy": True,
+            "local_bridge_healthy": True, "market_price_connected": True,
+        }
+        stale["continuity"] = {
+            "local_sequence_gap": False, "depth_reset_recovery": False,
+            "recovery_condition": None,
+        }
+        stale["market_freshness"] = {
+            "quote": {"fresh": True},
+            "classified_trade": {"fresh": False},
+            "depth_mutation": {"fresh": True},
+        }
+        reports = [stale, ready_operational_readiness(), ready_operational_readiness()]
+        service = self.service()
+        service._clock = clock
+        service._wait = clock.wait
+        service._custom_wait = clock.wait
+        service._operational_readiness = lambda: deepcopy(
+            reports.pop(0) if len(reports) > 1 else reports[0]
+        )
+        service.start("paper-auto-simultaneous-fresh")
+        service.wait(2)
+        self.assertEqual(service.status()["stage"], "RUNNING")
+        self.assertEqual(self.operational_requests, ["paper-auto-simultaneous-fresh"])
+
     def test_authentic_continuity_rewarm_waits_then_starts_once(self) -> None:
         self.paper["entry_profile_version"] = "BEELZEBUB_SCALPER_V2"
         clock = ManualClock()

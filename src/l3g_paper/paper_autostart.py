@@ -28,6 +28,9 @@ _SCALPER_PROFILE = "BEELZEBUB_SCALPER_V2"
 _SCALPER_WARMUP_FAMILIES = frozenset({
     "STRUCTURAL_CONTEXT", "ORDER_FLOW", "RESTING_LIQUIDITY",
 })
+_SCALPER_TRANSIENT_FRESHNESS_REASONS = frozenset({
+    "QUOTE_STALE", "CLASSIFIED_TRADE_STALE", "DEPTH_MUTATION_STALE",
+})
 _SCALPER_COVERAGE_HORIZON_SECONDS = float(max(
     POLICY.structural_evidence_lifetime_seconds,
     POLICY.flow_evidence_lifetime_seconds,
@@ -312,7 +315,7 @@ class PaperAutoStartService:
         transient = {
             "COMMISSIONING_SESSION_NOT_WARMED", "PAPER_EVIDENCE_NOT_WARMED",
             "PAPER_CONTINUITY_UNUSABLE",
-        }
+        } | _SCALPER_TRANSIENT_FRESHNESS_REASONS
         if not reasons or not set(reasons).issubset(transient):
             return "HARD_BLOCK", reasons or ["OPERATIONAL_READINESS_UNAVAILABLE"], [], {}
 
@@ -342,21 +345,31 @@ class PaperAutoStartService:
             family_progress[family] = detail.get("seen") is True
         missing = [family for family, seen in family_progress.items() if not seen]
 
-        freshness_proven = all(
+        freshness_detail_proven = all(
             isinstance(freshness.get(name), Mapping)
-            and freshness[name].get("fresh") is True  # type: ignore[index]
+            and type(freshness[name].get("fresh")) is bool  # type: ignore[index]
             for name in ("quote", "classified_trade", "depth_mutation")
+        )
+        evidence_rewarm_pending = bool(
+            warmup.get("status") == "NOT_WARMED"
+            and missing
+            and "COMMISSIONING_SESSION_NOT_WARMED" in reasons
+        )
+        freshness_sync_pending = bool(
+            warmup.get("status") == "WARMED"
+            and not missing
+            and reasons
+            and set(reasons).issubset(_SCALPER_TRANSIENT_FRESHNESS_REASONS)
         )
         common_rewarm_proven = bool(
             readiness.get("schema") == "lane-iii-phase-g-operational-paper-readiness-v1"
-            and warmup.get("status") == "NOT_WARMED"
-            and missing
+            and (evidence_rewarm_pending or freshness_sync_pending)
             and session.get("current") is True
             and session.get("session_kind") not in {None, "OFF_SESSION"}
             and observer.get("status") == "ACTIVE"
             and observer.get("local_bridge_healthy") is True
             and observer.get("market_price_connected") is True
-            and freshness_proven
+            and freshness_detail_proven
             and paper.get("state") == "READY_DISARMED"
             and paper.get("paper_execution") == "DISARMED"
             and paper.get("live_capital") == "DENIED"
@@ -364,8 +377,6 @@ class PaperAutoStartService:
         if not common_rewarm_proven:
             return "HARD_BLOCK", reasons + ["SCALPER_EVIDENCE_REWARM_UNPROVEN"], missing, family_progress
 
-        if "COMMISSIONING_SESSION_NOT_WARMED" not in reasons:
-            return "HARD_BLOCK", reasons + ["SCALPER_EVIDENCE_REWARM_UNPROVEN"], missing, family_progress
         if "PAPER_CONTINUITY_UNUSABLE" in reasons:
             recovery_source = bool(
                 continuity.get("recovery_condition") == "FRESH_POLICY_EVIDENCE_REWARM_REQUIRED"
