@@ -1302,6 +1302,13 @@ class ProfileSwitchServiceTests(unittest.TestCase):
             "ledger_identity": None,
             "risk_continuity_artifact_sha256": continuity["artifact_sha256"],
         }
+        if (
+            manifest["target_profile"]
+            == FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION
+        ):
+            binding["profile_switch_manifest_sha256"] = manifest[
+                "manifest_sha256"
+            ]
         binding_calls = 0
 
         def launch(command: list[str], **_: object) -> StubProcess:
@@ -1377,6 +1384,13 @@ class ProfileSwitchServiceTests(unittest.TestCase):
             "ledger_identity": None,
             "risk_continuity_artifact_sha256": continuity["artifact_sha256"],
         }
+        if (
+            manifest["target_profile"]
+            == FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION
+        ):
+            binding["profile_switch_manifest_sha256"] = manifest[
+                "manifest_sha256"
+            ]
 
         def launch(*_args: object, **_kwargs: object) -> object:
             target = resolve_paper_profile(str(manifest["target_profile"]))
@@ -2103,6 +2117,230 @@ class ProfileSwitchServiceTests(unittest.TestCase):
         self.assertEqual(len(notices), 1)
         self.assertIn("BEELZEBUB_FIVE_MINUTE_BIAS_V1", notices[0])
         self.assertIn("No automatic retry or fallback profile was started", notices[0])
+
+    def test_scalper_to_perpetual_prebinding_exit_is_recoverable_once(self) -> None:
+        manifest_path, manifest = self.supervisor_ready_manifest(
+            "switch-request-scalper-to-perpetual-prebinding-exit",
+            FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
+        )
+        self.assertFalse(manifest["perpetual_startup_seed_required"])
+        self.assertTrue(manifest["paper_only"])
+        self.assertEqual(manifest["live_capital"], "DENIED")
+        launches = 0
+        captured_environment: dict[str, str] = {}
+
+        class FailedProcess:
+            pid = 31338
+
+            @staticmethod
+            def poll() -> int:
+                return 1
+
+        def fail_after_app_construction(
+            _command: list[str], *, environment: Mapping[str, str],
+            output: object, **_kwargs: object,
+        ) -> FailedProcess:
+            nonlocal launches
+            launches += 1
+            captured_environment.update(environment)
+            output.write(b"RuntimeError: fixture prebinding startup exit\n")
+            output.flush()
+            return FailedProcess()
+
+        self.assertEqual(
+            supervise(
+                manifest_path,
+                2_147_483_647,
+                timeout_seconds=0.2,
+                poll_seconds=0.001,
+                pid_probe=lambda _pid: False,
+                port_probe=lambda: True,
+                wait=lambda _seconds: None,
+                launch_child=fail_after_app_construction,  # type: ignore[arg-type]
+            ),
+            12,
+        )
+        self.assertEqual(launches, 1)
+        self.assertEqual(
+            captured_environment["BEELZEBUB_PROFILE_SWITCH_MANIFEST_SHA256"],
+            manifest["manifest_sha256"],
+        )
+        self.assertEqual(
+            captured_environment["BEELZEBUB_PROFILE_SWITCH_MANIFEST_PATH"],
+            str(manifest_path),
+        )
+        self.assertNotIn(
+            "BEELZEBUB_PERPETUAL_STARTUP_SEED_REQUIRED",
+            captured_environment,
+        )
+        self.assertNotIn(
+            "BEELZEBUB_PERPETUAL_STARTUP_SEED_PATH",
+            captured_environment,
+        )
+        self.assertNotIn(
+            "BEELZEBUB_PERPETUAL_STARTUP_SEED_PROOF_PATH",
+            captured_environment,
+        )
+
+        # The exact environment emitted by the supervisor must reach app
+        # construction without demanding a legacy V1 detached seed.
+        from dataclasses import replace
+
+        defaults = CopyTradeConfig()
+        config = replace(
+            defaults,
+            storage=replace(
+                defaults.storage,
+                cold_root=self.root / "prebinding-target-cold",
+            ),
+            artifacts=replace(
+                defaults.artifacts,
+                database_path=(
+                    self.root / "prebinding-target-control" / "copytrade.sqlite3"
+                ),
+            ),
+        )
+        with patch.dict("os.environ", captured_environment, clear=True):
+            app = create_control_center_app(config)
+        route = next(
+            route for route in app.routes
+            if getattr(route, "path", None) == "/api/runtime-binding"
+        )
+        runtime_binding = asyncio.run(route.endpoint())
+        self.assertEqual(
+            runtime_binding["entry_profile_version"],
+            FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
+        )
+        self.assertEqual(
+            runtime_binding["profile_switch_manifest_sha256"],
+            manifest["manifest_sha256"],
+        )
+        self.assertIsNone(
+            runtime_binding["perpetual_startup_seed_artifact_sha256"],
+        )
+        self.assertIsNone(
+            runtime_binding["perpetual_startup_seed_proof_sha256"],
+        )
+
+        state_path = manifest_path.with_name("state.json")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["stage"], "TARGET_CLEANUP_UNPROVEN")
+        self.assertEqual(
+            state["blockers"],
+            [
+                "TARGET_PROCESS_EXITED_DURING_STARTUP",
+                "TARGET_PROCESS_EXIT_UNPROVEN",
+                "TARGET_CLEANUP_UNPROVEN",
+            ],
+        )
+        self.assertEqual(state["target_cleanup"]["process_exit_code"], 1)
+        self.assertIsNone(state.get("target_runtime_pid"))
+        self.assertIsNone(state.get("target_runtime_binding"))
+        self.assertIsNone(state.get("target_paper_status"))
+        target_backend_log = manifest_path.with_name("target-backend.log")
+        backend_log_before = target_backend_log.read_bytes()
+        self.assertTrue(backend_log_before)
+        target_backend_log.write_bytes(b"")
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "PROFILE_SWITCH_CLEANUP_PREBINDING_LOG_UNREADABLE",
+        ):
+            finalize_stale_target_cleanup(
+                self.root / "runtime",
+                str(manifest["operation_id"]),
+                pid_probe=lambda _pid: False,
+                native_probe=lambda **_kwargs: {
+                    "status": "PASS",
+                    "commands_sent": 0,
+                    "session_count": 2,
+                    "proof_hash": "b" * 64,
+                },
+                native_proof_validator=lambda proof, **_kwargs: dict(proof),
+                _test_control_endpoint=("127.0.0.1", 0),
+                _test_attestation_key=b"cleanup-attestation-test-key-32b",
+            )
+        target_backend_log.write_bytes(backend_log_before)
+        selection_path = (
+            self.root / "runtime" / "profile-switch" / "profile-selection.json"
+        )
+        selection_before = selection_path.read_bytes()
+        pid_calls: dict[int, int] = {}
+
+        def absent(pid: int) -> bool:
+            pid_calls[pid] = pid_calls.get(pid, 0) + 1
+            return False
+
+        fake_proof = {
+            "status": "PASS",
+            "commands_sent": 0,
+            "session_count": 2,
+            "proof_hash": "b" * 64,
+            "completed_at": "2026-09-10T22:30:00Z",
+        }
+
+        recovered = finalize_stale_target_cleanup(
+            self.root / "runtime",
+            str(manifest["operation_id"]),
+            pid_probe=absent,
+            native_probe=lambda **_kwargs: dict(fake_proof),
+            native_proof_validator=lambda proof, **_kwargs: dict(proof),
+            _test_control_endpoint=("127.0.0.1", 0),
+            _test_attestation_key=b"cleanup-attestation-test-key-32b",
+        )
+        self.assertEqual(recovered["stage"], "BLOCKED_SAFE")
+        self.assertFalse(recovered["in_progress"])
+        self.assertEqual(
+            recovered["blockers"],
+            ["TARGET_PROCESS_EXITED_DURING_STARTUP"],
+        )
+        cleanup = recovered["target_cleanup"]
+        self.assertTrue(cleanup["cleanup_proven"])
+        self.assertTrue(cleanup["safe_terminal_proven"])
+        self.assertTrue(cleanup["target_runtime_pid_absent"])
+        self.assertTrue(cleanup["control_port_released"])
+        self.assertTrue(cleanup["native_exposure_absent"])
+        self.assertIsNone(cleanup["target_runtime_pid"])
+        self.assertEqual(
+            cleanup["late_revalidation"]["schema"],
+            "lane-iii-profile-switch-prebinding-cleanup-v1",
+        )
+        self.assertNotIn(
+            manifest["parent_pid"],
+            cleanup["late_revalidation"]["probed_absent_pids"],
+        )
+        self.assertGreater(
+            cleanup["late_revalidation"]["target_backend_log_size"], 0,
+        )
+        self.assertTrue(
+            cleanup["late_revalidation"]["target_storage_absent"],
+        )
+        self.assertTrue(
+            cleanup["late_revalidation"]["target_audit_files_absent"],
+        )
+        self.assertEqual(set(pid_calls.values()), {2})
+        self.assertEqual(selection_path.read_bytes(), selection_before)
+        selection = json.loads(selection_before.decode("utf-8"))
+        self.assertIsNone(selection["established"])
+        self.assertEqual(
+            selection["requested"]["profile"],
+            FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
+        )
+
+        repeated = finalize_stale_target_cleanup(
+            self.root / "runtime",
+            str(manifest["operation_id"]),
+            pid_probe=lambda _pid: (_ for _ in ()).throw(
+                AssertionError("idempotent finalization must not probe again")
+            ),
+            native_probe=lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("idempotent finalization must not probe again")
+            ),
+            native_proof_validator=lambda proof, **_kwargs: dict(proof),
+            _test_control_endpoint=("127.0.0.1", 0),
+            _test_attestation_key=b"cleanup-attestation-test-key-32b",
+        )
+        self.assertEqual(repeated, recovered)
+        self.assertEqual(launches, 1)
 
     def test_binding_timeout_cannot_prove_unknown_runtime_child_cleanup(self) -> None:
         manifest_path, manifest = self.supervisor_ready_manifest(

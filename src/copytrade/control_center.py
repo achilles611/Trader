@@ -1506,29 +1506,23 @@ def create_control_center_app(
         perpetual_seed_required,
         perpetual_seed_path,
         perpetual_seed_proof_path,
+    ))
+    manifest_values_present = any((
         profile_switch_manifest_sha256,
         profile_switch_manifest_path,
     ))
-    if (
-        os.getenv("BEELZEBUB_PROFILE_SWITCH_OPERATION")
+    inherited_operation = os.getenv("BEELZEBUB_PROFILE_SWITCH_OPERATION")
+    perpetual_profile_switch = bool(
+        inherited_operation
         and selected_paper_profile.selection_key
         == "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2"
-        and not seed_values_present
-    ):
-        raise RuntimeError("PERPETUAL_STARTUP_SEED_ENVIRONMENT_INVALID")
-    if seed_values_present:
-        inherited_operation = os.getenv("BEELZEBUB_PROFILE_SWITCH_OPERATION")
+    )
+    if perpetual_profile_switch:
         if not (
-            perpetual_seed_required
-            and inherited_operation
-            and perpetual_seed_path
-            and perpetual_seed_proof_path
-            and profile_switch_manifest_sha256
+            profile_switch_manifest_sha256
             and profile_switch_manifest_path
             and risk_continuity_artifact is not None
             and configured_risk_continuity
-            and selected_paper_profile.selection_key
-            == "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2"
         ):
             raise RuntimeError("PERPETUAL_STARTUP_SEED_ENVIRONMENT_INVALID")
         manifest_path = Path(profile_switch_manifest_path).expanduser().resolve()
@@ -1543,8 +1537,6 @@ def create_control_center_app(
             != profile_switch_manifest_sha256
             or perpetual_seed_manifest.get("operation_id")
             != inherited_operation
-            or perpetual_seed_manifest.get("current_profile")
-            != "BEELZEBUB_FIVE_MINUTE_BIAS_V1"
             or perpetual_seed_manifest.get("target_profile")
             != selected_paper_profile.selection_key
             or perpetual_seed_manifest.get("paper_policy_hash")
@@ -1564,18 +1556,44 @@ def create_control_center_app(
             or Path(str(perpetual_seed_manifest.get("python_executable"))).resolve()
             != Path(sys.executable).resolve()
             or perpetual_seed_manifest.get("git_sha") != runtime_git_sha
-            or Path(perpetual_seed_path).expanduser().resolve()
-            != Path(str(perpetual_seed_manifest.get(
-                "perpetual_startup_seed_path",
-            ))).resolve()
-            or Path(perpetual_seed_proof_path).expanduser().resolve()
-            != Path(str(perpetual_seed_manifest.get(
-                "perpetual_startup_seed_proof_path",
-            ))).resolve()
             or Path(configured_risk_continuity).expanduser().resolve()
             != expected_continuity_path.resolve()
         ):
             raise RuntimeError("PERPETUAL_STARTUP_SEED_TARGET_BINDING_MISMATCH")
+        manifest_seed_required = perpetual_seed_manifest.get(
+            "perpetual_startup_seed_required",
+        )
+        if manifest_seed_required is True:
+            if not (
+                perpetual_seed_required
+                and perpetual_seed_path
+                and perpetual_seed_proof_path
+                and perpetual_seed_manifest.get("current_profile")
+                == "BEELZEBUB_FIVE_MINUTE_BIAS_V1"
+                and Path(perpetual_seed_path).expanduser().resolve()
+                == Path(str(perpetual_seed_manifest.get(
+                    "perpetual_startup_seed_path",
+                ))).resolve()
+                and Path(perpetual_seed_proof_path).expanduser().resolve()
+                == Path(str(perpetual_seed_manifest.get(
+                    "perpetual_startup_seed_proof_path",
+                ))).resolve()
+            ):
+                raise RuntimeError("PERPETUAL_STARTUP_SEED_ENVIRONMENT_INVALID")
+        elif manifest_seed_required is False:
+            if seed_values_present:
+                raise RuntimeError("PERPETUAL_STARTUP_SEED_ENVIRONMENT_INVALID")
+        else:
+            raise RuntimeError("PERPETUAL_STARTUP_SEED_ENVIRONMENT_INVALID")
+
+    elif seed_values_present or manifest_values_present:
+        # Seed and manifest fields are a closed profile-switch contract. They
+        # must never influence a direct start or a different target profile.
+        raise RuntimeError("PERPETUAL_STARTUP_SEED_ENVIRONMENT_INVALID")
+
+    if perpetual_seed_manifest is not None and perpetual_seed_required:
+        assert perpetual_seed_path is not None
+        assert perpetual_seed_proof_path is not None
         perpetual_seed_artifact = read_perpetual_startup_seed_artifact(
             Path(perpetual_seed_path).expanduser().resolve(),
             operation_id=inherited_operation,

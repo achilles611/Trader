@@ -1430,6 +1430,12 @@ def _target_binding_matches(
         and runtime_parent_pid > 0
         and (runtime_pid == target_pid or runtime_parent_pid == target_pid)
     )
+    profile_switch_manifest_matches = (
+        manifest.get("target_profile")
+        != FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION
+        or binding.get("profile_switch_manifest_sha256")
+        == manifest.get("manifest_sha256")
+    )
     seed_matches = (
         manifest.get("perpetual_startup_seed_required") is not True
         or (
@@ -1445,18 +1451,25 @@ def _target_binding_matches(
             == manifest.get("manifest_sha256")
         )
     )
-    return seed_matches and process_tree_matches and (
-        binding.get("ledger") == str(manifest["ledger_path"])
-        and binding.get("audit") == str(manifest["audit_root"])
-        and binding.get("git_sha") == manifest.get("git_sha")
-        and binding.get("entry_profile_version") == manifest.get("target_profile")
-        and binding.get("paper_policy_hash") == manifest.get("paper_policy_hash")
-        and binding.get("risk_profile_hash") == manifest.get("risk_profile_hash")
-        and binding.get("ledger_epoch") == manifest.get("ledger_epoch")
-        and re.fullmatch(
-            r"l3g-ledger-[0-9a-f]{32}", str(binding.get("ledger_identity") or ""),
-        ) is not None
-        and binding.get("risk_continuity_artifact_sha256") == continuity.get("artifact_sha256")
+    return (
+        profile_switch_manifest_matches
+        and seed_matches
+        and process_tree_matches
+        and (
+            binding.get("ledger") == str(manifest["ledger_path"])
+            and binding.get("audit") == str(manifest["audit_root"])
+            and binding.get("git_sha") == manifest.get("git_sha")
+            and binding.get("entry_profile_version") == manifest.get("target_profile")
+            and binding.get("paper_policy_hash") == manifest.get("paper_policy_hash")
+            and binding.get("risk_profile_hash") == manifest.get("risk_profile_hash")
+            and binding.get("ledger_epoch") == manifest.get("ledger_epoch")
+            and re.fullmatch(
+                r"l3g-ledger-[0-9a-f]{32}",
+                str(binding.get("ledger_identity") or ""),
+            ) is not None
+            and binding.get("risk_continuity_artifact_sha256")
+            == continuity.get("artifact_sha256")
+        )
     )
 
 
@@ -1814,10 +1827,16 @@ def _cleanup_spawned_target(
     terminate_attempted = False
     kill_attempted = False
     errors: list[str] = []
+    process_exit_code: int | None = None
 
     def handle_exited() -> bool:
+        nonlocal process_exit_code
         try:
-            return process.poll() is not None
+            result = process.poll()
+            if result is None:
+                return False
+            process_exit_code = int(result)
+            return True
         except (AttributeError, OSError, subprocess.SubprocessError) as error:
             errors.append(type(error).__name__)
             return False
@@ -1885,6 +1904,7 @@ def _cleanup_spawned_target(
         "terminate_attempted": terminate_attempted,
         "kill_attempted": kill_attempted,
         "process_handle_exited": handle_is_exited,
+        "process_exit_code": process_exit_code,
         "target_pid_absent": pid_absent,
         "target_runtime_pid": target_runtime_pid,
         "target_runtime_pid_absent": runtime_pid_absent,
@@ -2033,6 +2053,70 @@ def finalize_stale_target_cleanup(
             and stored_cleanup.get("target_pid") == target_pid
             and stored_cleanup.get("target_runtime_pid") == target_runtime_pid
         )
+        stored_late = (
+            stored_cleanup.get("late_revalidation")
+            if isinstance(stored_cleanup, Mapping) else None
+        )
+        prebinding_transition_manifest = bool(
+            manifest.get("current_profile") == "BEELZEBUB_SCALPER_V2"
+            and manifest.get("target_profile")
+            == FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION
+            and manifest.get("perpetual_startup_seed_required") is False
+            and manifest.get("perpetual_startup_seed_path") is None
+            and manifest.get("perpetual_startup_seed_proof_path") is None
+        )
+        prebinding_initial = bool(
+            prebinding_transition_manifest
+            and cleanup_binding_valid
+            and state.get("stage") == "TARGET_CLEANUP_UNPROVEN"
+            and state.get("in_progress") is True
+            and blockers == [
+                "TARGET_PROCESS_EXITED_DURING_STARTUP",
+                "TARGET_PROCESS_EXIT_UNPROVEN",
+                "TARGET_CLEANUP_UNPROVEN",
+            ]
+            and target_runtime_pid is None
+            and binding is None
+            and paper is None
+            and isinstance(stored_cleanup, Mapping)
+            and stored_cleanup.get("process_handle_exited") is True
+            and stored_cleanup.get("target_pid_absent") is True
+            and stored_cleanup.get("target_runtime_pid_absent") is False
+            and stored_cleanup.get("process_dead") is False
+            and stored_cleanup.get("control_port_released") is True
+            and stored_cleanup.get("cleanup_proven") is False
+            and stored_cleanup.get("safe_terminal_proven") is False
+            and stored_cleanup.get("terminate_attempted") is False
+            and stored_cleanup.get("kill_attempted") is False
+            and (
+                stored_cleanup.get("process_exit_code") is None
+                or type(stored_cleanup.get("process_exit_code")) is int
+            )
+        )
+        prebinding_terminal = bool(
+            prebinding_transition_manifest
+            and cleanup_binding_valid
+            and state.get("stage") == "BLOCKED_SAFE"
+            and state.get("in_progress") is False
+            and target_runtime_pid is None
+            and binding is None
+            and paper is None
+            and isinstance(stored_late, Mapping)
+            and stored_late.get("schema")
+            == "lane-iii-profile-switch-prebinding-cleanup-v1"
+        )
+        prebinding_cleanup = prebinding_initial or prebinding_terminal
+        runtime_bound_cleanup = bool(
+            (cleanup_binding_valid or orphaned_faulted_target)
+            and isinstance(binding, Mapping)
+            and isinstance(paper, Mapping)
+            and type(target_runtime_pid) is int
+            and target_runtime_pid > 0
+            and binding.get("pid") == target_runtime_pid
+            and type(binding.get("parent_pid")) is int
+            and int(binding["parent_pid"]) > 0
+            and int(binding["parent_pid"]) in (target_pid, supervisor_pid)
+        )
         if (
             state.get("schema") != PROFILE_SWITCH_SCHEMA
             or state.get("operation_id") != operation_id
@@ -2040,25 +2124,21 @@ def finalize_stale_target_cleanup(
             or state.get("current_profile") != manifest.get("current_profile")
             or state.get("target_profile") != manifest.get("target_profile")
             or Path(str(state.get("manifest_path"))).resolve() != manifest_path.resolve()
-            or not (cleanup_binding_valid or orphaned_faulted_target)
-            or not isinstance(binding, Mapping)
-            or not isinstance(paper, Mapping)
+            or not (prebinding_cleanup or runtime_bound_cleanup)
             or not isinstance(blockers, list)
             or not all(isinstance(item, str) and item for item in blockers)
             or type(target_pid) is not int
             or target_pid <= 0
-            or type(target_runtime_pid) is not int
-            or target_runtime_pid <= 0
             or type(supervisor_pid) is not int
             or supervisor_pid <= 0
-            or supervisor_pid in {target_pid, target_runtime_pid}
+            or supervisor_pid == target_pid
             or type(source_parent_pid) is not int
             or source_parent_pid <= 0
-            or source_parent_pid in {supervisor_pid, target_pid, target_runtime_pid}
-            or binding.get("pid") != target_runtime_pid
-            or type(binding.get("parent_pid")) is not int
-            or int(binding["parent_pid"]) <= 0
-            or int(binding["parent_pid"]) not in {target_pid, supervisor_pid}
+            or source_parent_pid in {supervisor_pid, target_pid}
+            or (
+                runtime_bound_cleanup
+                and source_parent_pid == target_runtime_pid
+            )
         ):
             raise RuntimeError("PROFILE_SWITCH_CLEANUP_STATE_BINDING_INVALID")
 
@@ -2086,32 +2166,102 @@ def finalize_stale_target_cleanup(
                 "errors": ["ORIGINAL_SUPERVISOR_CLEANUP_NOT_RECORDED"],
             }
 
-        transport = paper.get("transport")
-        if not isinstance(transport, Mapping):
-            raise RuntimeError("PROFILE_SWITCH_CLEANUP_PROVENANCE_INVALID")
-        build_fingerprint = transport.get("addon_build_fingerprint")
-        build_timestamp = transport.get("addon_build_timestamp")
-        source_fingerprint = transport.get("expected_addon_source_fingerprint")
-        if (
-            transport.get("addon_provenance_valid") is not True
-            or transport.get("addon_protocol_version") != ADDON_PROTOCOL_VERSION
-            or transport.get("addon_source_fingerprint") != source_fingerprint
-            or not isinstance(source_fingerprint, str)
-            or re.fullmatch(r"[0-9a-f]{64}", source_fingerprint) is None
-            or not isinstance(build_fingerprint, str)
-            or re.fullmatch(r"[0-9a-f]{64}", build_fingerprint) is None
-            or not isinstance(build_timestamp, str)
-            or not build_timestamp.strip()
-            or type(transport.get("commands_sent")) is not int
-            or transport.get("commands_sent") != 0
-        ):
-            raise RuntimeError("PROFILE_SWITCH_CLEANUP_PROVENANCE_INVALID")
+        target_backend_log = manifest_path.with_name("target-backend.log")
+        target_backend_log_bytes: bytes | None = None
+        target_storage_paths: tuple[Path, ...] = ()
+        target_audit = Path(str(manifest.get("audit_root") or "")).resolve()
+        if prebinding_cleanup:
+            target_ledger = Path(str(manifest.get("ledger_path") or "")).resolve()
+            target_storage_paths = (
+                target_ledger,
+                Path(str(target_ledger) + "-wal"),
+                Path(str(target_ledger) + "-shm"),
+                Path(str(target_ledger) + "-journal"),
+            )
+            target_backend_log_bytes = read_bytes(
+                target_backend_log,
+                "PROFILE_SWITCH_CLEANUP_PREBINDING_LOG_UNREADABLE",
+            )
+            created_at = state.get("target_process_created_at")
+            if (
+                root not in target_ledger.parents
+                or root not in target_audit.parents
+                or not target_ledger.parent.is_dir()
+                or not target_audit.is_dir()
+                or any(path.exists() for path in target_storage_paths)
+                or any(path.is_file() for path in target_audit.rglob("*"))
+                or not isinstance(created_at, str)
+                or not created_at.strip()
+            ):
+                raise RuntimeError(
+                    "PROFILE_SWITCH_CLEANUP_PREBINDING_EVIDENCE_INVALID",
+                )
+        else:
+            assert isinstance(paper, Mapping)
+            transport = paper.get("transport")
+            if not isinstance(transport, Mapping):
+                raise RuntimeError("PROFILE_SWITCH_CLEANUP_PROVENANCE_INVALID")
+            build_fingerprint = transport.get("addon_build_fingerprint")
+            build_timestamp = transport.get("addon_build_timestamp")
+            source_fingerprint = transport.get("expected_addon_source_fingerprint")
+            if (
+                transport.get("addon_provenance_valid") is not True
+                or transport.get("addon_protocol_version") != ADDON_PROTOCOL_VERSION
+                or transport.get("addon_source_fingerprint") != source_fingerprint
+                or not isinstance(source_fingerprint, str)
+                or re.fullmatch(r"[0-9a-f]{64}", source_fingerprint) is None
+                or not isinstance(build_fingerprint, str)
+                or re.fullmatch(r"[0-9a-f]{64}", build_fingerprint) is None
+                or not isinstance(build_timestamp, str)
+                or not build_timestamp.strip()
+                or type(transport.get("commands_sent")) is not int
+                or transport.get("commands_sent") != 0
+            ):
+                raise RuntimeError("PROFILE_SWITCH_CLEANUP_PROVENANCE_INVALID")
+
+        def prebinding_evidence_changed() -> bool:
+            if not prebinding_cleanup:
+                return False
+            assert target_backend_log_bytes is not None
+            return bool(
+                read_bytes(
+                    target_backend_log,
+                    "PROFILE_SWITCH_CLEANUP_PREBINDING_LOG_UNREADABLE",
+                ) != target_backend_log_bytes
+                or any(path.exists() for path in target_storage_paths)
+                or not target_audit.is_dir()
+                or any(path.is_file() for path in target_audit.rglob("*"))
+            )
 
         continuity = read_risk_continuity_artifact(
             manifest_path.with_name("risk-continuity.json"),
             operation_id=operation_id,
             target_profile=str(manifest.get("target_profile")),
         )
+        if prebinding_cleanup:
+            source_shutdown = state.get("shutdown_receipt")
+            source_snapshot = continuity.get("snapshot")
+            source_ledger = (
+                source_snapshot.get("source_ledger")
+                if isinstance(source_snapshot, Mapping) else None
+            )
+            source_boundary = (
+                {
+                    key: value for key, value in source_ledger.items()
+                    if key != "coverage_complete"
+                }
+                if isinstance(source_ledger, Mapping) else None
+            )
+            if (
+                not isinstance(source_shutdown, Mapping)
+                or not _clean_shutdown_receipt(source_shutdown)
+                or state.get("closing_verifier_status") != "PASS"
+                or source_boundary
+                != source_shutdown.get("risk_continuity_boundary")
+            ):
+                raise RuntimeError(
+                    "PROFILE_SWITCH_CLEANUP_SOURCE_CLOSE_PROOF_INVALID",
+                )
         seed_artifact: Mapping[str, object] | None = None
         seed_proof: Mapping[str, object] | None = None
         if manifest.get("perpetual_startup_seed_required") is True:
@@ -2142,23 +2292,34 @@ def finalize_stale_target_cleanup(
                 != manifest.get("manifest_sha256")
             ):
                 raise RuntimeError("PROFILE_SWITCH_CLEANUP_SEED_BINDING_INVALID")
-        if not _target_binding_matches(
-            binding,
-            manifest,
-            continuity,
-            target_pid=target_pid,
-            seed_artifact=seed_artifact,
-            seed_proof=seed_proof,
-        ):
-            raise RuntimeError("PROFILE_SWITCH_CLEANUP_RUNTIME_BINDING_INVALID")
-
-        all_pids = tuple(sorted({
-            source_parent_pid,
-            supervisor_pid,
-            target_pid,
-            target_runtime_pid,
-            int(binding["parent_pid"]),
-        }))
+        if not prebinding_cleanup:
+            assert isinstance(binding, Mapping)
+            if not _target_binding_matches(
+                binding,
+                manifest,
+                continuity,
+                target_pid=target_pid,
+                seed_artifact=seed_artifact,
+                seed_proof=seed_proof,
+            ):
+                raise RuntimeError("PROFILE_SWITCH_CLEANUP_RUNTIME_BINDING_INVALID")
+            all_pids = tuple(sorted({
+                source_parent_pid,
+                supervisor_pid,
+                target_pid,
+                target_runtime_pid,
+                int(binding["parent_pid"]),
+            }))
+        else:
+            # Reaching TARGET_PROCESS_CREATED already required the source's
+            # clean receipt, exact risk boundary, parent-PID absence, and an
+            # exclusive port release. Revalidate that durable close proof
+            # above; do not mistake a later reuse of the old source PID for
+            # the exited source process.
+            all_pids = tuple(sorted({
+                supervisor_pid,
+                target_pid,
+            }))
 
         if native_probe is None or native_proof_validator is None:
             from .ninjatrader_reconciliation_probe import (
@@ -2267,6 +2428,23 @@ def finalize_stale_target_cleanup(
                 "native_session_count", "native_commands_sent",
                 "native_exposure_absent", "cleanup_attestation",
             }
+            expected_late_schema = "lane-iii-profile-switch-late-cleanup-v1"
+            if prebinding_cleanup:
+                expected_late_schema = (
+                    "lane-iii-profile-switch-prebinding-cleanup-v1"
+                )
+                expected_late_fields.update({
+                    "target_backend_log_path",
+                    "target_backend_log_sha256",
+                    "target_backend_log_size",
+                    "target_storage_paths",
+                    "target_storage_absent",
+                    "target_audit_root",
+                    "target_audit_files_absent",
+                    "target_runtime_pid_published",
+                    "target_runtime_binding_published",
+                    "target_paper_status_published",
+                })
             expected_cleanup = {
                 **dict(prior_attempt),
                 "target_pid_absent": True,
@@ -2290,7 +2468,7 @@ def finalize_stale_target_cleanup(
                 or cleanup.get("native_exposure_absent") is not True
                 or state.get("in_progress") is not False
                 or late.get("schema")
-                != "lane-iii-profile-switch-late-cleanup-v1"
+                != expected_late_schema
                 or late.get("manifest_sha256") != manifest.get("manifest_sha256")
                 or late.get("selection_sha256")
                 != hashlib.sha256(selection_bytes).hexdigest()
@@ -2308,6 +2486,27 @@ def finalize_stale_target_cleanup(
                 or late.get("native_session_count") != 2
                 or late.get("native_commands_sent") != 0
                 or late.get("native_exposure_absent") is not True
+                or prebinding_evidence_changed()
+                or (
+                    prebinding_cleanup
+                    and (
+                        target_backend_log_bytes is None
+                        or late.get("target_backend_log_path")
+                        != str(target_backend_log)
+                        or late.get("target_backend_log_sha256")
+                        != hashlib.sha256(target_backend_log_bytes).hexdigest()
+                        or late.get("target_backend_log_size")
+                        != len(target_backend_log_bytes)
+                        or late.get("target_storage_paths")
+                        != [str(path) for path in target_storage_paths]
+                        or late.get("target_storage_absent") is not True
+                        or late.get("target_audit_root") != str(target_audit)
+                        or late.get("target_audit_files_absent") is not True
+                        or late.get("target_runtime_pid_published") is not False
+                        or late.get("target_runtime_binding_published") is not False
+                        or late.get("target_paper_status_published") is not False
+                    )
+                )
                 or state.get("target_cleanup_revalidated_at")
                 != late.get("revalidated_at")
                 or set(late) != expected_late_fields
@@ -2320,15 +2519,17 @@ def finalize_stale_target_cleanup(
                 raise RuntimeError("PROFILE_SWITCH_CLEANUP_NATIVE_PROOF_INVALID")
             return state
         clean_non_operational = bool(
-            paper.get("state") == "READY_DISARMED"
+            isinstance(paper, Mapping)
+            and paper.get("state") == "READY_DISARMED"
             and paper.get("paper_execution") == "DISARMED"
             and paper.get("session_armed_state") == "DISARMED"
             and paper.get("entry_owner") == "NONE"
             and paper.get("protective_stop_state") == "NONE"
             and _target_non_operational_flat_proven(paper, manifest)
         )
-        exact_faulted_stopping = _target_faulted_stopping_flat_proven(
-            paper, manifest,
+        exact_faulted_stopping = bool(
+            isinstance(paper, Mapping)
+            and _target_faulted_stopping_flat_proven(paper, manifest)
         )
         recorded_cleanup_eligible = bool(
             state.get("stage") == "TARGET_CLEANUP_UNPROVEN"
@@ -2337,7 +2538,11 @@ def finalize_stale_target_cleanup(
             and cleanup.get("cleanup_proven") is False
             and cleanup.get("safe_terminal_proven") is False
             and cleanup.get("process_handle_exited") is True
-            and (clean_non_operational or exact_faulted_stopping)
+            and (
+                prebinding_initial
+                or clean_non_operational
+                or exact_faulted_stopping
+            )
         )
         if not (recorded_cleanup_eligible or orphaned_faulted_target):
             raise RuntimeError("PROFILE_SWITCH_CLEANUP_NOT_ELIGIBLE")
@@ -2386,6 +2591,7 @@ def finalize_stale_target_cleanup(
                 or _validated_selection(root, required=True) != selection
                 or _read_json(state_path) != state
                 or _read_json(claim_path) != claim
+                or prebinding_evidence_changed()
             ):
                 raise RuntimeError("PROFILE_SWITCH_CLEANUP_INPUT_CHANGED")
             prove_absent(all_pids)
@@ -2403,6 +2609,7 @@ def finalize_stale_target_cleanup(
                 != state_bytes
                 or read_bytes(claim_path, "PROFILE_SWITCH_CLEANUP_CLAIM_UNREADABLE")
                 != claim_bytes
+                or prebinding_evidence_changed()
             ):
                 raise RuntimeError("PROFILE_SWITCH_CLEANUP_INPUT_CHANGED")
 
@@ -2413,7 +2620,11 @@ def finalize_stale_target_cleanup(
                 if item not in removable_cleanup_blockers
             ]
             late_revalidation: dict[str, object] = {
-                "schema": "lane-iii-profile-switch-late-cleanup-v1",
+                "schema": (
+                    "lane-iii-profile-switch-prebinding-cleanup-v1"
+                    if prebinding_cleanup
+                    else "lane-iii-profile-switch-late-cleanup-v1"
+                ),
                 "revalidated_at": revalidated_at,
                 "source_state_sha256": hashlib.sha256(state_bytes).hexdigest(),
                 "selection_sha256": hashlib.sha256(selection_bytes).hexdigest(),
@@ -2432,6 +2643,24 @@ def finalize_stale_target_cleanup(
                 "native_commands_sent": 0,
                 "native_exposure_absent": True,
             }
+            if prebinding_cleanup:
+                assert target_backend_log_bytes is not None
+                late_revalidation.update({
+                    "target_backend_log_path": str(target_backend_log),
+                    "target_backend_log_sha256": hashlib.sha256(
+                        target_backend_log_bytes,
+                    ).hexdigest(),
+                    "target_backend_log_size": len(target_backend_log_bytes),
+                    "target_storage_paths": [
+                        str(path) for path in target_storage_paths
+                    ],
+                    "target_storage_absent": True,
+                    "target_audit_root": str(target_audit),
+                    "target_audit_files_absent": True,
+                    "target_runtime_pid_published": False,
+                    "target_runtime_binding_published": False,
+                    "target_paper_status_published": False,
+                })
             recovered_cleanup = {
                 **prior_cleanup,
                 "target_pid_absent": True,
@@ -3007,6 +3236,19 @@ def supervise(
         "BEELZEBUB_RISK_CONTINUITY_PATH": str(continuity_path),
         "BEELZEBUB_GIT_SHA": str(manifest["git_sha"]),
     })
+    if (
+        manifest.get("target_profile")
+        == FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION
+    ):
+        # Every perpetual profile-switch target receives the immutable
+        # manifest binding. The manifest itself, not the target profile name,
+        # decides whether the legacy V1 detached startup seed is required.
+        environment.update({
+            "BEELZEBUB_PROFILE_SWITCH_MANIFEST_SHA256": str(
+                manifest["manifest_sha256"],
+            ),
+            "BEELZEBUB_PROFILE_SWITCH_MANIFEST_PATH": str(manifest_path),
+        })
     if seed_artifact is not None and seed_proof is not None:
         environment.update({
             "BEELZEBUB_PERPETUAL_STARTUP_SEED_REQUIRED": "1",
@@ -3016,10 +3258,6 @@ def supervise(
             "BEELZEBUB_PERPETUAL_STARTUP_SEED_PROOF_PATH": str(
                 manifest["perpetual_startup_seed_proof_path"],
             ),
-            "BEELZEBUB_PROFILE_SWITCH_MANIFEST_SHA256": str(
-                manifest["manifest_sha256"],
-            ),
-            "BEELZEBUB_PROFILE_SWITCH_MANIFEST_PATH": str(manifest_path),
         })
     backend_log = manifest_path.with_name("target-backend.log")
     try:
