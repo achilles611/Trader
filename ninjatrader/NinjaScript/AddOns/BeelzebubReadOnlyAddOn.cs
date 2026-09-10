@@ -737,6 +737,105 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
     }
 
+    // BEELZEBUB_PROVIDER_TIMESTAMP_CONTRACT_BEGIN
+    // Callback timestamps with Kind=Unspecified are NinjaTrader application-
+    // zone wall times. DateTime does not carry a DST fold bit that callers can
+    // supply authoritatively, so ambiguous wall times are rejected unless the
+    // provider also supplies one of the zone's exact candidate UTC offsets.
+    public static class BeelzebubProviderTimestamp
+    {
+        public static bool TryConvertUtc(
+            DateTime providerTime,
+            TimeZoneInfo applicationTimeZone,
+            TimeSpan? authoritativeUtcOffset,
+            out DateTime utc,
+            out string rejectionReason)
+        {
+            utc = DateTime.MinValue;
+            rejectionReason = null;
+
+            if (providerTime.Kind == DateTimeKind.Utc)
+            {
+                utc = providerTime;
+                return true;
+            }
+
+            TimeZoneInfo sourceTimeZone;
+            if (providerTime.Kind == DateTimeKind.Local)
+                sourceTimeZone = TimeZoneInfo.Local;
+            else if (providerTime.Kind == DateTimeKind.Unspecified)
+            {
+                if (applicationTimeZone == null)
+                {
+                    rejectionReason = "PROVIDER_TIMESTAMP_APPLICATION_TIMEZONE_MISSING";
+                    return false;
+                }
+                sourceTimeZone = applicationTimeZone;
+            }
+            else
+            {
+                rejectionReason = "PROVIDER_TIMESTAMP_KIND_UNSUPPORTED";
+                return false;
+            }
+
+            DateTime wallTime = DateTime.SpecifyKind(providerTime, DateTimeKind.Unspecified);
+            try
+            {
+                if (sourceTimeZone.IsInvalidTime(wallTime))
+                {
+                    rejectionReason = "PROVIDER_TIMESTAMP_DST_INVALID";
+                    return false;
+                }
+
+                if (sourceTimeZone.IsAmbiguousTime(wallTime))
+                {
+                    if (!authoritativeUtcOffset.HasValue)
+                    {
+                        rejectionReason = "PROVIDER_TIMESTAMP_DST_AMBIGUOUS";
+                        return false;
+                    }
+
+                    TimeSpan suppliedOffset = authoritativeUtcOffset.Value;
+                    if (!sourceTimeZone.GetAmbiguousTimeOffsets(wallTime).Contains(suppliedOffset))
+                    {
+                        rejectionReason = "PROVIDER_TIMESTAMP_AMBIGUOUS_OFFSET_INVALID";
+                        return false;
+                    }
+
+                    utc = new DateTime(
+                        checked(wallTime.Ticks - suppliedOffset.Ticks),
+                        DateTimeKind.Utc);
+                    return true;
+                }
+
+                if (authoritativeUtcOffset.HasValue)
+                {
+                    rejectionReason = "PROVIDER_TIMESTAMP_OFFSET_NOT_APPLICABLE";
+                    return false;
+                }
+
+                utc = TimeZoneInfo.ConvertTimeToUtc(wallTime, sourceTimeZone);
+                return true;
+            }
+            catch (ArgumentException)
+            {
+                rejectionReason = "PROVIDER_TIMESTAMP_CONVERSION_REJECTED";
+                return false;
+            }
+            catch (InvalidTimeZoneException)
+            {
+                rejectionReason = "PROVIDER_TIMESTAMP_CONVERSION_REJECTED";
+                return false;
+            }
+            catch (OverflowException)
+            {
+                rejectionReason = "PROVIDER_TIMESTAMP_CONVERSION_REJECTED";
+                return false;
+            }
+        }
+    }
+    // BEELZEBUB_PROVIDER_TIMESTAMP_CONTRACT_END
+
     // Outbound-only loopback sink. It opens a local client connection and only
     // writes one observation frame. There is intentionally no stream Read.
     public static class BeelzebubReadOnlyOutbound
@@ -756,6 +855,39 @@ namespace NinjaTrader.NinjaScript.AddOns
         private static bool senderRunning;
         private static bool senderStopping;
 
+        private static string ProviderTimestampUtc(DateTime? providerTime)
+        {
+            if (!providerTime.HasValue)
+                return "null";
+
+            try
+            {
+                DateTime utc;
+                string rejectionReason;
+                if (!BeelzebubProviderTimestamp.TryConvertUtc(
+                    providerTime.Value,
+                    Core.Globals.GeneralOptions.TimeZoneInfo,
+                    null,
+                    out utc,
+                    out rejectionReason))
+                {
+                    TransportDiagnosticOnce(rejectionReason);
+                    return "null";
+                }
+                return utc.ToString("o", CultureInfo.InvariantCulture);
+            }
+            catch (ArgumentException)
+            {
+                TransportDiagnosticOnce("PROVIDER_TIMESTAMP_CONVERSION_REJECTED");
+                return "null";
+            }
+            catch (InvalidTimeZoneException)
+            {
+                TransportDiagnosticOnce("PROVIDER_TIMESTAMP_CONVERSION_REJECTED");
+                return "null";
+            }
+        }
+
         public static string Publish(string type, string alias, string accountClass, string payload, DateTime? providerTime = null)
         {
             TransportDiagnosticOnce("BRIDGE_PUBLISH_ATTEMPT_" + type);
@@ -768,7 +900,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 string observationId = "nt-" + sessionId + "-" + number;
                 string account = alias == null ? "null" : "{\"alias\":\"" + alias + "\",\"class\":\"" + accountClass + "\"}";
                 string timestamp = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
-                string providerTimestamp = providerTime.HasValue ? providerTime.Value.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture) : "null";
+                string providerTimestamp = ProviderTimestampUtc(providerTime);
                 string frame = "{\"schema\":\"lane-iii-phase-f2-ninjatrader-observation-v1\",\"observation_id\":\"" + observationId +
                     "\",\"session_id\":\"" + sessionId + "\",\"observation_type\":\"" + type + "\",\"ninja_receipt_time\":\"" + timestamp +
                     "\",\"local_monotonic_sequence\":" + number + ",\"provider_timestamp\":" + (providerTimestamp == "null" ? "null" : "\"" + providerTimestamp + "\"") +

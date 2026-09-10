@@ -1586,6 +1586,35 @@ class NinjaScriptSourceTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, source)
 
+    def test_read_only_addon_converts_provider_time_from_ninjatrader_application_timezone(self) -> None:
+        source = (Path(__file__).parents[1] / "ninjatrader" / "NinjaScript" / "AddOns" / "BeelzebubReadOnlyAddOn.cs").read_text(encoding="utf-8")
+        contract = source[
+            source.index("    // BEELZEBUB_PROVIDER_TIMESTAMP_CONTRACT_BEGIN"):
+            source.index("    // BEELZEBUB_PROVIDER_TIMESTAMP_CONTRACT_END")
+        ]
+        publication = source[
+            source.index("        private static string ProviderTimestampUtc"):
+            source.index("        public static string Publish")
+        ]
+        self.assertIn("providerTime.Kind == DateTimeKind.Utc", contract)
+        self.assertIn("providerTime.Kind == DateTimeKind.Local", contract)
+        self.assertIn("providerTime.Kind == DateTimeKind.Unspecified", contract)
+        self.assertIn("sourceTimeZone = TimeZoneInfo.Local", contract)
+        self.assertIn("sourceTimeZone = applicationTimeZone", contract)
+        self.assertIn("sourceTimeZone.IsInvalidTime(wallTime)", contract)
+        self.assertIn("sourceTimeZone.IsAmbiguousTime(wallTime)", contract)
+        self.assertIn("authoritativeUtcOffset", contract)
+        self.assertIn('"PROVIDER_TIMESTAMP_DST_INVALID"', contract)
+        self.assertIn('"PROVIDER_TIMESTAMP_DST_AMBIGUOUS"', contract)
+        self.assertIn("TimeZoneInfo.ConvertTimeToUtc", contract)
+        self.assertNotIn("DateTime.Now", contract)
+        self.assertNotIn("DateTime.UtcNow", contract)
+        self.assertIn("Core.Globals.GeneralOptions.TimeZoneInfo", publication)
+        self.assertIn("BeelzebubProviderTimestamp.TryConvertUtc", publication)
+        self.assertIn("TransportDiagnosticOnce(rejectionReason)", publication)
+        self.assertIn("string providerTimestamp = ProviderTimestampUtc(providerTime);", source)
+        self.assertNotIn("providerTime.Value.ToUniversalTime()", source)
+
     def test_read_only_addon_uses_native_headless_subscription_with_optional_chart_focus(self) -> None:
         root = Path(__file__).parents[1] / "ninjatrader" / "NinjaScript"
         addon = (root / "AddOns" / "BeelzebubReadOnlyAddOn.cs").read_text(encoding="utf-8")
