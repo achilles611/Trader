@@ -44,6 +44,7 @@ from src.l3g_paper.profile_switch import (
     _pid_exists,
     _target_binding_matches,
     _target_faulted_stopping_flat_proven,
+    _valid_scalper_policy_revision_source_close,
     exact_flat_shutdown_ready,
     finalize_stale_target_cleanup,
     remembered_profile_selection,
@@ -251,6 +252,108 @@ def clean_shutdown_receipt() -> dict[str, object]:
         "verifier_shutdown": {"completed": True},
         "runtime_watchdog_shutdown": {"completed": True},
     }
+
+
+def scalper_policy_revision_source_close_fixture() -> tuple[
+    dict[str, object], dict[str, object],
+]:
+    source_path = "N:/fixture/scalper-source.sqlite3"
+    source_identity = "l3g-ledger-" + "1" * 32
+    source_epoch = "L3G-PAPER-EPOCH-BEELZEBUB_SCALPER_V2-FIXTURE"
+    risk_boundary = {
+        "path": source_path,
+        "ledger_identity": source_identity,
+        "ledger_epoch": source_epoch,
+        "risk_boundary_sequence": 12,
+        "risk_boundary_hash": "2" * 64,
+    }
+    manifest: dict[str, object] = {
+        "operation_id": "profile-switch-" + "3" * 32,
+        "transition_kind": "SCALPER_V2_CONTINUOUS_EXECUTION_POLICY_REVISION",
+        "current_profile": "BEELZEBUB_SCALPER_V2",
+        "target_profile": "BEELZEBUB_SCALPER_V2",
+        "source_paper_policy_hash": "7077c30bdeb3b8017b5d8049ed32b92eb3acca67393ef101b217538da30d6659",
+        "source_risk_profile_hash": "c86c2c2b39f7fef9fcdaed06978ab22141eeacd2cf1590f2a8cddee0c5b17404",
+        "source_ledger_path": source_path,
+        "source_ledger_identity": source_identity,
+        "source_ledger_epoch": source_epoch,
+        "parent_pid": 101,
+    }
+    verification = {
+        "status": "PASS",
+        "verification_mode": "full",
+        "quick_check": "ok",
+        "chain_valid": True,
+        "checkpoint_valid": True,
+        "ledger_path": source_path,
+        "ledger_identity": source_identity,
+        "ledger_epoch": source_epoch,
+        "captured_tip_sequence": 99,
+        "verified_through_sequence": 99,
+        "tip_hash": "4" * 64,
+        "storage_end": {"wal_bytes": 0},
+    }
+    core: dict[str, object] = {
+        "schema": "l3g-scalper-policy-revision-source-close-v1",
+        "operation_id": manifest["operation_id"],
+        "transition_kind": manifest["transition_kind"],
+        "source_ledger_path": source_path,
+        "source_ledger_identity": source_identity,
+        "source_ledger_epoch": source_epoch,
+        "risk_continuity_boundary": risk_boundary,
+        "graceful_shutdown_request": {
+            "schema": "beezconsole-graceful-shutdown-v1",
+            "accepted": True,
+            "request_id": "fixture-graceful-close-0001",
+            "state": "SHUTDOWN_REQUESTED",
+        },
+        "source_processes": {
+            "parent_pid": 101,
+            "runtime_pid": 102,
+            "parent_absent": True,
+            "runtime_absent": True,
+        },
+        "control_port_released": True,
+        "source_verification": verification,
+        "recorded_at": "2026-09-10T21:30:00Z",
+    }
+    attestation = {
+        **core,
+        "attestation_sha256": sha256(
+            json.dumps(
+                core, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+            ).encode("utf-8"),
+        ).hexdigest(),
+    }
+    return manifest, attestation
+
+
+class ScalperPolicyRevisionSourceCloseTests(unittest.TestCase):
+    def test_accepts_only_exact_process_release_and_full_closed_ledger_proof(self) -> None:
+        manifest, attestation = scalper_policy_revision_source_close_fixture()
+        self.assertTrue(
+            _valid_scalper_policy_revision_source_close(attestation, manifest),
+        )
+
+    def test_rejects_wal_tail_and_tampered_projection(self) -> None:
+        manifest, attestation = scalper_policy_revision_source_close_fixture()
+        for name, mutation in {
+            "wal_tail": lambda value: value["source_verification"][
+                "storage_end"
+            ].__setitem__("wal_bytes", 1),
+            "process_present": lambda value: value["source_processes"].__setitem__(
+                "runtime_absent", False,
+            ),
+            "wrong_source_policy": lambda value: manifest.__setitem__(
+                "source_paper_policy_hash", "5" * 64,
+            ),
+        }.items():
+            with self.subTest(name=name):
+                changed = json.loads(json.dumps(attestation))
+                mutation(changed)
+                self.assertFalse(
+                    _valid_scalper_policy_revision_source_close(changed, manifest),
+                )
 
 
 class ProfileCatalogTests(unittest.TestCase):

@@ -65,10 +65,20 @@ failure which locks entry authority and invokes the existing emergency path.
 7. Shutdown seals admission, drains the writer, quiesces the verifier, proves
    the durable tip, performs the final complete checkpoint, and records the
    receipt in the handoff state.
-8. Only a complete receipt plus the exact operation, source, target, and
-   continuity-artifact bindings release the supervisor. It starts the selected
-   profile with the prepared ledger, audit root, epoch, policy, risk, continuity,
-   and Git identity.
+   The exact legacy session-bound Scalper V2 to continuous Scalper V2 revision
+   is the sole cross-version exception: because the already-running legacy
+   process cannot write into an operation prepared by newer code, the new-code
+   coordinator requires a preexisting exact reconciled flat state and a current
+   Full PASS, invokes the same authenticated graceful-shutdown endpoint, proves
+   both source PIDs absent and the control port released, and then Full-verifies
+   the closed source ledger with a zero-byte WAL tail. Those facts are stored as
+   a separately named, hash-bound source-close attestation; they are never
+   presented as the legacy process's in-memory shutdown receipt.
+8. Only a complete receipt, or the narrowly validated Scalper revision
+   source-close attestation described above, plus the exact operation, source,
+   target, and continuity-artifact bindings release the supervisor. It starts
+   the selected profile with the prepared ledger, audit root, epoch, policy,
+   risk, continuity, and Git identity.
    For V2, the supervisor first runs a bounded process-owned Full scan of the
    closed V1 ledger and requires its exact shutdown tip. Crossing into a newer
    five-minute bucket, a timeout, an incomplete seed chain, or a mismatched
@@ -79,6 +89,21 @@ failure which locks entry authority and invokes the existing emergency path.
    `operational-start`.
 
 Operational start is never routed through Atomic Commissioning.
+
+For that one policy-revision deployment, run from the canonical checkout:
+
+```powershell
+.\.venv312\Scripts\python.exe -m src.l3g_paper.profile_switch `
+  --commission-scalper-policy-revision `
+  --runtime-root N:\Beelzebub\runtime `
+  --project-root C:\Users\atlas\Documents\Trader
+```
+
+The command refuses a non-legacy source hash, a non-flat or unreconciled
+runtime, a missing current Full PASS, any surviving source process or occupied
+control port, any source-ledger verification failure, or any WAL tail. The
+ordinary detached supervisor and operational auto-start remain responsible for
+the target after the attestation is durable.
 
 ## Automatic storage
 

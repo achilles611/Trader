@@ -3,7 +3,11 @@
 The active process prepares a fresh ledger/audit run, flattens and disarms the
 current profile, then delegates restart to a detached local supervisor.  The
 supervisor will not launch the target profile unless the old process publishes
-a complete controlled-ledger-shutdown receipt.
+a complete controlled-ledger-shutdown receipt.  The one allowed cross-version
+Scalper policy revision can instead use an independently verified source-close
+attestation after the legacy process accepts its supported graceful-shutdown
+request, exits, releases the control port, and its closed ledger passes a fresh
+full verification with no WAL tail.
 """
 
 from __future__ import annotations
@@ -64,6 +68,8 @@ PROFILE_SELECTION_SCHEMA = "lane-iii-paper-profile-selection-v3"
 PROFILE_SWITCH_ACTION_HEADER = "X-Beelzebub-Profile-Switch-Action"
 PROFILE_SWITCH_ACTION_VALUE = "sim101-profile-switch-v1"
 PROFILE_SWITCH_TOKEN_HEADER = "X-Beelzebub-Profile-Switch-Token"
+_GRACEFUL_SHUTDOWN_ACTION_HEADER = "X-Beelzebub-Graceful-Shutdown-Action"
+_GRACEFUL_SHUTDOWN_ACTION_VALUE = "beezconsole-graceful-shutdown-v1"
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 _RECORD_HASH = re.compile(r"^[0-9a-f]{64}$")
 _PROFILE_SWITCH_OPERATION = re.compile(r"^profile-switch-[0-9a-f]{32}$")
@@ -71,6 +77,7 @@ _SOURCE_BEFORE_OPERATION = re.compile(r"^source-before-(profile-switch-[0-9a-f]{
 _LEGACY_SESSION_BOUND_SCALPER_POLICY_HASH = "7077c30bdeb3b8017b5d8049ed32b92eb3acca67393ef101b217538da30d6659"
 _LEGACY_SESSION_BOUND_SCALPER_RISK_HASH = "c86c2c2b39f7fef9fcdaed06978ab22141eeacd2cf1590f2a8cddee0c5b17404"
 _SCALPER_POLICY_REVISION = "SCALPER_V2_CONTINUOUS_EXECUTION_POLICY_REVISION"
+_SCALPER_POLICY_REVISION_CLOSE_SCHEMA = "l3g-scalper-policy-revision-source-close-v1"
 _ACTIVE_STAGES = frozenset({
     "PREPARING", "STOPPING_CURRENT", "AWAITING_FLAT", "SHUTDOWN_REQUESTED",
     "VERIFYING_STARTUP_SEED", "STARTING_TARGET", "TARGET_PROCESS_CREATED",
@@ -546,6 +553,92 @@ def _clean_shutdown_receipt(receipt: Mapping[str, object]) -> bool:
         and receipt["verifier_shutdown"].get("completed") is True  # type: ignore[index]
         and isinstance(receipt.get("runtime_watchdog_shutdown"), Mapping)
         and receipt["runtime_watchdog_shutdown"].get("completed") is True  # type: ignore[index]
+    )
+
+
+def _valid_scalper_policy_revision_source_close(
+    attestation: Mapping[str, object], manifest: Mapping[str, object],
+) -> bool:
+    """Validate the exact legacy-to-continuous Scalper source-close proof.
+
+    This is not a synthesized controlled-shutdown receipt. It records facts
+    observed after the legacy process accepted its supported graceful shutdown,
+    exited, released the control port, and left a fully verified ledger with no
+    WAL tail. No other profile transition may use this path.
+    """
+    core = {
+        key: value for key, value in attestation.items()
+        if key != "attestation_sha256"
+    }
+    verification = attestation.get("source_verification")
+    storage_end = (
+        verification.get("storage_end")
+        if isinstance(verification, Mapping) else None
+    )
+    shutdown = attestation.get("graceful_shutdown_request")
+    processes = attestation.get("source_processes")
+    return (
+        attestation.get("schema") == _SCALPER_POLICY_REVISION_CLOSE_SCHEMA
+        and attestation.get("operation_id") == manifest.get("operation_id")
+        and manifest.get("transition_kind") == _SCALPER_POLICY_REVISION
+        and manifest.get("current_profile") == "BEELZEBUB_SCALPER_V2"
+        and manifest.get("target_profile") == "BEELZEBUB_SCALPER_V2"
+        and manifest.get("source_paper_policy_hash")
+        == _LEGACY_SESSION_BOUND_SCALPER_POLICY_HASH
+        and manifest.get("source_risk_profile_hash")
+        == _LEGACY_SESSION_BOUND_SCALPER_RISK_HASH
+        and attestation.get("transition_kind") == _SCALPER_POLICY_REVISION
+        and attestation.get("source_ledger_path")
+        == manifest.get("source_ledger_path")
+        and isinstance(manifest.get("source_ledger_path"), str)
+        and bool(str(manifest.get("source_ledger_path") or "").strip())
+        and attestation.get("source_ledger_identity")
+        == manifest.get("source_ledger_identity")
+        and re.fullmatch(
+            r"l3g-ledger-[0-9a-f]{32}",
+            str(manifest.get("source_ledger_identity") or ""),
+        ) is not None
+        and attestation.get("source_ledger_epoch")
+        == manifest.get("source_ledger_epoch")
+        and isinstance(manifest.get("source_ledger_epoch"), str)
+        and bool(str(manifest.get("source_ledger_epoch") or "").strip())
+        and _valid_risk_boundary(attestation.get("risk_continuity_boundary"))
+        and isinstance(shutdown, Mapping)
+        and shutdown.get("schema") == "beezconsole-graceful-shutdown-v1"
+        and shutdown.get("accepted") is True
+        and shutdown.get("state") == "SHUTDOWN_REQUESTED"
+        and isinstance(shutdown.get("request_id"), str)
+        and isinstance(processes, Mapping)
+        and processes.get("parent_pid") == manifest.get("parent_pid")
+        and type(processes.get("runtime_pid")) is int
+        and int(processes["runtime_pid"]) > 0
+        and processes.get("parent_absent") is True
+        and processes.get("runtime_absent") is True
+        and attestation.get("control_port_released") is True
+        and isinstance(verification, Mapping)
+        and verification.get("status") == "PASS"
+        and verification.get("verification_mode") == "full"
+        and verification.get("quick_check") == "ok"
+        and verification.get("chain_valid") is True
+        and verification.get("checkpoint_valid") is True
+        and verification.get("ledger_path") == manifest.get("source_ledger_path")
+        and verification.get("ledger_identity")
+        == manifest.get("source_ledger_identity")
+        and verification.get("ledger_epoch") == manifest.get("source_ledger_epoch")
+        and type(verification.get("captured_tip_sequence")) is int
+        and verification.get("captured_tip_sequence")
+        == verification.get("verified_through_sequence")
+        and _valid_shutdown_tip(
+            verification.get("verified_through_sequence"),
+            verification.get("tip_hash"),
+        )
+        and isinstance(storage_end, Mapping)
+        and storage_end.get("wal_bytes") == 0
+        and isinstance(attestation.get("recorded_at"), str)
+        and bool(str(attestation.get("recorded_at") or "").strip())
+        and isinstance(attestation.get("attestation_sha256"), str)
+        and attestation.get("attestation_sha256")
+        == hashlib.sha256(_canonical(core)).hexdigest()
     )
 
 
@@ -1065,6 +1158,95 @@ class PaperProfileSwitchService:
             blockers=[] if clean else ["CURRENT_PROFILE_CONTROLLED_SHUTDOWN_UNPROVEN"],
             shutdown_receipt=dict(receipt),
         )
+
+    def record_scalper_policy_revision_source_close(
+        self,
+        *,
+        graceful_shutdown_request: Mapping[str, object],
+        source_verification: Mapping[str, object],
+        pid_probe: Callable[[int], bool] | None = None,
+        port_probe: Callable[[], bool] | None = None,
+    ) -> dict[str, object]:
+        """Record independent close proof for the one cross-version revision.
+
+        A legacy running process cannot write into a profile-switch operation
+        prepared by newer code. This method closes that narrow deployment gap
+        without inventing the legacy process's in-memory shutdown receipt.
+        """
+        with self._lock:
+            if self._state_path is None or not self._state_path.is_file():
+                raise RuntimeError("SCALPER_POLICY_REVISION_STATE_UNAVAILABLE")
+            state = _read_json(self._state_path)
+            if (
+                state.get("stage") != "SHUTDOWN_REQUESTED"
+                or state.get("operation_id") is None
+                or state.get("manifest_path") is None
+            ):
+                raise RuntimeError("SCALPER_POLICY_REVISION_SHUTDOWN_NOT_REQUESTED")
+            manifest = _manifest(Path(str(state["manifest_path"])).resolve())
+            if manifest.get("transition_kind") != _SCALPER_POLICY_REVISION:
+                raise RuntimeError("SCALPER_POLICY_REVISION_TRANSITION_MISMATCH")
+            binding = self._current_runtime_binding or {}
+            runtime_pid = binding.get("pid")
+            if type(runtime_pid) is not int or runtime_pid <= 0:
+                raise RuntimeError("SCALPER_POLICY_REVISION_SOURCE_PID_INVALID")
+
+        process_exists = pid_probe or _pid_exists
+        control_port_released = port_probe or _control_port_released
+        if process_exists(self.parent_pid) or process_exists(runtime_pid):
+            raise RuntimeError("SCALPER_POLICY_REVISION_SOURCE_PROCESS_STILL_ACTIVE")
+        if not control_port_released():
+            raise RuntimeError("SCALPER_POLICY_REVISION_SOURCE_RESOURCES_NOT_RELEASED")
+
+        continuity = read_risk_continuity_artifact(
+            Path(str(state["manifest_path"])).with_name("risk-continuity.json"),
+            operation_id=str(state["operation_id"]),
+            target_profile=str(state["target_profile"]),
+        )
+        snapshot = continuity.get("snapshot")
+        source_ledger = (
+            snapshot.get("source_ledger")
+            if isinstance(snapshot, Mapping) else None
+        )
+        if not isinstance(source_ledger, Mapping):
+            raise RuntimeError("SCALPER_POLICY_REVISION_RISK_BOUNDARY_INVALID")
+        risk_boundary = {
+            key: value for key, value in source_ledger.items()
+            if key != "coverage_complete"
+        }
+        recorded_at = _utc_now()
+        core: dict[str, object] = {
+            "schema": _SCALPER_POLICY_REVISION_CLOSE_SCHEMA,
+            "operation_id": state["operation_id"],
+            "transition_kind": _SCALPER_POLICY_REVISION,
+            "source_ledger_path": manifest.get("source_ledger_path"),
+            "source_ledger_identity": manifest.get("source_ledger_identity"),
+            "source_ledger_epoch": manifest.get("source_ledger_epoch"),
+            "risk_continuity_boundary": risk_boundary,
+            "graceful_shutdown_request": dict(graceful_shutdown_request),
+            "source_processes": {
+                "parent_pid": self.parent_pid,
+                "runtime_pid": runtime_pid,
+                "parent_absent": True,
+                "runtime_absent": True,
+            },
+            "control_port_released": True,
+            "source_verification": dict(source_verification),
+            "recorded_at": recorded_at,
+        }
+        attestation = {
+            **core,
+            "attestation_sha256": hashlib.sha256(_canonical(core)).hexdigest(),
+        }
+        if not _valid_scalper_policy_revision_source_close(attestation, manifest):
+            raise RuntimeError("SCALPER_POLICY_REVISION_SOURCE_CLOSE_UNPROVEN")
+        self._record(
+            "SCALPER_POLICY_REVISION_SOURCE_CLOSE_VERIFIED",
+            stage="CURRENT_PROFILE_CLOSED",
+            blockers=[],
+            source_close_attestation=attestation,
+        )
+        return attestation
 
 
 def _pid_exists(pid: int) -> bool:
@@ -2544,6 +2726,7 @@ def supervise(
     deadline = monotonic() + timeout_seconds
     state: dict[str, object] = {}
     receipt: Mapping[str, object] | None = None
+    source_close_attestation: Mapping[str, object] | None = None
     process_released = False
     resources_released = False
     while monotonic() < deadline:
@@ -2583,14 +2766,31 @@ def supervise(
             return 10
         candidate = state.get("shutdown_receipt")
         receipt = candidate if isinstance(candidate, Mapping) and _clean_shutdown_receipt(candidate) else None
+        close_candidate = state.get("source_close_attestation")
+        source_close_attestation = (
+            close_candidate
+            if isinstance(close_candidate, Mapping)
+            and _valid_scalper_policy_revision_source_close(
+                close_candidate, manifest,
+            )
+            else None
+        )
         process_released = not pid_probe(parent_pid)
         resources_released = port_probe()
-        if state.get("stage") == "CURRENT_PROFILE_CLOSED" and receipt is not None and process_released and resources_released:
+        if (
+            state.get("stage") == "CURRENT_PROFILE_CLOSED"
+            and (receipt is not None or source_close_attestation is not None)
+            and process_released
+            and resources_released
+        ):
             break
         wait(min(poll_seconds, max(0.001, deadline - monotonic())))
     else:
         blockers: list[str] = []
-        if receipt is None or state.get("stage") != "CURRENT_PROFILE_CLOSED":
+        if (
+            (receipt is None and source_close_attestation is None)
+            or state.get("stage") != "CURRENT_PROFILE_CLOSED"
+        ):
             blockers.append("CURRENT_PROFILE_CONTROLLED_SHUTDOWN_UNPROVEN")
         if not process_released:
             blockers.append("CURRENT_PROCESS_DID_NOT_EXIT")
@@ -2599,7 +2799,8 @@ def supervise(
         _state_update(state_path, "SUPERVISOR_BLOCKED", stage="BLOCKED_SAFE", blockers=blockers)
         notify(blockers)
         return 3
-    assert receipt is not None
+    source_close_proof = receipt or source_close_attestation
+    assert source_close_proof is not None
     continuity_path = manifest_path.with_name("risk-continuity.json")
     try:
         continuity = read_risk_continuity_artifact(
@@ -2637,7 +2838,7 @@ def supervise(
         {key: value for key, value in source_ledger.items() if key != "coverage_complete"}
         if isinstance(source_ledger, Mapping) else None
     )
-    if source_boundary != receipt.get("risk_continuity_boundary"):
+    if source_boundary != source_close_proof.get("risk_continuity_boundary"):
         blockers = ["RISK_CONTINUITY_SOURCE_BOUNDARY_MISMATCH"]
         _state_update(
             state_path, "SUPERVISOR_BLOCKED", stage="BLOCKED_SAFE",
@@ -2712,7 +2913,7 @@ def supervise(
                 proof_path,
                 artifact=seed_artifact,
                 manifest_sha256=str(manifest["manifest_sha256"]),
-                shutdown_receipt=receipt,
+                shutdown_receipt=source_close_proof,
                 verification_report=verification,
             )
             seed_proof = read_perpetual_startup_seed_proof(
@@ -3352,15 +3553,182 @@ def supervise(
         wait(delay)
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Supervise one prepared Beelzebub paper profile handoff.")
-    parser.add_argument("--supervise", type=Path, required=True)
-    parser.add_argument("--parent-pid", type=int, required=True)
-    options = parser.parse_args(argv)
-    return supervise(
-        options.supervise.resolve(), options.parent_pid,
-        notify_operator=_windows_profile_switch_notice,
+def commission_scalper_policy_revision(
+    *,
+    runtime_root: str | Path,
+    project_root: str | Path,
+    python_executable: str | Path,
+    api_base: str = "http://127.0.0.1:8090",
+    shutdown_timeout_seconds: float = 180.0,
+    verification_timeout_seconds: float = 600.0,
+) -> dict[str, object]:
+    """Commission the exact cross-version Scalper policy revision.
+
+    The source runtime remains the authority for flatness, reconciliation, and
+    its graceful-shutdown acceptance. After it exits, a new-code coordinator
+    independently performs a full scan of the closed source ledger before the
+    already-running supervisor may launch the target.
+    """
+    if shutdown_timeout_seconds <= 0 or verification_timeout_seconds <= 0:
+        raise ValueError("Policy revision timeouts must be positive.")
+    root = Path(runtime_root).resolve()
+    project = Path(project_root).resolve()
+    interpreter = Path(python_executable).resolve()
+    binding = _http_json(api_base + "/api/runtime-binding")
+    paper = _http_json(api_base + "/api/lane-iii/paper")
+    verifier = _http_json(api_base + "/api/lane-iii/paper/ledger-verification")
+    runtime_pid = binding.get("pid")
+    parent_pid = binding.get("parent_pid")
+    if (
+        type(runtime_pid) is not int
+        or runtime_pid <= 0
+        or type(parent_pid) is not int
+        or parent_pid <= 0
+        or not interpreter.is_file()
+        or not (project / "main.py").is_file()
+        or binding.get("entry_profile_version") != "BEELZEBUB_SCALPER_V2"
+        or binding.get("paper_policy_hash")
+        != _LEGACY_SESSION_BOUND_SCALPER_POLICY_HASH
+        or binding.get("risk_profile_hash")
+        != _LEGACY_SESSION_BOUND_SCALPER_RISK_HASH
+        or not exact_flat_shutdown_ready(paper)
+        or verifier.get("status") != "PASS"
+        or verifier.get("verification_mode") != "full"
+        or verifier.get("ledger_path") != binding.get("ledger")
+        or verifier.get("ledger_identity") != binding.get("ledger_identity")
+        or verifier.get("ledger_epoch") != binding.get("ledger_epoch")
+        or verifier.get("captured_tip_sequence")
+        != verifier.get("verified_through_sequence")
+    ):
+        raise RuntimeError("SCALPER_POLICY_REVISION_SOURCE_PREFLIGHT_FAILED")
+    try:
+        checkout_sha = subprocess.run(
+            ["git", "-C", str(project), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("SCALPER_POLICY_REVISION_CHECKOUT_UNRESOLVED") from exc
+
+    shutdown_response: dict[str, object] = {}
+    shutdown_request_id = f"scalper-policy-revision-close-{uuid4().hex}"
+
+    def current_paper() -> Mapping[str, object]:
+        return _http_json(api_base + "/api/lane-iii/paper")
+
+    def no_implicit_flatten() -> Mapping[str, object]:
+        raise RuntimeError("SCALPER_POLICY_REVISION_REQUIRES_PREEXISTING_EXACT_FLAT")
+
+    def current_verifier() -> Mapping[str, object]:
+        return _http_json(api_base + "/api/lane-iii/paper/ledger-verification")
+
+    def request_shutdown() -> None:
+        response = _http_json(
+            api_base + "/api/system/graceful-shutdown",
+            method="POST",
+            headers={
+                _GRACEFUL_SHUTDOWN_ACTION_HEADER:
+                _GRACEFUL_SHUTDOWN_ACTION_VALUE,
+            },
+            body={"request_id": shutdown_request_id},
+        )
+        shutdown_response.update(response)
+
+    service = PaperProfileSwitchService(
+        current_profile=resolve_paper_profile("BEELZEBUB_SCALPER_V2"),
+        paper_status=current_paper,
+        flatten_and_disarm=no_implicit_flatten,
+        verifier_status=current_verifier,
+        request_shutdown=request_shutdown,
+        runtime_root=root,
+        project_root=project,
+        python_executable=interpreter,
+        git_sha=checkout_sha,
+        parent_pid=parent_pid,
+        current_runtime_binding=binding,
     )
+    request_id = f"scalper-continuous-policy-revision-{uuid4().hex}"
+    service.start(request_id, "BEELZEBUB_SCALPER_V2")
+    deadline = time.monotonic() + shutdown_timeout_seconds
+    while time.monotonic() < deadline:
+        state = service.status()
+        if state.get("stage") == "BLOCKED_SAFE":
+            raise RuntimeError(str((state.get("blockers") or ["SCALPER_POLICY_REVISION_BLOCKED"])[0]))
+        if (
+            state.get("stage") == "SHUTDOWN_REQUESTED"
+            and shutdown_response.get("accepted") is True
+            and not _pid_exists(parent_pid)
+            and not _pid_exists(runtime_pid)
+            and _control_port_released()
+        ):
+            break
+        time.sleep(0.25)
+    else:
+        service._record(  # noqa: SLF001 - same-module fail-closed coordinator
+            "SCALPER_POLICY_REVISION_SOURCE_CLOSE_TIMEOUT",
+            stage="BLOCKED_SAFE",
+            blockers=["SCALPER_POLICY_REVISION_SOURCE_CLOSE_TIMEOUT"],
+        )
+        raise RuntimeError("SCALPER_POLICY_REVISION_SOURCE_CLOSE_TIMEOUT")
+
+    source_ledger = Path(str(binding["ledger"])).resolve()
+    source_audit = Path(str(binding["audit"])).resolve()
+    try:
+        verification = _bounded_full_verification(
+            source_ledger, source_audit,
+            timeout_seconds=verification_timeout_seconds,
+        )
+        attestation = service.record_scalper_policy_revision_source_close(
+            graceful_shutdown_request=shutdown_response,
+            source_verification=verification,
+        )
+    except Exception as error:
+        message = str(error)
+        blocker = (
+            message if message and message == message.upper()
+            else "SCALPER_POLICY_REVISION_SOURCE_CLOSE_UNPROVEN"
+        )
+        service._record(  # noqa: SLF001 - same-module fail-closed coordinator
+            "SCALPER_POLICY_REVISION_SOURCE_CLOSE_BLOCKED",
+            stage="BLOCKED_SAFE",
+            blockers=[blocker],
+        )
+        raise
+    return {
+        "operation": service.status(),
+        "source_close_attestation": attestation,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Supervise or commission one Beelzebub paper profile handoff.",
+    )
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--supervise", type=Path)
+    action.add_argument("--commission-scalper-policy-revision", action="store_true")
+    parser.add_argument("--parent-pid", type=int)
+    parser.add_argument("--runtime-root", type=Path)
+    parser.add_argument("--project-root", type=Path)
+    options = parser.parse_args(argv)
+    if options.supervise is not None:
+        if options.parent_pid is None:
+            parser.error("--parent-pid is required with --supervise")
+        return supervise(
+            options.supervise.resolve(), options.parent_pid,
+            notify_operator=_windows_profile_switch_notice,
+        )
+    if options.runtime_root is None or options.project_root is None:
+        parser.error(
+            "--runtime-root and --project-root are required with "
+            "--commission-scalper-policy-revision",
+        )
+    result = commission_scalper_policy_revision(
+        runtime_root=options.runtime_root,
+        project_root=options.project_root,
+        python_executable=sys.executable,
+    )
+    print(json.dumps(result, sort_keys=True, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
