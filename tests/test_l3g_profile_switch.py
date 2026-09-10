@@ -2641,6 +2641,118 @@ class ProfileSwitchServiceTests(unittest.TestCase):
         self.assertEqual(state["stage"], "RUNNING")
         self.assertEqual(state["target_paper_status"]["current_position"], "SHORT")
 
+    def test_scalper_evidence_warmup_keeps_target_alive_and_projects_nested_blockers(self) -> None:
+        self.status_value["entry_profile_version"] = FIVE_MINUTE_PROFILE.policy.entry_profile_version
+        risk_continuity = self.status_value["risk_continuity"]
+        assert isinstance(risk_continuity, dict)
+        risk_continuity["source_profile"] = FIVE_MINUTE_PROFILE.policy.entry_profile_version
+        self.service = PaperProfileSwitchService(
+            current_profile=FIVE_MINUTE_PROFILE,
+            paper_status=lambda: dict(self.status_value),
+            flatten_and_disarm=self.flatten,
+            verifier_status=lambda: {"status": "PASS"},
+            request_shutdown=self.shutdown.set,
+            runtime_root=self.root / "runtime",
+            project_root=self.root,
+            python_executable=Path(__file__),
+            git_sha="a" * 40,
+            parent_pid=2_147_483_647,
+            launch_supervisor=lambda path, pid: self.launched.append((path, pid)),
+            poll_seconds=0.001,
+            stop_timeout_seconds=1,
+        )
+        manifest_path, manifest = self.supervisor_ready_manifest(
+            "switch-request-scalper-warmup", "BEELZEBUB_SCALPER_V2",
+        )
+
+        class Process:
+            pid = 31343
+            terminate_calls = 0
+
+            @staticmethod
+            def poll() -> None:
+                return None
+
+            def terminate(self) -> None:
+                self.terminate_calls += 1
+
+        process = Process()
+        binding, launch = self.target_launch_fixture(
+            manifest_path, manifest, process,
+        )
+        auto_calls = 0
+        paper_calls = 0
+        saw_warmup_projection = False
+
+        def http(url: str, *, method: str = "GET", **_kwargs: object) -> dict[str, object]:
+            nonlocal auto_calls, paper_calls, saw_warmup_projection
+            if url.endswith("/api/runtime-binding"):
+                return dict(binding)
+            if method == "POST":
+                return {"accepted": True}
+            if url.endswith("/api/lane-iii/paper"):
+                paper_calls += 1
+                if paper_calls >= 3:
+                    state = json.loads(
+                        manifest_path.with_name("state.json").read_text(encoding="utf-8"),
+                    )
+                    saw_warmup_projection = state["stage"] == "WARMING_TARGET_EVIDENCE"
+                    self.assertEqual(state["blockers"], [
+                        "COMMISSIONING_SESSION_NOT_WARMED",
+                        "PAPER_EVIDENCE_NOT_WARMED",
+                        "PAPER_CONTINUITY_UNUSABLE",
+                        "SCALPER_EVIDENCE_FAMILY_MISSING_RESTING_LIQUIDITY",
+                        "LOCAL_SEQUENCE_GAP_REWARM_REQUIRED",
+                    ])
+                    self.assertEqual(
+                        state["target_warmup_progress"]["missing_families"],
+                        ["RESTING_LIQUIDITY"],
+                    )
+                    return target_paper_status("BEELZEBUB_SCALPER_V2")
+                return target_paper_status("BEELZEBUB_SCALPER_V2", operational=False)
+            auto_calls += 1
+            if auto_calls == 1:
+                return {"stage": "IDLE", "in_progress": False, "action_token": "target-token"}
+            if auto_calls == 2:
+                return {
+                    "stage": "WAITING_FOR_EVIDENCE",
+                    "in_progress": True,
+                    "action_token": "target-token",
+                    "blockers": [],
+                    "warmup": {
+                        "elapsed_seconds": 3.0,
+                        "covered_family_count": 2,
+                        "missing_families": ["RESTING_LIQUIDITY"],
+                        "readiness_blockers": [
+                            "COMMISSIONING_SESSION_NOT_WARMED",
+                            "PAPER_EVIDENCE_NOT_WARMED",
+                            "PAPER_CONTINUITY_UNUSABLE",
+                        ],
+                    },
+                    "readiness": {
+                        "continuity": {
+                            "local_sequence_gap": True,
+                            "depth_reset_recovery": False,
+                        },
+                    },
+                }
+            return {"stage": "RUNNING", "in_progress": False, "action_token": "target-token"}
+
+        result = supervise(
+            manifest_path,
+            2_147_483_647,
+            timeout_seconds=0.2,
+            poll_seconds=0.001,
+            pid_probe=lambda _pid: False,
+            port_probe=lambda: True,
+            wait=lambda _seconds: None,
+            launch_child=launch,  # type: ignore[arg-type]
+            http_json=http,
+        )
+        self.assertEqual(result, 0)
+        self.assertTrue(saw_warmup_projection)
+        self.assertEqual(process.terminate_calls, 0)
+
     def test_perpetual_blocked_autostart_retains_active_flat_target(self) -> None:
         manifest_path, manifest = self.supervisor_ready_manifest(
             "switch-request-perpetual-autostart-blocked",

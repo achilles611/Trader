@@ -71,7 +71,7 @@ _SOURCE_BEFORE_OPERATION = re.compile(r"^source-before-(profile-switch-[0-9a-f]{
 _ACTIVE_STAGES = frozenset({
     "PREPARING", "STOPPING_CURRENT", "AWAITING_FLAT", "SHUTDOWN_REQUESTED",
     "VERIFYING_STARTUP_SEED", "STARTING_TARGET", "TARGET_PROCESS_CREATED",
-    "AUTOSTARTING_TARGET", "TARGET_ACTIVE_FLAT_BLOCKED",
+    "AUTOSTARTING_TARGET", "WARMING_TARGET_EVIDENCE", "TARGET_ACTIVE_FLAT_BLOCKED",
     "TARGET_CLEANUP_UNPROVEN",
 })
 _TERMINAL_STAGES = frozenset({"RUNNING", "BLOCKED_SAFE", "RUNNING_SELECTION_PERSISTENCE_FAILED"})
@@ -2884,7 +2884,7 @@ def supervise(
     last_auto: dict[str, object] = {}
     last_paper: dict[str, object] = {}
     last_error: str | None = None
-    active_projection: tuple[str, tuple[str, ...]] | None = None
+    active_projection: tuple[str, tuple[str, ...], str] | None = None
 
     def current_target_binding() -> tuple[dict[str, object] | None, str | None]:
         """Read one process-bound identity without accepting a replacement listener."""
@@ -2909,17 +2909,72 @@ def supervise(
             return None, "TARGET_PROCESS_EXITED_DURING_STARTUP"
         return dict(pinned_target_binding), None
 
+    def autostart_blockers(
+        auto: Mapping[str, object], *, fallback: str,
+    ) -> list[str]:
+        values: list[str] = []
+        direct = auto.get("blockers")
+        if isinstance(direct, (list, tuple)):
+            values.extend(str(value) for value in direct if isinstance(value, str) and value)
+        warmup = auto.get("warmup")
+        if isinstance(warmup, Mapping):
+            readiness_blockers = warmup.get("readiness_blockers")
+            if isinstance(readiness_blockers, (list, tuple)):
+                values.extend(
+                    str(value) for value in readiness_blockers
+                    if isinstance(value, str) and value
+                )
+            missing = warmup.get("missing_families")
+            if isinstance(missing, (list, tuple)):
+                values.extend(
+                    f"SCALPER_EVIDENCE_FAMILY_MISSING_{value}"
+                    for value in missing if isinstance(value, str) and value
+                )
+        readiness = auto.get("readiness")
+        continuity = readiness.get("continuity") if isinstance(readiness, Mapping) else None
+        if isinstance(continuity, Mapping):
+            if continuity.get("local_sequence_gap") is True:
+                values.append("LOCAL_SEQUENCE_GAP_REWARM_REQUIRED")
+            if continuity.get("depth_reset_recovery") is True:
+                values.append("DEPTH_RESET_RECOVERY_REWARM_REQUIRED")
+        return list(dict.fromkeys(values)) or [fallback]
+
     def project_active_target(stage: str, blockers: list[str]) -> None:
         nonlocal active_projection
-        projection = (stage, tuple(blockers))
+        warmup = last_auto.get("warmup")
+        progress = dict(warmup) if isinstance(warmup, Mapping) else {}
+        elapsed = progress.get("elapsed_seconds")
+        elapsed_bucket = (
+            int(float(elapsed) // 5.0)
+            if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool)
+            else None
+        )
+        semantic_progress = {
+            "covered_family_count": progress.get("covered_family_count"),
+            "family_progress": progress.get("family_progress"),
+            "missing_families": progress.get("missing_families"),
+            "readiness_blockers": progress.get("readiness_blockers"),
+            "elapsed_five_second_bucket": elapsed_bucket,
+        }
+        progress_fingerprint = hashlib.sha256(
+            json.dumps(
+                semantic_progress, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8"),
+        ).hexdigest()
+        projection = (stage, tuple(blockers), progress_fingerprint)
         if projection == active_projection:
             return
         active_projection = projection
         _state_update(
             state_path,
-            "TARGET_ACTIVE_FLAT_BLOCKED"
-            if stage == "TARGET_ACTIVE_FLAT_BLOCKED"
-            else "TARGET_AUTOSTART_OBSERVATION_PENDING",
+            (
+                "TARGET_ACTIVE_FLAT_BLOCKED"
+                if stage == "TARGET_ACTIVE_FLAT_BLOCKED"
+                else "TARGET_EVIDENCE_WARMUP_PENDING"
+                if stage == "WARMING_TARGET_EVIDENCE"
+                else "TARGET_AUTOSTART_OBSERVATION_PENDING"
+            ),
             stage=stage,
             blockers=blockers,
             target_pid=process.pid,
@@ -2927,6 +2982,7 @@ def supervise(
             target_runtime_binding=binding,
             target_autostart=last_auto,
             target_paper_status=last_paper,
+            target_warmup_progress=progress,
         )
 
     while True:
@@ -3133,7 +3189,16 @@ def supervise(
             )
             return 0
 
-        if paper_observed and _target_perpetual_flat_blocked(last_paper, manifest):
+        if (
+            auto_observed
+            and last_auto.get("in_progress") is True
+            and last_auto.get("stage") == "WAITING_FOR_EVIDENCE"
+        ):
+            warming_blockers = autostart_blockers(
+                last_auto, fallback="TARGET_SCALPER_EVIDENCE_WARMUP_PENDING",
+            )
+            project_active_target("WARMING_TARGET_EVIDENCE", warming_blockers)
+        elif paper_observed and _target_perpetual_flat_blocked(last_paper, manifest):
             project_active_target(
                 "TARGET_ACTIVE_FLAT_BLOCKED",
                 [_target_position_blocker(last_paper)],
@@ -3173,11 +3238,8 @@ def supervise(
                 )
             assert terminal_binding is not None
             binding = terminal_binding
-            auto_blockers = last_auto.get("blockers")
-            blockers = (
-                [str(value) for value in auto_blockers]
-                if isinstance(auto_blockers, list) and auto_blockers
-                else ["TARGET_AUTOSTART_BLOCKED"]
+            blockers = autostart_blockers(
+                last_auto, fallback="TARGET_AUTOSTART_BLOCKED",
             )
             return block_after_target_cleanup(
                 blockers,

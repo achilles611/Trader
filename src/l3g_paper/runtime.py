@@ -27,6 +27,7 @@ from .contracts import (
     CAPABILITY,
     FIVE_MINUTE_ENTRY_PROFILE_VERSION,
     FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
+    PAPER_ENTRY_PROFILE_VERSION,
     BookCompleteness,
     PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS,
     PAPER_ACCOUNT_DAILY_LOSS_POLICY_ID,
@@ -6769,6 +6770,15 @@ class LaneIIIPaperRuntime:
                 "local_bridge_healthy": self._snapshot.local_bridge_healthy,
                 "market_price_connected": self._snapshot.market_price_connected,
             },
+            "continuity": {
+                "local_sequence_gap": self._snapshot.local_sequence_gap,
+                "depth_reset_recovery": self._snapshot.depth_reset_recovery,
+                "recovery_condition": (
+                    "FRESH_POLICY_EVIDENCE_REWARM_REQUIRED"
+                    if self._snapshot.local_sequence_gap or self._snapshot.depth_reset_recovery
+                    else None
+                ),
+            },
             "market_freshness": freshness,
             "commissioning_warmup": {
                 "status": "WARMED" if self._snapshot.commissioning_session_warmed else "NOT_WARMED",
@@ -6881,12 +6891,36 @@ class LaneIIIPaperRuntime:
             hash_payload = dict(result)
             hash_payload.pop("snapshot_hash", None)
             result["snapshot_hash"] = canonical_hash(hash_payload)
-        return {
+        elif self.policy.artifact.entry_profile_version == PAPER_ENTRY_PROFILE_VERSION:
+            # Operational Scalper authority uses the ordinary strategy
+            # preflight, not the commissioning-only latch.  Surface those
+            # pure, counter-free predicates here so readiness cannot become
+            # READY after transient strategy evidence has expired and then
+            # rely on the mutating arm attempt to discover the mismatch.
+            with self._lock:
+                operational_reasons = self.risk.preflight_reasons(
+                    self._snapshot, at=_now(), commissioning=False,
+                )
+            raw_reasons = [
+                str(value) for value in result.get("blocking_reasons", [])
+                if isinstance(value, str)
+            ]
+            blocking = list(dict.fromkeys((*raw_reasons, *operational_reasons)))
+            result = {
+                **result,
+                "result": "READY" if not blocking else "BLOCKED",
+                "blocking_reasons": blocking,
+            }
+        operational = {
             **result,
             "schema": "lane-iii-phase-g-operational-paper-readiness-v1",
             "operational_paper": True,
             "commissioning": False,
         }
+        hash_payload = dict(operational)
+        hash_payload.pop("snapshot_hash", None)
+        operational["snapshot_hash"] = canonical_hash(hash_payload)
+        return operational
 
     def operational_paper_start(
         self,

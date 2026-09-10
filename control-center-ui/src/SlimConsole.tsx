@@ -139,8 +139,16 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
   const session = status?.session || {};
   const startEnabled = autoStartButton.enabled === true && autoStart?.in_progress !== true && !paper.autoStartBusy;
   const pnlUnavailable = pnl.state !== "CURRENT";
+  const autoWarmup = autoStart?.warmup || {};
+  const autoWarmupDetail = [
+    autoStart?.blockers?.length ? `Blockers: ${autoStart.blockers.join(", ")}` : "",
+    autoWarmup?.missing_families?.length
+      ? `Missing: ${autoWarmup.missing_families.join(", ")}` : "",
+    typeof autoWarmup?.elapsed_seconds === "number"
+      ? `Elapsed: ${autoWarmup.elapsed_seconds}s / ${autoWarmup.timeout_seconds ?? "?"}s` : "",
+  ].filter(Boolean).join(" · ");
   const startupStatus = autoStart?.in_progress
-    ? autoStartButton.label
+    ? `${autoStartButton.label}${autoWarmupDetail ? ` — ${autoWarmupDetail}` : ""}`
     : autoStart?.blockers?.length ? `Blocked: ${autoStart.blockers.join(", ")}`
     : "Launch, sign-in, MNQ observer, reconciliation, and ledger verification are automatic.";
   const profileSwitch = paper.profileSwitch;
@@ -199,7 +207,7 @@ export function SlimConsole({ paper, onFullConsole }: Props) {
   const switchStatus = runningTargetHasStaleSwitchProjection
     ? "Selected profile is running. The prior switch projection is stale."
     : switchInProgress
-    ? `Switch in progress: ${String(profileSwitch.stage || "PREPARING").replaceAll("_", " ")}`
+    ? `Switch in progress: ${String(profileSwitch.stage || "PREPARING").replaceAll("_", " ")}${profileSwitch?.blockers?.length ? ` — ${profileSwitch.blockers.join(", ")}` : ""}`
     : switchStage === "RUNNING_SELECTION_PERSISTENCE_FAILED"
     ? `Target is running, but its remembered selection was not durably established: ${profileSwitch?.blockers?.join(", ") || "PROFILE_SELECTION_PERSISTENCE_FAILED"}`
     : switchBlocked

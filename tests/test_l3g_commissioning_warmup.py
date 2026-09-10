@@ -152,6 +152,60 @@ class CommissioningWarmupTests(unittest.TestCase):
                 )
                 runtime.stop(); ledger.close()
 
+    def test_same_session_gap_clears_only_after_all_authentic_families_rewarm(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            runtime = LaneIIIPaperRuntime(ledger)
+            factory = self.warm(runtime)
+            before = runtime.status()
+            preserved = {
+                key: before[key] for key in (
+                    "daily_realized_pnl", "session_entries",
+                    "trade_date_entry_count", "consecutive_losses",
+                )
+            }
+
+            class EvidenceClock(datetime):
+                @classmethod
+                def now(cls, tz: timezone | None = None) -> datetime:
+                    return START if tz is not None else START.replace(tzinfo=None)
+
+            with patch("src.l3g_paper.policy.datetime", EvidenceClock):
+                factory.sequence += 1
+                runtime.ingest(factory.quote(100))
+                after_gap = runtime.status()
+                self.assertTrue(after_gap["continuity"]["local_sequence_gap"])
+                self.assertFalse(after_gap["commissioning_session_warmed"])
+                self.assertFalse(after_gap["strategy_evidence_warmed"])
+
+                # Re-form each family from new, same-session observations;
+                # no synthetic baseline or counter reset participates.
+                for price in (100, 99, 100):
+                    quote = factory.quote(price)
+                    runtime.ingest(quote)
+                    runtime.ingest(factory.trade(quote, price))
+                for operation, volume in (
+                    ("ADD", 10), ("UPDATE", 5), ("UPDATE", 10),
+                    ("UPDATE", 5), ("UPDATE", 11),
+                ):
+                    runtime.ingest(factory.depth(operation, volume))
+
+            recovered = runtime.status()
+            self.assertFalse(recovered["continuity"]["local_sequence_gap"])
+            self.assertTrue(recovered["commissioning_session_warmed"])
+            self.assertTrue(recovered["strategy_evidence_warmed"])
+            self.assertEqual(
+                {key: recovered[key] for key in preserved}, preserved,
+            )
+            self.assertEqual(runtime.policy.status()["counters"]["local_sequence_gaps"], 1)
+            self.assertEqual(
+                len(ledger.recent_kinds(("COMMISSIONING_SESSION_WARMUP_RESET",))), 1,
+            )
+            self.assertEqual(
+                len(ledger.recent_kinds(("COMMISSIONING_SESSION_WARMED",))), 2,
+            )
+            runtime.stop(); ledger.close()
+
     def test_session_generation_off_session_reconnect_and_restart_start_cold(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "paper.sqlite3"
@@ -217,6 +271,29 @@ class CommissioningWarmupTests(unittest.TestCase):
             self.assertEqual(runtime.status()["entry_owner"], "NONE")
             self.assertEqual(runtime.risk.status()["arm_attempts"], risk_before)
             self.assertEqual(ledger.health_status()["highest_sequence"], before)
+            runtime.stop(); ledger.close()
+
+    def test_operational_readiness_includes_counter_free_strategy_preflight(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            runtime = LaneIIIPaperRuntime(ledger)
+            runtime._state = PaperRuntimeState.READY_DISARMED
+            runtime._snapshot = replace(
+                runtime._snapshot,
+                evidence_warmed=False,
+                commissioning_session_warmed=True,
+            )
+            before = runtime.risk.status()["arm_attempts"]
+            with patch("src.l3g_paper.runtime._now", return_value="2026-08-26T14:00:00Z"):
+                result = runtime.operational_paper_readiness(
+                    lambda commissioning_id, snapshot: {
+                        "ledger_trust_state": "TEST_VERIFIED_ANCHOR",
+                    },
+                )
+            self.assertEqual(result["result"], "BLOCKED")
+            self.assertIn("PAPER_EVIDENCE_NOT_WARMED", result["blocking_reasons"])
+            self.assertEqual(result["strategy_evidence"]["status"], "INCOMPLETE")
+            self.assertEqual(runtime.risk.status()["arm_attempts"], before)
             runtime.stop(); ledger.close()
 
 

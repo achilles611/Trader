@@ -5,6 +5,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import threading
 import unittest
 
 from fastapi import HTTPException
@@ -21,8 +22,10 @@ def ready_paper() -> dict[str, object]:
         "paper_execution": "DISARMED",
         "session_armed_state": "DISARMED",
         "live_capital": "DENIED",
+        "paper_account": "Sim101",
         "account_class": "LOCAL_SIMULATION",
         "market_instrument": "MNQ SEP26",
+        "maximum_quantity": 1,
         "current_position": "FLAT",
         "current_quantity": 0,
         "broker_snapshot_position": "FLAT",
@@ -65,12 +68,78 @@ def passing_full_verification() -> dict[str, object]:
     }
 
 
+def ready_operational_readiness() -> dict[str, object]:
+    return {
+        "schema": "lane-iii-phase-g-operational-paper-readiness-v1",
+        "result": "READY",
+        "blocking_reasons": [],
+        "commissioning_warmup": {
+            "status": "WARMED",
+            "required_families": {
+                family: {"seen": True, "provenance": {"evidence_id": f"evidence-{family}"}}
+                for family in ("STRUCTURAL_CONTEXT", "ORDER_FLOW", "RESTING_LIQUIDITY")
+            },
+        },
+        "strategy_evidence": {"status": "ACTIVE"},
+    }
+
+
+def warming_operational_readiness(*, continuity_gap: bool = False) -> dict[str, object]:
+    reasons = ["COMMISSIONING_SESSION_NOT_WARMED", "PAPER_EVIDENCE_NOT_WARMED"]
+    if continuity_gap:
+        reasons.append("PAPER_CONTINUITY_UNUSABLE")
+    return {
+        "schema": "lane-iii-phase-g-operational-paper-readiness-v1",
+        "result": "BLOCKED",
+        "blocking_reasons": reasons,
+        "session": {"current": True, "session_kind": "NEW_YORK_RTH"},
+        "observer": {
+            "status": "ACTIVE",
+            "continuity_healthy": not continuity_gap,
+            "local_bridge_healthy": True,
+            "market_price_connected": True,
+        },
+        "continuity": {
+            "local_sequence_gap": continuity_gap,
+            "depth_reset_recovery": False,
+            "recovery_condition": (
+                "FRESH_POLICY_EVIDENCE_REWARM_REQUIRED" if continuity_gap else None
+            ),
+        },
+        "market_freshness": {
+            name: {"fresh": True} for name in ("quote", "classified_trade", "depth_mutation")
+        },
+        "commissioning_warmup": {
+            "status": "NOT_WARMED",
+            "required_families": {
+                "STRUCTURAL_CONTEXT": {"seen": True, "provenance": {"evidence_id": "structural"}},
+                "ORDER_FLOW": {"seen": True, "provenance": {"evidence_id": "flow"}},
+                "RESTING_LIQUIDITY": {"seen": False, "provenance": None},
+            },
+        },
+        "strategy_evidence": {"status": "INCOMPLETE"},
+    }
+
+
+class ManualClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def wait(self, seconds: float) -> bool:
+        self.now += seconds
+        return False
+
+
 class PaperAutoStartTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = TemporaryDirectory()
         self.paper = ready_paper()
         self.maintenance = ready_maintenance()
         self.verification = passing_full_verification()
+        self.readiness = ready_operational_readiness()
         self.ensure_requests: list[str] = []
         self.full_starts = 0
         self.operational_requests: list[str] = []
@@ -98,7 +167,14 @@ class PaperAutoStartTests(unittest.TestCase):
             ninjatrader_status=lambda: deepcopy(self.maintenance),
             start_full_verification=full,
             ledger_status=lambda: deepcopy(self.verification),
+            operational_readiness=lambda: deepcopy(self.readiness),
             start_operational_paper=operational,
+            begin_startup_observation_pause=lambda: {"paused": True, "drained": True},
+            end_startup_observation_pause=lambda: {"paused": False},
+            stop_operational_paper=lambda: (
+                self.paper.__setitem__("operational_paper_session", {"active": False})
+                or {"flat_confirmed": True}
+            ),
             audit_path=Path(self.temporary.name) / "paper-autostart.jsonl",
             startup_timeout_seconds=0.2,
             ledger_timeout_seconds=0.2,
@@ -139,6 +215,25 @@ class PaperAutoStartTests(unittest.TestCase):
         self.assertEqual(self.ensure_requests, [])
         self.assertEqual(self.full_starts, 0)
         self.assertEqual(self.operational_requests, [])
+
+    def test_account_instrument_and_quantity_boundary_cannot_be_widened(self) -> None:
+        cases = (
+            ("paper_account", "Lucid25kflex01", "PAPER_ACCOUNT_NOT_SIM101"),
+            ("account_class", "LIVE", "ACCOUNT_NOT_LOCAL_SIMULATION"),
+            ("market_instrument", "NQ SEP26", "INSTRUMENT_NOT_MNQ_SEP26"),
+            ("maximum_quantity", 2, "MAXIMUM_QUANTITY_NOT_ONE"),
+            ("live_capital", "ALLOWED", "LIVE_CAPITAL_NOT_DENIED"),
+        )
+        for index, (field, value, blocker) in enumerate(cases):
+            with self.subTest(field=field):
+                self.paper = ready_paper()
+                self.paper[field] = value
+                service = self.service()
+                status = service.start(f"paper-auto-boundary-{index}")
+                self.assertEqual(status["stage"], "BLOCKED")
+                self.assertIn(blocker, status["blockers"])
+                self.assertEqual(self.ensure_requests, [])
+                self.assertEqual(self.operational_requests, [])
 
     def test_native_observer_or_reconciliation_failure_blocks_before_full_scan(self) -> None:
         self.maintenance = {
@@ -202,10 +297,14 @@ class PaperAutoStartTests(unittest.TestCase):
             ninjatrader_status=lambda: deepcopy(self.maintenance),
             start_full_verification=start_full,
             ledger_status=ledger_status,
+            operational_readiness=lambda: ready_operational_readiness(),
             start_operational_paper=lambda request_id: (
                 self.paper.__setitem__("operational_paper_session", {"active": True})
                 or {"started": True}
             ),
+            begin_startup_observation_pause=lambda: {"paused": True, "drained": True},
+            end_startup_observation_pause=lambda: {"paused": False},
+            stop_operational_paper=lambda: {"flat_confirmed": True},
             audit_path=Path(self.temporary.name) / "paper-autostart-existing-verifier.jsonl",
             startup_timeout_seconds=0.2,
             ledger_timeout_seconds=0.2,
@@ -215,6 +314,250 @@ class PaperAutoStartTests(unittest.TestCase):
         service.wait(2)
         self.assertEqual(service.status()["stage"], "RUNNING")
         self.assertEqual(starts, ["lv-incremental-test", "lv-full-test"])
+
+    def test_delayed_resting_liquidity_waits_then_starts_once(self) -> None:
+        self.paper["entry_profile_version"] = "BEELZEBUB_SCALPER_V2"
+        clock = ManualClock()
+        reports = [
+            warming_operational_readiness(),
+            warming_operational_readiness(),
+            ready_operational_readiness(),
+            ready_operational_readiness(),
+        ]
+        service = self.service()
+        service._clock = clock
+        service._wait = clock.wait
+        service._custom_wait = clock.wait
+        service._readiness_timeout_seconds = 10.0
+        service._operational_readiness = lambda: deepcopy(
+            reports.pop(0) if len(reports) > 1 else reports[0]
+        )
+        service.start("paper-auto-delayed-depth")
+        service.wait(2)
+        status = service.status()
+        self.assertEqual(status["stage"], "RUNNING")
+        self.assertEqual(self.operational_requests, ["paper-auto-delayed-depth"])
+        self.assertEqual(status["warmup"]["covered_family_count"], 3)
+        self.assertEqual(status["warmup"]["missing_families"], [])
+        self.assertEqual(self.full_starts, 2)
+
+    def test_authentic_continuity_rewarm_waits_then_starts_once(self) -> None:
+        self.paper["entry_profile_version"] = "BEELZEBUB_SCALPER_V2"
+        clock = ManualClock()
+        reports = [
+            warming_operational_readiness(continuity_gap=True),
+            ready_operational_readiness(),
+            ready_operational_readiness(),
+        ]
+        service = self.service()
+        service._clock = clock
+        service._wait = clock.wait
+        service._custom_wait = clock.wait
+        service._operational_readiness = lambda: deepcopy(
+            reports.pop(0) if len(reports) > 1 else reports[0]
+        )
+        service.start("paper-auto-continuity-rewarm")
+        service.wait(2)
+        self.assertEqual(service.status()["stage"], "RUNNING")
+        self.assertEqual(self.operational_requests, ["paper-auto-continuity-rewarm"])
+
+    def test_unproven_continuity_recovery_is_hard_blocked(self) -> None:
+        self.paper["entry_profile_version"] = "BEELZEBUB_SCALPER_V2"
+        self.readiness = warming_operational_readiness(continuity_gap=True)
+        self.readiness["continuity"]["recovery_condition"] = None
+        service = self.service()
+        service.start("paper-auto-unresolved-gap")
+        service.wait(2)
+        status = service.status()
+        self.assertEqual(status["stage"], "BLOCKED")
+        self.assertIn("SCALPER_CONTINUITY_RECOVERY_UNPROVEN", status["blockers"])
+        self.assertEqual(self.operational_requests, [])
+
+    def test_missing_evidence_times_out_with_progress_and_no_start(self) -> None:
+        self.paper["entry_profile_version"] = "BEELZEBUB_SCALPER_V2"
+        clock = ManualClock()
+        self.readiness = warming_operational_readiness()
+        service = self.service()
+        service._clock = clock
+        service._wait = clock.wait
+        service._custom_wait = clock.wait
+        service._readiness_timeout_seconds = 2.0
+        service.start("paper-auto-warmup-timeout")
+        service.wait(2)
+        status = service.status()
+        self.assertEqual(status["stage"], "BLOCKED")
+        self.assertIn("SCALPER_EVIDENCE_WARMUP_TIMEOUT", status["blockers"])
+        self.assertEqual(status["warmup"]["missing_families"], ["RESTING_LIQUIDITY"])
+        self.assertGreaterEqual(status["warmup"]["elapsed_seconds"], 2.0)
+        self.assertEqual(self.operational_requests, [])
+
+    def test_hard_unknown_and_mixed_readiness_fail_without_start(self) -> None:
+        cases = (
+            ["DAILY_LOSS_ALLOWANCE_INSUFFICIENT"],
+            ["UNKNOWN_GATE"],
+            ["COMMISSIONING_SESSION_NOT_WARMED", "RECONCILIATION_INCOMPLETE"],
+        )
+        for index, reasons in enumerate(cases):
+            with self.subTest(reasons=reasons):
+                self.operational_requests.clear()
+                self.paper["entry_profile_version"] = "BEELZEBUB_SCALPER_V2"
+                self.readiness = warming_operational_readiness()
+                self.readiness["blocking_reasons"] = reasons
+                service = self.service()
+                service.start(f"paper-auto-hard-block-{index}")
+                service.wait(2)
+                self.assertEqual(service.status()["stage"], "BLOCKED")
+                self.assertEqual(self.operational_requests, [])
+
+    def test_readiness_regression_immediately_before_start_never_calls_start(self) -> None:
+        self.paper["entry_profile_version"] = "BEELZEBUB_SCALPER_V2"
+        reports = [ready_operational_readiness(), warming_operational_readiness()]
+        service = self.service()
+        service._operational_readiness = lambda: deepcopy(reports.pop(0))
+        service.start("paper-auto-readiness-regression")
+        service.wait(2)
+        status = service.status()
+        self.assertEqual(status["stage"], "BLOCKED")
+        self.assertIn("OPERATIONAL_READINESS_REGRESSED", status["blockers"])
+        self.assertEqual(self.operational_requests, [])
+
+    def test_expired_strategy_evidence_never_calls_start(self) -> None:
+        self.paper["entry_profile_version"] = "BEELZEBUB_SCALPER_V2"
+        self.readiness = ready_operational_readiness()
+        self.readiness["strategy_evidence"] = {"status": "INCOMPLETE"}
+        service = self.service()
+        service.start("paper-auto-expired-strategy-evidence")
+        service.wait(2)
+        status = service.status()
+        self.assertEqual(status["stage"], "BLOCKED")
+        self.assertIn("SCALPER_READY_EVIDENCE_PROOF_INVALID", status["blockers"])
+        self.assertEqual(self.operational_requests, [])
+
+    def test_non_scalper_profile_preserves_existing_start_path(self) -> None:
+        readiness_calls = 0
+
+        def readiness() -> dict[str, object]:
+            nonlocal readiness_calls
+            readiness_calls += 1
+            return warming_operational_readiness()
+
+        service = self.service()
+        service._operational_readiness = readiness
+        service.start("paper-auto-non-scalper-path")
+        service.wait(2)
+        self.assertEqual(service.status()["stage"], "RUNNING")
+        self.assertEqual(readiness_calls, 0)
+        self.assertEqual(self.full_starts, 1)
+        self.assertEqual(self.operational_requests, ["paper-auto-non-scalper-path"])
+
+    def test_stop_during_final_readiness_cannot_reach_start(self) -> None:
+        self.paper["entry_profile_version"] = "BEELZEBUB_SCALPER_V2"
+        entered = threading.Event()
+        release = threading.Event()
+        readiness_calls = 0
+
+        def readiness() -> dict[str, object]:
+            nonlocal readiness_calls
+            readiness_calls += 1
+            if readiness_calls == 2:
+                entered.set()
+                self.assertTrue(release.wait(2))
+            return ready_operational_readiness()
+
+        service = self.service()
+        service._operational_readiness = readiness
+        service.start("paper-auto-cancel-final-readiness")
+        self.assertTrue(entered.wait(2))
+        service.stop(timeout_seconds=0.01)
+        release.set()
+        service.wait(2)
+        self.assertEqual(service.status()["stage"], "CANCELLED")
+        self.assertEqual(self.operational_requests, [])
+
+    def test_requests_during_warmup_reuse_one_operation_and_one_start(self) -> None:
+        self.paper["entry_profile_version"] = "BEELZEBUB_SCALPER_V2"
+        entered = threading.Event()
+        release = threading.Event()
+        readiness_calls = 0
+
+        def readiness() -> dict[str, object]:
+            nonlocal readiness_calls
+            readiness_calls += 1
+            if readiness_calls == 1:
+                entered.set()
+                self.assertTrue(release.wait(2))
+                return warming_operational_readiness()
+            return ready_operational_readiness()
+
+        service = self.service()
+        service._operational_readiness = readiness
+        first = service.start("paper-auto-warmup-idempotent")
+        self.assertTrue(entered.wait(2))
+        same = service.start("paper-auto-warmup-idempotent")
+        different = service.start("paper-auto-warmup-different")
+        self.assertEqual(first["operation_id"], same["operation_id"])
+        self.assertEqual(first["operation_id"], different["operation_id"])
+        release.set()
+        service.wait(2)
+        self.assertEqual(service.status()["stage"], "RUNNING")
+        self.assertEqual(self.operational_requests, ["paper-auto-warmup-idempotent"])
+
+    def test_alternating_waitable_reasons_share_one_fixed_deadline(self) -> None:
+        self.paper["entry_profile_version"] = "BEELZEBUB_SCALPER_V2"
+        clock = ManualClock()
+        calls = 0
+
+        def readiness() -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            report = warming_operational_readiness(continuity_gap=calls % 2 == 0)
+            return report
+
+        service = self.service()
+        service._clock = clock
+        service._wait = clock.wait
+        service._custom_wait = clock.wait
+        service._readiness_timeout_seconds = 2.0
+        service._operational_readiness = readiness
+        service.start("paper-auto-one-fixed-deadline")
+        service.wait(2)
+        self.assertEqual(service.status()["stage"], "BLOCKED")
+        self.assertIn("SCALPER_EVIDENCE_WARMUP_TIMEOUT", service.status()["blockers"])
+        self.assertGreaterEqual(clock.now, 2.0)
+        self.assertLess(clock.now, 2.01)
+        self.assertEqual(self.operational_requests, [])
+
+    def test_post_warmup_full_must_cover_fixed_current_tip(self) -> None:
+        self.paper["entry_profile_version"] = "BEELZEBUB_SCALPER_V2"
+        service = self.service()
+        service._begin_startup_observation_pause = lambda: (
+            self.paper["ledger"].__setitem__("highest_sequence", 126)
+            or {"paused": True, "drained": True}
+        )
+        service.start("paper-auto-final-full-current-tip")
+        service.wait(2)
+        status = service.status()
+        self.assertEqual(status["stage"], "BLOCKED")
+        self.assertIn("FULL_LEDGER_VERIFICATION_NOT_CURRENT", status["blockers"])
+        self.assertEqual(self.full_starts, 2)
+        self.assertEqual(self.operational_requests, [])
+
+    def test_tuple_and_nested_start_refusal_reasons_are_retained(self) -> None:
+        service = self.service()
+        service._start_operational_paper = lambda request_id: {
+            "started": False,
+            "reason_codes": ("PAPER_CONTINUITY_UNUSABLE",),
+            "readiness": {
+                "blocking_reasons": ["COMMISSIONING_SESSION_NOT_WARMED"],
+            },
+        }
+        service.start("paper-auto-exact-refusal")
+        service.wait(2)
+        self.assertEqual(service.status()["blockers"], [
+            "PAPER_CONTINUITY_UNUSABLE",
+            "COMMISSIONING_SESSION_NOT_WARMED",
+            "OPERATIONAL_PAPER_START_REFUSED",
+        ])
 
     def test_stopped_operational_session_returns_to_idle_display_state(self) -> None:
         service = self.service()

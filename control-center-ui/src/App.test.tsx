@@ -885,6 +885,52 @@ describe("copy control center", () => {
     expect(screen.queryByRole("button", { name: "Ledger Verification" })).not.toBeInTheDocument();
   });
 
+  it("shows exact Scalper warmup blockers and progress in Slim and Full consoles", async () => {
+    paperAutoStartResponse = {
+      action_token: "fixture-paper-autostart-token",
+      stage: "WAITING_FOR_EVIDENCE",
+      in_progress: true,
+      button: { label: "Warming Scalper evidence…", enabled: false, tone: "progress" },
+      blockers: [
+        "COMMISSIONING_SESSION_NOT_WARMED",
+        "SCALPER_EVIDENCE_FAMILY_MISSING_RESTING_LIQUIDITY",
+      ],
+      warmup: {
+        covered_family_count: 2,
+        missing_families: ["RESTING_LIQUIDITY"],
+        elapsed_seconds: 15,
+        timeout_seconds: 120,
+      },
+      ledger: { status: "PASS", verified_through_sequence: 13 },
+    };
+    profileSwitchResponse = {
+      ...profileSwitchResponse,
+      stage: "WARMING_TARGET_EVIDENCE",
+      in_progress: true,
+      target_profile: "BEELZEBUB_SCALPER_V2",
+      blockers: ["SCALPER_EVIDENCE_FAMILY_MISSING_RESTING_LIQUIDITY"],
+    };
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Slim Console" }));
+    expect(await screen.findByText(/Elapsed: 15s \/ 120s/)).toHaveTextContent(
+      "SCALPER_EVIDENCE_FAMILY_MISSING_RESTING_LIQUIDITY",
+    );
+    expect(screen.getByText(/Switch in progress: WARMING TARGET EVIDENCE/)).toHaveTextContent(
+      "SCALPER_EVIDENCE_FAMILY_MISSING_RESTING_LIQUIDITY",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Full Console" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Lane III Paper" }));
+    const diagnostics = (await screen.findByRole("heading", {
+      name: "Operational paper startup diagnostics",
+    })).closest("section") as HTMLElement;
+    expect(diagnostics).toHaveTextContent("WAITING_FOR_EVIDENCE");
+    expect(diagnostics).toHaveTextContent("2 / 3");
+    expect(diagnostics).toHaveTextContent("RESTING_LIQUIDITY");
+    expect(diagnostics).toHaveTextContent("15s / 120s");
+  });
+
   it("preserves an active backend paper session across refresh and mode changes, then uses STOP TRADING", async () => {
     slimStatusResponse = {
       generated_at: new Date().toISOString(), light: "GREEN", label: "PAPER TRADING ACTIVE",

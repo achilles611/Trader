@@ -1947,13 +1947,33 @@ def create_control_center_app(
             )
             raise RuntimeError("OPERATIONAL_PAPER_START_REFUSED") from error
 
+    def operational_paper_readiness_from_autostart() -> Mapping[str, object]:
+        """Read the exact canonical start proof without acquiring authority."""
+        paper = ninjatrader_runtime.get("paper")
+        if not isinstance(paper, LaneIIIPaperRuntime):
+            raise RuntimeError("PAPER_RUNTIME_UNAVAILABLE")
+        return paper.operational_paper_readiness(
+            require_operational_paper_ledger_verification,
+        )
+
+    def stop_operational_paper_from_autostart() -> Mapping[str, object]:
+        """Use the normal evidence-preserving stop if the startup pause cannot resume."""
+        paper = ninjatrader_runtime.get("paper")
+        if not isinstance(paper, LaneIIIPaperRuntime):
+            raise RuntimeError("PAPER_RUNTIME_UNAVAILABLE")
+        return paper.flatten_and_disarm()
+
     paper_autostart = PaperAutoStartService(
         paper_status=lane_iii_paper_health,
         ensure_ninjatrader=ninjatrader_maintenance.ensure_started,
         ninjatrader_status=ninjatrader_maintenance.status,
         start_full_verification=lambda: ledger_verifier.start("full"),
         ledger_status=ledger_verifier.status,
+        operational_readiness=operational_paper_readiness_from_autostart,
         start_operational_paper=start_operational_paper_from_autostart,
+        begin_startup_observation_pause=begin_startup_observation_pause,
+        end_startup_observation_pause=end_startup_observation_pause,
+        stop_operational_paper=stop_operational_paper_from_autostart,
         audit_path=audit_root / "paper-autostart-audit.jsonl",
     )
     reconciliation_recovery = ReconciliationRecoveryService(

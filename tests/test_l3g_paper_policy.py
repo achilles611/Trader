@@ -12,6 +12,18 @@ from tests.l3g_helpers import ObservationFactory, warmed_bullish_policy
 
 
 class PaperPolicyTests(unittest.TestCase):
+    def test_arbitrary_first_sequence_is_an_attachment_baseline_not_a_gap(self) -> None:
+        policy = ExperimentalPaperPolicy()
+        policy.on_transport_state(StreamHealth.HEALTHY)
+        factory = ObservationFactory()
+        factory.sequence = 4_071
+        first = factory.quote(100)
+        decision = policy.ingest(first)
+        status = policy.status()
+        self.assertNotEqual(decision.reason_code, "LOCAL_SEQUENCE_GAP")
+        self.assertEqual(status["counters"]["local_sequence_gaps"], 0)
+        self.assertEqual(status["last_local_sequence"], 4_072)
+
     def test_non_market_observation_advances_global_local_sequence(self) -> None:
         policy = ExperimentalPaperPolicy(); policy.on_transport_state(StreamHealth.HEALTHY)
         factory = ObservationFactory()
