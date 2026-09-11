@@ -8,6 +8,10 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
+from src.copytrade.control_center import (
+    HeartbeatTimeRecoveryBoundaryError,
+    _recover_heartbeat_time_at_stable_ledger_tip,
+)
 from src.l3g_paper.contracts import PaperRuntimeState
 from src.l3g_paper.ledger import PaperLedger
 from src.l3g_paper.ninjatrader_transport import (
@@ -205,6 +209,160 @@ class HeartbeatTimeRecoveryTests(unittest.TestCase):
                     )
                 finally:
                     ledger.close()
+
+
+class HeartbeatTimeRecoveryBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    class Verifier:
+        def __init__(self, terminal: dict[str, object] | None = None) -> None:
+            self.events: list[str] = []
+            self.running = False
+            self.polls = 0
+            self.terminal = terminal or {
+                "status": "PASS",
+                "verification_id": "lv-heartbeat-fixed-tip",
+                "verification_mode": "full",
+                "verified_through_sequence": 42,
+            }
+
+        def status(self) -> dict[str, object]:
+            self.events.append("status")
+            if not self.running:
+                return {"status": "PASS"}
+            self.polls += 1
+            if self.polls == 1:
+                return {
+                    "status": "IN_PROGRESS",
+                    "verification_id": "lv-heartbeat-fixed-tip",
+                    "requested_mode": "full",
+                }
+            return dict(self.terminal)
+
+        def start(self, mode: str) -> dict[str, object]:
+            self.events.append("start:" + mode)
+            self.running = True
+            return {
+                "status": "IN_PROGRESS",
+                "verification_id": "lv-heartbeat-fixed-tip",
+                "requested_mode": mode,
+            }
+
+        def cancel(self) -> dict[str, object]:
+            self.events.append("cancel")
+            return {"status": "IN_PROGRESS", "cancellation_requested": True}
+
+    class Paper:
+        def __init__(self, events: list[str]) -> None:
+            self.events = events
+
+        def heartbeat_time_recovery_authority(self) -> dict[str, object]:
+            return {"eligible_without_ledger_proof": True}
+
+        def recover_heartbeat_time_lockout(
+            self, request_id: str, preflight=None,
+        ) -> dict[str, object]:
+            self.events.append("recover")
+            evidence = preflight("heartbeat-operation", {"tip": 42})
+            return {
+                "request_id": request_id,
+                "recovered": evidence.get("accepted") is True,
+                "armed": False,
+                "operational_paper_started": False,
+            }
+
+    async def test_full_verification_and_recovery_share_one_paused_tip(self) -> None:
+        events: list[str] = []
+        verifier = self.Verifier()
+
+        def pause() -> dict[str, object]:
+            events.append("pause-and-drain")
+            return {"paused": True, "drained": True}
+
+        def preflight(operation_id: str, snapshot: object) -> dict[str, object]:
+            self.assertEqual(operation_id, "heartbeat-operation")
+            self.assertEqual(snapshot, {"tip": 42})
+            events.append("preflight")
+            return {"accepted": True}
+
+        def resume() -> dict[str, object]:
+            events.append("resume-and-replay")
+            return {"paused": False, "replayed_observations": 3}
+
+        result = await _recover_heartbeat_time_at_stable_ledger_tip(
+            paper=self.Paper(events),  # type: ignore[arg-type]
+            ledger_verifier=verifier,  # type: ignore[arg-type]
+            begin_observation_pause=pause,
+            end_observation_pause=resume,
+            ledger_preflight=preflight,
+            request_id="heartbeat-boundary-pass",
+            timeout_seconds=1,
+            poll_seconds=0.001,
+        )
+
+        self.assertTrue(result["recovered"])
+        self.assertFalse(result["armed"])
+        self.assertEqual(
+            events,
+            ["pause-and-drain", "recover", "preflight", "resume-and-replay"],
+        )
+        self.assertEqual(
+            verifier.events,
+            ["status", "start:full", "status", "status"],
+        )
+        self.assertEqual(result["ledger_boundary"]["replayed_observations"], 3)
+
+    async def test_failed_full_verification_replays_without_recovery(self) -> None:
+        events: list[str] = []
+        verifier = self.Verifier({
+            "status": "FAIL",
+            "verification_id": "lv-heartbeat-fixed-tip",
+            "verification_mode": "full",
+            "errors": [{"code": "HASH_CHAIN_MISMATCH"}],
+        })
+
+        with self.assertRaises(HeartbeatTimeRecoveryBoundaryError) as refused:
+            await _recover_heartbeat_time_at_stable_ledger_tip(
+                paper=self.Paper(events),  # type: ignore[arg-type]
+                ledger_verifier=verifier,  # type: ignore[arg-type]
+                begin_observation_pause=lambda: (
+                    events.append("pause") or {"paused": True, "drained": True}
+                ),
+                end_observation_pause=lambda: (
+                    events.append("resume") or {"paused": False}
+                ),
+                ledger_preflight=lambda *_: {"accepted": True},
+                request_id="heartbeat-boundary-fail",
+                timeout_seconds=1,
+                poll_seconds=0.001,
+            )
+
+        self.assertEqual(refused.exception.status_code, 409)
+        self.assertIn("HASH_CHAIN_MISMATCH", str(refused.exception.detail))
+        self.assertEqual(events, ["pause", "resume"])
+
+    async def test_writer_drain_failure_replays_and_never_verifies(self) -> None:
+        events: list[str] = []
+        verifier = self.Verifier()
+
+        with self.assertRaises(HeartbeatTimeRecoveryBoundaryError) as refused:
+            await _recover_heartbeat_time_at_stable_ledger_tip(
+                paper=self.Paper(events),  # type: ignore[arg-type]
+                ledger_verifier=verifier,  # type: ignore[arg-type]
+                begin_observation_pause=lambda: {
+                    "paused": True, "drained": False,
+                },
+                end_observation_pause=lambda: (
+                    events.append("resume") or {"paused": False}
+                ),
+                ledger_preflight=lambda *_: {"accepted": True},
+                request_id="heartbeat-boundary-drain-fail",
+            )
+
+        self.assertEqual(
+            refused.exception.detail,
+            "HEARTBEAT_TIME_RECOVERY_LEDGER_WRITER_DRAIN_FAILED",
+        )
+        self.assertEqual(verifier.events, ["status"])
+        self.assertEqual(events, ["resume"])
 
 
 if __name__ == "__main__":

@@ -105,6 +105,8 @@ NINJATRADER_RUNTIME_LOGGER = logging.getLogger("uvicorn.error")
 LEDGER_VERIFICATION_FRESHNESS_SECONDS = 15 * 60
 MARKET_OBSERVER_ACTIVE_FRESHNESS_SECONDS = 15.0
 LEDGER_VERIFIER_SHUTDOWN_WAIT_SECONDS = 30.0
+HEARTBEAT_TIME_RECOVERY_LEDGER_TIMEOUT_SECONDS = 120.0
+HEARTBEAT_TIME_RECOVERY_LEDGER_POLL_SECONDS = 0.1
 GRACEFUL_SHUTDOWN_ACTION_HEADER = "X-Beelzebub-Graceful-Shutdown-Action"
 GRACEFUL_SHUTDOWN_ACTION_VALUE = "beezconsole-graceful-shutdown-v1"
 PONG_INDEPENDENT_COLLECTION_ENV = "BEELZEBUB_PONG_INDEPENDENT_COLLECTION"
@@ -126,6 +128,146 @@ _LOCAL_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 
 class UnsafePaperExecutionShutdown(RuntimeError):
     """Normal process teardown was refused while exact execution is unproven."""
+
+
+class HeartbeatTimeRecoveryBoundaryError(RuntimeError):
+    """The fixed-tip recovery boundary failed without widening authority."""
+
+    def __init__(self, detail: str, *, status_code: int = 409) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.status_code = status_code
+
+
+async def _recover_heartbeat_time_at_stable_ledger_tip(
+    *,
+    paper: LaneIIIPaperRuntime,
+    ledger_verifier: LocalLedgerVerificationController,
+    begin_observation_pause: Callable[[], Mapping[str, object]],
+    end_observation_pause: Callable[[], Mapping[str, object]],
+    ledger_preflight: Callable[
+        [str, Mapping[str, object]], Mapping[str, object]
+    ],
+    request_id: str,
+    timeout_seconds: float = HEARTBEAT_TIME_RECOVERY_LEDGER_TIMEOUT_SECONDS,
+    poll_seconds: float = HEARTBEAT_TIME_RECOVERY_LEDGER_POLL_SECONDS,
+) -> dict[str, object]:
+    """Verify and clear HEARTBEAT_TIME across one lossless fixed-tip boundary.
+
+    The pause affects only delivery to the paper sink. The sole native owner
+    and shadow/collector sink remain live, and held observations replay in
+    admitted callback order after the durable recovery decision. No verifier,
+    recovery append, network wait, or disk wait runs under a market callback
+    lock.
+    """
+    if timeout_seconds <= 0 or poll_seconds <= 0:
+        raise ValueError("Heartbeat-time recovery timing must be positive.")
+    authority = paper.heartbeat_time_recovery_authority()
+    if authority.get("eligible_without_ledger_proof") is not True:
+        # Do not launch a costly Full scan when an independent transport,
+        # reconciliation, or exact-lockout prerequisite is already false.
+        return paper.recover_heartbeat_time_lockout(request_id)
+
+    existing = ledger_verifier.status()
+    if existing.get("status") == "IN_PROGRESS":
+        raise HeartbeatTimeRecoveryBoundaryError(
+            "HEARTBEAT_TIME_RECOVERY_LEDGER_VERIFIER_BUSY",
+        )
+
+    paused = False
+    pause_result: Mapping[str, object] = {}
+    resume_result: Mapping[str, object] = {}
+    report: Mapping[str, object] = {}
+    result: dict[str, object] | None = None
+    try:
+        pause_result = begin_observation_pause()
+        paused = (
+            isinstance(pause_result, Mapping)
+            and pause_result.get("paused") is True
+        )
+        drained = (
+            isinstance(pause_result, Mapping)
+            and pause_result.get("drained") is True
+        )
+        if not paused:
+            raise HeartbeatTimeRecoveryBoundaryError(
+                "HEARTBEAT_TIME_RECOVERY_OBSERVATION_PAUSE_FAILED",
+            )
+        if not drained:
+            raise HeartbeatTimeRecoveryBoundaryError(
+                "HEARTBEAT_TIME_RECOVERY_LEDGER_WRITER_DRAIN_FAILED",
+            )
+
+        report = ledger_verifier.start("full")
+        verification_id = report.get("verification_id")
+        if not isinstance(verification_id, str):
+            raise HeartbeatTimeRecoveryBoundaryError(
+                "HEARTBEAT_TIME_RECOVERY_FULL_VERIFICATION_NOT_STARTED",
+            )
+        deadline = time.monotonic() + timeout_seconds
+        while report.get("status") == "IN_PROGRESS":
+            if time.monotonic() >= deadline:
+                ledger_verifier.cancel()
+                raise HeartbeatTimeRecoveryBoundaryError(
+                    "HEARTBEAT_TIME_RECOVERY_FULL_VERIFICATION_TIMEOUT",
+                )
+            await asyncio.sleep(poll_seconds)
+            report = ledger_verifier.status()
+
+        if (
+            report.get("verification_id") != verification_id
+            or report.get("status") != "PASS"
+            or report.get("verification_mode") != "full"
+        ):
+            errors = report.get("errors")
+            error_codes = [
+                str(value.get("code"))
+                for value in errors
+                if isinstance(value, Mapping) and value.get("code")
+            ] if isinstance(errors, list) else []
+            suffix = ":" + ",".join(error_codes) if error_codes else ""
+            raise HeartbeatTimeRecoveryBoundaryError(
+                "HEARTBEAT_TIME_RECOVERY_FULL_VERIFICATION_FAILED" + suffix,
+            )
+
+        result = paper.recover_heartbeat_time_lockout(
+            request_id,
+            ledger_preflight,
+        )
+    finally:
+        if paused:
+            try:
+                resume_result = end_observation_pause()
+            except Exception as error:
+                raise HeartbeatTimeRecoveryBoundaryError(
+                    "HEARTBEAT_TIME_RECOVERY_OBSERVATION_RESUME_FAILED:"
+                    f"{type(error).__name__}",
+                    status_code=500,
+                ) from error
+            if (
+                not isinstance(resume_result, Mapping)
+                or resume_result.get("paused") is not False
+            ):
+                raise HeartbeatTimeRecoveryBoundaryError(
+                    "HEARTBEAT_TIME_RECOVERY_OBSERVATION_RESUME_FAILED",
+                    status_code=500,
+                )
+
+    if result is None:  # pragma: no cover - every non-error path assigns it
+        raise RuntimeError("HEARTBEAT_TIME_RECOVERY_RESULT_UNAVAILABLE")
+    return {
+        **result,
+        "ledger_boundary": {
+            "schema": "lane-iii-heartbeat-time-recovery-ledger-boundary-v1",
+            "verification_id": report.get("verification_id"),
+            "verification_mode": report.get("verification_mode"),
+            "verified_through_sequence": report.get("verified_through_sequence"),
+            "paused": pause_result.get("paused"),
+            "drained": pause_result.get("drained"),
+            "resumed": resume_result.get("paused") is False,
+            "replayed_observations": resume_result.get("replayed_observations"),
+        },
+    }
 
 
 def _assert_hot_paper_ledger_path(paper_path: Path, cold_root: Path) -> None:
@@ -3512,15 +3654,24 @@ def create_control_center_app(
                 detail="Heartbeat-time recovery accepts only a request_id.",
             )
         try:
-            return paper.recover_heartbeat_time_lockout(
-                str(body["request_id"]),
-                lambda operation_id, runtime_snapshot:
+            return await _recover_heartbeat_time_at_stable_ledger_tip(
+                paper=paper,
+                ledger_verifier=ledger_verifier,
+                begin_observation_pause=begin_startup_observation_pause,
+                end_observation_pause=end_startup_observation_pause,
+                ledger_preflight=lambda operation_id, runtime_snapshot:
                     require_operational_paper_ledger_verification(
                         operation_id,
                         runtime_snapshot,
+                        launch_auto_on_failure=False,
                         enforce_observer=False,
-                    ),
+                ),
+                request_id=str(body["request_id"]),
             )
+        except HeartbeatTimeRecoveryBoundaryError as exc:
+            raise HTTPException(
+                status_code=exc.status_code, detail=exc.detail,
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
