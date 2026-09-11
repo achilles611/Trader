@@ -697,15 +697,30 @@ class PongBoundedController:
                     "PONG_NY_OPEN_BLACKOUT_FLAT_RECONCILED",
                 )
         elif now >= blackout_end:
-            # A released fence is valid only after the controller previously
-            # observed clean flat truth.  Once the release is visible, do not
-            # immediately re-fence merely because the overlay is now open.
-            command = None if observation.clean_flat else self._ensure_flat(
-                observation, now,
-                prefix="PONG_NY_OPEN_RESUME",
-                fencing_phase=PongControllerPhase.BLACKOUT_FENCING,
-                flattening_phase=PongControllerPhase.BLACKOUT_FLATTENING,
-                reconciling_phase=PongControllerPhase.BLACKOUT_RECONCILING,
+            # Complete a missed/in-progress blackout cleanup before the first
+            # release.  Once post-blackout operation has begun, an owned
+            # position is legitimate strategy exposure: controller health may
+            # fence new entries, but only the strategy/risk engine may reduce
+            # that exposure before the fixed experiment deadline.
+            resume_requires_flat = self.state.phase in {
+                PongControllerPhase.PREPARED,
+                PongControllerPhase.RUNNING_PRE_BLACKOUT,
+                PongControllerPhase.BLACKOUT_FENCING,
+                PongControllerPhase.BLACKOUT_FLATTENING,
+                PongControllerPhase.BLACKOUT_RECONCILING,
+                PongControllerPhase.BLACKOUT_FLAT,
+                PongControllerPhase.FAILED_SAFE,
+            }
+            command = (
+                self._ensure_flat(
+                    observation, now,
+                    prefix="PONG_NY_OPEN_RESUME",
+                    fencing_phase=PongControllerPhase.BLACKOUT_FENCING,
+                    flattening_phase=PongControllerPhase.BLACKOUT_FLATTENING,
+                    reconciling_phase=PongControllerPhase.BLACKOUT_RECONCILING,
+                )
+                if resume_requires_flat
+                else None
             )
             health_reason = observation.admission_health_reason
             if command is None and health_reason is not None:

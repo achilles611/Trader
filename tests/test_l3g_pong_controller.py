@@ -213,6 +213,46 @@ class PongBoundedControllerTests(unittest.TestCase):
             self.assertFalse(denied.allowed)
             self.assertTrue(denied.risk_reduction_allowed)
 
+    def test_post_blackout_exposure_is_not_flattened_and_health_loss_only_fences_entries(self) -> None:
+        with TemporaryDirectory() as temp:
+            controller = self.make(temp)
+            command = controller.tick(observation(
+                "2026-09-11T13:35:01Z", fence=True,
+            ))
+            self.assertEqual(command.kind, PongControllerCommandKind.RELEASE_ENTRY_FENCE)
+            self.settle(controller, command, "2026-09-11T13:35:01Z")
+            self.assertIsNone(controller.tick(observation(
+                "2026-09-11T13:35:02Z",
+            )))
+            self.assertEqual(controller.state.phase, PongControllerPhase.RUNNING_POST_BLACKOUT)
+
+            self.assertIsNone(controller.tick(observation(
+                "2026-09-11T13:36:00Z", position=1, owned=1,
+                protected=True,
+            )))
+            self.assertEqual(controller.state.phase, PongControllerPhase.RUNNING_POST_BLACKOUT)
+
+            command = controller.tick(observation(
+                "2026-09-11T13:36:01Z", position=1, owned=1,
+                protected=True, healthy=False,
+            ))
+            self.assertEqual(command.kind, PongControllerCommandKind.FENCE_NEW_ENTRIES)
+            self.settle(controller, command, "2026-09-11T13:36:01Z")
+            self.assertIsNone(controller.tick(observation(
+                "2026-09-11T13:36:02Z", fence=True, position=1,
+                owned=1, protected=True, healthy=False,
+            )))
+            self.assertEqual(controller.state.phase, PongControllerPhase.RESUME_BLOCKED)
+
+            denied = controller.assess_entry(
+                source_switch_id="switch-post-9",
+                source_switch_sequence=9,
+                source_event_at="2026-09-11T13:36:02Z",
+                at="2026-09-11T13:36:02Z",
+            )
+            self.assertFalse(denied.allowed)
+            self.assertTrue(denied.risk_reduction_allowed)
+
     def test_deadline_flattens_reconciles_seals_and_stops(self) -> None:
         with TemporaryDirectory() as temp:
             controller = self.make(temp)
