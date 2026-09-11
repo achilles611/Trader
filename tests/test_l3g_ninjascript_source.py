@@ -1658,6 +1658,14 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertNotIn("TryReservePublication(ref lastDepthPublicationTicks", source)
         self.assertIn("private readonly object bookLock = new object();", source)
         self.assertIn("lock (bookLock)", source)
+        depth_unavailable = source[
+            source.index("        private void PublishDepthUnavailable"):
+            source.index("        private static bool FinitePositive")
+        ]
+        self.assertIn('BeelzebubReadOnlyOutbound.Publish("DEPTH"', depth_unavailable)
+        self.assertIn('\\"status\\":\\"UNAVAILABLE\\"', depth_unavailable)
+        self.assertIn('\\"bids\\":[],\\"asks\\":[]', depth_unavailable)
+        self.assertNotIn('BeelzebubReadOnlyOutbound.Publish("HEALTH"', depth_unavailable)
         self.assertIn("Interlocked.Exchange(ref lastQuotePublicationTicks", source)
         self.assertIn("A sampled Last event must retain its exact same-callback", source)
         self.assertIn("publication_policy", source)
@@ -1666,6 +1674,13 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertIn("private const int MaximumQueuedFrames = 4096;", addon)
         self.assertIn("private readonly object bookLock = new object();", addon)
         self.assertIn("lock (bookLock)", addon)
+        automatic_unavailable = addon[
+            addon.index("        private void PublishDepthUnavailable"):
+            addon.index("        private static bool TryReservePublication", addon.index("        private void PublishDepthUnavailable"))
+        ]
+        self.assertIn('BeelzebubReadOnlyOutbound.Publish("DEPTH"', automatic_unavailable)
+        self.assertIn('\\"status\\":\\"UNAVAILABLE\\"', automatic_unavailable)
+        self.assertNotIn('BeelzebubReadOnlyOutbound.Publish("HEALTH"', automatic_unavailable)
         self.assertNotIn("private const int MaximumQueuedFrames = 20000;", addon)
         self.assertIn("bidAtTrade < askAtTrade", source)
         self.assertIn("bestBid < bestAsk", source)

@@ -896,9 +896,14 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void PublishDepthUnavailable(string reason, long sourceEventSequence, DateTime providerTime)
         {
-            BeelzebubReadOnlyOutbound.Publish("HEALTH", null, null,
-                "{\"component\":\"MARKET_DEPTH\",\"state\":\"UNAVAILABLE\",\"reason\":\"" + reason
-                + "\",\"contract_id\":\"" + instrument.FullName + "\",\"source_event_sequence\":" + sourceEventSequence
+            // This is still one authentic depth mutation. Keep it on the
+            // sequenced DEPTH stream so the consumer can distinguish explicit
+            // unavailability from a missing callback. Publishing it as HEALTH
+            // hid the sequence and flooded the operational-health ledger.
+            BeelzebubReadOnlyOutbound.Publish("DEPTH", null, null,
+                "{\"status\":\"UNAVAILABLE\",\"reason\":\"" + reason
+                + "\",\"contract_id\":\"" + instrument.FullName + "\",\"bids\":[],\"asks\":[]"
+                + ",\"source_event_sequence\":" + sourceEventSequence
                 + ",\"publication_policy\":\"" + DepthPublicationPolicy + "\"}", providerTime);
         }
 
@@ -1023,7 +1028,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string AttestedSchema = "lane-iii-phase-f3-ninjatrader-observation-v2";
         private const string AttestationProtocol = "l3f3-ninjatrader-observer-attestation-v1";
         private const string AttestationKeyContext = "BEELZEBUB_NINJATRADER_OBSERVATION_V2";
-        private const string ProducerSourceFingerprint = "ce1649e49f5fe83c4d93c22e963233d1d79e05a148adac24504bc473175ef464";
+        private const string ProducerSourceFingerprint = "abf30d0e4a42d5c717e991e344d53fe730e10e9f7861bac026263bb661e72587";
         // Event-driven trades/depth require burst capacity, but memory remains
         // bounded. A full queue drops the signed frame after assigning its
         // sequence; the next source_event_sequence exposes the gap.

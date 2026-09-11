@@ -283,9 +283,14 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         private void PublishDepthUnavailable(string reason, long sourceEventSequence, DateTime providerTime)
         {
-            BeelzebubReadOnlyOutbound.Publish("HEALTH", null, null,
-                "{\"component\":\"MARKET_DEPTH\",\"state\":\"UNAVAILABLE\",\"reason\":\"" + reason
-                + "\",\"contract_id\":\"" + Instrument.FullName + "\",\"source_event_sequence\":" + sourceEventSequence
+            // This is still one authentic depth mutation. Keep it on the
+            // sequenced DEPTH stream so the consumer can distinguish explicit
+            // unavailability from a missing callback. Publishing it as HEALTH
+            // hid the sequence and flooded the operational-health ledger.
+            BeelzebubReadOnlyOutbound.Publish("DEPTH", null, null,
+                "{\"status\":\"UNAVAILABLE\",\"reason\":\"" + reason
+                + "\",\"contract_id\":\"" + Instrument.FullName + "\",\"bids\":[],\"asks\":[]"
+                + ",\"source_event_sequence\":" + sourceEventSequence
                 + ",\"publication_policy\":\"" + DepthPublicationPolicy + "\"}", providerTime);
         }
 
