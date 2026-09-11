@@ -24,6 +24,7 @@ from .contracts import (
     EvidenceFamily,
     FiveMinutePaperPolicyArtifact,
     FiveMinutePerpetualPaperPolicyArtifact,
+    PongPaperPolicyArtifact,
     HighConfidencePaperPolicyArtifact,
     HypothesisKind,
     PaperDecision,
@@ -96,10 +97,11 @@ class ExperimentalPaperPolicy:
     def __init__(self, artifact: PaperPolicyArtifactType = POLICY) -> None:
         if type(artifact) not in {
             PaperPolicyArtifact, HighConfidencePaperPolicyArtifact, FiveMinutePaperPolicyArtifact,
-            FiveMinutePerpetualPaperPolicyArtifact,
+            FiveMinutePerpetualPaperPolicyArtifact, PongPaperPolicyArtifact,
         }:
             raise ValueError("Paper policy requires the exact immutable artifact type.")
         self.artifact = artifact
+        self._pong_profile = type(artifact) is PongPaperPolicyArtifact
         self._five_minute_profile = type(artifact) in {
             FiveMinutePaperPolicyArtifact, FiveMinutePerpetualPaperPolicyArtifact,
         }
@@ -108,7 +110,7 @@ class ExperimentalPaperPolicy:
             and artifact.perpetual_position
         )
         self._continuous_scalper_profile = (
-            type(artifact) is PaperPolicyArtifact
+            type(artifact) in {PaperPolicyArtifact, PongPaperPolicyArtifact}
             and artifact.reporting_sessions_only
             and artifact.execution_schedule == "CONTINUOUS_EXCHANGE_TRADEABLE"
         )
@@ -463,6 +465,12 @@ class ExperimentalPaperPolicy:
             # needed after a local bridge restart because the NinjaTrader
             # observer's connection transition may predate the new socket.
             self._price_connected = True
+            if self._pong_profile:
+                # Legacy loopback validation does not authenticate a Pong
+                # producer or prove complete hourly trade/depth coverage.
+                # Profile registration must never fall through to Scalper.
+                return self._decision(observation, PaperDecisionKind.NO_TRADE, None,
+                                      "PONG_NATIVE_INPUT_CONTRACT_UNCOMMISSIONED")
             if self._five_minute_profile:
                 if five_minute_decision is not None:
                     return five_minute_decision

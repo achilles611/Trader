@@ -509,11 +509,44 @@ class FiveMinutePerpetualPaperPolicyArtifact(FiveMinutePaperPolicyArtifact):
             raise ValueError("The legacy-named perpetual decision protocol is immutable.")
 
 
+@dataclass(frozen=True)
+class PongPaperPolicyArtifact(PaperPolicyArtifact):
+    """One-hour experimental Pong identity; existing profiles stay sealed."""
+
+    schema: str = "lane-iii-pong-bounded-paper-policy-v1"
+    policy_id: str = "l3g-beelzebub-pong-discernment-policy-v1"
+    entry_profile: str = "BEELZEBUB_PONG_DISCERNMENT"
+    entry_profile_version: str = "BEELZEBUB_PONG_DISCERNMENT_V1"
+    reentry_cooldown_seconds: int = 0
+    trial_required: bool = True
+    duration_seconds: int = 3600
+
+    def __post_init__(self) -> None:
+        expected = PaperPolicyArtifact().payload()
+        expected.update({
+            "schema": "lane-iii-pong-bounded-paper-policy-v1",
+            "policy_id": "l3g-beelzebub-pong-discernment-policy-v1",
+            "entry_profile": "BEELZEBUB_PONG_DISCERNMENT",
+            "entry_profile_version": "BEELZEBUB_PONG_DISCERNMENT_V1",
+            "reentry_cooldown_seconds": 0, "trial_required": True,
+            "duration_seconds": 3600,
+        })
+        if _jsonable(asdict(self)) != expected:
+            raise ValueError("Pong experimental operational policy is immutable.")
+
+    def payload(self) -> dict[str, object]:
+        from .pong_experiment import experimental_definition, EXPERIMENTAL_DEFINITION_HASH
+        return {**_jsonable(asdict(self)),
+                "pong_definition": experimental_definition(),
+                "pong_definition_hash": EXPERIMENTAL_DEFINITION_HASH}
+
+
 PaperPolicyArtifactType = (
     PaperPolicyArtifact
     | HighConfidencePaperPolicyArtifact
     | FiveMinutePaperPolicyArtifact
     | FiveMinutePerpetualPaperPolicyArtifact
+    | PongPaperPolicyArtifact
 )
 
 
@@ -839,11 +872,32 @@ class FiveMinutePerpetualPaperRiskProfile(FiveMinutePaperRiskProfile):
         return _jsonable(payload)  # type: ignore[return-value]
 
 
+@dataclass(frozen=True)
+class PongPaperRiskProfile(FiveMinutePerpetualPaperRiskProfile):
+    """Retain the previous perpetual run's one-MNQ monetary envelope."""
+
+    schema: str = "lane-iii-pong-bounded-paper-risk-v1"
+    profile_id: str = "l3g-beelzebub-pong-discernment-risk-v1"
+    perpetual_position: bool = False
+
+    def __post_init__(self) -> None:
+        expected = asdict(FiveMinutePerpetualPaperRiskProfile())
+        expected.update(schema="lane-iii-pong-bounded-paper-risk-v1",
+                        profile_id="l3g-beelzebub-pong-discernment-risk-v1",
+                        perpetual_position=False)
+        if asdict(self) != expected:
+            raise ValueError("Pong remains sealed to the retained one-MNQ paper risk envelope.")
+
+    def payload(self) -> dict[str, object]:
+        return _jsonable(asdict(self))
+
+
 PaperRiskProfileType = (
     PaperRiskProfile
     | HighConfidencePaperRiskProfile
     | FiveMinutePaperRiskProfile
     | FiveMinutePerpetualPaperRiskProfile
+    | PongPaperRiskProfile
 )
 
 
@@ -1312,7 +1366,9 @@ POLICY = PaperPolicyArtifact()
 HIGH_CONFIDENCE_POLICY = HighConfidencePaperPolicyArtifact()
 FIVE_MINUTE_POLICY = FiveMinutePaperPolicyArtifact()
 FIVE_MINUTE_PERPETUAL_POLICY = FiveMinutePerpetualPaperPolicyArtifact()
+PONG_PAPER_POLICY = PongPaperPolicyArtifact()
 KNOWN_PAPER_POLICY_IDENTITIES = frozenset({
+    (PONG_PAPER_POLICY.policy_id, PONG_PAPER_POLICY.configuration_hash),
     (POLICY.policy_id, POLICY.configuration_hash),
     (HIGH_CONFIDENCE_POLICY.policy_id, HIGH_CONFIDENCE_POLICY.configuration_hash),
     (FIVE_MINUTE_POLICY.policy_id, FIVE_MINUTE_POLICY.configuration_hash),
@@ -1325,6 +1381,7 @@ RISK_PROFILE = PaperRiskProfile()
 HIGH_CONFIDENCE_RISK_PROFILE = HighConfidencePaperRiskProfile()
 FIVE_MINUTE_RISK_PROFILE = FiveMinutePaperRiskProfile()
 FIVE_MINUTE_PERPETUAL_RISK_PROFILE = FiveMinutePerpetualPaperRiskProfile()
+PONG_PAPER_RISK_PROFILE = PongPaperRiskProfile()
 ACCOUNT_BINDING = ExecutionAccountBinding()
 CAPABILITY = ExecutionCapabilityManifest()
 AUTHORITY = PaperAuthorityBundle(POLICY, RISK_PROFILE, ACCOUNT_BINDING, CAPABILITY)
@@ -1393,6 +1450,11 @@ PAPER_PROFILE_CATALOG = (
     SCALPER_PROFILE,
     FIVE_MINUTE_PROFILE,
     FIVE_MINUTE_PERPETUAL_PROFILE,
+    PaperProfileDefinition(
+        "BEELZEBUB_PONG_DISCERNMENT_V1", "Pong experimental (bounded hour)",
+        "Event-driven experimental Discernment; one Sim101 MNQ; independent 60-minute stop required.",
+        PONG_PAPER_POLICY, PONG_PAPER_RISK_PROFILE,
+    ),
 )
 
 
@@ -1400,6 +1462,7 @@ def resolve_paper_profile(value: str | None) -> PaperProfileDefinition:
     """Resolve one complete compiled policy/risk bundle; scalper V2 is the default."""
     normalized = "" if value is None else value.strip().upper()
     aliases = {
+        "BEELZEBUB_PONG_DISCERNMENT_V1": PAPER_PROFILE_CATALOG[-1],
         "": SCALPER_PROFILE,
         PAPER_ENTRY_PROFILE: SCALPER_PROFILE,
         PAPER_ENTRY_PROFILE_VERSION: SCALPER_PROFILE,

@@ -408,7 +408,7 @@ def strong_discernment_policy() -> DiscernmentPolicy:
 
 
 class PongStateMachineTests(unittest.TestCase):
-    def test_pong_is_absent_from_operational_registration_and_native_paths(self) -> None:
+    def test_pong_native_paths_remain_uncommissioned(self) -> None:
         repository_root = Path(__file__).resolve().parents[1]
         operational_paths = (
             repository_root / "src/l3g_paper/runtime.py",
@@ -423,8 +423,11 @@ class PongStateMachineTests(unittest.TestCase):
         for path in operational_paths:
             with self.subTest(path=path):
                 text = path.read_text(encoding="utf-8")
-                self.assertNotIn("BEELZEBUB_PONG", text)
-                self.assertNotIn("l3g_paper.pong", text)
+                if path.name == "runtime.py":
+                    self.assertIn("PONG_NATIVE_INTEGRATION_UNCOMMISSIONED", text)
+                else:
+                    self.assertTrue("BEELZEBUB_PONG" not in text, str(path))
+                self.assertTrue("l3g_paper.pong" not in text, str(path))
 
     def _enter(
         self,

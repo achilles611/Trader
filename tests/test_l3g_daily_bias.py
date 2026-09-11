@@ -559,7 +559,14 @@ class DailyBiasAuthorityBoundaryTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, daily_source)
             self.assertNotIn(forbidden, pong_source)
-        self.assertNotIn("BEELZEBUB_PONG", registration_sources)
+        # The elevated one-hour authority now registers a separate experimental
+        # operational wrapper. The pure voter/machine still own no transport.
+        from src.l3g_paper.contracts import resolve_paper_profile
+        trial = resolve_paper_profile("BEELZEBUB_PONG_DISCERNMENT_V1")
+        self.assertTrue(trial.policy.trial_required)
+        self.assertEqual(trial.policy.duration_seconds, 3600)
+        self.assertEqual(trial.risk.maximum_entry_quantity, 1)
+        self.assertFalse(trial.risk.approved_for_live)
         self.assertFalse(PONG_DAILY_BIAS_PRODUCTION_CONFIGURED)
 
 

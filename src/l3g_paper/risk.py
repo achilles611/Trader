@@ -18,8 +18,10 @@ from .contracts import (
     ExecutionAccountBinding,
     FiveMinutePaperPolicyArtifact,
     FiveMinutePerpetualPaperPolicyArtifact,
+    PongPaperPolicyArtifact,
     FiveMinutePaperRiskProfile,
     FiveMinutePerpetualPaperRiskProfile,
+    PongPaperRiskProfile,
     HighConfidencePaperPolicyArtifact,
     HighConfidencePaperRiskProfile,
     PaperDecision,
@@ -114,12 +116,12 @@ class PaperRiskAuthority:
     ) -> None:
         if type(profile) not in {
             PaperRiskProfile, HighConfidencePaperRiskProfile, FiveMinutePaperRiskProfile,
-            FiveMinutePerpetualPaperRiskProfile,
+            FiveMinutePerpetualPaperRiskProfile, PongPaperRiskProfile,
         } or type(binding) is not ExecutionAccountBinding:
             raise ValueError("Paper risk authority requires exact immutable inputs.")
         if type(policy) not in {
             PaperPolicyArtifact, HighConfidencePaperPolicyArtifact, FiveMinutePaperPolicyArtifact,
-            FiveMinutePerpetualPaperPolicyArtifact,
+            FiveMinutePerpetualPaperPolicyArtifact, PongPaperPolicyArtifact,
         }:
             raise ValueError("Paper risk authority requires a compiled immutable policy.")
         self.profile = profile
@@ -132,8 +134,8 @@ class PaperRiskAuthority:
             and policy.perpetual_position
         )
         self._continuous_scalper_profile = (
-            type(profile) is PaperRiskProfile
-            and type(policy) is PaperPolicyArtifact
+            type(profile) in {PaperRiskProfile, PongPaperRiskProfile}
+            and type(policy) in {PaperPolicyArtifact, PongPaperPolicyArtifact}
             and profile.reporting_sessions_only
             and not profile.enforce_session_entry_window
             and not profile.enforce_hard_flat_deadline
@@ -195,6 +197,7 @@ class PaperRiskAuthority:
     def maximum_age_due(self, snapshot: PaperRiskSnapshot, at: str) -> bool:
         return (
             not self._perpetual_position_profile
+            and getattr(self.profile, "maximum_position_age_enforced", True)
             and snapshot.position_opened_at is not None
             and self._time(at) - self._time(snapshot.position_opened_at)
             >= timedelta(seconds=self.profile.maximum_position_age_seconds)

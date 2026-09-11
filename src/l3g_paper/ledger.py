@@ -30,8 +30,10 @@ from .contracts import (
     RISK_PROFILE,
     FiveMinutePaperPolicyArtifact,
     FiveMinutePerpetualPaperPolicyArtifact,
+    PongPaperPolicyArtifact,
     FiveMinutePaperRiskProfile,
     FiveMinutePerpetualPaperRiskProfile,
+    PongPaperRiskProfile,
     HighConfidencePaperPolicyArtifact,
     HighConfidencePaperRiskProfile,
     PaperPolicyArtifact,
@@ -1151,12 +1153,12 @@ class PaperLedger:
             raise ValueError("Paper ledger high-frequency persistence policy must be boolean.")
         if type(policy) not in {
             PaperPolicyArtifact, HighConfidencePaperPolicyArtifact, FiveMinutePaperPolicyArtifact,
-            FiveMinutePerpetualPaperPolicyArtifact,
+            FiveMinutePerpetualPaperPolicyArtifact, PongPaperPolicyArtifact,
         }:
             raise ValueError("Paper ledger policy identity must be a compiled immutable profile.")
         if type(risk) not in {
             PaperRiskProfile, HighConfidencePaperRiskProfile, FiveMinutePaperRiskProfile,
-            FiveMinutePerpetualPaperRiskProfile,
+            FiveMinutePerpetualPaperRiskProfile, PongPaperRiskProfile,
         }:
             raise ValueError("Paper ledger risk identity must be a compiled immutable profile.")
         self.path = Path(path).resolve()

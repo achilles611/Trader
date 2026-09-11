@@ -1249,6 +1249,43 @@ class DiscernmentEngine:
     def on_time(self, available_at: str) -> DiscernmentUpdate:
         return self._maintenance(MaintenanceEventKind.TIME, available_at)
 
+    def on_evidence_frame(
+        self, evidence: Iterable[DiscernmentEvidence], *, volume_regime: VolumeRegime,
+    ) -> DiscernmentUpdate:
+        """Commit a complete callback frame with at most one logical switch.
+
+        Component replacement order must not emit transitions from a mixture
+        of the old and new values of one atomic microstructure observation.
+        The scalar ingestion API and its accepted behavior remain unchanged.
+        """
+        import copy
+        values = tuple(evidence)
+        if not values or any(type(item) is not DiscernmentEvidence for item in values):
+            raise ValueError("A complete typed Discernment frame is required.")
+        if {item.component_key for item in values} != set(self.policy.required_components) or len(values) != len(self.policy.required_components):
+            raise ValueError("A Discernment frame requires every component exactly once.")
+        if len({(item.available_at, item.continuity_domain) for item in values}) != 1:
+            raise ValueError("Frame components must share causal availability and continuity.")
+        if all(self._seen_event_hashes.get(item.event_id) == item.evidence_hash for item in values):
+            return self._current_update("DUPLICATE_EVIDENCE_FRAME_IGNORED")
+        expected = self._evidence_revision + 1
+        if tuple(item.evidence_revision for item in values) != tuple(range(expected,expected+len(values))):
+            return self._invalidate(values[-1].available_at,"EVIDENCE_FRAME_REVISION_GAP")
+        if self._continuity_domain is not None and values[0].continuity_domain != self._continuity_domain:
+            return self._invalidate(values[-1].available_at,"EVIDENCE_FRAME_CONTINUITY_CHANGED")
+        stage = copy.copy(self)
+        stage._active = dict(self._active)
+        stage._seen_event_hashes = dict(self._seen_event_hashes)
+        cursor = (self._latched_direction,self._switch_sequence,self._last_switch_id)
+        admitted = False
+        for item in values:
+            result = stage.on_evidence(item,volume_regime=volume_regime)
+            admitted = admitted or result.admitted
+            stage._latched_direction,stage._switch_sequence,stage._last_switch_id = cursor
+        result = stage._snapshot_update(values[-1].available_at,"EVIDENCE_FRAME_ADMITTED",admitted=admitted,may_switch=admitted)
+        self.__dict__.update(stage.__dict__)
+        return result
+
     def on_expiry(self, available_at: str) -> DiscernmentUpdate:
         return self._maintenance(MaintenanceEventKind.EXPIRY, available_at)
 

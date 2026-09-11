@@ -27,8 +27,10 @@ from .contracts import (
     ExecutionVenueAdapter,
     FiveMinutePaperPolicyArtifact,
     FiveMinutePerpetualPaperPolicyArtifact,
+    PongPaperPolicyArtifact,
     FiveMinutePaperRiskProfile,
     FiveMinutePerpetualPaperRiskProfile,
+    PongPaperRiskProfile,
     HighConfidencePaperPolicyArtifact,
     HighConfidencePaperRiskProfile,
     PaperExecutionCommand,
@@ -203,12 +205,12 @@ class PaperExecutionTransport:
             raise ValueError("Maximum execution frame size is invalid.")
         if type(policy) not in {
             PaperPolicyArtifact, HighConfidencePaperPolicyArtifact, FiveMinutePaperPolicyArtifact,
-            FiveMinutePerpetualPaperPolicyArtifact,
+            FiveMinutePerpetualPaperPolicyArtifact, PongPaperPolicyArtifact,
         }:
             raise ValueError("Execution transport requires a compiled immutable policy.")
         if type(risk) not in {
             PaperRiskProfile, HighConfidencePaperRiskProfile, FiveMinutePaperRiskProfile,
-            FiveMinutePerpetualPaperRiskProfile,
+            FiveMinutePerpetualPaperRiskProfile, PongPaperRiskProfile,
         }:
             raise ValueError("Execution transport requires a compiled immutable risk profile.")
         if (
@@ -803,7 +805,7 @@ class PaperExecutionTransport:
                 and not command.commissioning
             )
             continuous_scalper = (
-                type(self.policy) is PaperPolicyArtifact
+                type(self.policy) in {PaperPolicyArtifact, PongPaperPolicyArtifact}
                 and self.policy.reporting_sessions_only
                 and self.policy.execution_schedule == "CONTINUOUS_EXCHANGE_TRADEABLE"
                 and not command.commissioning

@@ -83,6 +83,8 @@ class PongQuantityPolicy:
     live_authority: str = PONG_LIVE_AUTHORITY
     live_capital: str = "DENIED"
     execution_enabled: bool = PONG_QUANTITY_EXECUTION_ENABLED
+    reconciliation_source_fingerprint: str = PONG_RECONCILIATION_SOURCE_FINGERPRINT
+    reconciliation_build_fingerprint: str = PONG_RECONCILIATION_BUILD_FINGERPRINT
 
     def __post_init__(self) -> None:
         if (
@@ -108,6 +110,9 @@ class PongQuantityPolicy:
             raise ValueError("native_maximum_quantity must be an integer in [0, 2].")
         if not self.native_capability_status:
             raise ValueError("native_capability_status is required.")
+        for value in (self.reconciliation_source_fingerprint, self.reconciliation_build_fingerprint):
+            if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+                raise ValueError("Pong reconciliation requires sealed source/build fingerprints.")
 
     @property
     def nominal_risk_per_contract(self) -> Decimal:
@@ -116,6 +121,9 @@ class PongQuantityPolicy:
     @property
     def configuration_hash(self) -> str:
         payload = asdict(self)
+        if self.reconciliation_source_fingerprint == PONG_RECONCILIATION_SOURCE_FINGERPRINT and self.reconciliation_build_fingerprint == PONG_RECONCILIATION_BUILD_FINGERPRINT:
+            payload.pop("reconciliation_source_fingerprint")
+            payload.pop("reconciliation_build_fingerprint")
         payload["point_value_dollars"] = str(self.point_value_dollars)
         payload["stop_distance_points"] = str(self.stop_distance_points)
         payload["maximum_position_risk_dollars"] = str(
@@ -292,8 +300,8 @@ class PongReconciliationProof:
                 return "PONG_EXECUTION_IDENTITY_MISMATCH"
             if (
                 self.source_id != PONG_RECONCILIATION_SOURCE_ID
-                or self.source_fingerprint != PONG_RECONCILIATION_SOURCE_FINGERPRINT
-                or self.build_fingerprint != PONG_RECONCILIATION_BUILD_FINGERPRINT
+                or self.source_fingerprint != policy.reconciliation_source_fingerprint
+                or self.build_fingerprint != policy.reconciliation_build_fingerprint
                 or len(self.source_hash) != 64
                 or any(character not in "0123456789abcdef" for character in self.source_hash)
                 or self.signature_status != "SIGNED_RECONCILIATION"

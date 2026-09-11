@@ -4382,6 +4382,8 @@ class LaneIIIPaperRuntime:
             return False
 
     def _request_entry_with_capacity_fence_locked(self, decision: PaperDecision) -> bool:
+        if self._pong_activation_blockers():
+            return False
         if decision.commissioning:
             ownership = self._commissioning_ownership
             if (
@@ -4620,6 +4622,11 @@ class LaneIIIPaperRuntime:
         return PaperExecutionCommand(deterministic_id("l3g-pc-", payload), **payload)
 
     def _persist_and_send(self, command: PaperExecutionCommand, grant: object) -> None:
+        if (
+            self._pong_activation_blockers()
+            and command.action in {ExecutionAction.ENTER_LONG, ExecutionAction.ENTER_SHORT}
+        ):
+            raise RuntimeError("PONG_NATIVE_INTEGRATION_UNCOMMISSIONED")
         self.ledger.append("COMMAND", command.payload(), identity=command.command_id, occurred_at=command.created_at, execution_session_id=command.execution_session_id)
         adapter = self._adapter
         if adapter is None:
@@ -6980,6 +6987,22 @@ class LaneIIIPaperRuntime:
                 preflight_duration_seconds=duration,
             )
 
+    def _pong_activation_blockers(self) -> tuple[str, ...]:
+        """Keep the registered experimental definition inert until integrated.
+
+        The prospective native probe established neither an authenticated
+        complete Pong input stream nor usable two-sided depth. Registration
+        and pure policy tests confer no execution or controller authority.
+        Risk-reducing commands remain on the existing supported path.
+        """
+        if self.policy.artifact.entry_profile_version == "BEELZEBUB_PONG_DISCERNMENT_V1":
+            return (
+                "PONG_NATIVE_INPUT_CONTRACT_UNCOMMISSIONED",
+                "PONG_NATIVE_INTEGRATION_UNCOMMISSIONED",
+                "PONG_BOUNDED_STOP_UNVERIFIED",
+            )
+        return ()
+
     def operational_paper_readiness(
         self,
         ledger_preflight: Callable[[str, Mapping[str, object]], Mapping[str, object]] | None = None,
@@ -6990,6 +7013,10 @@ class LaneIIIPaperRuntime:
         reserves commissioning ownership, creates a one-shot credential, or
         submits a commissioning entry.
         """
+        pong_blockers = self._pong_activation_blockers()
+        if pong_blockers:
+            return {"result": "BLOCKED", "blocking_reasons": list(pong_blockers),
+                    "operational_paper": True, "entry_eligible": False}
         result = self.commissioning_rehearsal(ledger_preflight)
         if self._perpetual_position_profile:
             raw_reasons = [
@@ -7431,6 +7458,9 @@ class LaneIIIPaperRuntime:
         allow_starting: bool = False,
     ) -> dict[str, object]:
         """Persist an arm outcome while the ledger capacity/order fence is held."""
+        pong_blockers = self._pong_activation_blockers()
+        if pong_blockers:
+            return {"armed": False, "reason_codes": pong_blockers, "state": self._state.value}
         continuous_operation = (
             self._continuous_execution_profile
             and target_state is PaperRuntimeState.PAPER_RUNNING

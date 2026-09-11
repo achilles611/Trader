@@ -22,6 +22,12 @@ PONG_DAILY_BIAS_CALCULATION_ID = "pong-core-vote-options-overlay"
 PONG_DAILY_BIAS_CALCULATION_VERSION = "0"
 PONG_DAILY_BIAS_PRODUCTION_CONFIGURED = False
 PONG_DAILY_BIAS_INSTRUMENT = "MNQ SEP26"
+PONG_TRIAL_OPTIONS_AUTHORITY = canonical_hash({
+    "schema": "pong-one-hour-options-nonvoting-v1",
+    "authority": "JOSEPH_ELEVATED_PAPER_COMMISSIONING_20260911",
+    "missing_options": "UNAVAILABLE_NON_VOTING_NO_CONFIDENCE_CREDIT",
+    "maximum_execution_quantity": 1,
+})
 
 
 class DailyBiasDirection(StrEnum):
@@ -214,8 +220,20 @@ class OptionsOverlayEvidence:
     required: bool
     reason_codes: tuple[str, ...]
     provenance: BiasInputProvenance
+    experimental_nonvoting_authority: str | None = None
 
     def __post_init__(self) -> None:
+        nonvoting_trial = self.experimental_nonvoting_authority is not None
+        if nonvoting_trial and (
+            self.experimental_nonvoting_authority != PONG_TRIAL_OPTIONS_AUTHORITY
+            or self.day_class is not OptionsDayClass.UNKNOWN
+            or self.outcome is not OptionsOverlayOutcome.UNAVAILABLE
+            or self.direction is not None
+            or self.required is not False
+            or self.provenance.source != "UNAVAILABLE"
+            or self.reason_codes != ("OPTIONS_UNAVAILABLE_NON_VOTING_EXPERIMENT_ONLY",)
+        ):
+            raise ValueError("Non-voting options are sealed to the explicit one-hour Pong experiment.")
         if type(self.day_class) is not OptionsDayClass or type(self.outcome) is not OptionsOverlayOutcome:
             raise ValueError("Options day class and overlay outcome are required.")
         if self.direction is not None and type(self.direction) is not DailyBiasDirection:
@@ -234,13 +252,13 @@ class OptionsOverlayEvidence:
             raise ValueError("Only an ordinary options day may be not applicable.")
         if self.day_class is OptionsDayClass.MATERIAL_EXPIRY and not self.required:
             raise ValueError("Material expiry options context must be required.")
-        if self.day_class is OptionsDayClass.UNKNOWN and (
+        if not nonvoting_trial and self.day_class is OptionsDayClass.UNKNOWN and (
             self.outcome is not OptionsOverlayOutcome.UNAVAILABLE or not self.required
         ):
             raise ValueError("An unknown options day must fail as required and unavailable.")
         if self.outcome is OptionsOverlayOutcome.CONFIRM and self.direction is None:
             raise ValueError("A confirming options overlay requires a direction.")
-        if self.outcome is OptionsOverlayOutcome.UNAVAILABLE and not self.required:
+        if not nonvoting_trial and self.outcome is OptionsOverlayOutcome.UNAVAILABLE and not self.required:
             raise ValueError("Unavailable options context must represent a required/unknown day.")
 
     @property
@@ -255,6 +273,8 @@ class OptionsOverlayEvidence:
             "required": self.required,
             "reason_codes": list(self.reason_codes),
             "provenance": self.provenance.payload(),
+            **({"experimental_nonvoting_authority": self.experimental_nonvoting_authority}
+               if self.experimental_nonvoting_authority is not None else {}),
         }
 
 
@@ -573,6 +593,8 @@ class DailyBiasEngine:
                 direction = DailyBiasDirection.UNAVAILABLE
                 confidence = BiasConfidenceTier.NONE
                 reasons.append("REQUIRED_OPTIONS_CONTEXT_UNAVAILABLE")
+            elif overlay.experimental_nonvoting_authority == PONG_TRIAL_OPTIONS_AUTHORITY:
+                reasons.append("OPTIONS_UNAVAILABLE_NON_VOTING_EXPERIMENT_ONLY")
         elif overlay.outcome is OptionsOverlayOutcome.VETO and direction is not DailyBiasDirection.UNAVAILABLE:
             direction = DailyBiasDirection.NEUTRAL
             confidence = BiasConfidenceTier.NONE
