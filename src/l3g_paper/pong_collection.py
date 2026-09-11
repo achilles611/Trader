@@ -41,6 +41,8 @@ PONG_COLLECTION_TIMEZONE = "America/Denver"
 _MARKET_TYPES = frozenset({"TRADE", "QUOTE", "DEPTH"})
 _RETAINED_TYPES = _MARKET_TYPES | frozenset({"HISTORICAL_WARM_START", "HOURLY_BAR"})
 _ZERO_HASH = "0" * 64
+_STATUS_REPLACE_RETRY_SECONDS = 1.0
+_STATUS_REPLACE_RETRY_INTERVAL_SECONDS = 0.01
 
 
 def _utc_now() -> datetime:
@@ -801,4 +803,16 @@ class PongAuthenticHourCollector:
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, path)
+            # On Windows a concurrent read can briefly prevent replacement of
+            # the destination even though the fully-fsynced temporary file is
+            # valid.  Status publication is diagnostic, not a market callback;
+            # retry only this transient sharing failure for a bounded period.
+            deadline = time.monotonic() + _STATUS_REPLACE_RETRY_SECONDS
+            while True:
+                try:
+                    os.replace(temporary, path)
+                    break
+                except PermissionError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(_STATUS_REPLACE_RETRY_INTERVAL_SECONDS)

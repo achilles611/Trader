@@ -4,6 +4,7 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from src.lane_iii.contracts import canonical_hash
 from src.l3f_provider.ninjatrader_observation import (
@@ -50,6 +51,30 @@ def record(kind: str, payload: dict[str, object], sequence: int, observed: datet
 
 
 class PongAuthenticHourCollectorTests(unittest.TestCase):
+    def test_transient_windows_status_reader_contention_does_not_fail_collector(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            collector = PongAuthenticHourCollector(Path(directory))
+            original_replace = __import__("os").replace
+            attempts = 0
+
+            def transient_replace(source: object, destination: object) -> None:
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise PermissionError(5, "Access is denied", str(destination))
+                original_replace(source, destination)
+
+            with patch(
+                "src.l3g_paper.pong_collection.os.replace",
+                side_effect=transient_replace,
+            ):
+                started = collector.start()
+                stopped = collector.stop()
+
+            self.assertEqual(started["state"], "COLLECTING")
+            self.assertEqual(stopped["state"], "STOPPED")
+            self.assertGreaterEqual(attempts, 3)
+
     def test_test_only_hour_boundary_tracks_each_native_stream_independently(self) -> None:
         """Accelerated fixture only; these records are not authentic history."""
         with tempfile.TemporaryDirectory() as directory:
