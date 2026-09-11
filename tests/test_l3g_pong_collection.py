@@ -53,8 +53,16 @@ class PongAuthenticHourCollectorTests(unittest.TestCase):
     def test_verified_events_are_chained_durable_and_classified_causally(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             now = datetime.now(timezone.utc)
-            collector = PongAuthenticHourCollector(Path(directory), now=now)
+            collector = PongAuthenticHourCollector(
+                Path(directory), now=now, independent_market_collection=True,
+            )
             started = collector.start()
+            self.assertEqual(
+                started["independence"]["market_fanout"], "PONG_ONLY",
+            )
+            self.assertFalse(
+                started["independence"]["perpetual_operational_session_required"],
+            )
             target = datetime.fromisoformat(started["required_interval"]["start_utc"].replace("Z", "+00:00"))
             event_at = target + timedelta(seconds=1)
             collector.on_transport_state("HEALTHY")
@@ -94,6 +102,9 @@ class PongAuthenticHourCollectorTests(unittest.TestCase):
             self.assertEqual(rows[2]["previous_record_hash"], rows[1]["record_hash"])
             self.assertEqual(rows[1]["aggressor_classification"]["side"], "BUY")
             self.assertTrue(rows[1]["signature_verified"])
+            for row in rows:
+                digest = row.pop("record_hash")
+                self.assertEqual(digest, canonical_hash(row))
 
     def test_source_sequence_gap_invalidates_only_the_affected_hour(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -60,6 +60,17 @@ class ObservationAttestationTests(unittest.TestCase):
         self.assertTrue(admitted.signature_verified)
         self.assertEqual(admitted.producer.source_fingerprint, SOURCE_HASH)
         self.assertEqual(admitted.producer.build_fingerprint, "a" * 64)
+        unsigned = admitted.unsigned_wire_bytes()
+        wire_hash = admitted.wire_hash()
+        self.assertIs(admitted.unsigned_wire_bytes(), unsigned)
+        self.assertIs(admitted.wire_hash(), wire_hash)
+        self.assertEqual(
+            wire_hash,
+            canonical_hash({
+                **admitted.unsigned_wire_payload(),
+                "signature": admitted.signature,
+            }),
+        )
 
     def test_tamper_and_unsigned_legacy_are_refused_when_required(self):
         bridge = LoopbackNinjaTraderBridge(attestation_key=ROOT_KEY, require_attestation=True)
@@ -102,7 +113,7 @@ class ObservationAttestationTests(unittest.TestCase):
             self.assertIn("EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1", text)
             self.assertIn("EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1", text)
             self.assertIn("MarketDepth.Bids[index]", text)
-        self.assertEqual(SOURCE_HASH, "6cb4ceb5b7a1b9eea9d2c5aa40738f3c8847f3774825146c279f4d0d537cc49b")
+        self.assertEqual(SOURCE_HASH, "dab422fe84784b0affb0734248f4445127b88ff26a4ffd88c709cb44c9278a17")
 
 
 if __name__ == "__main__":

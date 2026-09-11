@@ -68,7 +68,33 @@ def _hour_start(value: datetime) -> datetime:
 
 
 def _canonical_bytes(value: object) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return _CANONICAL_ENCODER.encode(value).encode("utf-8")
+
+
+_CANONICAL_ENCODER = json.JSONEncoder(
+    sort_keys=True,
+    separators=(",", ":"),
+    ensure_ascii=True,
+    check_circular=False,
+)
+
+
+def _add_record_hash(canonical_body: bytes, digest: str) -> bytes:
+    """Insert the chain digest without canonicalizing the large body twice."""
+    # Canonical top-level ordering places record_hash immediately before the
+    # outer schema key.  Observation payloads can contain their own schema, so
+    # use the final marker and then assert the exact canonical result in tests.
+    marker = b',"schema":'
+    index = canonical_body.rfind(marker)
+    if index < 0:
+        raise RuntimeError("PONG_COLLECTION_CANONICAL_SCHEMA_MARKER_MISSING")
+    return (
+        canonical_body[:index]
+        + b',"record_hash":"'
+        + digest.encode("ascii")
+        + b'"'
+        + canonical_body[index:]
+    )
 
 
 def _finite_decimal(value: object, *, positive: bool = False) -> Decimal | None:
@@ -141,12 +167,15 @@ class PongAuthenticHourCollector:
         root: Path,
         *,
         expected_source_fingerprint: str = EXPECTED_OBSERVER_SOURCE_FINGERPRINT,
+        independent_market_collection: bool = False,
         now: datetime | None = None,
     ) -> None:
         if not isinstance(root, Path):
             raise ValueError("Pong collection root must be a Path.")
         if not isinstance(expected_source_fingerprint, str) or len(expected_source_fingerprint) != 64:
             raise ValueError("Pong collector requires a source SHA-256 fingerprint.")
+        if type(independent_market_collection) is not bool:
+            raise ValueError("Pong collection independence policy must be boolean.")
         started = (now or _utc_now()).astimezone(timezone.utc)
         stamp = started.strftime("%Y%m%dT%H%M%S%fZ")
         self.root = root.expanduser().resolve()
@@ -156,6 +185,7 @@ class PongAuthenticHourCollector:
         self.collector_status_path = self.collector_root / "status.json"
         self.status_path = self.root / "collection-status.json"
         self.expected_source_fingerprint = expected_source_fingerprint
+        self.independent_market_collection = independent_market_collection
         self.started_at = _wire(started)
         self._initial_target = _next_full_hour(started)
         self._queue: queue.Queue[_CollectorItem] = queue.Queue(self._QUEUE_CAPACITY)
@@ -276,6 +306,15 @@ class PongAuthenticHourCollector:
                 "paper_execution": "DISARMED",
                 "live_authority": "DISARMED",
                 "live_capital": "DENIED",
+                "independence": {
+                    "perpetual_operational_session_required": False,
+                    "perpetual_execution_required": False,
+                    "market_fanout": (
+                        "PONG_ONLY"
+                        if self.independent_market_collection
+                        else "SHARED_WITH_DISARMED_RUNTIMES"
+                    ),
+                },
                 "collector": {
                     "collector_id": self.collector_id,
                     "process_id": os.getpid(),
@@ -437,11 +476,11 @@ class PongAuthenticHourCollector:
         }
         if record.observation_type == "TRADE":
             body["aggressor_classification"] = self._classify_trade(record)
-        digest = hashlib.sha256(_canonical_bytes(body)).hexdigest()
-        body["record_hash"] = digest
+        canonical_body = _canonical_bytes(body)
+        digest = hashlib.sha256(canonical_body).hexdigest()
         with self._lock:
             self._journal_tip = digest
-        return _canonical_bytes(body) + b"\n"
+        return _add_record_hash(canonical_body, digest) + b"\n"
 
     def _classify_trade(self, trade: NinjaTraderObservation) -> dict[str, object]:
         payload = trade.payload

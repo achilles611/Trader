@@ -183,9 +183,12 @@ namespace NinjaTrader.NinjaScript.Indicators
                 string askLevels;
                 double bestNativeBid;
                 double bestNativeAsk;
-                if (!TryNativeDepthSnapshot(out bidLevels, out askLevels, out bestNativeBid, out bestNativeAsk))
+                string snapshotFailure;
+                if (!TryNativeDepthSnapshot(
+                    out bidLevels, out askLevels, out bestNativeBid,
+                    out bestNativeAsk, out snapshotFailure))
                 {
-                    PublishDepthUnavailable("POSITIONAL_SNAPSHOT_INVALID", sourceEventSequence, e.Time);
+                    PublishDepthUnavailable(snapshotFailure, sourceEventSequence, e.Time);
                     return;
                 }
                 if (FinitePositive(bestNativeBid) && FinitePositive(bestNativeAsk) && bestNativeBid >= bestNativeAsk)
@@ -244,14 +247,19 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         private bool TryNativeDepthSnapshot(
             out string bidLevels, out string askLevels,
-            out double bestNativeBid, out double bestNativeAsk)
+            out double bestNativeBid, out double bestNativeAsk,
+            out string failureReason)
         {
             bidLevels = "[]";
             askLevels = "[]";
             bestNativeBid = Double.NaN;
             bestNativeAsk = Double.NaN;
+            failureReason = null;
             if (Instrument == null || Instrument.MarketDepth == null)
+            {
+                failureReason = "NATIVE_MARKET_DEPTH_UNAVAILABLE";
                 return false;
+            }
             List<string> bidRows = new List<string>();
             List<string> askRows = new List<string>();
             double priorBid = Double.PositiveInfinity;
@@ -268,7 +276,21 @@ namespace NinjaTrader.NinjaScript.Indicators
                 {
                     double price = Instrument.MarketDepth.Bids[index].Price;
                     long volume = Instrument.MarketDepth.Bids[index].Volume;
-                    if (!FinitePositive(price) || volume <= 0 || price >= priorBid) return false;
+                    if (!FinitePositive(price))
+                    {
+                        failureReason = "NATIVE_BID_PRICE_INVALID";
+                        return false;
+                    }
+                    if (volume <= 0)
+                    {
+                        failureReason = "NATIVE_BID_VOLUME_INVALID";
+                        return false;
+                    }
+                    if (price >= priorBid)
+                    {
+                        failureReason = "NATIVE_BID_POSITION_ORDER_INVALID";
+                        return false;
+                    }
                     if (index == 0) bestNativeBid = price;
                     priorBid = price;
                     bidRows.Add("{\"price\":" + price.ToString(CultureInfo.InvariantCulture) + ",\"size\":" + volume + "}");
@@ -277,7 +299,21 @@ namespace NinjaTrader.NinjaScript.Indicators
                 {
                     double price = Instrument.MarketDepth.Asks[index].Price;
                     long volume = Instrument.MarketDepth.Asks[index].Volume;
-                    if (!FinitePositive(price) || volume <= 0 || price <= priorAsk) return false;
+                    if (!FinitePositive(price))
+                    {
+                        failureReason = "NATIVE_ASK_PRICE_INVALID";
+                        return false;
+                    }
+                    if (volume <= 0)
+                    {
+                        failureReason = "NATIVE_ASK_VOLUME_INVALID";
+                        return false;
+                    }
+                    if (price <= priorAsk)
+                    {
+                        failureReason = "NATIVE_ASK_POSITION_ORDER_INVALID";
+                        return false;
+                    }
                     if (index == 0) bestNativeAsk = price;
                     priorAsk = price;
                     askRows.Add("{\"price\":" + price.ToString(CultureInfo.InvariantCulture) + ",\"size\":" + volume + "}");
@@ -285,6 +321,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
             catch (ArgumentOutOfRangeException)
             {
+                failureReason = "NATIVE_POSITIONAL_SNAPSHOT_RACE";
                 return false;
             }
             bidLevels = "[" + String.Join(",", bidRows) + "]";

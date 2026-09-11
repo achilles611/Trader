@@ -106,6 +106,7 @@ MARKET_OBSERVER_ACTIVE_FRESHNESS_SECONDS = 15.0
 LEDGER_VERIFIER_SHUTDOWN_WAIT_SECONDS = 30.0
 GRACEFUL_SHUTDOWN_ACTION_HEADER = "X-Beelzebub-Graceful-Shutdown-Action"
 GRACEFUL_SHUTDOWN_ACTION_VALUE = "beezconsole-graceful-shutdown-v1"
+PONG_INDEPENDENT_COLLECTION_ENV = "BEELZEBUB_PONG_INDEPENDENT_COLLECTION"
 LEDGER_CAPACITY_RECOVERY_ACTION_HEADER = (
     "X-Beelzebub-Ledger-Capacity-Recovery-Action"
 )
@@ -142,6 +143,15 @@ def _runtime_git_sha() -> str:
     except (OSError, subprocess.SubprocessError):
         return "unknown"
     return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else "unknown"
+
+
+def _strict_environment_flag(name: str) -> bool:
+    value = os.getenv(name)
+    if value in {None, "0"}:
+        return False
+    if value == "1":
+        return True
+    raise RuntimeError(f"{name} must be exactly 0 or 1 when configured.")
 
 
 def _load(value: str | None, default: Any) -> Any:
@@ -1495,6 +1505,9 @@ def create_control_center_app(
         os.getenv("BEELZEBUB_LEDGER_AUDIT_ROOT") or remembered_audit_root or derived_audit_root
     ).resolve()
     pong_collection_root = audit_root / "pong-authentic-hour"
+    pong_independent_collection = _strict_environment_flag(
+        PONG_INDEPENDENT_COLLECTION_ENV,
+    )
     perpetual_seed_artifact: Mapping[str, object] | None = None
     perpetual_seed_proof: Mapping[str, object] | None = None
     perpetual_seed_manifest: Mapping[str, object] | None = None
@@ -1983,6 +1996,8 @@ def create_control_center_app(
 
     def start_operational_paper_from_autostart(request_id: str) -> Mapping[str, object]:
         """Enter only the canonical persistent Sim101 lifecycle after orchestration."""
+        if pong_independent_collection:
+            raise RuntimeError("PONG_INDEPENDENT_COLLECTION_ACTIVE")
         paper = ninjatrader_runtime.get("paper")
         if not isinstance(paper, LaneIIIPaperRuntime):
             raise RuntimeError("PAPER_RUNTIME_UNAVAILABLE")
@@ -2254,6 +2269,7 @@ def create_control_center_app(
             pong_collector = PongAuthenticHourCollector(
                 pong_collection_root,
                 expected_source_fingerprint=EXPECTED_OBSERVER_SOURCE_FINGERPRINT,
+                independent_market_collection=pong_independent_collection,
             )
             pong_collector.start()
             ninjatrader_runtime["pong_collection"] = pong_collector
@@ -2272,6 +2288,18 @@ def create_control_center_app(
             def collect_and_fanout_observation(observation: object) -> None:
                 assert pong_collector is not None
                 pong_collector.ingest(observation)  # type: ignore[arg-type]
+                if (
+                    pong_independent_collection
+                    and getattr(observation, "observation_type", None)
+                    in {"TRADE", "QUOTE", "DEPTH"}
+                ):
+                    # During the explicitly bounded evidence acquisition, the
+                    # authenticated Pong sink must not wait behind legacy
+                    # shadow interpretation or a disarmed Perpetual policy.
+                    # Account/order/position/control truth continues through
+                    # the shared fanout, and this mode creates no execution
+                    # route or authority.
+                    return
                 fanout.on_observation(observation)  # type: ignore[arg-type]
 
             def collect_and_fanout_transport(state: object) -> None:
@@ -3197,6 +3225,8 @@ def create_control_center_app(
         paper = ninjatrader_runtime.get("paper")
         if paper is None:
             raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
+        if pong_independent_collection:
+            raise HTTPException(status_code=409, detail="PONG_INDEPENDENT_COLLECTION_ACTIVE")
         bootstrap = ninjatrader_runtime.get("login_bootstrap")
         if bootstrap is not None and bootstrap.state is not NinjaTraderLoginState.AUTHENTICATED:
             # A BeezConsole-only restart can outlast the bounded desktop UI
@@ -3242,6 +3272,8 @@ def create_control_center_app(
         paper = ninjatrader_runtime.get("paper")
         if paper is None:
             raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
+        if pong_independent_collection:
+            raise HTTPException(status_code=409, detail="PONG_INDEPENDENT_COLLECTION_ACTIVE")
         bootstrap = ninjatrader_runtime.get("login_bootstrap")
         if bootstrap is not None and bootstrap.state is not NinjaTraderLoginState.AUTHENTICATED:
             transport = paper.status().get("transport")
@@ -3269,6 +3301,8 @@ def create_control_center_app(
         paper = ninjatrader_runtime.get("paper")
         if paper is None:
             raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
+        if pong_independent_collection:
+            raise HTTPException(status_code=409, detail="PONG_INDEPENDENT_COLLECTION_ACTIVE")
         if not isinstance(body, dict) or set(body) != {"request_id"} or not isinstance(body.get("request_id"), str):
             raise HTTPException(status_code=400, detail="Commissioning start accepts only a request_id.")
         bootstrap = ninjatrader_runtime.get("login_bootstrap")
@@ -3295,6 +3329,8 @@ def create_control_center_app(
         paper = ninjatrader_runtime.get("paper")
         if paper is None:
             raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
+        if pong_independent_collection:
+            raise HTTPException(status_code=409, detail="PONG_INDEPENDENT_COLLECTION_ACTIVE")
         if not isinstance(body, dict) or set(body) != {"request_id"} or not isinstance(body.get("request_id"), str):
             raise HTTPException(status_code=400, detail="Operational paper start accepts only a request_id.")
         bootstrap = ninjatrader_runtime.get("login_bootstrap")

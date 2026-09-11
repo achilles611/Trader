@@ -8,7 +8,7 @@ boundary, not a NinjaTrader automation API.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
@@ -42,7 +42,7 @@ NINJATRADER_ATTESTATION_KEY_CONTEXT = b"BEELZEBUB_NINJATRADER_OBSERVATION_V2"
 # Regenerated from both checked-in read-only NinjaScript producer sources.  The
 # helper below excludes this embedded value, so a compiled stale producer keeps
 # reporting its old identity even after the checkout changes.
-EXPECTED_OBSERVER_SOURCE_FINGERPRINT = "6cb4ceb5b7a1b9eea9d2c5aa40738f3c8847f3774825146c279f4d0d537cc49b"
+EXPECTED_OBSERVER_SOURCE_FINGERPRINT = "dab422fe84784b0affb0734248f4445127b88ff26a4ffd88c709cb44c9278a17"
 NINJATRADER_SOURCE = "NINJATRADER"
 LUCID_CQG_PROVIDER = "LUCID_CQG"
 PROP_SIM_ENVIRONMENT = "PROP_SIM"
@@ -294,6 +294,18 @@ class NinjaTraderObservation:
     source: str = NINJATRADER_SOURCE
     provider: str = LUCID_CQG_PROVIDER
     environment: str = PROP_SIM_ENVIRONMENT
+    # One admitted native frame is consumed by duplicate detection, the live
+    # shadow, the paper runtime, and the independent Pong journal.  Rebuilding
+    # and canonicalizing the same immutable wire value in every sink can make
+    # the sole loopback reader fall behind a busy depth stream.  These caches
+    # are derived only from frozen validated fields and are excluded from
+    # equality/construction so they cannot change observation semantics.
+    _cached_unsigned_wire_bytes: bytes | None = field(
+        default=None, init=False, repr=False, compare=False,
+    )
+    _cached_wire_hash: str | None = field(
+        default=None, init=False, repr=False, compare=False,
+    )
 
     def __post_init__(self) -> None:
         _text(self.observation_id, "Observation ID")
@@ -375,10 +387,22 @@ class NinjaTraderObservation:
             raise NinjaTraderObservationError(ProviderErrorCode.MALFORMED_PROVIDER_PAYLOAD, "bridge_record_fields") from exc
 
     def wire_hash(self) -> str:
-        return canonical_hash({
-            **self.unsigned_wire_payload(),
-            "signature": self.signature,
-        })
+        cached = self._cached_wire_hash
+        if cached is None:
+            cached = canonical_hash({
+                **self.unsigned_wire_payload(),
+                "signature": self.signature,
+            })
+            object.__setattr__(self, "_cached_wire_hash", cached)
+        return cached
+
+    def unsigned_wire_bytes(self) -> bytes:
+        """Return the cached canonical bytes covered by native attestation."""
+        cached = self._cached_unsigned_wire_bytes
+        if cached is None:
+            cached = _canonical_bytes(self.unsigned_wire_payload())
+            object.__setattr__(self, "_cached_unsigned_wire_bytes", cached)
+        return cached
 
     def unsigned_wire_payload(self) -> dict[str, object]:
         value: dict[str, object] = {
@@ -416,10 +440,15 @@ class NinjaTraderObservation:
         if payload_policy is not None and payload_policy != self.producer.publication_policy:
             raise NinjaTraderObservationError(ProviderErrorCode.AUTH_FAILED, "ninjatrader_publication_policy")
         key = derive_observation_signing_key(root_key)
-        expected = hmac.new(key, _canonical_bytes(self.unsigned_wire_payload()), hashlib.sha256).hexdigest()
+        unsigned_wire_bytes = self.unsigned_wire_bytes()
+        expected = hmac.new(key, unsigned_wire_bytes, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(self.signature, expected):
             raise NinjaTraderObservationError(ProviderErrorCode.AUTH_FAILED, "ninjatrader_attestation_signature")
-        return replace(self, signature_verified=True)
+        verified = replace(self, signature_verified=True)
+        object.__setattr__(
+            verified, "_cached_unsigned_wire_bytes", unsigned_wire_bytes,
+        )
+        return verified
 
 
 @dataclass(frozen=True)
