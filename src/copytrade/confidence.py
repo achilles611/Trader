@@ -6,15 +6,21 @@ import math
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
+from src.shared.confidence_math import (
+    logit_probability,
+    shrink_toward_neutral,
+    sigmoid_clipped,
+    unit_interval,
+)
+
 
 def _unit(value: float, name: str) -> float:
-    if not 0 <= value <= 1:
-        raise ValueError(f"{name} must be in [0, 1].")
-    return float(value)
+    """Compatibility wrapper for the implementation-neutral validator."""
+    return unit_interval(value, name)
 
 
 def effective_confidence(trade_confidence: float, model_confidence: float) -> float:
-    return 0.5 + (_unit(trade_confidence, "trade_confidence") - 0.5) * _unit(model_confidence, "model_confidence")
+    return shrink_toward_neutral(trade_confidence, model_confidence)
 
 
 @dataclass(frozen=True)
@@ -65,7 +71,7 @@ class ConfidenceEngine:
     def trade_confidence(self, baseline: float, *, evidence_updates: Mapping[str, float]) -> tuple[float, tuple[str, ...]]:
         """Apply calibrated log-odds updates; age appears only through a learned input update."""
         probability = _unit(baseline, "baseline trade confidence")
-        log_odds = math.log(max(probability, 1e-9) / max(1 - probability, 1e-9))
+        log_odds = logit_probability(probability, name="baseline trade confidence")
         explanations = []
         for name, update in evidence_updates.items():
             if not math.isfinite(update):
@@ -73,7 +79,7 @@ class ConfidenceEngine:
             log_odds += float(update)
             if update:
                 explanations.append(f"{name}:{update:+.3f} calibrated log-odds")
-        recalculated = 1 / (1 + math.exp(-max(-30.0, min(30.0, log_odds))))
+        recalculated = sigmoid_clipped(log_odds)
         return recalculated, tuple(explanations or ("No new validated evidence.",))
 
     def snapshot(self, model_evidence: ModelEvidence, baseline_trade_confidence: float, *, evidence_updates: Mapping[str, float]) -> ConfidenceSnapshot:
