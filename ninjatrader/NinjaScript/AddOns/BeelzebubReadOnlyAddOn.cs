@@ -607,6 +607,11 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string DepthPublicationPolicy = "EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1";
         private readonly Instrument instrument;
         private readonly object bookLock = new object();
+        // NinjaTrader may deliver level-one callbacks concurrently.  The
+        // per-stream sequence number and the outbound enqueue must share this
+        // owner boundary or otherwise-contiguous QUOTE/TRADE callbacks can be
+        // observed in reversed order by the authenticated consumer.
+        private readonly object marketDataLock = new object();
         private readonly SortedDictionary<int, KeyValuePair<double, long>> depthBids =
             new SortedDictionary<int, KeyValuePair<double, long>>();
         private readonly SortedDictionary<int, KeyValuePair<double, long>> depthAsks =
@@ -868,6 +873,12 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
         private void OnMarketData(object sender, MarketDataEventArgs e)
+        {
+            lock (marketDataLock)
+                OnMarketDataSerial(e);
+        }
+
+        private void OnMarketDataSerial(MarketDataEventArgs e)
         {
             if (stopping)
                 return;
@@ -1287,7 +1298,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string AttestedSchema = "lane-iii-phase-f3-ninjatrader-observation-v2";
         private const string AttestationProtocol = "l3f3-ninjatrader-observer-attestation-v1";
         private const string AttestationKeyContext = "BEELZEBUB_NINJATRADER_OBSERVATION_V2";
-        private const string ProducerSourceFingerprint = "fcf81dba7bec2ba2bf7c17f5f6cc24fe830153735f24f9552996cf9fe3d55cd3";
+        private const string ProducerSourceFingerprint = "a8187ea7b542e0e44c2e39a9445e3ecc7b2f6e6375c76e92a5c2506e52b38321";
         // Event-driven trades/depth require burst capacity, but memory remains
         // bounded. A full queue drops the signed frame after assigning its
         // sequence; the next source_event_sequence exposes the gap.

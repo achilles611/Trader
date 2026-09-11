@@ -1635,6 +1635,10 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertIn("chart.Dispatcher.BeginInvoke(activate)", addon)
         self.assertIn("instrument.MarketData.Update += OnMarketData", addon)
         self.assertIn("instrument.MarketDepth.Update += OnMarketDepth", addon)
+        for source in (addon, observer):
+            self.assertIn("private readonly object marketDataLock = new object();", source)
+            self.assertIn("lock (marketDataLock)", source)
+            self.assertIn("OnMarketDataSerial(e);", source)
         self.assertIn('"NATIVE_ADDON"', addon)
         self.assertIn("BeelzebubAutomaticMarketObserver", addon)
         self.assertIn("MARKET_OBSERVER_ATTACHMENT", addon)

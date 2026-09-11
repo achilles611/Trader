@@ -28,6 +28,9 @@ namespace NinjaTrader.NinjaScript.Indicators
         private const string TradePublicationPolicy = "EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1";
         private const string DepthPublicationPolicy = "EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1";
         private readonly object bookLock = new object();
+        // Keep sequence assignment and publication ordered even when native
+        // level-one callbacks arrive concurrently.
+        private readonly object marketDataLock = new object();
         private readonly SortedDictionary<int, KeyValuePair<double, long>> depthBids =
             new SortedDictionary<int, KeyValuePair<double, long>>();
         private readonly SortedDictionary<int, KeyValuePair<double, long>> depthAsks =
@@ -76,6 +79,12 @@ namespace NinjaTrader.NinjaScript.Indicators
         }
 
         protected override void OnMarketData(MarketDataEventArgs e)
+        {
+            lock (marketDataLock)
+                OnMarketDataSerial(e);
+        }
+
+        private void OnMarketDataSerial(MarketDataEventArgs e)
         {
             if (BeelzebubReadOnlyAddOn.AutomaticObserverActive)
                 return;
