@@ -3251,6 +3251,38 @@ def create_control_center_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.get("/api/lane-iii/paper/bounded-trial")
+    async def api_lane_iii_paper_bounded_trial_status() -> dict[str, object]:
+        """Report the durable one-run deadline fence without execution authority."""
+        paper = ninjatrader_runtime.get("paper")
+        if paper is None:
+            raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
+        return paper.bounded_trial_status()
+
+    @app.post("/api/lane-iii/paper/bounded-trial")
+    async def api_lane_iii_paper_prepare_bounded_trial(
+        body: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, object]:
+        """Durably bind one exact Perpetual V2 request to a bounded duration."""
+        paper = ninjatrader_runtime.get("paper")
+        if paper is None:
+            raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
+        required = {"trial_id", "request_id", "duration_seconds", "manifest"}
+        if not isinstance(body, dict) or set(body) != required:
+            raise HTTPException(
+                status_code=400,
+                detail="Bounded trial accepts only trial_id, request_id, duration_seconds, and manifest.",
+            )
+        try:
+            return paper.prepare_bounded_trial(
+                trial_id=body["trial_id"],
+                request_id=body["request_id"],
+                duration_seconds=body["duration_seconds"],
+                manifest=body["manifest"],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/lane-iii/paper/commission-exit")
     async def api_lane_iii_paper_commission_exit() -> dict[str, object]:
         """Close only an active explicit commissioning position through normal paper gates."""

@@ -1978,6 +1978,130 @@ class PerpetualRuntimeTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_bounded_trial_deadline_flattens_reconciles_and_disarms(self) -> None:
+        with TemporaryDirectory() as directory, patch(
+            "src.l3g_paper.runtime._now", return_value=NOW,
+        ):
+            ledger, runtime, capture = self._runtime(directory)
+            try:
+                prepared = runtime.prepare_bounded_trial(
+                    trial_id="perpetual-bounded-trial-test",
+                    request_id="perpetual-bounded-request-test",
+                    duration_seconds=3600,
+                    manifest={
+                        "baseline_analysis_id": "baseline-analysis-test",
+                        "change": "consumed-checkpoint-fence",
+                    },
+                )
+                self.assertTrue(prepared["prepared"])
+                self.assertEqual(prepared["state"], "PREPARED")
+                replay = runtime.prepare_bounded_trial(
+                    trial_id="perpetual-bounded-trial-test",
+                    request_id="perpetual-bounded-request-test",
+                    duration_seconds=3600,
+                    manifest={
+                        "baseline_analysis_id": "baseline-analysis-test",
+                        "change": "consumed-checkpoint-fence",
+                    },
+                )
+                self.assertTrue(replay["idempotent_replay"])
+
+                self._start_and_fill_long(
+                    runtime,
+                    capture,
+                    request_id="perpetual-bounded-request-test",
+                    suffix="bounded-trial",
+                )
+                active = runtime.bounded_trial_status()
+                self.assertEqual(active["state"], "ACTIVE")
+                self.assertEqual(active["deadline"], "2026-09-01T21:54:00Z")
+
+                runtime._enforce_bounded_trial_deadline_locked(
+                    "2026-09-01T21:54:00Z",
+                )
+                self.assertTrue(runtime._entries_paused)
+                self.assertEqual(runtime.bounded_trial_status()["state"], "STOPPING")
+                self.assertEqual(
+                    runtime.status()["operational_paper_session"]["stopping_reason"],  # type: ignore[index]
+                    "BOUNDED_TRIAL_DEADLINE",
+                )
+                exit_commands = [
+                    command for command in capture.commands
+                    if command.action is ExecutionAction.EMERGENCY_FLATTEN  # type: ignore[attr-defined]
+                ]
+                self.assertEqual(len(exit_commands), 1)
+                command_id = exit_commands[0].command_id  # type: ignore[attr-defined]
+
+                runtime.on_execution_message({
+                    "message_type": "EXECUTION_EVENT",
+                    "order_role": "EXIT",
+                    "direction": "FLAT",
+                    "price": "100.00",
+                    "quantity": 1,
+                    "native_execution_id": "bounded-trial-exit-execution",
+                    "native_order_id": "bounded-trial-exit-order",
+                    "command_id": command_id,
+                    "account_name": "Sim101",
+                    "instrument": "MNQ SEP26",
+                    "timestamp": NOW,
+                })
+                runtime.on_execution_message({
+                    "message_type": "POSITION_EVENT",
+                    "quantity": 0,
+                    "timestamp": NOW,
+                })
+                runtime.on_execution_message(self._filled_order(
+                    "EXIT", "bounded-trial-exit-order", command_id=command_id,
+                ))
+                runtime.on_execution_message(self._flat_reconciliation(
+                    "bounded-trial-flat", NOW,
+                ))
+
+                stopped = runtime.bounded_trial_status()
+                self.assertEqual(stopped["state"], "COMPLETED")
+                self.assertEqual(stopped["stop_reason"], "BOUNDED_TRIAL_DEADLINE")
+                self.assertEqual(runtime.state, PaperRuntimeState.READY_DISARMED)
+                self.assertIsNone(runtime.status()["operational_paper_session"])
+                self.assertEqual(
+                    len(ledger.recent_kind_records((
+                        "RISK_EVENT_BOUNDED_TRIAL_PREPARED",
+                        "RISK_EVENT_BOUNDED_TRIAL_STARTED",
+                        "RISK_EVENT_BOUNDED_TRIAL_DEADLINE_REACHED",
+                        "RISK_EVENT_BOUNDED_TRIAL_STOPPED",
+                    ))),
+                    4,
+                )
+                runtime._maintain_perpetual_position_locked("POST_TRIAL_CALLBACK")
+                self.assertEqual(self._entry_actions(capture), [ExecutionAction.ENTER_LONG])
+            finally:
+                ledger.close()
+
+    def test_prepared_bounded_trial_rejects_a_different_start_request(self) -> None:
+        with TemporaryDirectory() as directory, patch(
+            "src.l3g_paper.runtime._now", return_value=NOW,
+        ):
+            ledger, runtime, capture = self._runtime(directory)
+            try:
+                runtime.prepare_bounded_trial(
+                    trial_id="perpetual-bounded-mismatch",
+                    request_id="perpetual-bounded-request",
+                    duration_seconds=3600,
+                    manifest={},
+                )
+                self._ready(runtime)
+                result = runtime.operational_paper_start(
+                    "different-operational-request",
+                )
+                self.assertFalse(result["started"])
+                self.assertEqual(
+                    result["reason_codes"],
+                    ("BOUNDED_TRIAL_REQUEST_ID_MISMATCH",),
+                )
+                self.assertEqual(capture.commands, [])
+                self.assertEqual(runtime.bounded_trial_status()["state"], "PREPARED")
+            finally:
+                ledger.close()
+
     def test_safety_exit_reconciles_and_waits_for_a_later_boundary(self) -> None:
         with TemporaryDirectory() as directory, patch(
             "src.l3g_paper.runtime._now", return_value=NOW,
@@ -2023,6 +2147,23 @@ class PerpetualRuntimeTests(unittest.TestCase):
                 self.assertEqual(runtime.state, PaperRuntimeState.PAPER_RUNNING)
                 self.assertEqual(
                     self._entry_actions(capture), [ExecutionAction.ENTER_LONG],
+                )
+
+                # The stopped run exposed a callback sequence that the
+                # simpler healthy-path assertion above did not cover: a
+                # freshness blocker arrived while flat, then health recovered
+                # before the next scheduled boundary.  A checkpoint that
+                # already produced an entry remains consumed across that
+                # blocker/recovery cycle.
+                runtime._snapshot = replace(
+                    runtime._snapshot,
+                    quote_observed_at="2026-09-01T20:53:00Z",
+                )
+                runtime._maintain_perpetual_position_locked(
+                    "SAME_CHECKPOINT_QUOTE_STALE",
+                )
+                runtime._snapshot = self._healthy_snapshot(
+                    NOW, runtime._session_context,
                 )
                 runtime._maintain_perpetual_position_locked(
                     "SAME_CHECKPOINT_HEALTH_RECOVERED",

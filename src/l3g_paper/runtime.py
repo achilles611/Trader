@@ -101,6 +101,12 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _timestamp_utc(value: str) -> datetime:
+    return datetime.fromisoformat(
+        normalized_utc(value, "UTC timestamp").replace("Z", "+00:00")
+    )
+
+
 _RISK_LOCKOUT_PENDING_SCHEMA = "lane-iii-risk-lockout-pending-v1"
 _PERPETUAL_SIGNAL_SCHEMA = "lane-iii-five-minute-perpetual-signal-v3"
 _PERPETUAL_SIGNAL_KIND = "RISK_EVENT_FIVE_MINUTE_DIRECTION_CHECKPOINT"
@@ -453,6 +459,7 @@ class LaneIIIPaperRuntime:
         self._entries_paused = False
         self._commissioning_ownership = self._load_unresolved_commissioning_ownership()
         self._operational_session: _OperationalPaperSession | None = None
+        self._bounded_trial: dict[str, object] | None = None
         self._entry_owner = PaperEntryOwner.COMMISSIONING if self._commissioning_ownership is not None else PaperEntryOwner.NONE
         if self._commissioning_ownership is not None:
             # A process restart must not accidentally restore normal strategy
@@ -1925,11 +1932,6 @@ class LaneIIIPaperRuntime:
         blockers = self._perpetual_position_blockers_locked()
         if blockers:
             self._perpetual_flat_blocker = blockers[0]
-            if blockers[0] not in {
-                "NO_COMPLETED_FIVE_MINUTE_SIGNAL", "ENTRY_PENDING",
-                "REVERSAL_OR_SAFETY_EXIT_PENDING",
-            }:
-                self._perpetual_entry_attempted_checkpoint = None
             return False
         checkpoint = self._latest_five_minute_direction_checkpoint
         assert checkpoint is not None
@@ -2217,6 +2219,35 @@ class LaneIIIPaperRuntime:
             }),
             execution_session_id=self._execution_session_id(),
         )
+        trial = self._bounded_trial
+        if (
+            isinstance(trial, dict)
+            and trial.get("request_id") == session.request_id
+            and trial.get("state") in {"ACTIVE", "STOPPING"}
+        ):
+            stopped_at = _now()
+            deadline = str(trial["deadline"])
+            completed = {
+                **trial,
+                "state": (
+                    "COMPLETED"
+                    if session.stopping_reason == "BOUNDED_TRIAL_DEADLINE"
+                    else "STOPPED_EARLY"
+                ),
+                "stopped_at": stopped_at,
+                "stop_reason": session.stopping_reason or reason,
+                "drain_seconds": max(
+                    0.0,
+                    (_timestamp_utc(stopped_at) - _timestamp_utc(deadline)).total_seconds(),
+                ),
+            }
+            self.ledger.append(
+                "RISK_EVENT_BOUNDED_TRIAL_STOPPED",
+                completed,
+                identity="l3g-bounded-trial-stopped-" + str(trial["trial_id"]),
+                execution_session_id=self._execution_session_id(),
+            )
+            self._bounded_trial = completed
         self._export_five_minute_analysis_locked(session.context)
         self._operational_session = None
         self._disarm_after_flat = False
@@ -2767,6 +2798,7 @@ class LaneIIIPaperRuntime:
         return context, resolution.reason_code
 
     def _enforce_session_boundary(self) -> None:
+        self._enforce_bounded_trial_deadline_locked()
         if self._continuous_execution_profile:
             return
         context = self._session_context
@@ -2779,6 +2811,24 @@ class LaneIIIPaperRuntime:
             self._entries_paused = True
             self.ledger.append("RISK_EVENT_HARD_FLAT", {**context.payload(), "reason": "HARD_FLAT_DEADLINE"})
             self.flatten_and_disarm()
+
+    def _enforce_bounded_trial_deadline_locked(self, at: str | None = None) -> None:
+        trial = self._bounded_trial
+        if not isinstance(trial, dict) or trial.get("state") != "ACTIVE":
+            return
+        now = normalized_utc(at or _now(), "Bounded trial deadline check")
+        if _timestamp_utc(now) < _timestamp_utc(str(trial["deadline"])):
+            return
+        stopping = {**trial, "state": "STOPPING", "deadline_reached_at": now}
+        self._bounded_trial = stopping
+        self._entries_paused = True
+        self.ledger.append(
+            "RISK_EVENT_BOUNDED_TRIAL_DEADLINE_REACHED",
+            stopping,
+            identity="l3g-bounded-trial-deadline-" + str(trial["trial_id"]),
+            execution_session_id=self._execution_session_id(),
+        )
+        self.flatten_and_disarm(reason="BOUNDED_TRIAL_DEADLINE")
 
     def bind_transport(self, transport: PaperExecutionTransport) -> None:
         if type(transport) is not PaperExecutionTransport:
@@ -7038,6 +7088,20 @@ class LaneIIIPaperRuntime:
                     ),
                     "state": self._state.value,
                 }
+            trial = self._bounded_trial
+            if (
+                isinstance(trial, dict)
+                and trial.get("state") == "PREPARED"
+                and trial.get("request_id") != request_id
+            ):
+                return {
+                    "started": False,
+                    "operational_paper": True,
+                    "request_id": request_id,
+                    "idempotent_replay": False,
+                    "reason_codes": ("BOUNDED_TRIAL_REQUEST_ID_MISMATCH",),
+                    "state": self._state.value,
+                }
 
         readiness = self.operational_paper_readiness(ledger_preflight)
         recovery_blockers: tuple[str, ...] = ()
@@ -7167,6 +7231,48 @@ class LaneIIIPaperRuntime:
                             "request_id": request_id,
                             "idempotent_replay": False,
                         }
+                    trial = self._bounded_trial
+                    if isinstance(trial, dict) and trial.get("state") == "PREPARED":
+                        deadline = (
+                            _timestamp_utc(started_at)
+                            + timedelta(seconds=int(trial["duration_seconds"]))
+                        ).isoformat().replace("+00:00", "Z")
+                        active_trial = {
+                            **trial,
+                            "state": "ACTIVE",
+                            "started_at": started_at,
+                            "deadline": deadline,
+                        }
+                        try:
+                            self.ledger.append(
+                                "RISK_EVENT_BOUNDED_TRIAL_STARTED",
+                                active_trial,
+                                identity=(
+                                    "l3g-bounded-trial-started-"
+                                    + str(trial["trial_id"])
+                                ),
+                                execution_session_id=self._execution_session_id(),
+                            )
+                        except Exception as error:
+                            self._entries_paused = True
+                            self._request_operational_stop_locked(
+                                "BOUNDED_TRIAL_START_DURABILITY_FAILED"
+                            )
+                            self.flatten_and_disarm(
+                                reason="BOUNDED_TRIAL_START_DURABILITY_FAILED"
+                            )
+                            return {
+                                **armed,
+                                "started": False,
+                                "operational_paper": True,
+                                "request_id": request_id,
+                                "idempotent_replay": False,
+                                "reason_codes": (
+                                    "BOUNDED_TRIAL_START_DURABILITY_FAILED:"
+                                    + type(error).__name__,
+                                ),
+                            }
+                        self._bounded_trial = active_trial
                     if self._perpetual_position_profile:
                         self._calculate_perpetual_startup_signal_locked(started_at)
                         self._maintain_perpetual_position_locked(
@@ -7190,6 +7296,114 @@ class LaneIIIPaperRuntime:
                     "reason_codes": ("LEDGER_CAPACITY_INADEQUATE",),
                     "state": self._state.value,
                 }
+
+    def bounded_trial_status(self) -> dict[str, object]:
+        with self._lock:
+            return (
+                {
+                    "state": "UNPREPARED",
+                    "profile": self.policy.artifact.entry_profile_version,
+                }
+                if self._bounded_trial is None
+                else dict(self._bounded_trial)
+            )
+
+    def prepare_bounded_trial(
+        self,
+        *,
+        trial_id: str,
+        request_id: str,
+        duration_seconds: int,
+        manifest: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Durably bind one exact V2 run to the heartbeat deadline fence."""
+        for label, value in (("trial_id", trial_id), ("request_id", request_id)):
+            if (
+                not isinstance(value, str)
+                or not 8 <= len(value) <= 128
+                or any(
+                    not (character.isalnum() or character in "-_.:")
+                    for character in value
+                )
+            ):
+                raise ValueError(
+                    f"Bounded trial {label} must be an 8-128 character identifier."
+                )
+        if type(duration_seconds) is not int or not 60 <= duration_seconds <= 86_400:
+            raise ValueError("Bounded trial duration must be 60-86400 whole seconds.")
+        if not isinstance(manifest, Mapping):
+            raise ValueError("Bounded trial manifest must be an object.")
+        with self._lock:
+            if not self._perpetual_position_profile:
+                raise ValueError("Bounded trials are available only for Perpetual V2.")
+            existing = self._bounded_trial
+            if existing is not None:
+                same = (
+                    existing.get("trial_id") == trial_id
+                    and existing.get("request_id") == request_id
+                    and existing.get("duration_seconds") == duration_seconds
+                    and existing.get("manifest") == dict(manifest)
+                )
+                return {
+                    **dict(existing),
+                    "prepared": same,
+                    "idempotent_replay": same,
+                }
+            blockers: list[str] = []
+            if self._state is not PaperRuntimeState.READY_DISARMED:
+                blockers.append("STATE_NOT_READY_DISARMED")
+            if self._operational_session is not None:
+                blockers.append("OPERATIONAL_PAPER_SESSION_ALREADY_ACTIVE")
+            if (
+                self._position is not PaperDirection.FLAT
+                or self._snapshot.current_position_quantity != 0
+            ):
+                blockers.append("POSITION_NOT_FLAT")
+            if self._snapshot.working_owned_orders or self._snapshot.working_entry_orders:
+                blockers.append("WORKING_ORDERS_PRESENT")
+            if (
+                not self._snapshot.reconciliation_current
+                or not self._snapshot.position_snapshot_complete
+                or not self._snapshot.order_snapshot_complete
+            ):
+                blockers.append("RECONCILIATION_INCOMPLETE")
+            if blockers:
+                return {
+                    "prepared": False,
+                    "state": "REFUSED",
+                    "trial_id": trial_id,
+                    "request_id": request_id,
+                    "reason_codes": tuple(blockers),
+                }
+            prepared_at = _now()
+            payload = {
+                "schema": "lane-iii-perpetual-bounded-trial-v1",
+                "state": "PREPARED",
+                "trial_id": trial_id,
+                "request_id": request_id,
+                "duration_seconds": duration_seconds,
+                "prepared_at": prepared_at,
+                "profile": self.policy.artifact.entry_profile_version,
+                "paper_policy_hash": self.policy.artifact.configuration_hash,
+                "risk_profile_hash": self.risk.profile.configuration_hash,
+                "runtime_git_sha": self._runtime_identity.get("git_sha"),
+                "binding": {
+                    "account": "Sim101",
+                    "account_class": "LOCAL_SIMULATION",
+                    "instrument": "MNQ SEP26",
+                    "maximum_quantity": 1,
+                    "live_capital": "DENIED",
+                },
+                "manifest": dict(manifest),
+            }
+            self.ledger.append(
+                "RISK_EVENT_BOUNDED_TRIAL_PREPARED",
+                payload,
+                identity="l3g-bounded-trial-prepared-" + trial_id,
+                execution_session_id=self._execution_session_id(),
+            )
+            self._bounded_trial = payload
+            return {**payload, "prepared": True, "idempotent_replay": False}
 
     def arm(self) -> dict[str, object]:
         with self._lock:
@@ -7923,11 +8137,11 @@ class LaneIIIPaperRuntime:
                 self._maintain_perpetual_position_locked("OPERATOR_RESUME")
             return {"resumed": True, "state": self._state.value}
 
-    def flatten_and_disarm(self) -> dict[str, object]:
+    def flatten_and_disarm(self, *, reason: str = "OPERATOR_STOP_TRADING") -> dict[str, object]:
         with self._lock:
             operational = self._operational_session
             if operational is not None:
-                self._request_operational_stop_locked("OPERATOR_STOP_TRADING")
+                self._request_operational_stop_locked(reason)
                 audit_payload = {
                     "position": self._position.value,
                     "state": self._state.value,
@@ -7951,7 +8165,7 @@ class LaneIIIPaperRuntime:
                     and self._snapshot.order_snapshot_complete
                     and self._snapshot.working_owned_orders == 0
                 ):
-                    self._complete_operational_stop_locked("OPERATOR_STOP_TRADING_RECONCILED")
+                    self._complete_operational_stop_locked(reason + "_RECONCILED")
                     result = {
                         "initiated": True,
                         "stopping": False,
@@ -7960,7 +8174,7 @@ class LaneIIIPaperRuntime:
                         "reason_codes": ("OPERATIONAL_STOP_RECONCILED",),
                     }
                 else:
-                    submitted = self._request_exit("OPERATOR_STOP_TRADING", emergency=True)
+                    submitted = self._request_exit(reason, emergency=True)
                     result = {
                         "initiated": submitted,
                         "stopping": True,
@@ -8503,6 +8717,7 @@ class LaneIIIPaperRuntime:
                     "scientific_evidence": False,
                 },
                 "operational_paper_session": self._operational_session_payload(),
+                "bounded_trial": self.bounded_trial_status(),
                 "position_requirement": position_requirement,
                 "pending_five_minute_reversal": None if self._pending_five_minute_reversal is None else {
                     "decision_id": self._pending_five_minute_reversal.paper_decision_id,
