@@ -3470,6 +3470,231 @@ class LaneIIIPaperRuntime:
             )
         return True, ()
 
+    def _recover_healthy_ledger_capacity_locked(
+        self,
+        request_id: str,
+        readiness: Mapping[str, object],
+    ) -> tuple[bool, tuple[str, ...]]:
+        """Clear only a retired ledger-capacity lock after an exact safe proof.
+
+        Capacity lockouts are intentionally durable because dropping a writer
+        warning from memory would let a restart manufacture entry authority.
+        Recovery therefore requires the original lockout row, a later signed
+        flat/no-order reconciliation, a healthy current writer snapshot, and a
+        Full verification through the exact arm snapshot tip.  Risk counters
+        and the historical lockout remain immutable ledger evidence.
+        """
+        risk_status = self.risk.status()
+        lockout_reason = risk_status.get("lockout_reason")
+        if not (
+            isinstance(lockout_reason, str)
+            and lockout_reason.startswith("LEDGER_CAPACITY_INADEQUATE:")
+        ):
+            return False, ()
+
+        blockers: list[str] = []
+        transport = None if self._transport is None else self._transport.status()
+        if self._state not in {
+            PaperRuntimeState.LOCKED_OUT,
+            PaperRuntimeState.READY_DISARMED,
+        }:
+            blockers.append("LEDGER_CAPACITY_RECOVERY_STATE_MISMATCH")
+        if self._operational_session is not None:
+            blockers.append("LEDGER_CAPACITY_RECOVERY_OPERATION_ACTIVE")
+        if self._entry_owner is not PaperEntryOwner.NONE:
+            blockers.append("LEDGER_CAPACITY_RECOVERY_ENTRY_OWNERSHIP_ACTIVE")
+        if (
+            self._position is not PaperDirection.FLAT
+            or self._position_quantity != 0
+            or self._snapshot.current_position is not PaperDirection.FLAT
+            or self._snapshot.current_position_quantity != 0
+        ):
+            blockers.append("SIM101_MNQ_NOT_FLAT")
+        if self._snapshot.working_owned_orders or self._snapshot.working_entry_orders:
+            blockers.append("WORKING_ORDERS_PRESENT")
+        if (
+            self._snapshot.account_name != self.risk.binding.account_name
+            or self._snapshot.account_class != self.risk.binding.account_class
+            or self._snapshot.instrument != self.risk.binding.instrument
+            or self._snapshot.account_match_count != 1
+            or self._snapshot.instrument_match_count != 1
+        ):
+            blockers.append("LEDGER_CAPACITY_RECOVERY_IDENTITY_MISMATCH")
+        if (
+            not self._snapshot.position_snapshot_complete
+            or not self._snapshot.order_snapshot_complete
+            or not self._snapshot.reconciliation_current
+        ):
+            blockers.append("RECONCILIATION_INCOMPLETE")
+        if (
+            self._snapshot.foreign_activity
+            or self._snapshot.unresolved_command
+            or self._snapshot.unresolved_native_order
+            or self._snapshot.unresolved_execution
+        ):
+            blockers.append("UNRESOLVED_EXECUTION_TRUTH")
+        if self._snapshot.protective_stop_state != "NONE":
+            blockers.append("LEDGER_CAPACITY_RECOVERY_ORDER_STATE_MISMATCH")
+        if (
+            transport is None
+            or not transport.authenticated_client
+            or not transport.reconciled
+            or not transport.addon_provenance_valid
+        ):
+            blockers.append("EXECUTION_BRIDGE_UNHEALTHY")
+        if self._fault_reason not in {None, lockout_reason}:
+            blockers.append("LEDGER_CAPACITY_RECOVERY_NEWER_FAULT")
+        if self._risk_continuity_fault not in {None, lockout_reason}:
+            blockers.append("LEDGER_CAPACITY_RECOVERY_CONTINUITY_FAULT")
+
+        capacity = self.ledger.deferred_capacity()
+        if not deferred_capacity_allows_authority(capacity):
+            blockers.append("LEDGER_CAPACITY_STILL_INADEQUATE")
+
+        ledger_proof = readiness.get("ledger")
+        if not isinstance(ledger_proof, Mapping) or (
+            ledger_proof.get("ledger_trust_state")
+            != "VERIFIED_TO_ARM_SNAPSHOT_TIP"
+            or ledger_proof.get("unverified_tail_rows") != 0
+            or type(ledger_proof.get("verified_through_sequence")) is not int
+            or type(ledger_proof.get("arm_snapshot_tip")) is not int
+            or ledger_proof.get("verified_through_sequence")
+            != ledger_proof.get("arm_snapshot_tip")
+            or not isinstance(ledger_proof.get("arm_snapshot_tip_hash"), str)
+        ):
+            blockers.append("LEDGER_CAPACITY_RECOVERY_LEDGER_UNVERIFIED")
+
+        lockouts = self.ledger.recent_kind_records(
+            ("RISK_EVENT_AUTHORITY_LOCKOUT",), 1,
+        )
+        reconciliations = self.ledger.recent_kind_records(
+            ("POSITION_SNAPSHOT_RECONCILIATION",), 1000,
+        )
+        lockout = lockouts[0] if lockouts else None
+        lockout_payload = (
+            None if lockout is None
+            else self._protective_exit_recovery_record_payload(lockout)
+        )
+        verified_tip = (
+            ledger_proof.get("arm_snapshot_tip")
+            if isinstance(ledger_proof, Mapping) else None
+        )
+        matching_reconciliation = next((
+            value for value in reconciliations
+            if lockout is not None
+            and type(value.get("ledger_sequence")) is int
+            and type(verified_tip) is int
+            and lockout["ledger_sequence"] < value["ledger_sequence"] <= verified_tip
+            and self._recovery_reconciliation_payload_safe(
+                self._protective_exit_recovery_record_payload(value) or {},
+            )
+        ), None)
+        if (
+            lockout is None
+            or not isinstance(lockout_payload, Mapping)
+            or lockout_payload.get("lockout_reason") != lockout_reason
+            or matching_reconciliation is None
+        ):
+            blockers.append("LEDGER_CAPACITY_RECOVERY_EVIDENCE_MISSING")
+        if isinstance(ledger_proof, Mapping) and type(verified_tip) is int:
+            verified_record = self.ledger.record_by_sequence(verified_tip)
+            if (
+                verified_record is None
+                or verified_record.get("record_hash")
+                != ledger_proof.get("arm_snapshot_tip_hash")
+            ):
+                blockers.append("LEDGER_CAPACITY_RECOVERY_LEDGER_REFERENCE_INVALID")
+
+        if blockers:
+            return False, tuple(dict.fromkeys(blockers))
+
+        assert lockout is not None
+        assert matching_reconciliation is not None
+        assert isinstance(ledger_proof, Mapping)
+        trade_date = self._snapshot.trade_date
+        trade_risk = self._trade_date_risk.get(trade_date, _TradeDateRisk())
+        profile_version = self.policy.artifact.entry_profile_version
+        profile_risk = self._profile_trade_date_risk.get(
+            (trade_date, profile_version), _ProfileTradeDateRisk(),
+        )
+        capacity_evidence = {
+            "schema": capacity.get("schema"),
+            "state": capacity.get("state"),
+            "admission_open": capacity.get("admission_open"),
+            "capacity_fault_latched": capacity.get("capacity_fault_latched"),
+            "wal_capacity_fault_latched": capacity.get("wal_capacity_fault_latched"),
+            "database_capacity_fault_latched": capacity.get(
+                "database_capacity_fault_latched"
+            ),
+            "database_warning_reasons": capacity.get("database_warning_reasons"),
+            "queue_depth": capacity.get("queue_depth"),
+            "inflight_queue_depth": capacity.get("inflight_queue_depth"),
+            "pending_barrier_count": capacity.get("pending_barrier_count"),
+            "queue_growth_records_per_second": capacity.get(
+                "queue_growth_records_per_second"
+            ),
+            "writer_error": capacity.get("writer_error"),
+        }
+        payload = {
+            "schema": "lane-iii-ledger-capacity-recovery-v1",
+            "request_id": request_id,
+            "profile": profile_version,
+            "risk_profile_hash": self.risk.profile.configuration_hash,
+            "preserved_lockout": self._protective_exit_recovery_coordinate(lockout),
+            "flat_reconciliation": self._protective_exit_recovery_coordinate(
+                matching_reconciliation,
+            ),
+            "verified_ledger_tip": {
+                "ledger_sequence": verified_tip,
+                "record_hash": ledger_proof["arm_snapshot_tip_hash"],
+            },
+            "capacity": capacity_evidence,
+            "risk_counters": {
+                "trade_date": trade_date,
+                "daily_realized_pnl": str(trade_risk.realized_pnl),
+                "daily_unrealized_pnl": str(trade_risk.unrealized_pnl),
+                "account_trade_date_entry_count": trade_risk.entry_count,
+                "profile_trade_date_entry_count": profile_risk.entry_count,
+                "consecutive_losses": profile_risk.consecutive_losses,
+            },
+            "account": self.risk.binding.account_name,
+            "environment": self.risk.binding.account_class,
+            "instrument": self.risk.binding.instrument,
+            "maximum_quantity": 1,
+            "live_capital": "DENIED",
+            "locked_out": False,
+            "lockout_reason": None,
+            "lockout_trade_date": None,
+            "effective_trade_date": trade_date,
+            "cleared_lockout_reason": lockout_reason,
+            "effect": "ONLY_RETIRED_LEDGER_CAPACITY_LOCKOUT_CLEARED",
+        }
+        identity = "l3g-ledger-capacity-recovery-" + canonical_hash({
+            "request_id": request_id,
+            "preserved_lockout": payload["preserved_lockout"],
+        })
+        self.ledger.append(
+            "RISK_EVENT_AUTHORITY_LOCKOUT_CLEARED",
+            payload,
+            identity=identity,
+            execution_session_id=self._execution_session_id(),
+        )
+        if self.ledger.record_by_identity(identity) is None:
+            raise RuntimeError("LEDGER_CAPACITY_RECOVERY_NOT_DURABLE")
+
+        self.risk.restore_lockout(False, None, None)
+        if self._fault_reason == lockout_reason:
+            self._fault_reason = None
+        if self._risk_continuity_fault == lockout_reason:
+            self._risk_continuity_fault = None
+        self._entries_paused = False
+        if self._state is PaperRuntimeState.LOCKED_OUT:
+            self._transition(
+                PaperRuntimeState.READY_DISARMED,
+                "HEALTHY_LEDGER_CAPACITY_RECOVERED",
+            )
+        return True, ()
+
     @property
     def state(self) -> PaperRuntimeState:
         with self._lock:
@@ -6265,6 +6490,142 @@ class LaneIIIPaperRuntime:
                 status = self.risk.status()
                 if (
                     payload.get("schema")
+                    == "lane-iii-ledger-capacity-recovery-v1"
+                ):
+                    expected_keys = {
+                        "schema", "request_id", "profile", "risk_profile_hash",
+                        "preserved_lockout", "flat_reconciliation",
+                        "verified_ledger_tip", "capacity", "risk_counters",
+                        "account", "environment", "instrument",
+                        "maximum_quantity", "live_capital", "locked_out",
+                        "lockout_reason", "lockout_trade_date",
+                        "effective_trade_date", "cleared_lockout_reason",
+                        "effect", "session_family",
+                    }
+                    preserved = payload.get("preserved_lockout")
+                    reconciliation = payload.get("flat_reconciliation")
+                    verified_tip = payload.get("verified_ledger_tip")
+                    capacity = payload.get("capacity")
+                    counters = payload.get("risk_counters")
+                    cleared_reason = payload.get("cleared_lockout_reason")
+                    if (
+                        set(payload) != expected_keys
+                        or not isinstance(payload.get("request_id"), str)
+                        or payload.get("profile")
+                        != self.policy.artifact.entry_profile_version
+                        or payload.get("risk_profile_hash")
+                        != self.risk.profile.configuration_hash
+                        or payload.get("account") != "Sim101"
+                        or payload.get("environment") != "LOCAL_SIMULATION"
+                        or payload.get("instrument") != "MNQ SEP26"
+                        or payload.get("maximum_quantity") != 1
+                        or payload.get("live_capital") != "DENIED"
+                        or payload.get("locked_out") is not False
+                        or payload.get("lockout_reason") is not None
+                        or payload.get("lockout_trade_date") is not None
+                        or not isinstance(cleared_reason, str)
+                        or not cleared_reason.startswith(
+                            "LEDGER_CAPACITY_INADEQUATE:"
+                        )
+                        or payload.get("effect")
+                        != "ONLY_RETIRED_LEDGER_CAPACITY_LOCKOUT_CLEARED"
+                        or status.get("lockout_reason") != cleared_reason
+                        or active_lockout_coordinate is None
+                        or not isinstance(preserved, Mapping)
+                        or not isinstance(reconciliation, Mapping)
+                        or not isinstance(verified_tip, Mapping)
+                        or not isinstance(capacity, Mapping)
+                        or not isinstance(counters, Mapping)
+                    ):
+                        raise RuntimeError(
+                            "RISK_CONTINUITY_LEDGER_CAPACITY_CLEAR_INVALID"
+                        )
+                    coordinates = (preserved, reconciliation, verified_tip)
+                    sequences = [value.get("ledger_sequence") for value in coordinates]
+                    if (
+                        not all(type(value) is int for value in sequences)
+                        or not sequences[0] < sequences[1] <= sequences[2]
+                        or sequences[2] >= record.get("_ledger_sequence")
+                        or (
+                            preserved.get("ledger_sequence"),
+                            preserved.get("record_hash"),
+                        ) != active_lockout_coordinate
+                    ):
+                        raise RuntimeError(
+                            "RISK_CONTINUITY_LEDGER_CAPACITY_CLEAR_INVALID"
+                        )
+                    stored = [
+                        self.ledger.record_by_sequence(int(sequence))
+                        for sequence in sequences
+                    ]
+                    if any(
+                        value is None
+                        or coordinate.get("record_hash") != value.get("record_hash")
+                        for coordinate, value in zip(coordinates, stored, strict=True)
+                    ):
+                        raise RuntimeError(
+                            "RISK_CONTINUITY_LEDGER_CAPACITY_REFERENCE_INVALID"
+                        )
+                    lockout_payload = self._protective_exit_recovery_record_payload(
+                        stored[0] or {},
+                    )
+                    reconciliation_payload = (
+                        self._protective_exit_recovery_record_payload(stored[1] or {})
+                    )
+                    if (
+                        not isinstance(lockout_payload, Mapping)
+                        or lockout_payload.get("lockout_reason") != cleared_reason
+                        or not isinstance(reconciliation_payload, Mapping)
+                        or not self._recovery_reconciliation_payload_safe(
+                            reconciliation_payload,
+                        )
+                        or capacity.get("schema")
+                        != "l3g-ledger-writer-capacity-v1"
+                        or capacity.get("state") != "HEALTHY"
+                        or capacity.get("admission_open") is not True
+                        or capacity.get("capacity_fault_latched") is not False
+                        or capacity.get("wal_capacity_fault_latched") is not False
+                        or capacity.get("database_capacity_fault_latched") is not False
+                        or capacity.get("writer_error") is not None
+                    ):
+                        raise RuntimeError(
+                            "RISK_CONTINUITY_LEDGER_CAPACITY_REFERENCE_INVALID"
+                        )
+                    trade_date = counters.get("trade_date")
+                    if (
+                        not isinstance(trade_date, str)
+                        or payload.get("effective_trade_date") != trade_date
+                    ):
+                        raise RuntimeError(
+                            "RISK_CONTINUITY_LEDGER_CAPACITY_COUNTER_INVALID"
+                        )
+                    trade_risk = self._trade_date_risk.get(
+                        trade_date, _TradeDateRisk(),
+                    )
+                    profile_risk = self._profile_trade_date_risk.get(
+                        (trade_date, self.policy.artifact.entry_profile_version),
+                        _ProfileTradeDateRisk(),
+                    )
+                    if (
+                        counters.get("daily_realized_pnl")
+                        != str(trade_risk.realized_pnl)
+                        or counters.get("daily_unrealized_pnl")
+                        != str(trade_risk.unrealized_pnl)
+                        or counters.get("account_trade_date_entry_count")
+                        != trade_risk.entry_count
+                        or counters.get("profile_trade_date_entry_count")
+                        != profile_risk.entry_count
+                        or counters.get("consecutive_losses")
+                        != profile_risk.consecutive_losses
+                    ):
+                        raise RuntimeError(
+                            "RISK_CONTINUITY_LEDGER_CAPACITY_COUNTER_INVALID"
+                        )
+                    self.risk.restore_lockout(False, None, None)
+                    active_lockout_coordinate = None
+                    continue
+                if (
+                    payload.get("schema")
                     == "lane-iii-protective-stop-recovery-v1"
                 ):
                     expected_keys = {
@@ -7143,7 +7504,8 @@ class LaneIIIPaperRuntime:
         recovery_blockers: tuple[str, ...] = ()
         recovered = False
         with self._lock:
-            if self.risk.status().get("lockout_reason") == "PROTECTIVE_STOP_FILLED":
+            lockout_reason = self.risk.status().get("lockout_reason")
+            if lockout_reason == "PROTECTIVE_STOP_FILLED":
                 try:
                     with self.ledger.authority_capacity_fence():
                         recovered, recovery_blockers = (
@@ -7155,6 +7517,20 @@ class LaneIIIPaperRuntime:
                     self._pause_for_ledger_capacity_locked(error.capacity)
                     recovered = False
                     recovery_blockers = ("LEDGER_CAPACITY_INADEQUATE",)
+            elif (
+                isinstance(lockout_reason, str)
+                and lockout_reason.startswith("LEDGER_CAPACITY_INADEQUATE:")
+            ):
+                try:
+                    with self.ledger.authority_capacity_fence():
+                        recovered, recovery_blockers = (
+                            self._recover_healthy_ledger_capacity_locked(
+                                request_id, readiness,
+                            )
+                        )
+                except LedgerCapacityError:
+                    recovered = False
+                    recovery_blockers = ("LEDGER_CAPACITY_STILL_INADEQUATE",)
         if recovered:
             # The scoped transition is itself an authority mutation; require
             # a new Full proof which covers it before start.

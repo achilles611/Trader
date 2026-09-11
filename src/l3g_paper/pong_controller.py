@@ -1,16 +1,17 @@
-"""Durable operator overlay for the fixed 2026-09-11 Pong experiment.
+"""Durable operator overlay for one bounded 2026-09-11 Pong paper run.
 
 This module is deliberately independent of Pong strategy semantics.  It owns
-only a fixed entry fence/flat window, a fixed termination deadline, and a
-short controller-health lease.  Risk-reducing commands remain available in
-every phase.  Native execution and ledger integration are supplied by the
-owning runtime through the small runner callbacks at the bottom of the file.
+only the established entry fence/flat window, a single-use activation instant,
+a 3,600 elapsed-second deadline, and a short controller-health lease.  Risk-
+reducing commands remain available in every phase.  Native execution and
+ledger integration are supplied by the owning runtime through the small
+runner callbacks at the bottom of the file.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import StrEnum
 import hashlib
 import json
@@ -22,15 +23,16 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 
-PONG_CONTROLLER_SCHEMA = "beelzebub-pong-bounded-controller-v1"
+PONG_CONTROLLER_SCHEMA = "beelzebub-pong-bounded-controller-v2"
 PONG_CONTROLLER_ACCOUNT = "Sim101"
 PONG_CONTROLLER_ACCOUNT_CLASS = "LOCAL_SIMULATION"
 PONG_CONTROLLER_INSTRUMENT = "MNQ SEP26"
 PONG_CONTROLLER_CONTRACT = "MNQU6"
 PONG_CONTROLLER_LIVE_AUTHORITY = "DISARMED"
 PONG_CONTROLLER_HEARTBEAT_SECONDS = 5
+PONG_ACTIVATION_DATE_LOCAL = date(2026, 9, 11)
+PONG_RUN_DURATION_SECONDS = 3600
 _DENVER = ZoneInfo("America/Denver")
-_NEW_YORK = ZoneInfo("America/New_York")
 
 
 def _wire(value: datetime) -> str:
@@ -52,13 +54,8 @@ def _fixed_local(hour: int, minute: int) -> datetime:
 
 PONG_BLACKOUT_START_LOCAL = _fixed_local(7, 30)
 PONG_BLACKOUT_END_LOCAL = _fixed_local(7, 35)
-PONG_EXPERIMENT_END_LOCAL = _fixed_local(8, 35)
 PONG_BLACKOUT_START_UTC = _wire(PONG_BLACKOUT_START_LOCAL)
 PONG_BLACKOUT_END_UTC = _wire(PONG_BLACKOUT_END_LOCAL)
-PONG_EXPERIMENT_END_UTC = _wire(PONG_EXPERIMENT_END_LOCAL)
-PONG_EXPERIMENT_END_NEW_YORK = PONG_EXPERIMENT_END_LOCAL.astimezone(
-    _NEW_YORK,
-).isoformat()
 
 
 def _canonical(value: object) -> bytes:
@@ -240,13 +237,16 @@ class PongControllerState:
     created_at: str
     updated_at: str
     heartbeat_valid_until: str
+    activation_date_local: str
+    run_duration_seconds: int
+    activated_at_utc: str | None
+    execution_deadline_utc: str | None
+    activation_observation_hash: str | None
+    activation_state_verified_at: str | None
     blackout_start_local: str
     blackout_end_local: str
-    experiment_end_local: str
     blackout_start_utc: str
     blackout_end_utc: str
-    experiment_end_utc: str
-    experiment_end_new_york: str
     phase: PongControllerPhase
     command_sequence: int
     pending_command: PongControllerCommand | None
@@ -310,13 +310,12 @@ def _decode_state(raw: bytes, expected_path: Path) -> PongControllerState:
             raise ValueError("state path")
         if (
             state.schema != PONG_CONTROLLER_SCHEMA
+            or state.activation_date_local != PONG_ACTIVATION_DATE_LOCAL.isoformat()
+            or state.run_duration_seconds != PONG_RUN_DURATION_SECONDS
             or state.blackout_start_local != PONG_BLACKOUT_START_LOCAL.isoformat()
             or state.blackout_end_local != PONG_BLACKOUT_END_LOCAL.isoformat()
-            or state.experiment_end_local != PONG_EXPERIMENT_END_LOCAL.isoformat()
             or state.blackout_start_utc != PONG_BLACKOUT_START_UTC
             or state.blackout_end_utc != PONG_BLACKOUT_END_UTC
-            or state.experiment_end_utc != PONG_EXPERIMENT_END_UTC
-            or state.experiment_end_new_york != PONG_EXPERIMENT_END_NEW_YORK
             or not state.experiment_id
             or not state.controller_id.startswith("pong-controller-")
             or not state.process_instance_id.startswith("pong-controller-process-")
@@ -333,9 +332,31 @@ def _decode_state(raw: bytes, expected_path: Path) -> PongControllerState:
         for value in (
             state.created_at, state.updated_at, state.heartbeat_valid_until,
             state.blackout_start_utc, state.blackout_end_utc,
-            state.experiment_end_utc,
         ):
             _utc(value)
+        activation_fields = (
+            state.activated_at_utc,
+            state.execution_deadline_utc,
+            state.activation_observation_hash,
+            state.activation_state_verified_at,
+        )
+        if state.phase is PongControllerPhase.PREPARED:
+            if any(value is not None for value in activation_fields):
+                raise ValueError("prepared activation state")
+        else:
+            if not all(isinstance(value, str) and value for value in activation_fields):
+                raise ValueError("activated state missing")
+            activated = _utc(str(state.activated_at_utc))
+            deadline = _utc(str(state.execution_deadline_utc))
+            verified = _utc(str(state.activation_state_verified_at))
+            if (
+                deadline - activated
+                != timedelta(seconds=PONG_RUN_DURATION_SECONDS)
+                or verified != activated
+                or activated.astimezone(_DENVER).date()
+                != PONG_ACTIVATION_DATE_LOCAL
+            ):
+                raise ValueError("activation timing")
         return state
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise PongControllerIntegrityError(
@@ -416,13 +437,16 @@ class PongBoundedController:
                 heartbeat_valid_until=_wire(
                     now + timedelta(seconds=PONG_CONTROLLER_HEARTBEAT_SECONDS),
                 ),
+                activation_date_local=PONG_ACTIVATION_DATE_LOCAL.isoformat(),
+                run_duration_seconds=PONG_RUN_DURATION_SECONDS,
+                activated_at_utc=None,
+                execution_deadline_utc=None,
+                activation_observation_hash=None,
+                activation_state_verified_at=None,
                 blackout_start_local=PONG_BLACKOUT_START_LOCAL.isoformat(),
                 blackout_end_local=PONG_BLACKOUT_END_LOCAL.isoformat(),
-                experiment_end_local=PONG_EXPERIMENT_END_LOCAL.isoformat(),
                 blackout_start_utc=PONG_BLACKOUT_START_UTC,
                 blackout_end_utc=PONG_BLACKOUT_END_UTC,
-                experiment_end_utc=PONG_EXPERIMENT_END_UTC,
-                experiment_end_new_york=PONG_EXPERIMENT_END_NEW_YORK,
                 phase=PongControllerPhase.PREPARED,
                 command_sequence=0,
                 pending_command=None,
@@ -456,6 +480,73 @@ class PongBoundedController:
             ),
             state_hash="",
         )
+
+    def activate(
+        self,
+        observation: PongControllerObservation,
+        *,
+        at: str | None = None,
+    ) -> PongControllerState:
+        """Persist and read back the one permitted T0 before entry authority.
+
+        The ordinary paper runtime may already be active, but the Pong entry
+        path must continue to treat PREPARED as fenced.  This transition is the
+        independent controller's arming point: it is allowed once, only on the
+        authorized Denver calendar date, from a current signed clean-flat
+        observation with every admission gate healthy.
+        """
+        now = _utc(at or observation.observed_at)
+        observed = _utc(observation.observed_at)
+        if observed > now:
+            raise ValueError("PONG_CONTROLLER_OBSERVATION_FUTURE_DATED")
+        if now - observed > timedelta(seconds=PONG_CONTROLLER_HEARTBEAT_SECONDS):
+            raise ValueError("PONG_CONTROLLER_OBSERVATION_STALE")
+        if self.state.phase is not PongControllerPhase.PREPARED:
+            raise ValueError("PONG_CONTROLLER_ALREADY_ACTIVATED")
+        if now.astimezone(_DENVER).date() != PONG_ACTIVATION_DATE_LOCAL:
+            raise ValueError("PONG_CONTROLLER_ACTIVATION_DATE_REFUSED")
+        if _utc(PONG_BLACKOUT_START_UTC) <= now < _utc(PONG_BLACKOUT_END_UTC):
+            raise ValueError("PONG_ACTIVATION_RESTRICTED_BY_NY_OPEN_BLACKOUT")
+        health_reason = observation.admission_health_reason
+        if health_reason is not None:
+            raise ValueError(health_reason)
+        if not observation.clean_flat:
+            raise ValueError("PONG_CONTROLLER_ACTIVATION_REQUIRES_CLEAN_FLAT")
+        if observation.entry_fence_active:
+            raise ValueError("PONG_CONTROLLER_ACTIVATION_ENTRY_FENCE_ACTIVE")
+        if observation.evidence_sealed:
+            raise ValueError("PONG_CONTROLLER_ACTIVATION_EVIDENCE_ALREADY_SEALED")
+
+        activated = _wire(now)
+        deadline = _wire(now + timedelta(seconds=PONG_RUN_DURATION_SECONDS))
+        phase = (
+            PongControllerPhase.RUNNING_POST_BLACKOUT
+            if now >= _utc(PONG_BLACKOUT_END_UTC)
+            else PongControllerPhase.RUNNING_PRE_BLACKOUT
+        )
+        self._heartbeat(now)
+        self.state = replace(
+            self.state,
+            activated_at_utc=activated,
+            execution_deadline_utc=deadline,
+            activation_observation_hash=observation.observation_hash,
+            activation_state_verified_at=activated,
+            last_observation_hash=observation.observation_hash,
+            phase=phase,
+            transitions=tuple((
+                *self.state.transitions,
+                f"{phase.value}:PONG_CONTROLLER_ACTIVATED_T0",
+            ))[-32:],
+            state_hash="",
+        )
+        self._save()
+        verified = _decode_state(self.path.read_bytes(), self.path)
+        if verified.state_hash != self.state.state_hash:
+            raise PongControllerIntegrityError(
+                "PONG_CONTROLLER_ACTIVATION_READBACK_FAILED",
+            )
+        self.state = verified
+        return self.state
 
     def _phase(self, phase: PongControllerPhase, reason: str) -> None:
         if self.state.phase is phase:
@@ -633,6 +724,12 @@ class PongBoundedController:
             self.state, last_observation_hash=observation.observation_hash,
             state_hash="",
         )
+        if self.state.phase is PongControllerPhase.PREPARED:
+            # PREPARED is a durable virtual entry fence, never an auto-start
+            # request. Only the explicit, read-back-verified activate() method
+            # can establish T0 and its single deadline.
+            self._save()
+            return None
         pending = self.state.pending_command
         if pending is not None:
             if self._command_settled(pending, observation):
@@ -647,13 +744,17 @@ class PongBoundedController:
 
         blackout_start = _utc(PONG_BLACKOUT_START_UTC)
         blackout_end = _utc(PONG_BLACKOUT_END_UTC)
-        deadline = _utc(PONG_EXPERIMENT_END_UTC)
+        if self.state.execution_deadline_utc is None:
+            raise PongControllerIntegrityError(
+                "PONG_CONTROLLER_ACTIVATION_STATE_MISSING",
+            )
+        deadline = _utc(self.state.execution_deadline_utc)
         command: PongControllerCommand | None = None
 
         if now >= deadline:
             command = self._ensure_flat(
                 observation, now,
-                prefix="PONG_EXPERIMENT_END",
+                prefix="PONG_BOUNDED_RUN_DEADLINE",
                 fencing_phase=PongControllerPhase.TERMINATION_FENCING,
                 flattening_phase=PongControllerPhase.TERMINATION_FLATTENING,
                 reconciling_phase=PongControllerPhase.TERMINATION_RECONCILING,
@@ -661,27 +762,27 @@ class PongBoundedController:
             if command is None and not observation.evidence_sealed:
                 self._phase(
                     PongControllerPhase.TERMINATION_SEALING,
-                    "PONG_EXPERIMENT_EVIDENCE_SEAL_REQUIRED",
+                    "PONG_BOUNDED_RUN_EVIDENCE_SEAL_REQUIRED",
                 )
                 command = self._request(
                     PongControllerCommandKind.SEAL_EVIDENCE,
-                    "PONG_EXPERIMENT_END_SEAL_EVIDENCE",
+                    "PONG_BOUNDED_RUN_DEADLINE_SEAL_EVIDENCE",
                     now,
                 )
             elif command is None and observation.runtime_active:
                 self._phase(
                     PongControllerPhase.TERMINATION_STOPPING,
-                    "PONG_EXPERIMENT_OPERATION_STOP_REQUIRED",
+                    "PONG_BOUNDED_RUN_OPERATION_STOP_REQUIRED",
                 )
                 command = self._request(
                     PongControllerCommandKind.STOP_OPERATION,
-                    "PONG_EXPERIMENT_END_STOP_OPERATION",
+                    "PONG_BOUNDED_RUN_DEADLINE_STOP_OPERATION",
                     now,
                 )
             elif command is None:
                 self._phase(
                     PongControllerPhase.TERMINATED,
-                    "PONG_EXPERIMENT_TERMINATED_FLAT_RECONCILED_SEALED",
+                    "PONG_BOUNDED_RUN_TERMINATED_FLAT_RECONCILED_SEALED",
                 )
         elif blackout_start <= now < blackout_end:
             command = self._ensure_flat(
@@ -789,7 +890,15 @@ class PongBoundedController:
             raise ValueError("Pong controller entry provenance is invalid.")
         blackout_start = _utc(PONG_BLACKOUT_START_UTC)
         blackout_end = _utc(PONG_BLACKOUT_END_UTC)
-        deadline = _utc(PONG_EXPERIMENT_END_UTC)
+        if (
+            self.state.phase is PongControllerPhase.PREPARED
+            or self.state.activated_at_utc is None
+            or self.state.execution_deadline_utc is None
+        ):
+            return self._entry_decision(
+                False, "PONG_CONTROLLER_NOT_ACTIVATED",
+            )
+        deadline = _utc(self.state.execution_deadline_utc)
         if blackout_start <= now < blackout_end:
             high_water = max(
                 self.state.blackout_switch_high_water, source_switch_sequence,
@@ -803,7 +912,7 @@ class PongBoundedController:
             self._save()
             return self._entry_decision(False, "PONG_NY_OPEN_BLACKOUT_ENTRY_FENCED")
         if now >= deadline:
-            return self._entry_decision(False, "PONG_EXPERIMENT_DEADLINE_REACHED")
+            return self._entry_decision(False, "PONG_BOUNDED_RUN_DEADLINE_REACHED")
         if now > _utc(self.state.heartbeat_valid_until):
             return self._entry_decision(False, "PONG_CONTROLLER_HEARTBEAT_EXPIRED")
         allowed_phases = {

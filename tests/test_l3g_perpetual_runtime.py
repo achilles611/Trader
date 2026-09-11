@@ -2421,6 +2421,128 @@ class PerpetualRuntimeTests(unittest.TestCase):
             finally:
                 reopened.close()
 
+    def test_retired_ledger_capacity_lockout_has_scoped_durable_recovery(self) -> None:
+        with TemporaryDirectory() as directory, patch(
+            "src.l3g_paper.runtime._now", return_value=NOW,
+        ):
+            ledger, runtime, _capture = self._runtime(directory)
+            path = ledger.path
+            try:
+                runtime._pause_for_ledger_capacity_locked({"state": "DEGRADED"})
+                runtime.on_execution_message(
+                    self._flat_reconciliation("capacity-recovery-flat", NOW),
+                )
+                before = runtime.risk_continuity_snapshot()
+                refused, refusal_blockers = (
+                    runtime._recover_healthy_ledger_capacity_locked(
+                        "ledger-capacity-recovery-without-proof", {},
+                    )
+                )
+                self.assertFalse(refused)
+                self.assertIn(
+                    "LEDGER_CAPACITY_RECOVERY_LEDGER_UNVERIFIED",
+                    refusal_blockers,
+                )
+                self.assertTrue(runtime.risk.status()["locked_out"])
+                tip = int(ledger.health_status()["highest_sequence"])
+                tip_record = ledger.record_by_sequence(tip)
+                assert tip_record is not None
+                healthy_capacity = {
+                    **ledger.deferred_capacity(),
+                    "schema": "l3g-ledger-writer-capacity-v1",
+                    "state": "HEALTHY",
+                    "admission_open": True,
+                    "capacity_fault_latched": False,
+                    "wal_capacity_fault_latched": False,
+                    "database_capacity_fault_latched": False,
+                    "database_warning_reasons": [],
+                    "negative_headroom_sustained": False,
+                    "queue_growth_records_per_second": 0.0,
+                    "writer_error": None,
+                }
+                readiness = {
+                    "ledger": {
+                        "ledger_trust_state": "VERIFIED_TO_ARM_SNAPSHOT_TIP",
+                        "verified_through_sequence": tip,
+                        "arm_snapshot_tip": tip,
+                        "arm_snapshot_tip_hash": tip_record["record_hash"],
+                        "unverified_tail_rows": 0,
+                    },
+                }
+                with (
+                    patch.object(
+                        ledger, "deferred_capacity",
+                        return_value=healthy_capacity,
+                    ),
+                    patch(
+                        "src.l3g_paper.ledger.deferred_capacity_allows_authority",
+                        return_value=True,
+                    ),
+                    ledger.authority_capacity_fence(),
+                ):
+                    with patch(
+                        "src.l3g_paper.runtime.deferred_capacity_allows_authority",
+                        return_value=True,
+                    ):
+                        recovered, blockers = (
+                            runtime._recover_healthy_ledger_capacity_locked(
+                                "ledger-capacity-recovery-test", readiness,
+                            )
+                        )
+
+                self.assertTrue(recovered, blockers)
+                self.assertEqual(blockers, ())
+                self.assertFalse(runtime.risk.status()["locked_out"])
+                self.assertEqual(runtime.state, PaperRuntimeState.READY_DISARMED)
+                self.assertEqual(
+                    runtime.risk_continuity_snapshot()["trade_dates"],
+                    before["trade_dates"],
+                )
+                self.assertEqual(
+                    runtime.risk_continuity_snapshot()["profile_trade_dates"],
+                    before["profile_trade_dates"],
+                )
+                clear = ledger.recent_kind_records(
+                    ("RISK_EVENT_AUTHORITY_LOCKOUT_CLEARED",), 1,
+                )[0]
+                payload = clear["record"]["payload"]  # type: ignore[index]
+                self.assertEqual(
+                    payload["effect"],  # type: ignore[index]
+                    "ONLY_RETIRED_LEDGER_CAPACITY_LOCKOUT_CLEARED",
+                )
+                self.assertEqual(
+                    payload["cleared_lockout_reason"],  # type: ignore[index]
+                    "LEDGER_CAPACITY_INADEQUATE:DEGRADED",
+                )
+            finally:
+                ledger.close()
+
+            reopened = PaperLedger(
+                path,
+                epoch_id="L3G-PAPER-EPOCH-TEST-PERPETUAL",
+                policy=FIVE_MINUTE_PERPETUAL_PROFILE.policy,
+                risk=FIVE_MINUTE_PERPETUAL_PROFILE.risk,
+            )
+            try:
+                recovered_runtime = LaneIIIPaperRuntime(reopened)
+                self.assertFalse(
+                    recovered_runtime.risk.status()["locked_out"],
+                    recovered_runtime.risk.status(),
+                )
+                recovered_runtime.risk.lock_out("MANUAL_SAFETY_LOCKOUT")
+                refused, _ = (
+                    recovered_runtime._recover_healthy_ledger_capacity_locked(
+                        "must-not-clear-another-lockout", {},
+                    )
+                )
+                self.assertFalse(refused)
+                self.assertEqual(
+                    recovered_runtime.risk.status()["lockout_reason"],
+                    "MANUAL_SAFETY_LOCKOUT",
+                )
+            finally:
+                reopened.close()
+
     def test_legacy_protective_fill_settles_without_perpetual_reentry(self) -> None:
         at = "2026-09-01T14:00:00Z"
         with TemporaryDirectory() as directory, patch(

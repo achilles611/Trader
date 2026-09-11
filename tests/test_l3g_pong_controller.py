@@ -7,10 +7,10 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from src.l3g_paper.pong_controller import (
+    PONG_ACTIVATION_DATE_LOCAL,
     PONG_BLACKOUT_END_UTC,
     PONG_BLACKOUT_START_UTC,
-    PONG_EXPERIMENT_END_NEW_YORK,
-    PONG_EXPERIMENT_END_UTC,
+    PONG_RUN_DURATION_SECONDS,
     PongBoundedController,
     PongControllerCommandKind,
     PongControllerIntegrityError,
@@ -73,15 +73,43 @@ class PongBoundedControllerTests(unittest.TestCase):
             command.command_id, at=at, accepted=True,
         )
 
-    def test_fixed_identity_pid_deadlines_and_restart_are_durable(self) -> None:
+    @staticmethod
+    def activate(controller: PongBoundedController, at: str) -> None:
+        controller.activate(observation(at), at=at)
+
+    def test_single_use_t0_deadline_identity_and_restart_are_durable(self) -> None:
         with TemporaryDirectory() as temp:
             controller = self.make(temp)
             original_id = controller.state.controller_id
             self.assertEqual(controller.state.pid, 4101)
+            self.assertEqual(
+                controller.state.activation_date_local,
+                PONG_ACTIVATION_DATE_LOCAL.isoformat(),
+            )
+            self.assertEqual(
+                controller.state.run_duration_seconds,
+                PONG_RUN_DURATION_SECONDS,
+            )
             self.assertEqual(controller.state.blackout_start_utc, PONG_BLACKOUT_START_UTC)
             self.assertEqual(controller.state.blackout_end_utc, PONG_BLACKOUT_END_UTC)
-            self.assertEqual(controller.state.experiment_end_utc, PONG_EXPERIMENT_END_UTC)
-            self.assertEqual(PONG_EXPERIMENT_END_NEW_YORK, "2026-09-11T10:35:00-04:00")
+            self.assertIsNone(controller.state.activated_at_utc)
+            self.assertIsNone(controller.state.execution_deadline_utc)
+            self.assertIsNone(controller.tick(observation("2026-09-11T13:20:00Z")))
+            denied = controller.assess_entry(
+                source_switch_id="switch-prepared",
+                source_switch_sequence=1,
+                source_event_at="2026-09-11T13:20:00Z",
+                at="2026-09-11T13:20:00Z",
+            )
+            self.assertFalse(denied.allowed)
+            self.assertEqual(denied.reason, "PONG_CONTROLLER_NOT_ACTIVATED")
+            self.activate(controller, "2026-09-11T13:20:00Z")
+            self.assertEqual(controller.state.activated_at_utc, "2026-09-11T13:20:00Z")
+            self.assertEqual(controller.state.execution_deadline_utc, "2026-09-11T14:20:00Z")
+            self.assertEqual(
+                PongBoundedController.load(controller.path).state.state_hash,
+                controller.state.state_hash,
+            )
             with self.assertRaises(PongControllerLeaseError):
                 PongBoundedController.open(
                     controller.path,
@@ -101,9 +129,22 @@ class PongBoundedControllerTests(unittest.TestCase):
             self.assertEqual(restored.state.pid, 4102)
             self.assertIn("CONTROLLER_PROCESS_RESTORED", restored.state.transitions)
 
+    def test_activation_refuses_stale_signed_observation(self) -> None:
+        with TemporaryDirectory() as temp:
+            controller = self.make(temp)
+            with self.assertRaisesRegex(
+                ValueError, "PONG_CONTROLLER_OBSERVATION_STALE",
+            ):
+                controller.activate(
+                    observation("2026-09-11T13:19:54Z"),
+                    at="2026-09-11T13:20:00Z",
+                )
+            self.assertEqual(controller.state.phase, PongControllerPhase.PREPARED)
+
     def test_blackout_fences_cancels_flattens_reconciles_and_requires_fresh_switch(self) -> None:
         with TemporaryDirectory() as temp:
             controller = self.make(temp)
+            self.activate(controller, "2026-09-11T13:20:00Z")
             self.assertIsNone(controller.tick(observation("2026-09-11T13:29:59Z")))
             self.assertEqual(controller.state.phase, PongControllerPhase.RUNNING_PRE_BLACKOUT)
 
@@ -181,6 +222,7 @@ class PongBoundedControllerTests(unittest.TestCase):
     def test_controller_loss_and_safety_lockout_fail_closed_but_reduction_remains(self) -> None:
         with TemporaryDirectory() as temp:
             controller = self.make(temp)
+            self.activate(controller, "2026-09-11T13:20:00Z")
             controller.tick(observation("2026-09-11T13:20:00Z"))
             expired = read_controller_entry_fence(
                 controller.path,
@@ -215,12 +257,8 @@ class PongBoundedControllerTests(unittest.TestCase):
 
     def test_post_blackout_exposure_is_not_flattened_and_health_loss_only_fences_entries(self) -> None:
         with TemporaryDirectory() as temp:
-            controller = self.make(temp)
-            command = controller.tick(observation(
-                "2026-09-11T13:35:01Z", fence=True,
-            ))
-            self.assertEqual(command.kind, PongControllerCommandKind.RELEASE_ENTRY_FENCE)
-            self.settle(controller, command, "2026-09-11T13:35:01Z")
+            controller = self.make(temp, at="2026-09-11T13:35:01Z")
+            self.activate(controller, "2026-09-11T13:35:01Z")
             self.assertIsNone(controller.tick(observation(
                 "2026-09-11T13:35:02Z",
             )))
@@ -256,7 +294,8 @@ class PongBoundedControllerTests(unittest.TestCase):
     def test_deadline_flattens_reconciles_seals_and_stops(self) -> None:
         with TemporaryDirectory() as temp:
             controller = self.make(temp)
-            at = "2026-09-11T14:35:00Z"
+            self.activate(controller, "2026-09-11T13:20:00Z")
+            at = "2026-09-11T14:20:00Z"
             command = controller.tick(observation(
                 at, position=-1, owned=1, reconciled=False, protected=True,
             ))
@@ -289,6 +328,23 @@ class PongBoundedControllerTests(unittest.TestCase):
                 at, fence=True, sealed=True, active=False,
             )))
             self.assertEqual(controller.state.phase, PongControllerPhase.TERMINATED)
+
+    def test_activation_refuses_blackout_later_day_and_rearm(self) -> None:
+        with TemporaryDirectory() as temp:
+            controller = self.make(temp)
+            with self.assertRaisesRegex(
+                ValueError, "PONG_ACTIVATION_RESTRICTED_BY_NY_OPEN_BLACKOUT",
+            ):
+                controller.activate(observation("2026-09-11T13:31:00Z"))
+            with self.assertRaisesRegex(
+                ValueError, "PONG_CONTROLLER_ACTIVATION_DATE_REFUSED",
+            ):
+                controller.activate(observation("2026-09-12T13:20:00Z"))
+            self.activate(controller, "2026-09-11T13:20:00Z")
+            with self.assertRaisesRegex(
+                ValueError, "PONG_CONTROLLER_ALREADY_ACTIVATED",
+            ):
+                controller.activate(observation("2026-09-11T13:21:00Z"))
 
     def test_corrupt_or_wrong_scope_state_never_grants_entry(self) -> None:
         with TemporaryDirectory() as temp:
