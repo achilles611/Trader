@@ -5,7 +5,13 @@ from decimal import Decimal
 import unittest
 
 from src.lane_iii.contracts import canonical_hash
-from src.l3g_paper.discernment import DiscernmentDirection, DiscernmentEngine
+from src.l3g_paper.daily_bias import default_unconfigured_bias
+from src.l3g_paper.discernment import (
+    DISCERNMENT_INSTRUMENT,
+    DiscernmentDirection,
+    DiscernmentEngine,
+)
+from src.l3g_paper.pong import PongStateMachine
 from src.l3g_paper.pong_microstructure import (
     AggressorProvenance,
     AggressorSide,
@@ -20,6 +26,7 @@ from src.l3g_paper.pong_microstructure import (
     LiquidityClusterAdapter,
     MappedMicrostructureEvidence,
     MicrostructureEvidenceMapper,
+    MicrostructureEvidenceMappingPolicy,
     PriceResponse,
     ReductionAttribution,
     VolumeRegime,
@@ -63,10 +70,11 @@ def trade(
     *,
     base: datetime = BASE,
     namespace: str = "trade",
+    instrument: str = DISCERNMENT_INSTRUMENT,
 ) -> ClassifiedTrade:
     return ClassifiedTrade(
         event(sequence, base=base, namespace=namespace),
-        "MNQ SEP26", Decimal(price), Decimal(volume), side,
+        instrument, Decimal(price), Decimal(volume), side,
         AggressorProvenance.UNAVAILABLE
         if side is AggressorSide.UNKNOWN
         else AggressorProvenance.AUTHENTICATED_PROVIDER,
@@ -85,11 +93,12 @@ def depth(
     response: PriceResponse = PriceResponse.UNAVAILABLE,
     base: datetime = BASE,
     namespace: str = "depth",
+    instrument: str = DISCERNMENT_INSTRUMENT,
 ) -> DepthObservation:
     price = Decimal("100")
     return DepthObservation(
         event(sequence, base=base, namespace=namespace),
-        "MNQ SEP26", side, price, Decimal(quantity), Decimal("200"),
+        instrument, side, price, Decimal(quantity), Decimal("200"),
         price, kind, Decimal(matched), Decimal(interaction), cancellation, response,
     )
 
@@ -99,6 +108,7 @@ def volume_window(
     start: datetime,
     volume: str,
     *,
+    instrument: str = DISCERNMENT_INSTRUMENT,
     kind: VolumeWindowKind = VolumeWindowKind.COMPLETED,
     continuity: bool = True,
     fresh: bool = True,
@@ -106,10 +116,24 @@ def volume_window(
 ) -> VolumeWindow:
     end = start + timedelta(minutes=5)
     available = available_at or end
-    payload = {"name": name, "start": start.isoformat(), "volume": volume}
+    payload = {
+        "name": name,
+        "start": start.isoformat(),
+        "volume": volume,
+        "instrument": instrument,
+    }
     return VolumeWindow(
-        name, canonical_hash(payload), "UTC-14:00-5M", start.isoformat(), end.isoformat(),
-        available.isoformat(), Decimal(volume), kind, continuity, fresh,
+        window_id=name,
+        payload_hash=canonical_hash(payload),
+        instrument=instrument,
+        normalization_key="UTC-14:00-5M",
+        window_start=start.isoformat(),
+        window_end=end.isoformat(),
+        available_at=available.isoformat(),
+        volume=Decimal(volume),
+        kind=kind,
+        continuity_valid=continuity,
+        feed_fresh=fresh,
     )
 
 
@@ -253,6 +277,7 @@ class VolumeRegimeAdapterTests(unittest.TestCase):
             )
             result = adapter.evaluate(current, self.prior, as_of=current.available_at)
             self.assertTrue(result.valid)
+            self.assertEqual(result.instrument, DISCERNMENT_INSTRUMENT)
             self.assertEqual(result.regime, expected)
             self.assertEqual(result.prior_median_volume, Decimal("100"))
 
@@ -283,8 +308,67 @@ class VolumeRegimeAdapterTests(unittest.TestCase):
                 current, (*self.prior, future_known), as_of=current.available_at,
             )
 
+    def test_window_instruments_must_match_and_bind_result_identity(self) -> None:
+        current_nq = volume_window(
+            "current-nq", self.current_start, "100",
+            instrument="NQ SEP26", kind=VolumeWindowKind.AS_OF,
+        )
+        prior_nq = tuple(
+            volume_window(
+                f"prior-nq-{days}", BASE - timedelta(days=days), "100",
+                instrument="NQ SEP26",
+            )
+            for days in (3, 2, 1)
+        )
+        nq_result = VolumeRegimeAdapter().evaluate(
+            current_nq, prior_nq, as_of=current_nq.available_at,
+        )
+        mnq_result = VolumeRegimeAdapter().evaluate(
+            volume_window(
+                "current-nq", self.current_start, "100",
+                kind=VolumeWindowKind.AS_OF,
+            ),
+            tuple(
+                volume_window(
+                    f"prior-nq-{days}", BASE - timedelta(days=days), "100",
+                )
+                for days in (3, 2, 1)
+            ),
+            as_of=current_nq.available_at,
+        )
+
+        self.assertEqual(nq_result.instrument, "NQ SEP26")
+        self.assertNotEqual(nq_result.result_hash, mnq_result.result_hash)
+        with self.assertRaisesRegex(ValueError, "instrument mismatch"):
+            VolumeRegimeAdapter().evaluate(
+                current_nq, self.prior, as_of=current_nq.available_at,
+            )
+
 
 class MicrostructureEvidenceMapperTests(unittest.TestCase):
+    def test_mapping_effect_changes_propagate_into_discernment_hashes(self) -> None:
+        default_mapper = MicrostructureEvidenceMapper()
+        changed_mapper = MicrostructureEvidenceMapper(
+            MicrostructureEvidenceMappingPolicy(flow_progress_effect=Decimal("0.71")),
+        )
+        default_policy = default_mapper.policy.discernment_policy()
+        changed_policy = changed_mapper.policy.discernment_policy()
+
+        self.assertEqual(
+            default_policy.evidence_mapping_hash,
+            default_mapper.policy.mapping_hash,
+        )
+        self.assertNotEqual(
+            changed_mapper.policy.mapping_hash,
+            default_mapper.policy.mapping_hash,
+        )
+        self.assertEqual(
+            changed_policy.evidence_mapping_hash,
+            changed_mapper.policy.mapping_hash,
+        )
+        self.assertNotEqual(changed_policy.model_hash, default_policy.model_hash)
+        self.assertNotEqual(changed_policy.policy_hash, default_policy.policy_hash)
+
     @staticmethod
     def frame(
         base: datetime,
@@ -378,6 +462,12 @@ class MicrostructureEvidenceMapperTests(unittest.TestCase):
         self.assertEqual(engine.latched_direction, DiscernmentDirection.LONG)
         self.assertTrue(all(item.switch is None for item in long_updates))
         self.assertFalse(long_updates[-1].snapshot.execution_enabled)
+        pong = PongStateMachine(discernment_policy=engine.policy)
+        seeded = pong.observe_startup_seed(
+            DiscernmentDirection.LONG,
+            long_updates[-1].snapshot,
+        )
+        self.assertEqual(seeded.reason_code, "DISCERNMENT_SEED_OBSERVED_NO_SWITCH")
 
         _, short_batch = self.frame(
             BASE + timedelta(minutes=10), long=False, revision=5,
@@ -392,6 +482,12 @@ class MicrostructureEvidenceMapperTests(unittest.TestCase):
         self.assertEqual(switch.previous_direction, DiscernmentDirection.LONG)
         self.assertEqual(switch.direction, DiscernmentDirection.SHORT)
         self.assertFalse(switch.snapshot.execution_enabled)
+        consumed = pong.on_switch(switch, default_unconfigured_bias())
+        self.assertTrue(consumed.switch_consumed)
+        self.assertEqual(consumed.reason_code, "DAILY_BIAS_UNCONFIGURED")
+        self.assertEqual(consumed.actions, ())
+        self.assertEqual(pong.last_consumed_switch_id, switch.event_id)
+        self.assertFalse(pong.status()["execution_enabled"])
 
     def test_invalid_microstructure_maps_to_unavailable_without_neutral_evidence(self) -> None:
         mapper, batch = self.frame(BASE, long=True, revision=1)
@@ -411,29 +507,120 @@ class MicrostructureEvidenceMapperTests(unittest.TestCase):
         self.assertEqual(mapped.evidence, ())
         self.assertTrue(any(item.startswith("FLOW:") for item in mapped.blockers))
 
+    def test_mutually_matching_wrong_instrument_is_refused(self) -> None:
+        wrong_instrument = "NQ SEP26"
+        flow = ClassifiedFlowAdapter().evaluate(
+            tuple(
+                trade(
+                    sequence,
+                    AggressorSide.BUY,
+                    price,
+                    base=BASE,
+                    namespace="wrong-instrument-flow",
+                    instrument=wrong_instrument,
+                )
+                for sequence, price in zip(
+                    range(297, 301),
+                    ("100", "100", "100.25", "100.25"),
+                )
+            ),
+            window_start=stamp(296),
+            as_of=stamp(300),
+            feed_continuity_valid=True,
+        )
+        mapped = MicrostructureEvidenceMapper().map_frame(
+            flow,
+            self._valid_liquidity(
+                BASE, BookSide.BID, True, instrument=wrong_instrument,
+            ),
+            self._valid_liquidity(
+                BASE, BookSide.ASK, False, instrument=wrong_instrument,
+            ),
+            self._valid_regime(BASE, instrument=wrong_instrument),
+            first_evidence_revision=1,
+        )
+
+        self.assertEqual(mapped.evidence, ())
+        self.assertEqual(
+            mapped.blockers,
+            ("MICROSTRUCTURE_INSTRUMENT_NOT_DISCERNMENT_INSTRUMENT",),
+        )
+
+    def test_mixed_mnq_flow_and_nq_volume_regime_is_refused(self) -> None:
+        flow = ClassifiedFlowAdapter().evaluate(
+            tuple(
+                trade(
+                    sequence, AggressorSide.BUY, price, base=BASE,
+                    namespace="mixed-instrument-flow",
+                )
+                for sequence, price in zip(
+                    range(297, 301),
+                    ("100", "100", "100.25", "100.25"),
+                )
+            ),
+            window_start=stamp(296),
+            as_of=stamp(300),
+            feed_continuity_valid=True,
+        )
+        mapped = MicrostructureEvidenceMapper().map_frame(
+            flow,
+            self._valid_liquidity(BASE, BookSide.BID, True),
+            self._valid_liquidity(BASE, BookSide.ASK, False),
+            self._valid_regime(BASE, instrument="NQ SEP26"),
+            first_evidence_revision=1,
+        )
+
+        self.assertEqual(mapped.evidence, ())
+        self.assertEqual(
+            mapped.blockers,
+            ("MICROSTRUCTURE_INSTRUMENT_MISMATCH",),
+        )
+
     @staticmethod
     def _valid_liquidity(
-        base: datetime, side: BookSide, absorption: bool,
+        base: datetime,
+        side: BookSide,
+        absorption: bool,
+        *,
+        instrument: str = DISCERNMENT_INSTRUMENT,
     ):
         second_quantity = "100" if absorption else "70"
         return LiquidityClusterAdapter().evaluate(
             (
-                depth(299, side, "100", base=base, namespace=f"valid-{side}-liquidity"),
+                depth(
+                    299,
+                    side,
+                    "100",
+                    base=base,
+                    namespace=f"valid-{side}-liquidity",
+                    instrument=instrument,
+                ),
                 depth(
                     300, side, second_quantity,
                     matched="0" if absorption else "30", interaction="30",
                     response=PriceResponse.REJECTION if absorption else PriceResponse.ACCEPTANCE,
                     base=base, namespace=f"valid-{side}-liquidity",
+                    instrument=instrument,
                 ),
             ),
             as_of=stamp(300, base=base), feed_continuity_valid=True,
         )
 
     @staticmethod
-    def _valid_regime(base: datetime):
-        current = volume_window("valid-current", base, "100", kind=VolumeWindowKind.AS_OF)
+    def _valid_regime(
+        base: datetime,
+        *,
+        instrument: str = DISCERNMENT_INSTRUMENT,
+    ):
+        current = volume_window(
+            "valid-current", base, "100", instrument=instrument,
+            kind=VolumeWindowKind.AS_OF,
+        )
         priors = tuple(
-            volume_window(f"valid-prior-{days}", base - timedelta(days=days), "100")
+            volume_window(
+                f"valid-prior-{days}", base - timedelta(days=days), "100",
+                instrument=instrument,
+            )
             for days in (3, 2, 1)
         )
         return VolumeRegimeAdapter().evaluate(

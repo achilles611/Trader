@@ -673,6 +673,148 @@ class DiscernmentSnapshot:
     def valid(self) -> bool:
         return self.validity is DiscernmentValidity.VALID
 
+    def verification_error(
+        self,
+        policy: DiscernmentPolicy,
+        *,
+        at: str | None = None,
+    ) -> str | None:
+        """Verify policy, source identities, causality, and point-in-time validity."""
+        if type(policy) is not DiscernmentPolicy:
+            return "DISCERNMENT_SNAPSHOT_POLICY_TYPE_INVALID"
+        if self.policy_hash != policy.policy_hash:
+            return "DISCERNMENT_SNAPSHOT_POLICY_HASH_MISMATCH"
+        if self.model_hash != policy.model_hash:
+            return "DISCERNMENT_SNAPSHOT_MODEL_HASH_MISMATCH"
+        if not math.isclose(
+            self.reliability, policy.reliability, rel_tol=0, abs_tol=1e-15,
+        ):
+            return "DISCERNMENT_SNAPSHOT_RELIABILITY_MISMATCH"
+        if not self.valid:
+            return "DISCERNMENT_UNAVAILABLE"
+
+        component_keys = {
+            (item.component_id, item.component_version)
+            for item in self.component_effects
+        }
+        required_keys = set(policy.required_components)
+        if not required_keys.issubset(component_keys):
+            return "DISCERNMENT_REQUIRED_EVIDENCE_MISSING"
+        group_bounds = dict(policy.dependency_group_bounds)
+        source_ids: set[str] = set()
+        grouped_effects: dict[str, float] = {}
+        snapshot_available = _utc(self.available_at, "Snapshot available-at time")
+        evaluated = snapshot_available if at is None else _utc(at, "Snapshot evaluation time")
+        if snapshot_available > evaluated:
+            return "DISCERNMENT_NOT_YET_AVAILABLE"
+        for component in self.component_effects:
+            if type(component) is not ComponentEffect:
+                return "DISCERNMENT_COMPONENT_CONTRACT_INVALID"
+            key = (component.component_id, component.component_version)
+            if component.required != (key in required_keys):
+                return "DISCERNMENT_COMPONENT_REQUIRED_FLAG_MISMATCH"
+            if component.dependency_group not in group_bounds:
+                return "DISCERNMENT_COMPONENT_DEPENDENCY_UNBOUND"
+            if (
+                not component.continuity_valid
+                or component.continuity_domain != self.continuity_domain
+                or component.evidence_revision > self.evidence_revision
+                or _utc(component.available_at, "Component available-at time")
+                > snapshot_available
+            ):
+                return "DISCERNMENT_COMPONENT_CAUSALITY_INVALID"
+            if _utc(component.valid_until, "Component valid-until time") <= evaluated:
+                return "DISCERNMENT_EVIDENCE_EXPIRED_AT_ADMISSION"
+            evidence_payload = {
+                "event_id": component.event_id,
+                "component_id": component.component_id,
+                "component_version": component.component_version,
+                "dependency_group": component.dependency_group,
+                "log_odds_effect": component.log_odds_effect,
+                "required": component.required,
+                "source_event_at": normalized_utc(
+                    component.source_event_at, "Component source event time",
+                ),
+                "received_at": normalized_utc(
+                    component.received_at, "Component receipt time",
+                ),
+                "available_at": normalized_utc(
+                    component.available_at, "Component available-at time",
+                ),
+                "valid_until": normalized_utc(
+                    component.valid_until, "Component valid-until time",
+                ),
+                "evidence_revision": component.evidence_revision,
+                "continuity_domain": component.continuity_domain,
+                "continuity_valid": component.continuity_valid,
+                "source_ids": list(component.source_ids),
+                "source_hashes": list(component.source_hashes),
+            }
+            if canonical_hash(evidence_payload) != component.evidence_hash:
+                return "DISCERNMENT_COMPONENT_EVIDENCE_HASH_MISMATCH"
+            source_ids.update(component.source_ids)
+            grouped_effects[component.dependency_group] = (
+                grouped_effects.get(component.dependency_group, 0.0)
+                + float(component.log_odds_effect)
+            )
+        if tuple(sorted(source_ids)) != self.source_ids:
+            return "DISCERNMENT_SNAPSHOT_SOURCE_IDENTITY_MISMATCH"
+        expected_group_effects = tuple(
+            (
+                group,
+                max(-group_bounds[group], min(group_bounds[group], effect)),
+            )
+            for group, effect in sorted(grouped_effects.items())
+        )
+        if (
+            len(expected_group_effects) != len(self.dependency_group_effects)
+            or any(
+                expected_group != actual_group
+                or not math.isclose(
+                    expected_effect, actual_effect, rel_tol=0, abs_tol=1e-15,
+                )
+                for (expected_group, expected_effect), (actual_group, actual_effect)
+                in zip(expected_group_effects, self.dependency_group_effects)
+            )
+        ):
+            return "DISCERNMENT_DEPENDENCY_EFFECT_DERIVATION_MISMATCH"
+        expected_log_odds = logit_probability(
+            policy.prior_long_score, name="prior_long_score",
+        ) + sum(effect for _, effect in expected_group_effects)
+        expected_raw = sigmoid_clipped(expected_log_odds, clip=LOG_ODDS_CLIP)
+        expected_effective = shrink_toward_neutral(
+            expected_raw, policy.reliability,
+        )
+        assert self.raw_long_score is not None
+        assert self.effective_long_score is not None
+        assert self.long_discernment_pct is not None
+        assert self.short_discernment_pct is not None
+        if not all((
+            math.isclose(
+                self.raw_long_score, expected_raw, rel_tol=0, abs_tol=1e-15,
+            ),
+            math.isclose(
+                self.effective_long_score,
+                expected_effective,
+                rel_tol=0,
+                abs_tol=1e-15,
+            ),
+            math.isclose(
+                self.long_discernment_pct,
+                expected_effective * 100,
+                rel_tol=0,
+                abs_tol=1e-12,
+            ),
+            math.isclose(
+                self.short_discernment_pct,
+                (1 - expected_effective) * 100,
+                rel_tol=0,
+                abs_tol=1e-12,
+            ),
+        )):
+            return "DISCERNMENT_SCORE_DERIVATION_MISMATCH"
+        return None
+
     def payload(self, *, include_result_hash: bool = True) -> dict[str, object]:
         payload: dict[str, object] = {
             "schema": DISCERNMENT_SCHEMA,
@@ -825,8 +967,11 @@ class DiscernmentSwitch:
         snapshot: DiscernmentSnapshot,
     ) -> "DiscernmentSwitch":
         """Create a deterministic switch bound to the approved policy and snapshot."""
-        if snapshot.policy_hash != policy.policy_hash or snapshot.model_hash != policy.model_hash:
-            raise ValueError("Discernment snapshot does not match the switch policy.")
+        snapshot_error = snapshot.verification_error(
+            policy, at=snapshot.available_at,
+        )
+        if snapshot_error is not None:
+            raise ValueError(snapshot_error)
         occurred_at = snapshot.available_at
         available_at = snapshot.available_at
         material = _switch_identity_material(
@@ -911,6 +1056,11 @@ class DiscernmentSwitch:
             )
         ):
             return "DISCERNMENT_SWITCH_THRESHOLD_CONTRACT_MISMATCH"
+        snapshot_error = self.snapshot.verification_error(
+            policy, at=self.available_at,
+        )
+        if snapshot_error is not None:
+            return snapshot_error
         if expected_previous_direction is not None and (
             self.previous_direction is not expected_previous_direction
         ):

@@ -16,6 +16,7 @@ from typing import Iterable
 
 from src.lane_iii.contracts import canonical_hash, normalized_utc
 from src.l3g_paper.discernment import (
+    DISCERNMENT_INSTRUMENT,
     DiscernmentEvidence,
     DiscernmentPolicy,
     VolumeRegime as DiscernmentVolumeRegime,
@@ -725,6 +726,7 @@ class LiquidityClusterAdapter:
 class VolumeWindow:
     window_id: str
     payload_hash: str
+    instrument: str
     normalization_key: str
     window_start: str
     window_end: str
@@ -737,6 +739,7 @@ class VolumeWindow:
     def __post_init__(self) -> None:
         _text(self.window_id, "Volume window ID")
         _sha256(self.payload_hash, "Volume window hash")
+        _text(self.instrument, "Volume window instrument")
         _text(self.normalization_key, "Volume normalization key")
         start = _time(self.window_start, "Volume window start")
         end = _time(self.window_end, "Volume window end")
@@ -784,6 +787,7 @@ class VolumeRegimePolicy:
 
 @dataclass(frozen=True)
 class VolumeRegimeResult:
+    instrument: str
     regime: VolumeRegime
     valid: bool
     reason_codes: tuple[str, ...]
@@ -800,9 +804,13 @@ class VolumeRegimeResult:
     dependency_group_id: str
     policy_hash: str
 
+    def __post_init__(self) -> None:
+        _text(self.instrument, "Volume regime instrument")
+
     def payload(self) -> dict[str, object]:
         return {
             "schema": PONG_MICROSTRUCTURE_SCHEMA, "kind": "VOLUME_REGIME",
+            "instrument": self.instrument,
             "regime": self.regime.value, "valid": self.valid,
             "reason_codes": list(self.reason_codes),
             "current_window_id": self.current_window_id,
@@ -842,6 +850,8 @@ class VolumeRegimeAdapter:
         )))
         if len({item.window_id for item in prior}) != len(prior):
             raise ValueError("Duplicate prior volume window IDs are forbidden.")
+        if any(item.instrument != current.instrument for item in prior):
+            raise ValueError("Reference volume window instrument mismatch.")
         current_start = _time(current.window_start, "Current volume start")
         for item in prior:
             if item.kind is not VolumeWindowKind.COMPLETED:
@@ -857,6 +867,7 @@ class VolumeRegimeAdapter:
         source_hashes = tuple(item.payload_hash for item in source)
         group_hash = canonical_hash({
             "kind": "PRIOR_ONLY_VOLUME_REGIME_INPUTS",
+            "instrument": current.instrument,
             "source_ids": source_ids, "source_hashes": source_hashes,
         })
         reasons: list[str] = []
@@ -885,6 +896,7 @@ class VolumeRegimeAdapter:
                     else VolumeRegime.NORMAL
                 )
         return VolumeRegimeResult(
+            instrument=current.instrument,
             regime=regime,
             valid=not reasons,
             reason_codes=tuple(reasons),
@@ -989,7 +1001,7 @@ class MicrostructureEvidenceMappingPolicy:
         return canonical_hash(self.payload())
 
     def discernment_policy(self) -> DiscernmentPolicy:
-        return DiscernmentPolicy.research_fixture(
+        return DiscernmentPolicy(
             required_components=(
                 PONG_FLOW_COMPONENT,
                 PONG_BID_LIQUIDITY_COMPONENT,
@@ -1001,6 +1013,7 @@ class MicrostructureEvidenceMappingPolicy:
                 (PONG_LIQUIDITY_GROUP, float(self.liquidity_group_bound)),
                 (PONG_VOLUME_REGIME_GROUP, float(self.regime_group_bound)),
             ),
+            evidence_mapping_hash=self.mapping_hash,
         )
 
 
@@ -1116,9 +1129,16 @@ class MicrostructureEvidenceMapper:
             blockers.append("BID_LIQUIDITY_SIDE_MISMATCH")
         if ask_liquidity.side is not BookSide.ASK:
             blockers.append("ASK_LIQUIDITY_SIDE_MISMATCH")
-        instruments = {flow.instrument, bid_liquidity.instrument, ask_liquidity.instrument}
+        instruments = {
+            flow.instrument,
+            bid_liquidity.instrument,
+            ask_liquidity.instrument,
+            volume_regime.instrument,
+        }
         if len(instruments) != 1:
             blockers.append("MICROSTRUCTURE_INSTRUMENT_MISMATCH")
+        elif next(iter(instruments)) != DISCERNMENT_INSTRUMENT:
+            blockers.append("MICROSTRUCTURE_INSTRUMENT_NOT_DISCERNMENT_INSTRUMENT")
         as_of_values = {
             normalized_utc(item, "Mapped microstructure as-of time")
             for item in (flow.available_at, bid_liquidity.available_at,
