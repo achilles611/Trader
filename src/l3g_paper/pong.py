@@ -14,6 +14,12 @@ from enum import StrEnum
 import hashlib
 import json
 
+from src.l3g_paper.daily_bias import (
+    DailyBiasDirection,
+    DailyBiasResult,
+    default_unconfigured_bias,
+)
+
 
 PONG_EXECUTION_ENABLED = False
 PONG_PROFILE_REGISTRATION = "NOT_REGISTERED"
@@ -29,13 +35,6 @@ class PongDirection(StrEnum):
     FLAT = "FLAT"
     LONG = "LONG"
     SHORT = "SHORT"
-
-
-class DailyBiasDirection(StrEnum):
-    LONG = "LONG"
-    SHORT = "SHORT"
-    NEUTRAL = "NEUTRAL"
-    UNKNOWN = "UNKNOWN"
 
 
 class PongState(StrEnum):
@@ -62,44 +61,6 @@ def _utc(value: str) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("Pong timestamps must include a UTC offset.")
     return parsed
-
-
-@dataclass(frozen=True)
-class DailyBiasSnapshot:
-    """Injected, causal bias evidence; no production provider exists yet."""
-
-    direction: DailyBiasDirection = DailyBiasDirection.UNKNOWN
-    configured: bool = False
-    source_id: str | None = None
-    instrument: str = PONG_INSTRUMENT
-    as_of: str | None = None
-    available_at: str | None = None
-    expires_at: str | None = None
-
-    def eligibility(self, *, at: str, direction: PongDirection) -> str:
-        if not self.configured:
-            return "DAILY_BIAS_UNCONFIGURED"
-        if self.instrument != PONG_INSTRUMENT:
-            return "DAILY_BIAS_INSTRUMENT_MISMATCH"
-        if self.direction not in {
-            DailyBiasDirection.LONG, DailyBiasDirection.SHORT,
-        }:
-            return "DAILY_BIAS_NOT_DIRECTIONAL"
-        if not all((self.source_id, self.as_of, self.available_at, self.expires_at)):
-            return "DAILY_BIAS_PROVENANCE_INCOMPLETE"
-        decision_time = _utc(at)
-        as_of = _utc(str(self.as_of))
-        available = _utc(str(self.available_at))
-        expires = _utc(str(self.expires_at))
-        if as_of > available or expires <= available:
-            return "DAILY_BIAS_PROVENANCE_INVALID"
-        if available > decision_time:
-            return "DAILY_BIAS_NOT_YET_AVAILABLE"
-        if decision_time > expires:
-            return "DAILY_BIAS_STALE"
-        if self.direction.value != direction.value:
-            return "PERPETUAL_SWITCH_NOT_ALIGNED_WITH_DAILY_BIAS"
-        return "DAILY_BIAS_ALIGNED"
 
 
 @dataclass(frozen=True)
@@ -148,7 +109,7 @@ class PongStateMachine:
         self.entry_admitted = False
         self.exit_fill_seen = False
         self.safety_exit_fill_seen = False
-        self.daily_bias = DailyBiasSnapshot()
+        self.daily_bias = default_unconfigured_bias()
         self.safety_reason: str | None = None
 
     def _action(
@@ -191,8 +152,10 @@ class PongStateMachine:
             return self._transition("STARTUP_SEED_REPLAY_IGNORED", False)
         return self._safety_block("STARTUP_SEED_DIRECTION_CONFLICT")
 
-    def on_bias_update(self, snapshot: DailyBiasSnapshot) -> PongTransition:
+    def on_bias_update(self, snapshot: DailyBiasResult) -> PongTransition:
         """Record provenance only; a bias change is never an exit signal."""
+        if type(snapshot) is not DailyBiasResult:
+            raise ValueError("Pong requires a validated DailyBiasResult.")
         self.daily_bias = snapshot
         return self._transition("DAILY_BIAS_UPDATED_NO_POSITION_ACTION", False)
 
@@ -203,10 +166,12 @@ class PongStateMachine:
     def on_switch(
         self,
         event: PerpetualSwitchEvent,
-        bias: DailyBiasSnapshot,
+        bias: DailyBiasResult,
         *,
         entry_gates_pass: bool = True,
     ) -> PongTransition:
+        if type(bias) is not DailyBiasResult:
+            raise ValueError("Pong requires a validated DailyBiasResult.")
         if (
             event.source_profile_version != PONG_SOURCE_PROFILE_VERSION
             or event.source_policy_hash != PONG_SOURCE_POLICY_HASH
@@ -297,7 +262,7 @@ class PongStateMachine:
     def _evaluate_flat_entry(
         self,
         event: PerpetualSwitchEvent,
-        bias: DailyBiasSnapshot,
+        bias: DailyBiasResult,
         *,
         entry_gates_pass: bool,
     ) -> PongTransition:
@@ -328,7 +293,7 @@ class PongStateMachine:
         self,
         *,
         action_id: str,
-        bias: DailyBiasSnapshot,
+        bias: DailyBiasResult,
         at: str,
         source_fresh: bool,
         entry_gates_pass: bool,
@@ -338,6 +303,8 @@ class PongStateMachine:
         A future adapter must receive this successful transition before it may
         submit anything.  The design module itself still has no order sender.
         """
+        if type(bias) is not DailyBiasResult:
+            raise ValueError("Pong requires a validated DailyBiasResult.")
         if (
             self.pending_action is None
             or self.pending_action.action_id != action_id
@@ -569,6 +536,11 @@ class PongStateMachine:
             "daily_bias_source_id": self.daily_bias.source_id,
             "daily_bias_configured": self.daily_bias.configured,
             "daily_bias_direction": self.daily_bias.direction.value,
+            "daily_bias_confidence": self.daily_bias.confidence.value,
+            "daily_bias_result_hash": self.daily_bias.result_hash,
+            "daily_bias_reason_codes": list(self.daily_bias.reason_codes),
+            "daily_bias_boundary_start": self.daily_bias.boundary_start,
+            "daily_bias_boundary_end": self.daily_bias.boundary_end,
             "daily_bias_as_of": self.daily_bias.as_of,
             "daily_bias_available_at": self.daily_bias.available_at,
             "daily_bias_expires_at": self.daily_bias.expires_at,

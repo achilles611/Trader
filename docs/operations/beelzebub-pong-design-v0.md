@@ -55,28 +55,27 @@ SHORT bias is the exact mirror. A non-aligned switch after the waiting leg is
 observed and consumed but creates no entry. Pong can therefore remain flat for
 any number of additional beats; there is no forced-entry timeout.
 
-## Daily-bias dependency — intentionally unconfigured
+## Daily-bias dependency — engine implemented, production inputs unconfigured
 
-Repository review found no canonical, causally available daily-bias contract
-that can safely authorize Pong. The design therefore accepts an injected
-`DailyBiasSnapshot` for tests and denies every real entry by default with
-`DAILY_BIAS_UNCONFIGURED`. No price-versus-open, VWAP, moving-average, daily
-close, or hindsight proxy has been selected.
+The pure causal voter and provenance contract now live in
+`src/l3g_paper/daily_bias.py`; the complete inventory, calculation, overlay, and
+review boundary are specified in
+`docs/operations/beelzebub-pong-daily-bias-v0.md`. Pong consumes the resulting
+`DailyBiasResult`, but `PONG_DAILY_BIAS_PRODUCTION_CONFIGURED` remains `False`.
 
-Before any order-capable work, the owner must approve a provider contract with:
+No canonical hourly trend or Joseph-specific CRT implementation was found, and
+the existing derivatives type has no configured directional options/Greeks
+provider. Those component interfaces remain explicitly `UNCONFIGURED`. A
+design-only completed-hour order-flow evaluator can consume authenticated
+classified trades, but it has no runtime adapter and its parameters are not
+production-approved. The default result therefore denies every entry with
+`DAILY_BIAS_UNCONFIGURED`; no price/open, VWAP, moving-average, daily-close,
+generic-candle CRT, or hindsight proxy was selected.
 
-- instrument and allowed direction states: LONG, SHORT, NEUTRAL, UNKNOWN
-- input lineage and source identity
-- trading-day anchor and timezone
-- calculation rule and update/freeze schedule
-- `as_of`, causally available `available_at`, and `expires_at` timestamps
-- invalidation and correction rules
-- durable provenance, restart/replay behavior, and continuity semantics
-
-Unconfigured, unknown, neutral, incomplete, not-yet-available, stale,
+Unconfigured, unavailable, neutral, incomplete, not-yet-available, stale,
 instrument-mismatched, or direction-mismatched bias denies new entries. A bias
-change by itself never exits or reverses a position and never disables a
-protective or safety exit.
+change by itself never creates a beat, entry, exit, or reversal and never
+disables a protective or safety exit.
 
 ## State and transition contract
 
@@ -126,14 +125,14 @@ and authorization to clear any future Pong lockout are outside this design.
 
 - mirrored LONG and SHORT A/B/C examples
 - one or more extra beats caused by bias mismatch
-- unconfigured, unknown, and stale bias
+- unconfigured, unavailable, neutral, and stale bias
 - seed-only startup and same-direction repeats
 - entry-pending cancellation and late-fill risk reduction
 - entry-admission freshness, bias, and risk rechecks
 - switches during unresolved exits
 - native exit and safety-exit fill plus signed-flat/order reconciliation
 - duplicate, invalid, out-of-order, and missing-continuity events
-- bias changes and reporting-boundary persistence
+- bias changes while positioned or waiting and reporting-boundary persistence
 - retained safety lockout
 
 There is no Pong P&L counterfactual. Daily-bias history, Pong-specific
@@ -143,7 +142,8 @@ profitable subset of Perpetual fills would be non-causal and misleading.
 ## Decisions required before further work
 
 1. Confirm or change the B→C working definition of one waiting beat.
-2. Approve the complete causal daily-bias contract and provider.
+2. Approve the unresolved trend, CRT, order-flow, and options definitions and
+   providers in `beelzebub-pong-daily-bias-v0.md`.
 3. Separately review persistence, signed event provenance, risk/protection,
    restart, reconciliation, ownership, UI visibility, and commissioning design.
 4. Explicitly authorize any order-capable implementation and a later Sim101

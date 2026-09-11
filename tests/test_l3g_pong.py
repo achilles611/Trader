@@ -2,13 +2,26 @@ from __future__ import annotations
 
 import unittest
 
+from src.lane_iii.contracts import canonical_hash
 from src.l3g_paper.contracts import (
     FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
     FIVE_MINUTE_PERPETUAL_POLICY,
 )
-from src.l3g_paper.pong import (
+from src.l3g_paper.daily_bias import (
+    BiasInputProvenance,
+    BiasUpdateReason,
+    CoreComponentEvidence,
+    CoreComponentKind,
     DailyBiasDirection,
-    DailyBiasSnapshot,
+    DailyBiasEngine,
+    DailyBiasResult,
+    HourlyBiasFrame,
+    OptionsDayClass,
+    OptionsOverlayEvidence,
+    OptionsOverlayOutcome,
+    default_unconfigured_bias,
+)
+from src.l3g_paper.pong import (
     PerpetualSwitchEvent,
     PongActionKind,
     PongDirection,
@@ -21,18 +34,75 @@ from src.l3g_paper.pong import (
 )
 
 
-def bias(direction: DailyBiasDirection, *, stale: bool = False) -> DailyBiasSnapshot:
-    return DailyBiasSnapshot(
-        direction=direction,
-        configured=True,
-        source_id="daily-bias-test",
-        instrument="MNQ SEP26",
-        as_of="2026-09-11T00:00:00Z",
-        available_at="2026-09-11T00:01:00Z",
-        expires_at=(
-            "2026-09-11T00:30:00Z" if stale else "2026-09-12T00:00:00Z"
+def _provenance(name: str, *, stale: bool = False) -> BiasInputProvenance:
+    definition = {"test_component": name, "version": 0}
+    return BiasInputProvenance(
+        source="DETERMINISTIC_TEST_FIXTURE",
+        calculation_id=f"test-{name}",
+        calculation_version="0",
+        calculation_hash=canonical_hash(definition),
+        window_start="2026-09-11T00:00:00Z",
+        window_end="2026-09-11T01:00:00Z",
+        latest_event_at="2026-09-11T00:59:59Z",
+        observed_at="2026-09-11T01:00:00Z",
+        available_at="2026-09-11T01:00:00Z",
+        valid_until=(
+            "2026-09-11T01:00:30Z" if stale else "2026-09-11T02:05:00Z"
         ),
+        input_ids=(f"test-{name}-input",),
+        input_hashes=(canonical_hash({"test_input": name}),),
     )
+
+
+def bias(
+    direction: DailyBiasDirection,
+    *,
+    stale: bool = False,
+) -> DailyBiasResult:
+    if direction is DailyBiasDirection.UNAVAILABLE and not stale:
+        return default_unconfigured_bias()
+    component_directions = (
+        (direction, direction, direction)
+        if direction in {DailyBiasDirection.LONG, DailyBiasDirection.SHORT}
+        else (
+            DailyBiasDirection.LONG,
+            DailyBiasDirection.SHORT,
+            DailyBiasDirection.NEUTRAL,
+        )
+    )
+    components = tuple(
+        CoreComponentEvidence(
+            component,
+            component_direction,
+            True,
+            True,
+            False,
+            ("DETERMINISTIC_TEST_COMPONENT",),
+            _provenance(component.value.lower(), stale=stale),
+        )
+        for component, component_direction in zip(CoreComponentKind, component_directions)
+    )
+    options = OptionsOverlayEvidence(
+        OptionsDayClass.ORDINARY,
+        OptionsOverlayOutcome.NOT_APPLICABLE,
+        None,
+        False,
+        ("ORDINARY_TEST_DAY",),
+        _provenance("options", stale=stale),
+    )
+    return DailyBiasEngine().update(
+        HourlyBiasFrame(
+            "MNQ SEP26",
+            "2026-09-11T00:00:00Z",
+            "2026-09-11T01:00:00Z",
+            "2026-09-11T01:00:00Z",
+            components,
+            options,
+            True,
+            None,
+        ),
+        BiasUpdateReason.COMPLETED_HOURLY_BOUNDARY,
+    ).result
 
 
 def switch(
@@ -170,10 +240,37 @@ class PongStateMachineTests(unittest.TestCase):
         aligned = machine.on_switch(fifth, bias(DailyBiasDirection.LONG))
         self.assertEqual(aligned.actions[0].kind, PongActionKind.REQUEST_ENTRY_LONG)
 
+    def test_bias_change_while_waiting_does_not_manufacture_a_beat(self) -> None:
+        machine = PongStateMachine()
+        machine.observe_startup_seed(PongDirection.SHORT)
+        first = switch(1, PongDirection.SHORT, PongDirection.LONG, prior=None)
+        self._enter(machine, first, PongDirection.LONG)
+        second = switch(2, PongDirection.LONG, PongDirection.SHORT, prior=first.event_id)
+        exited = machine.on_switch(second, bias(DailyBiasDirection.LONG))
+        machine.on_exit_fill(action_id=exited.actions[0].action_id, quantity=1)
+        machine.on_signed_flat_reconciliation(
+            position_quantity=0, working_owned_orders=0, signed=True,
+        )
+        self.assertEqual(machine.state, PongState.FLAT_WAIT_BEAT)
+
+        update = machine.on_bias_update(bias(DailyBiasDirection.SHORT))
+        self.assertEqual(update.actions, ())
+        self.assertEqual(update.reason_code, "DAILY_BIAS_UPDATED_NO_POSITION_ACTION")
+        self.assertEqual(machine.state, PongState.FLAT_WAIT_BEAT)
+        self.assertEqual(machine.last_switch_sequence, 2)
+
+        third = switch(3, PongDirection.SHORT, PongDirection.LONG, prior=second.event_id)
+        opposed = machine.on_switch(third, bias(DailyBiasDirection.SHORT))
+        self.assertEqual(opposed.actions, ())
+        self.assertEqual(opposed.reason_code, "PERPETUAL_SWITCH_NOT_ALIGNED_WITH_DAILY_BIAS")
+        fourth = switch(4, PongDirection.LONG, PongDirection.SHORT, prior=third.event_id)
+        aligned = machine.on_switch(fourth, bias(DailyBiasDirection.SHORT))
+        self.assertEqual(aligned.actions[0].kind, PongActionKind.REQUEST_ENTRY_SHORT)
+
     def test_unconfigured_unknown_and_stale_bias_deny_entries(self) -> None:
         fixtures = (
-            (DailyBiasSnapshot(), "DAILY_BIAS_UNCONFIGURED"),
-            (bias(DailyBiasDirection.UNKNOWN), "DAILY_BIAS_NOT_DIRECTIONAL"),
+            (default_unconfigured_bias(), "DAILY_BIAS_UNCONFIGURED"),
+            (bias(DailyBiasDirection.NEUTRAL), "DAILY_BIAS_NOT_DIRECTIONAL"),
             (bias(DailyBiasDirection.LONG, stale=True), "DAILY_BIAS_STALE"),
         )
         for snapshot, reason in fixtures:
@@ -273,7 +370,7 @@ class PongStateMachineTests(unittest.TestCase):
         machine = PongStateMachine()
         machine.observe_startup_seed(PongDirection.SHORT)
         first = switch(1, PongDirection.SHORT, PongDirection.LONG, prior=None)
-        result = machine.on_switch(first, DailyBiasSnapshot())
+        result = machine.on_switch(first, default_unconfigured_bias())
         duplicate = machine.on_switch(first, bias(DailyBiasDirection.LONG))
         old = machine.on_switch(
             switch(0, PongDirection.LONG, PongDirection.SHORT, prior=None),
@@ -315,6 +412,17 @@ class PongStateMachineTests(unittest.TestCase):
         self.assertEqual(boundary.actions, ())
         self.assertEqual(machine.state, PongState.LONG)
         self.assertEqual(machine.actual_position, PongDirection.LONG)
+        self.assertEqual(machine.last_switch_id, first.event_id)
+
+    def test_bias_change_while_short_does_not_force_exit(self) -> None:
+        machine = PongStateMachine()
+        machine.observe_startup_seed(PongDirection.LONG)
+        first = switch(1, PongDirection.LONG, PongDirection.SHORT, prior=None)
+        self._enter(machine, first, PongDirection.SHORT)
+        update = machine.on_bias_update(bias(DailyBiasDirection.LONG))
+        self.assertEqual(update.actions, ())
+        self.assertEqual(machine.state, PongState.SHORT)
+        self.assertEqual(machine.actual_position, PongDirection.SHORT)
         self.assertEqual(machine.last_switch_id, first.event_id)
 
     def test_safety_exit_retains_lockout_after_flat_and_later_switches(self) -> None:
