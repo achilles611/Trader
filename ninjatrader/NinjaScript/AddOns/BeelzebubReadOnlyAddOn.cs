@@ -607,8 +607,10 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string DepthPublicationPolicy = "EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1";
         private readonly Instrument instrument;
         private readonly object bookLock = new object();
-        private readonly List<KeyValuePair<double, long>> depthBids = new List<KeyValuePair<double, long>>();
-        private readonly List<KeyValuePair<double, long>> depthAsks = new List<KeyValuePair<double, long>>();
+        private readonly SortedDictionary<int, KeyValuePair<double, long>> depthBids =
+            new SortedDictionary<int, KeyValuePair<double, long>>();
+        private readonly SortedDictionary<int, KeyValuePair<double, long>> depthAsks =
+            new SortedDictionary<int, KeyValuePair<double, long>>();
         private bool depthContinuityBroken;
         private readonly long startedTicks = System.Diagnostics.Stopwatch.GetTimestamp();
         private long lastMarketCallbackTicks;
@@ -1017,11 +1019,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                 failureReason = "NATIVE_DEPTH_MUTATION_MISSING";
                 return false;
             }
-            List<KeyValuePair<double, long>> candidateBids =
-                new List<KeyValuePair<double, long>>(depthBids);
-            List<KeyValuePair<double, long>> candidateAsks =
-                new List<KeyValuePair<double, long>>(depthAsks);
-            List<KeyValuePair<double, long>> side;
+            SortedDictionary<int, KeyValuePair<double, long>> candidateBids =
+                new SortedDictionary<int, KeyValuePair<double, long>>(depthBids);
+            SortedDictionary<int, KeyValuePair<double, long>> candidateAsks =
+                new SortedDictionary<int, KeyValuePair<double, long>>(depthAsks);
+            SortedDictionary<int, KeyValuePair<double, long>> side;
             if (update.MarketDataType == MarketDataType.Bid)
                 side = candidateBids;
             else if (update.MarketDataType == MarketDataType.Ask)
@@ -1042,15 +1044,16 @@ namespace NinjaTrader.NinjaScript.AddOns
             bool applied = false;
             if (update.Operation == Operation.Add)
             {
-                if (validPrice && update.Volume > 0 && update.Position >= 0 && update.Position <= side.Count)
+                if (validPrice && update.Volume > 0 && update.Position >= 0)
                 {
-                    side.Insert(update.Position, new KeyValuePair<double, long>(update.Price, update.Volume));
+                    ShiftKnownPositions(side, update.Position, true);
+                    side[update.Position] = new KeyValuePair<double, long>(update.Price, update.Volume);
                     applied = true;
                 }
             }
             else if (update.Operation == Operation.Update)
             {
-                if (validPrice && update.Volume > 0 && update.Position >= 0 && update.Position < side.Count)
+                if (validPrice && update.Volume > 0 && update.Position >= 0)
                 {
                     side[update.Position] = new KeyValuePair<double, long>(update.Price, update.Volume);
                     applied = true;
@@ -1058,9 +1061,10 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
             else if (update.Operation == Operation.Remove)
             {
-                if (update.Position >= 0 && update.Position < side.Count)
+                if (update.Position >= 0)
                 {
-                    side.RemoveAt(update.Position);
+                    side.Remove(update.Position);
+                    ShiftKnownPositions(side, update.Position, false);
                     applied = true;
                 }
             }
@@ -1071,30 +1075,29 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return false;
             }
             depthBids.Clear();
-            depthBids.AddRange(candidateBids);
+            foreach (KeyValuePair<int, KeyValuePair<double, long>> row in candidateBids)
+                depthBids[row.Key] = row.Value;
             depthAsks.Clear();
-            depthAsks.AddRange(candidateAsks);
-            if (depthBids.Count == 0 || depthAsks.Count == 0)
+            foreach (KeyValuePair<int, KeyValuePair<double, long>> row in candidateAsks)
+                depthAsks[row.Key] = row.Value;
+            List<KeyValuePair<double, long>> bidPrefix = DepthPrefix(depthBids, true);
+            List<KeyValuePair<double, long>> askPrefix = DepthPrefix(depthAsks, false);
+            if (bidPrefix.Count == 0 || askPrefix.Count == 0)
             {
-                failureReason = "NATIVE_DEPTH_SIDE_EMPTY";
+                failureReason = "NATIVE_DEPTH_POSITION_ZERO_UNAVAILABLE";
                 return false;
             }
-            if (!StrictlyOrdered(depthBids, true) || !StrictlyOrdered(depthAsks, false))
-            {
-                failureReason = "NATIVE_POSITIONAL_ORDER_INVALID";
-                return false;
-            }
-            bestNativeBid = depthBids[0].Key;
-            bestNativeAsk = depthAsks[0].Key;
+            bestNativeBid = bidPrefix[0].Key;
+            bestNativeAsk = askPrefix[0].Key;
             if (bestNativeBid >= bestNativeAsk)
             {
                 failureReason = "CROSSED_NATIVE_POSITIONAL_SNAPSHOT";
                 return false;
             }
-            List<string> bidRows = depthBids.Take(MaximumPublishedBookLevelsPerSide)
+            List<string> bidRows = bidPrefix
                 .Select(row => "{\"price\":" + row.Key.ToString(CultureInfo.InvariantCulture)
                     + ",\"size\":" + row.Value + "}").ToList();
-            List<string> askRows = depthAsks.Take(MaximumPublishedBookLevelsPerSide)
+            List<string> askRows = askPrefix
                 .Select(row => "{\"price\":" + row.Key.ToString(CultureInfo.InvariantCulture)
                     + ",\"size\":" + row.Value + "}").ToList();
             bidLevels = "[" + String.Join(",", bidRows) + "]";
@@ -1102,18 +1105,41 @@ namespace NinjaTrader.NinjaScript.AddOns
             return true;
         }
 
-        private static bool StrictlyOrdered(List<KeyValuePair<double, long>> levels, bool descending)
+        private static void ShiftKnownPositions(
+            SortedDictionary<int, KeyValuePair<double, long>> levels,
+            int position, bool inserting)
         {
-            for (int index = 0; index < levels.Count; index++)
+            List<int> positions = levels.Keys
+                .Where(value => inserting ? value >= position : value > position)
+                .ToList();
+            if (inserting)
+                positions.Reverse();
+            foreach (int current in positions)
             {
-                if (!FinitePositive(levels[index].Key) || levels[index].Value <= 0)
-                    return false;
-                if (index > 0 && (descending
-                    ? levels[index - 1].Key <= levels[index].Key
-                    : levels[index - 1].Key >= levels[index].Key))
-                    return false;
+                KeyValuePair<double, long> row = levels[current];
+                levels.Remove(current);
+                levels[inserting ? current + 1 : current - 1] = row;
             }
-            return true;
+        }
+
+        private static List<KeyValuePair<double, long>> DepthPrefix(
+            SortedDictionary<int, KeyValuePair<double, long>> levels,
+            bool descending)
+        {
+            List<KeyValuePair<double, long>> prefix = new List<KeyValuePair<double, long>>();
+            for (int position = 0; position < MaximumPublishedBookLevelsPerSide; position++)
+            {
+                KeyValuePair<double, long> row;
+                if (!levels.TryGetValue(position, out row)
+                    || !FinitePositive(row.Key) || row.Value <= 0)
+                    break;
+                if (prefix.Count > 0 && (descending
+                    ? prefix[prefix.Count - 1].Key <= row.Key
+                    : prefix[prefix.Count - 1].Key >= row.Key))
+                    break;
+                prefix.Add(row);
+            }
+            return prefix;
         }
 
         public bool NeedsRecovery(TimeSpan maximumCallbackAge)
@@ -1261,7 +1287,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string AttestedSchema = "lane-iii-phase-f3-ninjatrader-observation-v2";
         private const string AttestationProtocol = "l3f3-ninjatrader-observer-attestation-v1";
         private const string AttestationKeyContext = "BEELZEBUB_NINJATRADER_OBSERVATION_V2";
-        private const string ProducerSourceFingerprint = "7888f7db278fc6f997af8d13dc4d7eed84af42f43a8d1591fdeaeff1379b4656";
+        private const string ProducerSourceFingerprint = "fcf81dba7bec2ba2bf7c17f5f6cc24fe830153735f24f9552996cf9fe3d55cd3";
         // Event-driven trades/depth require burst capacity, but memory remains
         // bounded. A full queue drops the signed frame after assigning its
         // sequence; the next source_event_sequence exposes the gap.

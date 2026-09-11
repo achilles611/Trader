@@ -136,9 +136,11 @@ class ObservationAttestationTests(unittest.TestCase):
         for text in (addon, indicator):
             self.assertIn("EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1", text)
             self.assertIn("EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1", text)
-            self.assertIn("side.Insert(update.Position", text)
+            self.assertIn("ShiftKnownPositions(side, update.Position, true)", text)
             self.assertIn("side[update.Position]", text)
-            self.assertIn("side.RemoveAt(update.Position)", text)
+            self.assertIn("side.Remove(update.Position)", text)
+            self.assertIn("ShiftKnownPositions(side, update.Position, false)", text)
+            self.assertIn("DepthPrefix", text)
 
     def test_bounded_native_positional_snapshot_allows_a_deeper_mutation(self):
         adapter = NinjaTraderMarketDataAdapter(
@@ -162,7 +164,7 @@ class ObservationAttestationTests(unittest.TestCase):
         )
         self.assertEqual(len(adapter.normalize(raw)), 1)
 
-        self.assertEqual(SOURCE_HASH, "7888f7db278fc6f997af8d13dc4d7eed84af42f43a8d1591fdeaeff1379b4656")
+        self.assertEqual(SOURCE_HASH, "fcf81dba7bec2ba2bf7c17f5f6cc24fe830153735f24f9552996cf9fe3d55cd3")
 
 
 if __name__ == "__main__":
