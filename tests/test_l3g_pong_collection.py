@@ -1,0 +1,122 @@
+import json
+import tempfile
+import time
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from src.lane_iii.contracts import canonical_hash
+from src.l3f_provider.ninjatrader_observation import (
+    EXPECTED_OBSERVER_SOURCE_FINGERPRINT,
+    L3F3_SCHEMA,
+    NINJATRADER_ATTESTATION_PROTOCOL,
+    NinjaTraderObservation,
+    NinjaTraderProducerAttestation,
+)
+from src.l3g_paper.pong_collection import PongAuthenticHourCollector
+
+
+def wire(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def record(kind: str, payload: dict[str, object], sequence: int, observed: datetime) -> NinjaTraderObservation:
+    producer = NinjaTraderProducerAttestation(
+        protocol_version=NINJATRADER_ATTESTATION_PROTOCOL,
+        source_fingerprint=EXPECTED_OBSERVER_SOURCE_FINGERPRINT,
+        build_fingerprint="b" * 64,
+        build_timestamp="2026-09-11T13:30:00Z",
+        source_stream={"TRADE": "MARKET_DATA_LAST", "QUOTE": "MARKET_DATA_BID_ASK", "DEPTH": "MARKET_DEPTH"}[kind],
+        publication_policy=str(payload["publication_policy"]),
+    )
+    return NinjaTraderObservation(
+        observation_id=f"native-{kind}-{sequence}",
+        session_id="native-test-session",
+        observation_type=kind,
+        ninja_receipt_time=wire(observed),
+        local_monotonic_sequence=sequence,
+        provider_timestamp=wire(observed),
+        provider_sequence=None,
+        exchange_timestamp=None,
+        account_alias=None,
+        account_class=None,
+        payload=payload,
+        schema=L3F3_SCHEMA,
+        payload_hash=canonical_hash(payload),
+        producer=producer,
+        signature="a" * 64,
+        signature_verified=True,
+    )
+
+
+class PongAuthenticHourCollectorTests(unittest.TestCase):
+    def test_verified_events_are_chained_durable_and_classified_causally(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            now = datetime.now(timezone.utc)
+            collector = PongAuthenticHourCollector(Path(directory), now=now)
+            started = collector.start()
+            target = datetime.fromisoformat(started["required_interval"]["start_utc"].replace("Z", "+00:00"))
+            event_at = target + timedelta(seconds=1)
+            collector.on_transport_state("HEALTHY")
+            quote = {
+                "contract_id": "MNQ SEP26", "bid": 100, "ask": 101,
+                "bid_size": 2, "ask_size": 3, "source_event_sequence": 1,
+                "publication_policy": "EVENT_DRIVEN_SAME_CALLBACK_QUOTE_V1",
+            }
+            collector.ingest(record("QUOTE", quote, 1, event_at))
+            trade = {
+                "contract_id": "MNQ SEP26", "price": 101, "size": 2,
+                "aggressor_side": "UNKNOWN", "aggressor_source": "BID_ASK_CLASSIFICATION",
+                "bid_at_trade": 100, "ask_at_trade": 101,
+                "derivation_quote_observation_id": "native-QUOTE-1",
+                "source_event_sequence": 1,
+                "publication_policy": "EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1",
+            }
+            collector.ingest(record("TRADE", trade, 2, event_at))
+            depth = {
+                "contract_id": "MNQ SEP26",
+                "bids": [{"price": 100, "size": 2}],
+                "asks": [{"price": 101, "size": 3}],
+                "source_event_sequence": 1,
+                "publication_policy": "EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1",
+            }
+            collector.ingest(record("DEPTH", depth, 3, event_at))
+            deadline = time.monotonic() + 3
+            while collector.status()["durability"]["durable_records"] < 3 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            status = collector.stop()
+            self.assertEqual(status["durability"]["durable_records"], 3)
+            self.assertEqual(status["required_interval"]["classified_trades"]["BUY"], 1)
+            self.assertEqual(status["required_interval"]["depth"]["available"], 1)
+            rows = [json.loads(line) for line in collector.journal_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(rows[0]["previous_record_hash"], "0" * 64)
+            self.assertEqual(rows[1]["previous_record_hash"], rows[0]["record_hash"])
+            self.assertEqual(rows[2]["previous_record_hash"], rows[1]["record_hash"])
+            self.assertEqual(rows[1]["aggressor_classification"]["side"], "BUY")
+            self.assertTrue(rows[1]["signature_verified"])
+
+    def test_source_sequence_gap_invalidates_only_the_affected_hour(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            collector = PongAuthenticHourCollector(Path(directory))
+            started = collector.start()
+            target = datetime.fromisoformat(started["required_interval"]["start_utc"].replace("Z", "+00:00"))
+            payload = {
+                "contract_id": "MNQ SEP26", "price": 101, "size": 1,
+                "aggressor_side": "UNKNOWN", "aggressor_source": "UNKNOWN",
+                "bid_at_trade": None, "ask_at_trade": None,
+                "derivation_quote_observation_id": None,
+                "source_event_sequence": 1,
+                "publication_policy": "EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1",
+            }
+            collector.ingest(record("TRADE", payload, 1, target + timedelta(seconds=1)))
+            collector.ingest(record("TRADE", dict(payload, source_event_sequence=3), 2, target + timedelta(seconds=2)))
+            deadline = time.monotonic() + 2
+            while collector.status()["durability"]["written_records"] < 2 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            status = collector.stop()
+            self.assertIn("SOURCE_SEQUENCE_GAP", status["required_interval"]["blockers"])
+            self.assertFalse(status["required_interval"]["continuity_valid"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -24,6 +24,7 @@ from typing import Any, Callable, Iterator, Mapping
 from urllib.parse import urlsplit
 
 from src.l3f_provider.ninjatrader_commission import NinjaTraderListenerWorker
+from src.l3f_provider.ninjatrader_observation import EXPECTED_OBSERVER_SOURCE_FINGERPRINT
 from src.l3f_provider.shadow_runtime import LaneIIIShadowRuntime
 from src.l3g_paper.commissioning import (
     CommissioningLedgerGateError,
@@ -45,7 +46,8 @@ from src.l3g_paper.paper_autostart import (
     PAPER_AUTOSTART_TOKEN_HEADER,
     PaperAutoStartService,
 )
-from src.l3g_paper.ninjatrader_transport import PaperExecutionTransport
+from src.l3g_paper.ninjatrader_transport import LocalPaperSecretProvider, PaperExecutionTransport
+from src.l3g_paper.pong_collection import PongAuthenticHourCollector
 from src.l3g_paper.contracts import resolve_paper_profile
 from src.l3g_paper.profile_switch import (
     PROFILE_SWITCH_ACTION_HEADER,
@@ -1486,6 +1488,7 @@ def create_control_center_app(
     audit_root = Path(
         os.getenv("BEELZEBUB_LEDGER_AUDIT_ROOT") or remembered_audit_root or derived_audit_root
     ).resolve()
+    pong_collection_root = audit_root / "pong-authentic-hour"
     perpetual_seed_artifact: Mapping[str, object] | None = None
     perpetual_seed_proof: Mapping[str, object] | None = None
     perpetual_seed_manifest: Mapping[str, object] | None = None
@@ -1788,6 +1791,20 @@ def create_control_center_app(
 
     def lane_iii_paper_health() -> dict[str, object]:
         paper = ninjatrader_runtime.get("paper")
+        collector = ninjatrader_runtime.get("pong_collection")
+        collection_status = (
+            collector.status()
+            if type(collector) is PongAuthenticHourCollector
+            else {
+                "schema": "beelzebub-pong-authentic-hour-status-v1",
+                "state": "UNSTARTED",
+                "authority": "OBSERVE_ONLY",
+                "paper_execution": "DISARMED",
+                "live_authority": "DISARMED",
+                "live_capital": "DENIED",
+                "error": None,
+            }
+        )
         if paper is None:
             observer = ninja_listener_health()
             return {
@@ -1827,6 +1844,7 @@ def create_control_center_app(
                 "market_observer": observer,
                 "ledger_verification": ledger_verifier.status(),
                 "ledger_shutdown": paper_ledger_shutdown_receipt,
+                "pong_collection": collection_status,
             }
         status = paper.status()
         verification = ledger_verifier.status()
@@ -1841,6 +1859,7 @@ def create_control_center_app(
         status["account_balances"] = status["market_observer"]["account_balances"]
         status["ledger_verification"] = verification
         status["ledger_shutdown"] = paper_ledger_shutdown_receipt
+        status["pong_collection"] = collection_status
         raw_ledger = status.get("ledger")
         if isinstance(raw_ledger, Mapping):
             status["ledger"] = ledger_health_projection(
@@ -2092,6 +2111,7 @@ def create_control_center_app(
             raise RuntimeError("NINJATRADER_OBSERVER duplicate FastAPI lifespan refused")
         ninjatrader_runtime["active"] = True
         listener: NinjaTraderListenerWorker | None = None
+        pong_collector: PongAuthenticHourCollector | None = None
         paper_transport: PaperExecutionTransport | None = None
         paper_runtime: LaneIIIPaperRuntime | None = None
         paper_ledger: PaperLedger | None = None
@@ -2225,16 +2245,49 @@ def create_control_center_app(
                 runtime_binding["git_sha"],
             )
             app.state.lane_iii_paper_transport = paper_transport
+            pong_collector = PongAuthenticHourCollector(
+                pong_collection_root,
+                expected_source_fingerprint=EXPECTED_OBSERVER_SOURCE_FINGERPRINT,
+            )
+            pong_collector.start()
+            ninjatrader_runtime["pong_collection"] = pong_collector
+            app.state.pong_collection = pong_collector
             listener = (
                 ninjatrader_listener_factory()
                 if ninjatrader_listener_factory is not None
-                else NinjaTraderListenerWorker(logger=NINJATRADER_RUNTIME_LOGGER)
+                else NinjaTraderListenerWorker(
+                    logger=NINJATRADER_RUNTIME_LOGGER,
+                    attestation_key=LocalPaperSecretProvider().load_key(),
+                    require_attestation=True,
+                    expected_source_fingerprint=EXPECTED_OBSERVER_SOURCE_FINGERPRINT,
+                )
             )
+
+            def collect_and_fanout_observation(observation: object) -> None:
+                assert pong_collector is not None
+                pong_collector.ingest(observation)  # type: ignore[arg-type]
+                fanout.on_observation(observation)  # type: ignore[arg-type]
+
+            def collect_and_fanout_transport(state: object) -> None:
+                assert pong_collector is not None
+                pong_collector.on_transport_state(state)
+                fanout.on_transport_state(state)  # type: ignore[arg-type]
+
+            def collect_and_fanout_rejection(error: object) -> None:
+                assert pong_collector is not None
+                pong_collector.on_rejection(error)  # type: ignore[arg-type]
+                fanout.on_rejection(error)  # type: ignore[arg-type]
+
+            def collect_and_fanout_duplicate() -> None:
+                assert pong_collector is not None
+                pong_collector.on_duplicate()
+                fanout.on_duplicate()
+
             listener.set_observation_sinks(
-                on_observation=fanout.on_observation,
-                on_local_bridge_state=fanout.on_transport_state,
-                on_rejection=fanout.on_rejection,
-                on_duplicate=fanout.on_duplicate,
+                on_observation=collect_and_fanout_observation,
+                on_local_bridge_state=collect_and_fanout_transport,
+                on_rejection=collect_and_fanout_rejection,
+                on_duplicate=collect_and_fanout_duplicate,
             )
             ninjatrader_runtime["listener"] = listener
             app.state.ninjatrader_observer = listener
@@ -2285,6 +2338,8 @@ def create_control_center_app(
                     active_login.stop()
                 if listener is not None:
                     listener.stop()
+                if pong_collector is not None:
+                    pong_collector.stop()
             finally:
                 try:
                     if paper_runtime is not None:

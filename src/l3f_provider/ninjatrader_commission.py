@@ -187,13 +187,21 @@ class NinjaTraderCommissioningHarness:
         self,
         config: LoopbackBridgeConfig = LoopbackBridgeConfig(),
         *,
+        attestation_key: bytes | None = None,
+        require_attestation: bool = False,
+        expected_source_fingerprint: str | None = None,
         on_listener_started: Callable[[str, int], None] | None = None,
         on_observation: Callable[[NinjaTraderObservation], None] | None = None,
         on_local_bridge_state: Callable[[StreamHealth], None] | None = None,
         on_rejection: Callable[[NinjaTraderObservationError], None] | None = None,
         on_duplicate: Callable[[], None] | None = None,
     ) -> None:
-        self.bridge = LoopbackNinjaTraderBridge(config)
+        self.bridge = LoopbackNinjaTraderBridge(
+            config,
+            attestation_key=attestation_key,
+            require_attestation=require_attestation,
+            expected_source_fingerprint=expected_source_fingerprint,
+        )
         self.summary = CommissioningSummary()
         self.summary.listener_port = config.port
         self.health = NinjaTraderHealthTracker()
@@ -390,6 +398,9 @@ class NinjaTraderListenerWorker:
         config: LoopbackBridgeConfig = LoopbackBridgeConfig(),
         *,
         logger: logging.Logger | None = None,
+        attestation_key: bytes | None = None,
+        require_attestation: bool = False,
+        expected_source_fingerprint: str | None = None,
         on_observation: Callable[[NinjaTraderObservation], None] | None = None,
         on_local_bridge_state: Callable[[StreamHealth], None] | None = None,
         on_rejection: Callable[[NinjaTraderObservationError], None] | None = None,
@@ -397,6 +408,11 @@ class NinjaTraderListenerWorker:
     ) -> None:
         self.config = config
         self._logger = logger or logging.getLogger(__name__)
+        if require_attestation and attestation_key is None:
+            raise ValueError("Required NinjaTrader attestation needs a local verification key.")
+        self._attestation_key = attestation_key
+        self._require_attestation = require_attestation
+        self._expected_source_fingerprint = expected_source_fingerprint
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._ready_event = threading.Event()
@@ -583,6 +599,9 @@ class NinjaTraderListenerWorker:
             self._account_balances = _empty_account_balances()
             self._harness = NinjaTraderCommissioningHarness(
                 self.config,
+                attestation_key=self._attestation_key,
+                require_attestation=self._require_attestation,
+                expected_source_fingerprint=self._expected_source_fingerprint,
                 on_listener_started=self._listener_started,
                 on_observation=self._record_and_forward_observation,
                 on_local_bridge_state=self._on_local_bridge_state,
