@@ -50,6 +50,60 @@ def record(kind: str, payload: dict[str, object], sequence: int, observed: datet
 
 
 class PongAuthenticHourCollectorTests(unittest.TestCase):
+    def test_test_only_hour_boundary_tracks_each_native_stream_independently(self) -> None:
+        """Accelerated fixture only; these records are not authentic history."""
+        with tempfile.TemporaryDirectory() as directory:
+            now = datetime(2026, 9, 11, 17, 55, tzinfo=timezone.utc)
+            collector = PongAuthenticHourCollector(Path(directory), now=now)
+            started = collector.start()
+            collector.on_transport_state("HEALTHY")
+            target = datetime.fromisoformat(
+                started["required_interval"]["start_utc"].replace("Z", "+00:00")
+            )
+            payloads = {
+                "QUOTE": {
+                    "contract_id": "MNQ SEP26", "bid": 100, "ask": 101,
+                    "bid_size": 2, "ask_size": 3,
+                    "publication_policy": "EVENT_DRIVEN_SAME_CALLBACK_QUOTE_V1",
+                },
+                "TRADE": {
+                    "contract_id": "MNQ SEP26", "price": 101, "size": 1,
+                    "aggressor_side": "UNKNOWN", "aggressor_source": "UNKNOWN",
+                    "bid_at_trade": None, "ask_at_trade": None,
+                    "derivation_quote_observation_id": None,
+                    "publication_policy": "EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1",
+                },
+                "DEPTH": {
+                    "contract_id": "MNQ SEP26",
+                    "bids": [{"price": 100, "size": 2}],
+                    "asks": [{"price": 101, "size": 3}],
+                    "publication_policy": "EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1",
+                },
+            }
+            native_sequences = {"QUOTE": 7, "TRADE": 40, "DEPTH": 99}
+            local_sequence = 0
+            for kind in ("TRADE", "QUOTE", "DEPTH"):
+                local_sequence += 1
+                payload = dict(payloads[kind], source_event_sequence=native_sequences[kind])
+                collector.ingest(record(kind, payload, local_sequence, target - timedelta(microseconds=1)))
+            for kind in ("QUOTE", "TRADE", "DEPTH", "TRADE", "QUOTE", "DEPTH"):
+                local_sequence += 1
+                native_sequences[kind] += 1
+                payload = dict(payloads[kind], source_event_sequence=native_sequences[kind])
+                collector.ingest(record(kind, payload, local_sequence, target + timedelta(seconds=1)))
+            deadline = time.monotonic() + 2
+            while collector.status()["durability"]["written_records"] < 9 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            status = collector.stop()["required_interval"]
+            self.assertEqual(status["streams"]["TRADE"]["source_sequence_gaps"], 0)
+            self.assertEqual(status["streams"]["QUOTE"]["source_sequence_gaps"], 0)
+            self.assertEqual(status["streams"]["DEPTH"]["source_sequence_gaps"], 0)
+            self.assertNotIn("SOURCE_SEQUENCE_GAP", status["blockers"])
+            self.assertNotIn("SOURCE_SEQUENCE_DUPLICATE_OR_OUT_OF_ORDER", status["blockers"])
+            self.assertEqual(status["streams"]["TRADE"]["records"], 2)
+            self.assertEqual(status["streams"]["QUOTE"]["records"], 2)
+            self.assertEqual(status["streams"]["DEPTH"]["records"], 2)
+
     def test_verified_events_are_chained_durable_and_classified_causally(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             now = datetime.now(timezone.utc)

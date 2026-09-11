@@ -1635,9 +1635,12 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertIn("chart.Dispatcher.BeginInvoke(activate)", addon)
         self.assertIn("instrument.MarketData.Update += OnMarketData", addon)
         self.assertIn("instrument.MarketDepth.Update += OnMarketDepth", addon)
+        self.assertIn("class BeelzebubMarketCallbackGate", addon)
+        self.assertIn("expectedGeneration != generation", addon)
+        self.assertIn("marketDataGate.Retire();", addon)
         for source in (addon, observer):
-            self.assertIn("private readonly object marketDataLock = new object();", source)
-            self.assertIn("lock (marketDataLock)", source)
+            self.assertIn("BeelzebubMarketCallbackGate marketDataGate", source)
+            self.assertIn("marketDataGate.TryRun(", source)
             self.assertIn("OnMarketDataSerial(e);", source)
         self.assertIn('"NATIVE_ADDON"', addon)
         self.assertIn("BeelzebubAutomaticMarketObserver", addon)
@@ -1694,7 +1697,13 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertIn("publication_policy", source)
 
         addon = (Path(__file__).parents[1] / "ninjatrader" / "NinjaScript" / "AddOns" / "BeelzebubReadOnlyAddOn.cs").read_text(encoding="utf-8")
-        self.assertIn("private const int MaximumQueuedFrames = 4096;", addon)
+        self.assertIn("private const int MaximumQueuedFrames = 32768;", addon)
+        self.assertIn("MaximumSenderBatchFrames = 256", addon)
+        self.assertIn("Encoding.UTF8.GetBytes(String.Concat(frames))", addon)
+        self.assertLess(
+            addon.index("lock (outboundFramesLock)", addon.index("private static void SenderLoop")),
+            addon.index("stream.Write(bytes", addon.index("private static void SenderLoop")),
+        )
         self.assertIn("private readonly object bookLock = new object();", addon)
         self.assertIn("lock (bookLock)", addon)
         self.assertIn("MaximumObserverRecoveryAttempts = 3", addon)

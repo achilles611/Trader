@@ -23,6 +23,52 @@ using NinjaTrader.NinjaScript.AddOns;
 
 namespace NinjaTrader.NinjaScript.AddOns
 {
+    // BEELZEBUB_MARKET_CALLBACK_GATE_BEGIN
+    // This dependency-free gate is also compiled by the deterministic producer
+    // interleaving regression. The real callback path uses it below.
+    public sealed class BeelzebubMarketCallbackGate
+    {
+        private readonly object sync = new object();
+        private long generation = 1;
+        private bool active = true;
+
+        public long Generation
+        {
+            get { lock (sync) return generation; }
+        }
+
+        public bool IsActive
+        {
+            get { lock (sync) return active; }
+        }
+
+        public bool TryRun(long expectedGeneration, Action callback)
+        {
+            if (callback == null)
+                throw new ArgumentNullException("callback");
+            lock (sync)
+            {
+                if (!active || expectedGeneration != generation)
+                    return false;
+                // The callback captures provider state, assigns its stream
+                // sequence, signs, and admits to the bounded memory queue. It
+                // must contain no socket, disk, dispatcher, or other wait.
+                callback();
+                return true;
+            }
+        }
+
+        public void Retire()
+        {
+            lock (sync)
+            {
+                active = false;
+                generation++;
+            }
+        }
+    }
+    // BEELZEBUB_MARKET_CALLBACK_GATE_END
+
     public sealed class BeelzebubReadOnlyAddOn : AddOnBase
     {
         private readonly List<Account> observedAccounts = new List<Account>();
@@ -607,11 +653,9 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string DepthPublicationPolicy = "EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1";
         private readonly Instrument instrument;
         private readonly object bookLock = new object();
-        // NinjaTrader may deliver level-one callbacks concurrently.  The
-        // per-stream sequence number and the outbound enqueue must share this
-        // owner boundary or otherwise-contiguous QUOTE/TRADE callbacks can be
-        // observed in reversed order by the authenticated consumer.
-        private readonly object marketDataLock = new object();
+        private readonly BeelzebubMarketCallbackGate marketDataGate =
+            new BeelzebubMarketCallbackGate();
+        private readonly long marketDataGeneration = 1;
         private readonly SortedDictionary<int, KeyValuePair<double, long>> depthBids =
             new SortedDictionary<int, KeyValuePair<double, long>>();
         private readonly SortedDictionary<int, KeyValuePair<double, long>> depthAsks =
@@ -620,7 +664,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private readonly long startedTicks = System.Diagnostics.Stopwatch.GetTimestamp();
         private long lastMarketCallbackTicks;
         private bool subscribed;
-        private bool stopping;
+        private volatile bool stopping;
         private bool chartFound;
         private bool reportedLevelOne;
         private bool reportedDepth;
@@ -687,6 +731,10 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         public void Stop()
         {
+            // Drain the currently admitted callback, invalidate this producer
+            // generation, then unsubscribe. A queued callback from this older
+            // instance can no longer publish after recovery creates its owner.
+            marketDataGate.Retire();
             stopping = true;
             BeelzebubReadOnlyAddOn.SetAutomaticObserverActive(false);
             if (instrument == null || instrument.Dispatcher == null || instrument.Dispatcher.HasShutdownStarted)
@@ -874,8 +922,10 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void OnMarketData(object sender, MarketDataEventArgs e)
         {
-            lock (marketDataLock)
-                OnMarketDataSerial(e);
+            if (!marketDataGate.TryRun(
+                marketDataGeneration, delegate { OnMarketDataSerial(e); }))
+                BeelzebubReadOnlyOutbound.Diagnostic(
+                    "NATIVE_ADDON_STALE_MARKET_DATA_CALLBACK_REJECTED");
         }
 
         private void OnMarketDataSerial(MarketDataEventArgs e)
@@ -1298,11 +1348,13 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string AttestedSchema = "lane-iii-phase-f3-ninjatrader-observation-v2";
         private const string AttestationProtocol = "l3f3-ninjatrader-observer-attestation-v1";
         private const string AttestationKeyContext = "BEELZEBUB_NINJATRADER_OBSERVATION_V2";
-        private const string ProducerSourceFingerprint = "a8187ea7b542e0e44c2e39a9445e3ecc7b2f6e6375c76e92a5c2506e52b38321";
+        private const string ProducerSourceFingerprint = "677cc1fa39a880df73a0b84bed8d9e95db0839a09660537c9af5f6182de96309";
         // Event-driven trades/depth require burst capacity, but memory remains
         // bounded. A full queue drops the signed frame after assigning its
         // sequence; the next source_event_sequence exposes the gap.
-        private const int MaximumQueuedFrames = 4096;
+        private const int MaximumQueuedFrames = 32768;
+        private const int MaximumSenderBatchFrames = 256;
+        private const int MaximumSenderBatchCharacters = 524288;
         private static long sequence = 0;
         private static readonly string sessionId = Guid.NewGuid().ToString("N");
         private static readonly HashSet<string> transportMarkers = new HashSet<string>();
@@ -1441,14 +1493,24 @@ namespace NinjaTrader.NinjaScript.AddOns
             {
                 while (true)
                 {
-                    string frame;
+                    List<string> frames = new List<string>();
                     lock (outboundFramesLock)
                     {
                         while (!senderStopping && outboundFrames.Count == 0)
                             Monitor.Wait(outboundFramesLock);
                         if (senderStopping)
                             return;
-                        frame = outboundFrames.Dequeue();
+                        int characters = 0;
+                        while (outboundFrames.Count > 0
+                            && frames.Count < MaximumSenderBatchFrames)
+                        {
+                            string candidate = outboundFrames.Peek();
+                            if (frames.Count > 0
+                                && characters + candidate.Length > MaximumSenderBatchCharacters)
+                                break;
+                            frames.Add(outboundFrames.Dequeue());
+                            characters += candidate.Length;
+                        }
                     }
                     try
                     {
@@ -1459,7 +1521,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                             stream = client.GetStream();
                             TransportDiagnosticOnce("BRIDGE_CHANNEL_CONNECTED");
                         }
-                        byte[] bytes = Encoding.UTF8.GetBytes(frame);
+                        // Batch ordered newline-delimited frames into one socket
+                        // write. Encoding and network backpressure remain outside
+                        // the callback/queue lock; FIFO order is unchanged.
+                        byte[] bytes = Encoding.UTF8.GetBytes(String.Concat(frames));
                         stream.Write(bytes, 0, bytes.Length);
                         TransportDiagnosticOnce("BRIDGE_PUBLISH_DELIVERED");
                     }

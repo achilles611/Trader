@@ -28,9 +28,9 @@ namespace NinjaTrader.NinjaScript.Indicators
         private const string TradePublicationPolicy = "EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1";
         private const string DepthPublicationPolicy = "EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1";
         private readonly object bookLock = new object();
-        // Keep sequence assignment and publication ordered even when native
-        // level-one callbacks arrive concurrently.
-        private readonly object marketDataLock = new object();
+        private readonly BeelzebubMarketCallbackGate marketDataGate =
+            new BeelzebubMarketCallbackGate();
+        private readonly long marketDataGeneration = 1;
         private readonly SortedDictionary<int, KeyValuePair<double, long>> depthBids =
             new SortedDictionary<int, KeyValuePair<double, long>>();
         private readonly SortedDictionary<int, KeyValuePair<double, long>> depthAsks =
@@ -69,6 +69,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
             else if (State == State.Terminated)
             {
+                marketDataGate.Retire();
                 if (BeelzebubReadOnlyAddOn.AutomaticObserverActive)
                     return;
                 string configured = BeelzebubReadOnlyAddOn.ResolveConfiguredInstrument();
@@ -80,8 +81,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         protected override void OnMarketData(MarketDataEventArgs e)
         {
-            lock (marketDataLock)
-                OnMarketDataSerial(e);
+            if (!marketDataGate.TryRun(
+                marketDataGeneration, delegate { OnMarketDataSerial(e); }))
+                BeelzebubReadOnlyOutbound.Diagnostic(
+                    "INDICATOR_STALE_MARKET_DATA_CALLBACK_REJECTED");
         }
 
         private void OnMarketDataSerial(MarketDataEventArgs e)
@@ -174,7 +177,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         protected override void OnMarketDepth(MarketDepthEventArgs e)
         {
-            if (BeelzebubReadOnlyAddOn.AutomaticObserverActive)
+            if (!marketDataGate.IsActive || BeelzebubReadOnlyAddOn.AutomaticObserverActive)
                 return;
             PublishAttachmentHealth();
             PublishMarketConnectedOnce();
