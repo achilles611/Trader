@@ -114,6 +114,11 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             BeelzebubReadOnlyOutbound.Diagnostic("OBSERVER_RECHECK_REQUESTED");
             AttachKnownAccounts();
+            // The operator's explicit recheck must recover a stale native
+            // subscription.  Merely ensuring the existing observer cannot do
+            // that because a previously created observer remains non-null
+            // even when its provider callbacks have stopped advancing.
+            DetachAutomaticObserver();
             EnsureAutomaticObserver();
             InspectCharts(true);
         }
@@ -1040,7 +1045,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string AttestedSchema = "lane-iii-phase-f3-ninjatrader-observation-v2";
         private const string AttestationProtocol = "l3f3-ninjatrader-observer-attestation-v1";
         private const string AttestationKeyContext = "BEELZEBUB_NINJATRADER_OBSERVATION_V2";
-        private const string ProducerSourceFingerprint = "02f5161d932cb1a2b92ecf36962e3cd41c758d7444093a2c172e668fed2d62cf";
+        private const string ProducerSourceFingerprint = "8fdab72408699158516ff88d8c5a56a5b837134c91cddabfaa356c054185f4f8";
         // Event-driven trades/depth require burst capacity, but memory remains
         // bounded. A full queue drops the signed frame after assigning its
         // sequence; the next source_event_sequence exposes the gap.

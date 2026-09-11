@@ -1635,6 +1635,14 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertIn("BeelzebubAutomaticMarketObserver", addon)
         self.assertIn("MARKET_OBSERVER_ATTACHMENT", addon)
         self.assertIn("NATIVE_ADDON_OBSERVER_ACTIVE", addon)
+        recheck = addon[
+            addon.index("        private void OnAttachMenuItemClick"):
+            addon.index("        // A chart is optional.")
+        ]
+        self.assertLess(
+            recheck.index("DetachAutomaticObserver();"),
+            recheck.index("EnsureAutomaticObserver();"),
+        )
         self.assertIn("beelzebub-observer.local.config", addon)
         self.assertIn("L3F_NT_MARKET_INSTRUMENT", addon)
         self.assertIn("ResolveConfiguredInstrument()", observer)
