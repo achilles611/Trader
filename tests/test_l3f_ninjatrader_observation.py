@@ -105,6 +105,30 @@ class ObservationAttestationTests(unittest.TestCase):
             with self.assertRaises(NinjaTraderObservationError):
                 adapter.normalize(raw)
 
+    def test_canonical_native_snapshot_retains_original_mutation_position(self):
+        adapter = NinjaTraderMarketDataAdapter(
+            NinjaTraderContract("MNQ", "MNQ SEP26", "2026-09", "CME", Decimal("0.25"), "MNQ SEP26"),
+            attestation_key=ROOT_KEY, require_attestation=True,
+        )
+        payload = {
+            "contract_id": "MNQ SEP26",
+            "bids": [{"price": 100, "size": 3}, {"price": 99.75, "size": 2}],
+            "asks": [{"price": 100.25, "size": 4}, {"price": 100.5, "size": 1}],
+            "operation": "Update", "side": "Bid", "mutation_price": 100,
+            "mutation_volume": 3, "mutation_position": 7, "is_reset": False,
+            "snapshot_ordering": "PRICE_CANONICAL_BEST_TO_WORST_V1",
+            "source_event_sequence": 1,
+            "publication_policy": "EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1",
+        }
+        value = signed_record("DEPTH", payload=payload)
+        raw = RawProviderEvent(
+            "raw", MarketDataSource("NINJATRADER", "LUCID_CQG"),
+            "2026-09-11T12:30:00Z", value,
+        )
+        normalized = adapter.normalize(raw)
+        self.assertEqual([level.price for level in normalized[0].bids], [Decimal("100"), Decimal("99.75")])
+        self.assertEqual([level.price for level in normalized[0].asks], [Decimal("100.25"), Decimal("100.5")])
+
     def test_checked_in_native_sources_are_event_driven_and_positional(self):
         root = Path(__file__).resolve().parents[1]
         addon = (root / "ninjatrader/NinjaScript/AddOns/BeelzebubReadOnlyAddOn.cs").read_text()
@@ -113,7 +137,7 @@ class ObservationAttestationTests(unittest.TestCase):
             self.assertIn("EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1", text)
             self.assertIn("EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1", text)
             self.assertIn("MarketDepth.Bids[index]", text)
-        self.assertEqual(SOURCE_HASH, "9a4ab7bb5cf799ef98cab65e365742973c9f55c03e33f997c9c4336d663cddf3")
+        self.assertEqual(SOURCE_HASH, "41ca7792669f032193a035cbae5185f58421251be04d2745dcd803073ffb1ba5")
 
 
 if __name__ == "__main__":

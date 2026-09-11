@@ -883,6 +883,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     + e.Price.ToString(CultureInfo.InvariantCulture) + ",\"mutation_volume\":" + e.Volume
                     + ",\"mutation_position\":" + e.Position
                     + ",\"is_reset\":" + (e.IsReset ? "true" : "false")
+                    + ",\"snapshot_ordering\":\"PRICE_CANONICAL_BEST_TO_WORST_V1\""
                     + ",\"source_event_sequence\":" + sourceEventSequence
                     + ",\"publication_policy\":\"" + DepthPublicationPolicy + "\"}";
             }
@@ -919,20 +920,22 @@ namespace NinjaTrader.NinjaScript.AddOns
                 failureReason = "NATIVE_MARKET_DEPTH_UNAVAILABLE";
                 return false;
             }
-            List<string> bidRows = new List<string>();
-            List<string> askRows = new List<string>();
-            double priorBid = Double.PositiveInfinity;
-            double priorAsk = Double.NegativeInfinity;
+            SortedDictionary<double, long> nativeBids = new SortedDictionary<double, long>();
+            SortedDictionary<double, long> nativeAsks = new SortedDictionary<double, long>();
             try
             {
                 // NinjaTrader's bundled SuperDOM columns take this exact
                 // Instrument.SyncMarketDepth lock before enumerating Bids and
                 // Asks. Use the native owner lock as well as our callback lock
                 // so Count and indexed rows belong to one coherent snapshot.
+                // The public MarketDepth contract does not promise list order.
+                // Copy and aggregate the native rows here, then publish a
+                // deterministic best-to-worst price view without mutating the
+                // platform-owned collection or inventing any level.
                 lock (instrument.SyncMarketDepth)
                 {
-                    int bidCount = Math.Min(MaximumPublishedBookLevelsPerSide, instrument.MarketDepth.Bids.Count);
-                    int askCount = Math.Min(MaximumPublishedBookLevelsPerSide, instrument.MarketDepth.Asks.Count);
+                    int bidCount = instrument.MarketDepth.Bids.Count;
+                    int askCount = instrument.MarketDepth.Asks.Count;
                     for (int index = 0; index < bidCount; index++)
                     {
                         double price = instrument.MarketDepth.Bids[index].Price;
@@ -947,14 +950,17 @@ namespace NinjaTrader.NinjaScript.AddOns
                             failureReason = "NATIVE_BID_VOLUME_INVALID";
                             return false;
                         }
-                        if (price >= priorBid)
+                        long accumulated;
+                        nativeBids.TryGetValue(price, out accumulated);
+                        try
                         {
-                            failureReason = "NATIVE_BID_POSITION_ORDER_INVALID";
+                            nativeBids[price] = checked(accumulated + volume);
+                        }
+                        catch (OverflowException)
+                        {
+                            failureReason = "NATIVE_BID_VOLUME_OVERFLOW";
                             return false;
                         }
-                        if (index == 0) bestNativeBid = price;
-                        priorBid = price;
-                        bidRows.Add("{\"price\":" + price.ToString(CultureInfo.InvariantCulture) + ",\"size\":" + volume + "}");
                     }
                     for (int index = 0; index < askCount; index++)
                     {
@@ -970,14 +976,17 @@ namespace NinjaTrader.NinjaScript.AddOns
                             failureReason = "NATIVE_ASK_VOLUME_INVALID";
                             return false;
                         }
-                        if (price <= priorAsk)
+                        long accumulated;
+                        nativeAsks.TryGetValue(price, out accumulated);
+                        try
                         {
-                            failureReason = "NATIVE_ASK_POSITION_ORDER_INVALID";
+                            nativeAsks[price] = checked(accumulated + volume);
+                        }
+                        catch (OverflowException)
+                        {
+                            failureReason = "NATIVE_ASK_VOLUME_OVERFLOW";
                             return false;
                         }
-                        if (index == 0) bestNativeAsk = price;
-                        priorAsk = price;
-                        askRows.Add("{\"price\":" + price.ToString(CultureInfo.InvariantCulture) + ",\"size\":" + volume + "}");
                     }
                 }
             }
@@ -986,6 +995,19 @@ namespace NinjaTrader.NinjaScript.AddOns
                 failureReason = "NATIVE_POSITIONAL_SNAPSHOT_RACE";
                 return false;
             }
+            if (nativeBids.Count == 0 || nativeAsks.Count == 0)
+            {
+                failureReason = "NATIVE_DEPTH_SIDE_EMPTY";
+                return false;
+            }
+            List<string> bidRows = nativeBids.Reverse().Take(MaximumPublishedBookLevelsPerSide)
+                .Select(row => "{\"price\":" + row.Key.ToString(CultureInfo.InvariantCulture)
+                    + ",\"size\":" + row.Value + "}").ToList();
+            List<string> askRows = nativeAsks.Take(MaximumPublishedBookLevelsPerSide)
+                .Select(row => "{\"price\":" + row.Key.ToString(CultureInfo.InvariantCulture)
+                    + ",\"size\":" + row.Value + "}").ToList();
+            bestNativeBid = nativeBids.Last().Key;
+            bestNativeAsk = nativeAsks.First().Key;
             bidLevels = "[" + String.Join(",", bidRows) + "]";
             askLevels = "[" + String.Join(",", askRows) + "]";
             return true;
@@ -1125,7 +1147,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string AttestedSchema = "lane-iii-phase-f3-ninjatrader-observation-v2";
         private const string AttestationProtocol = "l3f3-ninjatrader-observer-attestation-v1";
         private const string AttestationKeyContext = "BEELZEBUB_NINJATRADER_OBSERVATION_V2";
-        private const string ProducerSourceFingerprint = "9a4ab7bb5cf799ef98cab65e365742973c9f55c03e33f997c9c4336d663cddf3";
+        private const string ProducerSourceFingerprint = "41ca7792669f032193a035cbae5185f58421251be04d2745dcd803073ffb1ba5";
         // Event-driven trades/depth require burst capacity, but memory remains
         // bounded. A full queue drops the signed frame after assigning its
         // sequence; the next source_event_sequence exposes the gap.

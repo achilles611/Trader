@@ -15,6 +15,7 @@ $referencePaths = @(
     'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\mscorlib.dll',
     'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\System.dll',
     'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\System.Core.dll',
+    'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\System.Web.Extensions.dll',
     'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\System.Xml.dll',
     'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\System.Xaml.dll',
     'C:\Windows\Microsoft.NET\Framework\v4.0.30319\WPF\WindowsBase.dll',

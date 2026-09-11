@@ -42,7 +42,7 @@ NINJATRADER_ATTESTATION_KEY_CONTEXT = b"BEELZEBUB_NINJATRADER_OBSERVATION_V2"
 # Regenerated from both checked-in read-only NinjaScript producer sources.  The
 # helper below excludes this embedded value, so a compiled stale producer keeps
 # reporting its old identity even after the checkout changes.
-EXPECTED_OBSERVER_SOURCE_FINGERPRINT = "9a4ab7bb5cf799ef98cab65e365742973c9f55c03e33f997c9c4336d663cddf3"
+EXPECTED_OBSERVER_SOURCE_FINGERPRINT = "41ca7792669f032193a035cbae5185f58421251be04d2745dcd803073ffb1ba5"
 NINJATRADER_SOURCE = "NINJATRADER"
 LUCID_CQG_PROVIDER = "LUCID_CQG"
 PROP_SIM_ENVIRONMENT = "PROP_SIM"
@@ -638,11 +638,17 @@ class NinjaTraderMarketDataAdapter(MarketDataProviderAdapter):
             return
         if not mutation_fields.issubset(payload):
             raise ValueError("incomplete_depth_mutation_provenance")
-        if payload["operation"] not in {"Add", "Update", "Remove"}:
+        operation = payload["operation"]
+        if operation not in {"Add", "Update", "Remove"}:
             raise ValueError("depth_mutation_operation")
         if payload["side"] not in {"Bid", "Ask"}:
             raise ValueError("depth_mutation_side")
-        price = _decimal(payload["mutation_price"], "Depth mutation price", positive=True)
+        price = _decimal(
+            payload["mutation_price"], "Depth mutation price",
+            positive=operation != "Remove",
+        )
+        if operation == "Remove" and price < 0:
+            raise ValueError("depth_mutation_remove_price")
         tick_size = _decimal(self.contract.tick_size, "Depth tick size", positive=True)
         if price % tick_size != 0:
             raise ValueError("depth_mutation_tick_alignment")
@@ -650,6 +656,18 @@ class NinjaTraderMarketDataAdapter(MarketDataProviderAdapter):
         position = _wire_integer(payload["mutation_position"], "Depth mutation position")
         if type(payload["is_reset"]) is not bool:
             raise ValueError("depth_mutation_reset")
+        snapshot_ordering = payload.get("snapshot_ordering")
+        if snapshot_ordering is not None:
+            if snapshot_ordering != "PRICE_CANONICAL_BEST_TO_WORST_V1":
+                raise ValueError("depth_snapshot_ordering")
+            # The signed native producer retains the callback's original
+            # positional mutation fields, while its bounded full-book arrays
+            # are explicitly price-normalized from one locked native snapshot.
+            # Do not reinterpret a native collection index as an index into
+            # that canonical price ordering; _levels validates the arrays.
+            if operation != "Remove" and (price <= 0 or volume <= 0):
+                raise ValueError("depth_mutation_upsert")
+            return
         rows = payload["bids" if payload["side"] == "Bid" else "asks"]
         if not isinstance(rows, list):
             raise ValueError("depth_mutation_book_side")
@@ -661,7 +679,7 @@ class NinjaTraderMarketDataAdapter(MarketDataProviderAdapter):
             for row in rows
         )
         matches = tuple(item for item in levels if item[0] == price)
-        if payload["operation"] == "Remove":
+        if operation == "Remove":
             if matches:
                 raise ValueError("removed_depth_level_still_present")
         elif volume <= 0 or matches != ((price, volume),):
