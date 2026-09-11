@@ -3060,7 +3060,7 @@ class LaneIIIPaperRuntime:
         """Return the minimal signed-runtime projection used by the controller."""
         with self._lock:
             transport = None if self._transport is None else self._transport.status()
-            lockout_reason = self.risk.lockout_reason
+            lockout_reason = self.risk.status().get("lockout_reason")
             risk_context = (
                 self._entry_session_context
                 if self._continuous_execution_profile
@@ -3105,7 +3105,7 @@ class LaneIIIPaperRuntime:
                 "account_name": self.risk.binding.account_name,
                 "account_class": self.risk.binding.account_class,
                 "instrument": self.risk.binding.instrument,
-                "maximum_quantity": self.risk.profile.maximum_quantity,
+                "maximum_quantity": self.risk.binding.maximum_quantity,
                 "available_loss_allowance_dollars": str(loss_remaining),
                 "live_authority": "DISARMED",
                 "execution_session_id": (

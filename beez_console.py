@@ -635,11 +635,25 @@ def server_environment(
     environment: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Create a clean child environment bound to this launch decision."""
-    child = dict(os.environ if environment is None else environment)
+    source = os.environ if environment is None else environment
+    child = dict(source)
+    # These two paper-only Pong switches are explicit process-launch
+    # authorities, not stale profile bindings. Preserve them across the clean
+    # launcher boundary; the backend still validates their values as exactly
+    # 0 or 1 and they never grant live-capital authority.
+    pong_flags = {
+        name: source[name]
+        for name in (
+            "BEELZEBUB_PONG_INDEPENDENT_COLLECTION",
+            "BEELZEBUB_PONG_BOUNDED_ACTIVATION",
+        )
+        if name in source
+    }
     for key in tuple(child):
         normalized = key.upper()
         if normalized.startswith("BEELZEBUB_") or normalized.startswith("COPYTRADE_"):
             child.pop(key, None)
+    child.update(pong_flags)
     child["BEELZEBUB_PROFILE_SWITCH_ROOT"] = str(binding.runtime_root)
     child["BEELZEBUB_GIT_SHA"] = binding.git_sha
     if binding.source == "EXPLICIT_MAINTENANCE":

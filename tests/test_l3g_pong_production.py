@@ -123,6 +123,38 @@ class PongProductionHostTests(unittest.TestCase):
             self.assertEqual(status["missing_events"]["QUOTE"], 0)
             self.assertEqual(status["input_error"], "PONG_NATIVE_INPUT_SOURCE_SEQUENCE_GAP")
 
+    def test_non_price_bearing_depth_shift_is_retained_without_latching_input_error(self) -> None:
+        with TemporaryDirectory(prefix="pong-production-") as root:
+            host = PongProductionHost(
+                Path(root),
+                selected_profile=PONG_ENTRY_PROFILE_VERSION,
+                expected_market_source_fingerprint=expected_observer_source_fingerprint(),
+                runtime_snapshot=runtime_snapshot,
+                collector_status=pending_collection,
+                controller_dispatch=lambda _kind, _reason: True,
+                native_dispatch=lambda directive, _evidence: {
+                    "accepted": True, "command_id": None,
+                    "directive_id": directive.directive_id,
+                },
+            )
+            host.on_observation(warm_record())
+            depth = {
+                "contract_id": "MNQ SEP26",
+                "side": "Ask",
+                "mutation_price": 0,
+                "mutation_volume": 0,
+                "is_reset": False,
+                "bids": [{"price": 99.75, "size": 1}],
+                "asks": [{"price": 100, "size": 1}],
+                "source_event_sequence": 700,
+                "publication_policy": "EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1",
+            }
+            host.on_observation(verified("DEPTH", depth, local_sequence=2))
+            status = host.status()
+            self.assertEqual(status["stream_counts"]["DEPTH"], 1)
+            self.assertEqual(status["missing_events"]["DEPTH"], 0)
+            self.assertIsNone(status["input_error"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 import json
 import os
 from pathlib import Path
@@ -372,8 +372,17 @@ class PongProductionHost:
         levels = payload.get("bids" if side is BookSide.BID else "asks")
         if not isinstance(levels, list) or not levels:
             return
+        # Native position-shift notifications can carry mutation_price=0
+        # while the signed post-mutation book snapshot is valid. They retain
+        # their stream sequence and durable collection evidence, but are not a
+        # price-bearing microstructure observation.
+        try:
+            price = Decimal(str(payload["mutation_price"]))
+        except (InvalidOperation, KeyError, TypeError, ValueError):
+            return
+        if not price.is_finite() or price <= 0:
+            return
         touch = Decimal(str(levels[0]["price"]))
-        price = Decimal(str(payload["mutation_price"]))
         if (side is BookSide.BID and price > touch) or (side is BookSide.ASK and price < touch):
             return
         kind = DepthEventKind.UPDATE

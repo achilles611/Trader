@@ -24,6 +24,7 @@ class PongCommissioningGuardTests(unittest.TestCase):
             try:
                 runtime = LaneIIIPaperRuntime(ledger)
                 runtime._state = PaperRuntimeState.READY_DISARMED
+                self.assertEqual(runtime.pong_controller_snapshot()["maximum_quantity"], 1)
                 self.assertFalse(runtime.operational_paper_start('pong-test-start')['started'])
                 self.assertFalse(runtime._arm_with_capacity_fence_locked()['armed'])
                 self.assertFalse(runtime._arm_with_capacity_fence_locked(

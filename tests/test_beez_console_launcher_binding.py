@@ -224,13 +224,19 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
             remembered.assert_not_called()
             child = beez_console.server_environment(
                 resolved,
-                {"BEELZEBUB_L3G_PAPER_PROFILE": "BEELZEBUB_SCALPER_V2"},
+                {
+                    "BEELZEBUB_L3G_PAPER_PROFILE": "BEELZEBUB_SCALPER_V2",
+                    "BEELZEBUB_PONG_INDEPENDENT_COLLECTION": "1",
+                    "BEELZEBUB_PONG_BOUNDED_ACTIVATION": "1",
+                },
             )
             self.assertEqual(resolved.source, "EXPLICIT_MAINTENANCE")
             self.assertEqual(child["BEELZEBUB_L3G_PAPER_LEDGER"], str(ledger.resolve()))
             self.assertEqual(child["BEELZEBUB_LEDGER_AUDIT_ROOT"], str(audit.resolve()))
             self.assertEqual(child["BEELZEBUB_L3G_PAPER_PROFILE"], "BEELZEBUB_FIVE_MINUTE_BIAS_V1")
             self.assertEqual(child["BEELZEBUB_L3G_PAPER_LEDGER_EPOCH"], "L3G-PAPER-EPOCH-EXPLICIT-TEST")
+            self.assertEqual(child["BEELZEBUB_PONG_INDEPENDENT_COLLECTION"], "1")
+            self.assertEqual(child["BEELZEBUB_PONG_BOUNDED_ACTIVATION"], "1")
 
     def test_partial_explicit_maintenance_binding_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
