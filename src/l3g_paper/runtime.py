@@ -3695,6 +3695,66 @@ class LaneIIIPaperRuntime:
             )
         return True, ()
 
+    def recover_healthy_ledger_capacity(
+        self,
+        request_id: str,
+        ledger_preflight: Callable[
+            [str, Mapping[str, object]], Mapping[str, object]
+        ] | None = None,
+    ) -> dict[str, object]:
+        """Recover only a retired capacity lock; never start or arm a profile.
+
+        This is deliberately separate from ``operational_paper_start`` so an
+        operator can repair a shared historical ledger without turning the
+        currently loaded strategy into execution authority.  The recovery
+        row itself advances the ledger tip, so a later start still requires a
+        new Full verification which covers this transition.
+        """
+        if (
+            not isinstance(request_id, str) or not 8 <= len(request_id) <= 128
+            or any(
+                not (character.isalnum() or character in "-_.:")
+                for character in request_id
+            )
+        ):
+            raise ValueError(
+                "Ledger capacity recovery requires an 8-128 character "
+                "idempotency request ID."
+            )
+        readiness = self.operational_paper_readiness(ledger_preflight)
+        recovered = False
+        blockers: tuple[str, ...] = ()
+        with self._lock:
+            reason = self.risk.status().get("lockout_reason")
+            if not (
+                isinstance(reason, str)
+                and reason.startswith("LEDGER_CAPACITY_INADEQUATE:")
+            ):
+                blockers = ("LEDGER_CAPACITY_LOCKOUT_NOT_ACTIVE",)
+            else:
+                try:
+                    with self.ledger.authority_capacity_fence():
+                        recovered, blockers = (
+                            self._recover_healthy_ledger_capacity_locked(
+                                request_id, readiness,
+                            )
+                        )
+                except LedgerCapacityError:
+                    blockers = ("LEDGER_CAPACITY_STILL_INADEQUATE",)
+            status = self.risk.status()
+            return {
+                "schema": "lane-iii-ledger-capacity-recovery-result-v1",
+                "request_id": request_id,
+                "recovered": recovered,
+                "reason_codes": blockers,
+                "state": self._state.value,
+                "locked_out": status.get("locked_out"),
+                "lockout_reason": status.get("lockout_reason"),
+                "operational_paper_started": False,
+                "armed": False,
+                "new_full_verification_required": recovered,
+            }
+
     @property
     def state(self) -> PaperRuntimeState:
         with self._lock:

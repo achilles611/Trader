@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -2542,6 +2543,46 @@ class PerpetualRuntimeTests(unittest.TestCase):
                 )
             finally:
                 reopened.close()
+
+    def test_capacity_recovery_entrypoint_cannot_start_perpetual(self) -> None:
+        with TemporaryDirectory() as directory, patch(
+            "src.l3g_paper.runtime._now", return_value=NOW,
+        ):
+            ledger, runtime, _capture = self._runtime(directory)
+            try:
+                runtime._pause_for_ledger_capacity_locked({"state": "DEGRADED"})
+                runtime.on_execution_message(
+                    self._flat_reconciliation("capacity-api-flat", NOW),
+                )
+                with (
+                    patch.object(
+                        runtime,
+                        "operational_paper_readiness",
+                        return_value={"ledger": {"verified": True}},
+                    ),
+                    patch.object(
+                        runtime,
+                        "_recover_healthy_ledger_capacity_locked",
+                        return_value=(True, ()),
+                    ) as recovery,
+                    patch.object(
+                        runtime.ledger,
+                        "authority_capacity_fence",
+                        return_value=nullcontext(),
+                    ),
+                ):
+                    result = runtime.recover_healthy_ledger_capacity(
+                        "capacity-api-does-not-start",
+                        lambda _request, _snapshot: {},
+                    )
+                self.assertTrue(result["recovered"])
+                self.assertFalse(result["operational_paper_started"])
+                self.assertFalse(result["armed"])
+                self.assertTrue(result["new_full_verification_required"])
+                self.assertIsNone(runtime._operational_session)
+                recovery.assert_called_once()
+            finally:
+                ledger.close()
 
     def test_legacy_protective_fill_settles_without_perpetual_reentry(self) -> None:
         at = "2026-09-01T14:00:00Z"

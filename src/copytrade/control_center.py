@@ -106,6 +106,12 @@ MARKET_OBSERVER_ACTIVE_FRESHNESS_SECONDS = 15.0
 LEDGER_VERIFIER_SHUTDOWN_WAIT_SECONDS = 30.0
 GRACEFUL_SHUTDOWN_ACTION_HEADER = "X-Beelzebub-Graceful-Shutdown-Action"
 GRACEFUL_SHUTDOWN_ACTION_VALUE = "beezconsole-graceful-shutdown-v1"
+LEDGER_CAPACITY_RECOVERY_ACTION_HEADER = (
+    "X-Beelzebub-Ledger-Capacity-Recovery-Action"
+)
+LEDGER_CAPACITY_RECOVERY_ACTION_VALUE = (
+    "lane-iii-ledger-capacity-recovery-v1"
+)
 _LOCAL_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 
 
@@ -3302,6 +3308,52 @@ def create_control_center_app(
         try:
             return paper.operational_paper_start(
                 str(body["request_id"]), require_operational_paper_ledger_verification,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/lane-iii/paper/ledger-capacity-recovery")
+    async def api_lane_iii_paper_ledger_capacity_recovery(
+        request: Request,
+        body: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, object]:
+        """Clear only a proven-retired capacity lock without starting paper."""
+        paper = ninjatrader_runtime.get("paper")
+        if paper is None:
+            raise HTTPException(
+                status_code=503, detail="Lane III paper runtime is unavailable."
+            )
+        hostname = (request.url.hostname or "").lower()
+        if hostname not in {"127.0.0.1", "localhost", "::1", "testserver"}:
+            raise HTTPException(
+                status_code=403, detail="Ledger capacity recovery is loopback-only."
+            )
+        if (
+            request.headers.get(LEDGER_CAPACITY_RECOVERY_ACTION_HEADER)
+            != LEDGER_CAPACITY_RECOVERY_ACTION_VALUE
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Ledger capacity recovery action authentication failed.",
+            )
+        if (
+            not isinstance(body, dict)
+            or set(body) != {"request_id"}
+            or not isinstance(body.get("request_id"), str)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Ledger capacity recovery accepts only a request_id.",
+            )
+        try:
+            return paper.recover_healthy_ledger_capacity(
+                str(body["request_id"]),
+                lambda operation_id, runtime_snapshot:
+                    require_operational_paper_ledger_verification(
+                        operation_id,
+                        runtime_snapshot,
+                        enforce_observer=False,
+                    ),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

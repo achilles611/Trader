@@ -234,6 +234,7 @@ class PaperControlCenterTests(unittest.TestCase):
             "/api/lane-iii/paper/commissioning-arm", "/api/lane-iii/paper/commission-entry", "/api/lane-iii/paper/commission-exit",
             "/api/lane-iii/paper/commissioning-rehearsal", "/api/lane-iii/paper/commissioning-start",
             "/api/lane-iii/paper/operational-start",
+            "/api/lane-iii/paper/ledger-capacity-recovery",
             "/api/lane-iii/paper/bounded-trial",
         }
         self.assertTrue(expected.issubset(routes))
@@ -247,11 +248,17 @@ class PaperControlCenterTests(unittest.TestCase):
             if getattr(route, "path", None) == "/api/lane-iii/paper/bounded-trial"
         ))
         self.assertEqual(bounded_methods, {"GET", "POST"})
-        for path in expected - {"/api/lane-iii/paper/commission-entry", "/api/lane-iii/paper/commissioning-start", "/api/lane-iii/paper/operational-start", "/api/lane-iii/paper/bounded-trial"}:
+        for path in expected - {"/api/lane-iii/paper/commission-entry", "/api/lane-iii/paper/commissioning-start", "/api/lane-iii/paper/operational-start", "/api/lane-iii/paper/ledger-capacity-recovery", "/api/lane-iii/paper/bounded-trial"}:
             self.assertEqual(inspect.signature(routes[path].endpoint).parameters, {})
         self.assertEqual(tuple(inspect.signature(routes["/api/lane-iii/paper/commission-entry"].endpoint).parameters), ("body",))
         self.assertEqual(tuple(inspect.signature(routes["/api/lane-iii/paper/commissioning-start"].endpoint).parameters), ("body",))
         self.assertEqual(tuple(inspect.signature(routes["/api/lane-iii/paper/operational-start"].endpoint).parameters), ("body",))
+        self.assertEqual(
+            tuple(inspect.signature(
+                routes["/api/lane-iii/paper/ledger-capacity-recovery"].endpoint,
+            ).parameters),
+            ("request", "body"),
+        )
         arm_source = inspect.getsource(routes["/api/lane-iii/paper/commissioning-arm"].endpoint)
         entry_source = inspect.getsource(routes["/api/lane-iii/paper/commission-entry"].endpoint)
         start_source = inspect.getsource(routes["/api/lane-iii/paper/commissioning-start"].endpoint)
