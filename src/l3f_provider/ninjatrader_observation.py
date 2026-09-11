@@ -8,11 +8,15 @@ boundary, not a NinjaTrader automation API.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
+import hashlib
+import hmac
 import json
+from pathlib import Path
+import re
 import socket
 from types import MappingProxyType
 from typing import Iterable, Mapping
@@ -32,15 +36,27 @@ from .tradovate_observation import (
 
 
 L3F2_SCHEMA = "lane-iii-phase-f2-ninjatrader-observation-v1"
+L3F3_SCHEMA = "lane-iii-phase-f3-ninjatrader-observation-v2"
+NINJATRADER_ATTESTATION_PROTOCOL = "l3f3-ninjatrader-observer-attestation-v1"
+NINJATRADER_ATTESTATION_KEY_CONTEXT = b"BEELZEBUB_NINJATRADER_OBSERVATION_V2"
+# Regenerated from both checked-in read-only NinjaScript producer sources.  The
+# helper below excludes this embedded value, so a compiled stale producer keeps
+# reporting its old identity even after the checkout changes.
+EXPECTED_OBSERVER_SOURCE_FINGERPRINT = "ce1649e49f5fe83c4d93c22e963233d1d79e05a148adac24504bc473175ef464"
 NINJATRADER_SOURCE = "NINJATRADER"
 LUCID_CQG_PROVIDER = "LUCID_CQG"
 PROP_SIM_ENVIRONMENT = "PROP_SIM"
 LOOPBACK_HOST = "127.0.0.1"
-_TYPES = {"CONNECTION", "INSTRUMENT", "TRADE", "QUOTE", "DEPTH", "ACCOUNT", "POSITION", "ORDER", "EXECUTION", "HEALTH", "SNAPSHOT_COMPLETE"}
-_WIRE_FIELDS = frozenset({
+_TYPES = {"CONNECTION", "INSTRUMENT", "TRADE", "QUOTE", "DEPTH", "ACCOUNT", "POSITION", "ORDER", "EXECUTION", "HEALTH", "SNAPSHOT_COMPLETE", "HISTORICAL_WARM_START", "HOURLY_BAR"}
+_LEGACY_WIRE_FIELDS = frozenset({
     "schema", "observation_id", "session_id", "observation_type",
     "ninja_receipt_time", "local_monotonic_sequence", "provider_timestamp",
     "provider_sequence", "exchange_timestamp", "account", "payload",
+})
+_ATTESTED_WIRE_FIELDS = _LEGACY_WIRE_FIELDS | frozenset({"payload_hash", "producer", "signature"})
+_PRODUCER_FIELDS = frozenset({
+    "protocol_version", "source_fingerprint", "build_fingerprint",
+    "build_timestamp", "source_stream", "publication_policy",
 })
 _ACCOUNT_ALIASES = frozenset({"Lucid25kflex01", "Sim101"})
 _ACCOUNT_SCOPED_TYPES = frozenset({"ACCOUNT", "POSITION", "ORDER", "EXECUTION", "SNAPSHOT_COMPLETE"})
@@ -158,6 +174,78 @@ def _contains_prohibited_identity(value: object) -> bool:
     return False
 
 
+def _canonical_bytes(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+def derive_observation_signing_key(root_key: bytes) -> bytes:
+    """Domain-separate observation signatures from paper command signatures."""
+    if not isinstance(root_key, bytes) or len(root_key) < 32:
+        raise ValueError("The local Beelzebub root HMAC key must contain at least 32 bytes.")
+    return hmac.new(root_key, NINJATRADER_ATTESTATION_KEY_CONTEXT, hashlib.sha256).digest()
+
+
+def expected_observer_source_fingerprint() -> str:
+    root = Path(__file__).resolve().parents[2]
+    paths = (
+        root / "ninjatrader" / "NinjaScript" / "AddOns" / "BeelzebubReadOnlyAddOn.cs",
+        root / "ninjatrader" / "NinjaScript" / "Indicators" / "BeelzebubReadOnlyMarketObserver.cs",
+    )
+    try:
+        texts = [path.read_text(encoding="utf-8").replace("\r\n", "\n") for path in paths]
+    except OSError:
+        return EXPECTED_OBSERVER_SOURCE_FINGERPRINT
+    texts[0] = re.sub(
+        r'(private const string ProducerSourceFingerprint = ")[0-9a-f]{64}(";)',
+        r"\1<SOURCE_FINGERPRINT>\2", texts[0],
+    )
+    material = "".join(
+        f"{path.as_posix().split('/ninjatrader/', 1)[-1]}\n{text}"
+        for path, text in zip(paths, texts, strict=True)
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class NinjaTraderProducerAttestation:
+    protocol_version: str
+    source_fingerprint: str
+    build_fingerprint: str
+    build_timestamp: str
+    source_stream: str
+    publication_policy: str
+
+    def __post_init__(self) -> None:
+        if self.protocol_version != NINJATRADER_ATTESTATION_PROTOCOL:
+            raise ValueError("NinjaTrader producer protocol is unsupported.")
+        for value, name in (
+            (self.source_fingerprint, "Producer source fingerprint"),
+            (self.build_fingerprint, "Producer build fingerprint"),
+        ):
+            if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ValueError(f"{name} must be a lowercase SHA-256 digest.")
+        normalized_utc(self.build_timestamp, "Producer build timestamp")
+        _text(self.source_stream, "Producer source stream")
+        _text(self.publication_policy, "Producer publication policy")
+
+    @classmethod
+    def from_wire(cls, value: object) -> "NinjaTraderProducerAttestation":
+        producer = _mapping(value, "producer_attestation")
+        if set(producer) != _PRODUCER_FIELDS:
+            raise ValueError("NinjaTrader producer attestation shape is invalid.")
+        return cls(**{name: str(producer[name]) for name in _PRODUCER_FIELDS})
+
+    def payload(self) -> dict[str, str]:
+        return {
+            "protocol_version": self.protocol_version,
+            "source_fingerprint": self.source_fingerprint,
+            "build_fingerprint": self.build_fingerprint,
+            "build_timestamp": self.build_timestamp,
+            "source_stream": self.source_stream,
+            "publication_policy": self.publication_policy,
+        }
+
+
 @dataclass(frozen=True)
 class NinjaTraderContract:
     master_instrument: str
@@ -198,6 +286,11 @@ class NinjaTraderObservation:
     provider_timestamp: str | None = None
     provider_sequence: int | None = None
     exchange_timestamp: str | None = None
+    schema: str = L3F2_SCHEMA
+    payload_hash: str | None = None
+    producer: NinjaTraderProducerAttestation | None = None
+    signature: str | None = None
+    signature_verified: bool | None = None
     source: str = NINJATRADER_SOURCE
     provider: str = LUCID_CQG_PROVIDER
     environment: str = PROP_SIM_ENVIRONMENT
@@ -230,6 +323,21 @@ class NinjaTraderObservation:
             normalized_utc(self.exchange_timestamp, "Exchange timestamp")
         if self.provider_sequence is not None and (type(self.provider_sequence) is not int or self.provider_sequence < 0):
             raise ValueError("Provider sequence must be non-negative when exposed.")
+        if self.schema not in {L3F2_SCHEMA, L3F3_SCHEMA}:
+            raise NinjaTraderObservationError(ProviderErrorCode.MALFORMED_PROVIDER_PAYLOAD, "bridge_schema")
+        attestation_values = (self.payload_hash, self.producer, self.signature)
+        if self.schema == L3F2_SCHEMA:
+            if any(value is not None for value in attestation_values) or self.signature_verified is not None:
+                raise ValueError("Legacy observations cannot claim producer attestation.")
+        else:
+            if not isinstance(self.producer, NinjaTraderProducerAttestation):
+                raise ValueError("Attested observations require producer identity.")
+            if not isinstance(self.payload_hash, str) or re.fullmatch(r"[0-9a-f]{64}", self.payload_hash) is None:
+                raise ValueError("Attested observations require a payload SHA-256 digest.")
+            if not isinstance(self.signature, str) or re.fullmatch(r"[0-9a-f]{64}", self.signature) is None:
+                raise ValueError("Attested observations require an HMAC-SHA256 signature.")
+            if self.signature_verified not in {None, True}:
+                raise ValueError("Signature verification state must be unknown or verified.")
 
     @classmethod
     def from_wire(cls, text: str) -> "NinjaTraderObservation":
@@ -238,9 +346,11 @@ class NinjaTraderObservation:
         except (json.JSONDecodeError, ValueError):
             raise NinjaTraderObservationError(ProviderErrorCode.MALFORMED_PROVIDER_PAYLOAD, "bridge_json") from None
         value = _mapping(raw, "bridge_record")
-        if value.get("schema") != L3F2_SCHEMA:
+        schema = value.get("schema")
+        if schema not in {L3F2_SCHEMA, L3F3_SCHEMA}:
             raise NinjaTraderObservationError(ProviderErrorCode.MALFORMED_PROVIDER_PAYLOAD, "bridge_schema")
-        if set(value) != _WIRE_FIELDS:
+        expected_fields = _LEGACY_WIRE_FIELDS if schema == L3F2_SCHEMA else _ATTESTED_WIRE_FIELDS
+        if set(value) != expected_fields:
             raise NinjaTraderObservationError(ProviderErrorCode.MALFORMED_PROVIDER_PAYLOAD, "bridge_record_shape")
         if _contains_prohibited_identity(value):
             raise NinjaTraderObservationError(ProviderErrorCode.MALFORMED_PROVIDER_PAYLOAD, "secret_or_provider_account_identifier")
@@ -256,12 +366,60 @@ class NinjaTraderObservation:
                 provider_timestamp=None if value.get("provider_timestamp") is None else str(value["provider_timestamp"]),
                 provider_sequence=None if value.get("provider_sequence") is None else _wire_integer(value["provider_sequence"], "Provider sequence"),
                 exchange_timestamp=None if value.get("exchange_timestamp") is None else str(value["exchange_timestamp"]),
+                schema=str(schema),
+                payload_hash=None if schema == L3F2_SCHEMA else str(value["payload_hash"]),
+                producer=None if schema == L3F2_SCHEMA else NinjaTraderProducerAttestation.from_wire(value["producer"]),
+                signature=None if schema == L3F2_SCHEMA else str(value["signature"]),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise NinjaTraderObservationError(ProviderErrorCode.MALFORMED_PROVIDER_PAYLOAD, "bridge_record_fields") from exc
 
     def wire_hash(self) -> str:
-        return canonical_hash({"schema": L3F2_SCHEMA, "observation_id": self.observation_id, "session_id": self.session_id, "observation_type": self.observation_type, "ninja_receipt_time": self.ninja_receipt_time, "local_monotonic_sequence": self.local_monotonic_sequence, "payload": dict(self.payload), "account_alias": self.account_alias, "account_class": None if self.account_class is None else self.account_class.value, "provider_timestamp": self.provider_timestamp, "provider_sequence": self.provider_sequence, "exchange_timestamp": self.exchange_timestamp})
+        return canonical_hash({
+            **self.unsigned_wire_payload(),
+            "signature": self.signature,
+        })
+
+    def unsigned_wire_payload(self) -> dict[str, object]:
+        value: dict[str, object] = {
+            "schema": self.schema,
+            "observation_id": self.observation_id,
+            "session_id": self.session_id,
+            "observation_type": self.observation_type,
+            "ninja_receipt_time": self.ninja_receipt_time,
+            "local_monotonic_sequence": self.local_monotonic_sequence,
+            "provider_timestamp": self.provider_timestamp,
+            "provider_sequence": self.provider_sequence,
+            "exchange_timestamp": self.exchange_timestamp,
+            "account": None if self.account_alias is None else {
+                "alias": self.account_alias,
+                "class": self.account_class.value,
+            },
+            "payload": dict(self.payload),
+        }
+        if self.schema == L3F3_SCHEMA:
+            value["payload_hash"] = self.payload_hash
+            value["producer"] = self.producer.payload()
+        return value
+
+    def verify_attestation(
+        self, root_key: bytes, *, expected_source_fingerprint: str | None = None,
+    ) -> "NinjaTraderObservation":
+        if self.schema != L3F3_SCHEMA or self.producer is None or self.signature is None:
+            raise NinjaTraderObservationError(ProviderErrorCode.AUTH_FAILED, "ninjatrader_attestation_required")
+        expected_source = expected_source_fingerprint or expected_observer_source_fingerprint()
+        if self.producer.source_fingerprint != expected_source:
+            raise NinjaTraderObservationError(ProviderErrorCode.AUTH_FAILED, "ninjatrader_source_fingerprint")
+        if self.payload_hash != canonical_hash(dict(self.payload)):
+            raise NinjaTraderObservationError(ProviderErrorCode.AUTH_FAILED, "ninjatrader_payload_hash")
+        payload_policy = self.payload.get("publication_policy")
+        if payload_policy is not None and payload_policy != self.producer.publication_policy:
+            raise NinjaTraderObservationError(ProviderErrorCode.AUTH_FAILED, "ninjatrader_publication_policy")
+        key = derive_observation_signing_key(root_key)
+        expected = hmac.new(key, _canonical_bytes(self.unsigned_wire_payload()), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(self.signature, expected):
+            raise NinjaTraderObservationError(ProviderErrorCode.AUTH_FAILED, "ninjatrader_attestation_signature")
+        return replace(self, signature_verified=True)
 
 
 @dataclass(frozen=True)
@@ -331,8 +489,17 @@ class NinjaTraderSessionLedger:
 
 
 class NinjaTraderMarketDataAdapter(MarketDataProviderAdapter):
-    def __init__(self, contract: NinjaTraderContract) -> None:
+    def __init__(
+        self, contract: NinjaTraderContract, *, attestation_key: bytes | None = None,
+        require_attestation: bool = False,
+        expected_source_fingerprint: str | None = None,
+    ) -> None:
         self.contract = contract
+        if require_attestation and attestation_key is None:
+            raise ValueError("Required NinjaTrader attestation needs a local verification key.")
+        self._attestation_key = attestation_key
+        self._require_attestation = require_attestation
+        self._expected_source_fingerprint = expected_source_fingerprint
         self._source = MarketDataSource(NINJATRADER_SOURCE, LUCID_CQG_PROVIDER)
         # A quote-derived aggressor may reference only the immediately
         # preceding quote emitted from the same NinjaTrader Last callback.
@@ -347,6 +514,13 @@ class NinjaTraderMarketDataAdapter(MarketDataProviderAdapter):
     def normalize(self, raw_event: RawProviderEvent) -> tuple[QuoteEvent | TradeEvent | BookSnapshotEvent, ...]:
         packet = _mapping(raw_event.payload, "ninjatrader_packet")
         record = NinjaTraderObservation.from_wire(json.dumps(dict(packet), sort_keys=True, separators=(",", ":")))
+        if self._attestation_key is not None:
+            record = record.verify_attestation(
+                self._attestation_key,
+                expected_source_fingerprint=self._expected_source_fingerprint,
+            )
+        elif self._require_attestation:
+            raise NinjaTraderObservationError(ProviderErrorCode.AUTH_FAILED, "ninjatrader_attestation_required")
         if record.observation_type == "QUOTE":
             return (self._quote(raw_event, record),)
         if record.observation_type == "TRADE":
@@ -440,7 +614,8 @@ class NinjaTraderMarketDataAdapter(MarketDataProviderAdapter):
         if payload["side"] not in {"Bid", "Ask"}:
             raise ValueError("depth_mutation_side")
         price = _decimal(payload["mutation_price"], "Depth mutation price", positive=True)
-        if price % self.contract.tick_size != 0:
+        tick_size = _decimal(self.contract.tick_size, "Depth tick size", positive=True)
+        if price % tick_size != 0:
             raise ValueError("depth_mutation_tick_alignment")
         volume = _quantity(payload["mutation_volume"], "Depth mutation volume", zero=True)
         position = _wire_integer(payload["mutation_position"], "Depth mutation position")
@@ -470,7 +645,10 @@ class NinjaTraderMarketDataAdapter(MarketDataProviderAdapter):
         if not isinstance(value, list):
             raise ValueError("depth_levels")
         levels = tuple(BookLevel(_decimal(_mapping(row, "depth_level")["price"], "Depth price", positive=True), _quantity(_mapping(row, "depth_level")["size"], "Depth size")) for row in value)
-        return tuple(sorted(levels, key=lambda level: level.price, reverse=reverse))
+        prices = tuple(level.price for level in levels)
+        if prices != tuple(sorted(prices, reverse=reverse)):
+            raise ValueError("depth_position_order")
+        return levels
 
 
 class NinjaTraderAccountIsolation:
@@ -501,8 +679,17 @@ class NinjaTraderAccountIsolation:
 
 class LoopbackNinjaTraderBridge:
     """A localhost-only observation receiver. It deliberately has no send API."""
-    def __init__(self, config: LoopbackBridgeConfig = LoopbackBridgeConfig()) -> None:
+    def __init__(
+        self, config: LoopbackBridgeConfig = LoopbackBridgeConfig(), *,
+        attestation_key: bytes | None = None, require_attestation: bool = False,
+        expected_source_fingerprint: str | None = None,
+    ) -> None:
+        if require_attestation and attestation_key is None:
+            raise ValueError("Required NinjaTrader attestation needs a local verification key.")
         self.config = config
+        self.attestation_key = attestation_key
+        self.require_attestation = require_attestation
+        self.expected_source_fingerprint = expected_source_fingerprint
         self.ledger = NinjaTraderSessionLedger()
 
     def open_listener(self) -> socket.socket:
@@ -534,4 +721,11 @@ class LoopbackNinjaTraderBridge:
 
     def accept_observation(self, frame: bytes) -> NinjaTraderObservation | None:
         observation = self.decode_frame(frame)
+        if self.attestation_key is not None:
+            observation = observation.verify_attestation(
+                self.attestation_key,
+                expected_source_fingerprint=self.expected_source_fingerprint,
+            )
+        elif self.require_attestation:
+            raise NinjaTraderObservationError(ProviderErrorCode.AUTH_FAILED, "ninjatrader_attestation_required")
         return observation if self.ledger.admit(observation) else None

@@ -2,14 +2,18 @@
 // Install/compile only through NinjaTrader's NinjaScript editor. This source
 // intentionally contains no order, ATM, or inbound bridge command surface.
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
+using System.Web.Script.Serialization;
 using System.Windows;
 using NinjaTrader.Cbi;
 using NinjaTrader.Data;
@@ -462,11 +466,12 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const int MaximumPublishedBookLevelsPerSide = 10;
         private static readonly long MinimumPublicationTicks = Math.Max(1L, System.Diagnostics.Stopwatch.Frequency / 2L);
         private static readonly long MinimumAttachmentPublicationTicks = Math.Max(1L, System.Diagnostics.Stopwatch.Frequency * 5L);
-        private const string PublicationPolicy = "BOUNDED_LATEST_STATE_2HZ";
+        private const string QuotePublicationPolicy = "BOUNDED_LATEST_STATE_2HZ";
+        private const string PairedQuotePublicationPolicy = "EVENT_DRIVEN_SAME_CALLBACK_QUOTE_V1";
+        private const string TradePublicationPolicy = "EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1";
+        private const string DepthPublicationPolicy = "EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1";
         private readonly Instrument instrument;
         private readonly object bookLock = new object();
-        private readonly SortedDictionary<double, long> bids = new SortedDictionary<double, long>(Comparer<double>.Create((x, y) => y.CompareTo(x)));
-        private readonly SortedDictionary<double, long> asks = new SortedDictionary<double, long>();
         private bool subscribed;
         private bool stopping;
         private bool chartFound;
@@ -480,9 +485,13 @@ namespace NinjaTrader.NinjaScript.AddOns
         private DateTime bestBidTime = DateTime.MinValue;
         private DateTime bestAskTime = DateTime.MinValue;
         private long lastQuotePublicationTicks;
-        private long lastTradePublicationTicks;
-        private long lastDepthPublicationTicks;
         private long lastAttachmentPublicationTicks;
+        private long quoteEventSequence;
+        private long tradeEventSequence;
+        private long depthEventSequence;
+        private BarsRequest hourlyBarsRequest;
+        private readonly object hourlyLock = new object();
+        private readonly HashSet<string> publishedHourlyEnds = new HashSet<string>(StringComparer.Ordinal);
 
         public BeelzebubAutomaticMarketObserver(Instrument instrument)
         {
@@ -503,6 +512,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     {
                         instrument.MarketData.Update += OnMarketData;
                         instrument.MarketDepth.Update += OnMarketDepth;
+                        StartHourlyBarsRequest();
                         subscribed = true;
                         BeelzebubReadOnlyAddOn.SetAutomaticObserverActive(true);
                         BeelzebubReadOnlyOutbound.Diagnostic("NATIVE_ADDON_OBSERVER_ACTIVE");
@@ -541,6 +551,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                         return;
                     instrument.MarketData.Update -= OnMarketData;
                     instrument.MarketDepth.Update -= OnMarketDepth;
+                    if (hourlyBarsRequest != null)
+                    {
+                        hourlyBarsRequest.Update -= OnHourlyBarsUpdate;
+                        hourlyBarsRequest.Dispose();
+                        hourlyBarsRequest = null;
+                    }
                     subscribed = false;
                     BeelzebubReadOnlyAddOn.PublishObserverAttachment(
                         "OBSERVER_TERMINATED", BeelzebubReadOnlyAddOn.ResolveConfiguredInstrument(),
@@ -575,6 +591,139 @@ namespace NinjaTrader.NinjaScript.AddOns
                 configured, instrument.FullName, found, matches, "NATIVE_ADDON");
         }
 
+        private const string HourlyWarmStartPolicyVersion = "pong-hourly-warm-start-v1";
+        private const string HourlyWarmStartPolicyHash = "5a1c78a287d50b69e5dd6e8d9bc584ef5a264efd98845997fd08b7c85668e5c2";
+
+        private void StartHourlyBarsRequest()
+        {
+            try
+            {
+                DateTime requestedAt = DateTime.UtcNow;
+                BarsRequest request = new BarsRequest(instrument, 6);
+                request.BarsPeriod = new BarsPeriod { BarsPeriodType = BarsPeriodType.Minute, Value = 60 };
+                request.TradingHours = TradingHours.Get("Default 24 x 7");
+                request.LookupPolicy = LookupPolicies.Provider;
+                request.MergePolicy = MergePolicy.DoNotMerge;
+                request.Update += OnHourlyBarsUpdate;
+                hourlyBarsRequest = request;
+                request.Request(new Action<BarsRequest, ErrorCode, string>((result, errorCode, errorMessage) =>
+                {
+                    if (errorCode != ErrorCode.NoError)
+                    {
+                        BeelzebubReadOnlyOutbound.Diagnostic("HOURLY_WARM_START_REQUEST_FAILED_" + errorCode);
+                        PublishHourlyWarmStartUnavailable(requestedAt, "BARS_REQUEST_FAILED");
+                        return;
+                    }
+                    PublishHourlyWarmStart(result.Bars, requestedAt);
+                }));
+            }
+            catch (Exception error)
+            {
+                BeelzebubReadOnlyOutbound.Diagnostic("HOURLY_WARM_START_REQUEST_FAILED_" + error.GetType().Name);
+                PublishHourlyWarmStartUnavailable(DateTime.UtcNow, "BARS_REQUEST_UNAVAILABLE");
+            }
+        }
+
+        private void PublishHourlyWarmStart(Bars bars, DateTime requestedAt)
+        {
+            DateTime boundary = new DateTime(requestedAt.Year, requestedAt.Month, requestedAt.Day, requestedAt.Hour, 0, 0, DateTimeKind.Utc);
+            Dictionary<DateTime, string> matching = new Dictionary<DateTime, string>();
+            for (int index = 0; index < bars.Count; index++)
+            {
+                DateTime end;
+                if (!TryBarEndUtc(bars.GetTime(index), out end))
+                    continue;
+                if (end != boundary - TimeSpan.FromHours(1) && end != boundary)
+                    continue;
+                DateTime start = end - TimeSpan.FromHours(1);
+                matching[end] = HourBarJson(
+                    start, end, bars.GetOpen(index), bars.GetHigh(index), bars.GetLow(index),
+                    bars.GetClose(index), bars.GetVolume(index));
+            }
+            List<string> rows = new List<string>();
+            List<string> gaps = new List<string>();
+            foreach (DateTime expectedEnd in new[] { boundary - TimeSpan.FromHours(1), boundary })
+            {
+                string row;
+                if (matching.TryGetValue(expectedEnd, out row)) rows.Add(row);
+                else gaps.Add("\"" + expectedEnd.ToString("o", CultureInfo.InvariantCulture) + "\"");
+            }
+            string status = rows.Count == 2 && gaps.Count == 0 ? "COMPLETE" : "UNAVAILABLE";
+            string payload = "{\"contract_id\":\"" + instrument.FullName + "\",\"status\":\"" + status
+                + "\",\"source\":\"NINJATRADER_BARS_REQUEST_PROVIDER\",\"requested_at\":\""
+                + requestedAt.ToString("o", CultureInfo.InvariantCulture) + "\",\"earliest_required\":\""
+                + (boundary - TimeSpan.FromHours(2)).ToString("o", CultureInfo.InvariantCulture)
+                + "\",\"latest_included_timestamp\":\"" + boundary.ToString("o", CultureInfo.InvariantCulture)
+                + "\",\"expected_intervals\":2,\"actual_intervals\":" + rows.Count
+                + ",\"gaps\":[" + String.Join(",", gaps) + "],\"timezone\":\"UTC\",\"day_anchor\":\""
+                + (boundary - TimeSpan.FromHours(2)).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
+                + "\",\"policy_version\":\"" + HourlyWarmStartPolicyVersion + "\",\"policy_hash\":\""
+                + HourlyWarmStartPolicyHash + "\",\"bars\":[" + String.Join(",", rows)
+                + "],\"publication_policy\":\"CAUSAL_HISTORICAL_COMPLETED_HOUR_V1\"}";
+            string observationId = BeelzebubReadOnlyOutbound.Publish("HISTORICAL_WARM_START", null, null, payload);
+            if (observationId != null && status == "COMPLETE")
+                lock (hourlyLock)
+                    foreach (DateTime end in matching.Keys) publishedHourlyEnds.Add(end.ToString("o", CultureInfo.InvariantCulture));
+        }
+
+        private void PublishHourlyWarmStartUnavailable(DateTime requestedAt, string reason)
+        {
+            DateTime boundary = new DateTime(requestedAt.Year, requestedAt.Month, requestedAt.Day, requestedAt.Hour, 0, 0, DateTimeKind.Utc);
+            string payload = "{\"contract_id\":\"" + instrument.FullName + "\",\"status\":\"UNAVAILABLE\",\"source\":\"NINJATRADER_BARS_REQUEST_PROVIDER\",\"requested_at\":\""
+                + requestedAt.ToString("o", CultureInfo.InvariantCulture) + "\",\"earliest_required\":\""
+                + (boundary - TimeSpan.FromHours(2)).ToString("o", CultureInfo.InvariantCulture)
+                + "\",\"latest_included_timestamp\":\"" + boundary.ToString("o", CultureInfo.InvariantCulture)
+                + "\",\"expected_intervals\":2,\"actual_intervals\":0,\"gaps\":[\"" + reason
+                + "\"],\"timezone\":\"UTC\",\"day_anchor\":\""
+                + (boundary - TimeSpan.FromHours(2)).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
+                + "\",\"policy_version\":\"" + HourlyWarmStartPolicyVersion + "\",\"policy_hash\":\""
+                + HourlyWarmStartPolicyHash + "\",\"bars\":[],\"publication_policy\":\"CAUSAL_HISTORICAL_COMPLETED_HOUR_V1\"}";
+            BeelzebubReadOnlyOutbound.Publish("HISTORICAL_WARM_START", null, null, payload);
+        }
+
+        private void OnHourlyBarsUpdate(object sender, BarsUpdateEventArgs e)
+        {
+            DateTime now = DateTime.UtcNow;
+            for (int index = e.MinIndex; index <= e.MaxIndex; index++)
+            {
+                DateTime end;
+                if (!TryBarEndUtc(e.BarsSeries.GetTime(index), out end)
+                    || end > now || now - end > TimeSpan.FromMinutes(5))
+                    continue;
+                string endIdentity = end.ToString("o", CultureInfo.InvariantCulture);
+                lock (hourlyLock)
+                    if (publishedHourlyEnds.Contains(endIdentity)) continue;
+                string payload = HourBarJson(
+                    end - TimeSpan.FromHours(1), end, e.BarsSeries.GetOpen(index), e.BarsSeries.GetHigh(index),
+                    e.BarsSeries.GetLow(index), e.BarsSeries.GetClose(index), e.BarsSeries.GetVolume(index));
+                payload = payload.Substring(0, payload.Length - 1)
+                    + ",\"contract_id\":\"" + instrument.FullName
+                    + "\",\"source\":\"NINJATRADER_BARS_REQUEST_PROVIDER\",\"policy_version\":\""
+                    + HourlyWarmStartPolicyVersion + "\",\"policy_hash\":\"" + HourlyWarmStartPolicyHash
+                    + "\",\"publication_policy\":\"CAUSAL_LIVE_COMPLETED_HOUR_V1\"}";
+                if (BeelzebubReadOnlyOutbound.Publish("HOURLY_BAR", null, null, payload) != null)
+                    lock (hourlyLock) publishedHourlyEnds.Add(endIdentity);
+            }
+        }
+
+        private static bool TryBarEndUtc(DateTime value, out DateTime end)
+        {
+            string rejection;
+            if (!BeelzebubProviderTimestamp.TryConvertUtc(
+                value, Core.Globals.GeneralOptions.TimeZoneInfo, null, out end, out rejection))
+                return false;
+            return end.Minute == 0 && end.Second == 0 && end.Millisecond == 0;
+        }
+
+        private static string HourBarJson(
+            DateTime start, DateTime end, double open, double high, double low, double close, long volume)
+        {
+            return "{\"start\":\"" + start.ToString("o", CultureInfo.InvariantCulture) + "\",\"end\":\""
+                + end.ToString("o", CultureInfo.InvariantCulture) + "\",\"open\":" + open.ToString(CultureInfo.InvariantCulture)
+                + ",\"high\":" + high.ToString(CultureInfo.InvariantCulture) + ",\"low\":" + low.ToString(CultureInfo.InvariantCulture)
+                + ",\"close\":" + close.ToString(CultureInfo.InvariantCulture) + ",\"volume\":" + volume + "}";
+        }
+
         private void OnMarketData(object sender, MarketDataEventArgs e)
         {
             if (stopping)
@@ -589,8 +738,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             string contract = instrument.FullName;
             if (e.MarketDataType == MarketDataType.Last)
             {
-                if (!TryReservePublication(ref lastTradePublicationTicks, MinimumPublicationTicks))
-                    return;
+                long sourceEventSequence = Interlocked.Increment(ref tradeEventSequence);
                 double bidAtTrade = e.Bid;
                 double askAtTrade = e.Ask;
                 bool completeQuote = FinitePositive(bidAtTrade) && FinitePositive(askAtTrade) && bidAtTrade < askAtTrade
@@ -607,7 +755,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                         + ",\"ask_size\":" + bestAskSize + ",\"bid_source_time\":\""
                         + bestBidTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture) + "\",\"ask_source_time\":\""
                         + bestAskTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture)
-                        + "\",\"publication_policy\":\"" + PublicationPolicy + "\"}", e.Time);
+                        + "\",\"source_event_sequence\":" + Interlocked.Increment(ref quoteEventSequence)
+                        + ",\"publication_policy\":\"" + PairedQuotePublicationPolicy + "\"}", e.Time);
                 }
                 string source = quoteObservationId == null ? "UNKNOWN" : "BID_ASK_CLASSIFICATION";
                 string bid = completeQuote ? bidAtTrade.ToString(CultureInfo.InvariantCulture) : "null";
@@ -618,7 +767,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                     + ",\"size\":" + e.Volume + ",\"aggressor_side\":\"UNKNOWN\",\"aggressor_source\":\"" + source
                     + "\",\"bid_at_trade\":" + bid + ",\"ask_at_trade\":" + ask
                     + ",\"derivation_quote_observation_id\":" + quoteReference
-                    + ",\"publication_policy\":\"" + PublicationPolicy + "\"}", e.Time);
+                    + ",\"source_event_sequence\":" + sourceEventSequence
+                    + ",\"publication_policy\":\"" + TradePublicationPolicy + "\"}", e.Time);
                 return;
             }
             if (e.MarketDataType == MarketDataType.Bid)
@@ -639,7 +789,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                 BeelzebubReadOnlyOutbound.Publish("QUOTE", null, null,
                     "{\"contract_id\":\"" + contract + "\",\"bid\":" + bestBid.ToString(CultureInfo.InvariantCulture)
                     + ",\"ask\":" + bestAsk.ToString(CultureInfo.InvariantCulture) + ",\"bid_size\":" + bestBidSize
-                    + ",\"ask_size\":" + bestAskSize + ",\"publication_policy\":\"" + PublicationPolicy + "\"}", e.Time);
+                    + ",\"ask_size\":" + bestAskSize + ",\"source_event_sequence\":" + Interlocked.Increment(ref quoteEventSequence)
+                    + ",\"publication_policy\":\"" + QuotePublicationPolicy + "\"}", e.Time);
         }
 
         private void OnMarketDepth(object sender, MarketDepthEventArgs e)
@@ -656,33 +807,33 @@ namespace NinjaTrader.NinjaScript.AddOns
             string payload;
             lock (bookLock)
             {
-                // MarketDepth callbacks may arrive concurrently. Mutation,
-                // positional remove resolution, trimming, and both-side
-                // serialization must observe one coherent book snapshot.
-                SortedDictionary<double, long> book = e.MarketDataType == MarketDataType.Bid ? bids : asks;
-                double mutationPrice = e.Price;
-                if (e.Operation == Operation.Remove && !FinitePositive(mutationPrice))
+                // NinjaTrader applies Operation to its zero-based Position
+                // before this AddOn callback. Read that native positional
+                // snapshot directly. A price-keyed Update leaves the old slot
+                // price stale whenever the level moves and caused crossed books.
+                long sourceEventSequence = Interlocked.Increment(ref depthEventSequence);
+                string bidLevels;
+                string askLevels;
+                double bestNativeBid;
+                double bestNativeAsk;
+                if (!TryNativeDepthSnapshot(out bidLevels, out askLevels, out bestNativeBid, out bestNativeAsk))
                 {
-                    if (e.Position < 0 || e.Position >= book.Count)
-                        return;
-                    mutationPrice = book.ElementAt(e.Position).Key;
+                    PublishDepthUnavailable("POSITIONAL_SNAPSHOT_INVALID", sourceEventSequence, e.Time);
+                    return;
                 }
-                if (!FinitePositive(mutationPrice))
+                if (FinitePositive(bestNativeBid) && FinitePositive(bestNativeAsk) && bestNativeBid >= bestNativeAsk)
+                {
+                    PublishDepthUnavailable("CROSSED_NATIVE_POSITIONAL_SNAPSHOT", sourceEventSequence, e.Time);
                     return;
-                if (e.Operation == Operation.Remove)
-                    book.Remove(mutationPrice);
-                else
-                    book[mutationPrice] = e.Volume;
-                TrimBook(book);
-                if (e.Position >= MaximumPublishedBookLevelsPerSide
-                    || !TryReservePublication(ref lastDepthPublicationTicks, MinimumPublicationTicks))
-                    return;
-                payload = "{\"contract_id\":\"" + instrument.FullName + "\",\"bids\":" + Levels(bids)
-                    + ",\"asks\":" + Levels(asks) + ",\"operation\":\"" + e.Operation
+                }
+                payload = "{\"contract_id\":\"" + instrument.FullName + "\",\"bids\":" + bidLevels
+                    + ",\"asks\":" + askLevels + ",\"operation\":\"" + e.Operation
                     + "\",\"side\":\"" + e.MarketDataType + "\",\"mutation_price\":"
-                    + mutationPrice.ToString(CultureInfo.InvariantCulture) + ",\"mutation_volume\":" + e.Volume
+                    + e.Price.ToString(CultureInfo.InvariantCulture) + ",\"mutation_volume\":" + e.Volume
                     + ",\"mutation_position\":" + e.Position
-                    + ",\"is_reset\":false,\"publication_policy\":\"" + PublicationPolicy + "\"}";
+                    + ",\"is_reset\":" + (e.IsReset ? "true" : "false")
+                    + ",\"source_event_sequence\":" + sourceEventSequence
+                    + ",\"publication_policy\":\"" + DepthPublicationPolicy + "\"}";
             }
             BeelzebubReadOnlyOutbound.Publish(
                 "DEPTH", null, null, payload, e.Time);
@@ -702,25 +853,53 @@ namespace NinjaTrader.NinjaScript.AddOns
             return !Double.IsNaN(value) && !Double.IsInfinity(value) && value > 0;
         }
 
-        private static string Levels(SortedDictionary<double, long> book)
+        private bool TryNativeDepthSnapshot(
+            out string bidLevels, out string askLevels,
+            out double bestNativeBid, out double bestNativeAsk)
         {
-            List<string> values = new List<string>();
-            foreach (KeyValuePair<double, long> item in book)
-                values.Add("{\"price\":" + item.Key.ToString(CultureInfo.InvariantCulture) + ",\"size\":" + item.Value + "}");
-            return "[" + String.Join(",", values) + "]";
+            bidLevels = "[]";
+            askLevels = "[]";
+            bestNativeBid = Double.NaN;
+            bestNativeAsk = Double.NaN;
+            if (instrument.MarketDepth == null)
+                return false;
+            List<string> bidRows = new List<string>();
+            List<string> askRows = new List<string>();
+            double priorBid = Double.PositiveInfinity;
+            double priorAsk = Double.NegativeInfinity;
+            int bidCount = Math.Min(MaximumPublishedBookLevelsPerSide, instrument.MarketDepth.Bids.Count);
+            int askCount = Math.Min(MaximumPublishedBookLevelsPerSide, instrument.MarketDepth.Asks.Count);
+            for (int index = 0; index < bidCount; index++)
+            {
+                double price = instrument.MarketDepth.Bids[index].Price;
+                long volume = instrument.MarketDepth.Bids[index].Volume;
+                if (!FinitePositive(price) || volume <= 0 || price >= priorBid)
+                    return false;
+                if (index == 0) bestNativeBid = price;
+                priorBid = price;
+                bidRows.Add("{\"price\":" + price.ToString(CultureInfo.InvariantCulture) + ",\"size\":" + volume + "}");
+            }
+            for (int index = 0; index < askCount; index++)
+            {
+                double price = instrument.MarketDepth.Asks[index].Price;
+                long volume = instrument.MarketDepth.Asks[index].Volume;
+                if (!FinitePositive(price) || volume <= 0 || price <= priorAsk)
+                    return false;
+                if (index == 0) bestNativeAsk = price;
+                priorAsk = price;
+                askRows.Add("{\"price\":" + price.ToString(CultureInfo.InvariantCulture) + ",\"size\":" + volume + "}");
+            }
+            bidLevels = "[" + String.Join(",", bidRows) + "]";
+            askLevels = "[" + String.Join(",", askRows) + "]";
+            return true;
         }
 
-        private static void TrimBook(SortedDictionary<double, long> book)
+        private void PublishDepthUnavailable(string reason, long sourceEventSequence, DateTime providerTime)
         {
-            if (book.Count <= MaximumPublishedBookLevelsPerSide)
-                return;
-            List<double> discarded = new List<double>();
-            int index = 0;
-            foreach (KeyValuePair<double, long> item in book)
-                if (index++ >= MaximumPublishedBookLevelsPerSide)
-                    discarded.Add(item.Key);
-            foreach (double price in discarded)
-                book.Remove(price);
+            BeelzebubReadOnlyOutbound.Publish("HEALTH", null, null,
+                "{\"component\":\"MARKET_DEPTH\",\"state\":\"UNAVAILABLE\",\"reason\":\"" + reason
+                + "\",\"contract_id\":\"" + instrument.FullName + "\",\"source_event_sequence\":" + sourceEventSequence
+                + ",\"publication_policy\":\"" + DepthPublicationPolicy + "\"}", providerTime);
         }
 
         private static bool TryReservePublication(ref long lastPublicationTicks, long minimumTicks)
@@ -841,10 +1020,14 @@ namespace NinjaTrader.NinjaScript.AddOns
     public static class BeelzebubReadOnlyOutbound
     {
         private const int Port = 48135;
-        // Bound recovery lag. At the observer's declared 2 Hz-per-stream
-        // publication policy this holds well under one freshness epoch. If it
-        // fills, sequence gaps remain visible and authority fails closed.
-        private const int MaximumQueuedFrames = 8;
+        private const string AttestedSchema = "lane-iii-phase-f3-ninjatrader-observation-v2";
+        private const string AttestationProtocol = "l3f3-ninjatrader-observer-attestation-v1";
+        private const string AttestationKeyContext = "BEELZEBUB_NINJATRADER_OBSERVATION_V2";
+        private const string ProducerSourceFingerprint = "ce1649e49f5fe83c4d93c22e963233d1d79e05a148adac24504bc473175ef464";
+        // Event-driven trades/depth require burst capacity, but memory remains
+        // bounded. A full queue drops the signed frame after assigning its
+        // sequence; the next source_event_sequence exposes the gap.
+        private const int MaximumQueuedFrames = 4096;
         private static long sequence = 0;
         private static readonly string sessionId = Guid.NewGuid().ToString("N");
         private static readonly HashSet<string> transportMarkers = new HashSet<string>();
@@ -854,6 +1037,10 @@ namespace NinjaTrader.NinjaScript.AddOns
         private static Thread senderThread;
         private static bool senderRunning;
         private static bool senderStopping;
+        private static bool signingKeyLoadAttempted;
+        private static byte[] signingKey;
+        private static readonly string producerBuildFingerprint = AssemblyHash();
+        private static readonly string producerBuildTimestamp = AssemblyBuildTimestamp();
 
         private static string ProviderTimestampUtc(DateTime? providerTime)
         {
@@ -901,24 +1088,61 @@ namespace NinjaTrader.NinjaScript.AddOns
                 string account = alias == null ? "null" : "{\"alias\":\"" + alias + "\",\"class\":\"" + accountClass + "\"}";
                 string timestamp = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
                 string providerTimestamp = ProviderTimestampUtc(providerTime);
+                if (EnsureSigningKey())
+                {
+                    JavaScriptSerializer serializer = new JavaScriptSerializer();
+                    Dictionary<string, object> payloadValue = serializer.DeserializeObject(payload) as Dictionary<string, object>;
+                    if (payloadValue == null)
+                    {
+                        TransportDiagnosticOnce("ATTESTED_PAYLOAD_PARSE_FAILED");
+                        return null;
+                    }
+                    Dictionary<string, object> accountValue = null;
+                    if (alias != null)
+                        accountValue = new Dictionary<string, object>(StringComparer.Ordinal) {
+                            {"alias", alias}, {"class", accountClass}
+                        };
+                    string publicationPolicy = payloadValue.ContainsKey("publication_policy")
+                        ? Convert.ToString(payloadValue["publication_policy"], CultureInfo.InvariantCulture)
+                        : "EVENT_DRIVEN_NATIVE_CALLBACK_V1";
+                    Dictionary<string, object> producer = new Dictionary<string, object>(StringComparer.Ordinal) {
+                        {"protocol_version", AttestationProtocol},
+                        {"source_fingerprint", ProducerSourceFingerprint},
+                        {"build_fingerprint", producerBuildFingerprint},
+                        {"build_timestamp", producerBuildTimestamp},
+                        {"source_stream", SourceStream(type)},
+                        {"publication_policy", publicationPolicy},
+                    };
+                    Dictionary<string, object> frameValue = new Dictionary<string, object>(StringComparer.Ordinal) {
+                        {"schema", AttestedSchema}, {"observation_id", observationId},
+                        {"session_id", sessionId}, {"observation_type", type},
+                        {"ninja_receipt_time", timestamp}, {"local_monotonic_sequence", number},
+                        {"provider_timestamp", providerTimestamp == "null" ? null : providerTimestamp},
+                        {"provider_sequence", null}, {"exchange_timestamp", null},
+                        {"account", accountValue}, {"payload", payloadValue},
+                        {"payload_hash", Sha256(Canonical(payloadValue))}, {"producer", producer},
+                    };
+                    frameValue["signature"] = Sign(frameValue);
+                    string attestedFrame = Canonical(frameValue) + "\n";
+                    return EnqueueLocked(attestedFrame) ? observationId : null;
+                }
                 string frame = "{\"schema\":\"lane-iii-phase-f2-ninjatrader-observation-v1\",\"observation_id\":\"" + observationId +
                     "\",\"session_id\":\"" + sessionId + "\",\"observation_type\":\"" + type + "\",\"ninja_receipt_time\":\"" + timestamp +
                     "\",\"local_monotonic_sequence\":" + number + ",\"provider_timestamp\":" + (providerTimestamp == "null" ? "null" : "\"" + providerTimestamp + "\"") +
                     ",\"provider_sequence\":null,\"exchange_timestamp\":null,\"account\":" + account + ",\"payload\":" + payload + "}\n";
-                EnqueueLocked(frame);
-                return observationId;
+                return EnqueueLocked(frame) ? observationId : null;
             }
         }
 
         // Serialize all writes through one localhost-only sender. Market data
         // callbacks can be concurrent; opening one socket per callback permits
         // frame reordering and can exhaust local ephemeral ports.
-        private static void EnqueueLocked(string frame)
+        private static bool EnqueueLocked(string frame)
         {
             if (outboundFrames.Count >= MaximumQueuedFrames)
             {
                 TransportDiagnosticOnce("BRIDGE_QUEUE_CAPACITY_REACHED");
-                return;
+                return false;
             }
             outboundFrames.Enqueue(frame);
             senderStopping = false;
@@ -931,6 +1155,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 senderThread.Start();
             }
             Monitor.Pulse(outboundFramesLock);
+            return true;
         }
 
         private static void SenderLoop()
@@ -990,12 +1215,106 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
         }
 
+        private static bool EnsureSigningKey()
+        {
+            if (signingKey != null)
+                return true;
+            if (signingKeyLoadAttempted)
+                return false;
+            signingKeyLoadAttempted = true;
+            try
+            {
+                string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                    "NinjaTrader 8", "l3g.paper.local.key");
+                byte[] rootKey = File.ReadAllBytes(path);
+                if (rootKey.Length < 32)
+                    throw new InvalidDataException();
+                using (HMACSHA256 hmac = new HMACSHA256(rootKey))
+                    signingKey = hmac.ComputeHash(Encoding.UTF8.GetBytes(AttestationKeyContext));
+                Array.Clear(rootKey, 0, rootKey.Length);
+                TransportDiagnosticOnce("OBSERVATION_ATTESTATION_READY");
+                return true;
+            }
+            catch (IOException) { TransportDiagnosticOnce("OBSERVATION_ATTESTATION_KEY_UNAVAILABLE"); }
+            catch (UnauthorizedAccessException) { TransportDiagnosticOnce("OBSERVATION_ATTESTATION_KEY_UNAVAILABLE"); }
+            catch (InvalidDataException) { TransportDiagnosticOnce("OBSERVATION_ATTESTATION_KEY_INVALID"); }
+            return false;
+        }
+
+        private static string SourceStream(string type)
+        {
+            if (String.Equals(type, "TRADE", StringComparison.Ordinal)) return "MARKET_DATA_LAST";
+            if (String.Equals(type, "QUOTE", StringComparison.Ordinal)) return "MARKET_DATA_BID_ASK";
+            if (String.Equals(type, "DEPTH", StringComparison.Ordinal)) return "MARKET_DEPTH";
+            if (String.Equals(type, "HISTORICAL_WARM_START", StringComparison.Ordinal)
+                || String.Equals(type, "HOURLY_BAR", StringComparison.Ordinal)) return "HISTORICAL_BARS";
+            return "NINJATRADER_CALLBACK";
+        }
+
+        private static string Sign(Dictionary<string, object> frame)
+        {
+            Dictionary<string, object> unsigned = new Dictionary<string, object>(frame, StringComparer.Ordinal);
+            unsigned.Remove("signature");
+            using (HMACSHA256 hmac = new HMACSHA256(signingKey))
+                return Hex(hmac.ComputeHash(Encoding.UTF8.GetBytes(Canonical(unsigned))));
+        }
+
+        private static string Sha256(string value)
+        {
+            using (SHA256 sha = SHA256.Create())
+                return Hex(sha.ComputeHash(Encoding.UTF8.GetBytes(value)));
+        }
+
+        private static string Hex(byte[] value)
+        {
+            return BitConverter.ToString(value).Replace("-", String.Empty).ToLowerInvariant();
+        }
+
+        private static string Canonical(object value)
+        {
+            IDictionary<string, object> dictionary = value as IDictionary<string, object>;
+            if (dictionary != null)
+                return "{" + String.Join(",", dictionary.OrderBy(item => item.Key, StringComparer.Ordinal)
+                    .Select(item => new JavaScriptSerializer().Serialize(item.Key) + ":" + Canonical(item.Value))) + "}";
+            IEnumerable enumerable = value as IEnumerable;
+            if (enumerable != null && !(value is string))
+            {
+                List<string> items = new List<string>();
+                foreach (object item in enumerable) items.Add(Canonical(item));
+                return "[" + String.Join(",", items) + "]";
+            }
+            if (value == null) return "null";
+            if (value is bool) return (bool)value ? "true" : "false";
+            if (value is string) return new JavaScriptSerializer().Serialize((string)value);
+            return Convert.ToString(value, CultureInfo.InvariantCulture);
+        }
+
+        private static string AssemblyHash()
+        {
+            try
+            {
+                using (SHA256 sha = SHA256.Create())
+                    return Hex(sha.ComputeHash(File.ReadAllBytes(Assembly.GetExecutingAssembly().Location)));
+            }
+            catch { return new string('0', 64); }
+        }
+
+        private static string AssemblyBuildTimestamp()
+        {
+            try { return File.GetLastWriteTimeUtc(Assembly.GetExecutingAssembly().Location).ToString("o", CultureInfo.InvariantCulture); }
+            catch { return "1970-01-01T00:00:00.0000000Z"; }
+        }
+
         public static void Shutdown()
         {
             lock (outboundFramesLock)
             {
                 senderStopping = true;
                 outboundFrames.Clear();
+                if (signingKey != null)
+                    Array.Clear(signingKey, 0, signingKey.Length);
+                signingKey = null;
+                signingKeyLoadAttempted = false;
                 Monitor.PulseAll(outboundFramesLock);
             }
         }

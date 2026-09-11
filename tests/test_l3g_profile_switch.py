@@ -361,7 +361,7 @@ class ProfileCatalogTests(unittest.TestCase):
         nested = Path("N:/Beelzebub/runtime/profiles/beelzebub_scalper_v2/runs/run-1/hot/lane_iii_paper.sqlite3")
         self.assertEqual(profile_switch_runtime_root(nested), Path("N:/Beelzebub/runtime").resolve())
 
-    def test_catalog_contains_four_closed_policy_and_risk_bundles(self) -> None:
+    def test_catalog_contains_five_closed_policy_and_risk_bundles(self) -> None:
         self.assertEqual(
             tuple(profile.selection_key for profile in PAPER_PROFILE_CATALOG),
             (
@@ -369,6 +369,7 @@ class ProfileCatalogTests(unittest.TestCase):
                 "BEELZEBUB_SCALPER_V2",
                 "BEELZEBUB_FIVE_MINUTE_BIAS_V1",
                 "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2",
+                "BEELZEBUB_PONG_DISCERNMENT_V1",
             ),
         )
         self.assertEqual(HIGH_CONFIDENCE_POLICY.configuration_hash, "070587789049231d268cb742404eb6dcc21d91014c9529aa109419a563729a91")
@@ -4515,7 +4516,7 @@ class ProfileSwitchRouteTests(unittest.IsolatedAsyncioTestCase):
             get_endpoint = next(route.endpoint for route in routes if "GET" in route.methods)
             post_endpoint = next(route.endpoint for route in routes if "POST" in route.methods)
             catalog = await get_endpoint()
-            self.assertEqual(len(catalog["profiles"]), 4)
+            self.assertEqual(len(catalog["profiles"]), 5)
             request = Request({
                 "type": "http", "http_version": "1.1", "method": "POST",
                 "scheme": "http", "path": "/api/lane-iii/paper/profile-switch",

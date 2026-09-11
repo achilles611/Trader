@@ -28,6 +28,7 @@ from .contracts import (
     FIVE_MINUTE_ENTRY_PROFILE_VERSION,
     FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
     PAPER_ENTRY_PROFILE_VERSION,
+    PONG_ENTRY_PROFILE_VERSION,
     BookCompleteness,
     PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS,
     PAPER_ACCOUNT_DAILY_LOSS_POLICY_ID,
@@ -44,6 +45,7 @@ from .contracts import (
     PaperAuthorityBundle,
     PaperRuntimeState,
     PaperSessionArmGrant,
+    PongPaperPolicyArtifact,
     SequenceAuthority,
     deterministic_id,
     resolve_paper_profile,
@@ -415,8 +417,14 @@ class LaneIIIPaperRuntime:
             type(self.policy.artifact) is FiveMinutePerpetualPaperPolicyArtifact
             and self.policy.artifact.perpetual_position
         )
+        self._pong_profile = (
+            type(self.policy.artifact) is PongPaperPolicyArtifact
+            and self.policy.artifact.entry_profile_version
+            == PONG_ENTRY_PROFILE_VERSION
+        )
         self._continuous_scalper_profile = (
-            self.policy.artifact.entry_profile_version == PAPER_ENTRY_PROFILE_VERSION
+            self.policy.artifact.entry_profile_version
+            in {PAPER_ENTRY_PROFILE_VERSION, PONG_ENTRY_PROFILE_VERSION}
             and self.policy.artifact.reporting_sessions_only
             and self.policy.artifact.execution_schedule
             == "CONTINUOUS_EXCHANGE_TRADEABLE"
@@ -6057,6 +6065,7 @@ class LaneIIIPaperRuntime:
         return (
             profile in {
                 PAPER_ENTRY_PROFILE_VERSION,
+                PONG_ENTRY_PROFILE_VERSION,
                 FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
             }
             and context.trade_date != "1970-01-01"

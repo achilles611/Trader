@@ -19,17 +19,15 @@ namespace NinjaTrader.NinjaScript.Indicators
         // and snapshot size prevents the one-way bridge from silently losing
         // frames during sustained MNQ depth bursts.
         private const int MaximumPublishedBookLevelsPerSide = 10;
-        // The runtime freshness gates are 2s for quotes and 5s for trades/depth.
-        // Publish the latest authentic state at 2 Hz per stream instead of
-        // attempting to persist every UI callback. The provider sequence is
-        // unavailable and book completeness remains UNVERIFIED, so this is an
-        // explicit bounded observation policy, never a complete-feed claim.
+        // Quotes remain bounded state, but trades and depth retain every native
+        // callback so causal coverage can be proved from source sequences.
         private static readonly long MinimumPublicationTicks = Math.Max(1L, System.Diagnostics.Stopwatch.Frequency / 2L);
         private static readonly long MinimumAttachmentPublicationTicks = Math.Max(1L, System.Diagnostics.Stopwatch.Frequency * 5L);
-        private const string PublicationPolicy = "BOUNDED_LATEST_STATE_2HZ";
+        private const string QuotePublicationPolicy = "BOUNDED_LATEST_STATE_2HZ";
+        private const string PairedQuotePublicationPolicy = "EVENT_DRIVEN_SAME_CALLBACK_QUOTE_V1";
+        private const string TradePublicationPolicy = "EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1";
+        private const string DepthPublicationPolicy = "EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1";
         private readonly object bookLock = new object();
-        private readonly SortedDictionary<double, long> bids = new SortedDictionary<double, long>(Comparer<double>.Create((x, y) => y.CompareTo(x)));
-        private readonly SortedDictionary<double, long> asks = new SortedDictionary<double, long>();
         private double bestBid = Double.NaN;
         private double bestAsk = Double.NaN;
         private long bestBidSize = 0;
@@ -40,9 +38,10 @@ namespace NinjaTrader.NinjaScript.Indicators
         private bool reportedDepth;
         private bool reportedMarketDataConnected;
         private long lastQuotePublicationTicks;
-        private long lastTradePublicationTicks;
-        private long lastDepthPublicationTicks;
         private long lastAttachmentPublicationTicks;
+        private long quoteEventSequence;
+        private long tradeEventSequence;
+        private long depthEventSequence;
 
         protected override void OnStateChange()
         {
@@ -86,8 +85,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             string contract = Instrument.FullName;
             if (e.MarketDataType == MarketDataType.Last)
             {
-                if (!TryReservePublication(ref lastTradePublicationTicks))
-                    return;
+                long sourceEventSequence = Interlocked.Increment(ref tradeEventSequence);
                 // NinjaTrader directly supplies Bid and Ask on the Last event,
                 // but not a native aggressor flag.  Emit a same-callback quote
                 // first only when its cached sizes match those exact prices.
@@ -115,7 +113,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                         + ",\"ask_size\":" + bestAskSize + ",\"bid_source_time\":\""
                         + bestBidTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture) + "\",\"ask_source_time\":\""
                         + bestAskTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture)
-                        + "\",\"publication_policy\":\"" + PublicationPolicy + "\"}", e.Time);
+                        + "\",\"source_event_sequence\":" + Interlocked.Increment(ref quoteEventSequence)
+                        + ",\"publication_policy\":\"" + PairedQuotePublicationPolicy + "\"}", e.Time);
                 }
                 string source = quoteObservationId == null ? "UNKNOWN" : "BID_ASK_CLASSIFICATION";
                 string bid = completeQuote ? bidAtTrade.ToString(CultureInfo.InvariantCulture) : "null";
@@ -126,7 +125,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                     + ",\"size\":" + e.Volume + ",\"aggressor_side\":\"UNKNOWN\",\"aggressor_source\":\"" + source
                     + "\",\"bid_at_trade\":" + bid + ",\"ask_at_trade\":" + ask
                     + ",\"derivation_quote_observation_id\":" + quoteReference
-                    + ",\"publication_policy\":\"" + PublicationPolicy + "\"}", e.Time);
+                    + ",\"source_event_sequence\":" + sourceEventSequence
+                    + ",\"publication_policy\":\"" + TradePublicationPolicy + "\"}", e.Time);
                 return;
             }
             if (e.MarketDataType == MarketDataType.Bid)
@@ -143,7 +143,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
             if (!Double.IsNaN(bestBid) && !Double.IsNaN(bestAsk) && bestBid < bestAsk && bestBidSize > 0 && bestAskSize > 0
                 && TryReservePublication(ref lastQuotePublicationTicks))
-                BeelzebubReadOnlyOutbound.Publish("QUOTE", null, null, "{\"contract_id\":\"" + contract + "\",\"bid\":" + bestBid.ToString(CultureInfo.InvariantCulture) + ",\"ask\":" + bestAsk.ToString(CultureInfo.InvariantCulture) + ",\"bid_size\":" + bestBidSize + ",\"ask_size\":" + bestAskSize + ",\"publication_policy\":\"" + PublicationPolicy + "\"}", e.Time);
+                BeelzebubReadOnlyOutbound.Publish("QUOTE", null, null, "{\"contract_id\":\"" + contract + "\",\"bid\":" + bestBid.ToString(CultureInfo.InvariantCulture) + ",\"ask\":" + bestAsk.ToString(CultureInfo.InvariantCulture) + ",\"bid_size\":" + bestBidSize + ",\"ask_size\":" + bestAskSize + ",\"source_event_sequence\":" + Interlocked.Increment(ref quoteEventSequence) + ",\"publication_policy\":\"" + QuotePublicationPolicy + "\"}", e.Time);
         }
 
         protected override void OnConnectionStatusUpdate(ConnectionStatusEventArgs e)
@@ -178,33 +178,28 @@ namespace NinjaTrader.NinjaScript.Indicators
             string payload;
             lock (bookLock)
             {
-                // NinjaTrader can invoke depth callbacks concurrently. Keep
-                // positional remove resolution, mutation, trimming, and the
-                // two-sided snapshot inside one book critical section.
-                SortedDictionary<double, long> book = e.MarketDataType == MarketDataType.Bid ? bids : asks;
-                double mutationPrice = e.Price;
-                if (e.Operation == Operation.Remove && (Double.IsNaN(mutationPrice) || Double.IsInfinity(mutationPrice) || mutationPrice <= 0))
+                long sourceEventSequence = Interlocked.Increment(ref depthEventSequence);
+                string bidLevels;
+                string askLevels;
+                double bestNativeBid;
+                double bestNativeAsk;
+                if (!TryNativeDepthSnapshot(out bidLevels, out askLevels, out bestNativeBid, out bestNativeAsk))
                 {
-                    if (e.Position < 0 || e.Position >= book.Count)
-                    {
-                        BeelzebubReadOnlyOutbound.Diagnostic("MARKET_OBSERVER_UNRESOLVED_DEPTH_REMOVE");
-                        return;
-                    }
-                    mutationPrice = book.ElementAt(e.Position).Key;
+                    PublishDepthUnavailable("POSITIONAL_SNAPSHOT_INVALID", sourceEventSequence, e.Time);
+                    return;
                 }
-                if (Double.IsNaN(mutationPrice) || Double.IsInfinity(mutationPrice) || mutationPrice <= 0)
+                if (FinitePositive(bestNativeBid) && FinitePositive(bestNativeAsk) && bestNativeBid >= bestNativeAsk)
+                {
+                    PublishDepthUnavailable("CROSSED_NATIVE_POSITIONAL_SNAPSHOT", sourceEventSequence, e.Time);
                     return;
-                if (e.Operation == Operation.Remove) book.Remove(mutationPrice); else book[mutationPrice] = e.Volume;
-                TrimBook(book);
-                if (e.Position >= MaximumPublishedBookLevelsPerSide)
-                    return;
-                if (!TryReservePublication(ref lastDepthPublicationTicks))
-                    return;
+                }
                 payload = "{\"contract_id\":\"" + Instrument.FullName
-                    + "\",\"bids\":" + Levels(bids) + ",\"asks\":" + Levels(asks) + ",\"operation\":\"" + e.Operation
-                    + "\",\"side\":\"" + e.MarketDataType + "\",\"mutation_price\":" + mutationPrice.ToString(CultureInfo.InvariantCulture)
+                    + "\",\"bids\":" + bidLevels + ",\"asks\":" + askLevels + ",\"operation\":\"" + e.Operation
+                    + "\",\"side\":\"" + e.MarketDataType + "\",\"mutation_price\":" + e.Price.ToString(CultureInfo.InvariantCulture)
                     + ",\"mutation_volume\":" + e.Volume + ",\"mutation_position\":" + e.Position
-                    + ",\"is_reset\":false,\"publication_policy\":\"" + PublicationPolicy + "\"}";
+                    + ",\"is_reset\":" + (e.IsReset ? "true" : "false")
+                    + ",\"source_event_sequence\":" + sourceEventSequence
+                    + ",\"publication_policy\":\"" + DepthPublicationPolicy + "\"}";
             }
             BeelzebubReadOnlyOutbound.Publish(
                 "DEPTH", null, null, payload, e.Time);
@@ -212,11 +207,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         private void ClearMarketState()
         {
-            lock (bookLock)
-            {
-                bids.Clear();
-                asks.Clear();
-            }
             bestBid = Double.NaN;
             bestAsk = Double.NaN;
             bestBidSize = 0;
@@ -252,27 +242,56 @@ namespace NinjaTrader.NinjaScript.Indicators
                 configured, instrument, true, true);
         }
 
-        private static string Levels(SortedDictionary<double, long> book)
+        private bool TryNativeDepthSnapshot(
+            out string bidLevels, out string askLevels,
+            out double bestNativeBid, out double bestNativeAsk)
         {
-            List<string> values = new List<string>();
-            foreach (KeyValuePair<double, long> item in book)
-                values.Add("{\"price\":" + item.Key.ToString(CultureInfo.InvariantCulture) + ",\"size\":" + item.Value + "}");
-            return "[" + String.Join(",", values) + "]";
+            bidLevels = "[]";
+            askLevels = "[]";
+            bestNativeBid = Double.NaN;
+            bestNativeAsk = Double.NaN;
+            if (Instrument == null || Instrument.MarketDepth == null)
+                return false;
+            List<string> bidRows = new List<string>();
+            List<string> askRows = new List<string>();
+            double priorBid = Double.PositiveInfinity;
+            double priorAsk = Double.NegativeInfinity;
+            int bidCount = Math.Min(MaximumPublishedBookLevelsPerSide, Instrument.MarketDepth.Bids.Count);
+            int askCount = Math.Min(MaximumPublishedBookLevelsPerSide, Instrument.MarketDepth.Asks.Count);
+            for (int index = 0; index < bidCount; index++)
+            {
+                double price = Instrument.MarketDepth.Bids[index].Price;
+                long volume = Instrument.MarketDepth.Bids[index].Volume;
+                if (!FinitePositive(price) || volume <= 0 || price >= priorBid) return false;
+                if (index == 0) bestNativeBid = price;
+                priorBid = price;
+                bidRows.Add("{\"price\":" + price.ToString(CultureInfo.InvariantCulture) + ",\"size\":" + volume + "}");
+            }
+            for (int index = 0; index < askCount; index++)
+            {
+                double price = Instrument.MarketDepth.Asks[index].Price;
+                long volume = Instrument.MarketDepth.Asks[index].Volume;
+                if (!FinitePositive(price) || volume <= 0 || price <= priorAsk) return false;
+                if (index == 0) bestNativeAsk = price;
+                priorAsk = price;
+                askRows.Add("{\"price\":" + price.ToString(CultureInfo.InvariantCulture) + ",\"size\":" + volume + "}");
+            }
+            bidLevels = "[" + String.Join(",", bidRows) + "]";
+            askLevels = "[" + String.Join(",", askRows) + "]";
+            return true;
         }
 
-        private static void TrimBook(SortedDictionary<double, long> book)
+        private void PublishDepthUnavailable(string reason, long sourceEventSequence, DateTime providerTime)
         {
-            if (book.Count <= MaximumPublishedBookLevelsPerSide)
-                return;
-            List<double> discarded = new List<double>();
-            int index = 0;
-            foreach (KeyValuePair<double, long> item in book)
-            {
-                if (index++ >= MaximumPublishedBookLevelsPerSide)
-                    discarded.Add(item.Key);
-            }
-            foreach (double price in discarded)
-                book.Remove(price);
+            BeelzebubReadOnlyOutbound.Publish("HEALTH", null, null,
+                "{\"component\":\"MARKET_DEPTH\",\"state\":\"UNAVAILABLE\",\"reason\":\"" + reason
+                + "\",\"contract_id\":\"" + Instrument.FullName + "\",\"source_event_sequence\":" + sourceEventSequence
+                + ",\"publication_policy\":\"" + DepthPublicationPolicy + "\"}", providerTime);
+        }
+
+        private static bool FinitePositive(double value)
+        {
+            return !Double.IsNaN(value) && !Double.IsInfinity(value) && value > 0;
         }
 
         private static bool TryReservePublication(ref long lastPublicationTicks)

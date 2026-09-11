@@ -42,6 +42,8 @@ FIVE_MINUTE_PERPETUAL_POLICY_SCHEMA = "lane-iii-phase-g-five-minute-perpetual-po
 FIVE_MINUTE_PERPETUAL_POLICY_ID = "l3g-beelzebub-five-minute-perpetual-policy-v2"
 FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE = "BEELZEBUB_FIVE_MINUTE_PERPETUAL"
 FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION = "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2"
+PONG_ENTRY_PROFILE = "BEELZEBUB_PONG_DISCERNMENT"
+PONG_ENTRY_PROFILE_VERSION = "BEELZEBUB_PONG_DISCERNMENT_V1"
 PAPER_RISK_PROFILE_ID = "l3g-beelzebub-scalper-risk-v3"
 HIGH_CONFIDENCE_RISK_SCHEMA = "lane-iii-phase-g-paper-risk-v2"
 HIGH_CONFIDENCE_RISK_PROFILE_ID = "l3g-ny-high-confluence-commissioning-risk-v1"
@@ -515,8 +517,8 @@ class PongPaperPolicyArtifact(PaperPolicyArtifact):
 
     schema: str = "lane-iii-pong-bounded-paper-policy-v1"
     policy_id: str = "l3g-beelzebub-pong-discernment-policy-v1"
-    entry_profile: str = "BEELZEBUB_PONG_DISCERNMENT"
-    entry_profile_version: str = "BEELZEBUB_PONG_DISCERNMENT_V1"
+    entry_profile: str = PONG_ENTRY_PROFILE
+    entry_profile_version: str = PONG_ENTRY_PROFILE_VERSION
     reentry_cooldown_seconds: int = 0
     trial_required: bool = True
     duration_seconds: int = 3600
@@ -526,8 +528,8 @@ class PongPaperPolicyArtifact(PaperPolicyArtifact):
         expected.update({
             "schema": "lane-iii-pong-bounded-paper-policy-v1",
             "policy_id": "l3g-beelzebub-pong-discernment-policy-v1",
-            "entry_profile": "BEELZEBUB_PONG_DISCERNMENT",
-            "entry_profile_version": "BEELZEBUB_PONG_DISCERNMENT_V1",
+            "entry_profile": PONG_ENTRY_PROFILE,
+            "entry_profile_version": PONG_ENTRY_PROFILE_VERSION,
             "reentry_cooldown_seconds": 0, "trial_required": True,
             "duration_seconds": 3600,
         })
@@ -1451,7 +1453,7 @@ PAPER_PROFILE_CATALOG = (
     FIVE_MINUTE_PROFILE,
     FIVE_MINUTE_PERPETUAL_PROFILE,
     PaperProfileDefinition(
-        "BEELZEBUB_PONG_DISCERNMENT_V1", "Pong experimental (bounded hour)",
+        PONG_ENTRY_PROFILE_VERSION, "Pong experimental (bounded NY-open pass)",
         "Event-driven experimental Discernment; one Sim101 MNQ; independent 60-minute stop required.",
         PONG_PAPER_POLICY, PONG_PAPER_RISK_PROFILE,
     ),
@@ -1462,7 +1464,7 @@ def resolve_paper_profile(value: str | None) -> PaperProfileDefinition:
     """Resolve one complete compiled policy/risk bundle; scalper V2 is the default."""
     normalized = "" if value is None else value.strip().upper()
     aliases = {
-        "BEELZEBUB_PONG_DISCERNMENT_V1": PAPER_PROFILE_CATALOG[-1],
+        PONG_ENTRY_PROFILE_VERSION: PAPER_PROFILE_CATALOG[-1],
         "": SCALPER_PROFILE,
         PAPER_ENTRY_PROFILE: SCALPER_PROFILE,
         PAPER_ENTRY_PROFILE_VERSION: SCALPER_PROFILE,

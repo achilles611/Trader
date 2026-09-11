@@ -74,6 +74,7 @@ def validate_risk_continuity_snapshot(value: object, *, require_flat: bool = Fal
         from .contracts import (
             FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
             PAPER_ENTRY_PROFILE_VERSION,
+            PONG_ENTRY_PROFILE_VERSION,
             resolve_paper_profile,
         )
         source_profile = resolve_paper_profile(source_profile).selection_key
@@ -224,6 +225,7 @@ def validate_risk_continuity_snapshot(value: object, *, require_flat: bool = Fal
             and profile in {
                 PAPER_ENTRY_PROFILE_VERSION,
                 FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
+                PONG_ENTRY_PROFILE_VERSION,
             }
             and context.trade_date != "1970-01-01"
             and context.session_id
