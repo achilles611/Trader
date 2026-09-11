@@ -116,8 +116,11 @@ class PongProductionHostTests(unittest.TestCase):
             host.on_observation(verified(
                 "TRADE", dict(base, source_event_sequence=102), local_sequence=4,
             ))
+            host.on_observation(verified(
+                "TRADE", dict(base, source_event_sequence=103), local_sequence=5,
+            ))
             status = host.status()
-            self.assertEqual(status["stream_counts"]["TRADE"], 1)
+            self.assertEqual(status["stream_counts"]["TRADE"], 2)
             self.assertEqual(status["stream_counts"]["QUOTE"], 1)
             self.assertEqual(status["missing_events"]["TRADE"], 1)
             self.assertEqual(status["missing_events"]["QUOTE"], 0)

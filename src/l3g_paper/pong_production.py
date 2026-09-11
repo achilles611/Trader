@@ -297,6 +297,12 @@ class PongProductionHost:
                         return
                     if sequence != prior + 1:
                         self._stream_missing[record.observation_type] += sequence - prior - 1
+                        # Advance the observed source cursor even though this
+                        # record cannot bridge the missing range. Otherwise
+                        # every later record re-counts the same absent events
+                        # and freezes an already-invalid stream projection.
+                        # The input-error latch remains fail-closed.
+                        self._stream_sequences[record.observation_type] = sequence
                         self._input_error = "PONG_NATIVE_INPUT_SOURCE_SEQUENCE_GAP"
                         return
                 self._stream_sequences[record.observation_type] = sequence
