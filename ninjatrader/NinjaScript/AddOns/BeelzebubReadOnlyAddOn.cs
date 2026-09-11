@@ -67,8 +67,9 @@ namespace NinjaTrader.NinjaScript.AddOns
             NinjaTrader.Gui.Chart.Chart chart = window as NinjaTrader.Gui.Chart.Chart;
             if (chart != null)
             {
-                if (!observedCharts.Contains(chart))
-                    observedCharts.Add(chart);
+                lock (observedCharts)
+                    if (!observedCharts.Contains(chart))
+                        observedCharts.Add(chart);
                 InspectCharts(true);
                 return;
             }
@@ -96,7 +97,8 @@ namespace NinjaTrader.NinjaScript.AddOns
             NinjaTrader.Gui.Chart.Chart chart = window as NinjaTrader.Gui.Chart.Chart;
             if (chart != null)
             {
-                observedCharts.Remove(chart);
+                lock (observedCharts)
+                    observedCharts.Remove(chart);
                 InspectCharts(false);
                 return;
             }
@@ -138,11 +140,14 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
             NinjaTrader.Gui.Chart.Chart correct = null;
             string firstInstrument = null;
-            foreach (NinjaTrader.Gui.Chart.Chart chart in observedCharts)
+            NinjaTrader.Gui.Chart.Chart[] charts;
+            lock (observedCharts)
+                charts = observedCharts.ToArray();
+            foreach (NinjaTrader.Gui.Chart.Chart chart in charts)
             {
-                if (chart == null || chart.ActiveChartControl == null || chart.ActiveChartControl.Instrument == null)
+                string instrument = ChartInstrument(chart);
+                if (String.IsNullOrWhiteSpace(instrument))
                     continue;
-                string instrument = chart.ActiveChartControl.Instrument.FullName;
                 if (firstInstrument == null)
                     firstInstrument = instrument;
                 if (String.Equals(instrument, configured, StringComparison.Ordinal))
@@ -158,12 +163,50 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return;
             }
             if (focusCorrectChart)
-            {
-                try { correct.Activate(); }
-                catch (InvalidOperationException) { }
-            }
+                ActivateChart(correct);
             if (automaticObserver != null)
                 automaticObserver.PublishAttachment(true);
+        }
+
+        private static string ChartInstrument(NinjaTrader.Gui.Chart.Chart chart)
+        {
+            if (chart == null)
+                return null;
+            Func<string> resolve = () =>
+            {
+                if (chart.ActiveChartControl == null || chart.ActiveChartControl.Instrument == null)
+                    return null;
+                return chart.ActiveChartControl.Instrument.FullName;
+            };
+            try
+            {
+                if (chart.Dispatcher.CheckAccess())
+                    return resolve();
+                return chart.Dispatcher.Invoke(resolve);
+            }
+            catch (InvalidOperationException)
+            {
+                return null;
+            }
+        }
+
+        private static void ActivateChart(NinjaTrader.Gui.Chart.Chart chart)
+        {
+            if (chart == null)
+                return;
+            Action activate = () =>
+            {
+                try { chart.Activate(); }
+                catch (InvalidOperationException) { }
+            };
+            try
+            {
+                if (chart.Dispatcher.CheckAccess())
+                    activate();
+                else
+                    chart.Dispatcher.BeginInvoke(activate);
+            }
+            catch (InvalidOperationException) { }
         }
 
         private void EnsureAutomaticObserver()
@@ -1045,7 +1088,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string AttestedSchema = "lane-iii-phase-f3-ninjatrader-observation-v2";
         private const string AttestationProtocol = "l3f3-ninjatrader-observer-attestation-v1";
         private const string AttestationKeyContext = "BEELZEBUB_NINJATRADER_OBSERVATION_V2";
-        private const string ProducerSourceFingerprint = "8fdab72408699158516ff88d8c5a56a5b837134c91cddabfaa356c054185f4f8";
+        private const string ProducerSourceFingerprint = "6cb4ceb5b7a1b9eea9d2c5aa40738f3c8847f3774825146c279f4d0d537cc49b";
         // Event-driven trades/depth require burst capacity, but memory remains
         // bounded. A full queue drops the signed frame after assigning its
         // sequence; the next source_event_sequence exposes the gap.
