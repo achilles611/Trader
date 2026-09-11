@@ -62,6 +62,193 @@ class MaintenanceEventKind(StrEnum):
     FILL = "FILL"
 
 
+@dataclass(frozen=True)
+class ResearchEvidenceEffect:
+    """One explicitly versioned, uncalibrated research-state mapping."""
+
+    component_id: str
+    component_version: str
+    dependency_group: str
+    state: str
+    volume_regime: VolumeRegime
+    log_odds_effect: float
+    required: bool
+
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(value, str) or not value.strip()
+            for value in (
+                self.component_id,
+                self.component_version,
+                self.dependency_group,
+                self.state,
+            )
+        ):
+            raise ValueError("Research evidence mapping identity fields are required.")
+        if type(self.volume_regime) is not VolumeRegime:
+            raise ValueError("Research evidence mapping volume regime is invalid.")
+        if not math.isfinite(float(self.log_odds_effect)):
+            raise ValueError("Research evidence mapping effect must be finite.")
+        if type(self.required) is not bool:
+            raise ValueError("Research evidence mapping required flag must be boolean.")
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "component_id": self.component_id,
+            "component_version": self.component_version,
+            "dependency_group": self.dependency_group,
+            "state": self.state,
+            "volume_regime": self.volume_regime.value,
+            "log_odds_effect": self.log_odds_effect,
+            "required": self.required,
+        }
+
+
+@dataclass(frozen=True)
+class ResearchEvidenceMapping:
+    """Frozen synthetic hypothesis mapping; never a calibrated probability."""
+
+    mapping_id: str
+    mapping_version: str
+    effects: tuple[ResearchEvidenceEffect, ...]
+    dependency_group_bounds: tuple[tuple[str, float], ...]
+    calibration_status: str = EXPERIMENTAL_DIRECTIONAL_SUPPORT
+    production_configured: bool = False
+
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(value, str) or not value.strip()
+            for value in (self.mapping_id, self.mapping_version)
+        ):
+            raise ValueError("Research evidence mapping identity is required.")
+        if self.calibration_status != EXPERIMENTAL_DIRECTIONAL_SUPPORT:
+            raise ValueError("The frozen mapping is not a calibrated probability model.")
+        if self.production_configured or DISCERNMENT_EXECUTION_ENABLED:
+            raise ValueError("The research evidence mapping cannot enable execution.")
+        effect_keys = [
+            (
+                item.component_id,
+                item.component_version,
+                item.state,
+                item.volume_regime.value,
+            )
+            for item in self.effects
+        ]
+        if not effect_keys or len(effect_keys) != len(set(effect_keys)):
+            raise ValueError("Research evidence mapping entries must be non-empty and unique.")
+        groups = [group for group, _ in self.dependency_group_bounds]
+        if len(groups) != len(set(groups)):
+            raise ValueError("Research evidence dependency group bounds must be unique.")
+        for group, bound in self.dependency_group_bounds:
+            if not isinstance(group, str) or not group.strip():
+                raise ValueError("Research evidence dependency group is required.")
+            if not math.isfinite(float(bound)) or float(bound) <= 0:
+                raise ValueError("Research evidence dependency group bound must be positive.")
+        if {item.dependency_group for item in self.effects} - set(groups):
+            raise ValueError("Every research evidence dependency group requires a bound.")
+
+    @property
+    def mapping_hash(self) -> str:
+        return canonical_hash(self.payload())
+
+    @property
+    def required_components(self) -> tuple[tuple[str, str], ...]:
+        return tuple(
+            sorted(
+                {
+                    (effect.component_id, effect.component_version)
+                    for effect in self.effects
+                    if effect.required
+                }
+            )
+        )
+
+    def effect_for(
+        self,
+        component_id: str,
+        component_version: str,
+        state: str,
+        volume_regime: VolumeRegime,
+    ) -> float:
+        matches = [
+            item.log_odds_effect
+            for item in self.effects
+            if (
+                item.component_id == component_id
+                and item.component_version == component_version
+                and item.state == state
+                and item.volume_regime is volume_regime
+            )
+        ]
+        if len(matches) != 1:
+            raise ValueError("Research evidence state mapping is unavailable or ambiguous.")
+        return matches[0]
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "mapping_id": self.mapping_id,
+            "mapping_version": self.mapping_version,
+            "effects": [
+                item.payload()
+                for item in sorted(
+                    self.effects,
+                    key=lambda value: (
+                        value.component_id,
+                        value.component_version,
+                        value.state,
+                        value.volume_regime.value,
+                    ),
+                )
+            ],
+            "dependency_group_bounds": [
+                [group, bound] for group, bound in sorted(self.dependency_group_bounds)
+            ],
+            "calibration_status": self.calibration_status,
+            "production_configured": self.production_configured,
+            "execution_enabled": DISCERNMENT_EXECUTION_ENABLED,
+        }
+
+
+_RESEARCH_EFFECT_ROWS = (
+    # LOW gives validated flow/interaction hypotheses more influence than the
+    # weak structural fixture.  Group bounds still prevent independent votes.
+    ("CLASSIFIED_FLOW", "BUY_PROGRESS", 0.90, 0.75),
+    ("CLASSIFIED_FLOW", "BUY_ABSORBED", -0.45, -0.40),
+    ("CLASSIFIED_FLOW", "SELL_PROGRESS", -0.90, -0.75),
+    ("CLASSIFIED_FLOW", "SELL_ABSORBED", 0.45, 0.40),
+    ("INTERACTING_LIQUIDITY", "LONG_INTERACTION", 0.75, 0.60),
+    ("INTERACTING_LIQUIDITY", "SHORT_INTERACTION", -0.75, -0.60),
+    ("WEAK_STRUCTURE", "LONG", 0.10, 0.25),
+    ("WEAK_STRUCTURE", "SHORT", -0.10, -0.25),
+)
+
+PONG_RESEARCH_EVIDENCE_MAPPING = ResearchEvidenceMapping(
+    mapping_id="pong-discernment-synthetic-research-mapping",
+    mapping_version="1",
+    effects=tuple(
+        ResearchEvidenceEffect(
+            component_id,
+            "1",
+            (
+                "FLOW_AND_INTERACTION_SHARED"
+                if component_id != "WEAK_STRUCTURE"
+                else "WEAK_STRUCTURE"
+            ),
+            state,
+            regime,
+            low_effect if regime is VolumeRegime.LOW else normal_effect,
+            component_id in {"CLASSIFIED_FLOW", "INTERACTING_LIQUIDITY"},
+        )
+        for component_id, state, low_effect, normal_effect in _RESEARCH_EFFECT_ROWS
+        for regime in (VolumeRegime.LOW, VolumeRegime.NORMAL)
+    ),
+    dependency_group_bounds=(
+        ("FLOW_AND_INTERACTION_SHARED", 1.25),
+        ("WEAK_STRUCTURE", 0.35),
+    ),
+)
+
+
 def _required_text(value: object, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} is required.")
@@ -195,8 +382,16 @@ class ComponentEffect:
     log_odds_effect: float
     event_id: str
     source_event_at: str
+    received_at: str
     available_at: str
+    valid_until: str
+    evidence_revision: int
+    continuity_domain: str
+    continuity_valid: bool
+    required: bool
     source_ids: tuple[str, ...]
+    source_hashes: tuple[str, ...]
+    evidence_hash: str
 
     def __post_init__(self) -> None:
         for value, field in (
@@ -204,17 +399,31 @@ class ComponentEffect:
             (self.component_version, "Component effect version"),
             (self.dependency_group, "Component effect dependency group"),
             (self.event_id, "Component effect event ID"),
+            (self.continuity_domain, "Component effect continuity domain"),
         ):
             _required_text(value, field)
         _finite(self.log_odds_effect, "Component log-odds effect")
-        if not self.source_ids or tuple(sorted(self.source_ids)) != self.source_ids:
-            raise ValueError("Component source IDs must be non-empty and sorted.")
+        if type(self.evidence_revision) is not int or self.evidence_revision <= 0:
+            raise ValueError("Component evidence revision must be positive.")
+        if type(self.continuity_valid) is not bool or type(self.required) is not bool:
+            raise ValueError("Component evidence state flags must be booleans.")
+        source_at = _utc(self.source_event_at, "Component source event time")
+        received_at = _utc(self.received_at, "Component receipt time")
+        available_at = _utc(self.available_at, "Component available-at time")
+        valid_until = _utc(self.valid_until, "Component valid-until time")
+        if source_at > received_at or received_at > available_at or available_at >= valid_until:
+            raise ValueError("Component effect timing is non-causal.")
+        if not self.source_ids or len(self.source_ids) != len(self.source_hashes):
+            raise ValueError("Component source IDs and hashes must be non-empty and aligned.")
+        if tuple(sorted(zip(self.source_ids, self.source_hashes))) != tuple(
+            zip(self.source_ids, self.source_hashes)
+        ):
+            raise ValueError("Component source identities must be deterministically ordered.")
         if len(set(self.source_ids)) != len(self.source_ids):
             raise ValueError("Component source IDs must be unique.")
-        if _utc(self.source_event_at, "Component source event time") > _utc(
-            self.available_at, "Component available-at time"
-        ):
-            raise ValueError("Component effect timing is non-causal.")
+        for source_hash in self.source_hashes:
+            _sha256(source_hash, "Component source hash")
+        _sha256(self.evidence_hash, "Component evidence hash")
 
     def payload(self) -> dict[str, object]:
         return {
@@ -224,8 +433,16 @@ class ComponentEffect:
             "log_odds_effect": self.log_odds_effect,
             "event_id": self.event_id,
             "source_event_at": normalized_utc(self.source_event_at, "Component source event time"),
+            "received_at": normalized_utc(self.received_at, "Component receipt time"),
             "available_at": normalized_utc(self.available_at, "Component available-at time"),
+            "valid_until": normalized_utc(self.valid_until, "Component valid-until time"),
+            "evidence_revision": self.evidence_revision,
+            "continuity_domain": self.continuity_domain,
+            "continuity_valid": self.continuity_valid,
+            "required": self.required,
             "source_ids": list(self.source_ids),
+            "source_hashes": list(self.source_hashes),
+            "evidence_hash": self.evidence_hash,
         }
 
 
@@ -253,6 +470,7 @@ class DiscernmentPolicy:
     model_version: str = DISCERNMENT_MODEL_VERSION
     calibration_status: str = EXPERIMENTAL_DIRECTIONAL_SUPPORT
     production_configured: bool = DISCERNMENT_PRODUCTION_CONFIGURED
+    evidence_mapping_hash: str | None = None
 
     def __post_init__(self) -> None:
         unit_interval(self.prior_long_score, "prior_long_score")
@@ -272,6 +490,8 @@ class DiscernmentPolicy:
         _required_text(self.model_version, "Discernment model version")
         if self.calibration_status != EXPERIMENTAL_DIRECTIONAL_SUPPORT:
             raise ValueError("The Pong research fixture is not a calibrated probability model.")
+        if self.evidence_mapping_hash is not None:
+            _sha256(self.evidence_mapping_hash, "Discernment evidence mapping hash")
         if len(set(self.required_components)) != len(self.required_components):
             raise ValueError("Required component identities must be unique.")
         for component_id, component_version in self.required_components:
@@ -297,6 +517,16 @@ class DiscernmentPolicy:
             dependency_group_bounds=tuple(dependency_group_bounds),
         )
 
+    @classmethod
+    def frozen_research_mapping(cls) -> "DiscernmentPolicy":
+        """Use the explicit v1 hypothesis mapping without enabling operation."""
+        mapping = PONG_RESEARCH_EVIDENCE_MAPPING
+        return cls(
+            required_components=mapping.required_components,
+            dependency_group_bounds=mapping.dependency_group_bounds,
+            evidence_mapping_hash=mapping.mapping_hash,
+        )
+
     @property
     def model_hash(self) -> str:
         return canonical_hash(
@@ -310,6 +540,7 @@ class DiscernmentPolicy:
                     [group, bound] for group, bound in sorted(self.dependency_group_bounds)
                 ],
                 "calibration_status": self.calibration_status,
+                "evidence_mapping_hash": self.evidence_mapping_hash,
             }
         )
 
@@ -339,6 +570,9 @@ class DiscernmentPolicy:
             short_reachable,
             None if long_reachable and short_reachable else STRONG_THRESHOLD_UNREACHABLE,
         )
+
+
+PONG_RESEARCH_POLICY = DiscernmentPolicy.frozen_research_mapping()
 
 
 @dataclass(frozen=True)
@@ -471,6 +705,53 @@ class DiscernmentSnapshot:
         return payload
 
 
+def _switch_identity_material(
+    *,
+    sequence: int,
+    prior_switch_id: str | None,
+    previous_direction: DiscernmentDirection,
+    direction: DiscernmentDirection,
+    occurred_at: str,
+    available_at: str,
+    continuity_valid: bool,
+    continuity_domain: str,
+    snapshot: DiscernmentSnapshot,
+    long_on_threshold: float,
+    short_on_threshold: float,
+    strong_threshold: float,
+) -> dict[str, object]:
+    return {
+        "schema": DISCERNMENT_SCHEMA,
+        "event_type": "DISCERNMENT_SWITCH",
+        "sequence": sequence,
+        "prior_switch_id": prior_switch_id,
+        "prior_latch": previous_direction.value,
+        "next_latch": direction.value,
+        "previous_direction": previous_direction.value,
+        "direction": direction.value,
+        "occurred_at": normalized_utc(occurred_at, "Switch occurrence time"),
+        "available_at": normalized_utc(available_at, "Switch available-at time"),
+        "continuity_valid": continuity_valid,
+        "continuity_domain": continuity_domain,
+        "snapshot_hash": snapshot.result_hash,
+        "snapshot_evidence_revision": snapshot.evidence_revision,
+        "snapshot_as_of": snapshot.as_of,
+        "snapshot_received_at": snapshot.received_at,
+        "snapshot_available_at": snapshot.available_at,
+        "instrument": snapshot.instrument,
+        "contract": snapshot.contract,
+        "policy_hash": snapshot.policy_hash,
+        "model_hash": snapshot.model_hash,
+        "long_on_threshold": long_on_threshold,
+        "short_on_threshold": short_on_threshold,
+        "strong_threshold": strong_threshold,
+        "calibration_status": snapshot.calibration_status,
+    }
+
+
+_VERIFY_UNSET = object()
+
+
 @dataclass(frozen=True)
 class DiscernmentSwitch:
     event_id: str
@@ -483,6 +764,9 @@ class DiscernmentSwitch:
     continuity_valid: bool
     continuity_domain: str
     snapshot: DiscernmentSnapshot
+    long_on_threshold: float = 0.65
+    short_on_threshold: float = 0.35
+    strong_threshold: float = 0.85
 
     def __post_init__(self) -> None:
         if not self.event_id.startswith("pong-discernment-switch-"):
@@ -496,6 +780,13 @@ class DiscernmentSwitch:
             raise ValueError("Discernment switch directions are invalid.")
         if self.previous_direction is self.direction:
             raise ValueError("Discernment switch requires a distinct direction transition.")
+        long_on = unit_interval(self.long_on_threshold, "switch long_on_threshold")
+        short_on = unit_interval(self.short_on_threshold, "switch short_on_threshold")
+        strong = unit_interval(self.strong_threshold, "switch strong_threshold")
+        if not 0 < short_on < 0.5 < long_on < strong < 1 or not math.isclose(
+            short_on, 1 - long_on, rel_tol=0, abs_tol=1e-12
+        ):
+            raise ValueError("Discernment switch thresholds are invalid.")
         if normalized_utc(self.occurred_at, "Switch occurrence time") != normalized_utc(
             self.available_at, "Switch available-at time"
         ):
@@ -510,6 +801,65 @@ class DiscernmentSwitch:
             raise ValueError("Discernment switch continuity domain mismatch.")
         if normalized_utc(self.available_at, "Switch available-at time") != self.snapshot.available_at:
             raise ValueError("Discernment switch must bind its causal snapshot.")
+        score = self.effective_long_score
+        if self.direction is DiscernmentDirection.LONG:
+            valid_transition = (
+                self.previous_direction is DiscernmentDirection.SHORT and score >= long_on
+            )
+        else:
+            valid_transition = (
+                self.previous_direction is DiscernmentDirection.LONG and score <= short_on
+            )
+        if not valid_transition:
+            raise ValueError("Discernment direction is not the snapshot's opposite threshold transition.")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        policy: DiscernmentPolicy,
+        sequence: int,
+        prior_switch_id: str | None,
+        previous_direction: DiscernmentDirection,
+        direction: DiscernmentDirection,
+        snapshot: DiscernmentSnapshot,
+    ) -> "DiscernmentSwitch":
+        """Create a deterministic switch bound to the approved policy and snapshot."""
+        if snapshot.policy_hash != policy.policy_hash or snapshot.model_hash != policy.model_hash:
+            raise ValueError("Discernment snapshot does not match the switch policy.")
+        occurred_at = snapshot.available_at
+        available_at = snapshot.available_at
+        material = _switch_identity_material(
+            sequence=sequence,
+            prior_switch_id=prior_switch_id,
+            previous_direction=previous_direction,
+            direction=direction,
+            occurred_at=occurred_at,
+            available_at=available_at,
+            continuity_valid=snapshot.continuity_valid,
+            continuity_domain=snapshot.continuity_domain,
+            snapshot=snapshot,
+            long_on_threshold=policy.long_on_threshold,
+            short_on_threshold=policy.short_on_threshold,
+            strong_threshold=policy.strong_threshold,
+        )
+        result = cls(
+            event_id="pong-discernment-switch-" + canonical_hash(material)[:32],
+            sequence=sequence,
+            prior_switch_id=prior_switch_id,
+            previous_direction=previous_direction,
+            direction=direction,
+            occurred_at=occurred_at,
+            available_at=available_at,
+            continuity_valid=snapshot.continuity_valid,
+            continuity_domain=snapshot.continuity_domain,
+            snapshot=snapshot,
+            long_on_threshold=policy.long_on_threshold,
+            short_on_threshold=policy.short_on_threshold,
+            strong_threshold=policy.strong_threshold,
+        )
+        result.require_verified(policy)
+        return result
 
     @property
     def switch_id(self) -> str:
@@ -519,6 +869,94 @@ class DiscernmentSwitch:
     def effective_long_score(self) -> float:
         assert self.snapshot.effective_long_score is not None
         return self.snapshot.effective_long_score
+
+    @property
+    def identity_material(self) -> dict[str, object]:
+        return _switch_identity_material(
+            sequence=self.sequence,
+            prior_switch_id=self.prior_switch_id,
+            previous_direction=self.previous_direction,
+            direction=self.direction,
+            occurred_at=self.occurred_at,
+            available_at=self.available_at,
+            continuity_valid=self.continuity_valid,
+            continuity_domain=self.continuity_domain,
+            snapshot=self.snapshot,
+            long_on_threshold=self.long_on_threshold,
+            short_on_threshold=self.short_on_threshold,
+            strong_threshold=self.strong_threshold,
+        )
+
+    def verification_error(
+        self,
+        policy: DiscernmentPolicy,
+        *,
+        expected_previous_direction: DiscernmentDirection | None = None,
+        expected_prior_switch_id: object = _VERIFY_UNSET,
+        expected_sequence: int | None = None,
+    ) -> str | None:
+        """Return a stable reason if this event is not an approved causal transition."""
+        if type(policy) is not DiscernmentPolicy:
+            return "DISCERNMENT_SWITCH_POLICY_TYPE_INVALID"
+        if self.snapshot.policy_hash != policy.policy_hash:
+            return "DISCERNMENT_SWITCH_POLICY_HASH_MISMATCH"
+        if self.snapshot.model_hash != policy.model_hash:
+            return "DISCERNMENT_SWITCH_MODEL_HASH_MISMATCH"
+        if not all(
+            math.isclose(actual, expected, rel_tol=0, abs_tol=1e-15)
+            for actual, expected in (
+                (self.long_on_threshold, policy.long_on_threshold),
+                (self.short_on_threshold, policy.short_on_threshold),
+                (self.strong_threshold, policy.strong_threshold),
+            )
+        ):
+            return "DISCERNMENT_SWITCH_THRESHOLD_CONTRACT_MISMATCH"
+        if expected_previous_direction is not None and (
+            self.previous_direction is not expected_previous_direction
+        ):
+            return "DISCERNMENT_SWITCH_PRIOR_LATCH_MISMATCH"
+        if expected_prior_switch_id is not _VERIFY_UNSET and (
+            self.prior_switch_id != expected_prior_switch_id
+        ):
+            return "DISCERNMENT_SWITCH_PRIOR_ID_MISMATCH"
+        if expected_sequence is not None and self.sequence != expected_sequence:
+            return "DISCERNMENT_SWITCH_SEQUENCE_MISMATCH"
+        expected_id = "pong-discernment-switch-" + canonical_hash(self.identity_material)[:32]
+        if self.event_id != expected_id:
+            return "DISCERNMENT_SWITCH_IDENTITY_MISMATCH"
+        return None
+
+    def verify(
+        self,
+        policy: DiscernmentPolicy,
+        *,
+        expected_previous_direction: DiscernmentDirection | None = None,
+        expected_prior_switch_id: object = _VERIFY_UNSET,
+        expected_sequence: int | None = None,
+    ) -> bool:
+        return self.verification_error(
+            policy,
+            expected_previous_direction=expected_previous_direction,
+            expected_prior_switch_id=expected_prior_switch_id,
+            expected_sequence=expected_sequence,
+        ) is None
+
+    def require_verified(
+        self,
+        policy: DiscernmentPolicy,
+        *,
+        expected_previous_direction: DiscernmentDirection | None = None,
+        expected_prior_switch_id: object = _VERIFY_UNSET,
+        expected_sequence: int | None = None,
+    ) -> None:
+        reason = self.verification_error(
+            policy,
+            expected_previous_direction=expected_previous_direction,
+            expected_prior_switch_id=expected_prior_switch_id,
+            expected_sequence=expected_sequence,
+        )
+        if reason is not None:
+            raise ValueError(reason)
 
     def payload(self) -> dict[str, object]:
         return {
@@ -533,7 +971,13 @@ class DiscernmentSwitch:
             "continuity_valid": self.continuity_valid,
             "continuity_domain": self.continuity_domain,
             "snapshot_hash": self.snapshot.result_hash,
+            "snapshot_evidence_revision": self.snapshot.evidence_revision,
             "effective_long_score": self.effective_long_score,
+            "policy_hash": self.snapshot.policy_hash,
+            "model_hash": self.snapshot.model_hash,
+            "long_on_threshold": self.long_on_threshold,
+            "short_on_threshold": self.short_on_threshold,
+            "strong_threshold": self.strong_threshold,
         }
 
 
@@ -555,7 +999,7 @@ class DiscernmentEngine:
         instrument: str = DISCERNMENT_INSTRUMENT,
         contract: str = DISCERNMENT_CONTRACT,
     ) -> None:
-        self.policy = policy or DiscernmentPolicy.research_fixture()
+        self.policy = policy or PONG_RESEARCH_POLICY
         if instrument != DISCERNMENT_INSTRUMENT or contract != DISCERNMENT_CONTRACT:
             raise ValueError("Discernment is sealed to verified MNQ SEP26 / MNQU6.")
         self.instrument = instrument
@@ -721,14 +1165,22 @@ class DiscernmentEngine:
 
         components = tuple(
             ComponentEffect(
-                item.component_id,
-                item.component_version,
-                item.dependency_group,
-                float(item.log_odds_effect),
-                item.event_id,
-                item.source_event_at,
-                item.available_at,
-                item.source_ids,
+                component_id=item.component_id,
+                component_version=item.component_version,
+                dependency_group=item.dependency_group,
+                log_odds_effect=float(item.log_odds_effect),
+                event_id=item.event_id,
+                source_event_at=item.source_event_at,
+                received_at=item.received_at,
+                available_at=item.available_at,
+                valid_until=item.valid_until,
+                evidence_revision=item.evidence_revision,
+                continuity_domain=item.continuity_domain,
+                continuity_valid=item.continuity_valid,
+                required=item.required,
+                source_ids=item.source_ids,
+                source_hashes=item.source_hashes,
+                evidence_hash=item.evidence_hash,
             )
             for item in active
         )
@@ -833,31 +1285,15 @@ class DiscernmentEngine:
 
         previous = self._latched_direction
         sequence = self._switch_sequence + 1
-        material = {
-            "schema": DISCERNMENT_SCHEMA,
-            "sequence": sequence,
-            "prior_switch_id": self._last_switch_id,
-            "previous_direction": previous.value,
-            "direction": candidate.value,
-            "snapshot_hash": snapshot.result_hash,
-            "evidence_revision": snapshot.evidence_revision,
-            "policy_hash": snapshot.policy_hash,
-            "continuity_domain": snapshot.continuity_domain,
-        }
-        event_id = "pong-discernment-switch-" + canonical_hash(material)[:32]
-        switch = DiscernmentSwitch(
-            event_id,
-            sequence,
-            self._last_switch_id,
-            previous,
-            candidate,
-            snapshot.available_at,
-            snapshot.available_at,
-            snapshot.continuity_valid,
-            snapshot.continuity_domain,
-            snapshot,
+        switch = DiscernmentSwitch.create(
+            policy=self.policy,
+            sequence=sequence,
+            prior_switch_id=self._last_switch_id,
+            previous_direction=previous,
+            direction=candidate,
+            snapshot=snapshot,
         )
         self._latched_direction = candidate
         self._switch_sequence = sequence
-        self._last_switch_id = event_id
+        self._last_switch_id = switch.event_id
         return switch
