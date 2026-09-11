@@ -867,27 +867,39 @@ namespace NinjaTrader.NinjaScript.AddOns
             List<string> askRows = new List<string>();
             double priorBid = Double.PositiveInfinity;
             double priorAsk = Double.NegativeInfinity;
-            int bidCount = Math.Min(MaximumPublishedBookLevelsPerSide, instrument.MarketDepth.Bids.Count);
-            int askCount = Math.Min(MaximumPublishedBookLevelsPerSide, instrument.MarketDepth.Asks.Count);
-            for (int index = 0; index < bidCount; index++)
+            try
             {
-                double price = instrument.MarketDepth.Bids[index].Price;
-                long volume = instrument.MarketDepth.Bids[index].Volume;
-                if (!FinitePositive(price) || volume <= 0 || price >= priorBid)
-                    return false;
-                if (index == 0) bestNativeBid = price;
-                priorBid = price;
-                bidRows.Add("{\"price\":" + price.ToString(CultureInfo.InvariantCulture) + ",\"size\":" + volume + "}");
+                // NinjaTrader owns these positional collections and can resize
+                // them between Count and the following indexed read.  A local
+                // lock only serializes our callbacks; it cannot lock the native
+                // producer.  Treat that exact transient race as an unavailable
+                // snapshot so no exception escapes the market-data callback.
+                int bidCount = Math.Min(MaximumPublishedBookLevelsPerSide, instrument.MarketDepth.Bids.Count);
+                int askCount = Math.Min(MaximumPublishedBookLevelsPerSide, instrument.MarketDepth.Asks.Count);
+                for (int index = 0; index < bidCount; index++)
+                {
+                    double price = instrument.MarketDepth.Bids[index].Price;
+                    long volume = instrument.MarketDepth.Bids[index].Volume;
+                    if (!FinitePositive(price) || volume <= 0 || price >= priorBid)
+                        return false;
+                    if (index == 0) bestNativeBid = price;
+                    priorBid = price;
+                    bidRows.Add("{\"price\":" + price.ToString(CultureInfo.InvariantCulture) + ",\"size\":" + volume + "}");
+                }
+                for (int index = 0; index < askCount; index++)
+                {
+                    double price = instrument.MarketDepth.Asks[index].Price;
+                    long volume = instrument.MarketDepth.Asks[index].Volume;
+                    if (!FinitePositive(price) || volume <= 0 || price <= priorAsk)
+                        return false;
+                    if (index == 0) bestNativeAsk = price;
+                    priorAsk = price;
+                    askRows.Add("{\"price\":" + price.ToString(CultureInfo.InvariantCulture) + ",\"size\":" + volume + "}");
+                }
             }
-            for (int index = 0; index < askCount; index++)
+            catch (ArgumentOutOfRangeException)
             {
-                double price = instrument.MarketDepth.Asks[index].Price;
-                long volume = instrument.MarketDepth.Asks[index].Volume;
-                if (!FinitePositive(price) || volume <= 0 || price <= priorAsk)
-                    return false;
-                if (index == 0) bestNativeAsk = price;
-                priorAsk = price;
-                askRows.Add("{\"price\":" + price.ToString(CultureInfo.InvariantCulture) + ",\"size\":" + volume + "}");
+                return false;
             }
             bidLevels = "[" + String.Join(",", bidRows) + "]";
             askLevels = "[" + String.Join(",", askRows) + "]";
@@ -1028,7 +1040,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string AttestedSchema = "lane-iii-phase-f3-ninjatrader-observation-v2";
         private const string AttestationProtocol = "l3f3-ninjatrader-observer-attestation-v1";
         private const string AttestationKeyContext = "BEELZEBUB_NINJATRADER_OBSERVATION_V2";
-        private const string ProducerSourceFingerprint = "abf30d0e4a42d5c717e991e344d53fe730e10e9f7861bac026263bb661e72587";
+        private const string ProducerSourceFingerprint = "02f5161d932cb1a2b92ecf36962e3cd41c758d7444093a2c172e668fed2d62cf";
         // Event-driven trades/depth require burst capacity, but memory remains
         // bounded. A full queue drops the signed frame after assigning its
         // sequence; the next source_event_sequence exposes the gap.

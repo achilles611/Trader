@@ -102,7 +102,7 @@ class ObservationAttestationTests(unittest.TestCase):
             self.assertIn("EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1", text)
             self.assertIn("EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1", text)
             self.assertIn("MarketDepth.Bids[index]", text)
-        self.assertEqual(SOURCE_HASH, "abf30d0e4a42d5c717e991e344d53fe730e10e9f7861bac026263bb661e72587")
+        self.assertEqual(SOURCE_HASH, "02f5161d932cb1a2b92ecf36962e3cd41c758d7444093a2c172e668fed2d62cf")
 
 
 if __name__ == "__main__":

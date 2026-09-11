@@ -1658,6 +1658,7 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertNotIn("TryReservePublication(ref lastDepthPublicationTicks", source)
         self.assertIn("private readonly object bookLock = new object();", source)
         self.assertIn("lock (bookLock)", source)
+        self.assertIn("catch (ArgumentOutOfRangeException)", source)
         depth_unavailable = source[
             source.index("        private void PublishDepthUnavailable"):
             source.index("        private static bool FinitePositive")
@@ -1674,6 +1675,7 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertIn("private const int MaximumQueuedFrames = 4096;", addon)
         self.assertIn("private readonly object bookLock = new object();", addon)
         self.assertIn("lock (bookLock)", addon)
+        self.assertIn("catch (ArgumentOutOfRangeException)", addon)
         automatic_unavailable = addon[
             addon.index("        private void PublishDepthUnavailable"):
             addon.index("        private static bool TryReservePublication", addon.index("        private void PublishDepthUnavailable"))
