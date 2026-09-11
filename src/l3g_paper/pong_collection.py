@@ -130,6 +130,7 @@ class PongAuthenticHourCollector:
     """Persist signed native events and prove complete UTC-hour coverage."""
 
     _QUEUE_CAPACITY = 262_144
+    _JOURNAL_BUFFER_BYTES = 1024 * 1024
     _FLUSH_INTERVAL_SECONDS = 0.25
     _STATUS_INTERVAL_SECONDS = 1.0
     _START_TIMEOUT_SECONDS = 5.0
@@ -338,7 +339,13 @@ class PongAuthenticHourCollector:
         last_status = 0.0
         try:
             self.collector_root.mkdir(parents=True, exist_ok=False)
-            journal = self.journal_path.open("ab", buffering=0)
+            # Network-backed audit roots make one physical write per market
+            # event too slow for authentic MNQ bursts. Buffer the append-only
+            # stream, then explicitly flush it before every fsync so the
+            # durable-record watermark keeps its exact meaning.
+            journal = self.journal_path.open(
+                "ab", buffering=self._JOURNAL_BUFFER_BYTES,
+            )
             with self._lock:
                 self._state = "COLLECTING"
                 self._error = None
@@ -376,6 +383,7 @@ class PongAuthenticHourCollector:
                     or pending_records >= 1024
                     or now_monotonic - last_flush >= self._FLUSH_INTERVAL_SECONDS
                 ):
+                    journal.flush()
                     os.fsync(journal.fileno())
                     with self._lock:
                         self._durable_records = self._written_records
@@ -388,6 +396,7 @@ class PongAuthenticHourCollector:
             # Queue order guarantees STOP follows every record accepted before
             # stop(); perform one final durable checkpoint and status write.
             if pending_records:
+                journal.flush()
                 os.fsync(journal.fileno())
                 with self._lock:
                     self._durable_records = self._written_records
