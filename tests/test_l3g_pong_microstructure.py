@@ -5,6 +5,7 @@ from decimal import Decimal
 import unittest
 
 from src.lane_iii.contracts import canonical_hash
+from src.l3g_paper.discernment import DiscernmentDirection, DiscernmentEngine
 from src.l3g_paper.pong_microstructure import (
     AggressorProvenance,
     AggressorSide,
@@ -17,6 +18,8 @@ from src.l3g_paper.pong_microstructure import (
     FlowBehavior,
     LiquidityChangeKind,
     LiquidityClusterAdapter,
+    MappedMicrostructureEvidence,
+    MicrostructureEvidenceMapper,
     PriceResponse,
     ReductionAttribution,
     VolumeRegime,
@@ -33,18 +36,37 @@ def stamp(seconds: int, *, base: datetime = BASE) -> str:
     return (base + timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
 
 
-def event(sequence: int, *, available_offset: int | None = None) -> CausalEventRef:
+def event(
+    sequence: int,
+    *,
+    available_offset: int | None = None,
+    base: datetime = BASE,
+    namespace: str = "event",
+) -> CausalEventRef:
     available = sequence if available_offset is None else available_offset
-    payload = {"sequence": sequence, "available": available}
+    payload = {
+        "sequence": sequence, "available": available,
+        "base": base.isoformat(), "namespace": namespace,
+    }
     return CausalEventRef(
-        f"event-{sequence}", canonical_hash(payload), stamp(sequence), stamp(sequence),
-        stamp(available), sequence, "LOCAL_CALLBACK_ORDER", "test-continuity",
+        f"{namespace}-{sequence}", canonical_hash(payload), stamp(sequence, base=base),
+        stamp(sequence, base=base), stamp(available, base=base), sequence,
+        "LOCAL_CALLBACK_ORDER", "test-continuity",
     )
 
 
-def trade(sequence: int, side: AggressorSide, price: str, volume: str = "1") -> ClassifiedTrade:
+def trade(
+    sequence: int,
+    side: AggressorSide,
+    price: str,
+    volume: str = "1",
+    *,
+    base: datetime = BASE,
+    namespace: str = "trade",
+) -> ClassifiedTrade:
     return ClassifiedTrade(
-        event(sequence), "MNQ SEP26", Decimal(price), Decimal(volume), side,
+        event(sequence, base=base, namespace=namespace),
+        "MNQ SEP26", Decimal(price), Decimal(volume), side,
         AggressorProvenance.UNAVAILABLE
         if side is AggressorSide.UNKNOWN
         else AggressorProvenance.AUTHENTICATED_PROVIDER,
@@ -61,10 +83,13 @@ def depth(
     cancellation: bool = False,
     kind: DepthEventKind = DepthEventKind.UPDATE,
     response: PriceResponse = PriceResponse.UNAVAILABLE,
+    base: datetime = BASE,
+    namespace: str = "depth",
 ) -> DepthObservation:
     price = Decimal("100")
     return DepthObservation(
-        event(sequence), "MNQ SEP26", side, price, Decimal(quantity), Decimal("200"),
+        event(sequence, base=base, namespace=namespace),
+        "MNQ SEP26", side, price, Decimal(quantity), Decimal("200"),
         price, kind, Decimal(matched), Decimal(interaction), cancellation, response,
     )
 
@@ -257,6 +282,163 @@ class VolumeRegimeAdapterTests(unittest.TestCase):
             VolumeRegimeAdapter().evaluate(
                 current, (*self.prior, future_known), as_of=current.available_at,
             )
+
+
+class MicrostructureEvidenceMapperTests(unittest.TestCase):
+    @staticmethod
+    def frame(
+        base: datetime,
+        *,
+        long: bool,
+        revision: int,
+    ) -> tuple[MicrostructureEvidenceMapper, MappedMicrostructureEvidence]:
+        as_of = stamp(300, base=base)
+        side = AggressorSide.BUY if long else AggressorSide.SELL
+        prices = ("100", "100", "100.25", "100.25") if long else (
+            "100", "100", "99.75", "99.75",
+        )
+        flow = ClassifiedFlowAdapter().evaluate(
+            tuple(
+                trade(
+                    sequence, side, price, base=base,
+                    namespace=f"{'long' if long else 'short'}-flow",
+                )
+                for sequence, price in zip(range(297, 301), prices)
+            ),
+            window_start=stamp(296, base=base),
+            as_of=as_of,
+            feed_continuity_valid=True,
+        )
+        absorbing_side = BookSide.BID if long else BookSide.ASK
+        consumed_side = BookSide.ASK if long else BookSide.BID
+        absorbing = LiquidityClusterAdapter().evaluate(
+            (
+                depth(
+                    299, absorbing_side, "100", base=base,
+                    namespace=f"{'long' if long else 'short'}-absorb",
+                ),
+                depth(
+                    300, absorbing_side, "100", interaction="30",
+                    response=PriceResponse.REJECTION, base=base,
+                    namespace=f"{'long' if long else 'short'}-absorb",
+                ),
+            ),
+            as_of=as_of,
+            feed_continuity_valid=True,
+        )
+        consumed = LiquidityClusterAdapter().evaluate(
+            (
+                depth(
+                    299, consumed_side, "100", base=base,
+                    namespace=f"{'long' if long else 'short'}-consume",
+                ),
+                depth(
+                    300, consumed_side, "70", matched="30", interaction="30",
+                    response=PriceResponse.ACCEPTANCE, base=base,
+                    namespace=f"{'long' if long else 'short'}-consume",
+                ),
+            ),
+            as_of=as_of,
+            feed_continuity_valid=True,
+        )
+        bid = absorbing if absorbing.side is BookSide.BID else consumed
+        ask = absorbing if absorbing.side is BookSide.ASK else consumed
+        current = volume_window(
+            f"current-{'long' if long else 'short'}", base, "100",
+            kind=VolumeWindowKind.AS_OF,
+        )
+        priors = tuple(
+            volume_window(
+                f"prior-{'long' if long else 'short'}-{days}",
+                base - timedelta(days=days), "100",
+            )
+            for days in (3, 2, 1)
+        )
+        regime = VolumeRegimeAdapter().evaluate(current, priors, as_of=as_of)
+        mapper = MicrostructureEvidenceMapper()
+        return mapper, mapper.map_frame(
+            flow, bid, ask, regime, first_evidence_revision=revision,
+        )
+
+    def test_synthetic_events_map_causally_through_snapshot_and_switch(self) -> None:
+        mapper, long_batch = self.frame(BASE, long=True, revision=1)
+        self.assertEqual(long_batch.blockers, ())
+        self.assertEqual(len(long_batch.evidence), 4)
+        self.assertTrue(all(item.required for item in long_batch.evidence))
+        self.assertTrue(any(
+            "classified-flow-result" in item.source_ids
+            for item in long_batch.evidence
+        ))
+        engine = DiscernmentEngine(mapper.policy.discernment_policy())
+        long_updates = tuple(
+            engine.on_evidence(item, volume_regime=long_batch.volume_regime)
+            for item in long_batch.evidence
+        )
+        self.assertTrue(long_updates[-1].snapshot.valid)
+        self.assertEqual(engine.latched_direction, DiscernmentDirection.LONG)
+        self.assertTrue(all(item.switch is None for item in long_updates))
+        self.assertFalse(long_updates[-1].snapshot.execution_enabled)
+
+        _, short_batch = self.frame(
+            BASE + timedelta(minutes=10), long=False, revision=5,
+        )
+        short_updates = tuple(
+            engine.on_evidence(item, volume_regime=short_batch.volume_regime)
+            for item in short_batch.evidence
+        )
+        switch = short_updates[-1].switch
+        self.assertIsNotNone(switch)
+        assert switch is not None
+        self.assertEqual(switch.previous_direction, DiscernmentDirection.LONG)
+        self.assertEqual(switch.direction, DiscernmentDirection.SHORT)
+        self.assertFalse(switch.snapshot.execution_enabled)
+
+    def test_invalid_microstructure_maps_to_unavailable_without_neutral_evidence(self) -> None:
+        mapper, batch = self.frame(BASE, long=True, revision=1)
+        valid_flow_evidence = batch.evidence[0]
+        self.assertNotEqual(valid_flow_evidence.log_odds_effect, 0)
+        sparse = ClassifiedFlowAdapter().evaluate(
+            (trade(300, AggressorSide.BUY, "100", base=BASE, namespace="sparse"),),
+            window_start=stamp(296), as_of=stamp(300), feed_continuity_valid=True,
+        )
+        mapped = mapper.map_frame(
+            sparse,
+            self._valid_liquidity(BASE, BookSide.BID, True),
+            self._valid_liquidity(BASE, BookSide.ASK, False),
+            self._valid_regime(BASE),
+            first_evidence_revision=1,
+        )
+        self.assertEqual(mapped.evidence, ())
+        self.assertTrue(any(item.startswith("FLOW:") for item in mapped.blockers))
+
+    @staticmethod
+    def _valid_liquidity(
+        base: datetime, side: BookSide, absorption: bool,
+    ):
+        second_quantity = "100" if absorption else "70"
+        return LiquidityClusterAdapter().evaluate(
+            (
+                depth(299, side, "100", base=base, namespace=f"valid-{side}-liquidity"),
+                depth(
+                    300, side, second_quantity,
+                    matched="0" if absorption else "30", interaction="30",
+                    response=PriceResponse.REJECTION if absorption else PriceResponse.ACCEPTANCE,
+                    base=base, namespace=f"valid-{side}-liquidity",
+                ),
+            ),
+            as_of=stamp(300, base=base), feed_continuity_valid=True,
+        )
+
+    @staticmethod
+    def _valid_regime(base: datetime):
+        current = volume_window("valid-current", base, "100", kind=VolumeWindowKind.AS_OF)
+        priors = tuple(
+            volume_window(f"valid-prior-{days}", base - timedelta(days=days), "100")
+            for days in (3, 2, 1)
+        )
+        return VolumeRegimeAdapter().evaluate(
+            current, priors, as_of=stamp(300, base=base),
+        )
 
 
 if __name__ == "__main__":

@@ -19,6 +19,16 @@ from src.lane_iii.contracts import canonical_hash, normalized_utc
 
 
 PONG_REPLAY_SCHEMA = "beelzebub-pong-offline-replay-comparison-v1"
+REPLAY_COVERAGE_KINDS = (
+    "actual_execution_records",
+    "causal_bias_history",
+    "closure_record",
+    "executable_price_path",
+    "full_market_event_stream",
+    "legacy_switch_stream",
+    "low_volume_labels",
+    "outcome_path",
+)
 
 
 class EvidenceBasis(StrEnum):
@@ -82,17 +92,65 @@ class ReplaySourceRef:
     source_id: str
     source_hash: str
     available_at: str
+    coverage_kinds: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _text(self.source_id, "Replay source ID")
         _sha256(self.source_hash, "Replay source hash")
         _time(self.available_at, "Replay source available-at time")
+        if tuple(sorted(self.coverage_kinds)) != self.coverage_kinds:
+            raise ValueError("Replay source coverage kinds must be sorted.")
+        if len(set(self.coverage_kinds)) != len(self.coverage_kinds):
+            raise ValueError("Replay source coverage kinds must be unique.")
+        if any(item not in REPLAY_COVERAGE_KINDS for item in self.coverage_kinds):
+            raise ValueError("Replay source coverage kind is unknown.")
 
     def payload(self) -> dict[str, str]:
         return {
             "source_id": self.source_id,
             "source_hash": self.source_hash,
             "available_at": normalized_utc(self.available_at, "Replay source available-at time"),
+            "coverage_kinds": list(self.coverage_kinds),
+        }
+
+
+@dataclass(frozen=True)
+class ReplayCoverageArtifact:
+    coverage_kind: str
+    state: EvidenceBasis
+    source_ids: tuple[str, ...]
+    source_hashes: tuple[str, ...]
+    unavailable_reason: str | None
+
+    def __post_init__(self) -> None:
+        if self.coverage_kind not in REPLAY_COVERAGE_KINDS:
+            raise ValueError("Replay coverage artifact kind is unknown.")
+        if self.state not in {EvidenceBasis.ACTUAL, EvidenceBasis.SYNTHETIC,
+                              EvidenceBasis.UNAVAILABLE}:
+            raise ValueError("Coverage artifacts cannot claim modeled raw sources.")
+        if len(self.source_ids) != len(self.source_hashes):
+            raise ValueError("Coverage artifact sources must be aligned.")
+        if tuple(sorted(zip(self.source_ids, self.source_hashes))) != tuple(
+            zip(self.source_ids, self.source_hashes)
+        ):
+            raise ValueError("Coverage artifact sources must be deterministically ordered.")
+        if self.state is EvidenceBasis.UNAVAILABLE:
+            if self.source_ids or not self.unavailable_reason:
+                raise ValueError("Unavailable coverage requires a reason and no supporting sources.")
+        elif not self.source_ids or self.unavailable_reason is not None:
+            raise ValueError("Available coverage requires source IDs and hashes.")
+        for digest in self.source_hashes:
+            _sha256(digest, "Coverage artifact source hash")
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "coverage_kind": self.coverage_kind,
+            "state": self.state.value,
+            "sources": [
+                {"source_id": source_id, "source_hash": source_hash}
+                for source_id, source_hash in zip(self.source_ids, self.source_hashes)
+            ],
+            "unavailable_reason": self.unavailable_reason,
         }
 
 
@@ -136,26 +194,60 @@ class ReplayCoverageManifest:
             self.actual_execution_records, self.closure_record, self.low_volume_labels,
         )) and not self.sources:
             raise ValueError("Claimed replay coverage requires immutable source references.")
+        flags = self.coverage_flags
+        for name, available in flags.items():
+            supporting = tuple(item for item in self.sources if name in item.coverage_kinds)
+            if available and not supporting:
+                raise ValueError(f"Replay coverage {name} lacks a bound source digest.")
+            if not available and supporting:
+                raise ValueError(f"Unavailable replay coverage {name} has contradictory support.")
 
     @property
     def ordered_sources(self) -> tuple[ReplaySourceRef, ...]:
         return tuple(sorted(self.sources, key=lambda item: (item.available_at, item.source_id)))
+
+    @property
+    def coverage_flags(self) -> dict[str, bool]:
+        return {
+            "full_market_event_stream": self.full_market_event_stream,
+            "causal_bias_history": self.causal_bias_history,
+            "legacy_switch_stream": self.legacy_switch_stream,
+            "executable_price_path": self.executable_price_path,
+            "outcome_path": self.outcome_path,
+            "actual_execution_records": self.actual_execution_records,
+            "closure_record": self.closure_record,
+            "low_volume_labels": self.low_volume_labels,
+        }
+
+    @property
+    def coverage_artifacts(self) -> tuple[ReplayCoverageArtifact, ...]:
+        available_basis = (
+            EvidenceBasis.ACTUAL
+            if self.source_kind is CoverageSourceKind.RETAINED_ACTUAL
+            else EvidenceBasis.SYNTHETIC
+        )
+        artifacts: list[ReplayCoverageArtifact] = []
+        for name, available in sorted(self.coverage_flags.items()):
+            supporting = sorted(
+                (item.source_id, item.source_hash)
+                for item in self.sources if name in item.coverage_kinds
+            )
+            artifacts.append(ReplayCoverageArtifact(
+                name,
+                available_basis if available else EvidenceBasis.UNAVAILABLE,
+                tuple(item[0] for item in supporting),
+                tuple(item[1] for item in supporting),
+                None if available else "NOT_PROVEN_BY_COVERAGE_MANIFEST",
+            ))
+        return tuple(artifacts)
 
     def payload(self) -> dict[str, object]:
         return {
             "manifest_id": self.manifest_id, "source_kind": self.source_kind.value,
             "as_of": normalized_utc(self.as_of, "Replay coverage as-of time"),
             "sources": [item.payload() for item in self.ordered_sources],
-            "coverage": {
-                "full_market_event_stream": self.full_market_event_stream,
-                "causal_bias_history": self.causal_bias_history,
-                "legacy_switch_stream": self.legacy_switch_stream,
-                "executable_price_path": self.executable_price_path,
-                "outcome_path": self.outcome_path,
-                "actual_execution_records": self.actual_execution_records,
-                "closure_record": self.closure_record,
-                "low_volume_labels": self.low_volume_labels,
-            },
+            "coverage": self.coverage_flags,
+            "coverage_artifacts": [item.payload() for item in self.coverage_artifacts],
         }
 
     @property
@@ -164,18 +256,48 @@ class ReplayCoverageManifest:
 
 
 @dataclass(frozen=True)
-class ReplayMetric:
-    """One explicitly defined metric; absent outcomes use UNAVAILABLE, never zero."""
-
+class MetricIdentity:
     name: str
     definition: str
+    unit: str
+    horizon: str
+    cost_basis: str
+    fill_basis: str
+
+    def __post_init__(self) -> None:
+        for value, field in (
+            (self.name, "Replay metric name"),
+            (self.definition, "Replay metric definition"),
+            (self.unit, "Replay metric unit"),
+            (self.horizon, "Replay metric horizon"),
+            (self.cost_basis, "Replay metric cost basis"),
+            (self.fill_basis, "Replay metric fill basis"),
+        ):
+            _text(value, field)
+
+    def payload(self) -> dict[str, str]:
+        return {
+            "name": self.name,
+            "definition": self.definition,
+            "unit": self.unit,
+            "horizon": self.horizon,
+            "cost_basis": self.cost_basis,
+            "fill_basis": self.fill_basis,
+        }
+
+
+@dataclass(frozen=True)
+class ReplayMetric:
+    """One exactly identified metric; absent outcomes use UNAVAILABLE, never zero."""
+
+    identity: MetricIdentity
     basis: EvidenceBasis
     value: Decimal | None = None
     unavailable_reason: str | None = None
 
     def __post_init__(self) -> None:
-        _text(self.name, "Replay metric name")
-        _text(self.definition, "Replay metric definition")
+        if type(self.identity) is not MetricIdentity:
+            raise ValueError("Replay metric identity is required.")
         if type(self.basis) is not EvidenceBasis:
             raise ValueError("Replay metric basis is required.")
         if self.basis is EvidenceBasis.UNAVAILABLE:
@@ -186,9 +308,13 @@ class ReplayMetric:
                 raise ValueError("Available replay metrics require a value and no unavailable reason.")
             _decimal(self.value, "Replay metric value")
 
+    @property
+    def name(self) -> str:
+        return self.identity.name
+
     def payload(self) -> dict[str, object]:
         return {
-            "name": self.name, "definition": self.definition, "basis": self.basis.value,
+            "identity": self.identity.payload(), "basis": self.basis.value,
             "value": None if self.value is None else _dtext(self.value),
             "unavailable_reason": self.unavailable_reason,
         }
@@ -220,8 +346,8 @@ class CandidateReplayResult:
             raise ValueError("Replay result source IDs must be unique.")
         for digest in self.source_hashes:
             _sha256(digest, "Replay result source hash")
-        if len({item.name for item in self.metrics}) != len(self.metrics):
-            raise ValueError("Replay metric names must be unique per candidate.")
+        if len({item.identity for item in self.metrics}) != len(self.metrics):
+            raise ValueError("Replay metric identities must be unique per candidate.")
         if any(item.basis not in {self.basis, EvidenceBasis.UNAVAILABLE} for item in self.metrics):
             raise ValueError("Replay metric basis must match its candidate result.")
 
@@ -232,7 +358,13 @@ class CandidateReplayResult:
             "coverage_hash": self.coverage_hash,
             "signal_policy_hash": self.signal_policy_hash,
             "quantity_policy_hash": self.quantity_policy_hash,
-            "metrics": [item.payload() for item in sorted(self.metrics, key=lambda value: value.name)],
+            "metrics": [
+                item.payload()
+                for item in sorted(
+                    self.metrics,
+                    key=lambda value: tuple(value.identity.payload().values()),
+                )
+            ],
             "sources": [
                 {"source_id": source_id, "source_hash": source_hash}
                 for source_id, source_hash in ordered_sources
@@ -262,14 +394,18 @@ class ReplayCandidateProjection:
 
 @dataclass(frozen=True)
 class MetricDelta:
-    name: str
+    identity: MetricIdentity
     left_value: Decimal
     right_value: Decimal
     right_minus_left: Decimal
 
-    def payload(self) -> dict[str, str]:
+    @property
+    def name(self) -> str:
+        return self.identity.name
+
+    def payload(self) -> dict[str, object]:
         return {
-            "name": self.name, "left_value": _dtext(self.left_value),
+            "identity": self.identity.payload(), "left_value": _dtext(self.left_value),
             "right_value": _dtext(self.right_value),
             "right_minus_left": _dtext(self.right_minus_left),
         }
@@ -316,6 +452,15 @@ class OfflineReplayReport:
 
 class OfflineReplayComparisonScaffold:
     """Validate supplied results and compare only causally covered candidates."""
+
+    @staticmethod
+    def _required_coverage_kinds(candidate: ReplayCandidate) -> tuple[str, ...]:
+        if candidate is ReplayCandidate.PERPETUAL_AS_EXECUTED:
+            return ("actual_execution_records", "closure_record")
+        shared = ("causal_bias_history", "executable_price_path", "outcome_path")
+        if candidate is ReplayCandidate.LEGACY_SWITCH_PONG:
+            return (*shared, "legacy_switch_stream")
+        return (*shared, "full_market_event_stream")
 
     @staticmethod
     def _coverage_reasons(
@@ -376,35 +521,58 @@ class OfflineReplayComparisonScaffold:
                 ("SIGNAL_POLICY_NOT_HELD_CONSTANT",), (),
             )
         left_metrics = {
-            item.name: item for item in left.result.metrics
+            item.identity: item for item in left.result.metrics
             if item.basis is not EvidenceBasis.UNAVAILABLE and item.value is not None
         }
         right_metrics = {
-            item.name: item for item in right.result.metrics
+            item.identity: item for item in right.result.metrics
             if item.basis is not EvidenceBasis.UNAVAILABLE and item.value is not None
         }
-        names = sorted(set(left_metrics) & set(right_metrics))
+        identities = sorted(
+            set(left_metrics) & set(right_metrics),
+            key=lambda item: tuple(item.payload().values()),
+        )
         deltas = tuple(
             MetricDelta(
-                name, left_metrics[name].value, right_metrics[name].value,
-                right_metrics[name].value - left_metrics[name].value,
+                identity, left_metrics[identity].value, right_metrics[identity].value,
+                right_metrics[identity].value - left_metrics[identity].value,
             )
-            for name in names
-            if left_metrics[name].value is not None and right_metrics[name].value is not None
+            for identity in identities
+            if (
+                left_metrics[identity].value is not None
+                and right_metrics[identity].value is not None
+            )
         )
-        unavailable_names = sorted(
-            {item.name for item in left.result.metrics + right.result.metrics}
-            - set(names)
+        left_by_name = {
+            item.name: {value.identity for value in left.result.metrics if value.name == item.name}
+            for item in left.result.metrics
+        }
+        right_by_name = {
+            item.name: {value.identity for value in right.result.metrics if value.name == item.name}
+            for item in right.result.metrics
+        }
+        identity_mismatches = sorted(
+            name for name in set(left_by_name) & set(right_by_name)
+            if not (left_by_name[name] & right_by_name[name])
+        )
+        unavailable_names = sorted({
+            item.name for item in left.result.metrics + right.result.metrics
+            if item.basis is EvidenceBasis.UNAVAILABLE
+            or item.identity not in set(identities)
+        } - set(identity_mismatches))
+        comparison_reasons = tuple(
+            [f"METRIC_IDENTITY_MISMATCH:{name}" for name in identity_mismatches]
+            + [f"METRIC_UNAVAILABLE:{name}" for name in unavailable_names]
         )
         if not deltas:
             return ReplayComparison(
                 left.candidate, right.candidate, ComparisonStatus.UNAVAILABLE,
-                ("NO_SHARED_AVAILABLE_METRICS",), (),
+                comparison_reasons + ("NO_SHARED_EXACT_METRIC_IDENTITIES",), (),
             )
         return ReplayComparison(
             left.candidate, right.candidate,
-            ComparisonStatus.PARTIAL if unavailable_names else ComparisonStatus.AVAILABLE,
-            tuple(f"METRIC_UNAVAILABLE:{name}" for name in unavailable_names), deltas,
+            ComparisonStatus.PARTIAL if comparison_reasons else ComparisonStatus.AVAILABLE,
+            comparison_reasons, deltas,
         )
 
     def build(
@@ -436,6 +604,17 @@ class OfflineReplayComparisonScaffold:
                 for source_id, source_hash in zip(result.source_ids, result.source_hashes):
                     if coverage_sources.get(source_id) != source_hash:
                         raise ValueError("Replay result source does not match the coverage manifest.")
+                submitted_source_ids = set(result.source_ids)
+                for coverage_kind in self._required_coverage_kinds(candidate):
+                    supporting_ids = {
+                        item.source_id for item in coverage.sources
+                        if coverage_kind in item.coverage_kinds
+                    }
+                    if not (submitted_source_ids & supporting_ids):
+                        raise ValueError(
+                            "Replay result does not cite a source digest for required coverage: "
+                            + coverage_kind
+                        )
             elif not reasons:
                 reasons.append("REPLAY_RESULT_NOT_SUPPLIED")
             if candidate is not ReplayCandidate.PERPETUAL_AS_EXECUTED and not coverage.low_volume_labels:

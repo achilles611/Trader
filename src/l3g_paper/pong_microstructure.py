@@ -15,6 +15,11 @@ import re
 from typing import Iterable
 
 from src.lane_iii.contracts import canonical_hash, normalized_utc
+from src.l3g_paper.discernment import (
+    DiscernmentEvidence,
+    DiscernmentPolicy,
+    VolumeRegime as DiscernmentVolumeRegime,
+)
 
 
 PONG_MICROSTRUCTURE_SCHEMA = "beelzebub-pong-microstructure-research-v1"
@@ -268,6 +273,10 @@ class ClassifiedFlowResult:
     imbalance: Decimal | None
     arrival_rate_per_second: Decimal
     price_change: Decimal | None
+    source_event_at: str
+    received_at: str
+    available_at: str
+    continuity_domain: str
     source_ids: tuple[str, ...]
     source_hashes: tuple[str, ...]
     dependency_group_id: str
@@ -294,6 +303,10 @@ class ClassifiedFlowResult:
             "imbalance": None if self.imbalance is None else _dtext(self.imbalance),
             "arrival_rate_per_second": _dtext(self.arrival_rate_per_second),
             "price_change": None if self.price_change is None else _dtext(self.price_change),
+            "source_event_at": normalized_utc(self.source_event_at, "Flow source event time"),
+            "received_at": normalized_utc(self.received_at, "Flow receipt time"),
+            "available_at": normalized_utc(self.available_at, "Flow availability time"),
+            "continuity_domain": self.continuity_domain,
             "source_ids": list(self.source_ids),
             "source_hashes": list(self.source_hashes),
             "dependency_group_id": self.dependency_group_id,
@@ -394,13 +407,37 @@ class ClassifiedFlowAdapter:
             "source_ids": source_ids,
             "source_hashes": source_hashes,
         })
+        source_event_at = ordered[-1].event.event_at if ordered else as_of
+        received_at = ordered[-1].event.received_at if ordered else as_of
+        continuity_domain = ordered[-1].event.continuity_domain if ordered else "UNESTABLISHED"
         return ClassifiedFlowResult(
-            window_start, as_of, next(iter(instruments), "UNAVAILABLE"), behavior, valid,
-            tuple(reasons), len(ordered), len(buy), len(sell), len(unknown),
-            provenance_counts, buy_volume,
-            sell_volume, unknown_volume, total, coverage, imbalance, rate, price_change,
-            source_ids, source_hashes, "flow-dependency-" + dependency[:32],
-            self.policy.configuration_hash,
+            window_start=window_start,
+            as_of=as_of,
+            instrument=next(iter(instruments), "UNAVAILABLE"),
+            behavior=behavior,
+            valid=valid,
+            reason_codes=tuple(reasons),
+            sample_count=len(ordered),
+            buy_count=len(buy),
+            sell_count=len(sell),
+            unknown_count=len(unknown),
+            classification_provenance_counts=provenance_counts,
+            buy_volume=buy_volume,
+            sell_volume=sell_volume,
+            unknown_volume=unknown_volume,
+            total_volume=total,
+            classified_coverage=coverage,
+            imbalance=imbalance,
+            arrival_rate_per_second=rate,
+            price_change=price_change,
+            source_event_at=source_event_at,
+            received_at=received_at,
+            available_at=as_of,
+            continuity_domain=continuity_domain,
+            source_ids=source_ids,
+            source_hashes=source_hashes,
+            dependency_group_id="flow-dependency-" + dependency[:32],
+            policy_hash=self.policy.configuration_hash,
         )
 
 
@@ -509,6 +546,10 @@ class LiquidityClusterResult:
     depleted_quantity: Decimal
     replenished_quantity: Decimal
     transitions: tuple[LiquidityTransition, ...]
+    source_event_at: str
+    received_at: str
+    available_at: str
+    continuity_domain: str
     source_ids: tuple[str, ...]
     source_hashes: tuple[str, ...]
     dependency_group_id: str
@@ -532,6 +573,10 @@ class LiquidityClusterResult:
             "depleted_quantity": _dtext(self.depleted_quantity),
             "replenished_quantity": _dtext(self.replenished_quantity),
             "transitions": [item.payload() for item in self.transitions],
+            "source_event_at": normalized_utc(self.source_event_at, "Liquidity source event time"),
+            "received_at": normalized_utc(self.received_at, "Liquidity receipt time"),
+            "available_at": normalized_utc(self.available_at, "Liquidity availability time"),
+            "continuity_domain": self.continuity_domain,
             "source_ids": list(self.source_ids), "source_hashes": list(self.source_hashes),
             "dependency_group_id": self.dependency_group_id, "policy_hash": self.policy_hash,
             "book_fidelity": "AGGREGATE_MARKET_BY_PRICE_NOT_INDIVIDUAL_ORDER",
@@ -638,14 +683,41 @@ class LiquidityClusterAdapter:
         })
         interactions = tuple(item for item in ordered if item.interaction_volume > 0)
         return LiquidityClusterResult(
-            "liquidity-cluster-" + cluster_hash[:32], instrument, side, price, as_of,
-            not reasons, tuple(reasons), latest.displayed_quantity,
-            latest.nearby_same_side_quantity, relative, distance,
-            persistence, len(interactions), sum((item.interaction_volume for item in interactions), Decimal("0")),
-            sum(item.observed_price_response is PriceResponse.ACCEPTANCE for item in interactions),
-            sum(item.observed_price_response is PriceResponse.REJECTION for item in interactions),
-            depleted, replenished, tuple(transitions), source_ids, source_hashes,
-            "liquidity-dependency-" + group_hash[:32], self.policy.configuration_hash,
+            cluster_id="liquidity-cluster-" + cluster_hash[:32],
+            instrument=instrument,
+            side=side,
+            price=price,
+            as_of=as_of,
+            valid=not reasons,
+            reason_codes=tuple(reasons),
+            current_displayed_quantity=latest.displayed_quantity,
+            nearby_same_side_quantity=latest.nearby_same_side_quantity,
+            relative_size=relative,
+            distance_from_touch_ticks=distance,
+            persistence_seconds=persistence,
+            interaction_count=len(interactions),
+            interaction_volume=sum(
+                (item.interaction_volume for item in interactions), Decimal("0")
+            ),
+            acceptance_count=sum(
+                item.observed_price_response is PriceResponse.ACCEPTANCE
+                for item in interactions
+            ),
+            rejection_count=sum(
+                item.observed_price_response is PriceResponse.REJECTION
+                for item in interactions
+            ),
+            depleted_quantity=depleted,
+            replenished_quantity=replenished,
+            transitions=tuple(transitions),
+            source_event_at=latest.event.event_at,
+            received_at=latest.event.received_at,
+            available_at=as_of,
+            continuity_domain=latest.event.continuity_domain,
+            source_ids=source_ids,
+            source_hashes=source_hashes,
+            dependency_group_id="liquidity-dependency-" + group_hash[:32],
+            policy_hash=self.policy.configuration_hash,
         )
 
 
@@ -720,6 +792,9 @@ class VolumeRegimeResult:
     prior_median_volume: Decimal | None
     volume_ratio: Decimal | None
     as_of: str
+    source_event_at: str
+    received_at: str
+    available_at: str
     source_ids: tuple[str, ...]
     source_hashes: tuple[str, ...]
     dependency_group_id: str
@@ -735,6 +810,9 @@ class VolumeRegimeResult:
             "prior_median_volume": None if self.prior_median_volume is None else _dtext(self.prior_median_volume),
             "volume_ratio": None if self.volume_ratio is None else _dtext(self.volume_ratio),
             "as_of": normalized_utc(self.as_of, "Volume regime as-of time"),
+            "source_event_at": normalized_utc(self.source_event_at, "Volume source event time"),
+            "received_at": normalized_utc(self.received_at, "Volume receipt time"),
+            "available_at": normalized_utc(self.available_at, "Volume availability time"),
             "source_ids": list(self.source_ids), "source_hashes": list(self.source_hashes),
             "dependency_group_id": self.dependency_group_id, "policy_hash": self.policy_hash,
             "execution_authority": "DENIED",
@@ -807,7 +885,331 @@ class VolumeRegimeAdapter:
                     else VolumeRegime.NORMAL
                 )
         return VolumeRegimeResult(
-            regime, not reasons, tuple(reasons), current.window_id, current.volume,
-            median, ratio, as_of, source_ids, source_hashes,
-            "volume-regime-dependency-" + group_hash[:32], self.policy.configuration_hash,
+            regime=regime,
+            valid=not reasons,
+            reason_codes=tuple(reasons),
+            current_window_id=current.window_id,
+            current_volume=current.volume,
+            prior_median_volume=median,
+            volume_ratio=ratio,
+            as_of=as_of,
+            source_event_at=current.window_end,
+            received_at=current.available_at,
+            available_at=as_of,
+            source_ids=source_ids,
+            source_hashes=source_hashes,
+            dependency_group_id="volume-regime-dependency-" + group_hash[:32],
+            policy_hash=self.policy.configuration_hash,
+        )
+
+
+PONG_FLOW_COMPONENT = ("pong-symmetric-classified-flow", "mapping-v1")
+PONG_BID_LIQUIDITY_COMPONENT = ("pong-bid-liquidity-interaction", "mapping-v1")
+PONG_ASK_LIQUIDITY_COMPONENT = ("pong-ask-liquidity-interaction", "mapping-v1")
+PONG_VOLUME_REGIME_COMPONENT = ("pong-prior-only-volume-regime", "mapping-v1")
+PONG_FLOW_GROUP = "PONG_MICROSTRUCTURE_FLOW"
+PONG_LIQUIDITY_GROUP = "PONG_MICROSTRUCTURE_LIQUIDITY"
+PONG_VOLUME_REGIME_GROUP = "PONG_VOLUME_REGIME"
+
+
+@dataclass(frozen=True)
+class MicrostructureEvidenceMappingPolicy:
+    """Frozen hypotheses for research replay; not calibrated trading weights."""
+
+    mapping_id: str = "pong-microstructure-to-discernment-research"
+    version: str = "1"
+    flow_progress_effect: Decimal = Decimal("0.70")
+    flow_absorption_effect: Decimal = Decimal("0.55")
+    interacting_liquidity_effect: Decimal = Decimal("0.65")
+    displayed_wall_effect: Decimal = Decimal("0.10")
+    low_volume_multiplier: Decimal = Decimal("1.25")
+    normal_volume_multiplier: Decimal = Decimal("1")
+    high_volume_multiplier: Decimal = Decimal("0.85")
+    flow_group_bound: Decimal = Decimal("0.80")
+    liquidity_group_bound: Decimal = Decimal("1.00")
+    regime_group_bound: Decimal = Decimal("0.01")
+    validity_seconds: int = 5
+
+    def __post_init__(self) -> None:
+        _text(self.mapping_id, "Evidence mapping ID")
+        _text(self.version, "Evidence mapping version")
+        for value, field in (
+            (self.flow_progress_effect, "Flow progress effect"),
+            (self.flow_absorption_effect, "Flow absorption effect"),
+            (self.interacting_liquidity_effect, "Interacting liquidity effect"),
+            (self.displayed_wall_effect, "Displayed wall effect"),
+            (self.low_volume_multiplier, "Low-volume multiplier"),
+            (self.normal_volume_multiplier, "Normal-volume multiplier"),
+            (self.high_volume_multiplier, "High-volume multiplier"),
+            (self.flow_group_bound, "Flow group bound"),
+            (self.liquidity_group_bound, "Liquidity group bound"),
+            (self.regime_group_bound, "Regime group bound"),
+        ):
+            if _decimal(value, field) <= 0:
+                raise ValueError(f"{field} must be positive.")
+        if self.displayed_wall_effect >= self.interacting_liquidity_effect:
+            raise ValueError("Mere displayed liquidity must weigh less than an interaction.")
+        if type(self.validity_seconds) is not int or self.validity_seconds <= 0:
+            raise ValueError("Mapped evidence validity must be positive.")
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "mapping_id": self.mapping_id,
+            "version": self.version,
+            "components": [
+                list(PONG_FLOW_COMPONENT),
+                list(PONG_BID_LIQUIDITY_COMPONENT),
+                list(PONG_ASK_LIQUIDITY_COMPONENT),
+                list(PONG_VOLUME_REGIME_COMPONENT),
+            ],
+            "effects": {
+                "flow_progress": _dtext(self.flow_progress_effect),
+                "flow_absorption": _dtext(self.flow_absorption_effect),
+                "interacting_liquidity": _dtext(self.interacting_liquidity_effect),
+                "displayed_wall": _dtext(self.displayed_wall_effect),
+            },
+            "regime_multipliers": {
+                "LOW": _dtext(self.low_volume_multiplier),
+                "NORMAL": _dtext(self.normal_volume_multiplier),
+                "HIGH": _dtext(self.high_volume_multiplier),
+            },
+            "dependency_group_bounds": [
+                [PONG_FLOW_GROUP, _dtext(self.flow_group_bound)],
+                [PONG_LIQUIDITY_GROUP, _dtext(self.liquidity_group_bound)],
+                [PONG_VOLUME_REGIME_GROUP, _dtext(self.regime_group_bound)],
+            ],
+            "validity_seconds": self.validity_seconds,
+            "calibration_status": "EXPERIMENTAL_DIRECTIONAL_SUPPORT",
+            "production_configured": False,
+            "execution_authority": "DENIED",
+        }
+
+    @property
+    def mapping_hash(self) -> str:
+        return canonical_hash(self.payload())
+
+    def discernment_policy(self) -> DiscernmentPolicy:
+        return DiscernmentPolicy.research_fixture(
+            required_components=(
+                PONG_FLOW_COMPONENT,
+                PONG_BID_LIQUIDITY_COMPONENT,
+                PONG_ASK_LIQUIDITY_COMPONENT,
+                PONG_VOLUME_REGIME_COMPONENT,
+            ),
+            dependency_group_bounds=(
+                (PONG_FLOW_GROUP, float(self.flow_group_bound)),
+                (PONG_LIQUIDITY_GROUP, float(self.liquidity_group_bound)),
+                (PONG_VOLUME_REGIME_GROUP, float(self.regime_group_bound)),
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class MappedMicrostructureEvidence:
+    evidence: tuple[DiscernmentEvidence, ...]
+    volume_regime: DiscernmentVolumeRegime
+    mapping_hash: str
+    source_artifacts: tuple[tuple[str, str], ...]
+    blockers: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _sha256(self.mapping_hash, "Evidence mapping hash")
+        if tuple(sorted(self.source_artifacts)) != self.source_artifacts:
+            raise ValueError("Mapped source artifacts must be deterministically ordered.")
+        if len({item[0] for item in self.source_artifacts}) != len(self.source_artifacts):
+            raise ValueError("Mapped source artifact IDs must be unique.")
+        for artifact_id, artifact_hash in self.source_artifacts:
+            _text(artifact_id, "Mapped source artifact ID")
+            _sha256(artifact_hash, "Mapped source artifact hash")
+        if self.blockers:
+            if self.evidence or self.volume_regime is not DiscernmentVolumeRegime.UNAVAILABLE:
+                raise ValueError("Blocked microstructure mapping cannot expose usable evidence.")
+        elif not self.evidence or self.volume_regime is DiscernmentVolumeRegime.UNAVAILABLE:
+            raise ValueError("Usable microstructure mapping requires evidence and volume regime.")
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "schema": PONG_MICROSTRUCTURE_SCHEMA,
+            "kind": "DISCERNMENT_EVIDENCE_MAPPING",
+            "evidence_hashes": [item.evidence_hash for item in self.evidence],
+            "volume_regime": self.volume_regime.value,
+            "mapping_hash": self.mapping_hash,
+            "source_artifacts": [list(item) for item in self.source_artifacts],
+            "blockers": list(self.blockers),
+            "production_configured": False,
+            "execution_authority": "DENIED",
+        }
+
+    @property
+    def result_hash(self) -> str:
+        return canonical_hash(self.payload())
+
+
+class MicrostructureEvidenceMapper:
+    """Map one causal microstructure frame into bounded Discernment evidence."""
+
+    def __init__(
+        self,
+        policy: MicrostructureEvidenceMappingPolicy = MicrostructureEvidenceMappingPolicy(),
+    ) -> None:
+        self.policy = policy
+
+    def _multiplier(self, regime: VolumeRegime) -> Decimal:
+        return {
+            VolumeRegime.LOW: self.policy.low_volume_multiplier,
+            VolumeRegime.NORMAL: self.policy.normal_volume_multiplier,
+            VolumeRegime.HIGH: self.policy.high_volume_multiplier,
+        }[regime]
+
+    def _flow_effect(self, result: ClassifiedFlowResult) -> Decimal:
+        signed = {
+            FlowBehavior.BUY_PROGRESS: self.policy.flow_progress_effect,
+            FlowBehavior.BUY_ABSORBED: -self.policy.flow_absorption_effect,
+            FlowBehavior.SELL_PROGRESS: -self.policy.flow_progress_effect,
+            FlowBehavior.SELL_ABSORBED: self.policy.flow_absorption_effect,
+            FlowBehavior.BALANCED: Decimal("0"),
+        }
+        return signed[result.behavior]
+
+    def _liquidity_effect(self, result: LiquidityClusterResult) -> Decimal:
+        side_sign = Decimal("1") if result.side is BookSide.BID else Decimal("-1")
+        consumption = any(
+            item.reduction_attribution is ReductionAttribution.TRADE_MATCHED_CONSUMPTION
+            for item in result.transitions
+        )
+        if result.interaction_count and result.rejection_count > result.acceptance_count:
+            return side_sign * self.policy.interacting_liquidity_effect
+        if consumption and result.acceptance_count:
+            return -side_sign * self.policy.interacting_liquidity_effect
+        return side_sign * self.policy.displayed_wall_effect
+
+    @staticmethod
+    def _source_pairs(
+        artifact_id: str,
+        artifact_hash: str,
+        source_ids: tuple[str, ...],
+        source_hashes: tuple[str, ...],
+    ) -> tuple[tuple[str, str], ...]:
+        return tuple(sorted(((*zip(source_ids, source_hashes), (artifact_id, artifact_hash)))))
+
+    def map_frame(
+        self,
+        flow: ClassifiedFlowResult,
+        bid_liquidity: LiquidityClusterResult,
+        ask_liquidity: LiquidityClusterResult,
+        volume_regime: VolumeRegimeResult,
+        *,
+        first_evidence_revision: int,
+    ) -> MappedMicrostructureEvidence:
+        if type(first_evidence_revision) is not int or first_evidence_revision <= 0:
+            raise ValueError("First mapped evidence revision must be positive.")
+        blockers: list[str] = []
+        if not flow.valid:
+            blockers.extend(f"FLOW:{item}" for item in flow.reason_codes)
+        if not bid_liquidity.valid:
+            blockers.extend(f"BID_LIQUIDITY:{item}" for item in bid_liquidity.reason_codes)
+        if not ask_liquidity.valid:
+            blockers.extend(f"ASK_LIQUIDITY:{item}" for item in ask_liquidity.reason_codes)
+        if not volume_regime.valid:
+            blockers.extend(f"VOLUME_REGIME:{item}" for item in volume_regime.reason_codes)
+        if bid_liquidity.side is not BookSide.BID:
+            blockers.append("BID_LIQUIDITY_SIDE_MISMATCH")
+        if ask_liquidity.side is not BookSide.ASK:
+            blockers.append("ASK_LIQUIDITY_SIDE_MISMATCH")
+        instruments = {flow.instrument, bid_liquidity.instrument, ask_liquidity.instrument}
+        if len(instruments) != 1:
+            blockers.append("MICROSTRUCTURE_INSTRUMENT_MISMATCH")
+        as_of_values = {
+            normalized_utc(item, "Mapped microstructure as-of time")
+            for item in (flow.available_at, bid_liquidity.available_at,
+                         ask_liquidity.available_at, volume_regime.available_at)
+        }
+        if len(as_of_values) != 1:
+            blockers.append("MICROSTRUCTURE_FRAME_AVAILABILITY_MISMATCH")
+        continuity_domains = {flow.continuity_domain, bid_liquidity.continuity_domain,
+                              ask_liquidity.continuity_domain}
+        if len(continuity_domains) != 1:
+            blockers.append("MICROSTRUCTURE_CONTINUITY_DOMAIN_MISMATCH")
+        artifacts = tuple(sorted((
+            ("classified-flow-result", flow.result_hash),
+            (f"{bid_liquidity.side.value.lower()}-liquidity-result", bid_liquidity.result_hash),
+            (f"{ask_liquidity.side.value.lower()}-liquidity-result", ask_liquidity.result_hash),
+            ("volume-regime-result", volume_regime.result_hash),
+        )))
+        if blockers:
+            return MappedMicrostructureEvidence(
+                (), DiscernmentVolumeRegime.UNAVAILABLE, self.policy.mapping_hash,
+                artifacts, tuple(blockers),
+            )
+        available_at = next(iter(as_of_values))
+        valid_until = (
+            _time(available_at, "Mapped evidence availability")
+            + timedelta(seconds=self.policy.validity_seconds)
+        ).isoformat().replace("+00:00", "Z")
+        multiplier = self._multiplier(volume_regime.regime)
+        specifications = (
+            (
+                PONG_FLOW_COMPONENT, PONG_FLOW_GROUP,
+                self._flow_effect(flow) * multiplier, flow.source_event_at,
+                flow.received_at, "classified-flow-result", flow.result_hash,
+                flow.source_ids, flow.source_hashes,
+            ),
+            (
+                PONG_BID_LIQUIDITY_COMPONENT, PONG_LIQUIDITY_GROUP,
+                self._liquidity_effect(bid_liquidity) * multiplier,
+                bid_liquidity.source_event_at, bid_liquidity.received_at,
+                "bid-liquidity-result", bid_liquidity.result_hash,
+                bid_liquidity.source_ids, bid_liquidity.source_hashes,
+            ),
+            (
+                PONG_ASK_LIQUIDITY_COMPONENT, PONG_LIQUIDITY_GROUP,
+                self._liquidity_effect(ask_liquidity) * multiplier,
+                ask_liquidity.source_event_at, ask_liquidity.received_at,
+                "ask-liquidity-result", ask_liquidity.result_hash,
+                ask_liquidity.source_ids, ask_liquidity.source_hashes,
+            ),
+            (
+                PONG_VOLUME_REGIME_COMPONENT, PONG_VOLUME_REGIME_GROUP,
+                Decimal("0"), volume_regime.source_event_at, volume_regime.received_at,
+                "volume-regime-result", volume_regime.result_hash,
+                volume_regime.source_ids, volume_regime.source_hashes,
+            ),
+        )
+        evidence: list[DiscernmentEvidence] = []
+        continuity_domain = next(iter(continuity_domains))
+        for offset, specification in enumerate(specifications):
+            (
+                component, group, effect, source_event_at, received_at,
+                artifact_id, artifact_hash, source_ids, source_hashes,
+            ) = specification
+            pairs = self._source_pairs(artifact_id, artifact_hash, source_ids, source_hashes)
+            revision = first_evidence_revision + offset
+            event_material = {
+                "mapping_hash": self.policy.mapping_hash,
+                "component": list(component),
+                "dependency_group": group,
+                "effect": _dtext(effect),
+                "revision": revision,
+                "source_pairs": [list(item) for item in pairs],
+            }
+            evidence.append(DiscernmentEvidence(
+                event_id="pong-mapped-evidence-" + canonical_hash(event_material)[:32],
+                component_id=component[0],
+                component_version=component[1],
+                dependency_group=group,
+                log_odds_effect=float(effect),
+                required=True,
+                source_event_at=source_event_at,
+                received_at=received_at,
+                available_at=available_at,
+                valid_until=valid_until,
+                evidence_revision=revision,
+                continuity_domain=continuity_domain,
+                continuity_valid=True,
+                source_ids=tuple(item[0] for item in pairs),
+                source_hashes=tuple(item[1] for item in pairs),
+            ))
+        return MappedMicrostructureEvidence(
+            tuple(evidence), DiscernmentVolumeRegime(volume_regime.regime.value),
+            self.policy.mapping_hash, artifacts, (),
         )

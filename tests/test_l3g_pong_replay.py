@@ -9,6 +9,7 @@ from src.l3g_paper.pong_replay import (
     ComparisonStatus,
     CoverageSourceKind,
     EvidenceBasis,
+    MetricIdentity,
     OfflineReplayComparisonScaffold,
     ReplayCandidate,
     ReplayCoverageManifest,
@@ -23,7 +24,7 @@ LEGACY_SIGNAL_HASH = canonical_hash({"signal": "legacy-switch-policy"})
 PERPETUAL_SIGNAL_HASH = canonical_hash({"signal": "perpetual-as-executed"})
 ONE_HASH = canonical_hash({"quantity": 1})
 TWO_HASH = canonical_hash({"quantity": "conditional-two"})
-SOURCE = ReplaySourceRef("retained-source", canonical_hash({"source": 1}), AS_OF)
+SOURCE_HASH = canonical_hash({"source": 1})
 
 
 def coverage(
@@ -41,8 +42,12 @@ def coverage(
         "low_volume_labels": True,
     }
     values.update(overrides)
+    source = ReplaySourceRef(
+        "retained-source", SOURCE_HASH, AS_OF,
+        tuple(sorted(name for name, available in values.items() if available)),
+    )
     return ReplayCoverageManifest(
-        "manifest-test", source_kind, AS_OF, (SOURCE,), **values,
+        "manifest-test", source_kind, AS_OF, (source,), **values,
     )
 
 
@@ -50,13 +55,22 @@ def metric(
     name: str,
     value: str | None,
     basis: EvidenceBasis,
+    *,
+    definition: str | None = None,
+    unit: str = "COUNT",
+    horizon: str = "FULL_REPLAY_INTERVAL",
+    cost_basis: str = "RECORDED_OR_EXPLICIT_MODEL_COSTS",
+    fill_basis: str = "CAUSALLY_AVAILABLE_EXECUTABLE_PRICE_MODEL",
 ) -> ReplayMetric:
+    identity = MetricIdentity(
+        name, definition or f"Explicit definition for {name}", unit, horizon,
+        cost_basis, fill_basis,
+    )
     if value is None:
         return ReplayMetric(
-            name, f"Explicit definition for {name}", EvidenceBasis.UNAVAILABLE,
-            None, "SOURCE_OUTCOME_NOT_RETAINED",
+            identity, EvidenceBasis.UNAVAILABLE, None, "SOURCE_OUTCOME_NOT_RETAINED",
         )
-    return ReplayMetric(name, f"Explicit definition for {name}", basis, Decimal(value))
+    return ReplayMetric(identity, basis, Decimal(value))
 
 
 def result(
@@ -69,6 +83,7 @@ def result(
     pnl: str = "1",
     include_missing_mae: bool = False,
 ) -> CandidateReplayResult:
+    source = manifest.ordered_sources[0]
     metrics = [
         metric("SIGNAL_COUNT", "2", basis),
         metric("NET_PNL", pnl, basis),
@@ -77,12 +92,32 @@ def result(
         metrics.append(metric("MAE", None, basis))
     return CandidateReplayResult(
         candidate, basis, manifest.coverage_hash, signal_hash, quantity_hash,
-        tuple(metrics), (SOURCE.source_id,), (SOURCE.source_hash,),
+        tuple(metrics), (source.source_id,), (source.source_hash,),
         ("EXPLORATORY_NOT_GENERALIZABLE",),
     )
 
 
 class OfflineReplayComparisonTests(unittest.TestCase):
+    def test_available_coverage_requires_a_specifically_bound_source_digest(self) -> None:
+        unsupported = ReplaySourceRef(
+            "unsupported-source", SOURCE_HASH, AS_OF, (),
+        )
+        with self.assertRaisesRegex(ValueError, "lacks a bound source digest"):
+            ReplayCoverageManifest(
+                "manifest-unbound",
+                CoverageSourceKind.RETAINED_ACTUAL,
+                AS_OF,
+                (unsupported,),
+                True,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+            )
+
     def test_missing_coverage_and_results_remain_unavailable_without_metrics(self) -> None:
         manifest = coverage(
             full_market_event_stream=False,
@@ -103,6 +138,16 @@ class OfflineReplayComparisonTests(unittest.TestCase):
         self.assertIn("FULL_MARKET_EVENT_STREAM_UNAVAILABLE", fixed.reason_codes)
         self.assertIn("OUTCOME_PATH_UNAVAILABLE", fixed.reason_codes)
         self.assertIn("LOW_VOLUME_SUBSET_UNAVAILABLE", fixed.reason_codes)
+        artifacts = {item.coverage_kind: item for item in manifest.coverage_artifacts}
+        self.assertEqual(
+            artifacts["full_market_event_stream"].state,
+            EvidenceBasis.UNAVAILABLE,
+        )
+        self.assertEqual(
+            artifacts["full_market_event_stream"].unavailable_reason,
+            "NOT_PROVEN_BY_COVERAGE_MANIFEST",
+        )
+        self.assertEqual(artifacts["full_market_event_stream"].source_ids, ())
 
     def test_actual_modeled_and_conditional_comparisons_are_distinct(self) -> None:
         manifest = coverage()
@@ -128,6 +173,13 @@ class OfflineReplayComparisonTests(unittest.TestCase):
         bases = {item.candidate: item.basis for item in report.candidates}
         self.assertEqual(bases[ReplayCandidate.PERPETUAL_AS_EXECUTED], EvidenceBasis.ACTUAL)
         self.assertEqual(bases[ReplayCandidate.DISCERNMENT_FIXED_ONE], EvidenceBasis.MODELED)
+        event_artifact = next(
+            item for item in report.coverage.coverage_artifacts
+            if item.coverage_kind == "full_market_event_stream"
+        )
+        self.assertEqual(event_artifact.state, EvidenceBasis.ACTUAL)
+        self.assertEqual(event_artifact.source_ids, ("retained-source",))
+        self.assertEqual(event_artifact.source_hashes, (SOURCE_HASH,))
         self.assertTrue(all(item.status is ComparisonStatus.AVAILABLE for item in report.comparisons))
         quantity_comparison = report.comparisons[-1]
         pnl = next(item for item in quantity_comparison.metric_deltas if item.name == "NET_PNL")
@@ -195,6 +247,37 @@ class OfflineReplayComparisonTests(unittest.TestCase):
         self.assertEqual(comparison.status, ComparisonStatus.PARTIAL)
         self.assertIn("METRIC_UNAVAILABLE:MAE", comparison.reason_codes)
         self.assertNotIn("MAE", {item.name for item in comparison.metric_deltas})
+
+    def test_same_metric_name_with_different_identity_is_not_compared(self) -> None:
+        manifest = coverage()
+        source = manifest.ordered_sources[0]
+        fixed = CandidateReplayResult(
+            ReplayCandidate.DISCERNMENT_FIXED_ONE,
+            EvidenceBasis.MODELED,
+            manifest.coverage_hash,
+            SIGNAL_HASH,
+            ONE_HASH,
+            (metric("NET_PNL", "5", EvidenceBasis.MODELED, unit="USD"),),
+            (source.source_id,),
+            (source.source_hash,),
+        )
+        conditional = CandidateReplayResult(
+            ReplayCandidate.DISCERNMENT_CONDITIONAL_TWO,
+            EvidenceBasis.MODELED,
+            manifest.coverage_hash,
+            SIGNAL_HASH,
+            TWO_HASH,
+            (metric("NET_PNL", "7", EvidenceBasis.MODELED, unit="POINTS"),),
+            (source.source_id,),
+            (source.source_hash,),
+        )
+        comparison = OfflineReplayComparisonScaffold().build(
+            manifest, (fixed, conditional),
+        ).comparisons[-1]
+        self.assertEqual(comparison.status, ComparisonStatus.UNAVAILABLE)
+        self.assertIn("METRIC_IDENTITY_MISMATCH:NET_PNL", comparison.reason_codes)
+        self.assertIn("NO_SHARED_EXACT_METRIC_IDENTITIES", comparison.reason_codes)
+        self.assertEqual(comparison.metric_deltas, ())
 
 
 if __name__ == "__main__":
