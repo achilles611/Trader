@@ -1657,17 +1657,14 @@ class NinjaScriptSourceTests(unittest.TestCase):
     def test_observer_bounds_unverified_book_frames_and_stays_observation_only(self) -> None:
         source = (Path(__file__).parents[1] / "ninjatrader" / "NinjaScript" / "Indicators" / "BeelzebubReadOnlyMarketObserver.cs").read_text(encoding="utf-8")
         self.assertIn("MaximumPublishedBookLevelsPerSide = 10", source)
-        self.assertIn("TryNativeDepthSnapshot", source)
-        self.assertIn("Instrument.MarketDepth.Bids[index]", source)
-        self.assertIn("Instrument.MarketDepth.Asks[index]", source)
+        self.assertIn("TryApplyDepthMutation", source)
+        self.assertIn("side.Insert(update.Position", source)
+        self.assertIn("side[update.Position]", source)
+        self.assertIn("side.RemoveAt(update.Position)", source)
         self.assertIn("CROSSED_NATIVE_POSITIONAL_SNAPSHOT", source)
-        self.assertIn("SortedDictionary<double, long> nativeBids", source)
-        self.assertIn("nativeBids.Reverse().Take(MaximumPublishedBookLevelsPerSide)", source)
-        self.assertIn("nativeAsks.Take(MaximumPublishedBookLevelsPerSide)", source)
-        self.assertIn("PRICE_CANONICAL_BEST_TO_WORST_V1", source)
+        self.assertIn("NATIVE_POSITIONAL_BEST_TO_WORST_V1", source)
+        self.assertIn("NATIVE_DEPTH_MUTATION_APPLICATION_FAILED", source)
         self.assertIn("NATIVE_DEPTH_SIDE_EMPTY", source)
-        self.assertIn("NATIVE_POSITIONAL_SNAPSHOT_RACE", source)
-        self.assertIn("lock (Instrument.SyncMarketDepth)", source)
         self.assertNotIn('PublishDepthUnavailable("POSITIONAL_SNAPSHOT_INVALID"', source)
         self.assertIn('QuotePublicationPolicy = "BOUNDED_LATEST_STATE_2HZ"', source)
         self.assertIn('TradePublicationPolicy = "EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1"', source)
@@ -1678,7 +1675,6 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertNotIn("TryReservePublication(ref lastDepthPublicationTicks", source)
         self.assertIn("private readonly object bookLock = new object();", source)
         self.assertIn("lock (bookLock)", source)
-        self.assertIn("catch (ArgumentOutOfRangeException)", source)
         depth_unavailable = source[
             source.index("        private void PublishDepthUnavailable"):
             source.index("        private static bool FinitePositive")
@@ -1695,7 +1691,9 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertIn("private const int MaximumQueuedFrames = 4096;", addon)
         self.assertIn("private readonly object bookLock = new object();", addon)
         self.assertIn("lock (bookLock)", addon)
-        self.assertIn("catch (ArgumentOutOfRangeException)", addon)
+        self.assertIn("MaximumObserverRecoveryAttempts = 3", addon)
+        self.assertIn("ReferenceEquals(automaticObserver, candidate)", addon)
+        self.assertIn("NATIVE_ADDON_OBSERVER_RECOVERY_EXHAUSTED", addon)
         automatic_unavailable = addon[
             addon.index("        private void PublishDepthUnavailable"):
             addon.index("        private static bool TryReservePublication", addon.index("        private void PublishDepthUnavailable"))

@@ -28,6 +28,8 @@ namespace NinjaTrader.NinjaScript.Indicators
         private const string TradePublicationPolicy = "EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1";
         private const string DepthPublicationPolicy = "EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1";
         private readonly object bookLock = new object();
+        private readonly List<KeyValuePair<double, long>> depthBids = new List<KeyValuePair<double, long>>();
+        private readonly List<KeyValuePair<double, long>> depthAsks = new List<KeyValuePair<double, long>>();
         private double bestBid = Double.NaN;
         private double bestAsk = Double.NaN;
         private long bestBidSize = 0;
@@ -184,7 +186,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                 double bestNativeBid;
                 double bestNativeAsk;
                 string snapshotFailure;
-                if (!TryNativeDepthSnapshot(
+                if (!TryApplyDepthMutation(
+                    e,
                     out bidLevels, out askLevels, out bestNativeBid,
                     out bestNativeAsk, out snapshotFailure))
                 {
@@ -201,7 +204,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                     + "\",\"side\":\"" + e.MarketDataType + "\",\"mutation_price\":" + e.Price.ToString(CultureInfo.InvariantCulture)
                     + ",\"mutation_volume\":" + e.Volume + ",\"mutation_position\":" + e.Position
                     + ",\"is_reset\":" + (e.IsReset ? "true" : "false")
-                    + ",\"snapshot_ordering\":\"PRICE_CANONICAL_BEST_TO_WORST_V1\""
+                    + ",\"snapshot_ordering\":\"NATIVE_POSITIONAL_BEST_TO_WORST_V1\""
                     + ",\"source_event_sequence\":" + sourceEventSequence
                     + ",\"publication_policy\":\"" + DepthPublicationPolicy + "\"}";
             }
@@ -217,6 +220,11 @@ namespace NinjaTrader.NinjaScript.Indicators
             bestAskSize = 0;
             bestBidTime = DateTime.MinValue;
             bestAskTime = DateTime.MinValue;
+            lock (bookLock)
+            {
+                depthBids.Clear();
+                depthAsks.Clear();
+            }
         }
 
         private void PublishMarketConnectedOnce()
@@ -246,7 +254,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                 configured, instrument, true, true);
         }
 
-        private bool TryNativeDepthSnapshot(
+        private bool TryApplyDepthMutation(
+            MarketDepthEventArgs update,
             out string bidLevels, out string askLevels,
             out double bestNativeBid, out double bestNativeAsk,
             out string failureReason)
@@ -256,99 +265,105 @@ namespace NinjaTrader.NinjaScript.Indicators
             bestNativeBid = Double.NaN;
             bestNativeAsk = Double.NaN;
             failureReason = null;
-            if (Instrument == null || Instrument.MarketDepth == null)
+            if (update == null)
             {
-                failureReason = "NATIVE_MARKET_DEPTH_UNAVAILABLE";
+                failureReason = "NATIVE_DEPTH_MUTATION_MISSING";
                 return false;
             }
-            SortedDictionary<double, long> nativeBids = new SortedDictionary<double, long>();
-            SortedDictionary<double, long> nativeAsks = new SortedDictionary<double, long>();
-            try
+            List<KeyValuePair<double, long>> candidateBids =
+                new List<KeyValuePair<double, long>>(depthBids);
+            List<KeyValuePair<double, long>> candidateAsks =
+                new List<KeyValuePair<double, long>>(depthAsks);
+            List<KeyValuePair<double, long>> side;
+            if (update.MarketDataType == MarketDataType.Bid)
+                side = candidateBids;
+            else if (update.MarketDataType == MarketDataType.Ask)
+                side = candidateAsks;
+            else
             {
-                // NinjaTrader's bundled SuperDOM columns use this native lock
-                // before enumerating the positional book. It makes Count and
-                // indexed rows one coherent platform-owned snapshot. The
-                // public MarketDepth contract does not promise list order, so
-                // copy and aggregate before publishing a deterministic
-                // best-to-worst price view.
-                lock (Instrument.SyncMarketDepth)
+                failureReason = "NATIVE_DEPTH_SIDE_INVALID";
+                return false;
+            }
+            if (update.IsReset)
+            {
+                candidateBids.Clear();
+                candidateAsks.Clear();
+                side = update.MarketDataType == MarketDataType.Bid ? candidateBids : candidateAsks;
+            }
+            bool validPrice = FinitePositive(update.Price);
+            bool applied = false;
+            if (update.Operation == Operation.Add)
+            {
+                if (validPrice && update.Volume > 0 && update.Position >= 0 && update.Position <= side.Count)
                 {
-                    int bidCount = Instrument.MarketDepth.Bids.Count;
-                    int askCount = Instrument.MarketDepth.Asks.Count;
-                    for (int index = 0; index < bidCount; index++)
-                    {
-                        double price = Instrument.MarketDepth.Bids[index].Price;
-                        long volume = Instrument.MarketDepth.Bids[index].Volume;
-                        if (!FinitePositive(price))
-                        {
-                            failureReason = "NATIVE_BID_PRICE_INVALID";
-                            return false;
-                        }
-                        if (volume <= 0)
-                        {
-                            failureReason = "NATIVE_BID_VOLUME_INVALID";
-                            return false;
-                        }
-                        long accumulated;
-                        nativeBids.TryGetValue(price, out accumulated);
-                        try
-                        {
-                            nativeBids[price] = checked(accumulated + volume);
-                        }
-                        catch (OverflowException)
-                        {
-                            failureReason = "NATIVE_BID_VOLUME_OVERFLOW";
-                            return false;
-                        }
-                    }
-                    for (int index = 0; index < askCount; index++)
-                    {
-                        double price = Instrument.MarketDepth.Asks[index].Price;
-                        long volume = Instrument.MarketDepth.Asks[index].Volume;
-                        if (!FinitePositive(price))
-                        {
-                            failureReason = "NATIVE_ASK_PRICE_INVALID";
-                            return false;
-                        }
-                        if (volume <= 0)
-                        {
-                            failureReason = "NATIVE_ASK_VOLUME_INVALID";
-                            return false;
-                        }
-                        long accumulated;
-                        nativeAsks.TryGetValue(price, out accumulated);
-                        try
-                        {
-                            nativeAsks[price] = checked(accumulated + volume);
-                        }
-                        catch (OverflowException)
-                        {
-                            failureReason = "NATIVE_ASK_VOLUME_OVERFLOW";
-                            return false;
-                        }
-                    }
+                    side.Insert(update.Position, new KeyValuePair<double, long>(update.Price, update.Volume));
+                    applied = true;
                 }
             }
-            catch (ArgumentOutOfRangeException)
+            else if (update.Operation == Operation.Update)
             {
-                failureReason = "NATIVE_POSITIONAL_SNAPSHOT_RACE";
+                if (validPrice && update.Volume > 0 && update.Position >= 0 && update.Position < side.Count)
+                {
+                    side[update.Position] = new KeyValuePair<double, long>(update.Price, update.Volume);
+                    applied = true;
+                }
+            }
+            else if (update.Operation == Operation.Remove)
+            {
+                if (update.Position >= 0 && update.Position < side.Count)
+                {
+                    side.RemoveAt(update.Position);
+                    applied = true;
+                }
+            }
+            if (!applied)
+            {
+                failureReason = "NATIVE_DEPTH_MUTATION_APPLICATION_FAILED";
                 return false;
             }
-            if (nativeBids.Count == 0 || nativeAsks.Count == 0)
+            depthBids.Clear();
+            depthBids.AddRange(candidateBids);
+            depthAsks.Clear();
+            depthAsks.AddRange(candidateAsks);
+            if (depthBids.Count == 0 || depthAsks.Count == 0)
             {
                 failureReason = "NATIVE_DEPTH_SIDE_EMPTY";
                 return false;
             }
-            List<string> bidRows = nativeBids.Reverse().Take(MaximumPublishedBookLevelsPerSide)
+            if (!StrictlyOrdered(depthBids, true) || !StrictlyOrdered(depthAsks, false))
+            {
+                failureReason = "NATIVE_POSITIONAL_ORDER_INVALID";
+                return false;
+            }
+            bestNativeBid = depthBids[0].Key;
+            bestNativeAsk = depthAsks[0].Key;
+            if (bestNativeBid >= bestNativeAsk)
+            {
+                failureReason = "CROSSED_NATIVE_POSITIONAL_SNAPSHOT";
+                return false;
+            }
+            List<string> bidRows = depthBids.Take(MaximumPublishedBookLevelsPerSide)
                 .Select(row => "{\"price\":" + row.Key.ToString(CultureInfo.InvariantCulture)
                     + ",\"size\":" + row.Value + "}").ToList();
-            List<string> askRows = nativeAsks.Take(MaximumPublishedBookLevelsPerSide)
+            List<string> askRows = depthAsks.Take(MaximumPublishedBookLevelsPerSide)
                 .Select(row => "{\"price\":" + row.Key.ToString(CultureInfo.InvariantCulture)
                     + ",\"size\":" + row.Value + "}").ToList();
-            bestNativeBid = nativeBids.Last().Key;
-            bestNativeAsk = nativeAsks.First().Key;
             bidLevels = "[" + String.Join(",", bidRows) + "]";
             askLevels = "[" + String.Join(",", askRows) + "]";
+            return true;
+        }
+
+        private static bool StrictlyOrdered(List<KeyValuePair<double, long>> levels, bool descending)
+        {
+            for (int index = 0; index < levels.Count; index++)
+            {
+                if (!FinitePositive(levels[index].Key) || levels[index].Value <= 0)
+                    return false;
+                if (index > 0 && (descending
+                    ? levels[index - 1].Key <= levels[index].Key
+                    : levels[index - 1].Key >= levels[index].Key))
+                    return false;
+            }
             return true;
         }
 

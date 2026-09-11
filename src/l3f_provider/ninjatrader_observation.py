@@ -42,7 +42,7 @@ NINJATRADER_ATTESTATION_KEY_CONTEXT = b"BEELZEBUB_NINJATRADER_OBSERVATION_V2"
 # Regenerated from both checked-in read-only NinjaScript producer sources.  The
 # helper below excludes this embedded value, so a compiled stale producer keeps
 # reporting its old identity even after the checkout changes.
-EXPECTED_OBSERVER_SOURCE_FINGERPRINT = "41ca7792669f032193a035cbae5185f58421251be04d2745dcd803073ffb1ba5"
+EXPECTED_OBSERVER_SOURCE_FINGERPRINT = "7888f7db278fc6f997af8d13dc4d7eed84af42f43a8d1591fdeaeff1379b4656"
 NINJATRADER_SOURCE = "NINJATRADER"
 LUCID_CQG_PROVIDER = "LUCID_CQG"
 PROP_SIM_ENVIRONMENT = "PROP_SIM"
@@ -658,7 +658,10 @@ class NinjaTraderMarketDataAdapter(MarketDataProviderAdapter):
             raise ValueError("depth_mutation_reset")
         snapshot_ordering = payload.get("snapshot_ordering")
         if snapshot_ordering is not None:
-            if snapshot_ordering != "PRICE_CANONICAL_BEST_TO_WORST_V1":
+            if snapshot_ordering not in {
+                "PRICE_CANONICAL_BEST_TO_WORST_V1",
+                "NATIVE_POSITIONAL_BEST_TO_WORST_V1",
+            }:
                 raise ValueError("depth_snapshot_ordering")
             # The signed native producer retains the callback's original
             # positional mutation fields, while its bounded full-book arrays
@@ -667,7 +670,8 @@ class NinjaTraderMarketDataAdapter(MarketDataProviderAdapter):
             # that canonical price ordering; _levels validates the arrays.
             if operation != "Remove" and (price <= 0 or volume <= 0):
                 raise ValueError("depth_mutation_upsert")
-            return
+            if snapshot_ordering == "PRICE_CANONICAL_BEST_TO_WORST_V1":
+                return
         rows = payload["bids" if payload["side"] == "Bid" else "asks"]
         if not isinstance(rows, list):
             raise ValueError("depth_mutation_book_side")
@@ -682,10 +686,11 @@ class NinjaTraderMarketDataAdapter(MarketDataProviderAdapter):
         if operation == "Remove":
             if matches:
                 raise ValueError("removed_depth_level_still_present")
-        elif volume <= 0 or matches != ((price, volume),):
-            raise ValueError("depth_upsert_not_reflected_in_snapshot")
-        elif position >= len(levels) or levels[position][0] != price:
-            raise ValueError("depth_mutation_position_mismatch")
+        elif position < len(levels):
+            if matches != ((price, volume),) or levels[position] != (price, volume):
+                raise ValueError("depth_mutation_position_mismatch")
+        elif matches:
+            raise ValueError("depth_bounded_mutation_position_mismatch")
 
     @staticmethod
     def _levels(value: object, reverse: bool) -> tuple[BookLevel, ...]:

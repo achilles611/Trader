@@ -136,8 +136,33 @@ class ObservationAttestationTests(unittest.TestCase):
         for text in (addon, indicator):
             self.assertIn("EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1", text)
             self.assertIn("EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1", text)
-            self.assertIn("MarketDepth.Bids[index]", text)
-        self.assertEqual(SOURCE_HASH, "41ca7792669f032193a035cbae5185f58421251be04d2745dcd803073ffb1ba5")
+            self.assertIn("side.Insert(update.Position", text)
+            self.assertIn("side[update.Position]", text)
+            self.assertIn("side.RemoveAt(update.Position)", text)
+
+    def test_bounded_native_positional_snapshot_allows_a_deeper_mutation(self):
+        adapter = NinjaTraderMarketDataAdapter(
+            NinjaTraderContract("MNQ", "MNQ SEP26", "2026-09", "CME", Decimal("0.25"), "MNQ SEP26"),
+            attestation_key=ROOT_KEY, require_attestation=True,
+        )
+        payload = {
+            "contract_id": "MNQ SEP26",
+            "bids": [{"price": 100, "size": 3}, {"price": 99.75, "size": 2}],
+            "asks": [{"price": 100.25, "size": 4}, {"price": 100.5, "size": 1}],
+            "operation": "Update", "side": "Bid", "mutation_price": 98,
+            "mutation_volume": 7, "mutation_position": 10, "is_reset": False,
+            "snapshot_ordering": "NATIVE_POSITIONAL_BEST_TO_WORST_V1",
+            "source_event_sequence": 1,
+            "publication_policy": "EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1",
+        }
+        value = signed_record("DEPTH", payload=payload)
+        raw = RawProviderEvent(
+            "raw", MarketDataSource("NINJATRADER", "LUCID_CQG"),
+            "2026-09-11T12:30:00Z", value,
+        )
+        self.assertEqual(len(adapter.normalize(raw)), 1)
+
+        self.assertEqual(SOURCE_HASH, "7888f7db278fc6f997af8d13dc4d7eed84af42f43a8d1591fdeaeff1379b4656")
 
 
 if __name__ == "__main__":

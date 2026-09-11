@@ -32,6 +32,13 @@ namespace NinjaTrader.NinjaScript.AddOns
         private BeelzebubAutomaticMarketObserver automaticObserver;
         private bool addonActive;
         private static int automaticObserverActive;
+        private const int MaximumObserverRecoveryAttempts = 3;
+        private static readonly TimeSpan ObserverRecoveryInterval = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan ObserverCallbackStaleAfter = TimeSpan.FromSeconds(15);
+        private Timer observerRecoveryTimer;
+        private int observerRecoveryCheckQueued;
+        private int observerRecoveryAttempts;
+        private bool observerRecoveryExhaustedReported;
 
         public static bool AutomaticObserverActive
         {
@@ -47,10 +54,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                 BeelzebubReadOnlyOutbound.Diagnostic("ADDON_ACTIVE");
                 AttachKnownAccounts();
                 EnsureAutomaticObserver();
+                StartObserverRecoveryMonitor();
             }
             else if (State == State.Terminated)
             {
                 addonActive = false;
+                StopObserverRecoveryMonitor();
                 Account.AccountStatusUpdate -= OnAccountStatusUpdate;
                 DetachAutomaticObserver();
                 DetachKnownAccounts();
@@ -115,6 +124,8 @@ namespace NinjaTrader.NinjaScript.AddOns
         private void OnAttachMenuItemClick(object sender, RoutedEventArgs e)
         {
             BeelzebubReadOnlyOutbound.Diagnostic("OBSERVER_RECHECK_REQUESTED");
+            observerRecoveryAttempts = 0;
+            observerRecoveryExhaustedReported = false;
             AttachKnownAccounts();
             // The operator's explicit recheck must recover a stale native
             // subscription.  Merely ensuring the existing observer cannot do
@@ -225,12 +236,88 @@ namespace NinjaTrader.NinjaScript.AddOns
                 PublishObserverAttachment("NATIVE_ADDON_OBSERVER_FAILED", configured, null, false, false, "NATIVE_ADDON");
                 return;
             }
-            automaticObserver = new BeelzebubAutomaticMarketObserver(instrument);
-            if (!automaticObserver.Start())
+            BeelzebubAutomaticMarketObserver candidate =
+                new BeelzebubAutomaticMarketObserver(instrument);
+            automaticObserver = candidate;
+            if (!candidate.Start(() => addonActive && ReferenceEquals(automaticObserver, candidate)))
             {
-                automaticObserver = null;
+                if (ReferenceEquals(automaticObserver, candidate))
+                    automaticObserver = null;
+                candidate.Stop();
                 PublishObserverAttachment("NATIVE_ADDON_OBSERVER_FAILED", configured, instrument.FullName, false, false, "NATIVE_ADDON");
             }
+        }
+
+        private void StartObserverRecoveryMonitor()
+        {
+            if (observerRecoveryTimer != null)
+                return;
+            observerRecoveryTimer = new Timer(
+                _ => QueueObserverRecoveryCheck(), null,
+                ObserverRecoveryInterval, ObserverRecoveryInterval);
+        }
+
+        private void StopObserverRecoveryMonitor()
+        {
+            Timer current = observerRecoveryTimer;
+            observerRecoveryTimer = null;
+            if (current != null)
+                current.Dispose();
+            Interlocked.Exchange(ref observerRecoveryCheckQueued, 0);
+        }
+
+        private void QueueObserverRecoveryCheck()
+        {
+            if (!addonActive || Interlocked.Exchange(ref observerRecoveryCheckQueued, 1) != 0)
+                return;
+            try
+            {
+                if (Application.Current == null || Application.Current.Dispatcher.HasShutdownStarted)
+                {
+                    Interlocked.Exchange(ref observerRecoveryCheckQueued, 0);
+                    return;
+                }
+                Application.Current.Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    try { CheckObserverRecovery(); }
+                    finally { Interlocked.Exchange(ref observerRecoveryCheckQueued, 0); }
+                }));
+            }
+            catch (InvalidOperationException)
+            {
+                Interlocked.Exchange(ref observerRecoveryCheckQueued, 0);
+            }
+        }
+
+        private void CheckObserverRecovery()
+        {
+            if (!addonActive)
+                return;
+            BeelzebubAutomaticMarketObserver current = automaticObserver;
+            if (current != null && !current.NeedsRecovery(ObserverCallbackStaleAfter))
+            {
+                observerRecoveryAttempts = 0;
+                observerRecoveryExhaustedReported = false;
+                return;
+            }
+            if (observerRecoveryAttempts >= MaximumObserverRecoveryAttempts)
+            {
+                if (!observerRecoveryExhaustedReported)
+                {
+                    observerRecoveryExhaustedReported = true;
+                    BeelzebubReadOnlyOutbound.Diagnostic("NATIVE_ADDON_OBSERVER_RECOVERY_EXHAUSTED");
+                    PublishObserverAttachment(
+                        "OBSERVER_RECOVERY_EXHAUSTED", ResolveConfiguredInstrument(),
+                        null, false, false, "NATIVE_ADDON");
+                }
+                return;
+            }
+            observerRecoveryAttempts++;
+            BeelzebubReadOnlyOutbound.Diagnostic(
+                "NATIVE_ADDON_OBSERVER_RECOVERY_ATTEMPT_" + observerRecoveryAttempts);
+            DetachAutomaticObserver();
+            EnsureAutomaticObserver();
+            InspectCharts(false);
         }
 
         private void DetachAutomaticObserver()
@@ -520,6 +607,11 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string DepthPublicationPolicy = "EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1";
         private readonly Instrument instrument;
         private readonly object bookLock = new object();
+        private readonly List<KeyValuePair<double, long>> depthBids = new List<KeyValuePair<double, long>>();
+        private readonly List<KeyValuePair<double, long>> depthAsks = new List<KeyValuePair<double, long>>();
+        private bool depthContinuityBroken;
+        private readonly long startedTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+        private long lastMarketCallbackTicks;
         private bool subscribed;
         private bool stopping;
         private bool chartFound;
@@ -546,15 +638,16 @@ namespace NinjaTrader.NinjaScript.AddOns
             this.instrument = instrument;
         }
 
-        public bool Start()
+        public bool Start(Func<bool> activationCurrent)
         {
-            if (instrument == null || instrument.Dispatcher == null || instrument.Dispatcher.HasShutdownStarted)
+            if (activationCurrent == null || instrument == null
+                || instrument.Dispatcher == null || instrument.Dispatcher.HasShutdownStarted)
                 return false;
             try
             {
                 instrument.Dispatcher.InvokeAsync(() =>
                 {
-                    if (stopping || subscribed)
+                    if (stopping || subscribed || !activationCurrent())
                         return;
                     try
                     {
@@ -776,6 +869,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             if (stopping)
                 return;
+            Interlocked.Exchange(ref lastMarketCallbackTicks, System.Diagnostics.Stopwatch.GetTimestamp());
             PublishAttachment(chartFound, false);
             PublishMarketConnectedOnce();
             if (!reportedLevelOne)
@@ -845,6 +939,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             if (stopping)
                 return;
+            Interlocked.Exchange(ref lastMarketCallbackTicks, System.Diagnostics.Stopwatch.GetTimestamp());
             PublishAttachment(chartFound, false);
             PublishMarketConnectedOnce();
             if (!reportedDepth)
@@ -865,7 +960,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                 double bestNativeBid;
                 double bestNativeAsk;
                 string snapshotFailure;
-                if (!TryNativeDepthSnapshot(
+                if (!TryApplyDepthMutation(
+                    e,
                     out bidLevels, out askLevels, out bestNativeBid,
                     out bestNativeAsk, out snapshotFailure))
                 {
@@ -883,7 +979,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     + e.Price.ToString(CultureInfo.InvariantCulture) + ",\"mutation_volume\":" + e.Volume
                     + ",\"mutation_position\":" + e.Position
                     + ",\"is_reset\":" + (e.IsReset ? "true" : "false")
-                    + ",\"snapshot_ordering\":\"PRICE_CANONICAL_BEST_TO_WORST_V1\""
+                    + ",\"snapshot_ordering\":\"NATIVE_POSITIONAL_BEST_TO_WORST_V1\""
                     + ",\"source_event_sequence\":" + sourceEventSequence
                     + ",\"publication_policy\":\"" + DepthPublicationPolicy + "\"}";
             }
@@ -905,7 +1001,8 @@ namespace NinjaTrader.NinjaScript.AddOns
             return !Double.IsNaN(value) && !Double.IsInfinity(value) && value > 0;
         }
 
-        private bool TryNativeDepthSnapshot(
+        private bool TryApplyDepthMutation(
+            MarketDepthEventArgs update,
             out string bidLevels, out string askLevels,
             out double bestNativeBid, out double bestNativeAsk,
             out string failureReason)
@@ -915,102 +1012,119 @@ namespace NinjaTrader.NinjaScript.AddOns
             bestNativeBid = Double.NaN;
             bestNativeAsk = Double.NaN;
             failureReason = null;
-            if (instrument.MarketDepth == null)
+            if (update == null)
             {
-                failureReason = "NATIVE_MARKET_DEPTH_UNAVAILABLE";
+                failureReason = "NATIVE_DEPTH_MUTATION_MISSING";
                 return false;
             }
-            SortedDictionary<double, long> nativeBids = new SortedDictionary<double, long>();
-            SortedDictionary<double, long> nativeAsks = new SortedDictionary<double, long>();
-            try
+            List<KeyValuePair<double, long>> candidateBids =
+                new List<KeyValuePair<double, long>>(depthBids);
+            List<KeyValuePair<double, long>> candidateAsks =
+                new List<KeyValuePair<double, long>>(depthAsks);
+            List<KeyValuePair<double, long>> side;
+            if (update.MarketDataType == MarketDataType.Bid)
+                side = candidateBids;
+            else if (update.MarketDataType == MarketDataType.Ask)
+                side = candidateAsks;
+            else
             {
-                // NinjaTrader's bundled SuperDOM columns take this exact
-                // Instrument.SyncMarketDepth lock before enumerating Bids and
-                // Asks. Use the native owner lock as well as our callback lock
-                // so Count and indexed rows belong to one coherent snapshot.
-                // The public MarketDepth contract does not promise list order.
-                // Copy and aggregate the native rows here, then publish a
-                // deterministic best-to-worst price view without mutating the
-                // platform-owned collection or inventing any level.
-                lock (instrument.SyncMarketDepth)
+                depthContinuityBroken = true;
+                failureReason = "NATIVE_DEPTH_SIDE_INVALID";
+                return false;
+            }
+            if (update.IsReset)
+            {
+                candidateBids.Clear();
+                candidateAsks.Clear();
+                side = update.MarketDataType == MarketDataType.Bid ? candidateBids : candidateAsks;
+            }
+            bool validPrice = FinitePositive(update.Price);
+            bool applied = false;
+            if (update.Operation == Operation.Add)
+            {
+                if (validPrice && update.Volume > 0 && update.Position >= 0 && update.Position <= side.Count)
                 {
-                    int bidCount = instrument.MarketDepth.Bids.Count;
-                    int askCount = instrument.MarketDepth.Asks.Count;
-                    for (int index = 0; index < bidCount; index++)
-                    {
-                        double price = instrument.MarketDepth.Bids[index].Price;
-                        long volume = instrument.MarketDepth.Bids[index].Volume;
-                        if (!FinitePositive(price))
-                        {
-                            failureReason = "NATIVE_BID_PRICE_INVALID";
-                            return false;
-                        }
-                        if (volume <= 0)
-                        {
-                            failureReason = "NATIVE_BID_VOLUME_INVALID";
-                            return false;
-                        }
-                        long accumulated;
-                        nativeBids.TryGetValue(price, out accumulated);
-                        try
-                        {
-                            nativeBids[price] = checked(accumulated + volume);
-                        }
-                        catch (OverflowException)
-                        {
-                            failureReason = "NATIVE_BID_VOLUME_OVERFLOW";
-                            return false;
-                        }
-                    }
-                    for (int index = 0; index < askCount; index++)
-                    {
-                        double price = instrument.MarketDepth.Asks[index].Price;
-                        long volume = instrument.MarketDepth.Asks[index].Volume;
-                        if (!FinitePositive(price))
-                        {
-                            failureReason = "NATIVE_ASK_PRICE_INVALID";
-                            return false;
-                        }
-                        if (volume <= 0)
-                        {
-                            failureReason = "NATIVE_ASK_VOLUME_INVALID";
-                            return false;
-                        }
-                        long accumulated;
-                        nativeAsks.TryGetValue(price, out accumulated);
-                        try
-                        {
-                            nativeAsks[price] = checked(accumulated + volume);
-                        }
-                        catch (OverflowException)
-                        {
-                            failureReason = "NATIVE_ASK_VOLUME_OVERFLOW";
-                            return false;
-                        }
-                    }
+                    side.Insert(update.Position, new KeyValuePair<double, long>(update.Price, update.Volume));
+                    applied = true;
                 }
             }
-            catch (ArgumentOutOfRangeException)
+            else if (update.Operation == Operation.Update)
             {
-                failureReason = "NATIVE_POSITIONAL_SNAPSHOT_RACE";
+                if (validPrice && update.Volume > 0 && update.Position >= 0 && update.Position < side.Count)
+                {
+                    side[update.Position] = new KeyValuePair<double, long>(update.Price, update.Volume);
+                    applied = true;
+                }
+            }
+            else if (update.Operation == Operation.Remove)
+            {
+                if (update.Position >= 0 && update.Position < side.Count)
+                {
+                    side.RemoveAt(update.Position);
+                    applied = true;
+                }
+            }
+            if (!applied)
+            {
+                depthContinuityBroken = true;
+                failureReason = "NATIVE_DEPTH_MUTATION_APPLICATION_FAILED";
                 return false;
             }
-            if (nativeBids.Count == 0 || nativeAsks.Count == 0)
+            depthBids.Clear();
+            depthBids.AddRange(candidateBids);
+            depthAsks.Clear();
+            depthAsks.AddRange(candidateAsks);
+            if (depthBids.Count == 0 || depthAsks.Count == 0)
             {
                 failureReason = "NATIVE_DEPTH_SIDE_EMPTY";
                 return false;
             }
-            List<string> bidRows = nativeBids.Reverse().Take(MaximumPublishedBookLevelsPerSide)
+            if (!StrictlyOrdered(depthBids, true) || !StrictlyOrdered(depthAsks, false))
+            {
+                failureReason = "NATIVE_POSITIONAL_ORDER_INVALID";
+                return false;
+            }
+            bestNativeBid = depthBids[0].Key;
+            bestNativeAsk = depthAsks[0].Key;
+            if (bestNativeBid >= bestNativeAsk)
+            {
+                failureReason = "CROSSED_NATIVE_POSITIONAL_SNAPSHOT";
+                return false;
+            }
+            List<string> bidRows = depthBids.Take(MaximumPublishedBookLevelsPerSide)
                 .Select(row => "{\"price\":" + row.Key.ToString(CultureInfo.InvariantCulture)
                     + ",\"size\":" + row.Value + "}").ToList();
-            List<string> askRows = nativeAsks.Take(MaximumPublishedBookLevelsPerSide)
+            List<string> askRows = depthAsks.Take(MaximumPublishedBookLevelsPerSide)
                 .Select(row => "{\"price\":" + row.Key.ToString(CultureInfo.InvariantCulture)
                     + ",\"size\":" + row.Value + "}").ToList();
-            bestNativeBid = nativeBids.Last().Key;
-            bestNativeAsk = nativeAsks.First().Key;
             bidLevels = "[" + String.Join(",", bidRows) + "]";
             askLevels = "[" + String.Join(",", askRows) + "]";
             return true;
+        }
+
+        private static bool StrictlyOrdered(List<KeyValuePair<double, long>> levels, bool descending)
+        {
+            for (int index = 0; index < levels.Count; index++)
+            {
+                if (!FinitePositive(levels[index].Key) || levels[index].Value <= 0)
+                    return false;
+                if (index > 0 && (descending
+                    ? levels[index - 1].Key <= levels[index].Key
+                    : levels[index - 1].Key >= levels[index].Key))
+                    return false;
+            }
+            return true;
+        }
+
+        public bool NeedsRecovery(TimeSpan maximumCallbackAge)
+        {
+            if (stopping || depthContinuityBroken)
+                return !stopping;
+            long latest = Interlocked.Read(ref lastMarketCallbackTicks);
+            long baseline = latest == 0 ? startedTicks : latest;
+            double elapsed = (System.Diagnostics.Stopwatch.GetTimestamp() - baseline)
+                / (double)System.Diagnostics.Stopwatch.Frequency;
+            return elapsed > maximumCallbackAge.TotalSeconds;
         }
 
         private void PublishDepthUnavailable(string reason, long sourceEventSequence, DateTime providerTime)
@@ -1147,7 +1261,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string AttestedSchema = "lane-iii-phase-f3-ninjatrader-observation-v2";
         private const string AttestationProtocol = "l3f3-ninjatrader-observer-attestation-v1";
         private const string AttestationKeyContext = "BEELZEBUB_NINJATRADER_OBSERVATION_V2";
-        private const string ProducerSourceFingerprint = "41ca7792669f032193a035cbae5185f58421251be04d2745dcd803073ffb1ba5";
+        private const string ProducerSourceFingerprint = "7888f7db278fc6f997af8d13dc4d7eed84af42f43a8d1591fdeaeff1379b4656";
         // Event-driven trades/depth require burst capacity, but memory remains
         // bounded. A full queue drops the signed frame after assigning its
         // sequence; the next source_event_sequence exposes the gap.
