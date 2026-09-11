@@ -266,57 +266,59 @@ namespace NinjaTrader.NinjaScript.Indicators
             double priorAsk = Double.NegativeInfinity;
             try
             {
-                // The platform can resize its positional book between Count
-                // and an indexed read. Our lock cannot lock that native owner,
-                // so make the exact churn race a truthful unavailable snapshot
-                // instead of allowing it to terminate depth callbacks.
-                int bidCount = Math.Min(MaximumPublishedBookLevelsPerSide, Instrument.MarketDepth.Bids.Count);
-                int askCount = Math.Min(MaximumPublishedBookLevelsPerSide, Instrument.MarketDepth.Asks.Count);
-                for (int index = 0; index < bidCount; index++)
+                // NinjaTrader's bundled SuperDOM columns use this native lock
+                // before enumerating the positional book. It makes Count and
+                // indexed rows one coherent platform-owned snapshot.
+                lock (Instrument.SyncMarketDepth)
                 {
-                    double price = Instrument.MarketDepth.Bids[index].Price;
-                    long volume = Instrument.MarketDepth.Bids[index].Volume;
-                    if (!FinitePositive(price))
+                    int bidCount = Math.Min(MaximumPublishedBookLevelsPerSide, Instrument.MarketDepth.Bids.Count);
+                    int askCount = Math.Min(MaximumPublishedBookLevelsPerSide, Instrument.MarketDepth.Asks.Count);
+                    for (int index = 0; index < bidCount; index++)
                     {
-                        failureReason = "NATIVE_BID_PRICE_INVALID";
-                        return false;
+                        double price = Instrument.MarketDepth.Bids[index].Price;
+                        long volume = Instrument.MarketDepth.Bids[index].Volume;
+                        if (!FinitePositive(price))
+                        {
+                            failureReason = "NATIVE_BID_PRICE_INVALID";
+                            return false;
+                        }
+                        if (volume <= 0)
+                        {
+                            failureReason = "NATIVE_BID_VOLUME_INVALID";
+                            return false;
+                        }
+                        if (price >= priorBid)
+                        {
+                            failureReason = "NATIVE_BID_POSITION_ORDER_INVALID";
+                            return false;
+                        }
+                        if (index == 0) bestNativeBid = price;
+                        priorBid = price;
+                        bidRows.Add("{\"price\":" + price.ToString(CultureInfo.InvariantCulture) + ",\"size\":" + volume + "}");
                     }
-                    if (volume <= 0)
+                    for (int index = 0; index < askCount; index++)
                     {
-                        failureReason = "NATIVE_BID_VOLUME_INVALID";
-                        return false;
+                        double price = Instrument.MarketDepth.Asks[index].Price;
+                        long volume = Instrument.MarketDepth.Asks[index].Volume;
+                        if (!FinitePositive(price))
+                        {
+                            failureReason = "NATIVE_ASK_PRICE_INVALID";
+                            return false;
+                        }
+                        if (volume <= 0)
+                        {
+                            failureReason = "NATIVE_ASK_VOLUME_INVALID";
+                            return false;
+                        }
+                        if (price <= priorAsk)
+                        {
+                            failureReason = "NATIVE_ASK_POSITION_ORDER_INVALID";
+                            return false;
+                        }
+                        if (index == 0) bestNativeAsk = price;
+                        priorAsk = price;
+                        askRows.Add("{\"price\":" + price.ToString(CultureInfo.InvariantCulture) + ",\"size\":" + volume + "}");
                     }
-                    if (price >= priorBid)
-                    {
-                        failureReason = "NATIVE_BID_POSITION_ORDER_INVALID";
-                        return false;
-                    }
-                    if (index == 0) bestNativeBid = price;
-                    priorBid = price;
-                    bidRows.Add("{\"price\":" + price.ToString(CultureInfo.InvariantCulture) + ",\"size\":" + volume + "}");
-                }
-                for (int index = 0; index < askCount; index++)
-                {
-                    double price = Instrument.MarketDepth.Asks[index].Price;
-                    long volume = Instrument.MarketDepth.Asks[index].Volume;
-                    if (!FinitePositive(price))
-                    {
-                        failureReason = "NATIVE_ASK_PRICE_INVALID";
-                        return false;
-                    }
-                    if (volume <= 0)
-                    {
-                        failureReason = "NATIVE_ASK_VOLUME_INVALID";
-                        return false;
-                    }
-                    if (price <= priorAsk)
-                    {
-                        failureReason = "NATIVE_ASK_POSITION_ORDER_INVALID";
-                        return false;
-                    }
-                    if (index == 0) bestNativeAsk = price;
-                    priorAsk = price;
-                    askRows.Add("{\"price\":" + price.ToString(CultureInfo.InvariantCulture) + ",\"size\":" + volume + "}");
                 }
             }
             catch (ArgumentOutOfRangeException)

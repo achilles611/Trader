@@ -1664,6 +1664,7 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertIn("NATIVE_BID_POSITION_ORDER_INVALID", source)
         self.assertIn("NATIVE_ASK_POSITION_ORDER_INVALID", source)
         self.assertIn("NATIVE_POSITIONAL_SNAPSHOT_RACE", source)
+        self.assertIn("lock (Instrument.SyncMarketDepth)", source)
         self.assertNotIn('PublishDepthUnavailable("POSITIONAL_SNAPSHOT_INVALID"', source)
         self.assertIn('QuotePublicationPolicy = "BOUNDED_LATEST_STATE_2HZ"', source)
         self.assertIn('TradePublicationPolicy = "EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1"', source)
