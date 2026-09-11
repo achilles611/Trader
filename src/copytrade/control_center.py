@@ -48,6 +48,7 @@ from src.l3g_paper.paper_autostart import (
 )
 from src.l3g_paper.ninjatrader_transport import LocalPaperSecretProvider, PaperExecutionTransport
 from src.l3g_paper.pong_collection import PongAuthenticHourCollector
+from src.l3g_paper.pong_production import PongProductionHost
 from src.l3g_paper.contracts import resolve_paper_profile
 from src.l3g_paper.profile_switch import (
     PROFILE_SWITCH_ACTION_HEADER,
@@ -107,11 +108,18 @@ LEDGER_VERIFIER_SHUTDOWN_WAIT_SECONDS = 30.0
 GRACEFUL_SHUTDOWN_ACTION_HEADER = "X-Beelzebub-Graceful-Shutdown-Action"
 GRACEFUL_SHUTDOWN_ACTION_VALUE = "beezconsole-graceful-shutdown-v1"
 PONG_INDEPENDENT_COLLECTION_ENV = "BEELZEBUB_PONG_INDEPENDENT_COLLECTION"
+PONG_BOUNDED_ACTIVATION_ENV = "BEELZEBUB_PONG_BOUNDED_ACTIVATION"
 LEDGER_CAPACITY_RECOVERY_ACTION_HEADER = (
     "X-Beelzebub-Ledger-Capacity-Recovery-Action"
 )
 LEDGER_CAPACITY_RECOVERY_ACTION_VALUE = (
     "lane-iii-ledger-capacity-recovery-v1"
+)
+HEARTBEAT_TIME_RECOVERY_ACTION_HEADER = (
+    "X-Beelzebub-Heartbeat-Time-Recovery-Action"
+)
+HEARTBEAT_TIME_RECOVERY_ACTION_VALUE = (
+    "lane-iii-heartbeat-time-recovery-v1"
 )
 _LOCAL_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 
@@ -1508,6 +1516,9 @@ def create_control_center_app(
     pong_independent_collection = _strict_environment_flag(
         PONG_INDEPENDENT_COLLECTION_ENV,
     )
+    pong_bounded_activation = _strict_environment_flag(
+        PONG_BOUNDED_ACTIVATION_ENV,
+    )
     perpetual_seed_artifact: Mapping[str, object] | None = None
     perpetual_seed_proof: Mapping[str, object] | None = None
     perpetual_seed_manifest: Mapping[str, object] | None = None
@@ -1811,6 +1822,7 @@ def create_control_center_app(
     def lane_iii_paper_health() -> dict[str, object]:
         paper = ninjatrader_runtime.get("paper")
         collector = ninjatrader_runtime.get("pong_collection")
+        pong_host = ninjatrader_runtime.get("pong_production")
         collection_status = (
             collector.status()
             if type(collector) is PongAuthenticHourCollector
@@ -1864,6 +1876,16 @@ def create_control_center_app(
                 "ledger_verification": ledger_verifier.status(),
                 "ledger_shutdown": paper_ledger_shutdown_receipt,
                 "pong_collection": collection_status,
+                "pong_production": (
+                    pong_host.status()
+                    if type(pong_host) is PongProductionHost
+                    else {
+                        "schema": "beelzebub-pong-production-host-v1",
+                        "state": "UNSTARTED",
+                        "entry_authority_ready": False,
+                        "live_capital": "DENIED",
+                    }
+                ),
             }
         status = paper.status()
         verification = ledger_verifier.status()
@@ -1879,6 +1901,16 @@ def create_control_center_app(
         status["ledger_verification"] = verification
         status["ledger_shutdown"] = paper_ledger_shutdown_receipt
         status["pong_collection"] = collection_status
+        status["pong_production"] = (
+            pong_host.status()
+            if type(pong_host) is PongProductionHost
+            else {
+                "schema": "beelzebub-pong-production-host-v1",
+                "state": "UNSTARTED",
+                "entry_authority_ready": False,
+                "live_capital": "DENIED",
+            }
+        )
         raw_ledger = status.get("ledger")
         if isinstance(raw_ledger, Mapping):
             status["ledger"] = ledger_health_projection(
@@ -1997,7 +2029,11 @@ def create_control_center_app(
     def start_operational_paper_from_autostart(request_id: str) -> Mapping[str, object]:
         """Enter only the canonical persistent Sim101 lifecycle after orchestration."""
         if pong_independent_collection:
-            raise RuntimeError("PONG_INDEPENDENT_COLLECTION_ACTIVE")
+            host = ninjatrader_runtime.get("pong_production")
+            if type(host) is not PongProductionHost or (
+                host.authority_status().get("operational_start_ready") is not True
+            ):
+                raise RuntimeError("PONG_INDEPENDENT_COLLECTION_ACTIVE")
         paper = ninjatrader_runtime.get("paper")
         if not isinstance(paper, LaneIIIPaperRuntime):
             raise RuntimeError("PAPER_RUNTIME_UNAVAILABLE")
@@ -2133,6 +2169,7 @@ def create_control_center_app(
         ninjatrader_runtime["active"] = True
         listener: NinjaTraderListenerWorker | None = None
         pong_collector: PongAuthenticHourCollector | None = None
+        pong_host: PongProductionHost | None = None
         paper_transport: PaperExecutionTransport | None = None
         paper_runtime: LaneIIIPaperRuntime | None = None
         paper_ledger: PaperLedger | None = None
@@ -2274,6 +2311,21 @@ def create_control_center_app(
             pong_collector.start()
             ninjatrader_runtime["pong_collection"] = pong_collector
             app.state.pong_collection = pong_collector
+            pong_host = PongProductionHost(
+                resolved_profile_switch_runtime_root / "pong-production",
+                selected_profile=selected_paper_profile.selection_key,
+                expected_market_source_fingerprint=EXPECTED_OBSERVER_SOURCE_FINGERPRINT,
+                runtime_snapshot=paper_runtime.pong_controller_snapshot,
+                collector_status=pong_collector.status,
+                controller_dispatch=paper_runtime.apply_pong_controller_command,
+                native_dispatch=paper_runtime.apply_pong_native_directive,
+                activation_authorized=pong_bounded_activation,
+            )
+            paper_runtime.bind_pong_integration_status(pong_host.authority_status)
+            paper_runtime.bind_pong_execution_sink(pong_host.on_execution_message)
+            pong_host.start()
+            ninjatrader_runtime["pong_production"] = pong_host
+            app.state.pong_production = pong_host
             listener = (
                 ninjatrader_listener_factory()
                 if ninjatrader_listener_factory is not None
@@ -2288,10 +2340,14 @@ def create_control_center_app(
             def collect_and_fanout_observation(observation: object) -> None:
                 assert pong_collector is not None
                 pong_collector.ingest(observation)  # type: ignore[arg-type]
+                assert pong_host is not None
+                pong_host.on_observation(observation)  # type: ignore[arg-type]
                 if (
                     pong_independent_collection
                     and getattr(observation, "observation_type", None)
                     in {"TRADE", "QUOTE", "DEPTH"}
+                    and selected_paper_profile.selection_key
+                    != PONG_ENTRY_PROFILE_VERSION
                 ):
                     # During the explicitly bounded evidence acquisition, the
                     # authenticated Pong sink must not wait behind legacy
@@ -2372,6 +2428,8 @@ def create_control_center_app(
                     active_login.stop()
                 if listener is not None:
                     listener.stop()
+                if pong_host is not None:
+                    pong_host.stop()
                 if pong_collector is not None:
                     pong_collector.stop()
             finally:
@@ -2969,6 +3027,18 @@ def create_control_center_app(
     async def api_lane_iii_paper() -> dict[str, object]:
         return lane_iii_paper_health()
 
+    @app.get("/api/lane-iii/pong")
+    async def api_lane_iii_pong() -> dict[str, object]:
+        host = ninjatrader_runtime.get("pong_production")
+        if type(host) is not PongProductionHost:
+            return {
+                "schema": "beelzebub-pong-production-host-v1",
+                "state": "UNSTARTED",
+                "entry_authority_ready": False,
+                "live_capital": "DENIED",
+            }
+        return host.status()
+
     @app.get("/api/lane-iii/paper/slim-status")
     async def api_lane_iii_paper_slim_status() -> dict[str, object]:
         """Compact, read-only rendering state; it cannot acquire paper authority."""
@@ -3330,7 +3400,11 @@ def create_control_center_app(
         if paper is None:
             raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
         if pong_independent_collection:
-            raise HTTPException(status_code=409, detail="PONG_INDEPENDENT_COLLECTION_ACTIVE")
+            host = ninjatrader_runtime.get("pong_production")
+            if type(host) is not PongProductionHost or (
+                host.authority_status().get("operational_start_ready") is not True
+            ):
+                raise HTTPException(status_code=409, detail="PONG_INDEPENDENT_COLLECTION_ACTIVE")
         if not isinstance(body, dict) or set(body) != {"request_id"} or not isinstance(body.get("request_id"), str):
             raise HTTPException(status_code=400, detail="Operational paper start accepts only a request_id.")
         bootstrap = ninjatrader_runtime.get("login_bootstrap")
@@ -3383,6 +3457,62 @@ def create_control_center_app(
             )
         try:
             return paper.recover_healthy_ledger_capacity(
+                str(body["request_id"]),
+                lambda operation_id, runtime_snapshot:
+                    require_operational_paper_ledger_verification(
+                        operation_id,
+                        runtime_snapshot,
+                        enforce_observer=False,
+                    ),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/lane-iii/paper/heartbeat-time-recovery")
+    async def api_lane_iii_paper_heartbeat_time_recovery() -> dict[str, object]:
+        """Read the narrow recovery gate without changing paper authority."""
+        paper = ninjatrader_runtime.get("paper")
+        if paper is None:
+            raise HTTPException(
+                status_code=503, detail="Lane III paper runtime is unavailable."
+            )
+        return paper.heartbeat_time_recovery_authority()
+
+    @app.post("/api/lane-iii/paper/heartbeat-time-recovery")
+    async def api_recover_lane_iii_paper_heartbeat_time(
+        request: Request,
+        body: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, object]:
+        """Clear only proven-retired HEARTBEAT_TIME; never arm or start."""
+        paper = ninjatrader_runtime.get("paper")
+        if paper is None:
+            raise HTTPException(
+                status_code=503, detail="Lane III paper runtime is unavailable."
+            )
+        hostname = (request.url.hostname or "").lower()
+        if hostname not in {"127.0.0.1", "localhost", "::1", "testserver"}:
+            raise HTTPException(
+                status_code=403, detail="Heartbeat-time recovery is loopback-only."
+            )
+        if (
+            request.headers.get(HEARTBEAT_TIME_RECOVERY_ACTION_HEADER)
+            != HEARTBEAT_TIME_RECOVERY_ACTION_VALUE
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Heartbeat-time recovery action authentication failed.",
+            )
+        if (
+            not isinstance(body, dict)
+            or set(body) != {"request_id"}
+            or not isinstance(body.get("request_id"), str)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Heartbeat-time recovery accepts only a request_id.",
+            )
+        try:
+            return paper.recover_heartbeat_time_lockout(
                 str(body["request_id"]),
                 lambda operation_id, runtime_snapshot:
                     require_operational_paper_ledger_verification(

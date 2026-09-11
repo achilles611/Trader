@@ -61,6 +61,7 @@ HELLO_MAXIMUM_AGE_SECONDS = 10
 FUTURE_TOLERANCE_SECONDS = 1
 HEARTBEAT_INTERVAL_SECONDS = 1
 HEARTBEAT_WATCHDOG_SECONDS = 5
+HEARTBEAT_SEND_LOCK_TIMEOUT_SECONDS = 0.5
 COMMAND_ACKNOWLEDGEMENT_TIMEOUT_SECONDS = 3
 # This marker is transport-local metadata, never a wire-protocol field.  It
 # lets the runtime prioritize an authenticated safety callback when its normal
@@ -152,6 +153,16 @@ class ExecutionTransportStatus:
     addon_build_timestamp: str | None
     expected_addon_source_fingerprint: str
     addon_provenance_valid: bool
+    heartbeats_sent: int
+    heartbeats_sent_current_session: int
+    heartbeat_send_lock_timeouts: int
+    authenticated_at: str | None
+    last_heartbeat_sent_at: str | None
+    last_heartbeat_send_error: str | None
+    command_rejections_at_session_start: int
+    heartbeat_send_lock_timeouts_at_session_start: int
+    commands_sent_at_session_start: int
+    pending_acknowledgements: int
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -258,6 +269,15 @@ class PaperExecutionTransport:
         self._acknowledgements = 0
         self._command_rejections = 0
         self._duplicate_receipts = 0
+        self._heartbeats_sent = 0
+        self._heartbeats_sent_current_session = 0
+        self._heartbeat_send_lock_timeouts = 0
+        self._authenticated_at: str | None = None
+        self._last_heartbeat_sent_at: str | None = None
+        self._last_heartbeat_send_error: str | None = None
+        self._command_rejections_at_session_start = 0
+        self._heartbeat_send_lock_timeouts_at_session_start = 0
+        self._commands_sent_at_session_start = 0
         self._expected_addon_source_fingerprint = expected_source_fingerprint or expected_addon_source_fingerprint()
         self._addon_protocol_version: str | None = None
         self._addon_source_fingerprint: str | None = None
@@ -276,6 +296,13 @@ class PaperExecutionTransport:
                 self._addon_build_timestamp, self._expected_addon_source_fingerprint,
                 self._addon_protocol_version == ADDON_PROTOCOL_VERSION
                 and self._addon_source_fingerprint == self._expected_addon_source_fingerprint,
+                self._heartbeats_sent, self._heartbeats_sent_current_session,
+                self._heartbeat_send_lock_timeouts, self._authenticated_at,
+                self._last_heartbeat_sent_at, self._last_heartbeat_send_error,
+                self._command_rejections_at_session_start,
+                self._heartbeat_send_lock_timeouts_at_session_start,
+                self._commands_sent_at_session_start,
+                len(self._pending_acknowledgements),
             )
 
     def start(self, *, timeout_seconds: float = _START_TIMEOUT_SECONDS) -> ExecutionTransportStatus:
@@ -365,6 +392,10 @@ class PaperExecutionTransport:
                             self._addon_source_fingerprint = None
                             self._addon_build_fingerprint = None
                             self._addon_build_timestamp = None
+                            self._authenticated_at = None
+                            self._heartbeats_sent_current_session = 0
+                            self._last_heartbeat_sent_at = None
+                            self._last_heartbeat_send_error = None
                         self._notify_bridge("CONNECTED")
                         continue
                     try:
@@ -433,6 +464,10 @@ class PaperExecutionTransport:
             self._addon_source_fingerprint = None
             self._addon_build_fingerprint = None
             self._addon_build_timestamp = None
+            self._authenticated_at = None
+            self._heartbeats_sent_current_session = 0
+            self._last_heartbeat_sent_at = None
+            self._last_heartbeat_send_error = None
             self._pending_acknowledgements.clear()
             if self._state not in {"STOPPING", "STOPPED", "FAULTED"}:
                 self._state = "LISTENING"
@@ -660,6 +695,15 @@ class PaperExecutionTransport:
                 self._addon_source_fingerprint = str(payload["addon_source_fingerprint"])
                 self._addon_build_fingerprint = str(payload["addon_build_fingerprint"])
                 self._addon_build_timestamp = str(payload["addon_build_timestamp"])
+                self._authenticated_at = _now()
+                self._heartbeats_sent_current_session = 0
+                self._last_heartbeat_sent_at = None
+                self._last_heartbeat_send_error = None
+                self._command_rejections_at_session_start = self._command_rejections
+                self._heartbeat_send_lock_timeouts_at_session_start = (
+                    self._heartbeat_send_lock_timeouts
+                )
+                self._commands_sent_at_session_start = self._commands_sent
             self.ledger.append(
                 "SESSION_HANDSHAKE",
                 {key: value for key, value in payload.items() if key != "signature"},
@@ -881,20 +925,69 @@ class PaperExecutionTransport:
                 ) from exc
 
     def send_heartbeat(self, *, armed: bool) -> None:
-        with self._lock:
-            if not self._authenticated or self._execution_session_id is None:
+        # The timestamp is part of the native validity contract.  Creating it
+        # before waiting behind an ordinary command can turn a correctly
+        # signed heartbeat into a stale frame.  Acquire the one wire-ordering
+        # boundary first, then revalidate the current generation/session and
+        # timestamp immediately before signing and sending.  A saturated wire
+        # is explicit: never transmit an already-stale heartbeat later.
+        if not self._write_lock.acquire(timeout=HEARTBEAT_SEND_LOCK_TIMEOUT_SECONDS):
+            with self._lock:
+                self._heartbeat_send_lock_timeouts += 1
+                self._last_heartbeat_send_error = "HEARTBEAT_SEND_LOCK_TIMEOUT"
+            raise RuntimeError("HEARTBEAT_SEND_LOCK_TIMEOUT")
+        try:
+            with self._lock:
+                key = self._key
+                client = self._client
+                session_id = self._execution_session_id
+                authenticated = self._authenticated
+            if not authenticated or session_id is None:
                 return
-            session_id = self._execution_session_id
-        self._send_signed({
-            "schema": EXECUTION_SCHEMA,
-            "message_type": "HEARTBEAT",
-            "execution_session_id": session_id,
-            "armed": bool(armed),
-            "paper_policy_hash": self.policy.configuration_hash,
-            "risk_profile_hash": self.risk.configuration_hash,
-            "account_binding_hash": ACCOUNT_BINDING.binding_hash,
-            "timestamp": _now(),
-        })
+            if key is None:
+                with self._lock:
+                    self._last_heartbeat_send_error = "HEARTBEAT_SIGNING_KEY_UNAVAILABLE"
+                raise RuntimeError("Execution signing key is unavailable.")
+            if client is None:
+                with self._lock:
+                    self._last_heartbeat_send_error = "HEARTBEAT_EXECUTION_BRIDGE_DISCONNECTED"
+                raise RuntimeError("The NinjaTrader paper execution bridge is disconnected.")
+            sent_at = _now()
+            payload: dict[str, object] = {
+                "schema": EXECUTION_SCHEMA,
+                "message_type": "HEARTBEAT",
+                "execution_session_id": session_id,
+                "armed": bool(armed),
+                "paper_policy_hash": self.policy.configuration_hash,
+                "risk_profile_hash": self.risk.configuration_hash,
+                "account_binding_hash": ACCOUNT_BINDING.binding_hash,
+                "timestamp": sent_at,
+            }
+            payload["signature"] = sign_payload(key, payload)
+            frame = canonical_json(payload) + b"\n"
+            try:
+                client.sendall(frame)
+            except OSError as exc:
+                with self._lock:
+                    self._last_heartbeat_send_error = "HEARTBEAT_SEND_AMBIGUOUS"
+                self._request_session_invalidation(client)
+                raise RuntimeError(
+                    "The NinjaTrader paper execution bridge heartbeat send was ambiguous."
+                ) from exc
+            with self._lock:
+                # Session replacement while the frame was in flight makes the
+                # old write non-authoritative; do not advertise it as current.
+                if (
+                    self._client is client
+                    and self._authenticated
+                    and self._execution_session_id == session_id
+                ):
+                    self._heartbeats_sent += 1
+                    self._heartbeats_sent_current_session += 1
+                    self._last_heartbeat_sent_at = sent_at
+                    self._last_heartbeat_send_error = None
+        finally:
+            self._write_lock.release()
 
     def stop(self, *, timeout_seconds: float = _STOP_TIMEOUT_SECONDS) -> ExecutionTransportStatus:
         with self._lock:

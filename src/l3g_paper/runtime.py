@@ -69,6 +69,7 @@ from .ninjatrader_transport import (
     PaperExecutionTransport,
 )
 from .policy import ExperimentalPaperPolicy
+from .pong_runtime import PongNativeDirective, PongNativeDirectiveKind
 from .perpetual_startup_seed import (
     PERPETUAL_STARTUP_SEED_EXPORT_KIND,
     build_perpetual_boundary_bundle,
@@ -468,6 +469,16 @@ class LaneIIIPaperRuntime:
         self._commissioning_ownership = self._load_unresolved_commissioning_ownership()
         self._operational_session: _OperationalPaperSession | None = None
         self._bounded_trial: dict[str, object] | None = None
+        # Pong's research core remains execution-disabled.  A separately
+        # hosted production integration must bind all three concrete
+        # authorities (native input, runtime bridge, bounded controller)
+        # before this runtime will admit a Pong entry.  The fence starts
+        # closed on every process lifetime and is independent of the ordinary
+        # pause flag so controller recovery cannot erase another risk pause.
+        self._pong_integration_status: Callable[[], Mapping[str, object]] | None = None
+        self._pong_execution_sink: Callable[[Mapping[str, object]], None] | None = None
+        self._pong_entry_fence_active = True
+        self._pong_evidence_sealed = False
         self._entry_owner = PaperEntryOwner.COMMISSIONING if self._commissioning_ownership is not None else PaperEntryOwner.NONE
         if self._commissioning_ownership is not None:
             # A process restart must not accidentally restore normal strategy
@@ -2852,6 +2863,338 @@ class LaneIIIPaperRuntime:
             self._transport = transport
             self._adapter = NinjaTraderSim101PaperAdapter(transport)
 
+    def bind_pong_integration_status(
+        self,
+        provider: Callable[[], Mapping[str, object]],
+    ) -> None:
+        """Bind the sole process-local Pong production authority projection.
+
+        Pure Pong policy objects deliberately cannot call this method.  The
+        lifespan-owned host binds once, and every entry admission re-reads its
+        current fail-closed status rather than caching a prior green state.
+        """
+        if not callable(provider):
+            raise TypeError("Pong integration status provider must be callable.")
+        with self._lock:
+            if self._pong_integration_status is not None:
+                raise RuntimeError("PONG_PRODUCTION_HOST_ALREADY_BOUND")
+            self._pong_integration_status = provider
+
+    def bind_pong_execution_sink(
+        self,
+        sink: Callable[[Mapping[str, object]], None],
+    ) -> None:
+        """Fan authenticated execution callbacks into the sole Pong bridge.
+
+        The runtime remains the first consumer and preserves its existing risk
+        and ledger effects.  The bridge sees the callback only after that
+        processing returns successfully, so it cannot outrun native account
+        truth or manufacture a receipt which the runtime rejected.
+        """
+        if not callable(sink):
+            raise TypeError("Pong execution sink must be callable.")
+        with self._lock:
+            if self._pong_execution_sink is not None:
+                raise RuntimeError("PONG_EXECUTION_SINK_ALREADY_BOUND")
+            self._pong_execution_sink = sink
+
+    def apply_pong_native_directive(
+        self,
+        directive: PongNativeDirective,
+        evidence: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Translate one admitted Pong directive onto existing Sim101 commands.
+
+        This adapter deliberately reuses the ordinary decision, intent, risk,
+        durable-command, and authenticated AddOn path.  It does not create a
+        second transport authority and it cannot relax the one-MNQ fence.
+        """
+        if type(directive) is not PongNativeDirective or not isinstance(evidence, Mapping):
+            raise TypeError("Pong native dispatch requires exact bridge evidence.")
+        with self._lock:
+            if not self._pong_profile:
+                raise RuntimeError("PONG_PROFILE_NOT_SELECTED")
+            if directive.quantity not in {0, 1}:
+                raise RuntimeError("PONG_NATIVE_QUANTITY_INVALID")
+            reason = f"PONG_NATIVE:{directive.directive_id}:{directive.reason_code}"
+            accepted = False
+            command_id: str | None = None
+            if directive.kind in {
+                PongNativeDirectiveKind.ENTER_LONG,
+                PongNativeDirectiveKind.ENTER_SHORT,
+            }:
+                provider = self._pong_integration_status
+                authority = {} if provider is None else provider()
+                if (
+                    authority.get("entry_authority_ready") is not True
+                    or self._pong_entry_fence_active
+                    or self._state is not PaperRuntimeState.PAPER_RUNNING
+                ):
+                    raise RuntimeError("PONG_NATIVE_ENTRY_AUTHORITY_UNAVAILABLE")
+                source_at = normalized_utc(
+                    str(evidence.get("source_available_at")),
+                    "Pong source available time",
+                )
+                if _timestamp_utc(_now()) - _timestamp_utc(source_at) > timedelta(
+                    seconds=self.policy.artifact.decision_ttl_seconds,
+                ):
+                    raise RuntimeError("PONG_NATIVE_ENTRY_SOURCE_STALE")
+                support = Decimal(str(evidence.get("position_side_support")))
+                if not support.is_finite() or not Decimal("0") <= support <= Decimal("1"):
+                    raise RuntimeError("PONG_NATIVE_ENTRY_SUPPORT_INVALID")
+                snapshot_hash = str(evidence.get("snapshot_hash") or "")
+                bias_hash = str(evidence.get("daily_bias_result_hash") or "")
+                if any(
+                    len(value) != 64
+                    or any(character not in "0123456789abcdef" for character in value)
+                    for value in (snapshot_hash, bias_hash)
+                ):
+                    raise RuntimeError("PONG_NATIVE_ENTRY_EVIDENCE_HASH_INVALID")
+                created = _now()
+                decision_kind = (
+                    PaperDecisionKind.LONG
+                    if directive.kind is PongNativeDirectiveKind.ENTER_LONG
+                    else PaperDecisionKind.SHORT
+                )
+                direction = (
+                    PaperDirection.LONG
+                    if decision_kind is PaperDecisionKind.LONG
+                    else PaperDirection.SHORT
+                )
+                hypothesis = (
+                    HypothesisKind.BULLISH_REVERSAL
+                    if direction is PaperDirection.LONG
+                    else HypothesisKind.BEARISH_CONTINUATION
+                )
+                identity = {
+                    "directive_id": directive.directive_id,
+                    "admission_id": directive.admission_id,
+                    "source_switch_id": directive.source_switch_id,
+                    "source_switch_sequence": directive.source_switch_sequence,
+                    "snapshot_hash": snapshot_hash,
+                    "daily_bias_result_hash": bias_hash,
+                    "created_at": created,
+                }
+                decision = PaperDecision(
+                    "l3g-pd-" + canonical_hash(identity)[:32],
+                    self.policy.artifact.policy_id,
+                    self.policy.artifact.configuration_hash,
+                    decision_kind,
+                    created,
+                    (
+                        _timestamp_utc(created)
+                        + timedelta(seconds=self.policy.artifact.decision_ttl_seconds)
+                    ).isoformat().replace("+00:00", "Z"),
+                    hypothesis,
+                    direction,
+                    support,
+                    {
+                        "schema": "lane-iii-pong-native-decision-v1",
+                        **identity,
+                        "position_side_support": str(support),
+                        "score_desired_quantity": directive.score_desired_quantity,
+                        "admitted_total_quantity": directive.admitted_total_quantity,
+                        "live_authority": "DISARMED",
+                    },
+                    (directive.source_switch_id,),
+                    (directive.source_switch_sequence,),
+                    (snapshot_hash,),
+                    self.policy.artifact.sequence_authority,
+                    self.policy.artifact.book_completeness,
+                    False,
+                    reason,
+                    self._session_context.session_kind,
+                    self._session_context.session_id,
+                    self._session_context.trade_date,
+                    self._session_context.session_profile_hash,
+                    self._session_context.session_generation,
+                    False,
+                    True,
+                    False,
+                )
+                self._last_decision = decision
+                self._last_qualifying_entry_decision = decision
+                self.ledger.append(
+                    "DECISION", decision.payload(),
+                    identity=decision.paper_decision_id,
+                    occurred_at=decision.created_at,
+                    execution_session_id=self._execution_session_id(),
+                )
+                accepted = self._request_entry_locked(decision)
+                if accepted and self._last_command is not None:
+                    command_id = self._last_command.command_id
+            elif directive.kind is PongNativeDirectiveKind.VERIFY_NATIVE_PROTECTION:
+                accepted = (
+                    self._position_quantity == 1
+                    and self._snapshot.protective_stop_state
+                    in ACTIVE_PROTECTIVE_ORDER_STATES
+                )
+            elif directive.kind in {
+                PongNativeDirectiveKind.CANCEL_PENDING_ENTRY,
+                PongNativeDirectiveKind.CANCEL_PROTECTIVE_STOP,
+            }:
+                self._cancel_pending_and_reconcile()
+                accepted = True
+                command_id = None if self._last_command is None else self._last_command.command_id
+            elif directive.kind in {
+                PongNativeDirectiveKind.EXIT,
+                PongNativeDirectiveKind.EMERGENCY_FLATTEN,
+            }:
+                accepted = self._request_exit(
+                    reason,
+                    emergency=(
+                        directive.kind is PongNativeDirectiveKind.EMERGENCY_FLATTEN
+                    ),
+                    stop_operational=False,
+                )
+                command_id = self._pending_exit_command_id if accepted else None
+            else:  # pragma: no cover - exhaustive enum fence
+                raise RuntimeError("PONG_NATIVE_DIRECTIVE_UNSUPPORTED")
+            return {
+                "accepted": accepted,
+                "command_id": command_id,
+                "directive_id": directive.directive_id,
+            }
+
+    def pong_controller_snapshot(self) -> dict[str, object]:
+        """Return the minimal signed-runtime projection used by the controller."""
+        with self._lock:
+            transport = None if self._transport is None else self._transport.status()
+            lockout_reason = self.risk.lockout_reason
+            risk_context = (
+                self._entry_session_context
+                if self._continuous_execution_profile
+                and self._entry_session_context is not None
+                else self._session_context
+            )
+            trade_risk = self._trade_date_risk.get(
+                risk_context.trade_date, _TradeDateRisk(),
+            )
+            loss_remaining = max(
+                Decimal("0"),
+                PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS
+                + min(
+                    Decimal("0"),
+                    trade_risk.realized_pnl + trade_risk.unrealized_pnl,
+                ),
+            )
+            return {
+                "observed_at": _now(),
+                "entry_profile_version": self.policy.artifact.entry_profile_version,
+                "runtime_state": self._state.value,
+                "runtime_active": self._state not in {
+                    PaperRuntimeState.DISABLED,
+                    PaperRuntimeState.STOPPING,
+                    PaperRuntimeState.STOPPED,
+                    PaperRuntimeState.FAULTED,
+                },
+                "entry_fence_active": self._pong_entry_fence_active,
+                "evidence_sealed": self._pong_evidence_sealed,
+                "entries_paused": self._entries_paused,
+                "position_quantity": self._position_quantity,
+                "working_owned_orders": self._snapshot.working_owned_orders,
+                "working_entry_orders": self._snapshot.working_entry_orders,
+                "unresolved_execution": self._snapshot.unresolved_execution,
+                "reconciliation_current": self._snapshot.reconciliation_current,
+                "protection_current": (
+                    self._position_quantity == 0
+                    or self._snapshot.protective_stop_state == "WORKING"
+                ),
+                "safety_lockout": bool(lockout_reason),
+                "lockout_reason": lockout_reason,
+                "account_name": self.risk.binding.account_name,
+                "account_class": self.risk.binding.account_class,
+                "instrument": self.risk.binding.instrument,
+                "maximum_quantity": self.risk.profile.maximum_quantity,
+                "available_loss_allowance_dollars": str(loss_remaining),
+                "live_authority": "DISARMED",
+                "execution_session_id": (
+                    None if transport is None else transport.execution_session_id
+                ),
+                "addon_protocol_version": (
+                    None if transport is None else transport.addon_protocol_version
+                ),
+                "addon_source_fingerprint": (
+                    None if transport is None else transport.addon_source_fingerprint
+                ),
+                "addon_build_fingerprint": (
+                    None if transport is None else transport.addon_build_fingerprint
+                ),
+                "addon_provenance_valid": bool(
+                    transport is not None and transport.addon_provenance_valid
+                ),
+            }
+
+    def apply_pong_controller_command(self, kind: str, reason: str) -> bool:
+        """Apply one independently persisted bounded-controller command.
+
+        This method adds no entry authority.  Its release operation only opens
+        the controller-specific fence; all ordinary runtime, ledger, risk,
+        reconciliation, freshness, and session gates remain authoritative.
+        """
+        with self._lock:
+            if self.policy.artifact.entry_profile_version != PONG_ENTRY_PROFILE_VERSION:
+                raise RuntimeError("PONG_PROFILE_NOT_SELECTED")
+            if kind == "PREPARE_ACTIVATION":
+                provider = self._pong_integration_status
+                status = {} if provider is None else provider()
+                if (
+                    status.get("activation_candidate") is not True
+                    or status.get("native_input_contract") != "READY"
+                    or status.get("native_runtime_bridge") != "READY"
+                    or self._position_quantity != 0
+                    or self._snapshot.working_owned_orders != 0
+                    or self._snapshot.unresolved_execution
+                    or self.risk.lockout_reason is not None
+                ):
+                    raise RuntimeError("PONG_CONTROLLER_ACTIVATION_PREPARATION_REFUSED")
+                # The still-PREPARED controller and native integration blockers
+                # continue to deny every entry while activate() durably writes
+                # and reads back T0 and its deadline.
+                self._pong_entry_fence_active = False
+                return True
+            if kind == "FENCE_NEW_ENTRIES":
+                self._pong_entry_fence_active = True
+                return True
+            if kind == "RELEASE_ENTRY_FENCE":
+                provider = self._pong_integration_status
+                if provider is None:
+                    raise RuntimeError("PONG_PRODUCTION_HOST_UNAVAILABLE")
+                status = provider()
+                if (
+                    status.get("native_input_contract") != "READY"
+                    or status.get("native_runtime_bridge") != "READY"
+                    or status.get("bounded_controller") != "READY"
+                    or status.get("entry_authority_ready") is not True
+                ):
+                    raise RuntimeError("PONG_ENTRY_FENCE_RELEASE_REFUSED")
+                self._pong_entry_fence_active = False
+                return True
+            if kind == "CANCEL_OWNED_PENDING_ENTRIES":
+                self._pong_entry_fence_active = True
+                self._cancel_pending_and_reconcile()
+                return True
+            if kind == "CANCEL_REMAINING_OWNED_ORDERS":
+                self._pong_entry_fence_active = True
+                self._cancel_pending_and_reconcile()
+                return True
+            if kind == "CONTROLLED_FLATTEN":
+                self._pong_entry_fence_active = True
+                return self._request_exit(reason, emergency=False)
+            if kind == "REQUEST_SIGNED_FLAT_RECONCILIATION":
+                self._request_reconciliation_after_exit()
+                return True
+            if kind == "SEAL_EVIDENCE":
+                if self._position_quantity or self._snapshot.working_owned_orders:
+                    raise RuntimeError("PONG_EVIDENCE_SEAL_REQUIRES_FLAT")
+                self._pong_evidence_sealed = True
+                return True
+            if kind == "STOP_OPERATION":
+                self._pong_entry_fence_active = True
+                self._request_operational_stop_locked(reason)
+                return True
+            raise ValueError("PONG_CONTROLLER_COMMAND_KIND_UNKNOWN")
+
     def bind_runtime_identity(self, identity: Mapping[str, object]) -> None:
         """Bind non-authoritative deployment provenance before runtime start."""
         with self._lock:
@@ -3755,6 +4098,380 @@ class LaneIIIPaperRuntime:
                 "new_full_verification_required": recovered,
             }
 
+    def _heartbeat_time_recovery_blockers_locked(
+        self,
+        transport: ExecutionTransportStatus | None,
+        *,
+        now: datetime,
+    ) -> list[str]:
+        """Evaluate only the live, reason-specific heartbeat recovery facts."""
+        blockers: list[str] = []
+        risk_status = self.risk.status()
+        if risk_status.get("lockout_reason") != "EXECUTION_COMMAND_REJECTED:HEARTBEAT_TIME":
+            blockers.append("HEARTBEAT_TIME_LOCKOUT_NOT_ACTIVE")
+        if self._state not in {
+            PaperRuntimeState.READY_DISARMED,
+            PaperRuntimeState.LOCKED_OUT,
+        }:
+            blockers.append("HEARTBEAT_TIME_RECOVERY_STATE_MISMATCH")
+        if self._operational_session is not None:
+            blockers.append("HEARTBEAT_TIME_RECOVERY_OPERATION_ACTIVE")
+        if self._entry_owner is not PaperEntryOwner.NONE:
+            blockers.append("HEARTBEAT_TIME_RECOVERY_ENTRY_OWNERSHIP_ACTIVE")
+        if (
+            self._position is not PaperDirection.FLAT
+            or self._position_quantity != 0
+            or self._snapshot.current_position is not PaperDirection.FLAT
+            or self._snapshot.current_position_quantity != 0
+        ):
+            blockers.append("SIM101_MNQ_NOT_FLAT")
+        if self._snapshot.working_owned_orders or self._snapshot.working_entry_orders:
+            blockers.append("WORKING_ORDERS_PRESENT")
+        if (
+            self._snapshot.account_name != "Sim101"
+            or self._snapshot.account_class != "LOCAL_SIMULATION"
+            or self._snapshot.instrument != "MNQ SEP26"
+            or self._snapshot.account_match_count != 1
+            or self._snapshot.instrument_match_count != 1
+        ):
+            blockers.append("HEARTBEAT_TIME_RECOVERY_IDENTITY_MISMATCH")
+        if (
+            not self._snapshot.position_snapshot_complete
+            or not self._snapshot.order_snapshot_complete
+            or not self._snapshot.reconciliation_current
+        ):
+            blockers.append("RECONCILIATION_INCOMPLETE")
+        if (
+            self._snapshot.foreign_activity
+            or self._snapshot.unresolved_command
+            or self._snapshot.unresolved_native_order
+            or self._snapshot.unresolved_execution
+        ):
+            blockers.append("UNRESOLVED_EXECUTION_TRUTH")
+        if self._snapshot.protective_stop_state != "NONE":
+            blockers.append("HEARTBEAT_TIME_RECOVERY_ORDER_STATE_MISMATCH")
+        if self._risk_continuity_fault not in {
+            None, "EXECUTION_COMMAND_REJECTED:HEARTBEAT_TIME",
+        }:
+            blockers.append("HEARTBEAT_TIME_RECOVERY_CONTINUITY_FAULT")
+        if self._fault_reason not in {
+            None, "EXECUTION_COMMAND_REJECTED:HEARTBEAT_TIME",
+        }:
+            blockers.append("HEARTBEAT_TIME_RECOVERY_NEWER_FAULT")
+
+        if (
+            transport is None
+            or not transport.authenticated_client
+            or not transport.reconciled
+            or not transport.addon_provenance_valid
+            or not isinstance(transport.execution_session_id, str)
+            or not transport.execution_session_id
+        ):
+            blockers.append("EXECUTION_BRIDGE_UNHEALTHY")
+            return blockers
+        try:
+            authenticated_at = _timestamp_utc(str(transport.authenticated_at))
+            heartbeat_at = _timestamp_utc(str(transport.last_heartbeat_sent_at))
+        except (TypeError, ValueError):
+            blockers.append("HEARTBEAT_TIME_RECOVERY_HEARTBEAT_PROOF_MISSING")
+            return blockers
+        quarantine_seconds = (now - authenticated_at).total_seconds()
+        heartbeat_age_seconds = (now - heartbeat_at).total_seconds()
+        if (
+            quarantine_seconds < HEARTBEAT_WATCHDOG_SECONDS + 1
+            or transport.heartbeats_sent_current_session
+            < int(HEARTBEAT_WATCHDOG_SECONDS)
+        ):
+            blockers.append("HEARTBEAT_TIME_RECOVERY_QUARANTINE_INCOMPLETE")
+        if heartbeat_age_seconds < 0 or heartbeat_age_seconds > 2.5:
+            blockers.append("HEARTBEAT_TIME_RECOVERY_HEARTBEAT_STALE")
+        if transport.last_heartbeat_send_error is not None:
+            blockers.append("HEARTBEAT_TIME_RECOVERY_SEND_ERROR")
+        if (
+            transport.command_rejections
+            != transport.command_rejections_at_session_start
+        ):
+            blockers.append("HEARTBEAT_TIME_RECOVERY_NEW_REJECTION")
+        if (
+            transport.heartbeat_send_lock_timeouts
+            != transport.heartbeat_send_lock_timeouts_at_session_start
+        ):
+            blockers.append("HEARTBEAT_TIME_RECOVERY_LOCK_TIMEOUT")
+        if transport.commands_sent != transport.commands_sent_at_session_start:
+            blockers.append("HEARTBEAT_TIME_RECOVERY_COMMAND_ACTIVITY")
+        if transport.pending_acknowledgements != 0:
+            blockers.append("HEARTBEAT_TIME_RECOVERY_PENDING_ACKNOWLEDGEMENT")
+        return blockers
+
+    def heartbeat_time_recovery_authority(self) -> dict[str, object]:
+        """Expose a read-only view of the narrow HEARTBEAT_TIME recovery gate."""
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            transport = None if self._transport is None else self._transport.status()
+            blockers = self._heartbeat_time_recovery_blockers_locked(
+                transport, now=now,
+            )
+            payload: dict[str, object] = {
+                "schema": "lane-iii-heartbeat-time-recovery-authority-v1",
+                "eligible_without_ledger_proof": not blockers,
+                "blocking_reasons": blockers,
+                "runtime_state": self._state.value,
+                "entries_paused": self._entries_paused,
+                "paper_execution": "DISARMED",
+                "account": "Sim101",
+                "environment": "LOCAL_SIMULATION",
+                "instrument": "MNQ SEP26",
+                "maximum_quantity": 1,
+                "live_capital": "DENIED",
+                "transport": None if transport is None else {
+                    "execution_session_id": transport.execution_session_id,
+                    "authenticated_at": transport.authenticated_at,
+                    "last_heartbeat_sent_at": transport.last_heartbeat_sent_at,
+                    "heartbeats_sent_current_session": (
+                        transport.heartbeats_sent_current_session
+                    ),
+                    "command_rejections": transport.command_rejections,
+                    "command_rejections_at_session_start": (
+                        transport.command_rejections_at_session_start
+                    ),
+                    "heartbeat_send_lock_timeouts": (
+                        transport.heartbeat_send_lock_timeouts
+                    ),
+                    "heartbeat_send_lock_timeouts_at_session_start": (
+                        transport.heartbeat_send_lock_timeouts_at_session_start
+                    ),
+                    "commands_sent": transport.commands_sent,
+                    "commands_sent_at_session_start": (
+                        transport.commands_sent_at_session_start
+                    ),
+                    "pending_acknowledgements": transport.pending_acknowledgements,
+                    "addon_source_fingerprint": transport.addon_source_fingerprint,
+                    "addon_build_fingerprint": transport.addon_build_fingerprint,
+                    "addon_provenance_valid": transport.addon_provenance_valid,
+                },
+            }
+            payload["authority_state_hash"] = canonical_hash(payload)
+            return payload
+
+    def _recover_heartbeat_time_lockout_locked(
+        self,
+        request_id: str,
+        readiness: Mapping[str, object],
+    ) -> tuple[bool, tuple[str, ...], dict[str, object] | None]:
+        now = datetime.now(timezone.utc)
+        transport = None if self._transport is None else self._transport.status()
+        blockers = self._heartbeat_time_recovery_blockers_locked(
+            transport, now=now,
+        )
+        if transport is None:
+            return False, tuple(dict.fromkeys(blockers)), None
+
+        lockouts = self.ledger.recent_kind_records(
+            ("RISK_EVENT_AUTHORITY_LOCKOUT",), 1,
+        )
+        reconciliations = self.ledger.recent_kind_records(
+            ("POSITION_SNAPSHOT_RECONCILIATION",), 1000,
+        )
+        lockout = lockouts[0] if lockouts else None
+        lockout_payload = (
+            None if lockout is None
+            else self._protective_exit_recovery_record_payload(lockout)
+        )
+        matching_reconciliation = next((
+            value for value in reconciliations
+            if lockout is not None
+            and type(value.get("ledger_sequence")) is int
+            and value["ledger_sequence"] > lockout["ledger_sequence"]
+            and isinstance(value.get("record"), Mapping)
+            and value["record"].get("execution_session_id")
+            == transport.execution_session_id
+            and self._recovery_reconciliation_payload_safe(
+                self._protective_exit_recovery_record_payload(value) or {},
+            )
+        ), None)
+        if (
+            lockout is None
+            or not isinstance(lockout_payload, Mapping)
+            or lockout_payload.get("lockout_reason")
+            != "EXECUTION_COMMAND_REJECTED:HEARTBEAT_TIME"
+            or matching_reconciliation is None
+        ):
+            blockers.append("HEARTBEAT_TIME_RECOVERY_EVIDENCE_MISSING")
+
+        ledger_proof = readiness.get("ledger")
+        verified_tip = (
+            ledger_proof.get("arm_snapshot_tip")
+            if isinstance(ledger_proof, Mapping) else None
+        )
+        if not isinstance(ledger_proof, Mapping) or (
+            ledger_proof.get("ledger_trust_state")
+            != "VERIFIED_TO_ARM_SNAPSHOT_TIP"
+            or ledger_proof.get("unverified_tail_rows") != 0
+            or type(ledger_proof.get("verified_through_sequence")) is not int
+            or type(verified_tip) is not int
+            or ledger_proof.get("verified_through_sequence") != verified_tip
+            or not isinstance(ledger_proof.get("arm_snapshot_tip_hash"), str)
+            or lockout is None
+            or matching_reconciliation is None
+            or verified_tip < matching_reconciliation["ledger_sequence"]
+        ):
+            blockers.append("HEARTBEAT_TIME_RECOVERY_LEDGER_UNVERIFIED")
+        elif (
+            (tip_record := self.ledger.record_by_sequence(verified_tip)) is None
+            or tip_record.get("record_hash")
+            != ledger_proof.get("arm_snapshot_tip_hash")
+        ):
+            blockers.append("HEARTBEAT_TIME_RECOVERY_LEDGER_REFERENCE_INVALID")
+        if blockers:
+            return False, tuple(dict.fromkeys(blockers)), None
+
+        assert lockout is not None
+        assert matching_reconciliation is not None
+        assert isinstance(ledger_proof, Mapping)
+        trade_date = self._snapshot.trade_date
+        trade_risk = self._trade_date_risk.get(trade_date, _TradeDateRisk())
+        profile_version = self.policy.artifact.entry_profile_version
+        profile_risk = self._profile_trade_date_risk.get(
+            (trade_date, profile_version), _ProfileTradeDateRisk(),
+        )
+        transport_proof = {
+            "execution_session_id": transport.execution_session_id,
+            "authenticated_at": transport.authenticated_at,
+            "last_heartbeat_sent_at": transport.last_heartbeat_sent_at,
+            "heartbeats_sent_current_session": transport.heartbeats_sent_current_session,
+            "command_rejections": transport.command_rejections,
+            "command_rejections_at_session_start": (
+                transport.command_rejections_at_session_start
+            ),
+            "heartbeat_send_lock_timeouts": transport.heartbeat_send_lock_timeouts,
+            "heartbeat_send_lock_timeouts_at_session_start": (
+                transport.heartbeat_send_lock_timeouts_at_session_start
+            ),
+            "commands_sent": transport.commands_sent,
+            "commands_sent_at_session_start": transport.commands_sent_at_session_start,
+            "pending_acknowledgements": transport.pending_acknowledgements,
+            "addon_protocol_version": transport.addon_protocol_version,
+            "addon_source_fingerprint": transport.addon_source_fingerprint,
+            "addon_build_fingerprint": transport.addon_build_fingerprint,
+            "expected_addon_source_fingerprint": (
+                transport.expected_addon_source_fingerprint
+            ),
+            "addon_provenance_valid": transport.addon_provenance_valid,
+        }
+        payload = {
+            "schema": "lane-iii-heartbeat-time-recovery-v1",
+            "request_id": request_id,
+            "profile": profile_version,
+            "risk_profile_hash": self.risk.profile.configuration_hash,
+            "preserved_lockout": self._protective_exit_recovery_coordinate(lockout),
+            "flat_reconciliation": self._protective_exit_recovery_coordinate(
+                matching_reconciliation,
+            ),
+            "verified_ledger_tip": {
+                "ledger_sequence": verified_tip,
+                "record_hash": ledger_proof["arm_snapshot_tip_hash"],
+            },
+            "transport_proof": transport_proof,
+            "risk_counters": {
+                "trade_date": trade_date,
+                "daily_realized_pnl": str(trade_risk.realized_pnl),
+                "daily_unrealized_pnl": str(trade_risk.unrealized_pnl),
+                "account_trade_date_entry_count": trade_risk.entry_count,
+                "profile_trade_date_entry_count": profile_risk.entry_count,
+                "consecutive_losses": profile_risk.consecutive_losses,
+            },
+            "account": "Sim101",
+            "environment": "LOCAL_SIMULATION",
+            "instrument": "MNQ SEP26",
+            "maximum_quantity": 1,
+            "live_capital": "DENIED",
+            "locked_out": False,
+            "lockout_reason": None,
+            "lockout_trade_date": None,
+            "effective_trade_date": trade_date,
+            "cleared_lockout_reason": "EXECUTION_COMMAND_REJECTED:HEARTBEAT_TIME",
+            "effect": "ONLY_PROVEN_RETIRED_HEARTBEAT_TIME_LOCKOUT_CLEARED",
+        }
+        identity = "l3g-heartbeat-time-recovery-" + canonical_hash({
+            "request_id": request_id,
+            "preserved_lockout": payload["preserved_lockout"],
+        })
+        self.ledger.append(
+            "RISK_EVENT_AUTHORITY_LOCKOUT_CLEARED",
+            payload,
+            identity=identity,
+            execution_session_id=transport.execution_session_id,
+        )
+        clear = self.ledger.record_by_identity(identity)
+        if clear is None:
+            raise RuntimeError("HEARTBEAT_TIME_RECOVERY_NOT_DURABLE")
+
+        self.risk.restore_lockout(False, None, None)
+        if self._fault_reason == "EXECUTION_COMMAND_REJECTED:HEARTBEAT_TIME":
+            self._fault_reason = None
+        if self._risk_continuity_fault == "EXECUTION_COMMAND_REJECTED:HEARTBEAT_TIME":
+            self._risk_continuity_fault = None
+        self._entries_paused = False
+        if self._state is PaperRuntimeState.LOCKED_OUT:
+            self._transition(
+                PaperRuntimeState.READY_DISARMED,
+                "HEARTBEAT_TIME_LOCKOUT_RECOVERED",
+            )
+        return True, (), {
+            "identity": identity,
+            "ledger_sequence": clear["ledger_sequence"],
+            "record_hash": clear["record_hash"],
+        }
+
+    def recover_heartbeat_time_lockout(
+        self,
+        request_id: str,
+        ledger_preflight: Callable[
+            [str, Mapping[str, object]], Mapping[str, object]
+        ] | None = None,
+    ) -> dict[str, object]:
+        """Clear only a proven-retired HEARTBEAT_TIME latch; never arm/start."""
+        if (
+            not isinstance(request_id, str) or not 8 <= len(request_id) <= 128
+            or any(
+                not (character.isalnum() or character in "-_.:")
+                for character in request_id
+            )
+        ):
+            raise ValueError(
+                "Heartbeat-time recovery requires an 8-128 character "
+                "idempotency request ID."
+            )
+        readiness = self.operational_paper_readiness(ledger_preflight)
+        recovered = False
+        blockers: tuple[str, ...] = ()
+        clear: dict[str, object] | None = None
+        with self._lock:
+            try:
+                with self.ledger.authority_capacity_fence():
+                    recovered, blockers, clear = (
+                        self._recover_heartbeat_time_lockout_locked(
+                            request_id, readiness,
+                        )
+                    )
+            except LedgerCapacityError:
+                blockers = ("LEDGER_CAPACITY_INADEQUATE",)
+            status = self.risk.status()
+            return {
+                "schema": "lane-iii-heartbeat-time-recovery-result-v1",
+                "request_id": request_id,
+                "recovered": recovered,
+                "reason_codes": blockers,
+                "clear": clear,
+                "state": self._state.value,
+                "locked_out": status.get("locked_out"),
+                "lockout_reason": status.get("lockout_reason"),
+                "operational_paper_started": False,
+                "armed": False,
+                "risk_counters_preserved": recovered,
+                "new_full_verification_required": recovered,
+            }
+
     @property
     def state(self) -> PaperRuntimeState:
         with self._lock:
@@ -4386,6 +5103,12 @@ class LaneIIIPaperRuntime:
             ):
                 self._advance_commissioning_authority_epoch()
             self._observe_commissioning_warmup(event_at)
+            if self._pong_profile:
+                # Pong uses this admission only for the shared authenticated
+                # freshness/reconciliation risk snapshot.  Its sole strategy
+                # authority is the durable Pong bridge; legacy policy output
+                # must never create a second entry producer.
+                decision = None
             if (
                 decision is None
                 and self._perpetual_position_profile
@@ -4677,6 +5400,8 @@ class LaneIIIPaperRuntime:
     def _request_entry_with_capacity_fence_locked(self, decision: PaperDecision) -> bool:
         if self._pong_activation_blockers():
             return False
+        if self._pong_profile and self._pong_entry_fence_active:
+            return False
         if decision.commissioning:
             ownership = self._commissioning_ownership
             if (
@@ -4937,6 +5662,28 @@ class LaneIIIPaperRuntime:
         self._last_command = command
 
     def on_execution_message(self, message: Mapping[str, object]) -> None:
+        self._apply_execution_message(message)
+        sink = self._pong_execution_sink
+        if sink is not None:
+            try:
+                sink(dict(message))
+            except Exception as error:
+                with self._lock:
+                    reason = (
+                        "PONG_EXECUTION_SINK_FAILED:" + type(error).__name__
+                    )
+                    self._entries_paused = True
+                    self._fault_reason = reason
+                    self.risk.lock_out(reason)
+                    self._request_operational_stop_locked(reason)
+                    if self._state not in {
+                        PaperRuntimeState.LOCKED_OUT,
+                        PaperRuntimeState.STOPPING,
+                        PaperRuntimeState.STOPPED,
+                    }:
+                        self._transition(PaperRuntimeState.LOCKED_OUT, reason)
+
+    def _apply_execution_message(self, message: Mapping[str, object]) -> None:
         with self._lock:
             self._advance_commissioning_authority_epoch()
             # The transport attaches this internal marker only after a frame
@@ -6686,6 +7433,180 @@ class LaneIIIPaperRuntime:
                     continue
                 if (
                     payload.get("schema")
+                    == "lane-iii-heartbeat-time-recovery-v1"
+                ):
+                    expected_keys = {
+                        "schema", "request_id", "profile", "risk_profile_hash",
+                        "preserved_lockout", "flat_reconciliation",
+                        "verified_ledger_tip", "transport_proof", "risk_counters",
+                        "account", "environment", "instrument", "maximum_quantity",
+                        "live_capital", "locked_out", "lockout_reason",
+                        "lockout_trade_date", "effective_trade_date",
+                        "cleared_lockout_reason", "effect", "session_family",
+                    }
+                    preserved = payload.get("preserved_lockout")
+                    reconciliation = payload.get("flat_reconciliation")
+                    verified_tip = payload.get("verified_ledger_tip")
+                    transport_proof = payload.get("transport_proof")
+                    counters = payload.get("risk_counters")
+                    coordinates = (preserved, reconciliation, verified_tip)
+                    if (
+                        set(payload) != expected_keys
+                        or not isinstance(payload.get("request_id"), str)
+                        or payload.get("profile")
+                        != self.policy.artifact.entry_profile_version
+                        or payload.get("risk_profile_hash")
+                        != self.risk.profile.configuration_hash
+                        or payload.get("account") != "Sim101"
+                        or payload.get("environment") != "LOCAL_SIMULATION"
+                        or payload.get("instrument") != "MNQ SEP26"
+                        or payload.get("maximum_quantity") != 1
+                        or payload.get("live_capital") != "DENIED"
+                        or payload.get("locked_out") is not False
+                        or payload.get("lockout_reason") is not None
+                        or payload.get("lockout_trade_date") is not None
+                        or payload.get("cleared_lockout_reason")
+                        != "EXECUTION_COMMAND_REJECTED:HEARTBEAT_TIME"
+                        or payload.get("effect")
+                        != "ONLY_PROVEN_RETIRED_HEARTBEAT_TIME_LOCKOUT_CLEARED"
+                        or status.get("lockout_reason")
+                        != "EXECUTION_COMMAND_REJECTED:HEARTBEAT_TIME"
+                        or active_lockout_coordinate is None
+                        or not all(isinstance(value, Mapping) for value in coordinates)
+                        or not isinstance(transport_proof, Mapping)
+                        or not isinstance(counters, Mapping)
+                    ):
+                        raise RuntimeError(
+                            "RISK_CONTINUITY_HEARTBEAT_TIME_CLEAR_INVALID"
+                        )
+                    assert isinstance(preserved, Mapping)
+                    assert isinstance(reconciliation, Mapping)
+                    assert isinstance(verified_tip, Mapping)
+                    assert isinstance(transport_proof, Mapping)
+                    assert isinstance(counters, Mapping)
+                    sequences = [
+                        value.get("ledger_sequence") for value in coordinates
+                    ]
+                    if (
+                        not all(type(value) is int for value in sequences)
+                        or not sequences[0] < sequences[1] <= sequences[2]
+                        or sequences[2] >= record.get("_ledger_sequence")
+                        or (
+                            preserved.get("ledger_sequence"),
+                            preserved.get("record_hash"),
+                        ) != active_lockout_coordinate
+                    ):
+                        raise RuntimeError(
+                            "RISK_CONTINUITY_HEARTBEAT_TIME_CLEAR_INVALID"
+                        )
+                    stored = [
+                        self.ledger.record_by_sequence(int(sequence))
+                        for sequence in sequences
+                    ]
+                    if any(
+                        value is None
+                        or coordinate.get("record_hash") != value.get("record_hash")
+                        for coordinate, value in zip(coordinates, stored, strict=True)
+                    ):
+                        raise RuntimeError(
+                            "RISK_CONTINUITY_HEARTBEAT_TIME_REFERENCE_INVALID"
+                        )
+                    lockout_payload = self._protective_exit_recovery_record_payload(
+                        stored[0] or {},
+                    )
+                    reconciliation_payload = (
+                        self._protective_exit_recovery_record_payload(stored[1] or {})
+                    )
+                    reconciliation_record = (
+                        stored[1].get("record")
+                        if isinstance(stored[1], Mapping) else None
+                    )
+                    execution_session_id = transport_proof.get(
+                        "execution_session_id"
+                    )
+                    try:
+                        authenticated_at = _timestamp_utc(
+                            str(transport_proof.get("authenticated_at"))
+                        )
+                        heartbeat_at = _timestamp_utc(
+                            str(transport_proof.get("last_heartbeat_sent_at"))
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise RuntimeError(
+                            "RISK_CONTINUITY_HEARTBEAT_TIME_TRANSPORT_INVALID"
+                        ) from exc
+                    if (
+                        not isinstance(lockout_payload, Mapping)
+                        or lockout_payload.get("lockout_reason")
+                        != "EXECUTION_COMMAND_REJECTED:HEARTBEAT_TIME"
+                        or not isinstance(reconciliation_payload, Mapping)
+                        or not self._recovery_reconciliation_payload_safe(
+                            reconciliation_payload,
+                        )
+                        or not isinstance(reconciliation_record, Mapping)
+                        or not isinstance(execution_session_id, str)
+                        or not execution_session_id
+                        or reconciliation_record.get("execution_session_id")
+                        != execution_session_id
+                        or transport_proof.get("addon_provenance_valid") is not True
+                        or transport_proof.get("addon_source_fingerprint")
+                        != transport_proof.get("expected_addon_source_fingerprint")
+                        or not isinstance(
+                            transport_proof.get("addon_build_fingerprint"), str,
+                        )
+                        or transport_proof.get("heartbeats_sent_current_session", 0)
+                        < int(HEARTBEAT_WATCHDOG_SECONDS)
+                        or heartbeat_at < authenticated_at
+                        or (heartbeat_at - authenticated_at).total_seconds()
+                        < HEARTBEAT_WATCHDOG_SECONDS
+                        or transport_proof.get("command_rejections")
+                        != transport_proof.get("command_rejections_at_session_start")
+                        or transport_proof.get("heartbeat_send_lock_timeouts")
+                        != transport_proof.get(
+                            "heartbeat_send_lock_timeouts_at_session_start"
+                        )
+                        or transport_proof.get("commands_sent")
+                        != transport_proof.get("commands_sent_at_session_start")
+                        or transport_proof.get("pending_acknowledgements") != 0
+                    ):
+                        raise RuntimeError(
+                            "RISK_CONTINUITY_HEARTBEAT_TIME_REFERENCE_INVALID"
+                        )
+                    trade_date = counters.get("trade_date")
+                    if (
+                        not isinstance(trade_date, str)
+                        or payload.get("effective_trade_date") != trade_date
+                    ):
+                        raise RuntimeError(
+                            "RISK_CONTINUITY_HEARTBEAT_TIME_COUNTER_INVALID"
+                        )
+                    trade_risk = self._trade_date_risk.get(
+                        trade_date, _TradeDateRisk(),
+                    )
+                    profile_risk = self._profile_trade_date_risk.get(
+                        (trade_date, self.policy.artifact.entry_profile_version),
+                        _ProfileTradeDateRisk(),
+                    )
+                    if (
+                        counters.get("daily_realized_pnl")
+                        != str(trade_risk.realized_pnl)
+                        or counters.get("daily_unrealized_pnl")
+                        != str(trade_risk.unrealized_pnl)
+                        or counters.get("account_trade_date_entry_count")
+                        != trade_risk.entry_count
+                        or counters.get("profile_trade_date_entry_count")
+                        != profile_risk.entry_count
+                        or counters.get("consecutive_losses")
+                        != profile_risk.consecutive_losses
+                    ):
+                        raise RuntimeError(
+                            "RISK_CONTINUITY_HEARTBEAT_TIME_COUNTER_INVALID"
+                        )
+                    self.risk.restore_lockout(False, None, None)
+                    active_lockout_coordinate = None
+                    continue
+                if (
+                    payload.get("schema")
                     == "lane-iii-protective-stop-recovery-v1"
                 ):
                     expected_keys = {
@@ -7426,12 +8347,52 @@ class LaneIIIPaperRuntime:
         Risk-reducing commands remain on the existing supported path.
         """
         if self.policy.artifact.entry_profile_version == "BEELZEBUB_PONG_DISCERNMENT_V1":
-            return (
-                "PONG_NATIVE_INPUT_CONTRACT_UNCOMMISSIONED",
-                "PONG_NATIVE_INTEGRATION_UNCOMMISSIONED",
-                "PONG_BOUNDED_STOP_UNVERIFIED",
-            )
+            provider = self._pong_integration_status
+            if provider is None:
+                return (
+                    "PONG_NATIVE_INPUT_CONTRACT_UNCOMMISSIONED",
+                    "PONG_NATIVE_INTEGRATION_UNCOMMISSIONED",
+                    "PONG_BOUNDED_STOP_UNVERIFIED",
+                )
+            try:
+                status = provider()
+            except Exception:
+                return ("PONG_PRODUCTION_HOST_STATUS_UNAVAILABLE",)
+            blockers: list[str] = []
+            if status.get("native_input_contract") != "READY":
+                blockers.append("PONG_NATIVE_INPUT_CONTRACT_UNCOMMISSIONED")
+            if status.get("native_runtime_bridge") != "READY":
+                blockers.append("PONG_NATIVE_INTEGRATION_UNCOMMISSIONED")
+            if status.get("bounded_controller") != "READY":
+                blockers.append("PONG_BOUNDED_STOP_UNVERIFIED")
+            if status.get("entry_authority_ready") is not True:
+                blockers.extend(
+                    str(value) for value in status.get("blocking_reasons", ())
+                    if isinstance(value, str) and value
+                )
+            if self._pong_entry_fence_active:
+                blockers.append("PONG_CONTROLLER_ENTRY_FENCE_ACTIVE")
+            return tuple(dict.fromkeys(blockers))
         return ()
+
+    def _pong_operational_start_blockers(self) -> tuple[str, ...]:
+        """Allow start only up to the still-fenced PREPARED controller seam."""
+        if not self._pong_profile:
+            return ()
+        provider = self._pong_integration_status
+        if provider is None:
+            return ("PONG_PRODUCTION_HOST_UNAVAILABLE",)
+        try:
+            status = provider()
+        except Exception:
+            return ("PONG_PRODUCTION_HOST_STATUS_UNAVAILABLE",)
+        if status.get("operational_start_ready") is True:
+            return ()
+        reasons = tuple(
+            str(value) for value in status.get("blocking_reasons", ())
+            if isinstance(value, str) and value != "PONG_RUNTIME_NOT_ACTIVE"
+        )
+        return reasons or ("PONG_OPERATIONAL_START_NOT_READY",)
 
     def operational_paper_readiness(
         self,
@@ -7443,7 +8404,7 @@ class LaneIIIPaperRuntime:
         reserves commissioning ownership, creates a one-shot credential, or
         submits a commissioning entry.
         """
-        pong_blockers = self._pong_activation_blockers()
+        pong_blockers = self._pong_operational_start_blockers()
         if pong_blockers:
             return {"result": "BLOCKED", "blocking_reasons": list(pong_blockers),
                     "operational_paper": True, "entry_eligible": False}
@@ -7488,6 +8449,30 @@ class LaneIIIPaperRuntime:
             hash_payload = dict(result)
             hash_payload.pop("snapshot_hash", None)
             result["snapshot_hash"] = canonical_hash(hash_payload)
+        elif self._pong_profile:
+            # The production host owns directional evidence and controller
+            # readiness.  Reuse the shared runtime snapshot only for current
+            # market/transport/risk admission; commissioning-family labels and
+            # reporting-session labels cannot become a hidden Pong prerequisite.
+            with self._lock:
+                operational_reasons = tuple(
+                    reason for reason in self.risk.preflight_reasons(
+                        self._snapshot, at=_now(), commissioning=False,
+                    )
+                    if reason not in _REPORTING_SESSION_ONLY_REASONS
+                )
+            raw_reasons = [
+                str(value) for value in result.get("blocking_reasons", [])
+                if isinstance(value, str)
+                and str(value) not in _PERPETUAL_DEFERRED_ENTRY_REASONS
+                and str(value) not in _REPORTING_SESSION_ONLY_REASONS
+            ]
+            blocking = list(dict.fromkeys((*raw_reasons, *operational_reasons)))
+            result = {
+                **result,
+                "result": "READY" if not blocking else "BLOCKED",
+                "blocking_reasons": blocking,
+            }
         elif self.policy.artifact.entry_profile_version == PAPER_ENTRY_PROFILE_VERSION:
             # Operational Scalper authority uses the ordinary strategy
             # preflight, not the commissioning-only latch.  Surface those
@@ -7903,7 +8888,11 @@ class LaneIIIPaperRuntime:
         allow_starting: bool = False,
     ) -> dict[str, object]:
         """Persist an arm outcome while the ledger capacity/order fence is held."""
-        pong_blockers = self._pong_activation_blockers()
+        pong_blockers = (
+            self._pong_operational_start_blockers()
+            if allow_starting and self._pong_profile
+            else self._pong_activation_blockers()
+        )
         if pong_blockers:
             return {"armed": False, "reason_codes": pong_blockers, "state": self._state.value}
         continuous_operation = (

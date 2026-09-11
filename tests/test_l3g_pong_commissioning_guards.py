@@ -44,7 +44,25 @@ class PongCommissioningGuardTests(unittest.TestCase):
     def test_existing_profile_not_subject_to_pong_registration_guard(self):
         runtime = LaneIIIPaperRuntime.__new__(LaneIIIPaperRuntime)
         runtime.policy = SimpleNamespace(artifact=resolve_paper_profile('BEELZEBUB_SCALPER_V2').policy)
+        runtime._pong_profile = False
         self.assertEqual(runtime._pong_activation_blockers(), ())
+
+    def test_prepared_controller_can_start_runtime_but_cannot_admit_entry(self):
+        runtime = LaneIIIPaperRuntime.__new__(LaneIIIPaperRuntime)
+        runtime.policy = SimpleNamespace(artifact=PONG_PAPER_POLICY)
+        runtime._pong_profile = True
+        runtime._pong_entry_fence_active = True
+        runtime._pong_integration_status = lambda: {
+            'native_input_contract': 'READY',
+            'native_runtime_bridge': 'READY',
+            'bounded_controller': 'BLOCKED',
+            'operational_start_ready': True,
+            'entry_authority_ready': False,
+            'blocking_reasons': ['PONG_RUNTIME_NOT_ACTIVE'],
+        }
+        self.assertEqual(runtime._pong_operational_start_blockers(), ())
+        self.assertIn('PONG_BOUNDED_STOP_UNVERIFIED', runtime._pong_activation_blockers())
+        self.assertIn('PONG_CONTROLLER_ENTRY_FENCE_ACTIVE', runtime._pong_activation_blockers())
 
     def test_pong_frozen_limits_cannot_be_widened(self):
         for changes in ({'maximum_entry_quantity': 2}, {'protective_stop_distance_points': 24}):

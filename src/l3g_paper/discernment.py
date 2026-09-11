@@ -1175,6 +1175,11 @@ class DiscernmentEngine:
         return self._last_snapshot
 
     @property
+    def evidence_revision(self) -> int:
+        """Current admitted evidence cursor for a production composition root."""
+        return self._evidence_revision
+
+    @property
     def last_switch_id(self) -> str | None:
         return self._last_switch_id
 

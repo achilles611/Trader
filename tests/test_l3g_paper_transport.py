@@ -152,6 +152,95 @@ class PaperTransportTests(unittest.TestCase):
             self.assertTrue(transport.status().addon_provenance_valid)
             client.close(); transport.stop(); ledger.close()
 
+    def test_heartbeat_timestamp_is_allocated_after_wire_ordering_lock(self) -> None:
+        """Forced old-race interleaving: no heartbeat timestamp may age in queue."""
+        class CaptureSocket:
+            def __init__(self) -> None:
+                self.frames: list[bytes] = []
+
+            def sendall(self, frame: bytes) -> None:
+                self.frames.append(frame)
+
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            transport = PaperExecutionTransport(ledger, port=free_port())
+            key = bytes(range(32))
+            client = CaptureSocket()
+            with transport._lock:
+                transport._key = key
+                transport._client = client  # type: ignore[assignment]
+                transport._authenticated = True
+                transport._execution_session_id = "l3g-es-heartbeat-race"
+            timestamp_created = threading.Event()
+            errors: list[BaseException] = []
+
+            def timestamp() -> str:
+                timestamp_created.set()
+                return "2026-09-11T18:30:00Z"
+
+            def send() -> None:
+                try:
+                    transport.send_heartbeat(armed=False)
+                except BaseException as exc:  # pragma: no cover - surfaced below
+                    errors.append(exc)
+
+            transport._write_lock.acquire()
+            thread = threading.Thread(target=send)
+            try:
+                with patch("src.l3g_paper.ninjatrader_transport._now", side_effect=timestamp):
+                    thread.start()
+                    time.sleep(0.1)
+                    self.assertFalse(
+                        timestamp_created.is_set(),
+                        "heartbeat timestamp was allocated while waiting behind a wire write",
+                    )
+                    self.assertEqual(client.frames, [])
+                    transport._write_lock.release()
+                    thread.join(2)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(len(client.frames), 1)
+                payload = json.loads(client.frames[0])
+                self.assertEqual(payload["timestamp"], "2026-09-11T18:30:00Z")
+                self.assertTrue(verify_signature(key, payload))
+                status = transport.status()
+                self.assertEqual(status.heartbeats_sent_current_session, 1)
+                self.assertIsNone(status.last_heartbeat_send_error)
+            finally:
+                if transport._write_lock.locked():
+                    transport._write_lock.release()
+                thread.join(1)
+                ledger.close()
+
+    def test_heartbeat_wire_saturation_is_explicit_and_sends_no_stale_frame(self) -> None:
+        class CaptureSocket:
+            def __init__(self) -> None:
+                self.frames: list[bytes] = []
+
+            def sendall(self, frame: bytes) -> None:
+                self.frames.append(frame)
+
+        with TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite3")
+            transport = PaperExecutionTransport(ledger, port=free_port())
+            client = CaptureSocket()
+            with transport._lock:
+                transport._key = bytes(range(32))
+                transport._client = client  # type: ignore[assignment]
+                transport._authenticated = True
+                transport._execution_session_id = "l3g-es-heartbeat-timeout"
+            transport._write_lock.acquire()
+            try:
+                with self.assertRaisesRegex(RuntimeError, "HEARTBEAT_SEND_LOCK_TIMEOUT"):
+                    transport.send_heartbeat(armed=False)
+                self.assertEqual(client.frames, [])
+                status = transport.status()
+                self.assertEqual(status.heartbeat_send_lock_timeouts, 1)
+                self.assertEqual(status.last_heartbeat_send_error, "HEARTBEAT_SEND_LOCK_TIMEOUT")
+            finally:
+                transport._write_lock.release()
+                ledger.close()
+
     def test_addon_provenance_mismatch_is_visible_without_hiding_observation_transport(self) -> None:
         with TemporaryDirectory() as directory:
             key_path = Path(directory) / "key"; key_path.write_bytes(bytes(range(32)))
