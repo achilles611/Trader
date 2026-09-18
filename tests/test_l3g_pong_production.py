@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import time
+from types import SimpleNamespace
 import unittest
 
 from src.l3f_provider.ninjatrader_observation import expected_observer_source_fingerprint
 from src.l3g_paper.contracts import PONG_ENTRY_PROFILE_VERSION
+from src.l3g_paper.pong import PongState
 from src.l3g_paper.pong_production import PongProductionHost
+from src.l3g_paper.pong_scheduler import PongSchedulingConfig, PongSchedulingMode
 from tests.test_l3g_pong_inputs import verified, warm_record
 
 
@@ -57,6 +61,64 @@ def pending_collection() -> dict[str, object]:
 
 
 class PongProductionHostTests(unittest.TestCase):
+    def test_periodic_mode_is_flat_only_and_protection_supersedes_deadline(self) -> None:
+        with TemporaryDirectory(prefix="pong-production-") as root:
+            host = PongProductionHost(
+                Path(root),
+                selected_profile=PONG_ENTRY_PROFILE_VERSION,
+                expected_market_source_fingerprint=expected_observer_source_fingerprint(),
+                runtime_snapshot=runtime_snapshot,
+                collector_status=pending_collection,
+                controller_dispatch=lambda _kind, _reason: True,
+                native_dispatch=lambda directive, _evidence: {
+                    "accepted": True, "command_id": None,
+                    "directive_id": directive.directive_id,
+                },
+                scheduling=PongSchedulingConfig(
+                    mode=PongSchedulingMode.PERIODIC_FLAT_PROTECTED,
+                    interval_ms=20,
+                ),
+                clock_ns=lambda: 0,
+            )
+            machine = SimpleNamespace(
+                state=PongState.FLAT_WAIT_ALIGNMENT,
+                actual_quantity=0,
+                pending_action=None,
+            )
+            host._bridge = SimpleNamespace(machine=machine, status=lambda: {})
+            host._runtime = runtime_snapshot()
+            host._last_admitted_receipt_at = datetime.fromisoformat(
+                "2026-09-18T00:00:00+00:00",
+            )
+            evaluations: list[str] = []
+            host._evaluate_microstructure = lambda at: evaluations.append(at.isoformat())  # type: ignore[method-assign]
+
+            host._service_periodic_deadline(20_000_000)
+            self.assertEqual(len(evaluations), 1)
+            self.assertEqual(host.status()["evaluation_schedule"]["active_path"], "PERIODIC_FLAT")
+
+            machine.state = PongState.ENTRY_PENDING_LONG
+            host._service_periodic_deadline(40_000_000)
+            self.assertEqual(len(evaluations), 1)
+            status = host.status()["evaluation_schedule"]
+            self.assertEqual(status["active_path"], "EVENT_DRIVEN_PROTECTION")
+            self.assertEqual(
+                status["deadline_metrics"]["protection_mode_supersessions"], 1,
+            )
+
+            host._consume_observation(warm_record())
+            host._consume_observation(verified("TRADE", {
+                "contract_id": "MNQ SEP26", "price": 100, "size": 1,
+                "aggressor_side": "BUY", "aggressor_source": "NATIVE_BID_ASK",
+                "source_event_sequence": 100,
+                "publication_policy": "EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1",
+            }, local_sequence=2))
+            self.assertEqual(len(evaluations), 2)
+            self.assertEqual(
+                host.status()["evaluation_schedule"]["event_driven_analytical_evaluations"],
+                1,
+            )
+
     def test_lifespan_host_owns_prepared_controller_without_entry_authority(self) -> None:
         with TemporaryDirectory(prefix="pong-production-") as root:
             host = PongProductionHost(

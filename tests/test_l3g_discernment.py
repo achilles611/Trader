@@ -17,6 +17,7 @@ from src.l3g_paper.discernment import (
     DiscernmentPolicy,
     DiscernmentValidity,
     VolumeRegime,
+    normalized_utc,
 )
 
 
@@ -78,6 +79,66 @@ def policy(
 
 
 class DiscernmentCoreTests(unittest.TestCase):
+    def test_precise_timestamp_ordering_preserves_seventh_fractional_digit(self) -> None:
+        engine = DiscernmentEngine(policy())
+        exact = replace(
+            evidence(1, 2.0),
+            source_event_at="2026-09-10T14:00:00Z",
+            received_at="2026-09-10T14:00:00Z",
+            available_at="2026-09-10T14:00:00Z",
+            valid_until="2026-09-10T14:00:30Z",
+        )
+        later = replace(
+            evidence(2, 1.0),
+            source_event_at="2026-09-10T14:00:00.0000001Z",
+            received_at="2026-09-10T14:00:00.0000001Z",
+            available_at="2026-09-10T14:00:00.0000001Z",
+            valid_until="2026-09-10T14:00:30.0000001Z",
+        )
+        engine.on_evidence(exact)
+        update = engine.on_evidence(later)
+        self.assertTrue(update.admitted)
+        self.assertEqual(update.snapshot.available_at, "2026-09-10T14:00:00.0000001Z")
+
+        earlier = replace(
+            evidence(3, 1.0),
+            source_event_at="2026-09-10T14:00:00.0000000Z",
+            received_at="2026-09-10T14:00:00.0000000Z",
+            available_at="2026-09-10T14:00:00.0000000Z",
+            valid_until="2026-09-10T14:00:30Z",
+        )
+        self.assertEqual(
+            engine.on_evidence(earlier).reason_code,
+            "OUT_OF_ORDER_EVIDENCE_IGNORED",
+        )
+
+    def test_precise_timestamp_equality_offsets_and_expiry_are_chronological(self) -> None:
+        self.assertEqual(
+            normalized_utc("2026-09-10T15:00:00.5000000+01:00", "test time"),
+            "2026-09-10T14:00:00.5Z",
+        )
+        engine = DiscernmentEngine(policy())
+        first = replace(
+            evidence(1, 2.0),
+            source_event_at="2026-09-10T14:00:00.5Z",
+            received_at="2026-09-10T14:00:00.5Z",
+            available_at="2026-09-10T14:00:00.5Z",
+            valid_until="2026-09-10T14:00:01.0000002Z",
+        )
+        equal_representation = replace(
+            evidence(2, 1.0),
+            source_event_at="2026-09-10T15:00:00.5000000+01:00",
+            received_at="2026-09-10T15:00:00.5000000+01:00",
+            available_at="2026-09-10T15:00:00.5000000+01:00",
+            valid_until="2026-09-10T15:00:01.0000002+01:00",
+        )
+        engine.on_evidence(first)
+        equal = engine.on_evidence(equal_representation)
+        self.assertNotEqual(equal.reason_code, "OUT_OF_ORDER_EVIDENCE_IGNORED")
+        self.assertEqual(equal.snapshot.available_at, "2026-09-10T14:00:00.5Z")
+        self.assertTrue(engine.on_expiry("2026-09-10T14:00:01.0000001Z").snapshot.valid)
+        self.assertFalse(engine.on_expiry("2026-09-10T14:00:01.0000002Z").snapshot.valid)
+
     def test_missing_required_is_unavailable_not_neutral(self) -> None:
         engine = DiscernmentEngine(
             policy(

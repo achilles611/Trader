@@ -48,7 +48,12 @@ from .daily_bias import (
     default_unconfigured_bias,
 )
 from .discernment import DiscernmentEngine
-from .pong import PongActionKind, PongStateMachine
+from .pong import PongActionKind, PongState, PongStateMachine
+from .pong_scheduler import (
+    PongPeriodicDeadline,
+    PongSchedulingConfig,
+    PongSchedulingMode,
+)
 from .pong_controller import (
     PONG_ACTIVATION_DATE_LOCAL,
     PongBoundedController,
@@ -100,7 +105,8 @@ _LOADED_SOURCE_HASHES = {
                  "src/l3g_paper/pong_authorization.py", "src/l3g_paper/pong_volume_history.py",
                  "src/l3g_paper/runtime.py", "src/l3g_paper/pending_lockout.py",
                  "src/l3g_paper/ledger.py",
-                 "src/l3g_paper/pong_compute.py",
+                 "src/l3g_paper/pong_compute.py", "src/l3g_paper/pong.py",
+                 "src/l3g_paper/discernment.py", "src/l3g_paper/pong_scheduler.py",
                  "src/l3g_paper/pong_collection.py", "src/l3f_provider/ninjatrader_observation.py",
                  "src/l3f_provider/ninjatrader_commission.py", "src/l3g_paper/pong_microstructure.py")
 }
@@ -209,9 +215,20 @@ class PongProductionHost:
         launch_authorization: PongLaunchAuthorization | None = None,
         history_verification_key: bytes | None = None,
         compute_workers: int = 0,
+        scheduling: PongSchedulingConfig = PongSchedulingConfig(),
+        clock_ns: Callable[[], int] = time.perf_counter_ns,
     ) -> None:
         if not callable(native_dispatch):
             raise TypeError("Pong production host requires one native dispatcher.")
+        if type(scheduling) is not PongSchedulingConfig or not callable(clock_ns):
+            raise ValueError("PONG_SCHEDULING_CONTRACT_INVALID")
+        if (
+            scheduling.enabled
+            and selected_profile != PONG_ENTRY_PROFILE_VERSION
+        ):
+            raise ValueError("PONG_PERIODIC_PROFILE_NOT_SELECTED")
+        if scheduling.enabled and compute_workers:
+            raise ValueError("PONG_PERIODIC_COMPUTE_WORKERS_NOT_SUPPORTED")
         self.state_root = Path(state_root).resolve()
         self.selected_profile = selected_profile
         self.expected_market_source_fingerprint = expected_market_source_fingerprint
@@ -253,6 +270,23 @@ class PongProductionHost:
         self._compute_batch: list[tuple[PongWindowRequest, Future]] = []
         self._compute_batch_started = 0.0
         self._compute_batch_limit = 32
+        self._scheduling = scheduling
+        self._clock_ns = clock_ns
+        self._clock_info = vars(time.get_clock_info("perf_counter"))
+        if scheduling.enabled and (
+            self._clock_info["monotonic"] is not True
+            or self._clock_info["adjustable"] is not False
+            or self._clock_info["resolution"] > scheduling.interval_ms / 10_000
+        ):
+            raise RuntimeError("PONG_PERIODIC_CLOCK_RESOLUTION_UNSUPPORTED")
+        self._periodic_deadline = PongPeriodicDeadline(scheduling, clock_ns=clock_ns)
+        self._source_ingress_records = 0
+        self._authoritative_admission_records = 0
+        self._event_driven_evaluations = 0
+        self._periodic_evaluations = 0
+        self._last_admitted_receipt_at: datetime | None = None
+        self._last_periodic_cutoff: datetime | None = None
+        self._last_protection_transition: str | None = None
         self._process_instance_id = "pong-controller-process-" + uuid4().hex
         self._controller: PongBoundedController | None = None
         self._controller_error: str | None = None
@@ -373,6 +407,8 @@ class PongProductionHost:
         """Bounded callback admission; the host worker owns processing and I/O."""
         try:
             self._observations.put_nowait(record)
+            with self._admission_lock:
+                self._source_ingress_records += 1
         except queue.Full:
             with self._admission_lock:
                 self._observation_overflow += 1
@@ -388,8 +424,102 @@ class PongProductionHost:
         with self._lock:
             before = cursor()
             self._process_observation(record)
-            if self._input_error is None and cursor() != before:
-                self._evaluate_microstructure(_time(record.ninja_receipt_time))
+            if self._input_error is not None:
+                return
+            receipt = _time(record.ninja_receipt_time)
+            self._last_admitted_receipt_at = max(
+                receipt, self._last_admitted_receipt_at or receipt,
+            )
+            self._authoritative_admission_records += 1
+            if cursor() == before:
+                return
+            protection_reason = self._event_protection_reason_locked()
+            if not self._scheduling.enabled or protection_reason is not None:
+                if protection_reason is not None:
+                    self._last_protection_transition = protection_reason
+                self._event_driven_evaluations += 1
+                self._evaluate_microstructure(receipt)
+
+    def _event_protection_reason_locked(self) -> str | None:
+        """Return why the event path must remain authoritative right now.
+
+        Periodic work is allowed only while both independently observed runtime
+        truth and the durable bridge are cleanly flat.  An absent or stale field
+        is deliberately unresolved rather than interpreted as flat.
+        """
+        if not self._scheduling.enabled:
+            return "EVENT_DRIVEN_CONFIGURATION"
+        bridge = self._bridge
+        if bridge is None:
+            return "RUNTIME_BRIDGE_UNAVAILABLE"
+        machine = bridge.machine
+        if machine.state not in {
+            PongState.FLAT_WAIT_ALIGNMENT,
+            PongState.FLAT_WAIT_BEAT,
+        }:
+            return "BRIDGE_STATE_REQUIRES_PROTECTION:" + machine.state.value
+        if machine.actual_quantity != 0 or machine.pending_action is not None:
+            return "BRIDGE_EXPOSURE_OR_INTENT_UNRESOLVED"
+        runtime = self._runtime
+        if runtime.get("reconciliation_current") is not True:
+            return "RUNTIME_RECONCILIATION_UNRESOLVED"
+        if runtime.get("unresolved_execution") is not False:
+            return "RUNTIME_EXECUTION_UNRESOLVED"
+        if int(runtime.get("position_quantity") or 0) != 0:
+            return "RUNTIME_POSITION_NOT_FLAT"
+        if int(runtime.get("working_owned_orders") or 0) != 0:
+            return "RUNTIME_OWNED_ORDERS_PRESENT"
+        if int(runtime.get("working_entry_orders") or 0) != 0:
+            return "RUNTIME_ENTRY_ORDERS_PRESENT"
+        if self._pending_native:
+            return "NATIVE_DIRECTIVE_PENDING"
+        return None
+
+    def _service_periodic_deadline(self, now_ns: int | None = None) -> None:
+        """Run one current flat-mode evaluation or account for its supersession."""
+        due = self._periodic_deadline.take_due(now_ns)
+        if due is None:
+            return
+        with self._lock:
+            if self._stop.is_set():
+                self._periodic_deadline.mark_shutdown(due)
+                return
+            protection_reason = self._event_protection_reason_locked()
+            if protection_reason is not None:
+                self._last_protection_transition = protection_reason
+                self._periodic_deadline.supersede_for_protection(due)
+                return
+            if self._last_admitted_receipt_at is None:
+                self._periodic_deadline.complete(
+                    due, applied=False, intentional_no_work=True,
+                )
+                return
+            cutoff = max(self._last_admitted_receipt_at, _time(_now()))
+            if (
+                self._last_periodic_cutoff is not None
+                and cutoff < self._last_periodic_cutoff
+            ):
+                self._input_error = "PONG_PERIODIC_RECEIPT_CUTOFF_REGRESSED"
+                self._microstructure_blockers = (self._input_error,)
+                self._periodic_deadline.complete(due, applied=False)
+                return
+            self._last_periodic_cutoff = cutoff
+            self._periodic_evaluations += 1
+            self._evaluate_microstructure(cutoff)
+            if (
+                self._microstructure_blockers
+                and self._discernment.last_snapshot is not None
+            ):
+                update = self._discernment.on_expiry(
+                    cutoff.isoformat().replace("+00:00", "Z"),
+                )
+                self._apply_discernment_update(update)
+            self._periodic_deadline.complete(
+                due, applied=self._input_error is None,
+            )
+
+    def _periodic_wait_seconds(self) -> float | None:
+        return self._periodic_deadline.next_wait_seconds()
 
     def _process_observation(self, record: NinjaTraderObservation) -> None:
         """Validate the native envelope and update causal state on the worker."""
@@ -752,6 +882,10 @@ class PongProductionHost:
                 }
             )
             if entry_actions:
+                # The scheduler changes to the protected event path before the
+                # pending entry is revalidated, persisted, and exposed to the
+                # native dispatcher.  A timer callback never owns this state.
+                self._last_protection_transition = "ENTRY_SUBMISSION_PENDING"
                 action = entry_actions[0]
                 now = _now()
                 source_fresh = (
@@ -1333,7 +1467,11 @@ class PongProductionHost:
                         self._compute_wakeup.clear()
                         record = None  # bounded backpressure; control ticks continue
                     else:
-                        record = self._observations.get(timeout=0.005 if self._compute_pending else 0.5)
+                        timeout = 0.005 if self._compute_pending else 0.5
+                        periodic_wait = self._periodic_wait_seconds()
+                        if periodic_wait is not None:
+                            timeout = min(timeout, periodic_wait)
+                        record = self._observations.get(timeout=timeout)
                 except queue.Empty:
                     record = None
                 if record is not None:
@@ -1341,6 +1479,12 @@ class PongProductionHost:
                         self._consume_observation(record)
                     finally:
                         self._observations.task_done()
+                # A queued market record is applied first when it was already
+                # available at the same QPC deadline.  Otherwise the timer
+                # uses only the admitted prefix and never invents a backlog
+                # completion.  Protected states supersede, rather than delay,
+                # obsolete flat-mode opportunities.
+                self._service_periodic_deadline()
                 # Native evidence remains event-driven. Snapshot copying and
                 # durable controller heartbeats are control-plane work, not one
                 # fsync per quote/trade. Pending directives still dispatch now.
@@ -1417,6 +1561,30 @@ class PongProductionHost:
                 **authority,
                 "state": "RUNNING" if self._thread is not None and self._thread.is_alive() else "STOPPED",
                 "selected_profile": self.selected_profile,
+                "evaluation_schedule": {
+                    "configuration": {
+                        "mode": self._scheduling.mode.value,
+                        "interval_ms": self._scheduling.interval_ms,
+                    },
+                    "active_path": (
+                        "PERIODIC_FLAT"
+                        if self._event_protection_reason_locked() is None
+                        else "EVENT_DRIVEN_PROTECTION"
+                    ),
+                    "protection_reason": self._event_protection_reason_locked(),
+                    "last_protection_transition": self._last_protection_transition,
+                    "qpc_clock": dict(self._clock_info),
+                    "deadline_metrics": self._periodic_deadline.metrics(),
+                    "source_receiver_ingress_records": self._source_ingress_records,
+                    "authoritative_admission_records": self._authoritative_admission_records,
+                    "event_driven_analytical_evaluations": self._event_driven_evaluations,
+                    "periodic_flat_analytical_evaluations": self._periodic_evaluations,
+                    "periodic_last_cutoff": (
+                        None if self._last_periodic_cutoff is None
+                        else self._last_periodic_cutoff.isoformat().replace("+00:00", "Z")
+                    ),
+                    "wake_mechanism": "bounded Queue.get timeout measured by QPC grid",
+                },
                 "registration": "PRODUCTION_REGISTERED",
                 "loaded_artifact_hash": PONG_LOADED_ARTIFACT_HASH,
                 "module_import_source_sha256": dict(_LOADED_SOURCE_HASHES),

@@ -647,6 +647,8 @@ def server_environment(
             "BEELZEBUB_PONG_INDEPENDENT_COLLECTION",
             "BEELZEBUB_PONG_BOUNDED_ACTIVATION",
             "BEELZEBUB_PONG_COMMISSIONING_AUTHORIZATION",
+            "BEELZEBUB_PONG_SCHEDULING_MODE",
+            "BEELZEBUB_PONG_PERIODIC_INTERVAL_MS",
         )
         if name in source
     }

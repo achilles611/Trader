@@ -50,6 +50,11 @@ from src.l3g_paper.ninjatrader_transport import LocalPaperSecretProvider, PaperE
 from src.l3g_paper.pong_collection import PongAuthenticHourCollector
 from src.l3g_paper.pong_production import PongProductionHost
 from src.l3g_paper.pong_authorization import PONG_AUTHORIZATION_ENV, PongLaunchAuthorization
+from src.l3g_paper.pong_scheduler import (
+    PONG_PERIODIC_INTERVAL_ENV,
+    PONG_SCHEDULING_MODE_ENV,
+    scheduling_config_from_environment,
+)
 from src.l3g_paper.contracts import PONG_ENTRY_PROFILE_VERSION, resolve_paper_profile
 from src.l3g_paper.profile_switch import (
     PROFILE_SWITCH_ACTION_HEADER,
@@ -1672,6 +1677,10 @@ def create_control_center_app(
         None if not pong_authorization_path
         else PongLaunchAuthorization.load(pong_authorization_path)
     )
+    pong_scheduling = scheduling_config_from_environment(
+        os.getenv(PONG_SCHEDULING_MODE_ENV),
+        os.getenv(PONG_PERIODIC_INTERVAL_ENV),
+    )
     perpetual_seed_artifact: Mapping[str, object] | None = None
     perpetual_seed_proof: Mapping[str, object] | None = None
     perpetual_seed_manifest: Mapping[str, object] | None = None
@@ -2475,6 +2484,7 @@ def create_control_center_app(
                 activation_authorized=pong_bounded_activation,
                 launch_authorization=pong_launch_authorization,
                 history_verification_key=LocalPaperSecretProvider().load_key(),
+                scheduling=pong_scheduling,
             )
             paper_runtime.bind_pong_integration_status(pong_host.authority_status)
             paper_runtime.bind_pong_execution_sink(pong_host.on_execution_message)

@@ -10,13 +10,13 @@ but can never manufacture a logical switch.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import StrEnum
 import math
 import re
 from typing import Iterable
 
-from src.lane_iii.contracts import canonical_hash, normalized_utc
+from src.lane_iii.contracts import canonical_hash
 from src.shared.confidence_math import (
     LOG_ODDS_CLIP,
     attainable_effective_range,
@@ -255,8 +255,45 @@ def _required_text(value: object, field: str) -> str:
     return value
 
 
-def _utc(value: object, field: str) -> datetime:
-    return datetime.fromisoformat(normalized_utc(value, field).replace("Z", "+00:00"))
+_PRECISE_UTC = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})T(?P<clock>\d{2}:\d{2}:\d{2})"
+    r"(?:\.(?P<fraction>\d{1,9}))?(?P<offset>Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def normalized_utc(value: object, field: str) -> str:
+    """Canonical UTC text without silently discarding sub-microsecond input.
+
+    Discernment identities are text based, so a lexical comparison of an exact
+    second and a fractional second is not chronological.  The canonical form
+    accepts the existing explicit-UTC-offset grammar, normalizes the offset,
+    and retains up to nanosecond fractional precision (including 100 ns input).
+    Numerically equal representations have one canonical value.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be ISO-8601 text with an explicit UTC offset.")
+    matched = _PRECISE_UTC.fullmatch(value)
+    if matched is None:
+        raise ValueError(f"{field} must be ISO-8601 text with an explicit UTC offset.")
+    offset = "+00:00" if matched["offset"] == "Z" else matched["offset"]
+    try:
+        whole = datetime.fromisoformat(
+            matched["date"] + "T" + matched["clock"] + offset,
+        )
+    except ValueError as error:
+        raise ValueError(f"{field} must be ISO-8601 text with an explicit UTC offset.") from error
+    whole = whole.astimezone(timezone.utc)
+    fraction = (matched["fraction"] or "").rstrip("0")
+    return whole.strftime("%Y-%m-%dT%H:%M:%S") + (
+        "" if not fraction else "." + fraction
+    ) + "Z"
+
+
+def _utc(value: object, field: str) -> str:
+    """Fixed-width chronological key for valid canonical UTC timestamp text."""
+    canonical = normalized_utc(value, field)
+    second, separator, fractional = canonical[:-1].partition(".")
+    return second + "." + (fractional if separator else "").ljust(9, "0") + "Z"
 
 
 def _sha256(value: object, field: str) -> str:
@@ -1160,6 +1197,7 @@ class DiscernmentEngine:
         self._continuity_valid = True
         self._evidence_revision = 0
         self._latest_available_at: str | None = None
+        self._latest_available_key: str | None = None
         self._latched_direction: DiscernmentDirection | None = None
         self._switch_sequence = 0
         self._last_switch_id: str | None = None
@@ -1205,7 +1243,8 @@ class DiscernmentEngine:
             return self._invalidate(evidence.available_at, "EVIDENCE_EVENT_IDENTITY_CONFLICT")
 
         available = normalized_utc(evidence.available_at, "Evidence available-at time")
-        if self._latest_available_at is not None and available < self._latest_available_at:
+        available_key = _utc(evidence.available_at, "Evidence available-at time")
+        if self._latest_available_key is not None and available_key < self._latest_available_key:
             return self._current_update("OUT_OF_ORDER_EVIDENCE_IGNORED")
 
         if self._continuity_domain is not None and evidence.continuity_domain != self._continuity_domain:
@@ -1218,6 +1257,7 @@ class DiscernmentEngine:
         if not evidence.continuity_valid:
             self._seen_event_hashes[evidence.event_id] = event_hash
             self._latest_available_at = available
+            self._latest_available_key = available_key
             self._evidence_revision = evidence.evidence_revision
             self._continuity_valid = False
             return self._snapshot_update(available, "EVIDENCE_CONTINUITY_GAP", admitted=False)
@@ -1230,6 +1270,7 @@ class DiscernmentEngine:
             self._continuity_valid = False
             self._seen_event_hashes[evidence.event_id] = event_hash
             self._latest_available_at = available
+            self._latest_available_key = available_key
             self._evidence_revision = evidence.evidence_revision
             return self._snapshot_update(available, "EVIDENCE_REVISION_GAP", admitted=False)
 
@@ -1243,6 +1284,7 @@ class DiscernmentEngine:
         prior = self._active.get(evidence.component_key)
         self._seen_event_hashes[evidence.event_id] = event_hash
         self._latest_available_at = available
+        self._latest_available_key = available_key
         self._evidence_revision = evidence.evidence_revision
         self._volume_regime = volume_regime
         if prior is not None and prior.semantic_hash == evidence.semantic_hash:
@@ -1269,7 +1311,7 @@ class DiscernmentEngine:
             raise ValueError("A complete typed Discernment frame is required.")
         if {item.component_key for item in values} != set(self.policy.required_components) or len(values) != len(self.policy.required_components):
             raise ValueError("A Discernment frame requires every component exactly once.")
-        if len({(item.available_at, item.continuity_domain) for item in values}) != 1:
+        if len({(_utc(item.available_at, "Evidence available-at time"), item.continuity_domain) for item in values}) != 1:
             raise ValueError("Frame components must share causal availability and continuity.")
         if all(self._seen_event_hashes.get(item.event_id) == item.evidence_hash for item in values):
             return self._current_update("DUPLICATE_EVIDENCE_FRAME_IGNORED")
@@ -1304,9 +1346,11 @@ class DiscernmentEngine:
         self, kind: MaintenanceEventKind, available_at: str,
     ) -> DiscernmentUpdate:
         available = normalized_utc(available_at, f"{kind.value} available-at time")
-        if self._latest_available_at is not None and available < self._latest_available_at:
+        available_key = _utc(available_at, f"{kind.value} available-at time")
+        if self._latest_available_key is not None and available_key < self._latest_available_key:
             return self._current_update(f"OUT_OF_ORDER_{kind.value}_IGNORED")
         self._latest_available_at = available
+        self._latest_available_key = available_key
         return self._snapshot_update(
             available,
             f"{kind.value}_CALLBACK_NO_SWITCH",
@@ -1322,6 +1366,7 @@ class DiscernmentEngine:
     def _invalidate(self, available_at: str, reason: str) -> DiscernmentUpdate:
         self._continuity_valid = False
         self._latest_available_at = normalized_utc(available_at, "Invalidation available-at time")
+        self._latest_available_key = _utc(available_at, "Invalidation available-at time")
         return self._snapshot_update(self._latest_available_at, reason, admitted=False)
 
     def _snapshot_update(
@@ -1402,8 +1447,20 @@ class DiscernmentEngine:
             validity = DiscernmentValidity.UNAVAILABLE
 
         if active:
-            as_of = max(normalized_utc(item.source_event_at, "Evidence source event time") for item in active)
-            received_at = max(normalized_utc(item.received_at, "Evidence receipt time") for item in active)
+            latest_event = max(
+                active,
+                key=lambda item: _utc(item.source_event_at, "Evidence source event time"),
+            )
+            latest_receipt = max(
+                active,
+                key=lambda item: _utc(item.received_at, "Evidence receipt time"),
+            )
+            as_of = normalized_utc(
+                latest_event.source_event_at, "Evidence source event time",
+            )
+            received_at = normalized_utc(
+                latest_receipt.received_at, "Evidence receipt time",
+            )
             source_ids = tuple(sorted({source_id for item in active for source_id in item.source_ids}))
         else:
             as_of = received_at = normalized_utc(available_at, "Snapshot available-at time")
