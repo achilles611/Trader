@@ -1,0 +1,16 @@
+{
+  "schema": "pong-single-trial-authorization-v1",
+  "account": "Sim101",
+  "account_class": "LOCAL_SIMULATION",
+  "instrument": "MNQ SEP26",
+  "canonical_contract": "MNQU6",
+  "maximum_quantity": 1,
+  "run_duration_seconds": 3600,
+  "maximum_runs": 1,
+  "live_authority": "DISARMED",
+  "live_capital": "DENIED",
+  "activation_date_local": "2026-09-13",
+  "ny_open_blackout": false,
+  "source_path": "C:\\Users\\atlas\\Desktop\\bis\\Pong_ASAP_Paper_Commissioning_Astra_xhigh_2026-09-13.md",
+  "source_sha256": "aa4b69bc8cd5205cc45048f3562dc9f6ec603d511c82651f9f65613e8916d6f3"
+}

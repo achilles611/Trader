@@ -646,6 +646,7 @@ def server_environment(
         for name in (
             "BEELZEBUB_PONG_INDEPENDENT_COLLECTION",
             "BEELZEBUB_PONG_BOUNDED_ACTIVATION",
+            "BEELZEBUB_PONG_COMMISSIONING_AUTHORIZATION",
         )
         if name in source
     }

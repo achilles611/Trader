@@ -1,4 +1,4 @@
-"""Durable operator overlay for one bounded 2026-09-11 Pong paper run.
+"""Durable operator overlay for one explicitly dated bounded Pong paper run.
 
 This module is deliberately independent of Pong strategy semantics.  It owns
 only the established entry fence/flat window, a single-use activation instant,
@@ -50,6 +50,11 @@ def _utc(value: str) -> datetime:
 
 def _fixed_local(hour: int, minute: int) -> datetime:
     return datetime(2026, 9, 11, hour, minute, tzinfo=_DENVER)
+
+
+def _bounded_deadline(activated: datetime, activation_day: date) -> datetime:
+    expiry = datetime.combine(activation_day + timedelta(days=1), datetime.min.time(), _DENVER)
+    return min(activated + timedelta(seconds=PONG_RUN_DURATION_SECONDS), expiry.astimezone(timezone.utc))
 
 
 PONG_BLACKOUT_START_LOCAL = _fixed_local(7, 30)
@@ -263,6 +268,25 @@ _STATE_KEYS = frozenset(PongControllerState.__dataclass_fields__)
 _COMMAND_KEYS = frozenset(PongControllerCommand.__dataclass_fields__)
 
 
+def _schedule(activation_date_local: date, ny_open_blackout: bool) -> dict[str, str]:
+    if type(activation_date_local) is not date or type(ny_open_blackout) is not bool:
+        raise ValueError("PONG_CONTROLLER_AUTHORIZATION_SCHEDULE_INVALID")
+    # An empty interval explicitly disables the historical NY-open overlay.
+    # This is fixed in each new state; restoring never derives it from today.
+    start = datetime.combine(activation_date_local, datetime.min.time(), _DENVER)
+    end = start
+    if ny_open_blackout:
+        start += timedelta(hours=7, minutes=30)
+        end = start + timedelta(minutes=5)
+    return {
+        "activation_date_local": activation_date_local.isoformat(),
+        "blackout_start_local": start.isoformat(),
+        "blackout_end_local": end.isoformat(),
+        "blackout_start_utc": _wire(start),
+        "blackout_end_utc": _wire(end),
+    }
+
+
 def _state_payload(state: PongControllerState) -> dict[str, object]:
     payload = asdict(state)
     payload["phase"] = state.phase.value
@@ -308,14 +332,14 @@ def _decode_state(raw: bytes, expected_path: Path) -> PongControllerState:
             raise ValueError("state hash")
         if Path(state.state_path).resolve() != expected_path.resolve():
             raise ValueError("state path")
+        schedule = _schedule(
+            date.fromisoformat(state.activation_date_local),
+            state.blackout_start_utc != state.blackout_end_utc,
+        )
         if (
             state.schema != PONG_CONTROLLER_SCHEMA
-            or state.activation_date_local != PONG_ACTIVATION_DATE_LOCAL.isoformat()
             or state.run_duration_seconds != PONG_RUN_DURATION_SECONDS
-            or state.blackout_start_local != PONG_BLACKOUT_START_LOCAL.isoformat()
-            or state.blackout_end_local != PONG_BLACKOUT_END_LOCAL.isoformat()
-            or state.blackout_start_utc != PONG_BLACKOUT_START_UTC
-            or state.blackout_end_utc != PONG_BLACKOUT_END_UTC
+            or any(getattr(state, key) != value for key, value in schedule.items())
             or not state.experiment_id
             or not state.controller_id.startswith("pong-controller-")
             or not state.process_instance_id.startswith("pong-controller-process-")
@@ -350,11 +374,10 @@ def _decode_state(raw: bytes, expected_path: Path) -> PongControllerState:
             deadline = _utc(str(state.execution_deadline_utc))
             verified = _utc(str(state.activation_state_verified_at))
             if (
-                deadline - activated
-                != timedelta(seconds=PONG_RUN_DURATION_SECONDS)
+                deadline != _bounded_deadline(activated, date.fromisoformat(state.activation_date_local))
                 or verified != activated
                 or activated.astimezone(_DENVER).date()
-                != PONG_ACTIVATION_DATE_LOCAL
+                != date.fromisoformat(state.activation_date_local)
             ):
                 raise ValueError("activation timing")
         return state
@@ -396,6 +419,8 @@ class PongBoundedController:
         at: str,
         pid: int | None = None,
         process_instance_id: str | None = None,
+        activation_date_local: date = PONG_ACTIVATION_DATE_LOCAL,
+        ny_open_blackout: bool = True,
     ) -> "PongBoundedController":
         target = Path(path).resolve()
         now = _utc(at)
@@ -403,8 +428,11 @@ class PongBoundedController:
         if type(use_pid) is not int or use_pid <= 0 or not experiment_id:
             raise ValueError("Pong controller identity is invalid.")
         process_id = process_instance_id or "pong-controller-process-" + uuid.uuid4().hex
+        schedule = _schedule(activation_date_local, ny_open_blackout)
         if target.exists():
             state = _decode_state(target.read_bytes(), target)
+            if any(getattr(state, key) != value for key, value in schedule.items()):
+                raise PongControllerIntegrityError("PONG_CONTROLLER_AUTHORIZATION_MISMATCH")
             if state.experiment_id != experiment_id:
                 raise PongControllerIntegrityError(
                     "PONG_CONTROLLER_EXPERIMENT_ID_MISMATCH",
@@ -437,16 +465,16 @@ class PongBoundedController:
                 heartbeat_valid_until=_wire(
                     now + timedelta(seconds=PONG_CONTROLLER_HEARTBEAT_SECONDS),
                 ),
-                activation_date_local=PONG_ACTIVATION_DATE_LOCAL.isoformat(),
+                activation_date_local=schedule["activation_date_local"],
                 run_duration_seconds=PONG_RUN_DURATION_SECONDS,
                 activated_at_utc=None,
                 execution_deadline_utc=None,
                 activation_observation_hash=None,
                 activation_state_verified_at=None,
-                blackout_start_local=PONG_BLACKOUT_START_LOCAL.isoformat(),
-                blackout_end_local=PONG_BLACKOUT_END_LOCAL.isoformat(),
-                blackout_start_utc=PONG_BLACKOUT_START_UTC,
-                blackout_end_utc=PONG_BLACKOUT_END_UTC,
+                blackout_start_local=schedule["blackout_start_local"],
+                blackout_end_local=schedule["blackout_end_local"],
+                blackout_start_utc=schedule["blackout_start_utc"],
+                blackout_end_utc=schedule["blackout_end_utc"],
                 phase=PongControllerPhase.PREPARED,
                 command_sequence=0,
                 pending_command=None,
@@ -503,9 +531,9 @@ class PongBoundedController:
             raise ValueError("PONG_CONTROLLER_OBSERVATION_STALE")
         if self.state.phase is not PongControllerPhase.PREPARED:
             raise ValueError("PONG_CONTROLLER_ALREADY_ACTIVATED")
-        if now.astimezone(_DENVER).date() != PONG_ACTIVATION_DATE_LOCAL:
+        if now.astimezone(_DENVER).date() != date.fromisoformat(self.state.activation_date_local):
             raise ValueError("PONG_CONTROLLER_ACTIVATION_DATE_REFUSED")
-        if _utc(PONG_BLACKOUT_START_UTC) <= now < _utc(PONG_BLACKOUT_END_UTC):
+        if _utc(self.state.blackout_start_utc) <= now < _utc(self.state.blackout_end_utc):
             raise ValueError("PONG_ACTIVATION_RESTRICTED_BY_NY_OPEN_BLACKOUT")
         health_reason = observation.admission_health_reason
         if health_reason is not None:
@@ -518,10 +546,10 @@ class PongBoundedController:
             raise ValueError("PONG_CONTROLLER_ACTIVATION_EVIDENCE_ALREADY_SEALED")
 
         activated = _wire(now)
-        deadline = _wire(now + timedelta(seconds=PONG_RUN_DURATION_SECONDS))
+        deadline = _wire(_bounded_deadline(now, date.fromisoformat(self.state.activation_date_local)))
         phase = (
             PongControllerPhase.RUNNING_POST_BLACKOUT
-            if now >= _utc(PONG_BLACKOUT_END_UTC)
+            if now >= _utc(self.state.blackout_end_utc)
             else PongControllerPhase.RUNNING_PRE_BLACKOUT
         )
         self._heartbeat(now)
@@ -742,8 +770,8 @@ class PongBoundedController:
                     else None
                 )
 
-        blackout_start = _utc(PONG_BLACKOUT_START_UTC)
-        blackout_end = _utc(PONG_BLACKOUT_END_UTC)
+        blackout_start = _utc(self.state.blackout_start_utc)
+        blackout_end = _utc(self.state.blackout_end_utc)
         if self.state.execution_deadline_utc is None:
             raise PongControllerIntegrityError(
                 "PONG_CONTROLLER_ACTIVATION_STATE_MISSING",
@@ -888,8 +916,8 @@ class PongBoundedController:
             or event_at > now
         ):
             raise ValueError("Pong controller entry provenance is invalid.")
-        blackout_start = _utc(PONG_BLACKOUT_START_UTC)
-        blackout_end = _utc(PONG_BLACKOUT_END_UTC)
+        blackout_start = _utc(self.state.blackout_start_utc)
+        blackout_end = _utc(self.state.blackout_end_utc)
         if (
             self.state.phase is PongControllerPhase.PREPARED
             or self.state.activated_at_utc is None

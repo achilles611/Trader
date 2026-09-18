@@ -732,7 +732,7 @@ class RiskContinuityTests(unittest.TestCase):
                 "RISK_LOCKOUT_EVIDENCE_PERSISTENCE_FAILED",
             )
             self.assertTrue(recovered.status()["entries_paused"])
-            self.assertFalse(marker.exists())
+            self.assertTrue(marker.exists())
             reopened.close()
 
     def test_lockout_publication_precedes_observable_authority_transition(self) -> None:

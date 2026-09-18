@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import date
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -53,6 +54,88 @@ def observation(
 
 
 class PongBoundedControllerTests(unittest.TestCase):
+    def test_late_run_deadline_is_capped_at_authorization_expiry_and_cleanup_survives(self):
+        """TEST ONLY accelerated clock; no market or execution authority."""
+        with TemporaryDirectory() as temp:
+            controller = PongBoundedController.open(
+                Path(temp) / 'controller.json', experiment_id='TEST-ONLY-expiry',
+                at='2026-09-15T05:50:00Z', activation_date_local=date(2026, 9, 14),
+                ny_open_blackout=True,
+            )
+            controller.activate(observation('2026-09-15T05:50:00Z'))
+            self.assertEqual(controller.state.execution_deadline_utc, '2026-09-15T06:00:00Z')
+            self.assertEqual(PongBoundedController.load(controller.path).state, controller.state)
+            denied = controller.assess_entry(source_switch_id='TEST-ONLY-late', source_switch_sequence=1,
+                source_event_at='2026-09-15T06:00:00Z', at='2026-09-15T06:00:00Z')
+            self.assertFalse(denied.allowed)
+            command = controller.tick(observation('2026-09-15T06:00:00Z', position=1, owned=1, protected=True))
+            self.assertIsNotNone(command)
+            self.assertEqual(command.kind, PongControllerCommandKind.FENCE_NEW_ENTRIES)
+            self.settle(controller, command, '2026-09-15T06:00:00Z')
+            command = controller.tick(observation('2026-09-15T06:00:01Z', fence=True,
+                                                  position=1, owned=1, protected=True))
+            self.assertIsNotNone(command)
+            self.assertEqual(command.kind, PongControllerCommandKind.CONTROLLED_FLATTEN)
+            self.settle(controller, command, '2026-09-15T06:00:01Z')
+            command = controller.tick(observation('2026-09-15T06:00:02Z', fence=True, owned=1))
+            self.assertEqual(command.kind, PongControllerCommandKind.CANCEL_REMAINING_OWNED_ORDERS)
+            self.settle(controller, command, '2026-09-15T06:00:02Z')
+            command = controller.tick(observation('2026-09-15T06:00:03Z', fence=True))
+            self.assertEqual(command.kind, PongControllerCommandKind.SEAL_EVIDENCE)
+            self.settle(controller, command, '2026-09-15T06:00:03Z')
+            command = controller.tick(observation('2026-09-15T06:00:04Z', fence=True, sealed=True))
+            self.assertEqual(command.kind, PongControllerCommandKind.STOP_OPERATION)
+            self.settle(controller, command, '2026-09-15T06:00:04Z')
+            self.assertIsNone(controller.tick(observation('2026-09-15T06:00:05Z', fence=True, sealed=True, active=False)))
+            self.assertEqual(controller.state.phase, PongControllerPhase.TERMINATED)
+
+    def test_explicit_new_authorization_does_not_redate_old_operation(self) -> None:
+        """TEST ONLY: a new dated trial must not extend September 11's state."""
+        with TemporaryDirectory() as temp:
+            old = self.make(temp)
+            old_bytes = old.path.read_bytes()
+            new = PongBoundedController.open(
+                Path(temp) / "september-13-controller.json",
+                experiment_id="pong-asap-20260913-test-only",
+                at="2026-09-14T01:30:00Z",
+                activation_date_local=date(2026, 9, 13),
+                ny_open_blackout=False,
+            )
+            self.activate(new, "2026-09-14T01:30:00Z")
+            self.assertEqual(new.state.execution_deadline_utc, "2026-09-14T02:30:00Z")
+            self.assertEqual(old.path.read_bytes(), old_bytes)
+            self.assertEqual(PongBoundedController.load(new.path).state, new.state)
+            with self.assertRaises(PongControllerIntegrityError):
+                PongBoundedController.open(
+                    old.path, experiment_id=old.state.experiment_id,
+                    at="2026-09-14T01:30:00Z",
+                    activation_date_local=date(2026, 9, 13),
+                    ny_open_blackout=False,
+                )
+            self.assertEqual(old.path.read_bytes(), old_bytes)
+            denied = new.assess_entry(
+                source_switch_id="late", source_switch_sequence=2,
+                source_event_at="2026-09-14T02:30:00Z", at="2026-09-14T02:30:00Z",
+            )
+            self.assertEqual(denied.reason, "PONG_BOUNDED_RUN_DEADLINE_REACHED")
+
+    def test_new_authorization_cannot_activate_next_day_or_with_stale_lease(self) -> None:
+        """TEST ONLY: fresh date authorization retains the five-second fence."""
+        with TemporaryDirectory() as temp:
+            controller = PongBoundedController.open(
+                Path(temp) / "controller.json", experiment_id="pong-asap-test-only",
+                at="2026-09-14T01:30:00Z",
+                activation_date_local=date(2026, 9, 13), ny_open_blackout=False,
+            )
+            with self.assertRaisesRegex(ValueError, "ACTIVATION_DATE_REFUSED"):
+                self.activate(controller, "2026-09-14T06:00:00Z")
+            self.activate(controller, "2026-09-14T01:30:00Z")
+            decision = controller.assess_entry(
+                source_switch_id="fresh", source_switch_sequence=1,
+                source_event_at="2026-09-14T01:30:06Z", at="2026-09-14T01:30:06Z",
+            )
+            self.assertEqual(decision.reason, "PONG_CONTROLLER_HEARTBEAT_EXPIRED")
+
     def make(self, root: str, at: str = "2026-09-11T13:20:00Z"):
         return PongBoundedController.open(
             Path(root) / "pong-controller.json",

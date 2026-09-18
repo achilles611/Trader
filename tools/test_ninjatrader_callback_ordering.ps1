@@ -124,8 +124,44 @@ public static class BeelzebubCallbackOrderingHarness
         long nextDelivered = bounded.Dequeue();
         bool saturationGapExplicit = overflow == 1 && firstDelivered == 1 && nextDelivered == 3;
 
+        // TEST ONLY: the newly retained failure was 9692 -> 1 under the same
+        // publisher session. Instance-local counters reproduce that reset.
+        long retiredInstanceCounter = 9692;
+        long replacementInstanceCounter = 0;
+        bool replacementFailureReproduced = ++replacementInstanceCounter <= retiredInstanceCounter;
+        long ownerA = NinjaTrader.NinjaScript.AddOns.BeelzebubMarketPublisherLease.Claim(true);
+        List<long> replacementQueue = new List<long>();
+        ManualResetEventSlim ownerAPaused = new ManualResetEventSlim(false);
+        ManualResetEventSlim ownerARelease = new ManualResetEventSlim(false);
+        ManualResetEventSlim ownerBDone = new ManualResetEventSlim(false);
+        long ownerB = 0;
+        Thread producerA = new Thread(new ThreadStart(delegate {
+            NinjaTrader.NinjaScript.AddOns.BeelzebubMarketPublisherLease.TryRun(ownerA, delegate {
+                long n = NinjaTrader.NinjaScript.AddOns.BeelzebubMarketPublisherLease.Next("TRADE");
+                ownerAPaused.Set(); ownerARelease.Wait();
+                replacementQueue.Add(n); // delayed publication must precede replacement
+            });
+        }));
+        producerA.Start(); ownerAPaused.Wait();
+        Thread producerB = new Thread(new ThreadStart(delegate {
+            ownerB = NinjaTrader.NinjaScript.AddOns.BeelzebubMarketPublisherLease.Claim(true);
+            NinjaTrader.NinjaScript.AddOns.BeelzebubMarketPublisherLease.TryRun(ownerB, delegate {
+                replacementQueue.Add(NinjaTrader.NinjaScript.AddOns.BeelzebubMarketPublisherLease.Next("TRADE"));
+            });
+            ownerBDone.Set();
+        }));
+        producerB.Start();
+        bool replacementWaitsForAdmission = !ownerBDone.Wait(50);
+        ownerARelease.Set(); producerA.Join(); producerB.Join();
+        bool replacedCallbackRan = false;
+        bool replacedAccepted = NinjaTrader.NinjaScript.AddOns.BeelzebubMarketPublisherLease.TryRun(
+            ownerA, delegate { replacedCallbackRan = true; });
+        bool fallbackDenied = NinjaTrader.NinjaScript.AddOns.BeelzebubMarketPublisherLease.Claim(false) == 0;
+        bool replacementPass = replacementWaitsForAdmission && replacementQueue.SequenceEqual(new long[] { 1, 2 })
+            && !replacedAccepted && !replacedCallbackRan && fallbackDenied;
+
         if (!legacyFailureReproduced || !secondBlockedAtRacePoint || !repairedOrder
-            || !staleGenerationRejected || !saturationGapExplicit)
+            || !staleGenerationRejected || !saturationGapExplicit || !replacementFailureReproduced || !replacementPass)
             throw new InvalidOperationException("NINJATRADER_CALLBACK_ORDERING_REGRESSION_FAILED");
 
         return "{\"schema\":\"beelzebub-native-callback-ordering-regression-v1\""
@@ -134,6 +170,9 @@ public static class BeelzebubCallbackOrderingHarness
             + ",\"forced_race_second_callback_blocked\":true"
             + ",\"production_gate_order\":\"1,2\""
             + ",\"stale_generation_rejected\":true"
+            + ",\"retained_replacement_reset_reproduced\":true"
+            + ",\"replacement_waits_for_delayed_publication\":true"
+            + ",\"replacement_stream_order\":\"1,2\",\"competing_publisher_denied\":true"
             + ",\"queue_saturation_overflow_explicit\":true"
             + ",\"post_overflow_delivered_sequences\":\"1,3\"}";
     }

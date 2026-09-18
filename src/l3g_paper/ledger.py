@@ -1794,6 +1794,13 @@ class PaperLedger:
                     """
                 )
             connection.execute("CREATE INDEX IF NOT EXISTS lane_iii_paper_audit_domain_time ON lane_iii_paper_audit(domain, occurred_at)")
+            # Status/risk recovery must not scan large intervening observation
+            # history while holding the authority lock. This additive covering
+            # index changes access cost only, never records, ordering or hashes.
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS lane_iii_paper_audit_kind_sequence "
+                "ON lane_iii_paper_audit(kind, ledger_sequence, record_hash)"
+            )
             # This additive side table keeps generated-vs-explicit timestamp
             # provenance out of the immutable audit payload/hash contract.
             # Historical rows without a provenance row are treated

@@ -21,6 +21,47 @@ from src.l3g_paper.runtime import LaneIIIPaperRuntime
 
 
 class PaperControlCenterTests(unittest.TestCase):
+    def test_pending_evidence_recovery_endpoint_is_scoped_and_dispatches_without_arming(self):
+        app = create_control_center_app(CopyTradeConfig())
+        endpoint = next(route.endpoint for route in app.routes
+                        if getattr(route, 'path', None) == '/api/lane-iii/paper/pending-lockout-evidence-recovery')
+        state = inspect.getclosurevars(endpoint).nonlocals['ninjatrader_runtime']
+        calls = []
+        def recovery(request_id, phase, evidence, preflight):
+            calls.append((request_id, phase, evidence, callable(preflight)))
+            return {'phase': phase, 'armed': False, 'lockout_cleared': False}
+        state['paper'] = SimpleNamespace(recover_pending_lockout_evidence=recovery)
+        def request(host, action):
+            return Request({'type': 'http', 'method': 'POST', 'path': '/',
+                'scheme': 'http', 'server': (host, 8090), 'query_string': b'',
+                'headers': [(b'x-beelzebub-pending-lockout-recovery-action', action.encode())]})
+        action = 'lane-iii-pending-lockout-evidence-recovery-v1'
+        body = {'request_id': 'TEST-ONLY-evidence', 'phase': 'RECORD', 'evidence': {'test_only': True}}
+        for host, header in (('outside.example', action), ('127.0.0.1', 'wrong')):
+            with self.assertRaises(HTTPException) as caught:
+                asyncio.run(endpoint(request(host, header), body))
+            self.assertEqual(caught.exception.status_code, 403)
+        with self.assertRaises(HTTPException) as caught:
+            asyncio.run(endpoint(request('127.0.0.1', action), dict(body, arm=True)))
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertEqual(calls, [])
+        result = asyncio.run(endpoint(request('127.0.0.1', action), body))
+        self.assertFalse(result['armed'])
+        self.assertFalse(result['lockout_cleared'])
+        self.assertEqual(calls, [('TEST-ONLY-evidence', 'RECORD', {'test_only': True}, True)])
+
+    def test_independent_collection_dispatch_has_no_unbound_profile_name(self) -> None:
+        """TEST ONLY: execute the exact live callback branch, not a source assertion."""
+        from src.copytrade.control_center import _pong_market_collection_only
+        for kind in ("TRADE", "QUOTE", "DEPTH"):
+            observation = SimpleNamespace(observation_type=kind)
+            self.assertTrue(_pong_market_collection_only(True, "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2", observation))
+            self.assertFalse(_pong_market_collection_only(True, "BEELZEBUB_PONG_DISCERNMENT_V1", observation))
+            self.assertFalse(_pong_market_collection_only(False, "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2", observation))
+        for kind in ("ACCOUNT", "POSITION", "ORDER", "HEALTH", "EXECUTION"):
+            self.assertFalse(_pong_market_collection_only(True, "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2",
+                                                        SimpleNamespace(observation_type=kind)))
+
     def test_unresolved_watchdog_defers_transport_and_ledger_shutdown(self) -> None:
         """A failed AddOn grace must retain its signed callback path.
 

@@ -228,6 +228,7 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
                     "BEELZEBUB_L3G_PAPER_PROFILE": "BEELZEBUB_SCALPER_V2",
                     "BEELZEBUB_PONG_INDEPENDENT_COLLECTION": "1",
                     "BEELZEBUB_PONG_BOUNDED_ACTIVATION": "1",
+                    "BEELZEBUB_PONG_COMMISSIONING_AUTHORIZATION": "TEST-ONLY-authority.json",
                 },
             )
             self.assertEqual(resolved.source, "EXPLICIT_MAINTENANCE")
@@ -237,6 +238,7 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
             self.assertEqual(child["BEELZEBUB_L3G_PAPER_LEDGER_EPOCH"], "L3G-PAPER-EPOCH-EXPLICIT-TEST")
             self.assertEqual(child["BEELZEBUB_PONG_INDEPENDENT_COLLECTION"], "1")
             self.assertEqual(child["BEELZEBUB_PONG_BOUNDED_ACTIVATION"], "1")
+            self.assertEqual(child["BEELZEBUB_PONG_COMMISSIONING_AUTHORIZATION"], "TEST-ONLY-authority.json")
 
     def test_partial_explicit_maintenance_binding_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

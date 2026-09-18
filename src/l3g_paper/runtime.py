@@ -110,7 +110,7 @@ def _timestamp_utc(value: str) -> datetime:
     )
 
 
-_RISK_LOCKOUT_PENDING_SCHEMA = "lane-iii-risk-lockout-pending-v1"
+_RISK_LOCKOUT_PENDING_SCHEMA = "lane-iii-risk-lockout-pending-v2"
 _PERPETUAL_SIGNAL_SCHEMA = "lane-iii-five-minute-perpetual-signal-v3"
 _PERPETUAL_SIGNAL_KIND = "RISK_EVENT_FIVE_MINUTE_DIRECTION_CHECKPOINT"
 _PERPETUAL_SEED_CHECKPOINT_BINDING_SCHEMA = (
@@ -636,9 +636,12 @@ class LaneIIIPaperRuntime:
             # a broker position whose existence cannot be inferred from disk.
             self._risk_continuity_fault = str(error)
             self._entries_paused = True
-            self.risk.lock_out(self._risk_continuity_fault)
+            if not self.risk.status().get("locked_out"):
+                self.risk.lock_out(self._risk_continuity_fault)
         self.risk.set_lockout_recorder(self._record_authority_lockout)
-        if self._risk_continuity_fault is not None:
+        if self._risk_continuity_fault is not None and not Path(
+            str(self.ledger.path) + ".risk-authority-pending.json"
+        ).exists():
             self._record_authority_lockout(True, self._risk_continuity_fault, None)
 
     def _record_authority_lockout(
@@ -655,10 +658,22 @@ class LaneIIIPaperRuntime:
             "RISK_EVENT_AUTHORITY_LOCKOUT"
             if locked_out else "RISK_EVENT_AUTHORITY_LOCKOUT_CLEARED"
         )
+        incident_id = uuid4().hex
         marker = Path(str(self.ledger.path) + ".risk-authority-pending.json")
+        if marker.exists():
+            # Never overwrite an earlier unresolved incident. The primary
+            # fence remains fail-closed; additional failures remain evidence.
+            marker = Path(str(marker) + "." + incident_id)
         marker_payload = {
             "schema": _RISK_LOCKOUT_PENDING_SCHEMA,
             "ledger_path": str(self.ledger.path),
+            "ledger_identity": self.ledger.ledger_identity,
+            "ledger_epoch": self.ledger.ledger_epoch,
+            "incident_id": incident_id,
+            "account": self.risk.binding.account_name,
+            "account_class": self.risk.binding.account_class,
+            "instrument": self.risk.binding.instrument,
+            "execution_session_id": self._execution_session_id(),
             "kind": kind,
             "payload": payload,
             "created_at": _now(),
@@ -677,7 +692,10 @@ class LaneIIIPaperRuntime:
         try:
             self.ledger.append(
                 kind, payload,
-                identity="l3g-risk-authority-state-" + canonical_hash(payload),
+                # A reason is not an incident identity. Separate recurrences
+                # may have different session/risk envelopes; retries of this
+                # one pending incident are resolved by its preserved hash.
+                identity="l3g-risk-authority-incident-" + incident_id,
                 execution_session_id=self._execution_session_id(),
             )
         except Exception:
@@ -4038,6 +4056,60 @@ class LaneIIIPaperRuntime:
             )
         return True, ()
 
+    def recover_pending_lockout_evidence(
+        self, request_id: str, phase: str, evidence: Mapping[str, object],
+        ledger_preflight: Callable[[str, Mapping[str, object]], Mapping[str, object]] | None = None,
+    ) -> dict[str, object]:
+        """Recover pending incident durability, never capacity/entry authority."""
+        from .pending_lockout import PENDING_FAULT, record_pending, resolve_pending
+        if (not isinstance(request_id, str) or not 8 <= len(request_id) <= 128
+                or not all(c.isalnum() or c in '-_.:' for c in request_id)
+                or phase not in {'RECORD', 'RESOLVE'}):
+            raise ValueError('PENDING_LOCKOUT_RECOVERY_REQUEST_INVALID')
+        readiness = self.operational_paper_readiness(ledger_preflight)
+        with self._lock, self.ledger.authority_capacity_fence(), self.ledger.commissioning_authority_fence():
+            snapshot = self._snapshot
+            transport = None if self._transport is None else self._transport.status()
+            reason = self.risk.status().get('lockout_reason')
+            if (self._state not in {PaperRuntimeState.READY_DISARMED, PaperRuntimeState.LOCKED_OUT}
+                    or self._operational_session is not None or self._armed_session is not None
+                    or self._entry_owner is not PaperEntryOwner.NONE
+                    or self._position is not PaperDirection.FLAT or self._position_quantity != 0
+                    or snapshot.current_position is not PaperDirection.FLAT or snapshot.current_position_quantity != 0
+                    or snapshot.working_owned_orders or snapshot.working_entry_orders
+                    or snapshot.protective_stop_state != 'NONE'
+                    or snapshot.foreign_activity or snapshot.unresolved_command
+                    or snapshot.unresolved_native_order or snapshot.unresolved_execution
+                    or not snapshot.position_snapshot_complete or not snapshot.order_snapshot_complete
+                    or not snapshot.reconciliation_current
+                    or (snapshot.account_name, snapshot.account_class, snapshot.instrument) != ('Sim101', 'LOCAL_SIMULATION', 'MNQ SEP26')
+                    or snapshot.account_match_count != 1 or snapshot.instrument_match_count != 1
+                    or transport is None or not transport.authenticated_client
+                    or not transport.reconciled or not transport.addon_provenance_valid):
+                raise ValueError('PENDING_LOCKOUT_RECOVERY_SAFE_RECONCILIATION_REQUIRED')
+            capacity_reason = str(reason or '').startswith('LEDGER_CAPACITY_INADEQUATE:')
+            if (reason != PENDING_FAULT and not capacity_reason
+                    or self._risk_continuity_fault not in {None, PENDING_FAULT, reason}
+                    or self._fault_reason not in {None, PENDING_FAULT, reason}):
+                raise ValueError('PENDING_LOCKOUT_RECOVERY_UNRELATED_LOCKOUT_RETAINED')
+            proof = readiness.get('ledger')
+            if not isinstance(proof, Mapping):
+                raise ValueError('PENDING_LOCKOUT_FULL_VERIFICATION_REQUIRED')
+            action = record_pending if phase == 'RECORD' else resolve_pending
+            result = action(self.ledger, evidence, proof)
+            if phase == 'RESOLVE':
+                # The appended, independently verified incident now owns the
+                # same lock. Only its persistence fault is repaired here.
+                if self._risk_continuity_fault == PENDING_FAULT:
+                    self._risk_continuity_fault = None
+                if self._fault_reason == PENDING_FAULT:
+                    self._fault_reason = None
+                if reason == PENDING_FAULT:
+                    self.risk.restore_lockout(True, str(result['lockout_reason']), None)
+                self._entries_paused = True
+            return {**result, 'request_id': request_id, 'armed': False,
+                    'operational_paper_started': False, 'live_capital': 'DENIED'}
+
     def recover_healthy_ledger_capacity(
         self,
         request_id: str,
@@ -7244,7 +7316,8 @@ class LaneIIIPaperRuntime:
         self._session_pnl[session_key] = self._session_pnl.get(session_key, Decimal("0")) + realized
 
     def _recover_risk_continuity(self, external: Mapping[str, object] | None) -> None:
-        if Path(str(self.ledger.path) + ".risk-authority-pending.json").exists():
+        pending_incident = Path(str(self.ledger.path) + ".risk-authority-pending.json").exists()
+        if pending_incident and external is not None:
             raise RuntimeError("RISK_LOCKOUT_EVIDENCE_PERSISTENCE_FAILED")
         if external is not None:
             canonical = validate_risk_continuity_snapshot(external, require_flat=True)
@@ -7922,6 +7995,11 @@ class LaneIIIPaperRuntime:
 
         if open_entry is not None or len(self._entry_execution_ids) != len(self._exit_execution_ids):
             raise RuntimeError("RISK_CONTINUITY_OPEN_LIFECYCLE_UNRESOLVED")
+        if pending_incident:
+            # Retain every recovered counter and existing lockout before
+            # refusing authority. Startup must not erase the original sidecar
+            # or turn a failed append into a fresh risk-history projection.
+            raise RuntimeError("RISK_LOCKOUT_EVIDENCE_PERSISTENCE_FAILED")
 
     def risk_continuity_snapshot(self) -> dict[str, object]:
         """Export the cumulative exchange-trade-date budget without authority."""

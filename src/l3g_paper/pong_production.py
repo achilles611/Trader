@@ -10,22 +10,32 @@ authority and never treats accelerated fixtures as market history.
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 from collections import deque
+from concurrent.futures import Future
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import json
+import hashlib
 import os
+import queue
 from pathlib import Path
 import threading
 import time
 from typing import Callable, Mapping
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from src.l3f_provider.ninjatrader_observation import NinjaTraderObservation
 from src.lane_iii.contracts import canonical_hash, normalized_utc
 
 from .contracts import PONG_ENTRY_PROFILE_VERSION
+from .pong_authorization import PongLaunchAuthorization
+from .pong_collection import PongAuthenticHourCollector
+from .pong_compute import COMPUTE_BUILD_HASH, PongWindowRequest, PongWindowResult, evaluate_window_batch, open_compute_pool
+from .pong_volume_history import HISTORY_TYPE, PongVolumeReferenceHistory
 from .daily_bias import (
     BiasUpdateReason,
     ClassifiedSide,
@@ -82,6 +92,19 @@ from .pong_runtime import (
 PONG_PRODUCTION_HOST_SCHEMA = "beelzebub-pong-production-host-v1"
 PONG_QUALIFYING_HOUR_SCHEMA = "beelzebub-pong-qualified-hour-certificate-v1"
 PONG_PRODUCTION_EXPERIMENT_ID = "pong-ny-open-20260911"
+_ARTIFACT_ROOT = Path(__file__).resolve().parents[2]
+_LOADED_SOURCE_HASHES = {
+    name: hashlib.sha256((_ARTIFACT_ROOT / name).read_bytes()).hexdigest()
+    for name in ("beez_console.py", "src/copytrade/control_center.py",
+                 "src/l3g_paper/pong_production.py", "src/l3g_paper/pong_controller.py",
+                 "src/l3g_paper/pong_authorization.py", "src/l3g_paper/pong_volume_history.py",
+                 "src/l3g_paper/runtime.py", "src/l3g_paper/pending_lockout.py",
+                 "src/l3g_paper/ledger.py",
+                 "src/l3g_paper/pong_compute.py",
+                 "src/l3g_paper/pong_collection.py", "src/l3f_provider/ninjatrader_observation.py",
+                 "src/l3f_provider/ninjatrader_commission.py", "src/l3g_paper/pong_microstructure.py")
+}
+PONG_LOADED_ARTIFACT_HASH = canonical_hash(_LOADED_SOURCE_HASHES)
 _RUNNING_CONTROLLER_PHASES = {
     PongControllerPhase.RUNNING_PRE_BLACKOUT,
     PongControllerPhase.RUNNING_POST_BLACKOUT,
@@ -93,9 +116,57 @@ def _now() -> str:
 
 
 def _time(value: object) -> datetime:
+    return _time_text(str(value))
+
+
+@lru_cache(maxsize=65536)
+def _time_text(value: str) -> datetime:
     return datetime.fromisoformat(
-        normalized_utc(str(value), "Pong production time").replace("Z", "+00:00")
+        normalized_utc(value, "Pong production time").replace("Z", "+00:00")
     )
+
+
+class _DepthWindow:
+    """The same bounded event sequence, indexed by exact Decimal price.
+
+    Window selection still uses original availability and the last eligible
+    event, including backwards/future time refusal by the frozen adapter.
+    No event is sampled and no final evaluation is cached.
+    """
+    def __init__(self, maxlen: int = 4096) -> None:
+        self._events: deque[DepthObservation] = deque(maxlen=maxlen)
+        self._by_price: dict[Decimal, deque[DepthObservation]] = {}
+
+    def __len__(self) -> int:
+        return len(self._events)
+
+    def __iter__(self):
+        return iter(self._events)
+
+    def __getitem__(self, index: int) -> DepthObservation:
+        return self._events[index]
+
+    def append(self, item: DepthObservation) -> None:
+        if len(self._events) == self._events.maxlen:
+            expired = self._events[0]
+            values = self._by_price[expired.price]
+            assert values.popleft() is expired
+            if not values:
+                del self._by_price[expired.price]
+        self._events.append(item)
+        self._by_price.setdefault(item.price, deque()).append(item)
+
+    def clear(self) -> None:
+        self._events.clear()
+        self._by_price.clear()
+
+    def price_window(self, cutoff: datetime) -> tuple[DepthObservation, ...]:
+        latest = next((item for item in reversed(self._events)
+                       if item.event._ordering_key[0] >= cutoff), None)
+        if latest is None:
+            return ()
+        return tuple(item for item in self._by_price[latest.price]
+                     if item.event._ordering_key[0] >= cutoff)
 
 
 def _canonical(value: object) -> bytes:
@@ -135,6 +206,9 @@ class PongProductionHost:
             [PongNativeDirective, Mapping[str, object]], Mapping[str, object]
         ],
         activation_authorized: bool = False,
+        launch_authorization: PongLaunchAuthorization | None = None,
+        history_verification_key: bytes | None = None,
+        compute_workers: int = 0,
     ) -> None:
         if not callable(native_dispatch):
             raise TypeError("Pong production host requires one native dispatcher.")
@@ -146,9 +220,39 @@ class PongProductionHost:
         self._controller_dispatch = controller_dispatch
         self._native_dispatch = native_dispatch
         self.activation_authorized = activation_authorized
+        self.launch_authorization = launch_authorization
+        self._experiment_id = (
+            PONG_PRODUCTION_EXPERIMENT_ID if launch_authorization is None
+            else launch_authorization.experiment_id
+        )
+        self._activation_date = (
+            PONG_ACTIVATION_DATE_LOCAL if launch_authorization is None
+            else launch_authorization.activation_date_local
+        )
+        self._operation_root = (
+            self.state_root if launch_authorization is None
+            else self.state_root / "runs" / self._experiment_id
+        )
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._observations: queue.Queue[NinjaTraderObservation] = queue.Queue(maxsize=262144)
+        self._admission_lock = threading.Lock()
+        self._observation_overflow = 0
+        if type(compute_workers) is not int or not 0 <= compute_workers <= 3:
+            raise ValueError('PONG_COMPUTE_WORKER_BOUND_INVALID')
+        self._compute_workers = compute_workers
+        self._compute_pool = None
+        self._compute_pending: deque = deque()
+        self._compute_generation = uuid4().hex
+        self._compute_submitted = 0
+        self._compute_applied = 0
+        self._compute_refused = 0
+        self._compute_limit = 512
+        self._compute_wakeup = threading.Event()
+        self._compute_batch: list[tuple[PongWindowRequest, Future]] = []
+        self._compute_batch_started = 0.0
+        self._compute_batch_limit = 32
         self._process_instance_id = "pong-controller-process-" + uuid4().hex
         self._controller: PongBoundedController | None = None
         self._controller_error: str | None = None
@@ -167,6 +271,9 @@ class PongProductionHost:
         self._input_adapter: PongCausalInputAdapter | None = None
         self._input_error: str | None = None
         self._producer: tuple[str, str, str] | None = None
+        self._source_generation: int | None = None
+        self._last_quote_record: NinjaTraderObservation | None = None
+        self._classified_retention_hour: datetime | None = None
         self._stream_sequences: dict[str, int] = {}
         self._stream_counts = {name: 0 for name in ("DEPTH", "QUOTE", "TRADE")}
         self._stream_missing = {name: 0 for name in ("DEPTH", "QUOTE", "TRADE")}
@@ -178,8 +285,8 @@ class PongProductionHost:
         self._certificate_error: str | None = None
         self._trades: deque[ClassifiedTrade] = deque(maxlen=8192)
         self._depth = {
-            BookSide.BID: deque(maxlen=4096),
-            BookSide.ASK: deque(maxlen=4096),
+            BookSide.BID: _DepthWindow(),
+            BookSide.ASK: _DepthWindow(),
         }
         self._volume_buckets: dict[str, Decimal] = {}
         self._volume_windows: dict[str, VolumeWindow] = {}
@@ -192,6 +299,12 @@ class PongProductionHost:
         self._flow = ClassifiedFlowAdapter()
         self._liquidity = LiquidityClusterAdapter()
         self._volume = VolumeRegimeAdapter()
+        self._volume_history = (
+            None if history_verification_key is None else PongVolumeReferenceHistory(
+                self.state_root / "volume-reference.json", root_key=history_verification_key,
+                expected_source=expected_market_source_fingerprint,
+            )
+        )
         self._load_certificate()
 
     @property
@@ -200,12 +313,14 @@ class PongProductionHost:
 
     @property
     def controller_path(self) -> Path:
-        return self.state_root / "controller-state.json"
+        return self._operation_root / "controller-state.json"
 
     def start(self) -> None:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
+            if self._compute_workers and self._compute_pool is None:
+                self._compute_pool = open_compute_pool(self._compute_workers)
             self._stop.clear()
             self._thread = threading.Thread(
                 target=self._run,
@@ -219,6 +334,11 @@ class PongProductionHost:
         thread = self._thread
         if thread is not None:
             thread.join(timeout_seconds)
+            if thread.is_alive():
+                raise RuntimeError('PONG_HOST_DRAIN_INCOMPLETE')
+        if self._compute_pool is not None:
+            self._compute_pool.shutdown(wait=False, cancel_futures=True)
+            self._compute_pool = None
 
     def _load_certificate(self) -> None:
         path = self.certificate_path
@@ -250,7 +370,29 @@ class PongProductionHost:
             )
 
     def on_observation(self, record: NinjaTraderObservation) -> None:
-        """Admit one already authenticated listener observation, without I/O."""
+        """Bounded callback admission; the host worker owns processing and I/O."""
+        try:
+            self._observations.put_nowait(record)
+        except queue.Full:
+            with self._admission_lock:
+                self._observation_overflow += 1
+                self._input_error = "PONG_PRODUCTION_OBSERVATION_QUEUE_OVERFLOW"
+
+    def _consume_observation(self, record: NinjaTraderObservation) -> None:
+        """Process exactly one queued causal event before admitting the next."""
+        def cursor() -> tuple[object, ...]:
+            return tuple(
+                values[-1].event.event_id if values else None
+                for values in (self._trades, self._depth[BookSide.BID], self._depth[BookSide.ASK])
+            )
+        with self._lock:
+            before = cursor()
+            self._process_observation(record)
+            if self._input_error is None and cursor() != before:
+                self._evaluate_microstructure(_time(record.ninja_receipt_time))
+
+    def _process_observation(self, record: NinjaTraderObservation) -> None:
+        """Validate the native envelope and update causal state on the worker."""
         if type(record) is not NinjaTraderObservation or record.signature_verified is not True:
             with self._lock:
                 self._input_error = "PONG_NATIVE_INPUT_ATTESTATION_UNVERIFIED"
@@ -270,6 +412,10 @@ class PongProductionHost:
                 self._input_error = "PONG_NATIVE_INPUT_PRODUCER_CHANGED"
                 return
             try:
+                if record.observation_type == HISTORY_TYPE:
+                    if self._volume_history is not None:
+                        self._volume_history.admit(record, received_at=_now())
+                    return
                 if record.observation_type == "HISTORICAL_WARM_START":
                     warm = PongWarmStart.from_observation(record)
                     self._warm_start = warm
@@ -288,6 +434,15 @@ class PongProductionHost:
                     return
                 if record.observation_type not in self._stream_counts:
                     return
+                if record.payload.get("contract_id") != "MNQ SEP26":
+                    raise ValueError("PONG_NATIVE_CONTRACT_MISMATCH")
+                generation = record.payload.get("source_generation")
+                if generation is not None:
+                    if type(generation) is not int or generation <= 0:
+                        raise ValueError("PONG_NATIVE_SOURCE_GENERATION_INVALID")
+                    if self._source_generation is not None and generation != self._source_generation:
+                        self._input_error = "PONG_NATIVE_SOURCE_GENERATION_CHANGED"
+                    self._source_generation = generation
                 sequence = int(record.payload["source_event_sequence"])
                 prior = self._stream_sequences.get(record.observation_type)
                 if prior is not None:
@@ -309,6 +464,8 @@ class PongProductionHost:
                 self._stream_counts[record.observation_type] += 1
                 if record.observation_type == "TRADE":
                     self._admit_trade(record)
+                elif record.observation_type == "QUOTE":
+                    self._last_quote_record = record
                 elif record.observation_type == "DEPTH":
                     self._admit_depth(record)
             except (KeyError, TypeError, ValueError, PongNativeInputRefused) as error:
@@ -319,7 +476,7 @@ class PongProductionHost:
         received = record.ninja_receipt_time
         event_at = record.provider_timestamp or record.exchange_timestamp or received
         if _time(event_at) > _time(received):
-            event_at = received
+            raise ValueError("PONG_NATIVE_PROVIDER_TIMESTAMP_AFTER_RECEIPT")
         producer = record.producer
         return CausalEventRef(
             record.observation_id,
@@ -336,13 +493,9 @@ class PongProductionHost:
 
     def _admit_trade(self, record: NinjaTraderObservation) -> None:
         payload = record.payload
-        side_text = str(payload.get("aggressor_side") or "UNKNOWN").upper()
-        side = AggressorSide(side_text if side_text in {"BUY", "SELL"} else "UNKNOWN")
-        provenance = (
-            AggressorProvenance.AUTHENTICATED_PROVIDER
-            if side is not AggressorSide.UNKNOWN
-            else AggressorProvenance.UNAVAILABLE
-        )
+        classification = PongAuthenticHourCollector.classify_trade(record, self._last_quote_record)
+        side = AggressorSide(classification["side"])
+        provenance = AggressorProvenance(classification["provenance"])
         trade = ClassifiedTrade(
             self._event_ref(record), "MNQ SEP26", Decimal(str(payload["price"])),
             Decimal(str(payload["size"])), side, provenance,
@@ -352,25 +505,21 @@ class PongProductionHost:
         bucket = event.replace(minute=(event.minute // 5) * 5, second=0, microsecond=0)
         key = bucket.isoformat().replace("+00:00", "Z")
         self._volume_buckets[key] = self._volume_buckets.get(key, Decimal("0")) + trade.volume
-        collection = self._collection.get("required_interval")
-        if isinstance(collection, Mapping) and side in {AggressorSide.BUY, AggressorSide.SELL}:
-            start_raw, end_raw = collection.get("start_utc"), collection.get("end_utc")
-            if isinstance(start_raw, str) and isinstance(end_raw, str) and (
-                _time(start_raw) <= event < _time(end_raw)
-            ):
-                self._classified_hour.append(ClassifiedTradeInput(
-                    event_id=record.observation_id,
-                    payload_hash=record.payload_hash,
-                    source="NINJATRADER_NATIVE_AGGRESSOR:"
-                    + str(payload.get("aggressor_source") or "UNKNOWN"),
-                    instrument="MNQ SEP26",
-                    side=ClassifiedSide(side.value),
-                    size=trade.volume,
-                    event_at=trade.event.event_at,
-                    observed_at=record.ninja_receipt_time,
-                    available_at=record.ninja_receipt_time,
-                    authenticated=True,
-                ))
+        # Retain the causal hour seam independently of a status snapshot that
+        # may already point at the next interval. Certification filters exactly.
+        hour = event.replace(minute=0, second=0, microsecond=0)
+        if self._classified_retention_hour is None or hour > self._classified_retention_hour:
+            self._classified_retention_hour = hour
+            self._classified_hour = [item for item in self._classified_hour
+                                     if _time(item.event_at) >= hour - timedelta(hours=1)]
+        if side in {AggressorSide.BUY, AggressorSide.SELL}:
+            self._classified_hour.append(ClassifiedTradeInput(
+                event_id=record.observation_id, payload_hash=record.payload_hash,
+                source="NINJATRADER_NATIVE_AGGRESSOR:" + str(payload.get("aggressor_source") or "UNKNOWN"),
+                instrument="MNQ SEP26", side=ClassifiedSide(side.value), size=trade.volume,
+                event_at=trade.event.event_at, observed_at=record.ninja_receipt_time,
+                available_at=record.ninja_receipt_time, authenticated=True,
+            ))
 
     def _admit_depth(self, record: NinjaTraderObservation) -> None:
         payload = record.payload
@@ -402,34 +551,25 @@ class PongProductionHost:
         ))
 
     def _evaluate_microstructure(self, at: datetime) -> None:
-        if self._last_microstructure_at is not None and (
-            at - self._last_microstructure_at < timedelta(seconds=1)
-        ):
-            return
-        self._last_microstructure_at = at
+        if self._compute_pool is None:
+            self._last_microstructure_at = at
         cutoff = at - timedelta(seconds=5)
-        trades = tuple(item for item in self._trades if _time(item.event.available_at) >= cutoff)
-        bids = tuple(item for item in self._depth[BookSide.BID] if _time(item.event.available_at) >= cutoff)
-        asks = tuple(item for item in self._depth[BookSide.ASK] if _time(item.event.available_at) >= cutoff)
+        # Flow's frozen window is event-time based. A delayed receipt must not
+        # pull an older trade into it; all trades remain in durable retention.
+        trades = tuple(item for item in self._trades
+                       if item.event._ordering_key[1] >= cutoff
+                       and item.event._ordering_key[0] >= cutoff)
+        bids = self._depth[BookSide.BID].price_window(cutoff)
+        asks = self._depth[BookSide.ASK].price_window(cutoff)
         if not trades or not bids or not asks:
-            self._microstructure_blockers = ("PONG_MICROSTRUCTURE_NATIVE_WINDOW_INCOMPLETE",)
+            blockers = ("PONG_MICROSTRUCTURE_NATIVE_WINDOW_INCOMPLETE",)
+            if self._compute_pool is None:
+                self._microstructure_blockers = blockers
+            else:
+                self._queue_compute(None, at, blockers)
             return
         as_of = at.isoformat().replace("+00:00", "Z")
         try:
-            flow = self._flow.evaluate(
-                trades, window_start=cutoff.isoformat().replace("+00:00", "Z"),
-                as_of=as_of, feed_continuity_valid=self._input_error is None,
-            )
-            bid_price = bids[-1].price
-            ask_price = asks[-1].price
-            bid = self._liquidity.evaluate(
-                tuple(item for item in bids if item.price == bid_price),
-                as_of=as_of, feed_continuity_valid=self._input_error is None,
-            )
-            ask = self._liquidity.evaluate(
-                tuple(item for item in asks if item.price == ask_price),
-                as_of=as_of, feed_continuity_valid=self._input_error is None,
-            )
             bucket = at.replace(minute=(at.minute // 5) * 5, second=0, microsecond=0)
             key = bucket.isoformat().replace("+00:00", "Z")
             window = VolumeWindow(
@@ -445,41 +585,137 @@ class PongProductionHost:
                 continuity_valid=self._input_error is None,
                 feed_fresh=True,
             )
-            prior = tuple(
-                item for item in self._volume_windows.values()
-                if item.normalization_key == window.normalization_key
-                and _time(item.window_end) <= bucket
-            )
+            prior = () if self._volume_history is None else self._volume_history.prior(bucket)
+            if self._compute_pool is not None:
+                request = PongWindowRequest(self._compute_generation, self._compute_submitted + 1,
+                    self._producer or (), as_of, cutoff.isoformat().replace('+00:00', 'Z'),
+                    trades, bids, asks, window, prior, self._input_error is None,
+                    self._flow.policy, self._liquidity.policy, self._volume.policy, self._mapper.policy)
+                self._queue_compute(request, at)
+                return
+            flow = self._flow.evaluate(trades, window_start=cutoff.isoformat().replace('+00:00', 'Z'),
+                                       as_of=as_of, feed_continuity_valid=self._input_error is None)
+            bid = self._liquidity.evaluate(bids, as_of=as_of, feed_continuity_valid=self._input_error is None)
+            ask = self._liquidity.evaluate(asks, as_of=as_of, feed_continuity_valid=self._input_error is None)
             regime = self._volume.evaluate(window, prior, as_of=as_of)
             mapped = self._mapper.map_frame(
                 flow, bid, ask, regime,
                 first_evidence_revision=self._discernment.evidence_revision + 1,
+                include_blocked_artifacts=False,
             )
             self._microstructure_blockers = mapped.blockers
             if not mapped.blockers:
-                for evidence in mapped.evidence:
-                    update = self._discernment.on_evidence(
-                        evidence, volume_regime=mapped.volume_regime,
-                    )
-                    self._apply_discernment_update(update)
-            # Keep completed buckets as prior-only candidates. A current partial
-            # window never becomes its own historical reference.
-            previous_start = bucket - timedelta(minutes=5)
-            previous_key = previous_start.isoformat().replace("+00:00", "Z")
-            if previous_key in self._volume_buckets and previous_key not in self._volume_windows:
-                previous_end = bucket.isoformat().replace("+00:00", "Z")
-                previous_volume = self._volume_buckets[previous_key]
-                self._volume_windows[previous_key] = VolumeWindow(
-                    "pong-volume-complete-" + canonical_hash({"start": previous_key})[:32],
-                    canonical_hash({"start": previous_key, "end": previous_end, "volume": str(previous_volume)}),
-                    "MNQ SEP26", f"UTC-{previous_start.hour:02d}:{previous_start.minute:02d}-5M",
-                    previous_key, previous_end, as_of, previous_volume,
-                    VolumeWindowKind.COMPLETED, self._input_error is None, True,
+                update = self._discernment.on_evidence_frame(
+                    mapped.evidence, volume_regime=mapped.volume_regime,
                 )
+                self._apply_discernment_update(update)
+            # A bucket observed only partially since process startup is not a
+            # completed historical reference. Only the verified provider loader
+            # supplies prior windows; no zero-fill or shortened history fallback.
         except Exception as error:
-            self._microstructure_blockers = (
+            blockers = (
                 "PONG_MICROSTRUCTURE_EVALUATION_BLOCKED:" + type(error).__name__,
             )
+            if self._compute_pool is None:
+                self._microstructure_blockers = blockers
+            elif self._input_error is None:
+                self._queue_compute(None, at, blockers)
+
+    def _queue_compute(self, request: PongWindowRequest | None, at: datetime,
+                       blockers: tuple[str, ...] = ()) -> None:
+        if len(self._compute_pending) >= self._compute_limit:
+            self._compute_refused += 1
+            self._input_error = 'PONG_COMPUTE_QUEUE_OVERFLOW'
+            raise RuntimeError(self._input_error)
+        ordinal = self._compute_submitted + 1
+        as_of = at.isoformat().replace('+00:00', 'Z')
+        producer = self._producer or ()
+        if request is None:
+            future = Future()
+            future.set_result(PongWindowResult(self._compute_generation, ordinal, producer,
+                as_of, COMPUTE_BUILD_HASH, blockers, None))
+        else:
+            future = Future()
+            if not self._compute_batch:
+                self._compute_batch_started = time.monotonic()
+            self._compute_batch.append((request, future))
+        self._compute_pending.append((ordinal, as_of, producer, future, time.monotonic()))
+        self._compute_submitted = ordinal
+        if len(self._compute_batch) >= self._compute_batch_limit:
+            self._flush_compute_batch()
+
+    def _flush_compute_batch(self) -> None:
+        if not self._compute_batch:
+            return
+        batch = tuple(self._compute_batch)
+        self._compute_batch.clear()
+        try:
+            future = self._compute_pool.submit(evaluate_window_batch, tuple(item[0] for item in batch))
+        except Exception as error:
+            self._input_error = 'PONG_COMPUTE_SUBMISSION_FAILED'
+            for _, pending in batch:
+                pending.set_exception(error)
+            self._compute_wakeup.set()
+            return
+
+        def complete(done: Future) -> None:
+            try:
+                values = done.result()
+                if type(values) is not tuple or len(values) != len(batch):
+                    raise RuntimeError('PONG_COMPUTE_BATCH_RESULT_SHAPE_INVALID')
+                for (_, pending), value in zip(batch, values):
+                    pending.set_result(value)
+            except Exception as error:
+                for _, pending in batch:
+                    if not pending.done():
+                        pending.set_exception(error)
+            finally:
+                self._compute_wakeup.set()
+        future.add_done_callback(complete)
+
+    def _drain_compute(self) -> None:
+        # A completed B cannot overtake paused A. Only this host thread applies
+        # results, assigns Discernment revisions and queues execution directives.
+        with self._lock:
+            while self._compute_pending:
+                ordinal, as_of, producer, future, admitted = self._compute_pending[0]
+                if not future.done():
+                    if time.monotonic() - admitted > 15:
+                        self._input_error = 'PONG_COMPUTE_RESPONSE_TIMEOUT'
+                        self._microstructure_blockers = (self._input_error,)
+                    return
+                self._compute_pending.popleft()
+                try:
+                    result = future.result()  # completed, never blocks the host
+                    if (type(result) is not PongWindowResult or result.ordinal != ordinal
+                            or result.generation != self._compute_generation
+                            or result.producer != producer or producer != (self._producer or ())
+                            or result.as_of != as_of or result.build_hash != COMPUTE_BUILD_HASH):
+                        self._input_error = 'PONG_COMPUTE_IDENTITY_OR_ORDER_MISMATCH'
+                        raise RuntimeError(self._input_error)
+                    if self._input_error is not None:
+                        self._compute_refused += 1
+                        self._microstructure_blockers = (self._input_error,)
+                        continue
+                    self._last_microstructure_at = _time(as_of)
+                    self._microstructure_blockers = result.blockers
+                    if result.frame is not None:
+                        mapped = self._mapper.map_frame(*result.frame,
+                            first_evidence_revision=self._discernment.evidence_revision + 1,
+                            include_blocked_artifacts=False)
+                        self._microstructure_blockers = mapped.blockers
+                        if not mapped.blockers:
+                            update = self._discernment.on_evidence_frame(mapped.evidence,
+                                volume_regime=mapped.volume_regime)
+                            self._apply_discernment_update(update)
+                    elif not result.blockers:
+                        raise RuntimeError('PONG_COMPUTE_RESULT_MISSING')
+                    self._compute_applied += 1
+                except Exception as error:
+                    self._compute_refused += 1
+                    self._microstructure_blockers = ('PONG_MICROSTRUCTURE_EVALUATION_BLOCKED:' + type(error).__name__,)
+                    if self._input_error is None:
+                        self._input_error = 'PONG_COMPUTE_WORKER_FAILED:' + type(error).__name__
 
     def _apply_discernment_update(self, update: object) -> None:
         bridge = self._bridge
@@ -780,22 +1016,45 @@ class PongProductionHost:
     def _maybe_certify_hour(self) -> None:
         if self._certificate is not None or self._certificate_error is not None:
             return
-        required = self._collection.get("required_interval")
         durability = self._collection.get("durability")
-        if not isinstance(required, Mapping) or required.get("eligible") is not True:
-            return
         if (
             self._input_error is not None
             or self._hour_pair is None
             or not isinstance(durability, Mapping)
-            or required.get("blockers") not in ([], ())
         ):
+            return
+        # status() advances required_interval to the new, incomplete hour.
+        # Consume the exact completed receipt, without stopping collection.
+        candidates = [self._collection.get("required_interval"), *reversed(
+            self._collection.get("recent_completed_intervals") or [],
+        )]
+        current = self._hour_pair[1]
+        required = next((item for item in candidates if (
+            isinstance(item, Mapping) and item.get("eligible") is True
+            and item.get("complete") is True and item.get("blockers") in ([], ())
+            and item.get("start_utc") == current.start
+            and item.get("end_utc") == current.end
+        )), None)
+        if required is None:
+            return
+        counts = [durability.get(key) for key in (
+            "enqueued_records", "written_records", "durable_records",
+        )]
+        if (any(type(value) is not int or value <= 0 for value in counts)
+                or len(set(counts)) != 1
+                or any(durability.get(key) != 0 for key in (
+                    "queue_overflow_records", "rejected_records", "duplicate_records",
+                ))
+                or not durability.get("last_fsync_at")
+                or _time(durability["last_fsync_at"]) < _time(current.available_at)):
             return
         published_at = self._hour_pair[1].available_at
         try:
+            trades = tuple(item for item in self._classified_hour
+                           if _time(current.start) <= _time(item.event_at) < _time(current.end))
             bias = self._bias_from_inputs(
                 self._hour_pair[0], self._hour_pair[1],
-                tuple(self._classified_hour), published_at=published_at,
+                trades, published_at=published_at,
             )
             if not bias.configured:
                 return
@@ -815,7 +1074,7 @@ class PongProductionHost:
                         **asdict(item), "side": item.side.value,
                         "size": str(item.size),
                     }
-                    for item in self._classified_hour
+                    for item in trades
                 ],
                 "published_at": published_at,
                 "daily_bias": bias.payload(),
@@ -874,7 +1133,7 @@ class PongProductionHost:
                 discernment_policy=self._discernment.policy,
             )
             machine.on_bias_update(self._daily_bias)
-            bridge_path = self.state_root / "bridges" / (
+            bridge_path = self._operation_root / "bridges" / (
                 identity.execution_session_id + ".json"
             )
             if bridge_path.exists():
@@ -915,6 +1174,8 @@ class PongProductionHost:
 
     def _blockers_locked(self) -> list[str]:
         blockers: list[str] = []
+        if self._stop.is_set():
+            blockers.append('PONG_HOST_STOPPING')
         runtime = self._runtime
         if self.selected_profile != PONG_ENTRY_PROFILE_VERSION:
             blockers.append("PONG_PROFILE_NOT_SELECTED")
@@ -922,8 +1183,15 @@ class PongProductionHost:
             blockers.append("PONG_BOUNDED_ACTIVATION_NOT_AUTHORIZED")
         if self._certificate is None:
             blockers.append(self._certificate_error or "PONG_AUTHENTIC_HOUR_NOT_QUALIFIED")
+        elif (self._daily_bias.expires_at is None
+              or _time(_now()) >= _time(self._daily_bias.expires_at)):
+            blockers.append("PONG_QUALIFIED_HOUR_EXPIRED")
         if not self._native_input_ready_locked():
             blockers.append(self._input_error or "PONG_NATIVE_INPUT_CONTRACT_NOT_READY")
+        blockers.extend(self._microstructure_blockers)
+        if (self._last_microstructure_at is not None
+                and _time(_now()) - self._last_microstructure_at >= timedelta(seconds=5)):
+            blockers.append("PONG_MICROSTRUCTURE_INPUT_STALE")
         if self._bridge is None or self._bridge_error is not None:
             blockers.append(self._bridge_error or "PONG_NATIVE_RUNTIME_BRIDGE_NOT_READY")
         if runtime.get("runtime_active") is not True:
@@ -950,6 +1218,20 @@ class PongProductionHost:
     def authority_status(self) -> dict[str, object]:
         with self._lock:
             blockers = self._blockers_locked()
+            now = _time(_now())
+            controller = self._controller
+            if self._controller_error is not None:
+                blockers.append(self._controller_error)
+            if controller is not None:
+                if now > _time(controller.state.heartbeat_valid_until):
+                    blockers.append("PONG_CONTROLLER_HEARTBEAT_EXPIRED")
+                if (controller.state.execution_deadline_utc is not None
+                        and now >= _time(controller.state.execution_deadline_utc)):
+                    blockers.append("PONG_BOUNDED_RUN_DEADLINE_REACHED")
+                if (controller.state.phase is PongControllerPhase.PREPARED
+                        and now.astimezone(ZoneInfo("America/Denver")).date()
+                        != self._activation_date):
+                    blockers.append("PONG_CONTROLLER_ACTIVATION_DATE_REFUSED")
             activation_blockers = [
                 value for value in blockers
                 if value not in {
@@ -972,7 +1254,7 @@ class PongProductionHost:
                     if self._bridge is not None and self._bridge_error is None
                     else "BLOCKED"
                 ),
-                "bounded_controller": "READY" if phase in _RUNNING_CONTROLLER_PHASES else "BLOCKED",
+                "bounded_controller": "READY" if ready else "BLOCKED",
                 "activation_candidate": candidate,
                 "operational_start_ready": (
                     not start_blockers
@@ -1007,9 +1289,14 @@ class PongProductionHost:
         try:
             self._controller = PongBoundedController.open(
                 self.controller_path,
-                experiment_id=PONG_PRODUCTION_EXPERIMENT_ID,
+                experiment_id=self._experiment_id,
                 at=_now(),
                 process_instance_id=self._process_instance_id,
+                activation_date_local=self._activation_date,
+                ny_open_blackout=(
+                    True if self.launch_authorization is None
+                    else self.launch_authorization.ny_open_blackout
+                ),
             )
             self._controller_error = None
         except Exception as error:
@@ -1033,8 +1320,40 @@ class PongProductionHost:
         )
 
     def _run(self) -> None:
-        while not self._stop.wait(0.5):
+        next_control = 0.0
+        while not self._stop.is_set() or not self._observations.empty() or self._compute_pending:
             try:
+                if self._compute_batch and (self._stop.is_set() or self._observations.empty()
+                        or time.monotonic() - self._compute_batch_started >= 0.01):
+                    self._flush_compute_batch()
+                self._drain_compute()
+                try:
+                    if len(self._compute_pending) >= self._compute_limit:
+                        self._compute_wakeup.wait(0.005)
+                        self._compute_wakeup.clear()
+                        record = None  # bounded backpressure; control ticks continue
+                    else:
+                        record = self._observations.get(timeout=0.005 if self._compute_pending else 0.5)
+                except queue.Empty:
+                    record = None
+                if record is not None:
+                    try:
+                        self._consume_observation(record)
+                    finally:
+                        self._observations.task_done()
+                # Native evidence remains event-driven. Snapshot copying and
+                # durable controller heartbeats are control-plane work, not one
+                # fsync per quote/trade. Pending directives still dispatch now.
+                control_due = time.monotonic() >= next_control
+                if not control_due:
+                    while True:
+                        with self._lock:
+                            if not self._pending_native:
+                                break
+                            directive, evidence = self._pending_native.popleft()
+                        self._dispatch_native(directive, evidence)
+                    continue
+                next_control = time.monotonic() + 0.5
                 runtime = dict(self._runtime_snapshot())
                 collection = dict(self._collector_status())
                 prepare_activation = False
@@ -1045,7 +1364,6 @@ class PongProductionHost:
                     self._open_controller()
                     self._maybe_certify_hour()
                     self._maybe_create_bridge()
-                    self._evaluate_microstructure(_time(runtime.get("observed_at") or _now()))
                     controller = self._controller
                     if controller is None:
                         continue
@@ -1053,6 +1371,7 @@ class PongProductionHost:
                     authority = self.authority_status()
                     if (
                         controller.state.phase is PongControllerPhase.PREPARED
+                        and not self._stop.is_set()
                         and self.activation_authorized
                         and authority["activation_candidate"] is True
                     ):
@@ -1070,7 +1389,7 @@ class PongProductionHost:
                     with self._lock:
                         self._runtime = refreshed
                         controller = self._controller
-                        if controller is None:
+                        if controller is None or self._stop.is_set():
                             continue
                         observation = self._controller_observation_locked()
                         controller.activate(observation, at=observation.observed_at)
@@ -1099,8 +1418,21 @@ class PongProductionHost:
                 "state": "RUNNING" if self._thread is not None and self._thread.is_alive() else "STOPPED",
                 "selected_profile": self.selected_profile,
                 "registration": "PRODUCTION_REGISTERED",
+                "loaded_artifact_hash": PONG_LOADED_ARTIFACT_HASH,
+                "module_import_source_sha256": dict(_LOADED_SOURCE_HASHES),
                 "activation_authorized": self.activation_authorized,
-                "activation_date_local": PONG_ACTIVATION_DATE_LOCAL.isoformat(),
+                "activation_date_local": self._activation_date.isoformat(),
+                "experiment_id": self._experiment_id,
+                "launch_authorization_hash": (
+                    None if self.launch_authorization is None
+                    else self.launch_authorization.manifest_hash
+                ),
+                "launch_authorization_expires_at": (
+                    None if self.launch_authorization is None else self.launch_authorization.expires_at_utc
+                ),
+                "launch_operator_acknowledged_at": (
+                    None if self.launch_authorization is None else self.launch_authorization.operator_acknowledged_at_utc
+                ),
                 "account": "Sim101",
                 "account_class": "LOCAL_SIMULATION",
                 "instrument": "MNQ SEP26",
@@ -1112,11 +1444,30 @@ class PongProductionHost:
                     "session_id": self._producer[0],
                     "source_fingerprint": self._producer[1],
                     "build_fingerprint": self._producer[2],
+                    "source_generation": self._source_generation,
                 },
                 "stream_counts": dict(self._stream_counts),
                 "missing_events": dict(self._stream_missing),
                 "out_of_order_events": dict(self._stream_out_of_order),
+                "observation_queue_depth": self._observations.qsize(),
+                "observation_queue_overflow": self._observation_overflow,
+                "compute_workers": self._compute_workers,
+                "compute_build_hash": COMPUTE_BUILD_HASH,
+                "compute_pending": len(self._compute_pending),
+                "compute_queue_limit": self._compute_limit,
+                "compute_submitted": self._compute_submitted,
+                "compute_applied": self._compute_applied,
+                "compute_refused": self._compute_refused,
+                "compute_oldest_pending_seconds": (
+                    0.0 if not self._compute_pending
+                    else time.monotonic() - self._compute_pending[0][4]
+                ),
                 "input_error": self._input_error,
+                "volume_reference": (
+                    {"loaded_windows": 0, "ready_for_current_slot": False,
+                     "error": "PONG_VOLUME_HISTORY_VERIFIER_NOT_CONFIGURED"}
+                    if self._volume_history is None else self._volume_history.status(_now())
+                ),
                 "warm_start_complete": self._warm_start is not None,
                 "hour_seed": (
                     "AUTHENTICATED_WARM_START"

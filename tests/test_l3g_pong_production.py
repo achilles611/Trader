@@ -99,24 +99,24 @@ class PongProductionHostTests(unittest.TestCase):
                     "directive_id": directive.directive_id,
                 },
             )
-            host.on_observation(warm_record())
+            host._consume_observation(warm_record())
             base = {
                 "contract_id": "MNQ SEP26", "price": 100, "size": 1,
                 "aggressor_side": "BUY", "aggressor_source": "NATIVE_BID_ASK",
                 "source_event_sequence": 100,
                 "publication_policy": "EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1",
             }
-            host.on_observation(verified("TRADE", base, local_sequence=2))
+            host._consume_observation(verified("TRADE", base, local_sequence=2))
             quote = {
                 "contract_id": "MNQ SEP26", "bid": 99.75, "ask": 100,
                 "bid_size": 1, "ask_size": 1, "source_event_sequence": 500,
                 "publication_policy": "EVENT_DRIVEN_SAME_CALLBACK_QUOTE_V1",
             }
-            host.on_observation(verified("QUOTE", quote, local_sequence=3))
-            host.on_observation(verified(
+            host._consume_observation(verified("QUOTE", quote, local_sequence=3))
+            host._consume_observation(verified(
                 "TRADE", dict(base, source_event_sequence=102), local_sequence=4,
             ))
-            host.on_observation(verified(
+            host._consume_observation(verified(
                 "TRADE", dict(base, source_event_sequence=103), local_sequence=5,
             ))
             status = host.status()
@@ -140,7 +140,7 @@ class PongProductionHostTests(unittest.TestCase):
                     "directive_id": directive.directive_id,
                 },
             )
-            host.on_observation(warm_record())
+            host._consume_observation(warm_record())
             depth = {
                 "contract_id": "MNQ SEP26",
                 "side": "Ask",
@@ -152,7 +152,7 @@ class PongProductionHostTests(unittest.TestCase):
                 "source_event_sequence": 700,
                 "publication_policy": "EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1",
             }
-            host.on_observation(verified("DEPTH", depth, local_sequence=2))
+            host._consume_observation(verified("DEPTH", depth, local_sequence=2))
             status = host.status()
             self.assertEqual(status["stream_counts"]["DEPTH"], 1)
             self.assertEqual(status["missing_events"]["DEPTH"], 0)

@@ -63,7 +63,10 @@ function Get-ExpectedFingerprint {
 }
 
 function Test-CompiledIdentity([string] $ExpectedFingerprint) {
-    $bytes = [IO.File]::ReadAllBytes($compiledAssembly)
+    # The native compiler briefly holds an exclusive lock while replacing it.
+    # Treat that as not-yet-verified within the existing bounded wait.
+    try { $bytes = [IO.File]::ReadAllBytes($compiledAssembly) }
+    catch [IO.IOException] { return $false }
     $unicode = [Text.Encoding]::Unicode.GetString($bytes)
     $utf8 = [Text.Encoding]::UTF8.GetString($bytes)
     return (
@@ -74,23 +77,50 @@ function Test-CompiledIdentity([string] $ExpectedFingerprint) {
     )
 }
 
+function Get-ObserverInstallText {
+    param([string] $SourceText, [string] $CurrentText = '', [switch] $PreserveGeneratedRegion)
+    $marker = '#region NinjaScript generated code. Neither change nor remove.'
+    $source = $SourceText.Replace("`r`n", "`n")
+    if ($source.Contains($marker)) {
+        throw 'Repository observer must not contain NinjaTrader-generated wrappers.'
+    }
+    $result = $source.TrimEnd() + "`n"
+    if ($PreserveGeneratedRegion) {
+        $current = $CurrentText.Replace("`r`n", "`n")
+        $index = $current.IndexOf($marker, [StringComparison]::Ordinal)
+        if ($index -ge 0) {
+            $suffix = $current.Substring($index)
+            $pattern = '(?ms)^#region NinjaScript generated code\. Neither change nor remove\.\n.*?^#endregion[ \t]*(?=\n|\z)'
+            $blocks = [regex]::Matches($suffix, $pattern)
+            if ($blocks.Count -eq 0 -or -not [string]::IsNullOrWhiteSpace([regex]::Replace($suffix, $pattern, ''))) {
+                throw 'Malformed generated wrapper suffix; refusing to discard unknown source.'
+            }
+            $first = $blocks[0].Value.TrimEnd()
+            foreach ($block in $blocks) {
+                if ($block.Value.TrimEnd() -cne $first) {
+                    throw 'Nonidentical generated wrappers; manual review required.'
+                }
+            }
+            # Retain one exact wrapper, never the entire potentially duplicated suffix.
+            $result += "`n" + $first + "`n"
+        }
+    }
+    # Keep deployed files in the native Windows editor's line-ending format.
+    return $result.Replace("`n", "`r`n")
+}
+
 function Install-ObserverSource {
     param([string] $Source, [string] $Target, [switch] $PreserveGeneratedRegion)
     $targetDirectory = Split-Path -Parent $Target
     [IO.Directory]::CreateDirectory($targetDirectory) | Out-Null
-    $sourceText = Get-CanonicalSource $Source
-    $generated = ''
-    if ($PreserveGeneratedRegion -and (Test-Path -LiteralPath $Target)) {
-        $current = [IO.File]::ReadAllText($Target).Replace("`r`n", "`n")
-        $marker = '#region NinjaScript generated code. Neither change nor remove.'
-        $index = $current.IndexOf($marker, [StringComparison]::Ordinal)
-        if ($index -ge 0) { $generated = "`n" + $current.Substring($index).TrimStart() }
-    }
+    $current = if (Test-Path -LiteralPath $Target) { [IO.File]::ReadAllText($Target) } else { '' }
+    $text = Get-ObserverInstallText -SourceText ([IO.File]::ReadAllText($Source)) -CurrentText $current -PreserveGeneratedRegion:$PreserveGeneratedRegion
+    if ($current -ceq $text) { return }
     if (Test-Path -LiteralPath $Target) {
         $backup = "$Target.unattended-before-$([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')).bak"
         Copy-Item -LiteralPath $Target -Destination $backup -ErrorAction Stop
     }
-    [IO.File]::WriteAllText($Target, $sourceText + $generated, [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($Target, $text, [Text.UTF8Encoding]::new($false))
 }
 
 function Get-PaperStatus {
@@ -185,11 +215,18 @@ if (-not $pythonMatch.Success -or -not $addOnMatch.Success -or
     throw 'Checked-in observer source fingerprint constants do not match the source material.'
 }
 
+$installedGeneratedValid = $false
+if (Test-Path -LiteralPath $installedIndicator) {
+    $installedText = [IO.File]::ReadAllText($installedIndicator)
+    $preparedText = Get-ObserverInstallText -SourceText ([IO.File]::ReadAllText($repositoryIndicator)) -CurrentText $installedText -PreserveGeneratedRegion
+    $installedGeneratedValid = $installedText.Replace("`r`n", "`n").TrimEnd() -ceq $preparedText.Replace("`r`n", "`n").TrimEnd()
+}
 $installedCurrent = (
     (Test-Path -LiteralPath $installedAddOn) -and
     (Test-Path -LiteralPath $installedIndicator) -and
     (Get-CanonicalSource $repositoryAddOn) -ceq (Get-CanonicalSource $installedAddOn) -and
-    (Get-CanonicalSource $repositoryIndicator) -ceq (Get-CanonicalSource $installedIndicator -WithoutGeneratedRegion)
+    (Get-CanonicalSource $repositoryIndicator) -ceq (Get-CanonicalSource $installedIndicator -WithoutGeneratedRegion) -and
+    $installedGeneratedValid
 )
 $assemblyBefore = Get-Item -LiteralPath $compiledAssembly
 $assemblyHashBefore = Get-Sha256 $compiledAssembly
@@ -199,7 +236,10 @@ if (-not $installedCurrent) {
     if (-not $InstallSource) {
         throw 'Installed observer source differs from the repository. Re-run with -InstallSource.'
     }
-    Install-ObserverSource -Source $repositoryAddOn -Target $installedAddOn
+    if (-not (Test-Path -LiteralPath $installedAddOn) -or
+        (Get-CanonicalSource $repositoryAddOn) -cne (Get-CanonicalSource $installedAddOn)) {
+        Install-ObserverSource -Source $repositoryAddOn -Target $installedAddOn
+    }
     Install-ObserverSource -Source $repositoryIndicator -Target $installedIndicator -PreserveGeneratedRegion
     $compileStatus = 'WAITING_FOR_NINJATRADER_SOURCE_WATCHER'
 }

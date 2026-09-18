@@ -51,6 +51,25 @@ def record(kind: str, payload: dict[str, object], sequence: int, observed: datet
 
 
 class PongAuthenticHourCollectorTests(unittest.TestCase):
+    def test_test_only_generation_change_invalidates_without_fake_sequence_inversion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            now = datetime(2026, 9, 14, 14, 55, tzinfo=timezone.utc)
+            collector = PongAuthenticHourCollector(Path(directory), now=now)
+            at = now.replace(hour=15, minute=1)
+            payload = {"contract_id": "MNQ SEP26", "price": 100, "size": 1,
+                       "aggressor_side": "UNKNOWN", "aggressor_source": "UNKNOWN",
+                       "publication_policy": "EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1"}
+            with patch("src.l3g_paper.pong_collection._utc_now", return_value=at):
+                collector._apply_observation_locked(record("TRADE", dict(payload, source_event_sequence=1, source_generation=1), 1, at))
+                collector._apply_observation_locked(record("TRADE", dict(payload, source_event_sequence=2, source_generation=2,
+                    observer_queue_overflow_frames=3, observer_transport_failed_frames=7), 2, at))
+                state = collector.status()
+            self.assertIn("SOURCE_GENERATION_CHANGED", state["required_interval"]["blockers"])
+            self.assertEqual(state["required_interval"]["streams"]["TRADE"]["duplicate_or_out_of_order"], 0)
+            self.assertEqual(state["durability"]["producer_queue_overflow_records"], 3)
+            self.assertEqual(state["durability"]["producer_transport_failed_records"], 7)
+            self.assertEqual(state["durability"]["queue_overflow_records"], 0)
+
     def test_transient_windows_status_reader_contention_does_not_fail_collector(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             collector = PongAuthenticHourCollector(Path(directory))

@@ -67,6 +67,50 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
         }
     }
+    // One authorized publisher across native replacement and chart fallback.
+    // Locally assigned counters belong to the publisher session, not instances.
+    public static class BeelzebubMarketPublisherLease
+    {
+        private static readonly object sync = new object();
+        private static long generation;
+        private static long owner;
+        private static long trade;
+        private static long quote;
+        private static long depth;
+        [ThreadStatic] private static long current;
+        public static long Claim(bool native)
+        {
+            lock (sync)
+            {
+                if (!native && owner != 0) return 0;
+                owner = ++generation;
+                return owner;
+            }
+        }
+        public static bool TryRun(long token, Action callback)
+        {
+            lock (sync)
+            {
+                if (token == 0 || token != owner) return false;
+                current = token;
+                try { callback(); } finally { current = 0; }
+                return true;
+            }
+        }
+        public static void Retire(long token)
+        {
+            lock (sync) { if (token == owner) owner = 0; }
+        }
+        public static long CurrentGeneration { get { return current; } }
+        public static long Next(string stream)
+        {
+            if (current == 0) throw new InvalidOperationException("Market publisher lease required");
+            if (stream == "TRADE") return ++trade;
+            if (stream == "QUOTE") return ++quote;
+            if (stream == "DEPTH") return ++depth;
+            throw new ArgumentException("Unknown local sequence domain");
+        }
+    }
     // BEELZEBUB_MARKET_CALLBACK_GATE_END
 
     public sealed class BeelzebubReadOnlyAddOn : AddOnBase
@@ -656,6 +700,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private readonly BeelzebubMarketCallbackGate marketDataGate =
             new BeelzebubMarketCallbackGate();
         private readonly long marketDataGeneration = 1;
+        private readonly long publisherLease;
         private readonly SortedDictionary<int, KeyValuePair<double, long>> depthBids =
             new SortedDictionary<int, KeyValuePair<double, long>>();
         private readonly SortedDictionary<int, KeyValuePair<double, long>> depthAsks =
@@ -681,12 +726,14 @@ namespace NinjaTrader.NinjaScript.AddOns
         private long tradeEventSequence;
         private long depthEventSequence;
         private BarsRequest hourlyBarsRequest;
+        private BarsRequest volumeBarsRequest;
         private readonly object hourlyLock = new object();
         private readonly HashSet<string> publishedHourlyEnds = new HashSet<string>(StringComparer.Ordinal);
 
         public BeelzebubAutomaticMarketObserver(Instrument instrument)
         {
             this.instrument = instrument;
+            publisherLease = BeelzebubMarketPublisherLease.Claim(true);
         }
 
         public bool Start(Func<bool> activationCurrent)
@@ -705,6 +752,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                         instrument.MarketData.Update += OnMarketData;
                         instrument.MarketDepth.Update += OnMarketDepth;
                         StartHourlyBarsRequest();
+                        StartVolumeReferenceRequest();
                         subscribed = true;
                         BeelzebubReadOnlyAddOn.SetAutomaticObserverActive(true);
                         BeelzebubReadOnlyOutbound.Diagnostic("NATIVE_ADDON_OBSERVER_ACTIVE");
@@ -735,6 +783,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             // generation, then unsubscribe. A queued callback from this older
             // instance can no longer publish after recovery creates its owner.
             marketDataGate.Retire();
+            BeelzebubMarketPublisherLease.Retire(publisherLease);
             stopping = true;
             BeelzebubReadOnlyAddOn.SetAutomaticObserverActive(false);
             if (instrument == null || instrument.Dispatcher == null || instrument.Dispatcher.HasShutdownStarted)
@@ -752,6 +801,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                         hourlyBarsRequest.Update -= OnHourlyBarsUpdate;
                         hourlyBarsRequest.Dispose();
                         hourlyBarsRequest = null;
+                    }
+                    if (volumeBarsRequest != null)
+                    {
+                        volumeBarsRequest.Dispose();
+                        volumeBarsRequest = null;
                     }
                     subscribed = false;
                     BeelzebubReadOnlyAddOn.PublishObserverAttachment(
@@ -790,6 +844,72 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string HourlyWarmStartPolicyVersion = "pong-hourly-warm-start-v1";
         private const string HourlyWarmStartPolicyHash = "5a1c78a287d50b69e5dd6e8d9bc584ef5a264efd98845997fd08b7c85668e5c2";
 
+        private void StartVolumeReferenceRequest()
+        {
+            // Separate provider history: no aggressors, depth, or live-hour
+            // authority. No contract merging, session interpolation or zeros.
+            DateTime requestedAt = DateTime.UtcNow;
+            string requestId = Guid.NewGuid().ToString("N");
+            try
+            {
+                BarsRequest request = new BarsRequest(instrument, 2016);
+                request.BarsPeriod = new BarsPeriod { BarsPeriodType = BarsPeriodType.Minute, Value = 5 };
+                request.TradingHours = TradingHours.Get("Default 24 x 7");
+                request.LookupPolicy = LookupPolicies.Provider;
+                request.MergePolicy = MergePolicy.DoNotMerge;
+                volumeBarsRequest = request;
+                request.Request(new Action<BarsRequest, ErrorCode, string>((result, errorCode, errorMessage) =>
+                {
+                    if (stopping || errorCode != ErrorCode.NoError)
+                    {
+                        BeelzebubReadOnlyOutbound.Diagnostic("VOLUME_REFERENCE_REQUEST_UNAVAILABLE_" + errorCode);
+                        return;
+                    }
+                    List<string> rows = new List<string>();
+                    for (int index = 0; index < result.Bars.Count; index++)
+                    {
+                        DateTime end;
+                        string rejection;
+                        if (!BeelzebubProviderTimestamp.TryConvertUtc(result.Bars.GetTime(index),
+                            Core.Globals.GeneralOptions.TimeZoneInfo, null, out end, out rejection)
+                            || end.Minute % 5 != 0 || end.Second != 0 || end.Millisecond != 0
+                            || end > requestedAt)
+                            continue;
+                        rows.Add("{\"start\":\"" + (end - TimeSpan.FromMinutes(5)).ToString("o", CultureInfo.InvariantCulture)
+                            + "\",\"end\":\"" + end.ToString("o", CultureInfo.InvariantCulture)
+                            + "\",\"volume\":" + result.Bars.GetVolume(index).ToString(CultureInfo.InvariantCulture) + "}");
+                    }
+                    if (rows.Count == 0 || rows.Count > 2016)
+                    {
+                        BeelzebubReadOnlyOutbound.Diagnostic("VOLUME_REFERENCE_EMPTY_OR_OVERSIZED");
+                        return;
+                    }
+                    int chunks = (rows.Count + 127) / 128;
+                    for (int index = 0; index < chunks; index++)
+                    {
+                        string payload = "{\"contract_id\":\"" + instrument.FullName
+                            + "\",\"canonical_contract\":\"MNQU6\",\"source\":\"NINJATRADER_BARS_REQUEST_PROVIDER\""
+                            + ",\"status\":\"COMPLETE\",\"merge_policy\":\"DO_NOT_MERGE\",\"trading_hours\":\"Default 24 x 7\""
+                            + ",\"timezone\":\"UTC\",\"bar_period_minutes\":5,\"requested_bars_back\":2016"
+                            + ",\"request_id\":\"" + requestId + "\",\"requested_at\":\""
+                            + requestedAt.ToString("o", CultureInfo.InvariantCulture) + "\",\"chunk_index\":" + index
+                            + ",\"chunk_count\":" + chunks + ",\"total_bars\":" + rows.Count
+                            + ",\"bars\":[" + String.Join(",", rows.Skip(index * 128).Take(128))
+                            + "],\"publication_policy\":\"PROVIDER_COMPLETED_UTC_5M_VOLUME_V1\"}";
+                        if (!marketDataGate.TryRun(marketDataGeneration, delegate {
+                            BeelzebubMarketPublisherLease.TryRun(publisherLease, delegate {
+                                BeelzebubReadOnlyOutbound.Publish("VOLUME_REFERENCE_HISTORY", null, null, payload);
+                            });
+                        })) return;
+                    }
+                }));
+            }
+            catch (Exception error)
+            {
+                BeelzebubReadOnlyOutbound.Diagnostic("VOLUME_REFERENCE_REQUEST_FAILED_" + error.GetType().Name);
+            }
+        }
+
         private void StartHourlyBarsRequest()
         {
             try
@@ -810,7 +930,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                         PublishHourlyWarmStartUnavailable(requestedAt, "BARS_REQUEST_FAILED");
                         return;
                     }
-                    PublishHourlyWarmStart(result.Bars, requestedAt);
+                    marketDataGate.TryRun(marketDataGeneration, delegate {
+                        BeelzebubMarketPublisherLease.TryRun(publisherLease, delegate {
+                            PublishHourlyWarmStart(result.Bars, requestedAt);
+                        });
+                    });
                 }));
             }
             catch (Exception error)
@@ -879,6 +1003,13 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void OnHourlyBarsUpdate(object sender, BarsUpdateEventArgs e)
         {
+            marketDataGate.TryRun(marketDataGeneration, delegate {
+                BeelzebubMarketPublisherLease.TryRun(publisherLease, delegate { PublishHourlyBarsUpdate(e); });
+            });
+        }
+
+        private void PublishHourlyBarsUpdate(BarsUpdateEventArgs e)
+        {
             DateTime now = DateTime.UtcNow;
             for (int index = e.MinIndex; index <= e.MaxIndex; index++)
             {
@@ -923,7 +1054,9 @@ namespace NinjaTrader.NinjaScript.AddOns
         private void OnMarketData(object sender, MarketDataEventArgs e)
         {
             if (!marketDataGate.TryRun(
-                marketDataGeneration, delegate { OnMarketDataSerial(e); }))
+                marketDataGeneration, delegate {
+                    BeelzebubMarketPublisherLease.TryRun(publisherLease, delegate { OnMarketDataSerial(e); });
+                }))
                 BeelzebubReadOnlyOutbound.Diagnostic(
                     "NATIVE_ADDON_STALE_MARKET_DATA_CALLBACK_REJECTED");
         }
@@ -943,7 +1076,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             string contract = instrument.FullName;
             if (e.MarketDataType == MarketDataType.Last)
             {
-                long sourceEventSequence = Interlocked.Increment(ref tradeEventSequence);
+                long sourceEventSequence = BeelzebubMarketPublisherLease.Next("TRADE");
                 double bidAtTrade = e.Bid;
                 double askAtTrade = e.Ask;
                 bool completeQuote = FinitePositive(bidAtTrade) && FinitePositive(askAtTrade) && bidAtTrade < askAtTrade
@@ -960,7 +1093,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                         + ",\"ask_size\":" + bestAskSize + ",\"bid_source_time\":\""
                         + bestBidTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture) + "\",\"ask_source_time\":\""
                         + bestAskTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture)
-                        + "\",\"source_event_sequence\":" + Interlocked.Increment(ref quoteEventSequence)
+                        + "\",\"source_event_sequence\":" + BeelzebubMarketPublisherLease.Next("QUOTE")
                         + ",\"publication_policy\":\"" + PairedQuotePublicationPolicy + "\"}", e.Time);
                 }
                 string source = quoteObservationId == null ? "UNKNOWN" : "BID_ASK_CLASSIFICATION";
@@ -994,11 +1127,18 @@ namespace NinjaTrader.NinjaScript.AddOns
                 BeelzebubReadOnlyOutbound.Publish("QUOTE", null, null,
                     "{\"contract_id\":\"" + contract + "\",\"bid\":" + bestBid.ToString(CultureInfo.InvariantCulture)
                     + ",\"ask\":" + bestAsk.ToString(CultureInfo.InvariantCulture) + ",\"bid_size\":" + bestBidSize
-                    + ",\"ask_size\":" + bestAskSize + ",\"source_event_sequence\":" + Interlocked.Increment(ref quoteEventSequence)
+                    + ",\"ask_size\":" + bestAskSize + ",\"source_event_sequence\":" + BeelzebubMarketPublisherLease.Next("QUOTE")
                     + ",\"publication_policy\":\"" + QuotePublicationPolicy + "\"}", e.Time);
         }
 
         private void OnMarketDepth(object sender, MarketDepthEventArgs e)
+        {
+            marketDataGate.TryRun(marketDataGeneration, delegate {
+                BeelzebubMarketPublisherLease.TryRun(publisherLease, delegate { OnMarketDepthSerial(e); });
+            });
+        }
+
+        private void OnMarketDepthSerial(MarketDepthEventArgs e)
         {
             if (stopping)
                 return;
@@ -1017,7 +1157,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 // before this AddOn callback. Read that native positional
                 // snapshot directly. A price-keyed Update leaves the old slot
                 // price stale whenever the level moves and caused crossed books.
-                long sourceEventSequence = Interlocked.Increment(ref depthEventSequence);
+                long sourceEventSequence = BeelzebubMarketPublisherLease.Next("DEPTH");
                 string bidLevels;
                 string askLevels;
                 double bestNativeBid;
@@ -1348,7 +1488,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string AttestedSchema = "lane-iii-phase-f3-ninjatrader-observation-v2";
         private const string AttestationProtocol = "l3f3-ninjatrader-observer-attestation-v1";
         private const string AttestationKeyContext = "BEELZEBUB_NINJATRADER_OBSERVATION_V2";
-        private const string ProducerSourceFingerprint = "677cc1fa39a880df73a0b84bed8d9e95db0839a09660537c9af5f6182de96309";
+        private const string ProducerSourceFingerprint = "e9ace3492b5d2d38e50d7c2d8c5d13b0cf344d9513d5344b282a23d026d43ced";
         // Event-driven trades/depth require burst capacity, but memory remains
         // bounded. A full queue drops the signed frame after assigning its
         // sequence; the next source_event_sequence exposes the gap.
@@ -1356,6 +1496,8 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const int MaximumSenderBatchFrames = 256;
         private const int MaximumSenderBatchCharacters = 524288;
         private static long sequence = 0;
+        private static long queueOverflowFrames;
+        private static long transportFailedFrames;
         private static readonly string sessionId = Guid.NewGuid().ToString("N");
         private static readonly HashSet<string> transportMarkers = new HashSet<string>();
         private static readonly object transportMarkersLock = new object();
@@ -1425,6 +1567,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                         return null;
                     }
                     Dictionary<string, object> accountValue = null;
+                    if (type == "TRADE" || type == "QUOTE" || type == "DEPTH")
+                        payloadValue["source_generation"] = BeelzebubMarketPublisherLease.CurrentGeneration;
+                    payloadValue["observer_queue_overflow_frames"] = Interlocked.Read(ref queueOverflowFrames);
+                    payloadValue["observer_transport_failed_frames"] = Interlocked.Read(ref transportFailedFrames);
                     if (alias != null)
                         accountValue = new Dictionary<string, object>(StringComparer.Ordinal) {
                             {"alias", alias}, {"class", accountClass}
@@ -1468,6 +1614,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             if (outboundFrames.Count >= MaximumQueuedFrames)
             {
+                Interlocked.Increment(ref queueOverflowFrames);
                 TransportDiagnosticOnce("BRIDGE_QUEUE_CAPACITY_REACHED");
                 return false;
             }
@@ -1530,6 +1677,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     }
                     catch (SocketException error)
                     {
+                        Interlocked.Add(ref transportFailedFrames, frames.Count);
                         TransportDiagnosticOnce("BRIDGE_CONNECT_FAILED_" + error.SocketErrorCode);
                         CloseClient(client);
                         client = null;
@@ -1537,6 +1685,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     }
                     catch (Exception error)
                     {
+                        Interlocked.Add(ref transportFailedFrames, frames.Count);
                         TransportDiagnosticOnce("BRIDGE_PUBLISH_FAILED_" + error.GetType().Name);
                         CloseClient(client);
                         client = null;
@@ -1587,6 +1736,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (String.Equals(type, "QUOTE", StringComparison.Ordinal)) return "MARKET_DATA_BID_ASK";
             if (String.Equals(type, "DEPTH", StringComparison.Ordinal)) return "MARKET_DEPTH";
             if (String.Equals(type, "HISTORICAL_WARM_START", StringComparison.Ordinal)
+                || String.Equals(type, "VOLUME_REFERENCE_HISTORY", StringComparison.Ordinal)
                 || String.Equals(type, "HOURLY_BAR", StringComparison.Ordinal)) return "HISTORICAL_BARS";
             return "NINJATRADER_CALLBACK";
         }

@@ -7,6 +7,9 @@ timestamps and hashes, and do not open files, sockets, accounts, or transports.
 
 from __future__ import annotations
 
+from functools import cached_property, lru_cache
+from operator import attrgetter
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -118,6 +121,16 @@ def _dtext(value: Decimal) -> str:
 
 
 def _time(value: str, field: str) -> datetime:
+    # Preserve ValueError for malformed/non-text input before cache hashing.
+    if not isinstance(value, str):
+        normalized_utc(value, field)
+    return _validated_time(value, field)
+
+
+@lru_cache(maxsize=65536)
+def _validated_time(value: str, field: str) -> datetime:
+    # Immutable timestamps recur in every causal window evaluation. Cache only
+    # their validated parse; never cache a window, decision or freshness result.
     return datetime.fromisoformat(normalized_utc(value, field).replace("Z", "+00:00"))
 
 
@@ -147,6 +160,25 @@ class CausalEventRef:
         _text(self.sequence_authority, "Sequence authority")
         _text(self.continuity_domain, "Continuity domain")
 
+    @cached_property
+    def _ordering_key(self) -> tuple[datetime, datetime, int, str]:
+        return (_time(self.available_at, "Event available-at time"),
+                _time(self.event_at, "Event time"), self.sequence, self.event_id)
+
+    @cached_property
+    def _immutable_hash(self) -> int:
+        return hash((self.event_id, self.payload_hash, self.event_at, self.received_at,
+                     self.available_at, self.sequence, self.sequence_authority,
+                     self.continuity_domain))
+
+    def __hash__(self) -> int:
+        return self._immutable_hash
+
+    def __getstate__(self) -> dict[str, object]:
+        # Python hashes are process salted, unlike the canonical evidence hash.
+        # Never carry a cached local hash into another compute process.
+        return {key: value for key, value in self.__dict__.items() if key != '_immutable_hash'}
+
     def payload(self) -> dict[str, object]:
         return {
             "event_id": self.event_id,
@@ -160,19 +192,22 @@ class CausalEventRef:
         }
 
 
-def _ordered_refs(refs: Iterable[CausalEventRef], as_of: datetime) -> tuple[CausalEventRef, ...]:
-    ordered = tuple(sorted(refs, key=lambda item: (
-        _time(item.available_at, "Event available-at time"),
-        _time(item.event_at, "Event time"),
-        item.sequence,
-        item.event_id,
-    )))
+@lru_cache(maxsize=128)
+def _ordered_ref_shape(refs: tuple[CausalEventRef, ...]) -> tuple[CausalEventRef, ...]:
+    # Only immutable identities and their shape are reused. As-of admission is
+    # deliberately outside this bounded cache and checked on every invocation.
+    ordered = tuple(sorted(refs, key=attrgetter("_ordering_key")))
     if len({item.event_id for item in ordered}) != len(ordered):
         raise ValueError("Duplicate event IDs are forbidden.")
     sequence_keys = {(item.continuity_domain, item.sequence) for item in ordered}
     if len(sequence_keys) != len(ordered):
         raise ValueError("Duplicate sequence coordinates are forbidden.")
-    if any(_time(item.available_at, "Event available-at time") > as_of for item in ordered):
+    return ordered
+
+
+def _ordered_refs(refs: Iterable[CausalEventRef], as_of: datetime) -> tuple[CausalEventRef, ...]:
+    ordered = _ordered_ref_shape(tuple(refs))
+    if ordered and ordered[-1]._ordering_key[0] > as_of:
         raise ValueError("Future-available evidence cannot enter an earlier result.")
     return ordered
 
@@ -185,6 +220,17 @@ class ClassifiedTrade:
     volume: Decimal
     aggressor_side: AggressorSide
     classification_provenance: AggressorProvenance
+
+    @cached_property
+    def _immutable_hash(self) -> int:
+        return hash((self.event, self.instrument, self.price, self.volume,
+                     self.aggressor_side, self.classification_provenance))
+
+    def __hash__(self) -> int:
+        return self._immutable_hash
+
+    def __getstate__(self) -> dict[str, object]:
+        return {key: value for key, value in self.__dict__.items() if key != '_immutable_hash'}
 
     def __post_init__(self) -> None:
         _text(self.instrument, "Trade instrument")
@@ -248,7 +294,7 @@ class ClassifiedFlowPolicy:
             "execution_authority": "DENIED",
         }
 
-    @property
+    @cached_property
     def configuration_hash(self) -> str:
         return canonical_hash(self.payload())
 
@@ -315,7 +361,7 @@ class ClassifiedFlowResult:
             "execution_authority": "DENIED",
         }
 
-    @property
+    @cached_property
     def result_hash(self) -> str:
         return canonical_hash(self.payload())
 
@@ -340,21 +386,11 @@ class ClassifiedFlowAdapter:
             raise ValueError("Flow window must have positive duration.")
         values = tuple(trades)
         refs = _ordered_refs((item.event for item in values), end)
-        by_id = {item.event.event_id: item for item in values}
-        ordered = tuple(by_id[item.event_id] for item in refs)
-        if any(_time(item.event.event_at, "Trade event time") < start for item in ordered):
+        (ordered, instrument, earliest_event, buy, sell, unknown, buy_volume,
+         sell_volume, unknown_volume, source_ids, source_hashes,
+         provenance_counts) = _flow_statistics(values, refs)
+        if earliest_event is not None and earliest_event < start:
             raise ValueError("Trade precedes the declared flow window.")
-        instruments = {item.instrument for item in ordered}
-        if len(instruments) > 1:
-            raise ValueError("A flow result cannot mix instruments.")
-        if len({item.event.continuity_domain for item in ordered}) > 1:
-            raise ValueError("A flow result cannot bridge continuity domains.")
-        buy = tuple(item for item in ordered if item.aggressor_side is AggressorSide.BUY)
-        sell = tuple(item for item in ordered if item.aggressor_side is AggressorSide.SELL)
-        unknown = tuple(item for item in ordered if item.aggressor_side is AggressorSide.UNKNOWN)
-        buy_volume = sum((item.volume for item in buy), Decimal("0"))
-        sell_volume = sum((item.volume for item in sell), Decimal("0"))
-        unknown_volume = sum((item.volume for item in unknown), Decimal("0"))
         classified = buy_volume + sell_volume
         total = classified + unknown_volume
         coverage = classified / total if total else Decimal("0")
@@ -395,12 +431,6 @@ class ClassifiedFlowAdapter:
                 )
             else:
                 behavior = FlowBehavior.BALANCED
-        source_ids = tuple(item.event.event_id for item in ordered)
-        source_hashes = tuple(item.event.payload_hash for item in ordered)
-        provenance_counts = tuple(
-            (provenance.value, sum(item.classification_provenance is provenance for item in ordered))
-            for provenance in AggressorProvenance
-        )
         dependency = canonical_hash({
             "kind": "CLASSIFIED_FLOW_WINDOW_INPUTS",
             "window_start": normalized_utc(window_start, "Flow window start"),
@@ -414,7 +444,7 @@ class ClassifiedFlowAdapter:
         return ClassifiedFlowResult(
             window_start=window_start,
             as_of=as_of,
-            instrument=next(iter(instruments), "UNAVAILABLE"),
+            instrument=instrument,
             behavior=behavior,
             valid=valid,
             reason_codes=tuple(reasons),
@@ -442,6 +472,31 @@ class ClassifiedFlowAdapter:
         )
 
 
+@lru_cache(maxsize=128)
+def _flow_statistics(values: tuple[ClassifiedTrade, ...], refs: tuple[CausalEventRef, ...]) -> tuple:
+    """Immutable window facts only; causal cutoff and policy are evaluated live."""
+    by_id = {item.event.event_id: item for item in values}
+    ordered = tuple(by_id[item.event_id] for item in refs)
+    instruments = {item.instrument for item in ordered}
+    if len(instruments) > 1:
+        raise ValueError("A flow result cannot mix instruments.")
+    if len({item.event.continuity_domain for item in ordered}) > 1:
+        raise ValueError("A flow result cannot bridge continuity domains.")
+    buy = tuple(item for item in ordered if item.aggressor_side is AggressorSide.BUY)
+    sell = tuple(item for item in ordered if item.aggressor_side is AggressorSide.SELL)
+    unknown = tuple(item for item in ordered if item.aggressor_side is AggressorSide.UNKNOWN)
+    return (ordered, next(iter(instruments), "UNAVAILABLE"),
+            min((item.event._ordering_key[1] for item in ordered), default=None),
+            buy, sell, unknown,
+            sum((item.volume for item in buy), Decimal("0")),
+            sum((item.volume for item in sell), Decimal("0")),
+            sum((item.volume for item in unknown), Decimal("0")),
+            tuple(item.event.event_id for item in ordered),
+            tuple(item.event.payload_hash for item in ordered),
+            tuple((p.value, sum(item.classification_provenance is p for item in ordered))
+                  for p in AggressorProvenance))
+
+
 @dataclass(frozen=True)
 class DepthObservation:
     event: CausalEventRef
@@ -456,6 +511,20 @@ class DepthObservation:
     interaction_volume: Decimal = Decimal("0")
     cancellation_evidence_supported: bool = False
     observed_price_response: PriceResponse = PriceResponse.UNAVAILABLE
+
+    @cached_property
+    def _immutable_hash(self) -> int:
+        return hash((self.event, self.instrument, self.side, self.price,
+                     self.displayed_quantity, self.nearby_same_side_quantity,
+                     self.touch_price, self.event_kind, self.matched_trade_volume,
+                     self.interaction_volume, self.cancellation_evidence_supported,
+                     self.observed_price_response))
+
+    def __hash__(self) -> int:
+        return self._immutable_hash
+
+    def __getstate__(self) -> dict[str, object]:
+        return {key: value for key, value in self.__dict__.items() if key != '_immutable_hash'}
 
     def __post_init__(self) -> None:
         _text(self.instrument, "Depth instrument")
@@ -505,7 +574,7 @@ class LiquidityClusterPolicy:
             "production_configured": False, "execution_authority": "DENIED",
         }
 
-    @property
+    @cached_property
     def configuration_hash(self) -> str:
         return canonical_hash(self.payload())
 
@@ -584,7 +653,7 @@ class LiquidityClusterResult:
             "execution_authority": "DENIED",
         }
 
-    @property
+    @cached_property
     def result_hash(self) -> str:
         return canonical_hash(self.payload())
 
@@ -607,6 +676,52 @@ class LiquidityClusterAdapter:
         if not values:
             raise ValueError("A liquidity cluster requires at least one observation.")
         refs = _ordered_refs((item.event for item in values), end)
+        (ordered, instrument, side, price, transitions, depleted, replenished,
+         source_ids, source_hashes, group_hash, cluster_hash,
+         interactions, interaction_volume, acceptance_count, rejection_count) = _liquidity_statistics(values, refs)
+        latest = ordered[-1]
+        relative = (
+            latest.displayed_quantity / latest.nearby_same_side_quantity
+            if latest.nearby_same_side_quantity > 0 else None
+        )
+        distance = (
+            latest.touch_price - latest.price if side is BookSide.BID
+            else latest.price - latest.touch_price
+        ) / self.policy.tick_size
+        persistence = Decimal(str((latest.event._ordering_key[1]
+                                   - ordered[0].event._ordering_key[1]).total_seconds()))
+        reasons: list[str] = []
+        if not feed_continuity_valid:
+            reasons.append("LIQUIDITY_CLUSTER_BROKEN_FEED")
+        if end - latest.event._ordering_key[0] > timedelta(seconds=self.policy.maximum_staleness_seconds):
+            reasons.append("LIQUIDITY_CLUSTER_STALE")
+        if latest.event_kind in {DepthEventKind.OUT_OF_RANGE, DepthEventKind.RECONNECT_RESET}:
+            reasons.append("LIQUIDITY_CLUSTER_RANGE_OR_RESET_AMBIGUOUS")
+        if relative is None:
+            reasons.append("LIQUIDITY_CLUSTER_NEARBY_DEPTH_UNAVAILABLE")
+        elif relative < self.policy.minimum_relative_size:
+            reasons.append("LIQUIDITY_CLUSTER_BELOW_RELATIVE_SIZE")
+        return LiquidityClusterResult(
+            cluster_id="liquidity-cluster-" + cluster_hash[:32], instrument=instrument,
+            side=side, price=price, as_of=as_of, valid=not reasons, reason_codes=tuple(reasons),
+            current_displayed_quantity=latest.displayed_quantity,
+            nearby_same_side_quantity=latest.nearby_same_side_quantity,
+            relative_size=relative, distance_from_touch_ticks=distance,
+            persistence_seconds=persistence, interaction_count=len(interactions),
+            interaction_volume=interaction_volume, acceptance_count=acceptance_count,
+            rejection_count=rejection_count, depleted_quantity=depleted,
+            replenished_quantity=replenished, transitions=transitions,
+            source_event_at=latest.event.event_at, received_at=latest.event.received_at,
+            available_at=as_of, continuity_domain=latest.event.continuity_domain,
+            source_ids=source_ids, source_hashes=source_hashes,
+            dependency_group_id="liquidity-dependency-" + group_hash[:32],
+            policy_hash=self.policy.configuration_hash,
+        )
+
+
+@lru_cache(maxsize=128)
+def _liquidity_statistics(values: tuple[DepthObservation, ...], refs: tuple[CausalEventRef, ...]) -> tuple:
+        """Cache immutable transitions, never availability, freshness or validity."""
         by_id = {item.event.event_id: item for item in values}
         ordered = tuple(by_id[item.event_id] for item in refs)
         identities = {(item.instrument, item.side, item.price) for item in ordered}
@@ -644,32 +759,6 @@ class LiquidityClusterAdapter:
             transitions.append(LiquidityTransition(
                 prior.event.event_id, current.event.event_id, kind, quantity, attribution,
             ))
-        latest = ordered[-1]
-        relative = (
-            latest.displayed_quantity / latest.nearby_same_side_quantity
-            if latest.nearby_same_side_quantity > 0 else None
-        )
-        distance = (
-            latest.touch_price - latest.price if side is BookSide.BID
-            else latest.price - latest.touch_price
-        ) / self.policy.tick_size
-        persistence = Decimal(str((
-            _time(latest.event.event_at, "Latest depth event time")
-            - _time(ordered[0].event.event_at, "First depth event time")
-        ).total_seconds()))
-        reasons: list[str] = []
-        if not feed_continuity_valid:
-            reasons.append("LIQUIDITY_CLUSTER_BROKEN_FEED")
-        if end - _time(latest.event.available_at, "Depth available-at time") > timedelta(
-            seconds=self.policy.maximum_staleness_seconds
-        ):
-            reasons.append("LIQUIDITY_CLUSTER_STALE")
-        if latest.event_kind in {DepthEventKind.OUT_OF_RANGE, DepthEventKind.RECONNECT_RESET}:
-            reasons.append("LIQUIDITY_CLUSTER_RANGE_OR_RESET_AMBIGUOUS")
-        if relative is None:
-            reasons.append("LIQUIDITY_CLUSTER_NEARBY_DEPTH_UNAVAILABLE")
-        elif relative < self.policy.minimum_relative_size:
-            reasons.append("LIQUIDITY_CLUSTER_BELOW_RELATIVE_SIZE")
         source_ids = tuple(item.event.event_id for item in ordered)
         source_hashes = tuple(item.event.payload_hash for item in ordered)
         group_hash = canonical_hash({
@@ -683,43 +772,11 @@ class LiquidityClusterAdapter:
             "first_event_id": ordered[0].event.event_id,
         })
         interactions = tuple(item for item in ordered if item.interaction_volume > 0)
-        return LiquidityClusterResult(
-            cluster_id="liquidity-cluster-" + cluster_hash[:32],
-            instrument=instrument,
-            side=side,
-            price=price,
-            as_of=as_of,
-            valid=not reasons,
-            reason_codes=tuple(reasons),
-            current_displayed_quantity=latest.displayed_quantity,
-            nearby_same_side_quantity=latest.nearby_same_side_quantity,
-            relative_size=relative,
-            distance_from_touch_ticks=distance,
-            persistence_seconds=persistence,
-            interaction_count=len(interactions),
-            interaction_volume=sum(
-                (item.interaction_volume for item in interactions), Decimal("0")
-            ),
-            acceptance_count=sum(
-                item.observed_price_response is PriceResponse.ACCEPTANCE
-                for item in interactions
-            ),
-            rejection_count=sum(
-                item.observed_price_response is PriceResponse.REJECTION
-                for item in interactions
-            ),
-            depleted_quantity=depleted,
-            replenished_quantity=replenished,
-            transitions=tuple(transitions),
-            source_event_at=latest.event.event_at,
-            received_at=latest.event.received_at,
-            available_at=as_of,
-            continuity_domain=latest.event.continuity_domain,
-            source_ids=source_ids,
-            source_hashes=source_hashes,
-            dependency_group_id="liquidity-dependency-" + group_hash[:32],
-            policy_hash=self.policy.configuration_hash,
-        )
+        return (ordered, instrument, side, price, tuple(transitions), depleted, replenished,
+                source_ids, source_hashes, group_hash, cluster_hash, interactions,
+                sum((item.interaction_volume for item in interactions), Decimal("0")),
+                sum(item.observed_price_response is PriceResponse.ACCEPTANCE for item in interactions),
+                sum(item.observed_price_response is PriceResponse.REJECTION for item in interactions))
 
 
 @dataclass(frozen=True)
@@ -780,7 +837,7 @@ class VolumeRegimePolicy:
             "production_configured": False, "execution_authority": "DENIED",
         }
 
-    @property
+    @cached_property
     def configuration_hash(self) -> str:
         return canonical_hash(self.payload())
 
@@ -826,7 +883,7 @@ class VolumeRegimeResult:
             "execution_authority": "DENIED",
         }
 
-    @property
+    @cached_property
     def result_hash(self) -> str:
         return canonical_hash(self.payload())
 
@@ -996,7 +1053,7 @@ class MicrostructureEvidenceMappingPolicy:
             "execution_authority": "DENIED",
         }
 
-    @property
+    @cached_property
     def mapping_hash(self) -> str:
         return canonical_hash(self.payload())
 
@@ -1113,9 +1170,12 @@ class MicrostructureEvidenceMapper:
         volume_regime: VolumeRegimeResult,
         *,
         first_evidence_revision: int,
+        include_blocked_artifacts: bool = True,
     ) -> MappedMicrostructureEvidence:
         if type(first_evidence_revision) is not int or first_evidence_revision <= 0:
             raise ValueError("First mapped evidence revision must be positive.")
+        if type(include_blocked_artifacts) is not bool:
+            raise ValueError("Blocked artifact selection must be boolean.")
         blockers: list[str] = []
         if not flow.valid:
             blockers.extend(f"FLOW:{item}" for item in flow.reason_codes)
@@ -1150,6 +1210,15 @@ class MicrostructureEvidenceMapper:
                               ask_liquidity.continuity_domain}
         if len(continuity_domains) != 1:
             blockers.append("MICROSTRUCTURE_CONTINUITY_DOMAIN_MISMATCH")
+        if blockers and not include_blocked_artifacts:
+            # Production consumes only these blockers on a rejected frame;
+            # there is no evidence emission or artifact persistence to omit.
+            # All input/frame validation above and valid-frame hashes below
+            # remain identical to the default research/output contract.
+            return MappedMicrostructureEvidence(
+                (), DiscernmentVolumeRegime.UNAVAILABLE, self.policy.mapping_hash,
+                (), tuple(blockers),
+            )
         artifacts = tuple(sorted((
             ("classified-flow-result", flow.result_hash),
             (f"{bid_liquidity.side.value.lower()}-liquidity-result", bid_liquidity.result_hash),

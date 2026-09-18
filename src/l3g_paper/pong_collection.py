@@ -18,7 +18,7 @@ from pathlib import Path
 import queue
 import threading
 import time
-from typing import Mapping
+from collections.abc import Mapping
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -39,7 +39,7 @@ PONG_COLLECTION_CONTRACT = "MNQ SEP26"
 PONG_COLLECTION_CANONICAL_CONTRACT = "MNQU6"
 PONG_COLLECTION_TIMEZONE = "America/Denver"
 _MARKET_TYPES = frozenset({"TRADE", "QUOTE", "DEPTH"})
-_RETAINED_TYPES = _MARKET_TYPES | frozenset({"HISTORICAL_WARM_START", "HOURLY_BAR"})
+_RETAINED_TYPES = _MARKET_TYPES | frozenset({"HISTORICAL_WARM_START", "HOURLY_BAR", "VOLUME_REFERENCE_HISTORY"})
 _ZERO_HASH = "0" * 64
 _STATUS_REPLACE_RETRY_SECONDS = 1.0
 _STATUS_REPLACE_RETRY_INTERVAL_SECONDS = 0.01
@@ -187,6 +187,9 @@ class PongAuthenticHourCollector:
         self.collector_status_path = self.collector_root / "status.json"
         self.status_path = self.root / "collection-status.json"
         self.expected_source_fingerprint = expected_source_fingerprint
+        self._source_generation: int | None = None
+        self._producer_overflow_records = 0
+        self._producer_transport_failed_records = 0
         self.independent_market_collection = independent_market_collection
         self.started_at = _wire(started)
         self._initial_target = _next_full_hour(started)
@@ -349,6 +352,8 @@ class PongAuthenticHourCollector:
                     "queue_depth": self._queue.qsize(),
                     "queue_capacity": self._QUEUE_CAPACITY,
                     "queue_overflow_records": self._queue_overflow_records,
+                    "producer_queue_overflow_records": self._producer_overflow_records,
+                    "producer_transport_failed_records": self._producer_transport_failed_records,
                     "rejected_records": self._rejected_records,
                     "duplicate_records": self._duplicate_records,
                 },
@@ -464,8 +469,6 @@ class PongAuthenticHourCollector:
         with self._lock:
             prior = self._journal_tip
             journal_sequence = self._written_records + 1
-        observation = record.unsigned_wire_payload()
-        observation["signature"] = record.signature
         body: dict[str, object] = {
             "schema": PONG_COLLECTION_RECORD_SCHEMA,
             "collector_id": self.collector_id,
@@ -474,17 +477,23 @@ class PongAuthenticHourCollector:
             "signature_verified": True,
             "wire_hash": record.wire_hash(),
             "previous_record_hash": prior,
-            "observation": observation,
+            "observation": None,
         }
         if record.observation_type == "TRADE":
             body["aggressor_classification"] = self._classify_trade(record)
-        canonical_body = _canonical_bytes(body)
+        canonical_body = _canonical_bytes(body).replace(
+            b'"observation":null', b'"observation":' + record.signed_wire_bytes(), 1,
+        )
         digest = hashlib.sha256(canonical_body).hexdigest()
         with self._lock:
             self._journal_tip = digest
         return _add_record_hash(canonical_body, digest) + b"\n"
 
     def _classify_trade(self, trade: NinjaTraderObservation) -> dict[str, object]:
+        return self.classify_trade(trade, self._last_quote)
+
+    @staticmethod
+    def classify_trade(trade: NinjaTraderObservation, quote: NinjaTraderObservation | None) -> dict[str, object]:
         payload = trade.payload
         side = "UNKNOWN"
         provenance = "UNAVAILABLE"
@@ -494,7 +503,6 @@ class PongAuthenticHourCollector:
             side = str(reported_side)
             provenance = "AUTHENTICATED_PROVIDER"
         elif source == "BID_ASK_CLASSIFICATION":
-            quote = self._last_quote
             price = _finite_decimal(payload.get("price"), positive=True)
             bid = _finite_decimal(payload.get("bid_at_trade"), positive=True)
             ask = _finite_decimal(payload.get("ask_at_trade"), positive=True)
@@ -524,6 +532,24 @@ class PongAuthenticHourCollector:
     def _apply_observation_locked(self, record: NinjaTraderObservation) -> None:
         current_identity = _identity(record)
         event_at = _parse_time(record.provider_timestamp or record.ninja_receipt_time, "Pong collection event time")
+        generation = record.payload.get("source_generation")
+        if record.observation_type in _MARKET_TYPES and generation is not None:
+            if type(generation) is not int or generation <= 0:
+                self._invalidate_at_locked(event_at, "SOURCE_GENERATION_INVALID")
+            elif self._source_generation is not None and generation != self._source_generation:
+                self._invalidate_at_locked(event_at, "SOURCE_GENERATION_CHANGED")
+                self._invalidate_at_locked(_utc_now(), "SOURCE_GENERATION_CHANGED")
+                self._last_quote = None
+            self._source_generation = generation
+        for field, attribute, reason in (
+            ("observer_queue_overflow_frames", "_producer_overflow_records", "PRODUCER_QUEUE_OVERFLOW"),
+            ("observer_transport_failed_frames", "_producer_transport_failed_records", "PRODUCER_TRANSPORT_FAILED"),
+        ):
+            total = record.payload.get(field)
+            if type(total) is int and total > getattr(self, attribute):
+                setattr(self, attribute, total)
+                self._invalidate_at_locked(event_at, reason)
+                self._invalidate_at_locked(_utc_now(), reason)
         if self._active_identity is None:
             self._active_identity = current_identity
         elif self._active_identity != current_identity:

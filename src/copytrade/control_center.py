@@ -32,7 +32,7 @@ from src.l3g_paper.commissioning import (
     evaluate_commissioning_post_run_verification,
 )
 from src.l3g_paper.health import ledger_health_projection, sanitized_paper_health
-from src.l3g_paper.ledger import PaperLedger, resolve_ledger_epoch
+from src.l3g_paper.ledger import LedgerCapacityError, PaperLedger, resolve_ledger_epoch
 from src.l3g_paper.ninjatrader_login import NinjaTraderLoginBootstrap, NinjaTraderLoginState
 from src.l3g_paper.ninjatrader_maintenance import (
     ACTION_TOKEN_HEADER,
@@ -49,7 +49,8 @@ from src.l3g_paper.paper_autostart import (
 from src.l3g_paper.ninjatrader_transport import LocalPaperSecretProvider, PaperExecutionTransport
 from src.l3g_paper.pong_collection import PongAuthenticHourCollector
 from src.l3g_paper.pong_production import PongProductionHost
-from src.l3g_paper.contracts import resolve_paper_profile
+from src.l3g_paper.pong_authorization import PONG_AUTHORIZATION_ENV, PongLaunchAuthorization
+from src.l3g_paper.contracts import PONG_ENTRY_PROFILE_VERSION, resolve_paper_profile
 from src.l3g_paper.profile_switch import (
     PROFILE_SWITCH_ACTION_HEADER,
     PROFILE_SWITCH_ACTION_VALUE,
@@ -102,6 +103,11 @@ CONTROL_STATES = {CONTROL_RUNNING, CONTROL_ENTRIES_PAUSED, CONTROL_EXITING, CONT
 OPERATOR_STATES = {"new", "approved", "shadow", "active", "muted", "rejected"}
 WATCHER_MAX_SUBSCRIPTIONS = 10
 NINJATRADER_RUNTIME_LOGGER = logging.getLogger("uvicorn.error")
+
+
+def _pong_market_collection_only(independent: bool, profile: str, observation: object) -> bool:
+    return (independent and getattr(observation, "observation_type", None) in {"TRADE", "QUOTE", "DEPTH"}
+            and profile != PONG_ENTRY_PROFILE_VERSION)
 LEDGER_VERIFICATION_FRESHNESS_SECONDS = 15 * 60
 MARKET_OBSERVER_ACTIVE_FRESHNESS_SECONDS = 15.0
 LEDGER_VERIFIER_SHUTDOWN_WAIT_SECONDS = 30.0
@@ -1661,6 +1667,11 @@ def create_control_center_app(
     pong_bounded_activation = _strict_environment_flag(
         PONG_BOUNDED_ACTIVATION_ENV,
     )
+    pong_authorization_path = os.getenv(PONG_AUTHORIZATION_ENV)
+    pong_launch_authorization = (
+        None if not pong_authorization_path
+        else PongLaunchAuthorization.load(pong_authorization_path)
+    )
     perpetual_seed_artifact: Mapping[str, object] | None = None
     perpetual_seed_proof: Mapping[str, object] | None = None
     perpetual_seed_manifest: Mapping[str, object] | None = None
@@ -2462,6 +2473,8 @@ def create_control_center_app(
                 controller_dispatch=paper_runtime.apply_pong_controller_command,
                 native_dispatch=paper_runtime.apply_pong_native_directive,
                 activation_authorized=pong_bounded_activation,
+                launch_authorization=pong_launch_authorization,
+                history_verification_key=LocalPaperSecretProvider().load_key(),
             )
             paper_runtime.bind_pong_integration_status(pong_host.authority_status)
             paper_runtime.bind_pong_execution_sink(pong_host.on_execution_message)
@@ -2484,12 +2497,8 @@ def create_control_center_app(
                 pong_collector.ingest(observation)  # type: ignore[arg-type]
                 assert pong_host is not None
                 pong_host.on_observation(observation)  # type: ignore[arg-type]
-                if (
-                    pong_independent_collection
-                    and getattr(observation, "observation_type", None)
-                    in {"TRADE", "QUOTE", "DEPTH"}
-                    and selected_paper_profile.selection_key
-                    != PONG_ENTRY_PROFILE_VERSION
+                if _pong_market_collection_only(
+                    pong_independent_collection, selected_paper_profile.selection_key, observation,
                 ):
                     # During the explicitly bounded evidence acquisition, the
                     # authenticated Pong sink must not wait behind legacy
@@ -3563,6 +3572,34 @@ def create_control_center_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/lane-iii/paper/pending-lockout-evidence-recovery")
+    async def api_lane_iii_pending_lockout_evidence_recovery(
+        request: Request, body: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, object]:
+        paper = ninjatrader_runtime.get("paper")
+        if paper is None:
+            raise HTTPException(status_code=503, detail="Lane III paper runtime is unavailable.")
+        if ((request.url.hostname or "").lower() not in {"127.0.0.1", "localhost", "::1", "testserver"}
+                or request.headers.get("X-Beelzebub-Pending-Lockout-Recovery-Action")
+                != "lane-iii-pending-lockout-evidence-recovery-v1"):
+            raise HTTPException(status_code=403, detail="Pending lockout recovery action authentication failed.")
+        if (not isinstance(body, dict) or set(body) != {"request_id", "phase", "evidence"}
+                or not isinstance(body.get("evidence"), dict)):
+            raise HTTPException(status_code=400, detail="Pending recovery requires request_id, phase and evidence.")
+        try:
+            return paper.recover_pending_lockout_evidence(
+                body["request_id"], body["phase"], body["evidence"],
+                lambda operation_id, snapshot: require_operational_paper_ledger_verification(
+                    operation_id, snapshot, enforce_observer=False,
+                ),
+            )
+        except (ValueError, OSError, KeyError, RuntimeError) as error:
+            # No evidence contents or arbitrary local file data in errors.
+            code = str(error)
+            if not code.startswith("PENDING_LOCKOUT_") or not all(c.isupper() or c.isdigit() or c == "_" for c in code):
+                code = type(error).__name__
+            raise HTTPException(status_code=409, detail="PENDING_LOCKOUT_RECOVERY_REFUSED:" + code) from error
 
     @app.post("/api/lane-iii/paper/ledger-capacity-recovery")
     async def api_lane_iii_paper_ledger_capacity_recovery(

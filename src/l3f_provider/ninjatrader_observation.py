@@ -8,7 +8,9 @@ boundary, not a NinjaTrader automation API.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
+from copy import copy
+from functools import lru_cache
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
@@ -42,12 +44,12 @@ NINJATRADER_ATTESTATION_KEY_CONTEXT = b"BEELZEBUB_NINJATRADER_OBSERVATION_V2"
 # Regenerated from both checked-in read-only NinjaScript producer sources.  The
 # helper below excludes this embedded value, so a compiled stale producer keeps
 # reporting its old identity even after the checkout changes.
-EXPECTED_OBSERVER_SOURCE_FINGERPRINT = "677cc1fa39a880df73a0b84bed8d9e95db0839a09660537c9af5f6182de96309"
+EXPECTED_OBSERVER_SOURCE_FINGERPRINT = "e9ace3492b5d2d38e50d7c2d8c5d13b0cf344d9513d5344b282a23d026d43ced"
 NINJATRADER_SOURCE = "NINJATRADER"
 LUCID_CQG_PROVIDER = "LUCID_CQG"
 PROP_SIM_ENVIRONMENT = "PROP_SIM"
 LOOPBACK_HOST = "127.0.0.1"
-_TYPES = {"CONNECTION", "INSTRUMENT", "TRADE", "QUOTE", "DEPTH", "ACCOUNT", "POSITION", "ORDER", "EXECUTION", "HEALTH", "SNAPSHOT_COMPLETE", "HISTORICAL_WARM_START", "HOURLY_BAR"}
+_TYPES = {"CONNECTION", "INSTRUMENT", "TRADE", "QUOTE", "DEPTH", "ACCOUNT", "POSITION", "ORDER", "EXECUTION", "HEALTH", "SNAPSHOT_COMPLETE", "HISTORICAL_WARM_START", "HOURLY_BAR", "VOLUME_REFERENCE_HISTORY"}
 _LEGACY_WIRE_FIELDS = frozenset({
     "schema", "observation_id", "session_id", "observation_type",
     "ninja_receipt_time", "local_monotonic_sequence", "provider_timestamp",
@@ -60,6 +62,52 @@ _PRODUCER_FIELDS = frozenset({
 })
 _ACCOUNT_ALIASES = frozenset({"Lucid25kflex01", "Sim101"})
 _ACCOUNT_SCOPED_TYPES = frozenset({"ACCOUNT", "POSITION", "ORDER", "EXECUTION", "SNAPSHOT_COMPLETE"})
+
+
+def _immutable_json_write(*args, **kwargs):
+    raise TypeError('Authenticated observation JSON is immutable.')
+
+
+class _FrozenJsonDict(dict):
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __ior__ = _immutable_json_write
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __init__(self, *args, **kwargs):
+        if hasattr(self, '_sealed'):
+            _immutable_json_write()
+        super().__init__(*args, **kwargs)
+        self._sealed = True
+
+
+class _FrozenJsonList(list):
+    __setitem__ = __delitem__ = append = clear = extend = insert = pop = remove = reverse = sort = __iadd__ = __imul__ = _immutable_json_write
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __init__(self, *args):
+        if hasattr(self, '_sealed'):
+            _immutable_json_write()
+        super().__init__(*args)
+        self._sealed = True
+
+
+def _freeze_json(value: object) -> object:
+    # Freeze once at ownership transfer, including nested book/history rows.
+    # The dict/list interfaces remain compatible with the existing validators
+    # and canonical JSON encoder. Re-validation may safely reuse these values.
+    kind = type(value)
+    if kind is _FrozenJsonDict or kind is _FrozenJsonList:
+        return value
+    if isinstance(value, dict):
+        return _FrozenJsonDict((key, _freeze_json(item)) for key, item in value.items())
+    if isinstance(value, list):
+        return _FrozenJsonList(_freeze_json(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze_json(item) for item in value)
+    return value
 
 
 class NinjaTraderObservationError(ProviderObservationRefused):
@@ -165,12 +213,29 @@ def _wire_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+_PROHIBITED_IDENTITY_KEYS = frozenset({"account_id", "accountid", "password", "token", "secret", "authorization"})
+
+
+@lru_cache(maxsize=128)
+def _prohibited_identity_key(key: str) -> bool:
+    return key.replace('-', '_').lower() in _PROHIBITED_IDENTITY_KEYS
+
+
 def _contains_prohibited_identity(value: object) -> bool:
-    forbidden = {"account_id", "accountid", "password", "token", "secret", "authorization"}
-    if isinstance(value, Mapping):
-        return any(str(key).replace("-", "_").lower() in forbidden or _contains_prohibited_identity(item) for key, item in value.items())
-    if isinstance(value, list):
-        return any(_contains_prohibited_identity(item) for item in value)
+    # Only called on json.loads output: every object was built as an exact
+    # dict by _wire_json_object. Walk containers once, without a typing ABC
+    # check, recreated set and generator for every scalar book field.
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if type(current) is dict:
+            for key, item in current.items():
+                if _prohibited_identity_key(key):
+                    return True
+                if type(item) is dict or type(item) is list:
+                    pending.append(item)
+        elif type(current) is list:
+            pending.extend(item for item in current if type(item) is dict or type(item) is list)
     return False
 
 
@@ -306,6 +371,9 @@ class NinjaTraderObservation:
     _cached_wire_hash: str | None = field(
         default=None, init=False, repr=False, compare=False,
     )
+    _cached_signed_wire_bytes: bytes | None = field(
+        default=None, init=False, repr=False, compare=False,
+    )
 
     def __post_init__(self) -> None:
         _text(self.observation_id, "Observation ID")
@@ -317,7 +385,9 @@ class NinjaTraderObservation:
             raise ValueError("Local ordering sequence must be non-negative.")
         if not isinstance(self.payload, Mapping):
             raise ValueError("Observation payload must be a mapping.")
-        object.__setattr__(self, "payload", MappingProxyType(dict(self.payload)))
+        object.__setattr__(self, "payload", MappingProxyType({
+            key: _freeze_json(value) for key, value in self.payload.items()
+        }))
         if (self.source, self.provider, self.environment) != (NINJATRADER_SOURCE, LUCID_CQG_PROVIDER, PROP_SIM_ENVIRONMENT):
             raise NinjaTraderObservationError(ProviderErrorCode.ENVIRONMENT_MISMATCH, "ninjatrader_provenance")
         if self.account_alias is None:
@@ -389,11 +459,21 @@ class NinjaTraderObservation:
     def wire_hash(self) -> str:
         cached = self._cached_wire_hash
         if cached is None:
-            cached = canonical_hash({
-                **self.unsigned_wire_payload(),
-                "signature": self.signature,
-            })
+            cached = hashlib.sha256(self.signed_wire_bytes()).hexdigest()
             object.__setattr__(self, "_cached_wire_hash", cached)
+        return cached
+
+    def signed_wire_bytes(self) -> bytes:
+        """Exactly the canonical object, reusing its immutable signed material.
+
+        'signature' sorts after every unsigned field in both frozen schemas.
+        This is byte reuse, not a different encoding or another hash contract.
+        """
+        cached = self._cached_signed_wire_bytes
+        if cached is None:
+            cached = (self.unsigned_wire_bytes()[:-1] + b',"signature":'
+                      + _canonical_bytes(self.signature) + b'}')
+            object.__setattr__(self, '_cached_signed_wire_bytes', cached)
         return cached
 
     def unsigned_wire_bytes(self) -> bytes:
@@ -444,7 +524,11 @@ class NinjaTraderObservation:
         expected = hmac.new(key, unsigned_wire_bytes, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(self.signature, expected):
             raise NinjaTraderObservationError(ProviderErrorCode.AUTH_FAILED, "ninjatrader_attestation_signature")
-        verified = replace(self, signature_verified=True)
+        # The validated, deeply immutable envelope is unchanged. Clone its
+        # fields and caches without re-decoding/reconstructing the same input;
+        # only this successful constant-time signature comparison sets trust.
+        verified = copy(self)
+        object.__setattr__(verified, 'signature_verified', True)
         object.__setattr__(
             verified, "_cached_unsigned_wire_bytes", unsigned_wire_bytes,
         )

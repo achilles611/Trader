@@ -1,0 +1,19 @@
+{
+  "schema": "pong-single-trial-authorization-v2",
+  "account": "Sim101",
+  "account_class": "LOCAL_SIMULATION",
+  "instrument": "MNQ SEP26",
+  "canonical_contract": "MNQU6",
+  "maximum_quantity": 1,
+  "run_duration_seconds": 3600,
+  "maximum_runs": 1,
+  "live_authority": "DISARMED",
+  "live_capital": "DENIED",
+  "activation_date_local": "2026-09-14",
+  "ny_open_blackout": true,
+  "operator_acknowledged_at_utc": "2026-09-14T17:05:58.392141Z",
+  "operator_acknowledged_at_denver": "2026-09-14T11:05:58.392141-06:00",
+  "expires_at_utc": "2026-09-15T06:00:00Z",
+  "source_path": "C:\\Users\\atlas\\.codex\\attachments\\e5ac253d-799d-439e-aff7-8386441173de\\pasted-text.txt",
+  "source_sha256": "65b010a33ad71ac75a1ad1e23cceae0e5173d956cb47f53698466937eabf1cbb"
+}

@@ -213,6 +213,8 @@ class NinjaTraderCommissioningHarness:
         self._on_local_bridge_state = on_local_bridge_state
         self._on_rejection = on_rejection
         self._on_duplicate = on_duplicate
+        self._transport_owner: object | None = None
+        self._market_transport_seen = False
         self.summary.set_health(self.health)
 
     @staticmethod
@@ -263,7 +265,7 @@ class NinjaTraderCommissioningHarness:
         ):
             self._mark(NinjaTraderHealthStream.LUCID_CONNECTION, StreamHealth.HEALTHY, at)
 
-    def ingest(self, frames: Iterable[bytes]) -> CommissioningSummary:
+    def ingest(self, frames: Iterable[bytes], *, source_connection: object | None = None) -> CommissioningSummary:
         self.summary.listener_ready = True
         for frame in frames:
             try:
@@ -278,6 +280,13 @@ class NinjaTraderCommissioningHarness:
                                 "NINJATRADER_OBSERVER downstream duplicate notification refused"
                             )
                     continue
+                if source_connection is not None:
+                    market = observation.observation_type in {"TRADE", "QUOTE", "DEPTH"}
+                    if market or not self._market_transport_seen:
+                        self._transport_owner = source_connection
+                        self._market_transport_seen = self._market_transport_seen or market
+                        if self.summary.health.get("LOCAL_BRIDGE") != StreamHealth.HEALTHY.value:
+                            self._mark(NinjaTraderHealthStream.LOCAL_BRIDGE, StreamHealth.HEALTHY)
                 self._record_observation_health(observation)
                 if self._on_observation is not None:
                     try:
@@ -306,7 +315,7 @@ class NinjaTraderCommissioningHarness:
         def close_connection(connection: socket.socket) -> None:
             data = connections.pop(connection, bytearray())
             if data:
-                self.ingest((bytes(data),))
+                self.ingest((bytes(data),), source_connection=connection)
             try:
                 connection.close()
             except OSError:
@@ -316,7 +325,13 @@ class NinjaTraderCommissioningHarness:
             finally:
                 # A peer disconnect is an explicit transport condition. It
                 # does not mutate account/position/order reconciliation.
-                self._mark(NinjaTraderHealthStream.LOCAL_BRIDGE, StreamHealth.DISCONNECTED)
+                # A retired/unverified peer cannot disconnect the current
+                # authenticated market owner. Account/control sockets do not
+                # keep market transport healthy after its owner disconnects.
+                if connection is self._transport_owner or not connections:
+                    if connection is self._transport_owner:
+                        self._transport_owner = None
+                    self._mark(NinjaTraderHealthStream.LOCAL_BRIDGE, StreamHealth.DISCONNECTED)
 
         try:
             listener.setblocking(False)
@@ -344,7 +359,8 @@ class NinjaTraderCommissioningHarness:
                                 continue
                             connection.setblocking(False)
                             connections[connection] = bytearray()
-                            self._mark(NinjaTraderHealthStream.LOCAL_BRIDGE, StreamHealth.HEALTHY)
+                            # Socket acceptance alone is not authenticated
+                            # producer evidence. Admission owns this transition.
                         continue
                     try:
                         buffered = len(connections[source])
@@ -367,9 +383,9 @@ class NinjaTraderCommissioningHarness:
                     while b"\n" in data:
                         frame, _, remainder = data.partition(b"\n")
                         connections[source] = data = bytearray(remainder)
-                        self.ingest((bytes(frame),))
+                        self.ingest((bytes(frame),), source_connection=source)
                     if len(data) > self.bridge.config.maximum_frame_bytes:
-                        self.ingest((bytes(data),))
+                        self.ingest((bytes(data),), source_connection=source)
                         connections[source] = bytearray()
                         close_connection(source)
         finally:

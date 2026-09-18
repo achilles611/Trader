@@ -20,7 +20,10 @@ The command performs the complete build/load/feed check:
 2. It recomputes the combined source fingerprint and requires the Python
    admission constant and the AddOn's embedded identity to match it.
 3. With `-InstallSource`, it backs up and installs only the two read-only source
-   files. The generated Indicator region is preserved. No DLL is copied.
+   files. Exactly one native-generated Indicator region is preserved; identical
+   duplicate regions are collapsed, and conflicting or malformed suffixes are
+   refused. Already-current AddOn source is not rewritten. Deployed files use
+   Windows CRLF line endings. No DLL is copied.
 4. It waits for NinjaTrader's source watcher to replace
    `NinjaTrader.Custom.dll`, then verifies that the assembly contains the exact
    source identity and current observer implementation. If the installed source
@@ -51,6 +54,18 @@ be supplied together. Do not use this observer command to improvise or replace
 that runtime binding.
 
 ## Ordering regression and frozen sources
+
+Check deployment packaging with the actual native-generated wrapper and actual
+installer formatter (TEST ONLY, no deployment or market history):
+
+```powershell
+pwsh -NoProfile -File .\tools\test_ninjatrader_generated_wrappers.ps1
+```
+
+This executable compiler regression must reproduce duplicate-member errors
+before repair and zero wrapper compiler errors afterward. It also checks
+idempotence, unchanged observer body, and refusal of conflicting/unknown source.
+It is not proof of a successful installed NinjaTrader compilation.
 
 Before installing, run the deterministic native callback regression:
 

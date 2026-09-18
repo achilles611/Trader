@@ -22,6 +22,7 @@ KEY = b"pong-input-test-root-key-material-32bytes!!!!"
 def verified(kind, payload, *, local_sequence=1, observed="2026-09-11T12:30:00Z"):
     stream = {
         "HISTORICAL_WARM_START": "HISTORICAL_BARS", "HOURLY_BAR": "HISTORICAL_BARS",
+        "VOLUME_REFERENCE_HISTORY": "HISTORICAL_BARS",
         "TRADE": "MARKET_DATA_LAST", "QUOTE": "MARKET_DATA_BID_ASK", "DEPTH": "MARKET_DEPTH",
     }[kind]
     value = {
