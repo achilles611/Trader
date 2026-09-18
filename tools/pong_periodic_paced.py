@@ -185,6 +185,11 @@ def _replay(corpus, output, key, *, interval_ms, phase_ms, mode, rate, limit,
     from src.l3g_paper import pong_production as production, pong_collection as collection
     from src.l3g_paper.pong_periodic import OfflinePeriodicPong
 
+    timer_clock = vars(time.get_clock_info("perf_counter"))
+    if not timer_clock["monotonic"] or timer_clock["adjustable"]:
+        raise ValueError("MONOTONIC_NONADJUSTABLE_TIMER_REQUIRED")
+    if interval_ms and timer_clock["resolution"] > interval_ms / 1000 / 10:
+        raise ValueError("TIMER_RESOLUTION_INSUFFICIENT")
     manifest = json.loads((corpus / "manifest.json").read_bytes())
     raw = (corpus / "frames.jsonl").read_bytes()
     if digest(raw) != manifest["frames_sha256"]:
@@ -229,6 +234,7 @@ def _replay(corpus, output, key, *, interval_ms, phase_ms, mode, rate, limit,
         raise ValueError("HISTORY_NOT_AVAILABLE_BEFORE_REPLAY_MARKET_ORIGIN")
     output.mkdir(parents=True, exist_ok=False)
     write_json(output / "performance-lease.json", lease)
+    write_json(output / "timer-clock.json", dict(name="perf_counter_ns", **timer_clock))
 
     context = multiprocessing.get_context("spawn")
     go, abort = context.Event(), context.Event()
@@ -360,10 +366,11 @@ def _replay(corpus, output, key, *, interval_ms, phase_ms, mode, rate, limit,
                     sender_identity.get("frames_sha256") != manifest["frames_sha256"] or
                     sender_identity.get("frame_count") != len(frames)):
                 raise RuntimeError("PRODUCER_PRELOAD_IDENTITY_MISMATCH")
-            started = time.perf_counter()
+            started_ns = time.perf_counter_ns()
+            started = started_ns / 1e9
             epoch.value = started
             adapter = OfflinePeriodicPong(host, interval_ms=interval_ms,
-                phase_ns=int(phase_ms*1e6), origin_ns=time.monotonic_ns())
+                phase_ns=int(phase_ms*1e6), origin_ns=started_ns)
             go.set()
             while True:
                 now = time.perf_counter()
@@ -388,11 +395,11 @@ def _replay(corpus, output, key, *, interval_ms, phase_ms, mode, rate, limit,
                 if failures:
                     break
                 if interval_ms and (processed < len(frames) or pending_indices):
-                    mono = time.monotonic_ns()
+                    mono = time.perf_counter_ns()
                     if mono >= adapter.next_deadline_ns:
                         # Cutoff uses elapsed wall time, including owner backlog
                         # and service; unavailable future records never enter it.
-                        tick_time = first_market+timedelta(seconds=time.perf_counter()-started)
+                        tick_time = first_market+timedelta(seconds=(mono-started_ns)/1e9)
                         if mode == "burst" and current_index >= 0:
                             # Synthetic stress compresses arrival spacing only.
                             # Its source-time axis cannot precede applied signed
@@ -445,7 +452,7 @@ def _replay(corpus, output, key, *, interval_ms, phase_ms, mode, rate, limit,
                 if processed == published:
                     sleep_seconds = .0005
                     if interval_ms:
-                        sleep_seconds = min(sleep_seconds, max(0., (adapter.next_deadline_ns-time.monotonic_ns())/1e9))
+                        sleep_seconds = min(sleep_seconds, max(0., (adapter.next_deadline_ns-time.perf_counter_ns())/1e9))
                     if sleep_seconds:
                         time.sleep(sleep_seconds)
         except BaseException as error:
@@ -517,6 +524,7 @@ def _replay(corpus, output, key, *, interval_ms, phase_ms, mode, rate, limit,
         for tick in timer_observations:
             trace.write(json.dumps(tick,separators=(",",":"))+"\n")
     result = dict(schema="pong-periodic-independent-paced-v1", test_only=True,
+        timer_clock=dict(name="perf_counter_ns", **timer_clock),
         qualification="NOT_QUALIFIED", interval_ms=interval_ms, phase_ms=phase_ms,
         mode=mode, target_events_per_second=2111, output_root=str(output),
         corpus_path=str(corpus), corpus_manifest=manifest, records=len(frames),

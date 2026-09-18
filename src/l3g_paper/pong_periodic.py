@@ -95,7 +95,7 @@ class OfflinePeriodicPong:
     def __init__(
         self, host: PongProductionHost, *, interval_ms: int = 0,
         phase_ns: int = 0, origin_ns: int = 0,
-        clock_ns: Callable[[], int] = time.monotonic_ns,
+        clock_ns: Callable[[], int] = time.perf_counter_ns,
     ) -> None:
         if type(interval_ms) is not int or interval_ms < 0:
             raise ValueError("PONG_PERIODIC_INTERVAL_INVALID")
