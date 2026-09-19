@@ -88,14 +88,16 @@ Get-FileHash 'C:\Users\atlas\Documents\NinjaTrader 8\bin\Custom\NinjaTrader.Cust
 ```
 
 The current offline attempt correctly wrote both source files and created
-backups, but stopped before compiled identity verification because no
-NinjaTrader source watcher was running. The installed DLL remained unchanged;
+backups. NinjaTrader was subsequently started and its existing LucidFlex25k
+connection reached `CONNECTED`, but two bounded commission retries still
+stopped before compiled identity verification because the source watcher did
+not replace/load the expected assembly. The installed DLL remained unchanged;
 this is a partial safe install, not a native activation proof.
 
 ### 4. Start the native observer read-only and prove the exact source session
 
 After the source/build checks pass, start NinjaTrader manually in the existing
-user profile. Attach only `BeelzebubReadOnlyMarketObserver` to the exact
+user profile and invoke the NinjaScript editor's compile/reload action. Attach only `BeelzebubReadOnlyMarketObserver` to the exact
 `MNQ DEC26` instrument. In the read-only AddOn configuration, select `Sim101`
 and retain `LOCAL_SIMULATION`. Do not attach or enable an order-capable AddOn.
 

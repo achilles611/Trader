@@ -273,3 +273,94 @@ is 19:00 Eastern / 23:00 UTC, inside CME's Sunday Globex session and the local
 reconciliation, warm-start, coherent-session capture, replay, and reporting
 have no fixed offline duration. If they are not complete by target time, the
 target is missed safely rather than by relaxing gates.
+
+## Final operational paper-contract execution pass — 2026-09-19
+
+The operating checkout now contains the generic versioned paper-contract
+integration. The implementation commits are `2abe4747650ab631f141119dd3cff0ccf88a9bde`
+and the follow-up SEP26 compatibility repair is
+`8aad2b41cf6cd7c0592c01d7caf4b0b80caa898`. The default remains SEP26 for
+historical callers; DEC26 is selected explicitly with
+`BEELZEBUB_L3G_PAPER_CONTRACT_TOPOLOGY=DEC26`.
+
+The integrated path now carries `MNQ DEC26` / `MNQZ6` through policy, risk,
+Sim101 binding, runtime status, session namespace, ledger metadata and records,
+transport reconciliation, profile switching, autostart, pending lockout, and
+reconciliation recovery. A coherent DEC26 `PaperLedger` can reopen its
+durable state; mixed DEC26/SEP26 policy, risk, binding, transport, or ledger
+identity is refused. SEP26 historical envelope shapes remain byte-compatible.
+
+Offline proof:
+
+- `tests/test_l3g_versioned_operational_contract.py`: 4 passed. This includes
+  the integrated operating control-center factory, not only observer/replay
+  fixtures.
+- Consolidated operational suite: 144 passed, 64 subtests; the affected
+  perpetual seed/recovery compatibility set after the final envelope repair:
+  53 passed, 8 subtests.
+- NinjaScript source suite: 43 passed.
+- Callback-ordering regression: passed; generated-wrapper repair: 0 repaired
+  compiler errors.
+- DEC-aware order-capable AddOn standalone compile against installed
+  NinjaTrader references: 0 errors, 1,939 warnings. No DLL was loaded or
+  copied, and no order-capable bridge was started.
+
+The repository `tests/` run before the final SEP26 envelope repair reported
+1,474 passed and 9 failures. The four perpetual seed failures were caused by
+the now-fixed additive identity fields on historical SEP26 envelopes. The
+remaining known failures are three control-center tests refusing the stale
+external `N:/Beelzebub/runtime` profile-selection artifact because its saved
+checkout SHA differs from `8aad2b4`, and two pre-existing observer-source
+false-positive assertions in `tests/test_lane_iii_phase_f2.py`. The guard and
+the observer source were not weakened to make those tests pass.
+
+### Native reload result and account boundary
+
+NinjaTrader was started safely at the verified executable path and the
+existing LucidFlex25k connection reached `CONNECTED`. No BeezConsole process
+or listener on ports `48136`, `48137`, or `8090` was started. The observer
+source files are installed with canonical parity and recoverable backups; the
+bundled Roslyn observer compile remains 0 errors / 1,267 warnings.
+
+The bounded observer commission was retried while NinjaTrader and the native
+connection were running. Both retries stopped at the compiled-identity gate:
+NinjaTrader did not replace/load the expected `NinjaTrader.Custom.dll` within
+the bounded 60-second watcher window. The DLL remains timestamped
+`2026-09-18T02:55:39.5916324Z` with SHA-256
+`a9db49334f7f8ed8992eb0dcd2ab842c4397d826b52dec2f8908542133f64fd9`. Therefore
+the read-only observer source/build identity is not native-proven, and the
+current Sim101 position, working-order, flatness, realized/unrealized totals,
+and reconciliation state remain unavailable. The Lucid connection is not a
+substitute for Sim101 proof.
+
+### Exact remaining blockers
+
+Fresh market data:
+
+1. A new DEC26 native observer producer session with the current source/build
+   fingerprint, warm-start/history receipt, quote/trade/depth/volume continuity,
+   and measured offline-to-durable latency.
+2. Protected replay of that one coherent current session, including zero
+   identity changes, gaps, overflow, duplicate/reject, and native dispatch.
+
+Current account context:
+
+1. A read-only Sim101 snapshot proving exact account/environment/instrument,
+   flat position, no working orders, no foreign activity, complete snapshots,
+   and current risk/reconciliation continuity.
+2. A restart/recovery proof against that current account snapshot and current
+   DEC26 producer session.
+
+Unfinished native implementation proof:
+
+1. The source-level DEC26-aware AddOn compiles, but the in-platform
+   NinjaScript editor/source-watcher reload and compiled identity verification
+   remain incomplete. This is the only remaining implementation/native gate;
+   the Python operating path itself is integrated and tested.
+
+The 5 p.m. Mountain task remains reserved for fresh-data qualification and
+reporting only. Qualification must begin earlier if a paper-start decision is
+expected at 5 p.m.; the required lead time cannot be calculated honestly until
+the native reload, account reconciliation, warm-start, and one coherent fresh
+session are measured. No preparation was armed and no scheduled task was
+changed.
