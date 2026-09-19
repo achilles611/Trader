@@ -14,10 +14,12 @@ from typing import Mapping
 from src.lane_iii.contracts import normalized_utc
 
 from .sessions import PaperSessionKind, context_from_identity
+from .pong_contract import PongContractTopology
 
 
 RISK_CONTINUITY_SNAPSHOT_SCHEMA = "lane-iii-paper-risk-continuity-snapshot-v2"
 RISK_CONTINUITY_ARTIFACT_SCHEMA = "lane-iii-paper-risk-continuity-artifact-v2"
+PONG_RISK_CONTINUITY_ARTIFACT_SCHEMA = "lane-iii-pong-risk-continuity-artifact-v1"
 _ACCOUNT_IDENTITY = ("Sim101", "LOCAL_SIMULATION", "MNQ SEP26")
 _RECORD_HASH = re.compile(r"^[0-9a-f]{64}$")
 
@@ -51,8 +53,22 @@ def _utc(value: object, field: str) -> str:
         raise RuntimeError(f"RISK_CONTINUITY_{field}_INVALID") from exc
 
 
-def validate_risk_continuity_snapshot(value: object, *, require_flat: bool = False) -> dict[str, object]:
+def validate_risk_continuity_snapshot(
+    value: object,
+    *,
+    require_flat: bool = False,
+    expected_identity: tuple[str, str, str] | None = None,
+    session_canonical_contract: str = "MNQU6",
+) -> dict[str, object]:
     """Return one canonical validated snapshot; caller-defined authority is refused."""
+    identity = _ACCOUNT_IDENTITY if expected_identity is None else expected_identity
+    if (
+        type(identity) is not tuple or len(identity) != 3
+        or not all(isinstance(item, str) and item for item in identity)
+        or not isinstance(session_canonical_contract, str)
+        or not session_canonical_contract
+    ):
+        raise RuntimeError("RISK_CONTINUITY_ACCOUNT_IDENTITY_INVALID")
     if not isinstance(value, Mapping):
         raise RuntimeError("RISK_CONTINUITY_SNAPSHOT_INVALID")
     required = {
@@ -64,7 +80,7 @@ def validate_risk_continuity_snapshot(value: object, *, require_flat: bool = Fal
         raise RuntimeError("RISK_CONTINUITY_SNAPSHOT_INVALID")
     if (
         value.get("account_name"), value.get("account_class"), value.get("instrument")
-    ) != _ACCOUNT_IDENTITY:
+    ) != identity:
         raise RuntimeError("RISK_CONTINUITY_ACCOUNT_IDENTITY_MISMATCH")
     generated_at = _utc(value.get("generated_at"), "GENERATED_AT")
     source_profile = value.get("source_profile")
@@ -213,13 +229,24 @@ def validate_risk_continuity_snapshot(value: object, *, require_flat: bool = Fal
             generation = raw.get("session_generation")
             if type(generation) is not int or generation < 0:
                 raise ValueError
+            raw_session_id = str(raw.get("session_id"))
+            context_session_id = raw_session_id
+            if (
+                session_canonical_contract != "MNQU6"
+                and kind is PaperSessionKind.OFF_SESSION
+            ):
+                # PaperSessionContext is the historical SEP26 session type. It
+                # still validates the compiled session family/profile while the
+                # explicit Pong route validates the DEC26 session namespace
+                # below, without mutating the shared historical type.
+                context_session_id = f"MNQU6:OFF_SESSION:{str(raw.get('trade_date'))}"
             context = context_from_identity(
-                kind, str(raw.get("session_id")), str(raw.get("trade_date")),
+                kind, context_session_id, str(raw.get("trade_date")),
                 str(raw.get("session_profile_hash")), generation,
             )
         except (TypeError, ValueError) as exc:
             raise RuntimeError("RISK_CONTINUITY_SESSION_IDENTITY_INVALID") from exc
-        key = (context.session_id, profile)
+        session_id = str(raw.get("session_id"))
         allowed_continuous_off_session = (
             context.session_kind is PaperSessionKind.OFF_SESSION
             and profile in {
@@ -229,7 +256,8 @@ def validate_risk_continuity_snapshot(value: object, *, require_flat: bool = Fal
             }
             and context.trade_date != "1970-01-01"
             and context.session_id
-            == f"MNQU6:OFF_SESSION:{context.trade_date}"
+            and session_id
+            == f"{session_canonical_contract}:OFF_SESSION:{context.trade_date}"
         )
         if (
             (
@@ -237,9 +265,10 @@ def validate_risk_continuity_snapshot(value: object, *, require_flat: bool = Fal
                 and not allowed_continuous_off_session
             )
             or raw.get("session_family") != context.session_family.value
-            or key in session_keys
+            or (session_id, profile) in session_keys
         ):
             raise RuntimeError("RISK_CONTINUITY_SESSION_IDENTITY_INVALID")
+        key = (session_id, profile)
         session_keys.add(key)
         entry_count = _count(raw.get("entry_count"), "SESSION_ENTRY_COUNT")
         realized_pnl = _decimal(raw.get("realized_pnl"), "SESSION_REALIZED_PNL")
@@ -251,7 +280,7 @@ def validate_risk_continuity_snapshot(value: object, *, require_flat: bool = Fal
             "profile": profile,
             "session_kind": context.session_kind.value,
             "session_family": context.session_family.value,
-            "session_id": context.session_id,
+            "session_id": session_id,
             "trade_date": context.trade_date,
             "session_profile_hash": context.session_profile_hash,
             "session_generation": context.session_generation,
@@ -297,9 +326,9 @@ def validate_risk_continuity_snapshot(value: object, *, require_flat: bool = Fal
     return {
         "schema": RISK_CONTINUITY_SNAPSHOT_SCHEMA,
         "generated_at": generated_at,
-        "account_name": _ACCOUNT_IDENTITY[0],
-        "account_class": _ACCOUNT_IDENTITY[1],
-        "instrument": _ACCOUNT_IDENTITY[2],
+        "account_name": identity[0],
+        "account_class": identity[1],
+        "instrument": identity[2],
         "source_profile": source_profile,
         "source_ledger": source_ledger,
         "authority_lockout": authority_lockout,
@@ -375,3 +404,112 @@ def read_risk_continuity_artifact(
     if snapshot.get("source_profile") != raw.get("source_profile"):
         raise RuntimeError("RISK_CONTINUITY_SOURCE_PROFILE_MISMATCH")
     return {**raw, "created_at": created_at, "snapshot": snapshot, "artifact_sha256": supplied}
+
+
+def validate_pong_risk_continuity_snapshot(
+    value: object,
+    *,
+    topology: PongContractTopology,
+    require_flat: bool = False,
+) -> dict[str, object]:
+    """Validate Pong continuity against one exact contract topology.
+
+    The historical generic Lane III validator remains SEP26 by default.  Pong's
+    versioned DEC26 route opts into this explicit identity so an epoch change
+    cannot silently rebind the generic runtime or relabel a historical snapshot.
+    """
+    if type(topology) is not PongContractTopology:
+        raise RuntimeError("RISK_CONTINUITY_PONG_TOPOLOGY_INVALID")
+    return validate_risk_continuity_snapshot(
+        value,
+        require_flat=require_flat,
+        expected_identity=(
+            topology.account_name,
+            topology.account_class,
+            topology.native_instrument,
+        ),
+        session_canonical_contract=topology.canonical_contract,
+    )
+
+
+def write_pong_risk_continuity_artifact(
+    path: Path,
+    *,
+    operation_id: str,
+    source_profile: str,
+    target_profile: str,
+    snapshot: object,
+    topology: PongContractTopology,
+) -> dict[str, object]:
+    """Write an exclusive, hash-bound Pong continuity artifact for one epoch."""
+    canonical_snapshot = validate_pong_risk_continuity_snapshot(
+        snapshot, topology=topology, require_flat=True,
+    )
+    if canonical_snapshot["source_profile"] != source_profile:
+        raise RuntimeError("RISK_CONTINUITY_SOURCE_PROFILE_MISMATCH")
+    artifact: dict[str, object] = {
+        "schema": PONG_RISK_CONTINUITY_ARTIFACT_SCHEMA,
+        "operation_id": operation_id,
+        "source_profile": source_profile,
+        "target_profile": target_profile,
+        "created_at": str(canonical_snapshot["generated_at"]),
+        "topology": topology.payload(),
+        "snapshot": canonical_snapshot,
+    }
+    artifact["artifact_sha256"] = sha256(_canonical(artifact)).hexdigest()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        os.write(descriptor, json.dumps(artifact, sort_keys=True, indent=2).encode("utf-8") + b"\n")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return artifact
+
+
+def read_pong_risk_continuity_artifact(
+    path: Path,
+    *,
+    topology: PongContractTopology,
+    operation_id: str | None = None,
+    target_profile: str | None = None,
+) -> dict[str, object]:
+    """Read and verify a Pong continuity artifact without granting authority."""
+    if type(topology) is not PongContractTopology:
+        raise RuntimeError("RISK_CONTINUITY_PONG_TOPOLOGY_INVALID")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("RISK_CONTINUITY_ARTIFACT_UNREADABLE") from exc
+    if not isinstance(raw, dict):
+        raise RuntimeError("RISK_CONTINUITY_ARTIFACT_INVALID")
+    supplied = raw.get("artifact_sha256")
+    body = {key: item for key, item in raw.items() if key != "artifact_sha256"}
+    if (
+        set(body) != {
+            "schema", "operation_id", "source_profile", "target_profile",
+            "created_at", "topology", "snapshot",
+        }
+        or body.get("schema") != PONG_RISK_CONTINUITY_ARTIFACT_SCHEMA
+        or supplied != sha256(_canonical(body)).hexdigest()
+        or body.get("topology") != topology.payload()
+    ):
+        raise RuntimeError("RISK_CONTINUITY_ARTIFACT_INTEGRITY_FAILED")
+    if operation_id is not None and body.get("operation_id") != operation_id:
+        raise RuntimeError("RISK_CONTINUITY_OPERATION_MISMATCH")
+    if target_profile is not None and body.get("target_profile") != target_profile:
+        raise RuntimeError("RISK_CONTINUITY_TARGET_PROFILE_MISMATCH")
+    snapshot = validate_pong_risk_continuity_snapshot(
+        body.get("snapshot"), topology=topology, require_flat=True,
+    )
+    created_at = _utc(body.get("created_at"), "CREATED_AT")
+    if created_at != snapshot.get("generated_at"):
+        raise RuntimeError("RISK_CONTINUITY_ARTIFACT_TIME_MISMATCH")
+    if snapshot.get("source_profile") != body.get("source_profile"):
+        raise RuntimeError("RISK_CONTINUITY_SOURCE_PROFILE_MISMATCH")
+    return {
+        **body,
+        "created_at": created_at,
+        "snapshot": snapshot,
+        "artifact_sha256": supplied,
+    }

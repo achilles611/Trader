@@ -75,8 +75,12 @@ class LaneIIIPhaseF2Tests(unittest.TestCase):
             isolation.authoritative()
 
     def test_contract_must_be_native_sep26_mnq_cme_with_mnq_tick(self):
+        dec26 = NinjaTraderContract(
+            "MNQ", "MNQ DEC26", "2026-12", "CME", Decimal("0.25"), "MNQZ6",
+        )
+        self.assertEqual(dec26.canonical.contract_symbol, "MNQZ6")
         with self.assertRaisesRegex(NinjaTraderObservationError, "CONTRACT_NOT_FOUND"):
-            NinjaTraderContract("MNQ", "MNQ DEC26", "2026-12", "CME", Decimal("0.25"), "x")
+            NinjaTraderContract("MNQ", "MNQ NOV26", "2026-11", "CME", Decimal("0.25"), "MNQX6")
         with self.assertRaisesRegex(NinjaTraderObservationError, "CONTRACT_NOT_FOUND"):
             NinjaTraderContract("MNQ", "MNQ SEPT26", "2026-09", "CME", Decimal("0.5"), "x")
 

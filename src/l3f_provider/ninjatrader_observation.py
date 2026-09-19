@@ -322,8 +322,25 @@ class NinjaTraderContract:
     point_value: Decimal | None = None
 
     def __post_init__(self) -> None:
-        if self.master_instrument != "MNQ" or self.exchange != "CME" or self.expiration != "2026-09":
-            raise NinjaTraderObservationError(ProviderErrorCode.CONTRACT_NOT_FOUND, "mnq_sep26_required")
+        if self.master_instrument != "MNQ" or self.exchange != "CME":
+            raise NinjaTraderObservationError(
+                ProviderErrorCode.CONTRACT_NOT_FOUND,
+                "mnq_versioned_contract_required",
+            )
+        if self.expiration == "2026-12":
+            if (
+                self.native_full_name != "MNQ DEC26"
+                or self.internal_contract_id not in {"MNQ DEC26", "MNQZ6"}
+            ):
+                raise NinjaTraderObservationError(
+                    ProviderErrorCode.CONTRACT_NOT_FOUND,
+                    "mnq_dec26_identity",
+                )
+        elif self.expiration != "2026-09":
+            raise NinjaTraderObservationError(
+                ProviderErrorCode.CONTRACT_NOT_FOUND,
+                "mnq_versioned_contract_required",
+            )
         _text(self.native_full_name, "Native contract name")
         _text(self.internal_contract_id, "NinjaTrader contract identity")
         if _decimal(self.tick_size, "Tick size", positive=True) != Decimal("0.25"):
@@ -333,6 +350,8 @@ class NinjaTraderContract:
 
     @property
     def canonical(self) -> MNQContract:
+        if self.expiration == "2026-12":
+            return MNQContract("MNQZ6", "2026-12", "CME", LaneIIIInstrument.MNQ)
         return MNQContract("MNQU6", "2026-09", "CME", LaneIIIInstrument.MNQ)
 
 
