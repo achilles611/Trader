@@ -93,6 +93,15 @@ This is an offline semantic/fixture proof, not proof of the current Sim101
 account. Current positions, working orders, realized/unrealized totals,
 unresolved executions, and restart continuity remain fresh-account gates.
 
+Durable receipt:
+`H:\PongPeriodic\20260919\dec26-risk-continuity-proof-v1\result.json`
+
+- Receipt SHA-256: `EBB6AD0E464DC4845E0962E382DFFB248810E19B250B3EC023AFC1BEE459C649`.
+- Hash-bound artifact SHA-256: `9AD7DF00E94BC1788A50A623621A3933BB9D52CE4D1D01BD2DAA259648D92CA5`.
+- Generic SEP26 refusal: `RISK_CONTINUITY_ACCOUNT_IDENTITY_MISMATCH`.
+- DEC26 proof: entry count `1`, realized P&L `5.00`, lockout preserved,
+  artifact round-trip `true`, native dispatches `0`.
+
 ## Replay accounting and receipts
 
 ### Existing SEP26 historical fixture
