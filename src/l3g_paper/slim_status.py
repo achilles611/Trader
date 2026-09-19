@@ -195,11 +195,12 @@ def _active_blockers(
     complete, healthy Sim101 position and protection state.
     """
     blockers: list[str] = []
+    expected_instrument = runtime.get("market_instrument", runtime.get("instrument", "MNQ SEP26"))
     expected = {
         "mode": "PAPER_SIM101",
         "paper_account": "Sim101",
         "account_class": "LOCAL_SIMULATION",
-        "market_instrument": "MNQ SEP26",
+        "market_instrument": expected_instrument,
         "maximum_quantity": 1,
         "live_capital": "DENIED",
     }

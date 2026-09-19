@@ -127,6 +127,7 @@ class PaperRiskAuthority:
         self.profile = profile
         self.binding = binding
         self.policy = policy
+        self._session_contract = binding.canonical_contract
         self._perpetual_position_profile = (
             type(profile) is FiveMinutePerpetualPaperRiskProfile
             and type(policy) is FiveMinutePerpetualPaperPolicyArtifact
@@ -163,13 +164,17 @@ class PaperRiskAuthority:
 
     def _context(self, snapshot: PaperRiskSnapshot, at: str):
         if self._legacy_session_identity(snapshot.session_kind, snapshot.session_id):
-            return PaperSessionResolver().resolve(at, generation=snapshot.session_generation).context
+            return PaperSessionResolver(
+                session_contract=self._session_contract,
+            ).resolve(at, generation=snapshot.session_generation).context
         # Compact risk snapshots carry the authenticated session identity but
         # not the calendar authority. Re-resolve the evaluation instant and
         # accept its calendar state only when every identity coordinate still
         # matches the snapshot. This preserves the legacy holiday fence while
         # preventing a different current session from being substituted.
-        resolved = PaperSessionResolver().resolve(
+        resolved = PaperSessionResolver(
+            session_contract=self._session_contract,
+        ).resolve(
             at, generation=snapshot.session_generation,
         ).context
         if (
@@ -187,11 +192,15 @@ class PaperRiskAuthority:
 
     def _inside_entry_session(self, at: datetime, snapshot: PaperRiskSnapshot | None = None) -> bool:
         if snapshot is None:
-            return PaperSessionResolver().resolve(at).entry_authorized
+            return PaperSessionResolver(
+                session_contract=self._session_contract,
+            ).resolve(at).entry_authorized
         return self._context(snapshot, at.isoformat()).entry_permitted_at(at)
 
     def hard_flat_due(self, at: str) -> bool:
-        resolution = PaperSessionResolver().resolve(at)
+        resolution = PaperSessionResolver(
+            session_contract=self._session_contract,
+        ).resolve(at)
         return resolution.context.hard_flat_due_at(self._time(at))
 
     def maximum_age_due(self, snapshot: PaperRiskSnapshot, at: str) -> bool:
@@ -208,7 +217,11 @@ class PaperRiskAuthority:
         if snapshot.account_name != self.binding.account_name or snapshot.account_class != self.binding.account_class or snapshot.account_match_count != 1:
             reasons.append("EXACT_SIM101_BINDING_REQUIRED")
         if snapshot.instrument != self.binding.instrument or snapshot.canonical_contract != self.binding.canonical_contract or snapshot.tick_size != self.profile.tick_size or snapshot.instrument_match_count != 1:
-            reasons.append("EXACT_MNQ_SEP26_BINDING_REQUIRED")
+            reasons.append(
+                "EXACT_MNQ_SEP26_BINDING_REQUIRED"
+                if self.binding.canonical_contract == "MNQU6"
+                else "EXACT_MNQ_DEC26_BINDING_REQUIRED"
+            )
         if snapshot.foreign_activity:
             reasons.append("FOREIGN_ACTIVITY_LOCKOUT")
         return reasons

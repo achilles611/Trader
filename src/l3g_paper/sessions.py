@@ -263,6 +263,7 @@ class PaperSessionContext:
     session_profile_hash: str
     session_generation: int
     calendar_state: PaperCalendarState = PaperCalendarState.NORMAL
+    session_contract: str = PAPER_SESSION_CONTRACT
 
     def __post_init__(self) -> None:
         profile = SESSION_PROFILES[self.session_kind]
@@ -276,10 +277,18 @@ class PaperSessionContext:
             raise ValueError("Paper session generation must be a non-negative integer.")
         if self.session_profile_hash != profile.profile_hash:
             raise ValueError("Paper session profile hash does not match the compiled profile.")
+        contract = self.session_contract
+        if self.session_id.startswith("MNQZ6:"):
+            contract = "MNQZ6"
+        elif self.session_id.startswith(f"{PAPER_SESSION_CONTRACT}:"):
+            contract = PAPER_SESSION_CONTRACT
+        if contract not in {PAPER_SESSION_CONTRACT, "MNQZ6"}:
+            raise ValueError("Paper session contract is unsupported.")
+        object.__setattr__(self, "session_contract", contract)
         if self.session_kind is PaperSessionKind.OFF_SESSION:
-            if not self.session_id.startswith(f"{PAPER_SESSION_CONTRACT}:OFF_SESSION:"):
+            if not self.session_id.startswith(f"{contract}:OFF_SESSION:"):
                 raise ValueError("OFF_SESSION identity is malformed.")
-        elif self.session_id != f"{PAPER_SESSION_CONTRACT}:{self.session_kind.value}:{self.trade_date}":
+        elif self.session_id != f"{contract}:{self.session_kind.value}:{self.trade_date}":
             raise ValueError("Paper market session ID is malformed.")
         if (self.observation_start, self.entry_start, self.entry_cutoff, self.hard_flat_deadline, self.session_end) != (
             profile.observation_start, profile.entry_start, profile.entry_cutoff, profile.hard_flat_deadline, profile.session_end,
@@ -287,7 +296,7 @@ class PaperSessionContext:
             raise ValueError("Paper session context cannot alter a compiled profile.")
 
     def payload(self) -> dict[str, object]:
-        return {
+        result = {
             "session_kind": self.session_kind.value,
             "session_family": self.session_family.value,
             "session_id": self.session_id,
@@ -302,6 +311,9 @@ class PaperSessionContext:
             "session_generation": self.session_generation,
             "calendar_state": self.calendar_state.value,
         }
+        if self.session_contract != PAPER_SESSION_CONTRACT:
+            result["canonical_contract"] = self.session_contract
+        return result
 
     @property
     def session_family(self) -> PaperSessionFamily:
@@ -359,13 +371,17 @@ def context_from_identity(
     session_generation: int,
     *,
     calendar_state: PaperCalendarState = PaperCalendarState.NORMAL,
+    session_contract: str | None = None,
 ) -> PaperSessionContext:
     """Rehydrate and validate the compact identity carried by paper records."""
     profile = SESSION_PROFILES[session_kind]
+    resolved_contract = session_contract
+    if resolved_contract is None:
+        resolved_contract = "MNQZ6" if session_id.startswith("MNQZ6:") else PAPER_SESSION_CONTRACT
     return PaperSessionContext(
         session_kind, session_id, trade_date, profile.timezone, profile.observation_start,
         profile.entry_start, profile.entry_cutoff, profile.hard_flat_deadline, profile.session_end,
-        session_profile_hash, session_generation, calendar_state,
+        session_profile_hash, session_generation, calendar_state, resolved_contract,
     )
 
 
@@ -473,15 +489,22 @@ class PaperSessionResolver:
     future calendar or timezone-rule change cannot silently change identity.
     """
 
-    def __init__(self, calendar: PaperSessionCalendar | None = None) -> None:
+    def __init__(
+        self,
+        calendar: PaperSessionCalendar | None = None,
+        *,
+        session_contract: str = PAPER_SESSION_CONTRACT,
+    ) -> None:
+        if session_contract not in {PAPER_SESSION_CONTRACT, "MNQZ6"}:
+            raise ValueError("Paper session contract is unsupported.")
         self.calendar = calendar or PaperSessionCalendar()
+        self.session_contract = session_contract
         self._last_event_at: datetime | None = None
 
-    @staticmethod
-    def _off_context(local: datetime, generation: int, state: PaperCalendarState) -> PaperSessionContext:
+    def _off_context(self, local: datetime, generation: int, state: PaperCalendarState) -> PaperSessionContext:
         return PaperSessionContext(
             PaperSessionKind.OFF_SESSION,
-            f"{PAPER_SESSION_CONTRACT}:OFF_SESSION:{local.date().isoformat()}",
+            f"{self.session_contract}:OFF_SESSION:{local.date().isoformat()}",
             local.date().isoformat(), NEW_YORK_TIMEZONE, "00:00", "00:00", "00:00", "00:00", "00:00",
             OFF_SESSION_PROFILE.profile_hash, generation, state,
         )
@@ -536,10 +559,10 @@ class PaperSessionResolver:
             return PaperSessionResolution(self._off_context(local, generation, closed), False, reason)
         state = self.calendar.state_for(trade_day)
         context = PaperSessionContext(
-            profile.session_kind, f"{PAPER_SESSION_CONTRACT}:{profile.session_kind.value}:{trade_day.isoformat()}",
+            profile.session_kind, f"{self.session_contract}:{profile.session_kind.value}:{trade_day.isoformat()}",
             trade_day.isoformat(), profile.timezone, profile.observation_start, profile.entry_start,
             profile.entry_cutoff, profile.hard_flat_deadline, profile.session_end, profile.profile_hash,
-            generation, state,
+            generation, state, self.session_contract,
         )
         if state is PaperCalendarState.HOLIDAY_OVERRIDE_REQUIRED:
             return PaperSessionResolution(context, False, "HOLIDAY_SESSION_UNVERIFIED")

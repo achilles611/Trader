@@ -26,7 +26,10 @@ from typing import BinaryIO, Callable, Iterator, Mapping, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from src.l3g_paper.contracts import resolve_paper_profile
+from src.l3g_paper.contracts import (
+    paper_contract_identity_matches,
+    resolve_paper_profile,
+)
 from src.l3g_paper.profile_switch import (
     PROFILE_SWITCH_SCHEMA,
     _manifest as validated_profile_switch_manifest,
@@ -779,9 +782,24 @@ def _runtime_binding_matches_launcher(
 
 
 def validate_paper_authority(actual: Mapping[str, object]) -> None:
-    """Refuse a backend that is not the sealed one-contract Sim101 runtime."""
+    """Refuse a backend outside the versioned Sim101 paper contract allow-list."""
+    expected_authority = dict(_PAPER_AUTHORITY)
+    actual_instrument = actual.get("market_instrument", _PAPER_AUTHORITY["market_instrument"])
+    has_canonical = "canonical_contract" in actual
+    actual_canonical = actual.get(
+        "canonical_contract",
+        "MNQZ6" if actual_instrument == "MNQ DEC26" else "MNQU6",
+    )
+    expected_authority["market_instrument"] = actual_instrument
+    if not paper_contract_identity_matches(actual_instrument, actual_canonical):
+        raise RuntimeError(
+            "The service on 127.0.0.1:8090 is not the exact Sim101 / LOCAL_SIMULATION / "
+            "versioned MNQ paper authority (unknown or mixed contract identity)."
+        )
+    if has_canonical:
+        expected_authority["canonical_contract"] = actual_canonical
     mismatches: list[str] = []
-    for key, value in _PAPER_AUTHORITY.items():
+    for key, value in expected_authority.items():
         actual_value = actual.get(key)
         if key == "maximum_quantity":
             matches = type(actual_value) is int and actual_value == value
@@ -792,7 +810,7 @@ def validate_paper_authority(actual: Mapping[str, object]) -> None:
     if mismatches:
         raise RuntimeError(
             "The service on 127.0.0.1:8090 is not the exact Sim101 / LOCAL_SIMULATION / "
-            f"MNQ SEP26 / quantity 1 / live-denied paper authority ({', '.join(mismatches)})."
+            f"versioned MNQ paper / quantity 1 / live-denied paper authority ({', '.join(mismatches)})."
         )
 
 

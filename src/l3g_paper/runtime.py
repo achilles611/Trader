@@ -24,12 +24,12 @@ from src.lane_iii.contracts import canonical_hash, normalized_utc
 
 from .contracts import (
     ACTIVE_PROTECTIVE_ORDER_STATES,
-    CAPABILITY,
     FIVE_MINUTE_ENTRY_PROFILE_VERSION,
     FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
     PAPER_ENTRY_PROFILE_VERSION,
     PONG_ENTRY_PROFILE_VERSION,
     BookCompleteness,
+    ExecutionCapabilityManifest,
     PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS,
     PAPER_ACCOUNT_DAILY_LOSS_POLICY_ID,
     PAPER_ACCOUNT_DAILY_LOSS_POLICY_PROVENANCE,
@@ -400,7 +400,11 @@ class LaneIIIPaperRuntime:
             raise ValueError("Paper runtime requires the exact durable ledger.")
         self.ledger = ledger
         self.policy = policy or ExperimentalPaperPolicy(ledger.policy)
-        self.risk = risk or PaperRiskAuthority(profile=ledger.risk, policy=self.policy.artifact)
+        self.risk = risk or PaperRiskAuthority(
+            profile=ledger.risk,
+            binding=ledger.binding,
+            policy=self.policy.artifact,
+        )
         if type(self.policy) is not ExperimentalPaperPolicy or type(self.risk) is not PaperRiskAuthority:
             raise ValueError("Paper runtime components must retain exact authority types.")
         if not (
@@ -411,8 +415,12 @@ class LaneIIIPaperRuntime:
             raise ValueError("Paper runtime, risk, and ledger policy identities must match.")
         if self.ledger.risk.configuration_hash != self.risk.profile.configuration_hash:
             raise ValueError("Paper runtime, risk, and ledger risk identities must match.")
+        self._instrument = self.risk.binding.instrument
+        self._canonical_contract = self.risk.binding.canonical_contract
+        self._session_contract = self._canonical_contract
+        self._capability = ExecutionCapabilityManifest(instrument=self._instrument)
         self.authority = PaperAuthorityBundle(
-            self.policy.artifact, self.risk.profile, self.risk.binding, CAPABILITY,
+            self.policy.artifact, self.risk.profile, self.risk.binding, self._capability,
         )
         self._perpetual_position_profile = (
             type(self.policy.artifact) is FiveMinutePerpetualPaperPolicyArtifact
@@ -487,8 +495,12 @@ class LaneIIIPaperRuntime:
         self._disarm_after_flat = False
         self._transport: PaperExecutionTransport | None = None
         self._adapter: NinjaTraderSim101PaperAdapter | None = None
-        self._snapshot = PaperRiskSnapshot(_now())
-        self._session_resolver = PaperSessionResolver()
+        self._snapshot = PaperRiskSnapshot(
+            _now(),
+            instrument=self._instrument,
+            canonical_contract=self._canonical_contract,
+        )
+        self._session_resolver = PaperSessionResolver(session_contract=self._session_contract)
         self._session_context = UNSPECIFIED_OFF_SESSION_CONTEXT
         self._session_generation = 0
         self._armed_session: PaperSessionArmGrant | None = None
@@ -3282,7 +3294,7 @@ class LaneIIIPaperRuntime:
             authority.get("runtime_quantity") == 0,
             authority.get("account") == "Sim101",
             authority.get("environment") == "LOCAL_SIMULATION",
-            authority.get("instrument") == "MNQ SEP26",
+            authority.get("instrument") in {"MNQ SEP26", "MNQ DEC26"},
             authority.get("broker_position") == PaperDirection.FLAT.value,
             authority.get("broker_quantity") == 0,
             authority.get("working_orders") == 0,
@@ -3339,12 +3351,11 @@ class LaneIIIPaperRuntime:
                 self._reconciliation_recovery_lease_id = None
                 self._entries_paused = True
 
-    @staticmethod
-    def _recovery_reconciliation_payload_safe(payload: Mapping[str, object]) -> bool:
+    def _recovery_reconciliation_payload_safe(self, payload: Mapping[str, object]) -> bool:
         return all((
             payload.get("account_name") == "Sim101",
             payload.get("account_class") == "LOCAL_SIMULATION",
-            payload.get("instrument") == "MNQ SEP26",
+            payload.get("instrument") == getattr(self, "_instrument", "MNQ SEP26"),
             payload.get("position_quantity") == 0,
             payload.get("working_order_count") == 0,
             payload.get("working_entry_count") == 0,
@@ -3379,7 +3390,10 @@ class LaneIIIPaperRuntime:
                 if (
                     payload.get("account_name"), payload.get("account_class"),
                     payload.get("instrument"), payload.get("capability"),
-                ) != ("Sim101", "LOCAL_SIMULATION", "MNQ SEP26", "PAPER_ONLY"):
+                ) != (
+                    "Sim101", "LOCAL_SIMULATION",
+                    getattr(self, "_instrument", "MNQ SEP26"), "PAPER_ONLY",
+                ):
                     raise RuntimeError("RECONCILIATION_RECOVERY_CONFLICTING_AUTHORITY")
                 continue
             if kind == "SESSION_TRANSITION":
@@ -3484,7 +3498,7 @@ class LaneIIIPaperRuntime:
                 "reconciliation": evidence_coordinate,
                 "account": "Sim101",
                 "environment": "LOCAL_SIMULATION",
-                "instrument": "MNQ SEP26",
+                "instrument": self._instrument,
                 "maximum_quantity": 1,
                 "live_capital": "DENIED",
                 "locked_out": False,
@@ -4082,7 +4096,7 @@ class LaneIIIPaperRuntime:
                     or snapshot.unresolved_native_order or snapshot.unresolved_execution
                     or not snapshot.position_snapshot_complete or not snapshot.order_snapshot_complete
                     or not snapshot.reconciliation_current
-                    or (snapshot.account_name, snapshot.account_class, snapshot.instrument) != ('Sim101', 'LOCAL_SIMULATION', 'MNQ SEP26')
+                    or (snapshot.account_name, snapshot.account_class, snapshot.instrument) != ('Sim101', 'LOCAL_SIMULATION', self._instrument)
                     or snapshot.account_match_count != 1 or snapshot.instrument_match_count != 1
                     or transport is None or not transport.authenticated_client
                     or not transport.reconciled or not transport.addon_provenance_valid):
@@ -4202,7 +4216,7 @@ class LaneIIIPaperRuntime:
         if (
             self._snapshot.account_name != "Sim101"
             or self._snapshot.account_class != "LOCAL_SIMULATION"
-            or self._snapshot.instrument != "MNQ SEP26"
+            or self._snapshot.instrument != self._instrument
             or self._snapshot.account_match_count != 1
             or self._snapshot.instrument_match_count != 1
         ):
@@ -4292,7 +4306,7 @@ class LaneIIIPaperRuntime:
                 "paper_execution": "DISARMED",
                 "account": "Sim101",
                 "environment": "LOCAL_SIMULATION",
-                "instrument": "MNQ SEP26",
+                "instrument": self._instrument,
                 "maximum_quantity": 1,
                 "live_capital": "DENIED",
                 "transport": None if transport is None else {
@@ -4454,7 +4468,7 @@ class LaneIIIPaperRuntime:
             },
             "account": "Sim101",
             "environment": "LOCAL_SIMULATION",
-            "instrument": "MNQ SEP26",
+            "instrument": self._instrument,
             "maximum_quantity": 1,
             "live_capital": "DENIED",
             "locked_out": False,
@@ -7162,8 +7176,7 @@ class LaneIIIPaperRuntime:
             raise RuntimeError("RISK_CONTINUITY_LEDGER_PROFILE_INVALID")
         return profile.selection_key
 
-    @staticmethod
-    def _risk_context_allowed(context: PaperSessionContext, profile: str) -> bool:
+    def _risk_context_allowed(self, context: PaperSessionContext, profile: str) -> bool:
         if context.session_kind is not PaperSessionKind.OFF_SESSION:
             return True
         return (
@@ -7174,12 +7187,11 @@ class LaneIIIPaperRuntime:
             }
             and context.trade_date != "1970-01-01"
             and context.session_id
-            == f"MNQU6:OFF_SESSION:{context.trade_date}"
+            == f"{self._session_contract}:OFF_SESSION:{context.trade_date}"
         )
 
-    @staticmethod
     def _legacy_pnl_context(
-        record: Mapping[str, object], payload: Mapping[str, object],
+        self, record: Mapping[str, object], payload: Mapping[str, object],
     ) -> PaperSessionContext:
         if all(key in payload for key in (
             "session_kind", "session_id", "trade_date", "session_profile_hash", "session_generation",
@@ -7188,7 +7200,9 @@ class LaneIIIPaperRuntime:
         entry_timestamp = payload.get("entry_timestamp")
         if isinstance(entry_timestamp, str) and entry_timestamp:
             generation = record.get("session_generation")
-            resolution = PaperSessionResolver().resolve(
+            resolution = PaperSessionResolver(
+                session_contract=self._session_contract,
+            ).resolve(
                 entry_timestamp, generation=generation if type(generation) is int else 0,
             )
             if resolution.context.session_kind is not PaperSessionKind.OFF_SESSION:
@@ -7397,7 +7411,7 @@ class LaneIIIPaperRuntime:
                         != self.risk.profile.configuration_hash
                         or payload.get("account") != "Sim101"
                         or payload.get("environment") != "LOCAL_SIMULATION"
-                        or payload.get("instrument") != "MNQ SEP26"
+                        or payload.get("instrument") != self._instrument
                         or payload.get("maximum_quantity") != 1
                         or payload.get("live_capital") != "DENIED"
                         or payload.get("locked_out") is not False
@@ -7532,7 +7546,7 @@ class LaneIIIPaperRuntime:
                         != self.risk.profile.configuration_hash
                         or payload.get("account") != "Sim101"
                         or payload.get("environment") != "LOCAL_SIMULATION"
-                        or payload.get("instrument") != "MNQ SEP26"
+                        or payload.get("instrument") != self._instrument
                         or payload.get("maximum_quantity") != 1
                         or payload.get("live_capital") != "DENIED"
                         or payload.get("locked_out") is not False
@@ -7708,7 +7722,7 @@ class LaneIIIPaperRuntime:
                         != self.risk.profile.configuration_hash
                         or payload.get("account") != "Sim101"
                         or payload.get("environment") != "LOCAL_SIMULATION"
-                        or payload.get("instrument") != "MNQ SEP26"
+                        or payload.get("instrument") != self._instrument
                         or payload.get("maximum_quantity") != 1
                         or payload.get("live_capital") != "DENIED"
                         or payload.get("locked_out") is not False
@@ -7863,7 +7877,7 @@ class LaneIIIPaperRuntime:
                     or payload.get("operator") != "Joseph"
                     or payload.get("account") != "Sim101"
                     or payload.get("environment") != "LOCAL_SIMULATION"
-                    or payload.get("instrument") != "MNQ SEP26"
+                    or payload.get("instrument") != self._instrument
                     or payload.get("maximum_quantity") != 1
                     or payload.get("live_capital") != "DENIED"
                     or payload.get("locked_out") is not False
@@ -8103,7 +8117,15 @@ class LaneIIIPaperRuntime:
                 "entry_execution_ids": sorted(self._entry_execution_ids),
                 "exit_execution_ids": sorted(self._exit_execution_ids),
             }
-        return validate_risk_continuity_snapshot(snapshot)
+        return validate_risk_continuity_snapshot(
+            snapshot,
+            expected_identity=(
+                self.risk.binding.account_name,
+                self.risk.binding.account_class,
+                self.risk.binding.instrument,
+            ),
+            session_canonical_contract=self._canonical_contract,
+        )
 
     def _request_five_minute_reversal_entry(self, reversal: PaperDecision) -> None:
         """Enter the opposite side only after signed flat/order reconciliation."""
@@ -8289,7 +8311,9 @@ class LaneIIIPaperRuntime:
         addon_match = transport_status is not None and transport_status.addon_provenance_valid
         if not addon_match:
             blocking.append("ADDON_BUILD_MISMATCH")
-        current = PaperSessionResolver().resolve(at, generation=context.session_generation).context
+        current = PaperSessionResolver(
+            session_contract=self._session_contract,
+        ).resolve(at, generation=context.session_generation).context
         session_current = (
             context.session_kind is not PaperSessionKind.OFF_SESSION
             and self._ownership_context_matches(context, current)
@@ -8724,7 +8748,7 @@ class LaneIIIPaperRuntime:
                                 "historical_trade_date_entry_count": self._snapshot.trade_date_entry_count,
                                 "risk_accounting_trade_date": self._snapshot.trade_date,
                                 "reason": "AUTHORIZED_CONTINUOUS_SCALPER_V2_PAPER_POLICY",
-                                "scope": "Sim101 / LOCAL_SIMULATION / MNQ SEP26 / MAXIMUM_QUANTITY_1",
+                                "scope": f"Sim101 / LOCAL_SIMULATION / {self._instrument} / MAXIMUM_QUANTITY_1",
                                 "live_capital": "DENIED",
                             },
                             identity="l3g-continuous-scalper-policy-applied-" + canonical_hash({
@@ -8925,7 +8949,7 @@ class LaneIIIPaperRuntime:
                 "binding": {
                     "account": "Sim101",
                     "account_class": "LOCAL_SIMULATION",
-                    "instrument": "MNQ SEP26",
+                    "instrument": self._instrument,
                     "maximum_quantity": 1,
                     "live_capital": "DENIED",
                 },
@@ -9006,7 +9030,9 @@ class LaneIIIPaperRuntime:
             return {"armed": False, "reason_codes": reasons, "state": self._state.value}
         context = self._session_context
         now = _now()
-        current = PaperSessionResolver().resolve(now, generation=context.session_generation)
+        current = PaperSessionResolver(
+            session_contract=self._session_contract,
+        ).resolve(now, generation=context.session_generation)
         if (
             not continuous_operation
             and (
@@ -9390,7 +9416,9 @@ class LaneIIIPaperRuntime:
                 self._abort_unsubmitted_commissioning(reasons[0])
                 return {"submitted": False, "reason_codes": reasons, "state": self._state.value}
             context = self._session_context
-            current = self._session_resolver.resolve(now, generation=context.session_generation).context
+            current = PaperSessionResolver(
+                session_contract=self._session_contract,
+            ).resolve(now, generation=context.session_generation).context
             if (
                 context.session_kind is PaperSessionKind.OFF_SESSION
                 or not self._ownership_context_matches(context, ownership.context)
@@ -10063,7 +10091,9 @@ class LaneIIIPaperRuntime:
                 value for (session_id, _), value in self._session_pnl.items()
                 if session_id == context.session_id
             )
-            next_context = PaperSessionResolver().next_valid_session(status_now, generation=context.session_generation)
+            next_context = PaperSessionResolver(
+                session_contract=self._session_contract,
+            ).next_valid_session(status_now, generation=context.session_generation)
             market_freshness = {
                 "quote": self._freshness_gate(
                     self._snapshot.quote_observed_at, self.risk.profile.quote_maximum_age_seconds, status_now,
@@ -10090,7 +10120,10 @@ class LaneIIIPaperRuntime:
                 "sequence_authority": "LOCAL_CALLBACK_ORDER_ONLY",
                 "book_completeness": "UNVERIFIED",
                 "market_connection": "LucidFlex",
-                "market_instrument": "MNQ SEP26",
+                "market_instrument": self._instrument,
+                "canonical_contract": self._canonical_contract,
+                "contract_topology_version": self.ledger.contract_topology.version,
+                "contract_topology_hash": self.ledger.contract_topology.binding_hash,
                 "paper_account": "Sim101",
                 "account_class": "LOCAL_SIMULATION",
                 "maximum_quantity": 1,
@@ -10234,7 +10267,7 @@ class LaneIIIPaperRuntime:
                 "account_trade_date_loss_policy": {
                     "policy_id": PAPER_ACCOUNT_DAILY_LOSS_POLICY_ID,
                     "limit_dollars": str(PAPER_ACCOUNT_DAILY_LOSS_LIMIT_DOLLARS),
-                    "scope": "Sim101 / MNQ SEP26 / EXCHANGE_TRADE_DATE / ALL_PROFILES",
+                    "scope": f"Sim101 / {self._instrument} / EXCHANGE_TRADE_DATE / ALL_PROFILES",
                     "provenance": PAPER_ACCOUNT_DAILY_LOSS_POLICY_PROVENANCE,
                     "broker_daily_loss_limit": "DISABLED; INTERNAL CEILING IS STRICTER",
                 },

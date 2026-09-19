@@ -37,6 +37,7 @@ from .contracts import (
     FIVE_MINUTE_PERPETUAL_ENTRY_PROFILE_VERSION,
     PAPER_PROFILE_CATALOG,
     PaperProfileDefinition,
+    paper_contract_identity_matches,
     resolve_paper_profile,
 )
 from .ledger import (
@@ -78,6 +79,15 @@ _LEGACY_SESSION_BOUND_SCALPER_POLICY_HASH = "7077c30bdeb3b8017b5d8049ed32b92eb3a
 _LEGACY_SESSION_BOUND_SCALPER_RISK_HASH = "c86c2c2b39f7fef9fcdaed06978ab22141eeacd2cf1590f2a8cddee0c5b17404"
 _SCALPER_POLICY_REVISION = "SCALPER_V2_CONTINUOUS_EXECUTION_POLICY_REVISION"
 _SCALPER_POLICY_REVISION_CLOSE_SCHEMA = "l3g-scalper-policy-revision-source-close-v1"
+
+
+def _runtime_contract_identity_matches(paper: Mapping[str, object]) -> bool:
+    instrument = paper.get("market_instrument", paper.get("instrument", "MNQ SEP26"))
+    canonical = paper.get(
+        "canonical_contract",
+        "MNQZ6" if instrument == "MNQ DEC26" else "MNQU6",
+    )
+    return paper_contract_identity_matches(instrument, canonical)
 _ACTIVE_STAGES = frozenset({
     "PREPARING", "STOPPING_CURRENT", "AWAITING_FLAT", "SHUTDOWN_REQUESTED",
     "VERIFYING_STARTUP_SEED", "STARTING_TARGET", "TARGET_PROCESS_CREATED",
@@ -1005,7 +1015,7 @@ class PaperProfileSwitchService:
                 or paper.get("live_capital") != "DENIED"
                 or paper.get("paper_account") != "Sim101"
                 or paper.get("account_class") != "LOCAL_SIMULATION"
-                or paper.get("market_instrument") != "MNQ SEP26"
+                or not _runtime_contract_identity_matches(paper)
             ):
                 raise RuntimeError("PROFILE_SWITCH_CURRENT_RUNTIME_IDENTITY_MISMATCH")
             source_policy_hash: str | None = None
@@ -1572,7 +1582,7 @@ def _target_paper_identity_matches(
         and paper.get("mode") == "PAPER_SIM101"
         and paper.get("paper_account") == "Sim101"
         and paper.get("account_class") == "LOCAL_SIMULATION"
-        and paper.get("market_instrument") == "MNQ SEP26"
+        and _runtime_contract_identity_matches(paper)
         and type(paper.get("maximum_quantity")) is int
         and paper.get("maximum_quantity") == 1
         and paper.get("live_capital") == "DENIED"

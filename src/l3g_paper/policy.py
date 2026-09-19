@@ -118,7 +118,9 @@ class ExperimentalPaperPolicy:
         self._lock = threading.RLock()
         self._market_session_id: str | None = None
         self._paper_session_context = UNSPECIFIED_OFF_SESSION_CONTEXT
-        self._session_resolver = PaperSessionResolver()
+        self._session_resolver = PaperSessionResolver(
+            session_contract=artifact.canonical_contract,
+        )
         self._last_local_sequence: int | None = None
         self._last_receipt_time: datetime | None = None
         self._transport_state = StreamHealth.UNKNOWN
@@ -181,9 +183,8 @@ class ExperimentalPaperPolicy:
     def _payload_hash(observation: NinjaTraderObservation) -> str:
         return canonical_hash(dict(observation.payload))
 
-    @staticmethod
-    def _contract_matches(observation: NinjaTraderObservation) -> bool:
-        return observation.payload.get("contract_id") == "MNQ SEP26"
+    def _contract_matches(self, observation: NinjaTraderObservation) -> bool:
+        return observation.payload.get("contract_id") == self.artifact.native_contract
 
     def _clear_provisional(self) -> None:
         self._quotes.clear()

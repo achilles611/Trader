@@ -22,10 +22,13 @@ def _gate_error(code: str, message: str, *, launch_auto: bool = False) -> None:
 
 def _runtime_reconciled(runtime: Mapping[str, object]) -> bool:
     transport = runtime.get("transport")
+    expected_instrument = runtime.get(
+        "market_instrument", runtime.get("instrument", "MNQ SEP26"),
+    )
     return (
         runtime.get("account") == "Sim101"
         and runtime.get("account_class") == "LOCAL_SIMULATION"
-        and runtime.get("instrument") == "MNQ SEP26"
+        and runtime.get("market_instrument", runtime.get("instrument")) == expected_instrument
         and runtime.get("current_position") == "FLAT"
         and runtime.get("current_position_quantity") == 0
         and runtime.get("broker_snapshot_position") == "FLAT"
@@ -46,7 +49,7 @@ def _runtime_reconciled(runtime: Mapping[str, object]) -> bool:
         and transport.get("reconciled") is True
         and transport.get("account") == "Sim101"
         and transport.get("account_class") == "LOCAL_SIMULATION"
-        and transport.get("instrument") == "MNQ SEP26"
+        and transport.get("instrument") == expected_instrument
         and transport.get("live_capital") == "DENIED"
     )
 

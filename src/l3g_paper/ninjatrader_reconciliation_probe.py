@@ -21,7 +21,12 @@ import time
 from typing import Mapping, Sequence
 from uuid import uuid4
 
-from .contracts import ACCOUNT_BINDING, canonical_json
+from .contracts import (
+    PAPER_INSTRUMENT,
+    canonical_json,
+    paper_binding_for_topology,
+    paper_contract_topology,
+)
 from .ninjatrader_transport import (
     ADDON_PROTOCOL_VERSION,
     EXECUTION_HOST,
@@ -203,6 +208,7 @@ def _validate_hello(
     expected_source_fingerprint: str,
     expected_build_fingerprint: str | None = None,
     expected_build_timestamp: str | None = None,
+    expected_instrument: str = PAPER_INSTRUMENT,
     reference_time: datetime | None = None,
 ) -> tuple[datetime, str, str]:
     if set(payload) != _HELLO_FIELDS:
@@ -218,7 +224,7 @@ def _validate_hello(
     if (
         payload.get("account_name"), payload.get("account_class"),
         payload.get("instrument"), payload.get("capability"),
-    ) != ("Sim101", "LOCAL_SIMULATION", "MNQ SEP26", "PAPER_ONLY"):
+    ) != ("Sim101", "LOCAL_SIMULATION", expected_instrument, "PAPER_ONLY"):
         _refuse("HELLO_IDENTITY_MISMATCH")
     for name in ("bridge_instance_id", "ninjatrader_session_id", "nonce"):
         _required_text(payload.get(name), "HELLO_IDENTITY_INVALID")
@@ -249,6 +255,7 @@ def _validate_probe_grant(
     payload: Mapping[str, object],
     *,
     key: bytes,
+    expected_binding_hash: str | None = None,
     reference_time: datetime | None = None,
 ) -> tuple[str, str, datetime]:
     if set(payload) != _PROBE_GRANT_FIELDS:
@@ -266,8 +273,11 @@ def _validate_probe_grant(
     server_nonce = _required_text(
         payload.get("server_nonce"), "PROBE_GRANT_IDENTITY_INVALID",
     )
+    expected_binding_hash = expected_binding_hash or paper_binding_for_topology(
+        paper_contract_topology(PAPER_INSTRUMENT, "MNQU6"),
+    ).binding_hash
     if (
-        payload.get("account_binding_hash") != ACCOUNT_BINDING.binding_hash
+        payload.get("account_binding_hash") != expected_binding_hash
         or payload.get("mode") != "PAPER_SIM101"
         or payload.get("live_capital") is not False
     ):
@@ -285,6 +295,7 @@ def _validate_probe_result(
     key: bytes,
     probe_session_id: str,
     server_nonce: str,
+    expected_instrument: str = PAPER_INSTRUMENT,
     reference_time: datetime | None = None,
 ) -> tuple[int, datetime]:
     if set(payload) != _PROBE_RESULT_FIELDS:
@@ -320,7 +331,7 @@ def _validate_probe_result(
     if (
         payload.get("account_name"), payload.get("account_class"),
         payload.get("instrument"),
-    ) != ("Sim101", "LOCAL_SIMULATION", "MNQ SEP26"):
+    ) != ("Sim101", "LOCAL_SIMULATION", expected_instrument):
         _refuse("PROBE_RESULT_IDENTITY_MISMATCH")
     if type(payload.get("position_quantity")) is not int or payload.get("position_quantity") != 0:
         _refuse("PROBE_RESULT_NOT_FLAT")
@@ -404,6 +415,8 @@ def probe_flat_sim101_reconciliation(
     timeout_seconds: float = 15.0,
     _test_endpoint: tuple[str, int] | None = None,
     _test_secret: bytes | None = None,
+    expected_instrument: str = PAPER_INSTRUMENT,
+    expected_canonical_contract: str | None = None,
 ) -> dict[str, object]:
     """Prove two stable native flat observations without runtime authority."""
 
@@ -418,6 +431,12 @@ def probe_flat_sim101_reconciliation(
     key = _secret(_test_secret)
     paper_policy_hash = _required_hash(paper_policy_hash, "PAPER_POLICY_HASH_INVALID")
     risk_profile_hash = _required_hash(risk_profile_hash, "RISK_PROFILE_HASH_INVALID")
+    canonical_contract = expected_canonical_contract or (
+        "MNQU6" if expected_instrument == PAPER_INSTRUMENT else "MNQZ6"
+    )
+    binding_hash = paper_binding_for_topology(
+        paper_contract_topology(expected_instrument, canonical_contract),
+    ).binding_hash
     source_fingerprint = _required_hash(
         expected_addon_source_fingerprint(), "EXPECTED_SOURCE_FINGERPRINT_INVALID",
     )
@@ -461,6 +480,7 @@ def probe_flat_sim101_reconciliation(
                 hello_time, build_fingerprint, build_timestamp = _validate_hello(
                     hello, key=key,
                     expected_source_fingerprint=source_fingerprint,
+                    expected_instrument=expected_instrument,
                 )
                 candidate_build = (build_fingerprint, build_timestamp)
                 if observed_build is None:
@@ -487,16 +507,19 @@ def probe_flat_sim101_reconciliation(
                     "message_type": "RECONCILIATION_PROBE_GRANT",
                     "probe_session_id": probe_session_id,
                     "server_nonce": server_nonce,
-                    "account_binding_hash": ACCOUNT_BINDING.binding_hash,
+                    "account_binding_hash": binding_hash,
                     "mode": "PAPER_SIM101",
                     "live_capital": False,
                     "timestamp": _utc_now(),
                 }, key, deadline)
-                _, _, grant_time = _validate_probe_grant(grant, key=key)
+                _, _, grant_time = _validate_probe_grant(
+                    grant, key=key, expected_binding_hash=binding_hash,
+                )
                 result = reader.read()
                 generation, result_time = _validate_probe_result(
                     result, key=key, probe_session_id=probe_session_id,
                     server_nonce=server_nonce,
+                    expected_instrument=expected_instrument,
                 )
                 if not hello_time <= grant_time <= result_time:
                     _refuse("PROBE_FRAME_TIME_ORDER_INVALID")
@@ -547,7 +570,7 @@ def probe_flat_sim101_reconciliation(
         "requested_context": {
             "paper_policy_hash": paper_policy_hash,
             "risk_profile_hash": risk_profile_hash,
-            "account_binding_hash": ACCOUNT_BINDING.binding_hash,
+            "account_binding_hash": binding_hash,
             "mode": "PAPER_SIM101",
             "live_capital": False,
         },
@@ -590,6 +613,8 @@ def validate_flat_sim101_reconciliation_proof(
     expected_at: str | datetime | None = None,
     _test_endpoint: tuple[str, int] | None = None,
     _test_secret: bytes | None = None,
+    expected_instrument: str = PAPER_INSTRUMENT,
+    expected_canonical_contract: str | None = None,
 ) -> dict[str, object]:
     """Cryptographically and semantically revalidate one status-only proof."""
 
@@ -622,6 +647,12 @@ def validate_flat_sim101_reconciliation_proof(
         expected_policy_hash, "EXPECTED_POLICY_HASH_INVALID",
     )
     expected_risk_hash = _required_hash(expected_risk_hash, "EXPECTED_RISK_HASH_INVALID")
+    canonical_contract = expected_canonical_contract or (
+        "MNQU6" if expected_instrument == PAPER_INSTRUMENT else "MNQZ6"
+    )
+    binding_hash = paper_binding_for_topology(
+        paper_contract_topology(expected_instrument, canonical_contract),
+    ).binding_hash
     reference_time = _expected_moment(expected_at)
     completed = _fresh_timestamp(
         proof.get("completed_at"), RECONCILIATION_MAXIMUM_AGE_SECONDS,
@@ -657,7 +688,7 @@ def validate_flat_sim101_reconciliation_proof(
     if not isinstance(context, Mapping) or dict(context) != {
         "paper_policy_hash": expected_policy_hash,
         "risk_profile_hash": expected_risk_hash,
-        "account_binding_hash": ACCOUNT_BINDING.binding_hash,
+        "account_binding_hash": binding_hash,
         "mode": "PAPER_SIM101",
         "live_capital": False,
     }:
@@ -699,6 +730,7 @@ def validate_flat_sim101_reconciliation_proof(
             _refuse("PROOF_OBSERVATION_HASH_MISMATCH")
         hello_time, _, _ = _validate_hello(
             hello, key=key, expected_source_fingerprint=source_fingerprint,
+            expected_instrument=expected_instrument,
             expected_build_fingerprint=observed_build_fingerprint,
             expected_build_timestamp=observed_build_timestamp,
             reference_time=reference_time,
@@ -713,7 +745,8 @@ def validate_flat_sim101_reconciliation_proof(
             _refuse("PROOF_HELLO_NONCE_REPLAY")
         hello_nonces.add(hello_nonce)
         probe_id, grant_nonce, grant_time = _validate_probe_grant(
-            grant, key=key, reference_time=reference_time,
+            grant, key=key, expected_binding_hash=binding_hash,
+            reference_time=reference_time,
         )
         if probe_id in probe_ids or grant_nonce in grant_nonces:
             _refuse("PROOF_GRANT_REPLAY")
@@ -722,6 +755,7 @@ def validate_flat_sim101_reconciliation_proof(
         generation, result_time = _validate_probe_result(
             result, key=key, probe_session_id=probe_id,
             server_nonce=grant_nonce, reference_time=reference_time,
+            expected_instrument=expected_instrument,
         )
         if not hello_time <= grant_time <= result_time:
             _refuse("PROOF_FRAME_TIME_ORDER_INVALID")

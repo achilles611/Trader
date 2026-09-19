@@ -25,19 +25,21 @@ class NinjaScriptSourceTests(unittest.TestCase):
     def test_execution_source_is_exact_sim101_closed_action_only(self) -> None:
         source = (Path(__file__).parents[1] / "ninjatrader" / "NinjaScript" / "AddOns" / "BeelzebubPaperExecutionAddOn.cs").read_text(encoding="utf-8")
         for required in (
-            'ExactAccountName = "Sim101"', 'ExactInstrumentName = "MNQ SEP26"',
+            'ExactAccountName = "Sim101"', 'ResolveExactInstrumentName()',
+            'return "MNQ SEP26"', 'return "MNQ DEC26"',
             "MaximumQuantity = 1", "HMACSHA256", "Account.All", "CreateOrder(",
             ".Submit(", ".Cancel(", "BZ-L3G-E-", "BZ-L3G-S-", "BZ-L3G-X-",
             "SubmitOwnedFlattenOrder(",
         ):
             self.assertIn(required, source)
         for forbidden in (
-            "Lucid25kflex01", "AccountSelector", "GetEnvironmentVariable", "FlattenEverything",
+            "Lucid25kflex01", "AccountSelector", "FlattenEverything",
             "CancelAllOrders", "AtmStrategy", "quantity > 1", "fallbackPort",
             "LiveExecutionMode", "NinjaTraderLiveAdapter", "LucidExecutionAdapter",
             ".Flatten(",
         ):
             self.assertNotIn(forbidden, source)
+        self.assertIn('"BEELZEBUB_L3G_PAPER_CONTRACT_TOPOLOGY"', source)
         for denial in (
             "INVALID_SIGNATURE_OR_SCHEMA", "DUPLICATE_JSON_KEY", "OVERSIZED_FRAME",
             "WRONG_EXECUTION_SESSION", "STALE_OR_FUTURE_COMMAND", "COMMAND_EXPIRED",
@@ -429,9 +431,14 @@ class NinjaScriptSourceTests(unittest.TestCase):
         ]
         self.assertEqual(set(re.findall(r'"([a-z_]+)"', grant_array)), expected_grant_fields)
         self.assertIn(
-            'ExactAccountBindingHash = "28ddf4acc88f1a9e35de79b8306a252e647a5a1dca0a6e9333ce814828e6841e"',
+            '"28ddf4acc88f1a9e35de79b8306a252e647a5a1dca0a6e9333ce814828e6841e"',
             source,
         )
+        self.assertIn(
+            '"a60c2febafc3cbda33d262dc4342a1a39d3b7cc43397c4996cd0ec0cc93454b6"',
+            source,
+        )
+        self.assertIn("ResolveExactAccountBindingHash()", source)
         self.assertIn('Text(grant, "account_binding_hash"), ExactAccountBindingHash', probe)
         self.assertIn('Text(grant, "mode"), "PAPER_SIM101"', probe)
         self.assertIn('Boolean(grant, "live_capital") != false', probe)

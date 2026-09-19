@@ -16,6 +16,12 @@ from types import MappingProxyType
 from typing import Mapping, Protocol, runtime_checkable
 
 from src.lane_iii.contracts import canonical_hash, normalized_utc
+from .pong_contract import (
+    DEC26_TOPOLOGY,
+    PongContractTopology,
+    SEP26_TOPOLOGY,
+    topology_for_identity,
+)
 from .sessions import (
     PaperSessionKind,
     UNSPECIFIED_OFF_SESSION_CONTEXT,
@@ -65,6 +71,77 @@ PAPER_ACCOUNT_DAILY_LOSS_POLICY_PROVENANCE = (
 PAPER_NATIVE_CONTRACT = "MNQ SEP26"
 PAPER_MAXIMUM_QUANTITY = 1
 ACTIVE_PROTECTIVE_ORDER_STATES = frozenset({"ACCEPTED", "WORKING"})
+
+
+def paper_contract_topology(
+    instrument: object,
+    canonical_contract: object,
+) -> PongContractTopology:
+    """Resolve the only two supported paper contract epochs.
+
+    This is deliberately an allow-list, not a configurable string binding:
+    SEP26 remains the legacy default and DEC26 is a separately hashed,
+    versioned topology.  Unknown or mixed identities fail closed.
+    """
+    topology = topology_for_identity(instrument, canonical_contract)
+    if topology is None:
+        raise ValueError("PAPER_CONTRACT_TOPOLOGY_IDENTITY_MISMATCH")
+    return topology
+
+
+def paper_contract_identity_matches(instrument: object, canonical_contract: object) -> bool:
+    return topology_for_identity(instrument, canonical_contract) is not None
+
+
+def paper_policy_for_topology(
+    policy: "PaperPolicyArtifactType", topology: PongContractTopology,
+) -> "PaperPolicyArtifactType":
+    """Clone one compiled policy for an explicitly selected contract epoch."""
+    paper_contract_topology(topology.native_instrument, topology.canonical_contract)
+    return replace(
+        policy,
+        native_contract=topology.native_instrument,
+        canonical_contract=topology.canonical_contract,
+    )
+
+
+def paper_risk_for_topology(
+    risk: "PaperRiskProfileType", topology: PongContractTopology,
+) -> "PaperRiskProfileType":
+    """Clone one compiled risk envelope for an explicitly selected epoch."""
+    paper_contract_topology(topology.native_instrument, topology.canonical_contract)
+    return replace(
+        risk,
+        instrument=topology.native_instrument,
+        canonical_contract=topology.canonical_contract,
+    )
+
+
+def paper_binding_for_topology(topology: PongContractTopology) -> "ExecutionAccountBinding":
+    paper_contract_topology(topology.native_instrument, topology.canonical_contract)
+    return ExecutionAccountBinding(
+        instrument=topology.native_instrument,
+        canonical_contract=topology.canonical_contract,
+    )
+
+
+def validate_paper_contract_coherence(
+    policy: "PaperPolicyArtifactType",
+    risk: "PaperRiskProfileType",
+    binding: "ExecutionAccountBinding",
+    capability: "ExecutionCapabilityManifest",
+) -> PongContractTopology:
+    """Reject mixed policy/risk/account/capability contract bundles."""
+    topology = paper_contract_topology(binding.instrument, binding.canonical_contract)
+    expected = (topology.native_instrument, topology.canonical_contract)
+    if (
+        (policy.native_contract, policy.canonical_contract) != expected
+        or (risk.instrument, risk.canonical_contract) != expected
+        or (capability.instrument, capability.account_name, capability.account_class)
+        != (topology.native_instrument, topology.account_name, topology.account_class)
+    ):
+        raise ValueError("PAPER_CONTRACT_TOPOLOGY_BUNDLE_MISMATCH")
+    return topology
 
 
 class PaperDecisionKind(StrEnum):
@@ -236,8 +313,8 @@ class PaperPolicyArtifact:
             raise ValueError("The paper policy identity is immutable.")
         if self.authority != "EXPERIMENTAL_PAPER_DIRECTION_ONLY" or self.scientific_eligibility:
             raise ValueError("The paper policy cannot acquire scientific or execution authority.")
-        if self.native_contract != PAPER_NATIVE_CONTRACT or self.canonical_contract != PAPER_CANONICAL_CONTRACT:
-            raise ValueError("The paper policy requires exact MNQ SEP26 identity.")
+        if not paper_contract_identity_matches(self.native_contract, self.canonical_contract):
+            raise ValueError("The paper policy requires one exact versioned MNQ identity.")
         if self.allowed_hypotheses != (
             HypothesisKind.BULLISH_REVERSAL,
             HypothesisKind.BEARISH_CONTINUATION,
@@ -329,8 +406,8 @@ class HighConfidencePaperPolicyArtifact:
             raise ValueError("The high-confidence paper policy identity is immutable.")
         if self.authority != "EXPERIMENTAL_PAPER_DIRECTION_ONLY" or self.scientific_eligibility:
             raise ValueError("The high-confidence paper policy cannot acquire scientific or execution authority.")
-        if self.native_contract != PAPER_NATIVE_CONTRACT or self.canonical_contract != PAPER_CANONICAL_CONTRACT:
-            raise ValueError("The high-confidence paper policy requires exact MNQ SEP26 identity.")
+        if not paper_contract_identity_matches(self.native_contract, self.canonical_contract):
+            raise ValueError("The high-confidence paper policy requires one exact versioned MNQ identity.")
         if (
             self.entry_session_kind is not PaperSessionKind.NEW_YORK_RTH
             or self.entry_support_threshold != Decimal("0.675")
@@ -402,8 +479,8 @@ class FiveMinutePaperPolicyArtifact(PaperPolicyArtifact):
             raise ValueError("The five-minute paper policy identity is immutable.")
         if self.authority != "EXPERIMENTAL_PAPER_DIRECTION_ONLY" or self.scientific_eligibility:
             raise ValueError("The five-minute policy cannot acquire scientific or execution authority.")
-        if self.native_contract != PAPER_NATIVE_CONTRACT or self.canonical_contract != PAPER_CANONICAL_CONTRACT:
-            raise ValueError("The five-minute policy requires exact MNQ SEP26 identity.")
+        if not paper_contract_identity_matches(self.native_contract, self.canonical_contract):
+            raise ValueError("The five-minute policy requires one exact versioned MNQ identity.")
         if self.allowed_hypotheses != (
             HypothesisKind.BULLISH_REVERSAL,
             HypothesisKind.BEARISH_CONTINUATION,
@@ -482,8 +559,7 @@ class FiveMinutePerpetualPaperPolicyArtifact(FiveMinutePaperPolicyArtifact):
         if (
             self.authority != "EXPERIMENTAL_PAPER_DIRECTION_ONLY"
             or self.scientific_eligibility
-            or self.native_contract != PAPER_NATIVE_CONTRACT
-            or self.canonical_contract != PAPER_CANONICAL_CONTRACT
+            or not paper_contract_identity_matches(self.native_contract, self.canonical_contract)
             or self.allowed_hypotheses != (
                 HypothesisKind.BULLISH_REVERSAL,
                 HypothesisKind.BEARISH_CONTINUATION,
@@ -524,7 +600,10 @@ class PongPaperPolicyArtifact(PaperPolicyArtifact):
     duration_seconds: int = 3600
 
     def __post_init__(self) -> None:
-        expected = PaperPolicyArtifact().payload()
+        expected = PaperPolicyArtifact(
+            native_contract=self.native_contract,
+            canonical_contract=self.canonical_contract,
+        ).payload()
         expected.update({
             "schema": "lane-iii-pong-bounded-paper-policy-v1",
             "policy_id": "l3g-beelzebub-pong-discernment-policy-v1",
@@ -613,8 +692,10 @@ class PaperRiskProfile:
     def __post_init__(self) -> None:
         identity = (self.schema, self.profile_id, self.mode, self.account_name, self.account_class, self.instrument, self.canonical_contract)
         required = (PAPER_RISK_SCHEMA, PAPER_RISK_PROFILE_ID, PAPER_MODE, PAPER_ACCOUNT, PAPER_ACCOUNT_CLASS, PAPER_INSTRUMENT, PAPER_CANONICAL_CONTRACT)
-        if identity != required:
-            raise ValueError("The Lane III-G risk identity is sealed to Sim101/MNQ SEP26.")
+        if identity[:5] != required[:5] or not paper_contract_identity_matches(
+            self.instrument, self.canonical_contract,
+        ):
+            raise ValueError("The Lane III-G risk identity requires one exact versioned MNQ contract.")
         if any((self.maximum_absolute_position != 1, self.maximum_entry_quantity != 1, not self.paper_only, self.approved_for_live)):
             raise ValueError("The paper risk profile cannot represent live or multi-contract authority.")
         if self.pyramiding or self.averaging or self.same_event_reversal:
@@ -705,8 +786,10 @@ class HighConfidencePaperRiskProfile:
             PAPER_MODE, PAPER_ACCOUNT, PAPER_ACCOUNT_CLASS, PAPER_INSTRUMENT,
             PAPER_CANONICAL_CONTRACT,
         )
-        if identity != required:
-            raise ValueError("The high-confidence risk identity is sealed to Sim101/MNQ SEP26.")
+        if identity[:5] != required[:5] or not paper_contract_identity_matches(
+            self.instrument, self.canonical_contract,
+        ):
+            raise ValueError("The high-confidence risk identity requires one exact versioned MNQ contract.")
         if any((self.maximum_absolute_position != 1, self.maximum_entry_quantity != 1, not self.paper_only, self.approved_for_live)):
             raise ValueError("The high-confidence risk profile cannot represent live or multi-contract authority.")
         if self.pyramiding or self.averaging or self.same_event_reversal:
@@ -780,8 +863,7 @@ class FiveMinutePaperRiskProfile(PaperRiskProfile):
             self.mode != PAPER_MODE
             or self.account_name != PAPER_ACCOUNT
             or self.account_class != PAPER_ACCOUNT_CLASS
-            or self.instrument != PAPER_INSTRUMENT
-            or self.canonical_contract != PAPER_CANONICAL_CONTRACT
+            or not paper_contract_identity_matches(self.instrument, self.canonical_contract)
             or self.maximum_absolute_position != 1
             or self.maximum_entry_quantity != 1
             or not self.paper_only
@@ -846,8 +928,7 @@ class FiveMinutePerpetualPaperRiskProfile(FiveMinutePaperRiskProfile):
             self.mode != PAPER_MODE
             or self.account_name != PAPER_ACCOUNT
             or self.account_class != PAPER_ACCOUNT_CLASS
-            or self.instrument != PAPER_INSTRUMENT
-            or self.canonical_contract != PAPER_CANONICAL_CONTRACT
+            or not paper_contract_identity_matches(self.instrument, self.canonical_contract)
             or self.maximum_absolute_position != 1
             or self.maximum_entry_quantity != 1
             or not self.paper_only
@@ -883,7 +964,10 @@ class PongPaperRiskProfile(FiveMinutePerpetualPaperRiskProfile):
     perpetual_position: bool = False
 
     def __post_init__(self) -> None:
-        expected = asdict(FiveMinutePerpetualPaperRiskProfile())
+        expected = asdict(FiveMinutePerpetualPaperRiskProfile(
+            instrument=self.instrument,
+            canonical_contract=self.canonical_contract,
+        ))
         expected.update(schema="lane-iii-pong-bounded-paper-risk-v1",
                         profile_id="l3g-beelzebub-pong-discernment-risk-v1",
                         perpetual_position=False)
@@ -922,7 +1006,11 @@ class ExecutionAccountBinding:
             self.maximum_quantity,
             self.paper_only,
             self.live_capital,
-        ) != (PAPER_ACCOUNT, PAPER_ACCOUNT_CLASS, PAPER_INSTRUMENT, PAPER_CANONICAL_CONTRACT, 1, True, False):
+        )[:2] != (PAPER_ACCOUNT, PAPER_ACCOUNT_CLASS) or not paper_contract_identity_matches(
+            self.instrument, self.canonical_contract,
+        ) or (
+            self.maximum_quantity, self.paper_only, self.live_capital
+        ) != (1, True, False):
             raise ValueError("No configurable or live account binding exists in Lane III-G.")
 
     def payload(self) -> dict[str, object]:
@@ -945,16 +1033,19 @@ class ExecutionCapabilityManifest:
     live_capital: bool = False
 
     def __post_init__(self) -> None:
-        if asdict(self) != {
+        expected = {
             "adapter": "NinjaTraderSim101PaperAdapter",
             "mode": PAPER_MODE,
             "account_class": PAPER_ACCOUNT_CLASS,
             "account_name": PAPER_ACCOUNT,
-            "instrument": PAPER_INSTRUMENT,
+            "instrument": self.instrument,
             "maximum_quantity": 1,
             "order_mutation": "PAPER_ONLY",
             "live_capital": False,
-        }:
+        }
+        if asdict(self) != expected or not paper_contract_identity_matches(
+            self.instrument, PAPER_CANONICAL_CONTRACT if self.instrument == PAPER_INSTRUMENT else DEC26_TOPOLOGY.canonical_contract,
+        ):
             raise ValueError("Only the compiled Sim101 paper capability may be registered.")
 
 
@@ -1104,8 +1195,14 @@ class PaperExecutionIntent:
     def __post_init__(self) -> None:
         if not self.intent_id.startswith("l3g-pi-") or not self.paper_decision_id.startswith("l3g-pd-"):
             raise ValueError("Paper intent identity is invalid.")
-        if self.instrument != PAPER_INSTRUMENT or self.requested_quantity != 1:
-            raise ValueError("Paper intents are sealed to one MNQ SEP26 contract.")
+        if (
+            not paper_contract_identity_matches(
+                self.instrument,
+                "MNQU6" if self.instrument == PAPER_INSTRUMENT else "MNQZ6",
+            )
+            or self.requested_quantity != 1
+        ):
+            raise ValueError("Paper intents are sealed to one known versioned MNQ contract.")
         _utc(self.created_at, "Paper intent time")
         _utc(self.expires_at, "Paper intent expiry")
         if self.target_position not in {PaperDirection.LONG, PaperDirection.SHORT, PaperDirection.FLAT}:
@@ -1241,8 +1338,15 @@ class PaperExecutionCommand:
             raise ValueError("Paper command identity or sequence is invalid.")
         if not self.session_id or not self.intent_id or not self.decision_id or not self.risk_grant_id:
             raise ValueError("Paper command provenance is incomplete.")
-        if (self.account_name, self.account_class, self.instrument) != (PAPER_ACCOUNT, PAPER_ACCOUNT_CLASS, PAPER_INSTRUMENT):
-            raise ValueError("Paper commands cannot target another account or instrument.")
+        if (
+            self.account_name != PAPER_ACCOUNT
+            or self.account_class != PAPER_ACCOUNT_CLASS
+            or not paper_contract_identity_matches(self.instrument, {
+                SEP26_TOPOLOGY.native_instrument: SEP26_TOPOLOGY.canonical_contract,
+                DEC26_TOPOLOGY.native_instrument: DEC26_TOPOLOGY.canonical_contract,
+            }.get(self.instrument))
+        ):
+            raise ValueError("Paper commands cannot target another account or mixed contract.")
         expected_quantity = 0 if self.action in {ExecutionAction.HEARTBEAT, ExecutionAction.RECONCILE, ExecutionAction.CANCEL_OWNED_ORDERS} else 1
         if self.quantity != expected_quantity:
             raise ValueError("Paper command quantity is fixed by its closed action.")
@@ -1329,14 +1433,25 @@ class PaperAuthorityBundle:
     binding: ExecutionAccountBinding = field(default_factory=ExecutionAccountBinding)
     capability: ExecutionCapabilityManifest = field(default_factory=ExecutionCapabilityManifest)
 
+    def __post_init__(self) -> None:
+        validate_paper_contract_coherence(
+            self.policy, self.risk, self.binding, self.capability,
+        )
+
     def authority_payload(self) -> dict[str, object]:
+        topology = validate_paper_contract_coherence(
+            self.policy, self.risk, self.binding, self.capability,
+        )
         return {
             "mode": PAPER_MODE,
             "scientific_eligibility": False,
             "paper_execution": "AVAILABLE",
-            "account": PAPER_ACCOUNT,
-            "account_class": PAPER_ACCOUNT_CLASS,
-            "instrument": PAPER_INSTRUMENT,
+            "account": self.binding.account_name,
+            "account_class": self.binding.account_class,
+            "instrument": self.binding.instrument,
+            "canonical_contract": self.binding.canonical_contract,
+            "contract_topology_version": topology.version,
+            "contract_topology_hash": topology.binding_hash,
             "maximum_quantity": 1,
             "live_capital": "DENIED",
             "entry_profile": self.policy.entry_profile,

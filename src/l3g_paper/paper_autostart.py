@@ -97,6 +97,7 @@ class PaperAutoStartService:
         poll_seconds: float = 0.5,
         clock: Callable[[], float] = time.monotonic,
         wait: Callable[[float], bool] | None = None,
+        expected_instrument: str = "MNQ SEP26",
     ) -> None:
         if min(
             startup_timeout_seconds, ledger_timeout_seconds,
@@ -139,6 +140,7 @@ class PaperAutoStartService:
         self._diagnostics: list[dict[str, str]] = []
         self._audit_healthy = True
         self._action_token = secrets.token_urlsafe(32)
+        self._expected_instrument = expected_instrument
 
     @property
     def action_token(self) -> str:
@@ -225,15 +227,17 @@ class PaperAutoStartService:
             return reason
         return "PERPETUAL_POSITION_NOT_PROVEN"
 
-    @staticmethod
-    def _base_start_failures(paper: Mapping[str, object]) -> list[str]:
+    def _base_start_failures(self, paper: Mapping[str, object]) -> list[str]:
         checks = (
             (paper.get("paper_execution") == "DISARMED", "PAPER_RUNTIME_NOT_DISARMED"),
             (paper.get("session_armed_state") == "DISARMED", "SESSION_AUTHORITY_NOT_DISARMED"),
             (paper.get("live_capital") == "DENIED", "LIVE_CAPITAL_NOT_DENIED"),
             (paper.get("paper_account") == "Sim101", "PAPER_ACCOUNT_NOT_SIM101"),
             (paper.get("account_class") == "LOCAL_SIMULATION", "ACCOUNT_NOT_LOCAL_SIMULATION"),
-            (paper.get("market_instrument") == "MNQ SEP26", "INSTRUMENT_NOT_MNQ_SEP26"),
+            (
+                paper.get("market_instrument") == self._expected_instrument,
+                "INSTRUMENT_NOT_" + self._expected_instrument.replace(" ", "_").upper(),
+            ),
             (paper.get("maximum_quantity") == 1, "MAXIMUM_QUANTITY_NOT_ONE"),
             (paper.get("current_position") == "FLAT", "POSITION_NOT_FLAT"),
             (paper.get("current_quantity") == 0, "POSITION_QUANTITY_NOT_ZERO"),
@@ -246,9 +250,8 @@ class PaperAutoStartService:
         )
         return [code for passed, code in checks if not passed]
 
-    @classmethod
-    def _ready_failures(cls, paper: Mapping[str, object], maintenance: Mapping[str, object]) -> list[str]:
-        failures = cls._base_start_failures(paper)
+    def _ready_failures(self, paper: Mapping[str, object], maintenance: Mapping[str, object]) -> list[str]:
+        failures = self._base_start_failures(paper)
         checks = (
             (paper.get("state") == "READY_DISARMED", "RUNTIME_NOT_READY_DISARMED"),
             (paper.get("broker_snapshot_position") == "FLAT", "BROKER_POSITION_NOT_FLAT"),

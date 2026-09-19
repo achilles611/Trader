@@ -155,8 +155,16 @@ class ReconciliationRecoveryService:
             raise RuntimeError("RECONCILIATION_RECOVERY_LEDGER_BINDING_MISMATCH")
         return runtime, transport, ledger
 
+    def _expected_instrument(self) -> str:
+        runtime = self._runtime_provider()
+        if type(runtime) is LaneIIIPaperRuntime:
+            return runtime.risk.binding.instrument
+        return "MNQ SEP26"
+
     @staticmethod
-    def request_template(authority_state_hash: object) -> dict[str, object]:
+    def request_template(
+        authority_state_hash: object, *, instrument: str = "MNQ SEP26",
+    ) -> dict[str, object]:
         return {
             "request_id": "incident-8631-recovery-<unique>",
             "operator": OPERATOR,
@@ -166,7 +174,7 @@ class ReconciliationRecoveryService:
             "order_identities": list(ORDER_IDENTITIES),
             "account": "Sim101",
             "environment": "LOCAL_SIMULATION",
-            "instrument": "MNQ SEP26",
+            "instrument": instrument,
             "operator_statement": OPERATOR_STATEMENT,
             "expected_lockout_reason": EXPECTED_LOCKOUT_REASON,
             "authority_state_hash": authority_state_hash,
@@ -192,7 +200,13 @@ class ReconciliationRecoveryService:
             "action_token": self._action_token,
             "authenticated_operator": OPERATOR,
             "authority": authority,
-            "request_template": self.request_template(authority.get("authority_state_hash")),
+            "request_template": self.request_template(
+                authority.get("authority_state_hash"),
+                instrument=(
+                    str(authority.get("instrument"))
+                    if authority.get("instrument") else "MNQ SEP26"
+                ),
+            ),
             "incident": dict(INCIDENT),
             "lockouts": [dict(value) for value in LOCKOUTS],
             "order_evidence": [dict(value) for value in ORDER_EVIDENCE],
@@ -203,7 +217,9 @@ class ReconciliationRecoveryService:
         }
 
     @staticmethod
-    def _validated_request(body: Mapping[str, object]) -> tuple[dict[str, object], str]:
+    def _validated_request(
+        body: Mapping[str, object], *, expected_instrument: str = "MNQ SEP26",
+    ) -> tuple[dict[str, object], str]:
         expected_keys = {
             "request_id", "operator", "incident_sequence", "incident_hash",
             "lockout_sequences", "order_identities", "account", "environment",
@@ -224,7 +240,7 @@ class ReconciliationRecoveryService:
             "order_identities": list(ORDER_IDENTITIES),
             "account": "Sim101",
             "environment": "LOCAL_SIMULATION",
-            "instrument": "MNQ SEP26",
+            "instrument": expected_instrument,
             "operator_statement": OPERATOR_STATEMENT,
             "expected_lockout_reason": EXPECTED_LOCKOUT_REASON,
         }
@@ -316,7 +332,9 @@ class ReconciliationRecoveryService:
         }
 
     def recover(self, body: Mapping[str, object]) -> dict[str, object]:
-        request, request_hash = self._validated_request(body)
+        request, request_hash = self._validated_request(
+            body, expected_instrument=self._expected_instrument(),
+        )
         request_id = str(request["request_id"])
         lease_id = "l3g-reconciliation-recovery-lease-" + canonical_hash({"request_id": request_id})
         with self._lock:
@@ -344,7 +362,7 @@ class ReconciliationRecoveryService:
                 "trace_evidence": dict(TRACE_EVIDENCE),
                 "binding": {
                     "account": "Sim101", "environment": "LOCAL_SIMULATION",
-                    "instrument": "MNQ SEP26", "maximum_quantity": 1,
+                    "instrument": runtime.risk.binding.instrument, "maximum_quantity": 1,
                     "live_capital": "DENIED",
                 },
                 "expected_active_lockout_reason": EXPECTED_LOCKOUT_REASON,
@@ -374,11 +392,15 @@ class ReconciliationRecoveryService:
                 proof = self._probe(
                     paper_policy_hash=runtime.policy.artifact.configuration_hash,
                     risk_profile_hash=runtime.risk.profile.configuration_hash,
+                    expected_instrument=runtime.risk.binding.instrument,
+                    expected_canonical_contract=runtime.risk.binding.canonical_contract,
                 )
                 validate_flat_sim101_reconciliation_proof(
                     proof,
                     expected_policy_hash=runtime.policy.artifact.configuration_hash,
                     expected_risk_hash=runtime.risk.profile.configuration_hash,
+                    expected_instrument=runtime.risk.binding.instrument,
+                    expected_canonical_contract=runtime.risk.binding.canonical_contract,
                 )
                 started = transport.start()
                 transport_stopped = False
@@ -401,6 +423,8 @@ class ReconciliationRecoveryService:
                     proof,
                     expected_policy_hash=runtime.policy.artifact.configuration_hash,
                     expected_risk_hash=runtime.risk.profile.configuration_hash,
+                    expected_instrument=runtime.risk.binding.instrument,
+                    expected_canonical_contract=runtime.risk.binding.canonical_contract,
                 )
                 evidence_digest = canonical_hash(proof)
                 result = runtime.complete_reconciliation_recovery(

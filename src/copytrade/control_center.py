@@ -56,7 +56,12 @@ from src.l3g_paper.pong_scheduler import (
     PONG_SCHEDULING_MODE_ENV,
     scheduling_config_from_environment,
 )
-from src.l3g_paper.contracts import PONG_ENTRY_PROFILE_VERSION, resolve_paper_profile
+from src.l3g_paper.contracts import (
+    PONG_ENTRY_PROFILE_VERSION,
+    paper_policy_for_topology,
+    paper_risk_for_topology,
+    resolve_paper_profile,
+)
 from src.l3g_paper.profile_switch import (
     PROFILE_SWITCH_ACTION_HEADER,
     PROFILE_SWITCH_ACTION_VALUE,
@@ -124,6 +129,7 @@ GRACEFUL_SHUTDOWN_ACTION_VALUE = "beezconsole-graceful-shutdown-v1"
 PONG_INDEPENDENT_COLLECTION_ENV = "BEELZEBUB_PONG_INDEPENDENT_COLLECTION"
 PONG_BOUNDED_ACTIVATION_ENV = "BEELZEBUB_PONG_BOUNDED_ACTIVATION"
 PONG_CONTRACT_TOPOLOGY_ENV = "BEELZEBUB_PONG_CONTRACT_TOPOLOGY"
+PAPER_CONTRACT_TOPOLOGY_ENV = "BEELZEBUB_L3G_PAPER_CONTRACT_TOPOLOGY"
 LEDGER_CAPACITY_RECOVERY_ACTION_HEADER = (
     "X-Beelzebub-Ledger-Capacity-Recovery-Action"
 )
@@ -1648,8 +1654,14 @@ def create_control_center_app(
     selected_paper_profile = resolve_paper_profile(
         configured_paper_profile
     )
-    selected_paper_policy = selected_paper_profile.policy
-    selected_paper_risk = selected_paper_profile.risk
+    configured_paper_topology = os.getenv(PAPER_CONTRACT_TOPOLOGY_ENV)
+    paper_topology = resolve_pong_topology(configured_paper_topology or "SEP26")
+    selected_paper_policy = paper_policy_for_topology(
+        selected_paper_profile.policy, paper_topology,
+    )
+    selected_paper_risk = paper_risk_for_topology(
+        selected_paper_profile.risk, paper_topology,
+    )
     risk_continuity_artifact: Mapping[str, object] | None = None
     configured_risk_continuity = os.getenv("BEELZEBUB_RISK_CONTINUITY_PATH")
     if configured_risk_continuity:
@@ -1850,6 +1862,10 @@ def create_control_center_app(
             else risk_continuity_artifact["artifact_sha256"]
         ),
         "profile_selection_source": profile_selection_source,
+        "market_instrument": selected_paper_policy.native_contract,
+        "canonical_contract": selected_paper_policy.canonical_contract,
+        "contract_topology_version": paper_topology.version,
+        "contract_topology_hash": paper_topology.binding_hash,
         "perpetual_startup_seed_operation_id": (
             None
             if perpetual_seed_artifact is None
@@ -2013,7 +2029,9 @@ def create_control_center_app(
                 "scientific_eligibility": False,
                 "paper_account": "Sim101",
                 "account_class": "LOCAL_SIMULATION",
-                "market_instrument": "MNQ SEP26",
+                "market_instrument": selected_paper_policy.native_contract,
+                "canonical_contract": selected_paper_policy.canonical_contract,
+                "contract_topology_version": paper_topology.version,
                 "maximum_quantity": 1,
                 "live_capital": "DENIED",
                 "entry_profile": selected_paper_policy.entry_profile,
@@ -2242,6 +2260,7 @@ def create_control_center_app(
         end_startup_observation_pause=end_startup_observation_pause,
         stop_operational_paper=stop_operational_paper_from_autostart,
         audit_path=audit_root / "paper-autostart-audit.jsonl",
+        expected_instrument=selected_paper_policy.native_contract,
     )
     reconciliation_recovery = ReconciliationRecoveryService(
         runtime_provider=lambda: ninjatrader_runtime.get("paper"),
@@ -2894,7 +2913,7 @@ def create_control_center_app(
             "last_depth_at": observer.get("last_depth_at"),
             "freshness": observer.get("market_observer_freshness"),
             "operator_guidance": None if observer_active else (
-                "Open the MNQ SEP26 chart, attach BeelzebubReadOnlyMarketObserver, and wait for ACTIVE."
+                f"Open the {selected_paper_policy.native_contract} chart, attach BeelzebubReadOnlyMarketObserver, and wait for ACTIVE."
             ),
         }
         reasons = [str(value) for value in result.get("blocking_reasons", [])]
@@ -3475,7 +3494,7 @@ def create_control_center_app(
                 transport.get("state"), transport.get("authenticated_client"),
                 transport.get("reconciled"), transport.get("account"),
                 transport.get("account_class"), transport.get("instrument"),
-            ) != ("AUTHENTICATED", True, True, "Sim101", "LOCAL_SIMULATION", "MNQ SEP26"):
+             ) != ("AUTHENTICATED", True, True, "Sim101", "LOCAL_SIMULATION", selected_paper_policy.native_contract):
                 raise HTTPException(status_code=409, detail="NinjaTrader desktop authentication is not operational.")
         return paper.arm()
 
@@ -3492,7 +3511,7 @@ def create_control_center_app(
                 transport.get("state"), transport.get("authenticated_client"),
                 transport.get("reconciled"), transport.get("account"),
                 transport.get("account_class"), transport.get("instrument"),
-            ) != ("AUTHENTICATED", True, True, "Sim101", "LOCAL_SIMULATION", "MNQ SEP26"):
+             ) != ("AUTHENTICATED", True, True, "Sim101", "LOCAL_SIMULATION", selected_paper_policy.native_contract):
                 raise HTTPException(status_code=409, detail="NinjaTrader desktop authentication is not operational.")
         if not isinstance(body, dict):
             raise HTTPException(status_code=400, detail="Commissioning entry requires its active lifecycle credential.")
@@ -3517,7 +3536,7 @@ def create_control_center_app(
                 transport.get("state"), transport.get("authenticated_client"),
                 transport.get("reconciled"), transport.get("account"),
                 transport.get("account_class"), transport.get("instrument"),
-            ) != ("AUTHENTICATED", True, True, "Sim101", "LOCAL_SIMULATION", "MNQ SEP26"):
+             ) != ("AUTHENTICATED", True, True, "Sim101", "LOCAL_SIMULATION", selected_paper_policy.native_contract):
                 raise HTTPException(status_code=409, detail="NinjaTrader desktop authentication is not operational.")
         return paper.commissioning_arm(require_commissioning_ledger_verification)
 
@@ -3548,7 +3567,7 @@ def create_control_center_app(
                 transport.get("state"), transport.get("authenticated_client"),
                 transport.get("reconciled"), transport.get("account"),
                 transport.get("account_class"), transport.get("instrument"),
-            ) != ("AUTHENTICATED", True, True, "Sim101", "LOCAL_SIMULATION", "MNQ SEP26"):
+             ) != ("AUTHENTICATED", True, True, "Sim101", "LOCAL_SIMULATION", selected_paper_policy.native_contract):
                 raise HTTPException(status_code=409, detail="NinjaTrader desktop authentication is not operational.")
         try:
             return paper.commissioning_start(
@@ -3579,7 +3598,7 @@ def create_control_center_app(
             if not isinstance(transport, Mapping) or (
                 transport.get("state"), transport.get("authenticated_client"), transport.get("reconciled"),
                 transport.get("account"), transport.get("account_class"), transport.get("instrument"),
-            ) != ("AUTHENTICATED", True, True, "Sim101", "LOCAL_SIMULATION", "MNQ SEP26"):
+             ) != ("AUTHENTICATED", True, True, "Sim101", "LOCAL_SIMULATION", selected_paper_policy.native_contract):
                 raise HTTPException(status_code=409, detail="NinjaTrader desktop authentication is not operational.")
         try:
             return paper.operational_paper_start(
@@ -3772,7 +3791,7 @@ def create_control_center_app(
                 transport.get("state"), transport.get("authenticated_client"),
                 transport.get("reconciled"), transport.get("account"),
                 transport.get("account_class"), transport.get("instrument"),
-            ) != ("AUTHENTICATED", True, True, "Sim101", "LOCAL_SIMULATION", "MNQ SEP26"):
+             ) != ("AUTHENTICATED", True, True, "Sim101", "LOCAL_SIMULATION", selected_paper_policy.native_contract):
                 raise HTTPException(status_code=409, detail="NinjaTrader desktop authentication is not operational.")
         return paper.commission_exit()
 

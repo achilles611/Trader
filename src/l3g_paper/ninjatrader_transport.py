@@ -18,8 +18,6 @@ from typing import Callable, Mapping
 from src.lane_iii.contracts import normalized_utc
 
 from .contracts import (
-    ACCOUNT_BINDING,
-    CAPABILITY,
     POLICY,
     RISK_PROFILE,
     ExecutionAction,
@@ -39,6 +37,7 @@ from .contracts import (
     PaperRiskGrant,
     PaperRiskProfile,
     PaperRiskProfileType,
+    paper_contract_identity_matches,
     canonical_json,
 )
 from .ledger import PaperLedger
@@ -55,7 +54,7 @@ EXECUTION_HOST = "127.0.0.1"
 EXECUTION_PORT = 48136
 EXECUTION_SCHEMA = "lane-iii-phase-g-paper-execution-v1"
 ADDON_PROTOCOL_VERSION = "l3g-paper-addon-provenance-v1"
-EXPECTED_ADDON_SOURCE_FINGERPRINT = "ded3309410f44aeb56018838fe1e59347c552664c4052cdab2bc56e9a71b2ef0"
+EXPECTED_ADDON_SOURCE_FINGERPRINT = "7f31b43e1ba5c7e0be3fdd4e9f56ce980814cdb6bf1cbfd19fd411db5fb521c6"
 MAXIMUM_FRAME_BYTES = 65536
 HELLO_MAXIMUM_AGE_SECONDS = 10
 FUTURE_TOLERANCE_SECONDS = 1
@@ -163,6 +162,7 @@ class ExecutionTransportStatus:
     heartbeat_send_lock_timeouts_at_session_start: int
     commands_sent_at_session_start: int
     pending_acknowledgements: int
+    instrument: str = "MNQ SEP26"
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -170,7 +170,8 @@ class ExecutionTransportStatus:
             "mode": "PAPER_SIM101",
             "account": "Sim101",
             "account_class": "LOCAL_SIMULATION",
-            "instrument": "MNQ SEP26",
+            "instrument": self.instrument,
+            "canonical_contract": "MNQZ6" if self.instrument == "MNQ DEC26" else "MNQU6",
             "maximum_quantity": 1,
             "scientific_eligibility": False,
             "paper_only": True,
@@ -232,6 +233,14 @@ class PaperExecutionTransport:
         self.ledger = ledger
         self.policy = policy
         self.risk = risk
+        self.binding = ledger.binding
+        if (
+            policy.native_contract != self.binding.instrument
+            or policy.canonical_contract != self.binding.canonical_contract
+            or risk.instrument != self.binding.instrument
+            or risk.canonical_contract != self.binding.canonical_contract
+        ):
+            raise ValueError("Execution transport and ledger contract identities must match.")
         self.secret_provider = secret_provider or LocalPaperSecretProvider()
         self.host = host
         self.port = port
@@ -303,6 +312,7 @@ class PaperExecutionTransport:
                 self._heartbeat_send_lock_timeouts_at_session_start,
                 self._commands_sent_at_session_start,
                 len(self._pending_acknowledgements),
+                self.binding.instrument,
             )
 
     def start(self, *, timeout_seconds: float = _START_TIMEOUT_SECONDS) -> ExecutionTransportStatus:
@@ -583,7 +593,7 @@ class PaperExecutionTransport:
         # unavailable. The normal path repeats it under that fence before
         # mutating reconciliation state.
         fallback_reconciliation_valid = (
-            message_type != "RECONCILIATION" or PaperExecutionTransport._validate_reconciliation(payload)
+            message_type != "RECONCILIATION" or self._validate_reconciliation(payload)
         )
         fallback_safety_message = message_type_text in _FALLBACK_SAFETY_MESSAGE_TYPES
         receipt_claimed = False
@@ -673,7 +683,7 @@ class PaperExecutionTransport:
             return
         if (
             payload.get("account_name"), payload.get("account_class"), payload.get("instrument"), payload.get("capability")
-        ) != ("Sim101", "LOCAL_SIMULATION", "MNQ SEP26", "PAPER_ONLY"):
+        ) != ("Sim101", "LOCAL_SIMULATION", self.binding.instrument, "PAPER_ONLY"):
             self._reject_frame("HELLO_CAPABILITY_MISMATCH")
             return
         if not all(isinstance(payload.get(key), str) and str(payload[key]).strip() for key in (
@@ -717,7 +727,7 @@ class PaperExecutionTransport:
             "server_nonce": uuid.uuid4().hex,
             "paper_policy_hash": self.policy.configuration_hash,
             "risk_profile_hash": self.risk.configuration_hash,
-            "account_binding_hash": ACCOUNT_BINDING.binding_hash,
+            "account_binding_hash": self.binding.binding_hash,
             "heartbeat_interval_seconds": HEARTBEAT_INTERVAL_SECONDS,
             "heartbeat_watchdog_seconds": HEARTBEAT_WATCHDOG_SECONDS,
             "command_ttl_seconds": self.policy.decision_ttl_seconds,
@@ -728,14 +738,13 @@ class PaperExecutionTransport:
         self._send_signed(response)
         self._notify_bridge("AUTHENTICATED")
 
-    @staticmethod
-    def _validate_reconciliation(payload: Mapping[str, object]) -> bool:
+    def _validate_reconciliation(self, payload: Mapping[str, object]) -> bool:
         working_order_count = payload.get("working_order_count")
         working_entry_count = payload.get("working_entry_count")
         return (
             payload.get("account_name") == "Sim101"
             and payload.get("account_class") == "LOCAL_SIMULATION"
-            and payload.get("instrument") == "MNQ SEP26"
+            and payload.get("instrument") == self.binding.instrument
             and type(payload.get("position_quantity")) is int
             and type(working_order_count) is int
             and type(working_entry_count) is int
@@ -841,7 +850,7 @@ class PaperExecutionTransport:
                 raise ValueError("Command sequence must be exactly monotonic.")
             if not grant.valid_at(_now()) or grant.grant_id != command.risk_grant_id or grant.intent_id != command.intent_id:
                 raise ValueError("A positive, current, matching paper risk grant is required.")
-            if command.policy_hash != self.policy.configuration_hash or command.risk_profile_hash != self.risk.configuration_hash or command.account_binding_hash != ACCOUNT_BINDING.binding_hash:
+            if command.policy_hash != self.policy.configuration_hash or command.risk_profile_hash != self.risk.configuration_hash or command.account_binding_hash != self.binding.binding_hash:
                 raise ValueError("Command authority hashes do not match the compiled paper authority.")
             perpetual = (
                 type(self.policy) is FiveMinutePerpetualPaperPolicyArtifact
@@ -871,7 +880,9 @@ class PaperExecutionTransport:
                         command.session_kind, command.session_id, command.trade_date,
                         command.session_profile_hash, command.session_generation,
                     )
-                    current = PaperSessionResolver().resolve(_now(), generation=command.session_generation)
+                    current = PaperSessionResolver(
+                        session_contract=self.binding.canonical_contract,
+                    ).resolve(_now(), generation=command.session_generation)
                     if (
                         current.context.session_kind is not context.session_kind
                         or current.context.session_id != context.session_id
@@ -960,7 +971,7 @@ class PaperExecutionTransport:
                 "armed": bool(armed),
                 "paper_policy_hash": self.policy.configuration_hash,
                 "risk_profile_hash": self.risk.configuration_hash,
-                "account_binding_hash": ACCOUNT_BINDING.binding_hash,
+                "account_binding_hash": self.binding.binding_hash,
                 "timestamp": sent_at,
             }
             payload["signature"] = sign_payload(key, payload)
@@ -1026,7 +1037,7 @@ class NinjaTraderSim101PaperAdapter(ExecutionVenueAdapter):
 
     @property
     def capability(self) -> ExecutionCapabilityManifest:
-        return CAPABILITY
+        return ExecutionCapabilityManifest(instrument=self.transport.binding.instrument)
 
     def submit(self, command: PaperExecutionCommand, grant: PaperRiskGrant) -> None:
         self.transport.send_command(command, grant)

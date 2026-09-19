@@ -1,6 +1,7 @@
 // Lane III-G experimental paper execution. This AddOn is compiled to one
-// account (Sim101), one instrument (MNQ SEP26), and one-contract authority.
-// It has no configurable account, instrument, quantity, or capital mode.
+// account (Sim101), one explicitly selected versioned MNQ instrument, and
+// one-contract authority.  SEP26 is the compatibility default; DEC26 is an
+// explicit process-topology selection and is never mixed with SEP26 state.
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -25,12 +26,13 @@ namespace NinjaTrader.NinjaScript.AddOns
         // Updated from the checked-in source before a NinjaTrader build.  The
         // Python bridge independently fingerprints the same source, so an old
         // compiled AddOn cannot be armed merely because its DLL timestamp is new.
-        private const string AddonSourceFingerprint = "ded3309410f44aeb56018838fe1e59347c552664c4052cdab2bc56e9a71b2ef0";
+        private const string AddonSourceFingerprint = "7f31b43e1ba5c7e0be3fdd4e9f56ce980814cdb6bf1cbfd19fd411db5fb521c6";
         private const string ExactAccountName = "Sim101";
         private const string ExactAccountClass = "LOCAL_SIMULATION";
-        private const string ExactInstrumentName = "MNQ SEP26";
+        private static readonly string ExactInstrumentName = ResolveExactInstrumentName();
+        private static readonly string ExactCanonicalContract = ResolveExactCanonicalContract();
         private const string ExactCapability = "PAPER_ONLY";
-        private const string ExactAccountBindingHash = "28ddf4acc88f1a9e35de79b8306a252e647a5a1dca0a6e9333ce814828e6841e";
+        private static readonly string ExactAccountBindingHash = ResolveExactAccountBindingHash();
         private const int Port = 48136;
         private const int MaximumFrameBytes = 65536;
         private const int MaximumQuantity = 1;
@@ -49,6 +51,34 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string OffSessionProfileHash = "168f289a5847781ccb7a09f2556c4b3aa03e6f767071dc061dc5e3211d3834eb";
         private const string ContinuousScalperPolicyHash = "872d9079f710ebaa58dbdec88db0d13b34822ed7b49ac69b9af63bffb1b280bf";
         private const string PerpetualPolicyHash = "daf3cc6daacdb32d5629fd6cbd97ef2246172426a00392f59f1246c567658fe7";
+
+        private static string SelectedTopology()
+        {
+            string value = Environment.GetEnvironmentVariable("BEELZEBUB_L3G_PAPER_CONTRACT_TOPOLOGY");
+            if (String.IsNullOrWhiteSpace(value)) return "SEP26";
+            return value.Trim().ToUpperInvariant();
+        }
+
+        private static string ResolveExactInstrumentName()
+        {
+            string topology = SelectedTopology();
+            if (topology == "SEP26" || topology == "PONG_CONTRACT_TOPOLOGY_SEP26_V1") return "MNQ SEP26";
+            if (topology == "DEC26" || topology == "PONG_CONTRACT_TOPOLOGY_DEC26_V1") return "MNQ DEC26";
+            throw new InvalidOperationException("PAPER_CONTRACT_TOPOLOGY_SELECTOR_UNKNOWN");
+        }
+
+        private static string ResolveExactCanonicalContract()
+        {
+            return String.Equals(ResolveExactInstrumentName(), "MNQ DEC26", StringComparison.Ordinal)
+                ? "MNQZ6" : "MNQU6";
+        }
+
+        private static string ResolveExactAccountBindingHash()
+        {
+            return String.Equals(ResolveExactCanonicalContract(), "MNQZ6", StringComparison.Ordinal)
+                ? "a60c2febafc3cbda33d262dc4342a1a39d3b7cc43397c4996cd0ec0cc93454b6"
+                : "28ddf4acc88f1a9e35de79b8306a252e647a5a1dca0a6e9333ce814828e6841e";
+        }
 
         private readonly object stateLock = new object();
         // Serializes the final stopping latch/account snapshot with every
@@ -1579,7 +1609,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 if (!String.Equals(family, expectedFamily, StringComparison.Ordinal)) return "COMMAND_SESSION_FAMILY_MISMATCH";
                 if (!String.Equals(profileHash, expectedHash, StringComparison.Ordinal)) return "SESSION_PROFILE_HASH_MISMATCH";
                 if (!String.Equals(tradeDate, expectedDate, StringComparison.Ordinal)
-                    || !String.Equals(sessionId, "MNQU6:" + expectedKind + ":" + expectedDate, StringComparison.Ordinal))
+                    || !String.Equals(sessionId, ExactCanonicalContract + ":" + expectedKind + ":" + expectedDate, StringComparison.Ordinal))
                     return "TRADE_DATE_MISMATCH";
                 if (Integer64(command, "session_generation", -1) < 0) return "SESSION_GENERATION_MISMATCH";
                 return null;
@@ -1627,7 +1657,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (!String.Equals(family, expectedFamily, StringComparison.Ordinal)) return "COMMAND_SESSION_FAMILY_MISMATCH";
             if (!String.Equals(profileHash, expectedHash, StringComparison.Ordinal)) return "SESSION_PROFILE_HASH_MISMATCH";
             if (!String.Equals(tradeDate, expectedDate, StringComparison.Ordinal)
-                || !String.Equals(sessionId, "MNQU6:" + expectedKind + ":" + expectedDate, StringComparison.Ordinal))
+                || !String.Equals(sessionId, ExactCanonicalContract + ":" + expectedKind + ":" + expectedDate, StringComparison.Ordinal))
                 return "TRADE_DATE_MISMATCH";
             if (!insideEntry) return "ENTRY_CUTOFF_PASSED";
             return null;
@@ -3656,7 +3686,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 DateTime local = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, NewYorkTimezone());
                 kind = "OFF_SESSION";
                 tradeDate = IsoDate(local);
-                sessionId = "MNQU6:OFF_SESSION:" + tradeDate;
+                sessionId = ExactCanonicalContract + ":OFF_SESSION:" + tradeDate;
                 profileHash = OffSessionProfileHash;
                 generation = 0;
             }

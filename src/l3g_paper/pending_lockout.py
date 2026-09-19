@@ -60,7 +60,7 @@ def validate_bundle(ledger: PaperLedger, bundle: Mapping[str, object]) -> dict[s
         if (original.get('ledger_identity') != ledger.ledger_identity
                 or original.get('ledger_epoch') != ledger.ledger_epoch
                 or (original.get('account'), original.get('account_class'), original.get('instrument'))
-                != ('Sim101', 'LOCAL_SIMULATION', 'MNQ SEP26')):
+                != ('Sim101', 'LOCAL_SIMULATION', ledger.binding.instrument)):
             raise ValueError('PENDING_LOCKOUT_ORIGINAL_BINDING_MISMATCH')
     else:
         raise ValueError('PENDING_LOCKOUT_SCHEMA_INVALID')
@@ -88,7 +88,7 @@ def validate_bundle(ledger: PaperLedger, bundle: Mapping[str, object]) -> dict[s
             or archived_lock.get('locked_out') is not True
             or paper.get('risk_continuity_fault') != PENDING_FAULT
             or (paper.get('paper_account'), paper.get('account_class'), paper.get('market_instrument'))
-            != ('Sim101', 'LOCAL_SIMULATION', 'MNQ SEP26')
+            != ('Sim101', 'LOCAL_SIMULATION', ledger.binding.instrument)
             or _time(original['created_at']) > _time(snapshot['captured_at'])):
         raise ValueError('PENDING_LOCKOUT_RUNTIME_ASSOCIATION_INVALID')
     anchor = ledger.record_by_sequence(source['risk_boundary_sequence'])
@@ -103,7 +103,7 @@ def validate_bundle(ledger: PaperLedger, bundle: Mapping[str, object]) -> dict[s
             'original_incident_at': original['created_at'], 'archived_runtime_observed_at': snapshot['captured_at'],
             'archived_runtime_artifact': loaded, 'risk_anchor_sequence': source['risk_boundary_sequence'],
             'risk_anchor_hash': source['risk_boundary_hash'], 'account': 'Sim101',
-            'account_class': 'LOCAL_SIMULATION', 'instrument': 'MNQ SEP26'}}
+            'account_class': 'LOCAL_SIMULATION', 'instrument': ledger.binding.instrument}}
 
 
 def require_verified_tip(ledger: PaperLedger, proof: Mapping[str, object], *, minimum: int = 1) -> None:

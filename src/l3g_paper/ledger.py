@@ -24,7 +24,6 @@ from uuid import uuid4
 from src.lane_iii.contracts import canonical_hash, normalized_utc
 
 from .contracts import (
-    ACCOUNT_BINDING,
     PAPER_RECORD_SCHEMA,
     POLICY,
     RISK_PROFILE,
@@ -40,6 +39,10 @@ from .contracts import (
     PaperPolicyArtifactType,
     PaperRiskProfile,
     PaperRiskProfileType,
+    ExecutionCapabilityManifest,
+    paper_binding_for_topology,
+    paper_contract_topology,
+    validate_paper_contract_coherence,
     known_paper_policy_identity,
 )
 from .sessions import (
@@ -216,8 +219,6 @@ _EPOCH_DIRECTORY = re.compile(r"^epoch-(\d+)$", re.IGNORECASE)
 _EPOCH_ID = re.compile(r"^L3G-PAPER-EPOCH-[A-Za-z0-9][A-Za-z0-9._-]*$")
 # The account binding is common to every compiled profile. Policy and risk
 # hashes are instance-bound because a profile switch always starts a new epoch.
-_ACCOUNT_BINDING_HASH = ACCOUNT_BINDING.binding_hash
-
 # Deferred records are still strictly ordered.  These bounds merely prevent a
 # failed or under-provisioned writer from turning the observer process into an
 # unbounded in-memory spool.
@@ -480,7 +481,13 @@ class CommissioningTailClassification:
 
 
 def _exact_keys(payload: Mapping[str, object], expected: frozenset[str]) -> bool:
-    return set(payload) == expected
+    actual = set(payload)
+    if actual == expected:
+        return True
+    # DEC26 session contexts carry their canonical contract explicitly.  Keep
+    # SEP26 historical envelopes byte-compatible while accepting that one
+    # additive identity field for the versioned topology.
+    return "session_id" in expected and actual == expected | {"canonical_contract"}
 
 
 def _is_hash(value: object) -> bool:
@@ -1164,6 +1171,16 @@ class PaperLedger:
         self.path = Path(path).resolve()
         self.policy = policy
         self.risk = risk
+        self.contract_topology = paper_contract_topology(
+            policy.native_contract, policy.canonical_contract,
+        )
+        self.binding = paper_binding_for_topology(self.contract_topology)
+        validate_paper_contract_coherence(
+            self.policy,
+            self.risk,
+            self.binding,
+            ExecutionCapabilityManifest(instrument=self.binding.instrument),
+        )
         self._paper_policy_hash = policy.configuration_hash
         self._risk_profile_hash = risk.configuration_hash
         self._path_preexisted = self.path.exists()
@@ -1708,7 +1725,7 @@ class PaperLedger:
             str(row["metadata_key"]): str(row["metadata_value"])
             for row in self._connection.execute(
                 "SELECT metadata_key, metadata_value FROM lane_iii_paper_ledger_metadata "
-                "WHERE metadata_key IN ('paper_policy_hash','risk_profile_hash','entry_profile','entry_profile_version')"
+                "WHERE metadata_key IN ('paper_policy_hash','risk_profile_hash','entry_profile','entry_profile_version','canonical_contract','contract_topology_version')"
             )
         }
         required = (
@@ -1727,7 +1744,11 @@ class PaperLedger:
                 metadata.get("entry_profile"),
                 metadata.get("entry_profile_version"),
             )
-            if identity == required:
+            stored_contract = metadata.get("canonical_contract", "MNQU6")
+            stored_topology_version = metadata.get("contract_topology_version", "PONG_CONTRACT_TOPOLOGY_SEP26_V1")
+            if identity == required and (
+                stored_contract, stored_topology_version
+            ) == (self.contract_topology.canonical_contract, self.contract_topology.version):
                 return
             self._connection.close()
             raise RuntimeError(
@@ -1860,6 +1881,9 @@ class PaperLedger:
                     "risk_profile_hash": self._risk_profile_hash,
                     "entry_profile": self.policy.entry_profile,
                     "entry_profile_version": self.policy.entry_profile_version,
+                    "canonical_contract": self.contract_topology.canonical_contract,
+                    "contract_topology_version": self.contract_topology.version,
+                    "contract_topology_hash": self.contract_topology.binding_hash,
                 })
             for key, value in metadata.items():
                 connection.execute(
@@ -2363,8 +2387,10 @@ class PaperLedger:
         # socket session. Such a shape cannot reach CreateOrder (the compiled
         # session fence rejects it); retain only enough compatibility to audit
         # it under a safe OFF_SESSION envelope.
-        if session_kind is PaperSessionKind.OFF_SESSION and not session_id.startswith("MNQU6:OFF_SESSION:"):
-            session_id = UNSPECIFIED_OFF_SESSION_CONTEXT.session_id
+        if session_kind is PaperSessionKind.OFF_SESSION and not session_id.startswith(
+            f"{self.contract_topology.canonical_contract}:OFF_SESSION:"
+        ):
+            session_id = f"{self.contract_topology.canonical_contract}:OFF_SESSION:1970-01-01"
             trade_date = UNSPECIFIED_OFF_SESSION_CONTEXT.trade_date
             profile_hash = UNSPECIFIED_OFF_SESSION_CONTEXT.session_profile_hash
             generation = UNSPECIFIED_OFF_SESSION_CONTEXT.session_generation
@@ -2390,7 +2416,11 @@ class PaperLedger:
             "entry_dominance_margin": str(self.policy.entry_dominance_margin),
             "entry_family_count": self.policy.entry_family_count,
             "retention_confidence_threshold": str(self.policy.retention_support_threshold),
-            "account_binding_hash": _ACCOUNT_BINDING_HASH,
+            "account_binding_hash": self.binding.binding_hash,
+            "instrument": self.binding.instrument,
+            "canonical_contract": self.binding.canonical_contract,
+            "contract_topology_version": self.contract_topology.version,
+            "contract_topology_hash": self.contract_topology.binding_hash,
             "scientific_eligibility": False,
             "paper_only": True,
             "live_capital": False,
