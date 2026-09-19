@@ -24,7 +24,10 @@ used to override the direct request or to arm capital.
 | Operating branch before integration | `codex/lane-iii-perpetual-corrective-20260906` |
 | Operating HEAD before integration | `c236255bf834c1b57ff898e68ea74f70dd4e828c` |
 | Isolated worktree | `C:\Users\atlas\.codex\worktrees\lane-iii-dec26-migration-luna\Trader` |
-| Migration commit | `c8c0fd831bc7b830770408decb4c7662c3e98a6d` |
+| Isolated migration commit | `c8c0fd831bc7b830770408decb4c7662c3e98a6d` |
+| Integrated migration commit | `3844c788d335594e2555bb0dc6c5abeb8be9a41f` |
+| Integrated completion commit | `d3b032e6502e66b5a422df046904a79fbbec4498` |
+| Integrated test-alignment commit | `5a0912aca454b5092d9553d63aa0121fc751e104` |
 | Remote | `https://github.com/achilles611/Trader.git` |
 | Authority | `DISARMED`; live capital `DENIED` |
 
@@ -35,6 +38,9 @@ they were preserved during integration: `beez_console.py`,
 `tests/test_beez_console_launcher_binding.py`,
 `tests/test_l3g_discernment.py`, and `tests/test_l3g_pong_production.py`.
 No unrelated edits were reset, cleaned, or overwritten.
+The seven edits remain in the working tree as staged user changes, with a
+recoverable copy retained at `stash@{0}` under
+`preopen-preserve-seven-user-edits-before-dec26-integration`.
 
 ## Exact topology migration
 
