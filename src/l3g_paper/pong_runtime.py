@@ -30,6 +30,7 @@ from src.l3g_paper.pong import (
     serialize_pong_checkpoint,
 )
 from src.l3g_paper.pong_quantity import PongQuantityPolicy, PongReconciliationProof
+from src.l3g_paper.pong_contract import SEP26_TOPOLOGY, topology_for_identity, topology_for_version
 
 
 PONG_RUNTIME_BRIDGE_SCHEMA = "beelzebub-pong-native-runtime-bridge-v1"
@@ -91,12 +92,19 @@ class PongLoadedRuntimeIdentity:
     instrument: str = "MNQ SEP26"
     canonical_contract: str = "MNQU6"
     live_authority: str = "DISARMED"
+    topology_version: str = SEP26_TOPOLOGY.version
+    topology_hash: str = SEP26_TOPOLOGY.binding_hash
 
     def __post_init__(self) -> None:
         _utc(self.verified_at)
         digests = (
             self.addon_source_fingerprint, self.addon_build_fingerprint,
         )
+        topology = topology_for_version(self.topology_version)
+        if topology is None or topology.binding_hash != self.topology_hash or not topology.matches(
+            self.instrument, self.canonical_contract,
+        ):
+            raise ValueError("Pong loaded runtime topology is invalid.")
         if (
             self.schema != PONG_RUNTIME_IDENTITY_SCHEMA
             or not self.execution_session_id.startswith("l3g-es-")
@@ -112,14 +120,19 @@ class PongLoadedRuntimeIdentity:
                 self.account_name, self.account_class, self.instrument,
                 self.canonical_contract, self.live_authority,
             ) != (
-                "Sim101", "LOCAL_SIMULATION", "MNQ SEP26", "MNQU6", "DISARMED",
+                "Sim101", "LOCAL_SIMULATION", self.instrument,
+                self.canonical_contract, "DISARMED",
             )
         ):
             raise ValueError("Pong loaded runtime identity is invalid.")
 
     @property
     def identity_hash(self) -> str:
-        return _digest(asdict(self))
+        payload = asdict(self)
+        if self.topology_version == SEP26_TOPOLOGY.version:
+            payload.pop("topology_version", None)
+            payload.pop("topology_hash", None)
+        return _digest(payload)
 
 
 @dataclass(frozen=True)
@@ -205,6 +218,8 @@ class PongNativeEventProof:
 
     def __post_init__(self) -> None:
         _utc(self.observed_at)
+        if topology_for_identity(self.instrument, self.canonical_contract) is None:
+            raise ValueError("Pong native event proof identity is invalid.")
         if (
             not self.receipt_id
             or type(self.signature_verified) is not bool

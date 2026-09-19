@@ -18,6 +18,8 @@ import hashlib
 import json
 import math
 
+from .pong_contract import SEP26_TOPOLOGY, PongContractTopology, topology_for_identity, topology_for_version
+
 
 PONG_QUANTITY_CONTRACT_VERSION = "BEELZEBUB_PONG_QUANTITY_V1"
 PONG_MODE = "PAPER_SIM101"
@@ -85,6 +87,8 @@ class PongQuantityPolicy:
     execution_enabled: bool = PONG_QUANTITY_EXECUTION_ENABLED
     reconciliation_source_fingerprint: str = PONG_RECONCILIATION_SOURCE_FINGERPRINT
     reconciliation_build_fingerprint: str = PONG_RECONCILIATION_BUILD_FINGERPRINT
+    topology_version: str = SEP26_TOPOLOGY.version
+    topology_hash: str = SEP26_TOPOLOGY.binding_hash
 
     def __post_init__(self) -> None:
         if (
@@ -92,14 +96,16 @@ class PongQuantityPolicy:
             or self.mode != PONG_MODE
             or self.account_name != "Sim101"
             or self.account_class != "LOCAL_SIMULATION"
-            or self.instrument != "MNQ SEP26"
-            or self.canonical_contract != "MNQU6"
+            or topology_for_identity(self.instrument, self.canonical_contract) is None
             or self.maximum_absolute_quantity != 2
             or self.live_authority != PONG_LIVE_AUTHORITY
             or self.live_capital != "DENIED"
             or self.execution_enabled
         ):
-            raise ValueError("Pong quantity identity is sealed to disabled Sim101/MNQU6.")
+            raise ValueError("Pong quantity identity is sealed to disabled Sim101 topology.")
+        topology = topology_for_version(self.topology_version)
+        if topology is None or not topology.matches(self.instrument, self.canonical_contract) or topology.binding_hash != self.topology_hash:
+            raise ValueError("Pong quantity topology binding is invalid.")
         for name in (
             "point_value_dollars", "stop_distance_points",
             "maximum_position_risk_dollars",
@@ -121,6 +127,9 @@ class PongQuantityPolicy:
     @property
     def configuration_hash(self) -> str:
         payload = asdict(self)
+        if self.topology_version == SEP26_TOPOLOGY.version:
+            payload.pop("topology_version", None)
+            payload.pop("topology_hash", None)
         if self.reconciliation_source_fingerprint == PONG_RECONCILIATION_SOURCE_FINGERPRINT and self.reconciliation_build_fingerprint == PONG_RECONCILIATION_BUILD_FINGERPRINT:
             payload.pop("reconciliation_source_fingerprint")
             payload.pop("reconciliation_build_fingerprint")
@@ -213,6 +222,8 @@ class PongReconciliationProof:
     live_authority: str
     signature_status: str
     result_hash: str
+    topology_version: str = SEP26_TOPOLOGY.version
+    topology_hash: str = SEP26_TOPOLOGY.binding_hash
 
     @classmethod
     def create(
@@ -234,6 +245,8 @@ class PongReconciliationProof:
         account_class: str = "LOCAL_SIMULATION",
         instrument: str = "MNQ SEP26",
         canonical_contract: str = "MNQU6",
+        topology_version: str = SEP26_TOPOLOGY.version,
+        topology_hash: str = SEP26_TOPOLOGY.binding_hash,
     ) -> PongReconciliationProof:
         values = {
             "mode": mode,
@@ -253,6 +266,9 @@ class PongReconciliationProof:
             "live_authority": live_authority,
             "signature_status": signature_status,
         }
+        if topology_version != SEP26_TOPOLOGY.version:
+            values["topology_version"] = topology_version
+            values["topology_hash"] = topology_hash
         return cls(**values, result_hash=_canonical_hash(values))
 
     def validation_reason(
@@ -280,6 +296,9 @@ class PongReconciliationProof:
                 "live_authority": self.live_authority,
                 "signature_status": self.signature_status,
             }
+            if self.topology_version != SEP26_TOPOLOGY.version:
+                payload["topology_version"] = self.topology_version
+                payload["topology_hash"] = self.topology_hash
             if self.result_hash != _canonical_hash(payload):
                 return "PONG_RECONCILIATION_INTEGRITY_FAILED"
             if (
@@ -298,6 +317,11 @@ class PongReconciliationProof:
                 policy.live_authority,
             ):
                 return "PONG_EXECUTION_IDENTITY_MISMATCH"
+            if (
+                self.topology_version != policy.topology_version
+                or self.topology_hash != policy.topology_hash
+            ):
+                return "PONG_CONTRACT_TOPOLOGY_MISMATCH"
             if (
                 self.source_id != PONG_RECONCILIATION_SOURCE_ID
                 or self.source_fingerprint != policy.reconciliation_source_fingerprint

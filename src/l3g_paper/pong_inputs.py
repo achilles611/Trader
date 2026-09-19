@@ -21,15 +21,17 @@ from src.l3f_provider.ninjatrader_observation import (
 )
 
 from .pong_experiment import CompletedPongHour
+from .pong_contract import SEP26_TOPOLOGY, PongContractTopology
 
 
 PONG_NATIVE_INPUT_POLICY_VERSION = "pong-native-input-admission-v1"
 PONG_HOURLY_WARM_START_POLICY_VERSION = "pong-hourly-warm-start-v1"
 PONG_HISTORICAL_ORDER_FLOW_STATUS = "UNAVAILABLE_NO_AUTHENTIC_AGGRESSOR_SEQUENCE"
-PONG_HOURLY_WARM_START_POLICY_HASH = canonical_hash({
+def hourly_warm_start_policy_hash(topology: PongContractTopology = SEP26_TOPOLOGY) -> str:
+    return canonical_hash({
     "schema": PONG_HOURLY_WARM_START_POLICY_VERSION,
-    "instrument": "MNQ SEP26",
-    "canonical_contract": "MNQU6",
+    "instrument": topology.native_instrument,
+    "canonical_contract": topology.canonical_contract,
     "source": "NINJATRADER_BARS_REQUEST_PROVIDER",
     "bar_period_minutes": 60,
     "required_completed_intervals": 2,
@@ -37,7 +39,10 @@ PONG_HOURLY_WARM_START_POLICY_HASH = canonical_hash({
     "future_data": "DENIED",
     "merge_policy": "DO_NOT_MERGE",
     "historical_to_live_overlap": "IDENTICAL_ONLY_DEDUPLICATED",
-})
+    })
+
+
+PONG_HOURLY_WARM_START_POLICY_HASH = hourly_warm_start_policy_hash()
 
 _SOURCE_STREAMS = {
     "TRADE": "MARKET_DATA_LAST",
@@ -174,7 +179,12 @@ class PongWarmStart:
     hours: tuple[CompletedPongHour, ...]
 
     @classmethod
-    def from_observation(cls, record: NinjaTraderObservation) -> "PongWarmStart":
+    def from_observation(
+        cls,
+        record: NinjaTraderObservation,
+        *,
+        topology: PongContractTopology = SEP26_TOPOLOGY,
+    ) -> "PongWarmStart":
         _require_verified(record)
         if record.observation_type != "HISTORICAL_WARM_START":
             raise PongNativeInputRefused("PONG_WARM_START_TYPE_REFUSED")
@@ -192,11 +202,11 @@ class PongWarmStart:
             raise PongNativeInputRefused("PONG_INPUT_SHAPE_INVALID", "Warm-start bars")
         if (
             payload.get("status") != "COMPLETE"
-            or payload.get("contract_id") != "MNQ SEP26"
+            or payload.get("contract_id") != topology.native_instrument
             or payload.get("source") != "NINJATRADER_BARS_REQUEST_PROVIDER"
             or payload.get("timezone") != "UTC"
             or payload.get("policy_version") != PONG_HOURLY_WARM_START_POLICY_VERSION
-            or payload.get("policy_hash") != PONG_HOURLY_WARM_START_POLICY_HASH
+            or payload.get("policy_hash") != hourly_warm_start_policy_hash(topology)
             or expected != 2
             or actual != len(bars_value)
             or actual != 2
@@ -241,14 +251,15 @@ class PongWarmStart:
                 continuity_domain=continuity_domain,
                 source_ids=(record.observation_id + f":hour:{index}",),
                 source_hashes=(bar_hash,), complete=True,
+                instrument=topology.native_instrument,
             ))
         coverage = PongWarmStartCoverage(
-            instrument="MNQ SEP26", source="NINJATRADER_BARS_REQUEST_PROVIDER",
+            instrument=topology.native_instrument, source="NINJATRADER_BARS_REQUEST_PROVIDER",
             requested_at=_wire(requested), earliest_required=_wire(earliest),
             latest_included_timestamp=_wire(latest), expected_intervals=expected,
             actual_intervals=actual, gaps=tuple(gaps_value), timezone_name="UTC",
             day_anchor=str(payload["day_anchor"]), policy_version=PONG_HOURLY_WARM_START_POLICY_VERSION,
-            policy_hash=PONG_HOURLY_WARM_START_POLICY_HASH,
+            policy_hash=hourly_warm_start_policy_hash(topology),
             producer_session_id=record.session_id,
             producer_source_fingerprint=record.producer.source_fingerprint,
             producer_build_fingerprint=record.producer.build_fingerprint,
@@ -273,10 +284,18 @@ class PongSequenceCoverage:
 class PongCausalInputAdapter:
     """Linearize verified native events and the historical-to-live hour seam."""
 
-    def __init__(self, warm_start: PongWarmStart) -> None:
+    def __init__(
+        self,
+        warm_start: PongWarmStart,
+        *,
+        topology: PongContractTopology = SEP26_TOPOLOGY,
+    ) -> None:
         if type(warm_start) is not PongWarmStart or not warm_start.coverage.complete:
             raise PongNativeInputRefused("PONG_HOURLY_WARM_START_INCOMPLETE")
         self.warm_start = warm_start
+        self.topology = topology
+        if warm_start.coverage.instrument != topology.native_instrument:
+            raise PongNativeInputRefused("PONG_WARM_START_TOPOLOGY_MISMATCH")
         self._session_id = warm_start.coverage.producer_session_id
         self._source_fingerprint = warm_start.coverage.producer_source_fingerprint
         self._build_fingerprint = warm_start.coverage.producer_build_fingerprint
@@ -321,10 +340,10 @@ class PongCausalInputAdapter:
             return None
         payload = record.payload
         if (
-            payload.get("contract_id") != "MNQ SEP26"
+            payload.get("contract_id") != self.topology.native_instrument
             or payload.get("source") != "NINJATRADER_BARS_REQUEST_PROVIDER"
             or payload.get("policy_version") != PONG_HOURLY_WARM_START_POLICY_VERSION
-            or payload.get("policy_hash") != PONG_HOURLY_WARM_START_POLICY_HASH
+            or payload.get("policy_hash") != hourly_warm_start_policy_hash(self.topology)
         ):
             raise PongNativeInputRefused("PONG_LIVE_HOUR_PROVENANCE_MISMATCH")
         start = _time(payload.get("start"), "Live hour start")
@@ -354,6 +373,7 @@ class PongCausalInputAdapter:
             continuity_domain=self.warm_start.hours[-1].continuity_domain,
             source_ids=(record.observation_id,),
             source_hashes=(canonical_hash(bar_core),), complete=True,
+            instrument=self.topology.native_instrument,
         )
         existing = self._hours.get(key)
         if existing is not None:

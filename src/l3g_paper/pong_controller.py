@@ -22,6 +22,8 @@ import uuid
 from typing import Callable
 from zoneinfo import ZoneInfo
 
+from .pong_contract import topology_for_identity
+
 
 PONG_CONTROLLER_SCHEMA = "beelzebub-pong-bounded-controller-v2"
 PONG_CONTROLLER_ACCOUNT = "Sim101"
@@ -179,6 +181,8 @@ class PongControllerObservation:
             or self.working_entry_orders > self.working_owned_orders
         ):
             raise ValueError("Pong controller native quantities are invalid.")
+        if topology_for_identity(self.instrument, self.canonical_contract) is None:
+            raise ValueError("Pong controller instrument identity is invalid.")
         if (
             self.account_name,
             self.account_class,
@@ -188,8 +192,8 @@ class PongControllerObservation:
         ) != (
             PONG_CONTROLLER_ACCOUNT,
             PONG_CONTROLLER_ACCOUNT_CLASS,
-            PONG_CONTROLLER_INSTRUMENT,
-            PONG_CONTROLLER_CONTRACT,
+            self.instrument,
+            self.canonical_contract,
             PONG_CONTROLLER_LIVE_AUTHORITY,
         ):
             raise ValueError("Pong controller observation scope is invalid.")

@@ -664,7 +664,10 @@ class PongStateMachine:
     ) -> str | None:
         if type(snapshot) is not DiscernmentSnapshot:
             return "DISCERNMENT_SNAPSHOT_TYPE_INVALID"
-        if snapshot.instrument != PONG_INSTRUMENT or snapshot.contract != PONG_CONTRACT:
+        if (
+            snapshot.instrument != self.quantity_policy.instrument
+            or snapshot.contract != self.quantity_policy.canonical_contract
+        ):
             return "DISCERNMENT_SOURCE_IDENTITY_MISMATCH"
         if snapshot.execution_enabled:
             return "DISCERNMENT_EXECUTION_AUTHORITY_INVALID"

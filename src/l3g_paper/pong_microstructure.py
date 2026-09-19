@@ -24,6 +24,7 @@ from src.l3g_paper.discernment import (
     DiscernmentPolicy,
     VolumeRegime as DiscernmentVolumeRegime,
 )
+from .pong_contract import SEP26_TOPOLOGY, PongContractTopology, topology_for_version
 
 
 PONG_MICROSTRUCTURE_SCHEMA = "beelzebub-pong-microstructure-research-v1"
@@ -998,6 +999,8 @@ class MicrostructureEvidenceMappingPolicy:
     liquidity_group_bound: Decimal = Decimal("1.00")
     regime_group_bound: Decimal = Decimal("0.01")
     validity_seconds: int = 5
+    topology_version: str = SEP26_TOPOLOGY.version
+    topology_hash: str = SEP26_TOPOLOGY.binding_hash
 
     def __post_init__(self) -> None:
         _text(self.mapping_id, "Evidence mapping ID")
@@ -1020,6 +1023,9 @@ class MicrostructureEvidenceMappingPolicy:
             raise ValueError("Mere displayed liquidity must weigh less than an interaction.")
         if type(self.validity_seconds) is not int or self.validity_seconds <= 0:
             raise ValueError("Mapped evidence validity must be positive.")
+        topology = topology_for_version(self.topology_version)
+        if topology is None or topology.binding_hash != self.topology_hash:
+            raise ValueError("Microstructure topology binding is invalid.")
 
     def payload(self) -> dict[str, object]:
         return {
@@ -1051,6 +1057,8 @@ class MicrostructureEvidenceMappingPolicy:
             "calibration_status": "EXPERIMENTAL_DIRECTIONAL_SUPPORT",
             "production_configured": False,
             "execution_authority": "DENIED",
+            **({"topology_version": self.topology_version, "topology_hash": self.topology_hash}
+               if self.topology_version != SEP26_TOPOLOGY.version else {}),
         }
 
     @cached_property
@@ -1071,6 +1079,8 @@ class MicrostructureEvidenceMappingPolicy:
                 (PONG_VOLUME_REGIME_GROUP, float(self.regime_group_bound)),
             ),
             evidence_mapping_hash=self.mapping_hash,
+            topology_version=self.topology_version,
+            topology_hash=self.topology_hash,
         )
 
 
@@ -1121,8 +1131,13 @@ class MicrostructureEvidenceMapper:
     def __init__(
         self,
         policy: MicrostructureEvidenceMappingPolicy = MicrostructureEvidenceMappingPolicy(),
+        *,
+        topology: PongContractTopology = SEP26_TOPOLOGY,
     ) -> None:
         self.policy = policy
+        self.topology = topology
+        if policy.topology_version != topology.version or policy.topology_hash != topology.binding_hash:
+            raise ValueError("Microstructure policy/topology bundle mismatch.")
 
     def _multiplier(self, regime: VolumeRegime) -> Decimal:
         return {
@@ -1197,7 +1212,7 @@ class MicrostructureEvidenceMapper:
         }
         if len(instruments) != 1:
             blockers.append("MICROSTRUCTURE_INSTRUMENT_MISMATCH")
-        elif next(iter(instruments)) != DISCERNMENT_INSTRUMENT:
+        elif next(iter(instruments)) != self.topology.native_instrument:
             blockers.append("MICROSTRUCTURE_INSTRUMENT_NOT_DISCERNMENT_INSTRUMENT")
         as_of_values = {
             normalized_utc(item, "Mapped microstructure as-of time")

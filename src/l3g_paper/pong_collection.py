@@ -30,6 +30,7 @@ from src.l3f_provider.ninjatrader_observation import (
     NinjaTraderObservation,
     NinjaTraderObservationError,
 )
+from .pong_contract import SEP26_TOPOLOGY, PongContractTopology
 
 
 PONG_COLLECTION_SCHEMA = "beelzebub-pong-authentic-hour-collection-v1"
@@ -171,6 +172,7 @@ class PongAuthenticHourCollector:
         expected_source_fingerprint: str = EXPECTED_OBSERVER_SOURCE_FINGERPRINT,
         independent_market_collection: bool = False,
         now: datetime | None = None,
+        topology: PongContractTopology = SEP26_TOPOLOGY,
     ) -> None:
         if not isinstance(root, Path):
             raise ValueError("Pong collection root must be a Path.")
@@ -178,6 +180,8 @@ class PongAuthenticHourCollector:
             raise ValueError("Pong collector requires a source SHA-256 fingerprint.")
         if type(independent_market_collection) is not bool:
             raise ValueError("Pong collection independence policy must be boolean.")
+        if type(topology) is not PongContractTopology:
+            raise ValueError("Pong collection topology is invalid.")
         started = (now or _utc_now()).astimezone(timezone.utc)
         stamp = started.strftime("%Y%m%dT%H%M%S%fZ")
         self.root = root.expanduser().resolve()
@@ -187,6 +191,7 @@ class PongAuthenticHourCollector:
         self.collector_status_path = self.collector_root / "status.json"
         self.status_path = self.root / "collection-status.json"
         self.expected_source_fingerprint = expected_source_fingerprint
+        self.topology = topology
         self._source_generation: int | None = None
         self._producer_overflow_records = 0
         self._producer_transport_failed_records = 0
@@ -331,8 +336,11 @@ class PongAuthenticHourCollector:
                     "expected_source_fingerprint": self.expected_source_fingerprint,
                 },
                 "instrument": {
-                    "native": PONG_COLLECTION_CONTRACT,
-                    "canonical": PONG_COLLECTION_CANONICAL_CONTRACT,
+                    "native": self.topology.native_instrument,
+                    "canonical": self.topology.canonical_contract,
+                    "topology_version": self.topology.version,
+                    "topology_hash": self.topology.binding_hash,
+                    "state_namespace": self.topology.state_namespace,
                 },
                 "transport": {
                     "state": self._transport_state,
@@ -578,7 +586,7 @@ class PongAuthenticHourCollector:
             stream["records"] = int(stream["records"]) + 1
             stream["first_event_at"] = stream["first_event_at"] or _wire(event_at)
             stream["last_event_at"] = _wire(event_at)
-            if record.payload.get("contract_id") != PONG_COLLECTION_CONTRACT:
+            if record.payload.get("contract_id") != self.topology.native_instrument:
                 self._add_reason(interval, "NATIVE_CONTRACT_MISMATCH")
             if record.observation_type == "QUOTE" and not self._valid_quote(record.payload):
                 self._add_reason(interval, "QUOTE_INVALID")
@@ -640,7 +648,7 @@ class PongAuthenticHourCollector:
             return
         if (
             end != start + timedelta(hours=1)
-            or payload.get("contract_id") != PONG_COLLECTION_CONTRACT
+            or payload.get("contract_id") != self.topology.native_instrument
             or payload.get("source") != "NINJATRADER_BARS_REQUEST_PROVIDER"
             or payload.get("publication_policy") != "CAUSAL_LIVE_COMPLETED_HOUR_V1"
         ):

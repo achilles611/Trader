@@ -34,6 +34,11 @@ from src.lane_iii.contracts import canonical_hash, normalized_utc
 from .contracts import PONG_ENTRY_PROFILE_VERSION
 from .pong_authorization import PongLaunchAuthorization
 from .pong_collection import PongAuthenticHourCollector
+from .pong_contract import (
+    SEP26_TOPOLOGY,
+    PongContractTopology,
+    validate_topology_bundle,
+)
 from .pong_compute import COMPUTE_BUILD_HASH, PongWindowRequest, PongWindowResult, evaluate_window_batch, open_compute_pool
 from .pong_volume_history import HISTORY_TYPE, PongVolumeReferenceHistory
 from .daily_bias import (
@@ -78,6 +83,7 @@ from .pong_microstructure import (
     DepthObservation,
     LiquidityClusterAdapter,
     MicrostructureEvidenceMapper,
+    MicrostructureEvidenceMappingPolicy,
     PriceResponse,
     VolumeRegimeAdapter,
     VolumeWindow,
@@ -217,6 +223,7 @@ class PongProductionHost:
         compute_workers: int = 0,
         scheduling: PongSchedulingConfig = PongSchedulingConfig(),
         clock_ns: Callable[[], int] = time.perf_counter_ns,
+        topology: PongContractTopology = SEP26_TOPOLOGY,
     ) -> None:
         if not callable(native_dispatch):
             raise TypeError("Pong production host requires one native dispatcher.")
@@ -229,7 +236,14 @@ class PongProductionHost:
             raise ValueError("PONG_PERIODIC_PROFILE_NOT_SELECTED")
         if scheduling.enabled and compute_workers:
             raise ValueError("PONG_PERIODIC_COMPUTE_WORKERS_NOT_SUPPORTED")
+        if type(topology) is not PongContractTopology:
+            raise ValueError("PONG_CONTRACT_TOPOLOGY_INVALID")
         self.state_root = Path(state_root).resolve()
+        self.topology = topology
+        self._effective_state_root = (
+            self.state_root if topology.version == SEP26_TOPOLOGY.version
+            else self.state_root / topology.state_namespace
+        )
         self.selected_profile = selected_profile
         self.expected_market_source_fingerprint = expected_market_source_fingerprint
         self._runtime_snapshot = runtime_snapshot
@@ -247,8 +261,8 @@ class PongProductionHost:
             else launch_authorization.activation_date_local
         )
         self._operation_root = (
-            self.state_root if launch_authorization is None
-            else self.state_root / "runs" / self._experiment_id
+            self._effective_state_root if launch_authorization is None
+            else self._effective_state_root / "runs" / self._experiment_id
         )
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -328,22 +342,34 @@ class PongProductionHost:
         self._microstructure_blockers: tuple[str, ...] = (
             "PONG_MICROSTRUCTURE_WAITING_FOR_NATIVE_INPUT",
         )
-        self._mapper = MicrostructureEvidenceMapper()
-        self._discernment = DiscernmentEngine(self._mapper.policy.discernment_policy())
+        mapping_policy = MicrostructureEvidenceMappingPolicy(
+            topology_version=topology.version,
+            topology_hash=topology.binding_hash,
+        )
+        self._mapper = MicrostructureEvidenceMapper(
+            policy=mapping_policy, topology=topology,
+        )
+        self._discernment = DiscernmentEngine(
+            self._mapper.policy.discernment_policy(),
+            instrument=topology.native_instrument,
+            contract=topology.canonical_contract,
+            topology=topology,
+        )
         self._flow = ClassifiedFlowAdapter()
         self._liquidity = LiquidityClusterAdapter()
         self._volume = VolumeRegimeAdapter()
         self._volume_history = (
             None if history_verification_key is None else PongVolumeReferenceHistory(
-                self.state_root / "volume-reference.json", root_key=history_verification_key,
+                self._effective_state_root / "volume-reference.json", root_key=history_verification_key,
                 expected_source=expected_market_source_fingerprint,
+                topology=topology,
             )
         )
         self._load_certificate()
 
     @property
     def certificate_path(self) -> Path:
-        return self.state_root / "qualified-hour.json"
+        return self._effective_state_root / "qualified-hour.json"
 
     @property
     def controller_path(self) -> Path:
@@ -547,9 +573,11 @@ class PongProductionHost:
                         self._volume_history.admit(record, received_at=_now())
                     return
                 if record.observation_type == "HISTORICAL_WARM_START":
-                    warm = PongWarmStart.from_observation(record)
+                    warm = PongWarmStart.from_observation(record, topology=self.topology)
                     self._warm_start = warm
-                    self._input_adapter = PongCausalInputAdapter(warm)
+                    self._input_adapter = PongCausalInputAdapter(
+                        warm, topology=self.topology,
+                    )
                     return
                 if record.observation_type == "HOURLY_BAR":
                     if self._input_adapter is None:
@@ -564,7 +592,7 @@ class PongProductionHost:
                     return
                 if record.observation_type not in self._stream_counts:
                     return
-                if record.payload.get("contract_id") != "MNQ SEP26":
+                if record.payload.get("contract_id") != self.topology.native_instrument:
                     raise ValueError("PONG_NATIVE_CONTRACT_MISMATCH")
                 generation = record.payload.get("source_generation")
                 if generation is not None:
@@ -627,7 +655,7 @@ class PongProductionHost:
         side = AggressorSide(classification["side"])
         provenance = AggressorProvenance(classification["provenance"])
         trade = ClassifiedTrade(
-            self._event_ref(record), "MNQ SEP26", Decimal(str(payload["price"])),
+            self._event_ref(record), self.topology.native_instrument, Decimal(str(payload["price"])),
             Decimal(str(payload["size"])), side, provenance,
         )
         self._trades.append(trade)
@@ -646,7 +674,7 @@ class PongProductionHost:
             self._classified_hour.append(ClassifiedTradeInput(
                 event_id=record.observation_id, payload_hash=record.payload_hash,
                 source="NINJATRADER_NATIVE_AGGRESSOR:" + str(payload.get("aggressor_source") or "UNKNOWN"),
-                instrument="MNQ SEP26", side=ClassifiedSide(side.value), size=trade.volume,
+                instrument=self.topology.native_instrument, side=ClassifiedSide(side.value), size=trade.volume,
                 event_at=trade.event.event_at, observed_at=record.ninja_receipt_time,
                 available_at=record.ninja_receipt_time, authenticated=True,
             ))
@@ -675,7 +703,7 @@ class PongProductionHost:
             kind = DepthEventKind.RECONNECT_RESET
         nearby = sum((Decimal(str(item["size"])) for item in levels), Decimal("0"))
         self._depth[side].append(DepthObservation(
-            self._event_ref(record), "MNQ SEP26", side, price,
+            self._event_ref(record), self.topology.native_instrument, side, price,
             Decimal(str(payload.get("mutation_volume") or 0)), nearby, touch, kind,
             Decimal("0"), Decimal("0"), False, PriceResponse.UNAVAILABLE,
         ))
@@ -705,7 +733,7 @@ class PongProductionHost:
             window = VolumeWindow(
                 window_id="pong-volume-" + canonical_hash({"start": key, "at": as_of})[:32],
                 payload_hash=canonical_hash({"start": key, "at": as_of, "volume": str(self._volume_buckets.get(key, 0))}),
-                instrument="MNQ SEP26",
+                instrument=self.topology.native_instrument,
                 normalization_key=f"UTC-{bucket.hour:02d}:{bucket.minute:02d}-5M",
                 window_start=key,
                 window_end=as_of,
@@ -980,6 +1008,11 @@ class PongProductionHost:
             build_fingerprint=str(runtime.get("addon_build_fingerprint") or ""),
             execution_session_id=str(runtime.get("execution_session_id") or ""),
             signature_verified=True,
+            account_name=self.topology.account_name,
+            account_class=self.topology.account_class,
+            instrument=self.topology.native_instrument,
+            canonical_contract=self.topology.canonical_contract,
+            live_authority=self.topology.live_authority,
         )
 
     def _directive_for_message_locked(
@@ -1092,7 +1125,6 @@ class PongProductionHost:
                     "PONG_NATIVE_CALLBACK_BRIDGE_FAILED:" + type(error).__name__
                 )
 
-    @staticmethod
     def _bias_from_inputs(
         previous: CompletedPongHour,
         current: CompletedPongHour,
@@ -1111,7 +1143,7 @@ class PongProductionHost:
             start=current.start, end=current.end, available_at=published_at,
         )
         frame = HourlyBiasFrame(
-            "MNQ SEP26", current.start, current.end, published_at,
+            self.topology.native_instrument, current.start, current.end, published_at,
             (*structural, flow), options, True, None,
         )
         return DailyBiasEngine().update(
@@ -1233,6 +1265,12 @@ class PongProductionHost:
             position_quantity=int(runtime["position_quantity"]),
             working_owned_orders=int(runtime["working_owned_orders"]),
             unresolved_execution=bool(runtime["unresolved_execution"]),
+            account_name=self.topology.account_name,
+            account_class=self.topology.account_class,
+            instrument=self.topology.native_instrument,
+            canonical_contract=self.topology.canonical_contract,
+            topology_version=self.topology.version,
+            topology_hash=self.topology.binding_hash,
         )
 
     def _maybe_create_bridge(self) -> None:
@@ -1255,12 +1293,20 @@ class PongProductionHost:
                 addon_build_fingerprint=str(runtime["addon_build_fingerprint"]),
                 verified_at=str(runtime["observed_at"]),
                 attestation_verified=True,
+                instrument=self.topology.native_instrument,
+                canonical_contract=self.topology.canonical_contract,
+                topology_version=self.topology.version,
+                topology_hash=self.topology.binding_hash,
             )
             policy = PongQuantityPolicy(
+                instrument=self.topology.native_instrument,
+                canonical_contract=self.topology.canonical_contract,
                 native_maximum_quantity=1,
                 native_capability_status="CURRENT_AUTHENTICATED_ONE_MNQ_CAPABILITY",
                 reconciliation_source_fingerprint=identity.addon_source_fingerprint,
                 reconciliation_build_fingerprint=identity.addon_build_fingerprint,
+                topology_version=self.topology.version,
+                topology_hash=self.topology.binding_hash,
             )
             machine = PongStateMachine(
                 quantity_policy=policy,
@@ -1302,6 +1348,31 @@ class PongProductionHost:
         # evidence; current microstructure starts a fresh continuity domain.
         # Source semantics must remain exact, while current market/execution
         # build congruency is checked separately below.
+        runtime = self._runtime
+        if self.topology.version != SEP26_TOPOLOGY.version:
+            bundle = {
+                "topology_version": runtime.get("topology_version"),
+                "topology_hash": runtime.get("topology_hash"),
+                "native_instrument": runtime.get("instrument"),
+                "canonical_contract": runtime.get("canonical_contract"),
+                "state_namespace": runtime.get("state_namespace"),
+                "account_name": runtime.get("account_name"),
+                "account_class": runtime.get("account_class"),
+                "live_authority": runtime.get("live_authority"),
+                "live_capital": runtime.get("live_capital"),
+                "maximum_quantity": runtime.get("maximum_quantity"),
+            }
+            try:
+                validate_topology_bundle(self.topology, bundle)
+            except ValueError:
+                return False
+        if (
+            runtime.get("instrument") not in {None, self.topology.native_instrument}
+            or runtime.get("canonical_contract") not in {None, self.topology.canonical_contract}
+            or runtime.get("topology_version") not in {None, self.topology.version}
+            or runtime.get("topology_hash") not in {None, self.topology.binding_hash}
+        ):
+            return False
         return self._producer[1] == str(
             producer.get("source_fingerprint"),
         )
@@ -1415,6 +1486,8 @@ class PongProductionHost:
             runtime_active=bool(runtime.get("runtime_active", False)),
             evidence_sealed=bool(runtime.get("evidence_sealed", False)),
             signature_verified=bool(runtime.get("addon_provenance_valid", False)),
+            instrument=self.topology.native_instrument,
+            canonical_contract=self.topology.canonical_contract,
         )
 
     def _open_controller(self) -> None:
@@ -1601,13 +1674,16 @@ class PongProductionHost:
                 "launch_operator_acknowledged_at": (
                     None if self.launch_authorization is None else self.launch_authorization.operator_acknowledged_at_utc
                 ),
-                "account": "Sim101",
-                "account_class": "LOCAL_SIMULATION",
-                "instrument": "MNQ SEP26",
-                "canonical_contract": "MNQU6",
-                "maximum_quantity": 1,
-                "live_authority": "DISARMED",
-                "live_capital": "DENIED",
+                "account": self.topology.account_name,
+                "account_class": self.topology.account_class,
+                "instrument": self.topology.native_instrument,
+                "canonical_contract": self.topology.canonical_contract,
+                "topology_version": self.topology.version,
+                "topology_hash": self.topology.binding_hash,
+                "state_namespace": self.topology.state_namespace,
+                "maximum_quantity": self.topology.maximum_quantity,
+                "live_authority": self.topology.live_authority,
+                "live_capital": self.topology.live_capital,
                 "source_identity": None if self._producer is None else {
                     "session_id": self._producer[0],
                     "source_fingerprint": self._producer[1],

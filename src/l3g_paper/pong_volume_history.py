@@ -13,6 +13,7 @@ from uuid import uuid4
 from src.l3f_provider.ninjatrader_observation import NinjaTraderObservation
 from src.lane_iii.contracts import canonical_hash, normalized_utc
 from .pong_microstructure import VolumeWindow, VolumeWindowKind
+from .pong_contract import SEP26_TOPOLOGY, PongContractTopology
 
 HISTORY_TYPE = "VOLUME_REFERENCE_HISTORY"
 HISTORY_POLICY = "PROVIDER_COMPLETED_UTC_5M_VOLUME_V1"
@@ -36,10 +37,18 @@ def _bytes(value: object) -> bytes:
 class PongVolumeReferenceHistory:
     """Admit one complete signed provider response; enforce availability at use."""
 
-    def __init__(self, path: Path, *, root_key: bytes, expected_source: str) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        root_key: bytes,
+        expected_source: str,
+        topology: PongContractTopology = SEP26_TOPOLOGY,
+    ) -> None:
         self.path = path
         self._key = bytes(root_key)
         self.expected_source = expected_source
+        self.topology = topology
         self._pending: list[dict] = []
         self._pending_id: str | None = None
         self.windows: tuple[VolumeWindow, ...] = ()
@@ -81,7 +90,8 @@ class PongVolumeReferenceHistory:
                     or record.producer.source_stream != "HISTORICAL_BARS"
                     or record.producer.publication_policy != HISTORY_POLICY
                     or p.get("publication_policy") != HISTORY_POLICY
-                    or p.get("contract_id") != "MNQ SEP26" or p.get("canonical_contract") != "MNQU6"
+                    or p.get("contract_id") != self.topology.native_instrument
+                    or p.get("canonical_contract") != self.topology.canonical_contract
                     or p.get("source") != "NINJATRADER_BARS_REQUEST_PROVIDER"
                     or p.get("merge_policy") != "DO_NOT_MERGE"
                     or p.get("trading_hours") != "Default 24 x 7" or p.get("timezone") != "UTC"
@@ -116,7 +126,7 @@ class PongVolumeReferenceHistory:
                 last_end = end
                 digest = canonical_hash({"bar": bar, "observation": record.wire_hash()})
                 windows.append(VolumeWindow(
-                    "pong-provider-volume-" + digest[:32], digest, "MNQ SEP26",
+                    "pong-provider-volume-" + digest[:32], digest, self.topology.native_instrument,
                     f"UTC-{start.hour:02d}:{start.minute:02d}-5M", _wire(start), _wire(end),
                     _wire(observed), Decimal(volume), VolumeWindowKind.COMPLETED, True, True,
                 ))
@@ -187,4 +197,8 @@ class PongVolumeReferenceHistory:
                 "last_end": self.windows[-1].window_end if self.windows else None,
                 "available_at": self.windows[0].available_at if self.windows else None,
                 "receipt_hash": self.receipt_hash, "error": self.error,
+                "instrument": self.topology.native_instrument,
+                "canonical_contract": self.topology.canonical_contract,
+                "topology_version": self.topology.version,
+                "topology_hash": self.topology.binding_hash,
                 "pending_chunks": len(self._pending), "authentic_order_flow_authority": "DENIED"}

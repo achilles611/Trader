@@ -25,6 +25,7 @@ from src.shared.confidence_math import (
     sigmoid_clipped,
     unit_interval,
 )
+from .pong_contract import SEP26_TOPOLOGY, PongContractTopology, topology_for_identity, topology_for_version
 
 
 DISCERNMENT_SCHEMA = "beelzebub-pong-discernment-v1"
@@ -508,6 +509,8 @@ class DiscernmentPolicy:
     calibration_status: str = EXPERIMENTAL_DIRECTIONAL_SUPPORT
     production_configured: bool = DISCERNMENT_PRODUCTION_CONFIGURED
     evidence_mapping_hash: str | None = None
+    topology_version: str = SEP26_TOPOLOGY.version
+    topology_hash: str = SEP26_TOPOLOGY.binding_hash
 
     def __post_init__(self) -> None:
         unit_interval(self.prior_long_score, "prior_long_score")
@@ -529,6 +532,9 @@ class DiscernmentPolicy:
             raise ValueError("The Pong research fixture is not a calibrated probability model.")
         if self.evidence_mapping_hash is not None:
             _sha256(self.evidence_mapping_hash, "Discernment evidence mapping hash")
+        expected_topology = topology_for_version(self.topology_version)
+        if expected_topology is None or self.topology_hash != expected_topology.binding_hash:
+            raise ValueError("Discernment topology binding is invalid.")
         if len(set(self.required_components)) != len(self.required_components):
             raise ValueError("Required component identities must be unique.")
         for component_id, component_version in self.required_components:
@@ -592,6 +598,8 @@ class DiscernmentPolicy:
                 "strong_threshold": self.strong_threshold,
                 "production_configured": self.production_configured,
                 "execution_enabled": DISCERNMENT_EXECUTION_ENABLED,
+                **({"topology_version": self.topology_version, "topology_hash": self.topology_hash}
+                   if self.topology_version != SEP26_TOPOLOGY.version else {}),
             }
         )
 
@@ -638,9 +646,12 @@ class DiscernmentSnapshot:
     reason_codes: tuple[str, ...]
     result_hash: str
     execution_enabled: bool = DISCERNMENT_EXECUTION_ENABLED
+    topology_version: str = SEP26_TOPOLOGY.version
+    topology_hash: str = SEP26_TOPOLOGY.binding_hash
 
     def __post_init__(self) -> None:
-        if self.instrument != DISCERNMENT_INSTRUMENT or self.contract != DISCERNMENT_CONTRACT:
+        topology = topology_for_identity(self.instrument, self.contract)
+        if topology is None or self.topology_version != topology.version or self.topology_hash != topology.binding_hash:
             raise ValueError("Discernment snapshot instrument/contract mismatch.")
         as_of = _utc(self.as_of, "Snapshot as-of time")
         received_at = _utc(self.received_at, "Snapshot receipt time")
@@ -878,6 +889,8 @@ class DiscernmentSnapshot:
             "validity": self.validity.value,
             "reason_codes": list(self.reason_codes),
             "execution_enabled": self.execution_enabled,
+            **({"topology_version": self.topology_version, "topology_hash": self.topology_hash}
+               if self.topology_version != SEP26_TOPOLOGY.version else {}),
         }
         if include_result_hash:
             payload["result_hash"] = self.result_hash
@@ -1185,12 +1198,14 @@ class DiscernmentEngine:
         *,
         instrument: str = DISCERNMENT_INSTRUMENT,
         contract: str = DISCERNMENT_CONTRACT,
+        topology: PongContractTopology = SEP26_TOPOLOGY,
     ) -> None:
         self.policy = policy or PONG_RESEARCH_POLICY
-        if instrument != DISCERNMENT_INSTRUMENT or contract != DISCERNMENT_CONTRACT:
-            raise ValueError("Discernment is sealed to verified MNQ SEP26 / MNQU6.")
+        if not topology.matches(instrument, contract):
+            raise ValueError("Discernment topology identity is not the selected exact contract.")
         self.instrument = instrument
         self.contract = contract
+        self.topology = topology
         self._active: dict[tuple[str, str], DiscernmentEvidence] = {}
         self._seen_event_hashes: dict[str, str] = {}
         self._continuity_domain: str | None = None
@@ -1490,6 +1505,8 @@ class DiscernmentEngine:
             "validity": validity.value,
             "reason_codes": reasons,
             "execution_enabled": DISCERNMENT_EXECUTION_ENABLED,
+            **({"topology_version": self.topology.version, "topology_hash": self.topology.binding_hash}
+               if self.topology.version != SEP26_TOPOLOGY.version else {}),
         }
         return DiscernmentSnapshot(
             self.instrument,
@@ -1515,6 +1532,8 @@ class DiscernmentEngine:
             validity,
             tuple(reasons),
             canonical_hash(payload_without_hash),
+            topology_version=self.topology.version,
+            topology_hash=self.topology.binding_hash,
         )
 
     def _consider_switch(self, snapshot: DiscernmentSnapshot) -> DiscernmentSwitch | None:

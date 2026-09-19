@@ -87,7 +87,7 @@ class CompletedPongHour:
         start, end, available = utc(self.start), utc(self.end), utc(self.available_at)
         if end - start != timedelta(hours=1) or any((start.minute, start.second, start.microsecond)):
             raise ValueError("Pong bars require exact completed UTC hours.")
-        if available < end or self.instrument != "MNQ SEP26":
+        if available < end or self.instrument not in {"MNQ SEP26", "MNQ DEC26"}:
             raise ValueError("Pong bar is future-dated or has the wrong contract.")
         if type(self.complete) is not bool or not self.source or not self.continuity_domain:
             raise ValueError("Pong hour requires explicit coverage and source identity.")

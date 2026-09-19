@@ -48,6 +48,7 @@ from src.l3g_paper.paper_autostart import (
 )
 from src.l3g_paper.ninjatrader_transport import LocalPaperSecretProvider, PaperExecutionTransport
 from src.l3g_paper.pong_collection import PongAuthenticHourCollector
+from src.l3g_paper.pong_contract import resolve_pong_topology
 from src.l3g_paper.pong_production import PongProductionHost
 from src.l3g_paper.pong_authorization import PONG_AUTHORIZATION_ENV, PongLaunchAuthorization
 from src.l3g_paper.pong_scheduler import (
@@ -122,6 +123,7 @@ GRACEFUL_SHUTDOWN_ACTION_HEADER = "X-Beelzebub-Graceful-Shutdown-Action"
 GRACEFUL_SHUTDOWN_ACTION_VALUE = "beezconsole-graceful-shutdown-v1"
 PONG_INDEPENDENT_COLLECTION_ENV = "BEELZEBUB_PONG_INDEPENDENT_COLLECTION"
 PONG_BOUNDED_ACTIVATION_ENV = "BEELZEBUB_PONG_BOUNDED_ACTIVATION"
+PONG_CONTRACT_TOPOLOGY_ENV = "BEELZEBUB_PONG_CONTRACT_TOPOLOGY"
 LEDGER_CAPACITY_RECOVERY_ACTION_HEADER = (
     "X-Beelzebub-Ledger-Capacity-Recovery-Action"
 )
@@ -1672,6 +1674,7 @@ def create_control_center_app(
     pong_bounded_activation = _strict_environment_flag(
         PONG_BOUNDED_ACTIVATION_ENV,
     )
+    pong_topology = resolve_pong_topology(os.getenv(PONG_CONTRACT_TOPOLOGY_ENV))
     pong_authorization_path = os.getenv(PONG_AUTHORIZATION_ENV)
     pong_launch_authorization = (
         None if not pong_authorization_path
@@ -2469,6 +2472,7 @@ def create_control_center_app(
                 pong_collection_root,
                 expected_source_fingerprint=EXPECTED_OBSERVER_SOURCE_FINGERPRINT,
                 independent_market_collection=pong_independent_collection,
+                topology=pong_topology,
             )
             pong_collector.start()
             ninjatrader_runtime["pong_collection"] = pong_collector
@@ -2485,6 +2489,7 @@ def create_control_center_app(
                 launch_authorization=pong_launch_authorization,
                 history_verification_key=LocalPaperSecretProvider().load_key(),
                 scheduling=pong_scheduling,
+                topology=pong_topology,
             )
             paper_runtime.bind_pong_integration_status(pong_host.authority_status)
             paper_runtime.bind_pong_execution_sink(pong_host.on_execution_message)

@@ -22,6 +22,7 @@ PONG_DAILY_BIAS_CALCULATION_ID = "pong-core-vote-options-overlay"
 PONG_DAILY_BIAS_CALCULATION_VERSION = "0"
 PONG_DAILY_BIAS_PRODUCTION_CONFIGURED = False
 PONG_DAILY_BIAS_INSTRUMENT = "MNQ SEP26"
+PONG_DAILY_BIAS_INSTRUMENTS = frozenset({"MNQ SEP26", "MNQ DEC26"})
 PONG_TRIAL_OPTIONS_AUTHORITY = canonical_hash({
     "schema": "pong-one-hour-options-nonvoting-v1",
     "authority": "JOSEPH_ELEVATED_PAPER_COMMISSIONING_20260911",
@@ -290,8 +291,8 @@ class HourlyBiasFrame:
     prior_result_id: str | None
 
     def __post_init__(self) -> None:
-        if self.instrument != PONG_DAILY_BIAS_INSTRUMENT:
-            raise ValueError("Daily bias is sealed to MNQ SEP26.")
+        if self.instrument not in PONG_DAILY_BIAS_INSTRUMENTS:
+            raise ValueError("Daily bias requires a known exact Pong instrument.")
         if type(self.continuity_valid) is not bool:
             raise ValueError("Daily-bias continuity state must be a boolean.")
         start = _time(self.boundary_start, "Hourly boundary start")
@@ -363,7 +364,7 @@ class DailyBiasResult:
             raise ValueError("Bias result direction is required.")
         if type(self.confidence) is not BiasConfidenceTier:
             raise ValueError("Bias confidence tier is required.")
-        if self.instrument != PONG_DAILY_BIAS_INSTRUMENT:
+        if self.instrument not in PONG_DAILY_BIAS_INSTRUMENTS:
             raise ValueError("Bias result instrument mismatch.")
         start = _time(self.boundary_start, "Bias result boundary start")
         end = _time(self.boundary_end, "Bias result boundary end")
@@ -737,7 +738,7 @@ class ClassifiedTradeInput:
         _text(self.event_id, "Classified trade ID")
         _sha256(self.payload_hash, "Classified trade hash")
         _text(self.source, "Classified trade source")
-        if self.instrument != PONG_DAILY_BIAS_INSTRUMENT:
+        if self.instrument not in PONG_DAILY_BIAS_INSTRUMENTS:
             raise ValueError("Classified trade instrument mismatch.")
         if type(self.side) is not ClassifiedSide:
             raise ValueError("Classified trade side is required.")

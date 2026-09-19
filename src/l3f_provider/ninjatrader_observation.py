@@ -44,7 +44,7 @@ NINJATRADER_ATTESTATION_KEY_CONTEXT = b"BEELZEBUB_NINJATRADER_OBSERVATION_V2"
 # Regenerated from both checked-in read-only NinjaScript producer sources.  The
 # helper below excludes this embedded value, so a compiled stale producer keeps
 # reporting its old identity even after the checkout changes.
-EXPECTED_OBSERVER_SOURCE_FINGERPRINT = "e9ace3492b5d2d38e50d7c2d8c5d13b0cf344d9513d5344b282a23d026d43ced"
+EXPECTED_OBSERVER_SOURCE_FINGERPRINT = "1825e9890fe54a71f9b495e778e07c9e523ca1b36f66569b21f9ca4549102b73"
 NINJATRADER_SOURCE = "NINJATRADER"
 LUCID_CQG_PROVIDER = "LUCID_CQG"
 PROP_SIM_ENVIRONMENT = "PROP_SIM"

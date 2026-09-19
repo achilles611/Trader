@@ -634,6 +634,15 @@ namespace NinjaTrader.NinjaScript.AddOns
             return null;
         }
 
+        public static string ResolveCanonicalContract(string nativeInstrument)
+        {
+            if (String.Equals(nativeInstrument, "MNQ SEP26", StringComparison.Ordinal))
+                return "MNQU6";
+            if (String.Equals(nativeInstrument, "MNQ DEC26", StringComparison.Ordinal))
+                return "MNQZ6";
+            return null;
+        }
+
         private void OnAccountItemUpdate(object sender, AccountItemEventArgs e)
         {
             Account account = sender as Account;
@@ -842,7 +851,17 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
         private const string HourlyWarmStartPolicyVersion = "pong-hourly-warm-start-v1";
-        private const string HourlyWarmStartPolicyHash = "5a1c78a287d50b69e5dd6e8d9bc584ef5a264efd98845997fd08b7c85668e5c2";
+        private const string Sep26HourlyWarmStartPolicyHash = "5a1c78a287d50b69e5dd6e8d9bc584ef5a264efd98845997fd08b7c85668e5c2";
+        private const string Dec26HourlyWarmStartPolicyHash = "f26f65d7fee9a386afcf220da80f32d98639440117570c932341b83086920443";
+
+        private string ResolveHourlyWarmStartPolicyHash()
+        {
+            if (String.Equals(instrument.FullName, "MNQ SEP26", StringComparison.Ordinal))
+                return Sep26HourlyWarmStartPolicyHash;
+            if (String.Equals(instrument.FullName, "MNQ DEC26", StringComparison.Ordinal))
+                return Dec26HourlyWarmStartPolicyHash;
+            return null;
+        }
 
         private void StartVolumeReferenceRequest()
         {
@@ -887,8 +906,14 @@ namespace NinjaTrader.NinjaScript.AddOns
                     int chunks = (rows.Count + 127) / 128;
                     for (int index = 0; index < chunks; index++)
                     {
+                        string canonicalContract = BeelzebubReadOnlyAddOn.ResolveCanonicalContract(instrument.FullName);
+                        if (String.IsNullOrWhiteSpace(canonicalContract))
+                        {
+                            BeelzebubReadOnlyOutbound.Diagnostic("VOLUME_REFERENCE_UNKNOWN_CONTRACT");
+                            return;
+                        }
                         string payload = "{\"contract_id\":\"" + instrument.FullName
-                            + "\",\"canonical_contract\":\"MNQU6\",\"source\":\"NINJATRADER_BARS_REQUEST_PROVIDER\""
+                            + "\",\"canonical_contract\":\"" + canonicalContract + "\",\"source\":\"NINJATRADER_BARS_REQUEST_PROVIDER\""
                             + ",\"status\":\"COMPLETE\",\"merge_policy\":\"DO_NOT_MERGE\",\"trading_hours\":\"Default 24 x 7\""
                             + ",\"timezone\":\"UTC\",\"bar_period_minutes\":5,\"requested_bars_back\":2016"
                             + ",\"request_id\":\"" + requestId + "\",\"requested_at\":\""
@@ -978,7 +1003,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 + ",\"gaps\":[" + String.Join(",", gaps) + "],\"timezone\":\"UTC\",\"day_anchor\":\""
                 + (boundary - TimeSpan.FromHours(2)).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
                 + "\",\"policy_version\":\"" + HourlyWarmStartPolicyVersion + "\",\"policy_hash\":\""
-                + HourlyWarmStartPolicyHash + "\",\"bars\":[" + String.Join(",", rows)
+                + ResolveHourlyWarmStartPolicyHash() + "\",\"bars\":[" + String.Join(",", rows)
                 + "],\"publication_policy\":\"CAUSAL_HISTORICAL_COMPLETED_HOUR_V1\"}";
             string observationId = BeelzebubReadOnlyOutbound.Publish("HISTORICAL_WARM_START", null, null, payload);
             if (observationId != null && status == "COMPLETE")
@@ -997,7 +1022,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 + "\"],\"timezone\":\"UTC\",\"day_anchor\":\""
                 + (boundary - TimeSpan.FromHours(2)).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
                 + "\",\"policy_version\":\"" + HourlyWarmStartPolicyVersion + "\",\"policy_hash\":\""
-                + HourlyWarmStartPolicyHash + "\",\"bars\":[],\"publication_policy\":\"CAUSAL_HISTORICAL_COMPLETED_HOUR_V1\"}";
+                + ResolveHourlyWarmStartPolicyHash() + "\",\"bars\":[],\"publication_policy\":\"CAUSAL_HISTORICAL_COMPLETED_HOUR_V1\"}";
             BeelzebubReadOnlyOutbound.Publish("HISTORICAL_WARM_START", null, null, payload);
         }
 
@@ -1026,7 +1051,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 payload = payload.Substring(0, payload.Length - 1)
                     + ",\"contract_id\":\"" + instrument.FullName
                     + "\",\"source\":\"NINJATRADER_BARS_REQUEST_PROVIDER\",\"policy_version\":\""
-                    + HourlyWarmStartPolicyVersion + "\",\"policy_hash\":\"" + HourlyWarmStartPolicyHash
+                    + HourlyWarmStartPolicyVersion + "\",\"policy_hash\":\"" + ResolveHourlyWarmStartPolicyHash()
                     + "\",\"publication_policy\":\"CAUSAL_LIVE_COMPLETED_HOUR_V1\"}";
                 if (BeelzebubReadOnlyOutbound.Publish("HOURLY_BAR", null, null, payload) != null)
                     lock (hourlyLock) publishedHourlyEnds.Add(endIdentity);
@@ -1488,7 +1513,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string AttestedSchema = "lane-iii-phase-f3-ninjatrader-observation-v2";
         private const string AttestationProtocol = "l3f3-ninjatrader-observer-attestation-v1";
         private const string AttestationKeyContext = "BEELZEBUB_NINJATRADER_OBSERVATION_V2";
-        private const string ProducerSourceFingerprint = "e9ace3492b5d2d38e50d7c2d8c5d13b0cf344d9513d5344b282a23d026d43ced";
+        private const string ProducerSourceFingerprint = "1825e9890fe54a71f9b495e778e07c9e523ca1b36f66569b21f9ca4549102b73";
         // Event-driven trades/depth require burst capacity, but memory remains
         // bounded. A full queue drops the signed frame after assigning its
         // sequence; the next source_event_sequence exposes the gap.
