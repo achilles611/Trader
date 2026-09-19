@@ -158,6 +158,13 @@ was copied. Because NinjaTrader was not running, compiled identity reload was
 not observed; this remains a safe-install partial result, not native runtime
 proof.
 
+The final operating-checkout source-contract validation is preserved at
+`H:\PongPeriodic\20260919\observer-build-operating\compile-result.txt`:
+bundled Roslyn, zero errors, 1,267 warnings, AddOn source SHA
+`82937fe51a32862bd70ba52b5b8dcfd84efa6dc15be8d84d1097a8c1349499ff`, and
+indicator source SHA
+`bb5b35aaff1cc064065e093d9ec661f4f081e86ae32ee7383df1bce13c0039ff`.
+
 ## Exactly what still requires fresh market/account data
 
 Only these gates remain fresh-data dependent:
