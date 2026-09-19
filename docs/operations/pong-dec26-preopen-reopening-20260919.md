@@ -211,3 +211,80 @@ fixture; authenticated historical journal verification; SEP26 historical
 regression/latency evidence; observer source compilation; safe source-only
 install with backups; generated-wrapper and callback-ordering checks; and
 disarmed zero-dispatch integration tests.
+
+## 2026-09-19 execution addendum
+
+The seven authorized reversions were resolved to the reviewed `HEAD` in the
+operating checkout after immutable copies, the staged patch, and the stash
+object were recorded. The only additional source repair was a narrow
+compatibility correction in `src/l3g_paper/pong_production.py`: the bias helper
+is static again for the retained historical certificate tool, while the live
+DEC26 host passes its selected instrument explicitly. No paper or native
+authority was enabled.
+
+Use this explicit scheduler configuration for a future disarmed DEC26
+observation. It keeps periodic flat evaluation enabled while retaining the
+event-driven protection path:
+
+```powershell
+$env:BEELZEBUB_PONG_CONTRACT_TOPOLOGY = 'DEC26'
+$env:BEELZEBUB_PONG_SCHEDULING_MODE = 'PERIODIC_FLAT_PROTECTED'
+$env:BEELZEBUB_PONG_PERIODIC_INTERVAL_MS = '20'
+$env:BEELZEBUB_PONG_BOUNDED_ACTIVATION = '0'
+$env:BEELZEBUB_LIVE_TRADING = '0'
+```
+
+The offline periodic replay used the 20 ms configuration, selected
+`PERIODIC_FLAT`, applied 7,684 periodic analytical evaluations, and retained
+zero event-driven analytical evaluations because the fixture stayed flat. Its
+deadline receipt recorded 9,166 scheduled opportunities, 7,805 dispatches,
+7,805 completions, 1,360 obsolete skips, 121 intentional no-work deadlines,
+and QPC/QueryPerformanceCounter monotonic timing. These are fixture results;
+they do not certify a live 20 ms SLA, capacity, or protective equivalence.
+
+The retained DEC26 replay is an integrity result only: 335,551/335,551 records
+verified, zero contract mismatches, zero native dispatches, and
+`PONG_NATIVE_INPUT_PRODUCER_CHANGED`. Its old producer fingerprint/build and
+two-session split remain refusal evidence and must not be merged.
+
+### Target-time and qualification boundary
+
+The requested target is Sunday, 2026-09-20 at 17:00 America/Denver, which is
+19:00 America/New_York and 23:00 UTC. CME's current equity-index schedule puts
+the Sunday Globex reopen at 18:00 Eastern, so the target is inside the exchange
+session. The local resolver selects `ASIA` beginning at 18:00 Eastern, with an
+18:05 entry start; it is not an `OFF_SESSION` target. Verify the live venue
+calendar and feed state again because the repository calendar is not a venue
+hours feed.
+
+Qualification must begin before 17:00 Mountain if the target is to be met. The
+observer, current account snapshot, warm-start/history receipt, one coherent
+DEC26 producer session, and the bounded natural capture all have to complete
+before qualification can be reported. There is no safe offline way to assign a
+fixed lead time: the earliest start is the first point at which NinjaTrader is
+running, `Sim101` is reconciled and flat, and the fresh DEC26 feed is producing
+the required streams. If that evidence is not complete by 17:00 Mountain,
+qualification and any paper start move later; the scheduler must report the
+shortfall rather than compressing or bypassing gates.
+
+### Exact guarded paper-start boundary
+
+The read-only status endpoint is:
+
+```text
+GET /api/lane-iii/paper/auto-start
+```
+
+The browser's guarded action, when all current gates are green, is the
+same-origin loopback `POST /api/lane-iii/paper/operational-start` with exactly
+`{"request_id":"<uuid>"}`. Do not issue it during preparation. The current
+general Lane III operational-start and transport gates still require
+`Sim101 / LOCAL_SIMULATION / MNQ SEP26`; that is a code-level blocker to a
+DEC26 Sim101 paper start, not a missing market-data receipt. The DEC26 Pong
+topology migration intentionally did not relabel or widen those generic paper
+contracts. A DEC26 paper start therefore remains blocked until a separately
+authorized topology-wide runtime/account integration is completed and tested.
+
+The existing scheduled 17:00 Mountain task is reserved for fresh-data
+qualification and reporting. It must not be treated as permission to repair,
+arm, or start paper trading.

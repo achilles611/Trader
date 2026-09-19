@@ -203,3 +203,73 @@ checks current read-only account/risk state, collects one matching signed
 session, runs protected replay while disarmed, measures natural-paced latency,
 and stops on any identity, freshness, queue, durability, reconciliation, or
 producer-session failure. No launch-at-open task or automation was created.
+
+## 2026-09-19 readiness execution addendum
+
+This addendum records the completion pass in the operating checkout
+`C:\Users\atlas\Documents\Trader`, branch
+`codex/lane-iii-perpetual-corrective-20260906`, starting at
+`4a6245c0e4ee976921790ce6291aeb2b7538bc7a`.
+
+### Completed before fresh-data qualification
+
+- The seven staged reversions were resolved to the committed reviewed content
+  after preserving full file copies, the staged patch, preflight state, and
+  immutable stash object `7cf6414d0516af3ba821fae3a3eff173d68d1b12`. The
+  operating checkout was clean for those seven paths; the separate bias-helper
+  compatibility repair is the only source change in this completion pass.
+- The repaired Pong and support suites passed: 182 Pong-named tests plus 70
+  support tests, 252 unique tests total. `py_compile` and `git diff --check`
+  passed.
+- Protected synthetic scenarios passed all six cases. The natural protected
+  replay passed with 150,016 source/receiver/admission/durable/verified
+  records, zero overflow/reject/duplicate records, final queue depth zero, and
+  zero native dispatches. Receipt:
+  `H:\PongPeriodic\20260919\periodic-repair-natural-v1\result.json`;
+  SHA-256 `6F2E02DB63999BD4BC6DA072A729AB04F5F90674018CB77A86461927696F6D9D`.
+- The periodic fixture ran with `PERIODIC_FLAT_PROTECTED` at 20 ms. It used
+  QPC timing, applied 7,684 periodic analytical evaluations, and retained the
+  event-driven protection branch. Host-evaluation p99 was 22.9445 ms and
+  callback-admission p99 was 122.4165 ms on the historical fixture; these are
+  not current qualification or SLA claims.
+- The repaired DEC26 replay passed integrity with 335,551 verified records,
+  zero contract mismatches, zero native dispatches, and qualification
+  `NOT_QUALIFIED`. Receipt:
+  `H:\PongPeriodic\20260919\dec26-authenticated-replay-after-periodic-repair-v1\result.json`;
+  SHA-256 `9B4CC94F9978F0A298D6C98502F01A11FC72E6BAD375D9FC276AEC6D87C67019`.
+  The retained `PONG_NATIVE_INPUT_PRODUCER_CHANGED` refusal is preserved.
+- The topology-bound risk-continuity proof passed with generic SEP26 refusal,
+  DEC26 validation, lockout preservation, artifact round-trip, and zero native
+  dispatches. Receipt:
+  `H:\PongPeriodic\20260919\offline-completion-after-repair-v1\risk-continuity\result.json`;
+  receipt SHA-256 `EBB6AD0E464DC4845E0962E382DFFB248810E19B250B3EC023AFC1BEE459C649`.
+- Generated-wrapper and callback-ordering tests passed. Both tests remained
+  test-only; no native assembly was loaded and no runtime authority was used.
+- The read-only observer compiled with bundled Roslyn, zero errors, and 1,267
+  warnings. Source-only install parity and backups are present. The attempted
+  compiled reload stopped safely because no NinjaTrader source watcher/process
+  was running; no DLL was copied and the installed DLL hash remained
+  `A9DB49334F7F8ED8992EB0DCD2AB842C4397D826B52DEC2F8908542133F64FD9`.
+
+### Remaining blockers to DEC26 Sim101 paper startup
+
+The native process/listener/account checks were absence checks only: no
+NinjaTrader or BeezConsole process and no listener on ports 8090/48135 were
+present. Current native source/build identity, account flatness, positions,
+working orders, risk totals, warm-start/history/bias, one producer session, and
+fresh latency/queue/durability evidence remain unknown until fresh data exists.
+
+Separately, the generic operational paper path is still sealed to
+`Sim101 / LOCAL_SIMULATION / MNQ SEP26` in `src/copytrade/control_center.py`
+and the Lane III runtime/transport contracts. That is a topology integration
+blocker for starting DEC26 paper, even if every DEC26 Pong feed gate later
+passes. The preparation pass deliberately did not widen or relabel those
+contracts. The exact guarded API and gate sequence are in the reopening
+runbook; no start request was sent.
+
+Qualification must start before the 17:00 Mountain target. Sunday at that time
+is 19:00 Eastern / 23:00 UTC, inside CME's Sunday Globex session and the local
+`ASIA` strategy window, but the necessary observer startup, account
+reconciliation, warm-start, coherent-session capture, replay, and reporting
+have no fixed offline duration. If they are not complete by target time, the
+target is missed safely rather than by relaxing gates.

@@ -1125,12 +1125,14 @@ class PongProductionHost:
                     "PONG_NATIVE_CALLBACK_BRIDGE_FAILED:" + type(error).__name__
                 )
 
+    @staticmethod
     def _bias_from_inputs(
         previous: CompletedPongHour,
         current: CompletedPongHour,
         trades: tuple[ClassifiedTradeInput, ...],
         *,
         published_at: str,
+        instrument: str = SEP26_TOPOLOGY.native_instrument,
     ) -> DailyBiasResult:
         structural = hourly_structure_components(
             previous, current, available_at=published_at,
@@ -1143,7 +1145,7 @@ class PongProductionHost:
             start=current.start, end=current.end, available_at=published_at,
         )
         frame = HourlyBiasFrame(
-            self.topology.native_instrument, current.start, current.end, published_at,
+            instrument, current.start, current.end, published_at,
             (*structural, flow), options, True, None,
         )
         return DailyBiasEngine().update(
@@ -1173,7 +1175,9 @@ class PongProductionHost:
             available_at=str(item["available_at"]), authenticated=bool(item["authenticated"]),
         ) for item in raw_trades)
         result = self._bias_from_inputs(
-            hours[0], hours[1], trades, published_at=str(value["published_at"]),
+            hours[0], hours[1], trades,
+            published_at=str(value["published_at"]),
+            instrument=self.topology.native_instrument,
         )
         if result.result_hash != value.get("daily_bias_result_hash"):
             raise ValueError("certificate daily bias hash")
@@ -1221,6 +1225,7 @@ class PongProductionHost:
             bias = self._bias_from_inputs(
                 self._hour_pair[0], self._hour_pair[1],
                 trades, published_at=published_at,
+                instrument=self.topology.native_instrument,
             )
             if not bias.configured:
                 return
