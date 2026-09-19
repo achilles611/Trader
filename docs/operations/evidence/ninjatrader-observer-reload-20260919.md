@@ -65,3 +65,29 @@ The supported procedure is intentionally visible and bounded:
 - **Fresh market data:** after native reload and exact Sim101 context, a new DEC26 observer session with warm-start/history, quote/trade/depth continuity, and measured durable latency is required. Historical DEC26 replay cannot substitute for this.
 
 No blocker is an execution bridge or a code-level observer compile error. Preparation remains disarmed.
+
+## Post-F5 verification
+
+The operator completed native F5 compilation after the original evidence above. The current verification was performed without starting BeezConsole or an execution bridge.
+
+- Stable compiled copy: `C:\Users\atlas\Documents\NinjaTrader 8\bin\Custom\NinjaTrader.Custom.dll`, length `1,371,136`, last write `2026-09-19T22:30:56.7834101Z`, SHA-256 `1d749900b9f0cd8aa0eeeef7eec2cee6a0840fda2de5338f15fa4ced9d90303a`.
+- Actual loaded assembly: `C:\Users\atlas\Documents\NinjaTrader 8\tmp\b090c521cffc483db90190bb46094506.dll`, length `1,371,136`, last write `2026-09-19T22:30:55.2804078Z`, SHA-256 `adfdfe544aa6748bbd4270a7aa90f42776e7f479b1e20114049ae71562272020`.
+- The AddOn's runtime `AssemblyHash()` hashes the executing assembly location. The signed producer frame reported exactly `adfdfe544aa6748bbd4270a7aa90f42776e7f479b1e20114049ae71562272020`, proving the loaded identity is the temp assembly above.
+- A bounded read-only receiver captured 134 frames; all 134 signatures verified. Every captured market/history frame identified `MNQ DEC26`. The producer source fingerprint was `1825e9890fe54a71f9b495e778e07c9e523ca1b36f66569b21f9ca4549102b73`, matching both the current Python expectation and the installed AddOn constant.
+- The signed receiver window began after initial account attachment, so it captured only `Lucid25kflex01 / PROVIDER_EVALUATION` account frames. It did not claim a signed Sim101 frame.
+
+## Sim101 / LOCAL_SIMULATION native state
+
+The live NinjaTrader Control Center Accounts tab explicitly showed a connected `Sim101` row. The current AddOn maps the non-provider `Sim101` alias to `LOCAL_SIMULATION` in `Alias()`/`Class()`; this is the exact class mapping used by its account, position, and order publications.
+
+The native Positions tab had zero data rows. The native Orders tab had zero data rows. The Sim101 Accounts row showed:
+
+- buying power `$0.00`;
+- cash value and net liquidation `$99,850.50`;
+- excess intraday and initial margin `$99,850.50`;
+- intraday and initial margin `$0.00`;
+- gross realized, realized, unrealized, and total PnL `$0.00`.
+
+The native log records `Automated trading disabled` and `Order entry hot keys disabled`. The temporary read-only receiver was stopped; no listener remains on `48135`, `48136`, `48137`, or `8090`, and no BeezConsole process is running.
+
+Conclusion: current-source observer reload and actual loaded producer identity are verified. Sim101 is natively connected, flat, has no working orders, and is explicitly classified by the current observer contract as `LOCAL_SIMULATION`; execution remains disarmed. A fresh signed Sim101 account snapshot and fresh DEC26 qualification remain separate data-capture gates because the bounded receiver attached after startup.
