@@ -2417,10 +2417,6 @@ class PaperLedger:
             "entry_family_count": self.policy.entry_family_count,
             "retention_confidence_threshold": str(self.policy.retention_support_threshold),
             "account_binding_hash": self.binding.binding_hash,
-            "instrument": self.binding.instrument,
-            "canonical_contract": self.binding.canonical_contract,
-            "contract_topology_version": self.contract_topology.version,
-            "contract_topology_hash": self.contract_topology.binding_hash,
             "scientific_eligibility": False,
             "paper_only": True,
             "live_capital": False,
@@ -2432,6 +2428,15 @@ class PaperLedger:
             "session_generation": generation,
             "payload": identity_payload,
         }
+        # Preserve historical SEP26 envelope bytes. DEC26 records carry the
+        # additive identity fields required to prevent a mixed-contract reopen.
+        if self.contract_topology.canonical_contract != "MNQU6":
+            common.update({
+                "instrument": self.binding.instrument,
+                "canonical_contract": self.binding.canonical_contract,
+                "contract_topology_version": self.contract_topology.version,
+                "contract_topology_hash": self.contract_topology.binding_hash,
+            })
         # Retain both exact and generated-time retry fingerprints. An explicit
         # event time remains part of identity-conflict detection; only a
         # caller which omitted it can retry with a fresh ledger envelope time.
