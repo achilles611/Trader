@@ -24,7 +24,6 @@ from src.l3g_paper.pong_quantity import (
     PongReconciliationProof,
 )
 from src.l3g_paper.pong_runtime import PongLoadedRuntimeIdentity
-from src.l3g_paper.pong_scheduler import PongSchedulingConfig
 from src.l3g_paper.risk_continuity import (
     read_pong_risk_continuity_artifact,
     validate_pong_risk_continuity_snapshot,
@@ -138,7 +137,6 @@ class PongContractTopologyTests(unittest.TestCase):
                 controller_dispatch=lambda *_: False,
                 native_dispatch=lambda directive, evidence: dispatched.append((directive, evidence)) or {},
                 activation_authorized=False,
-                scheduling=PongSchedulingConfig(),
                 topology=DEC26_TOPOLOGY,
             )
             self.assertEqual(
