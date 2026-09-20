@@ -28,8 +28,11 @@ from urllib.request import Request, urlopen
 
 from src.l3g_paper.contracts import (
     paper_contract_identity_matches,
+    paper_policy_for_topology,
+    paper_risk_for_topology,
     resolve_paper_profile,
 )
+from src.l3g_paper.pong_contract import resolve_pong_topology
 from src.l3g_paper.profile_switch import (
     PROFILE_SWITCH_SCHEMA,
     _manifest as validated_profile_switch_manifest,
@@ -287,6 +290,24 @@ def resolve_launch_binding(
         profile = resolve_paper_profile(profile_key)
     except ValueError as exc:
         raise RuntimeError(f"BeezConsole paper profile is invalid: {profile_key}") from exc
+    source_environment = os.environ if environment is None else environment
+    configured_paper_topology = source_environment.get(
+        "BEELZEBUB_L3G_PAPER_CONTRACT_TOPOLOGY"
+    )
+    configured_pong_topology = source_environment.get(
+        "BEELZEBUB_PONG_CONTRACT_TOPOLOGY"
+    )
+    try:
+        paper_topology = resolve_pong_topology(configured_paper_topology or "SEP26")
+        pong_topology = resolve_pong_topology(
+            configured_pong_topology or configured_paper_topology or "SEP26"
+        )
+    except ValueError as exc:
+        raise RuntimeError("BeezConsole paper contract topology is invalid.") from exc
+    if paper_topology.version != pong_topology.version:
+        raise RuntimeError("PONG_PAPER_CONTRACT_TOPOLOGY_MISMATCH")
+    paper_policy = paper_policy_for_topology(profile.policy, paper_topology)
+    paper_risk = paper_risk_for_topology(profile.risk, paper_topology)
     return LaunchBinding(
         runtime_root=runtime_root,
         ledger_path=ledger_path,
@@ -295,10 +316,10 @@ def resolve_launch_binding(
         profile=profile.selection_key,
         git_sha=git_sha,
         python=python.resolve(),
-        entry_profile=profile.policy.entry_profile,
-        entry_profile_version=profile.policy.entry_profile_version,
-        paper_policy_hash=profile.policy.configuration_hash,
-        risk_profile_hash=profile.risk.configuration_hash,
+        entry_profile=paper_policy.entry_profile,
+        entry_profile_version=paper_policy.entry_profile_version,
+        paper_policy_hash=paper_policy.configuration_hash,
+        risk_profile_hash=paper_risk.configuration_hash,
         source=source,
         ledger_identity=ledger_identity,
         operation_id=operation_id,
@@ -342,7 +363,10 @@ def _validated_operation(
         or _GIT_SHA.fullmatch(manifest_git_sha) is None
         or (require_current_git_sha and manifest_git_sha != binding.git_sha)
         or Path(str(manifest.get("runtime_root"))).resolve() != binding.runtime_root
-        or Path(str(manifest.get("project_root"))).resolve() != project
+        or (
+            require_current_git_sha
+            and Path(str(manifest.get("project_root"))).resolve() != project
+        )
         or Path(str(manifest.get("python_executable"))).resolve() != binding.python
         or state.get("schema") != PROFILE_SWITCH_SCHEMA
         or state.get("operation_id") != operation_id

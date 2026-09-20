@@ -253,6 +253,65 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
             self.assertEqual(child["BEELZEBUB_PONG_CONTRACT_TOPOLOGY"], "DEC26")
             self.assertEqual(child["BEELZEBUB_L3G_PAPER_CONTRACT_TOPOLOGY"], "DEC26")
 
+    def test_explicit_maintenance_binding_uses_the_selected_contract_topology(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project(root)
+            ledger = root / "explicit" / "hot" / "lane_iii_paper.sqlite3"
+            audit = root / "explicit" / "audit"
+            argv = (
+                "--maintenance-ledger-path", str(ledger),
+                "--maintenance-audit-root", str(audit),
+                "--maintenance-ledger-epoch", "L3G-PAPER-EPOCH-DEC26-TEST",
+                "--maintenance-paper-profile", "BEELZEBUB_PONG_DISCERNMENT_V1",
+            )
+            environment = {
+                "BEELZEBUB_L3G_PAPER_CONTRACT_TOPOLOGY": "DEC26",
+                "BEELZEBUB_PONG_CONTRACT_TOPOLOGY": "DEC26",
+            }
+            with patch("beez_console.checkout_git_sha", return_value=GIT_SHA):
+                resolved = beez_console.resolve_launch_binding(
+                    root, argv=argv, environment=environment,
+                )
+            profile = beez_console.resolve_paper_profile(
+                "BEELZEBUB_PONG_DISCERNMENT_V1"
+            )
+            topology = beez_console.resolve_pong_topology("DEC26")
+            expected_policy = beez_console.paper_policy_for_topology(
+                profile.policy, topology,
+            )
+            expected_risk = beez_console.paper_risk_for_topology(
+                profile.risk, topology,
+            )
+            self.assertEqual(
+                resolved.paper_policy_hash, expected_policy.configuration_hash,
+            )
+            self.assertEqual(
+                resolved.risk_profile_hash, expected_risk.configuration_hash,
+            )
+
+    def test_launch_binding_rejects_mixed_contract_topologies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project(root)
+            argv = (
+                "--maintenance-ledger-path", str(root / "ledger.sqlite3"),
+                "--maintenance-audit-root", str(root / "audit"),
+                "--maintenance-ledger-epoch", "L3G-PAPER-EPOCH-MIXED-TEST",
+                "--maintenance-paper-profile", "BEELZEBUB_PONG_DISCERNMENT_V1",
+            )
+            environment = {
+                "BEELZEBUB_L3G_PAPER_CONTRACT_TOPOLOGY": "DEC26",
+                "BEELZEBUB_PONG_CONTRACT_TOPOLOGY": "SEP26",
+            }
+            with patch("beez_console.checkout_git_sha", return_value=GIT_SHA):
+                with self.assertRaisesRegex(
+                    RuntimeError, "PONG_PAPER_CONTRACT_TOPOLOGY_MISMATCH",
+                ):
+                    beez_console.resolve_launch_binding(
+                        root, argv=argv, environment=environment,
+                    )
+
     def test_partial_explicit_maintenance_binding_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -788,7 +847,7 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "will not compete"):
                     beez_console.assert_remembered_launch_is_not_competing(expected)
 
-    def test_explicit_maintenance_accepts_intact_terminal_prior_policy_manifest(self) -> None:
+    def test_explicit_maintenance_accepts_intact_terminal_prior_checkout_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             project(root)
@@ -809,6 +868,7 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
             )
             historical = json.loads(manifest_path.read_text(encoding="utf-8"))
             historical.pop("manifest_sha256")
+            historical["project_root"] = str(root / "prior-checkout")
             historical["paper_policy_hash"] = "1" * 64
             without_digest = dict(historical)
             historical["manifest_sha256"] = sha256(
