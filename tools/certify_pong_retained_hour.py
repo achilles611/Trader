@@ -27,6 +27,14 @@ from src.l3f_provider.ninjatrader_observation import (  # noqa: E402
 from src.l3g_paper.ninjatrader_transport import LocalPaperSecretProvider  # noqa: E402
 from src.l3g_paper.daily_bias import ClassifiedSide, ClassifiedTradeInput  # noqa: E402
 from src.l3g_paper.pong_experiment import CompletedPongHour  # noqa: E402
+from src.l3g_paper.pong_inputs import (  # noqa: E402
+    PONG_HOURLY_WARM_START_POLICY_VERSION,
+    hourly_warm_start_policy_hash,
+)
+from src.l3g_paper.pong_contract import (  # noqa: E402
+    PongContractTopology,
+    topology_for_version,
+)
 from src.l3g_paper.pong_production import (  # noqa: E402
     PONG_QUALIFYING_HOUR_SCHEMA,
     PongProductionHost,
@@ -64,6 +72,7 @@ def eligible_interval(status: dict[str, object]) -> dict[str, object]:
 
 def completed_hour(
     observation: dict[str, object], *, continuity_domain: str,
+    topology: PongContractTopology,
 ) -> CompletedPongHour:
     payload = observation["payload"]
     if not isinstance(payload, dict):
@@ -75,8 +84,10 @@ def completed_hour(
         end != start + timedelta(hours=1)
         or end > observed
         or observed > end + timedelta(minutes=5)
-        or payload.get("contract_id") != "MNQ SEP26"
+        or payload.get("contract_id") != topology.native_instrument
         or payload.get("source") != "NINJATRADER_BARS_REQUEST_PROVIDER"
+        or payload.get("policy_version") != PONG_HOURLY_WARM_START_POLICY_VERSION
+        or payload.get("policy_hash") != hourly_warm_start_policy_hash(topology)
         or payload.get("publication_policy") != "CAUSAL_LIVE_COMPLETED_HOUR_V1"
     ):
         raise RuntimeError("PONG_RETAINED_HOURLY_PROVENANCE_INVALID")
@@ -97,7 +108,23 @@ def completed_hour(
         source_ids=(str(observation["observation_id"]),),
         source_hashes=(canonical_hash(bar_core),),
         complete=True,
+        instrument=topology.native_instrument,
     )
+
+
+def retained_topology(status: dict[str, object]) -> PongContractTopology:
+    instrument = status.get("instrument")
+    if not isinstance(instrument, dict):
+        raise RuntimeError("PONG_RETAINED_TOPOLOGY_MISSING")
+    topology = topology_for_version(instrument.get("topology_version"))
+    if topology is None or any((
+        instrument.get("native") != topology.native_instrument,
+        instrument.get("canonical") != topology.canonical_contract,
+        instrument.get("topology_hash") != topology.binding_hash,
+        instrument.get("state_namespace") != topology.state_namespace,
+    )):
+        raise RuntimeError("PONG_RETAINED_TOPOLOGY_INVALID")
+    return topology
 
 
 def select_status(collection_root: Path) -> tuple[Path, dict[str, object], dict[str, object]]:
@@ -123,6 +150,7 @@ def certify(
     test_only: bool = False,
 ) -> dict[str, object]:
     status_path, status, interval = select_status(collection_root)
+    topology = retained_topology(status)
     if status.get("state") != "STOPPED":
         raise RuntimeError("PONG_RETAINED_COLLECTOR_NOT_STOPPED")
     durability = status.get("durability")
@@ -199,13 +227,23 @@ def certify(
                 raise RuntimeError(f"PONG_RETAINED_WIRE_HASH_INVALID:{rows}")
             observation_type = str(observation.get("observation_type"))
             if observation_type == "HOURLY_BAR":
-                hour = completed_hour(observation, continuity_domain=continuity_domain)
+                hour = completed_hour(
+                    observation,
+                    continuity_domain=continuity_domain,
+                    topology=topology,
+                )
                 hour_start = utc(hour.start)
                 if hour_start in {previous_start, start}:
                     hours[hour.start] = hour
                 continue
             if observation_type not in interval_counts:
                 continue
+            payload = observation.get("payload")
+            if (
+                not isinstance(payload, dict)
+                or payload.get("contract_id") != topology.native_instrument
+            ):
+                raise RuntimeError("PONG_RETAINED_MARKET_TOPOLOGY_INVALID")
             event_at = utc(
                 observation.get("provider_timestamp")
                 or observation.get("ninja_receipt_time")
@@ -216,7 +254,6 @@ def certify(
             if observation_type != "TRADE":
                 continue
             classification = row.get("aggressor_classification")
-            payload = observation.get("payload")
             if not isinstance(classification, dict) or not isinstance(payload, dict):
                 raise RuntimeError("PONG_RETAINED_TRADE_CLASSIFICATION_INVALID")
             side = str(classification.get("side"))
@@ -227,7 +264,7 @@ def certify(
                 payload_hash=str(observation["payload_hash"]),
                 source="NINJATRADER_NATIVE_AGGRESSOR:"
                 + str(classification.get("provenance") or "UNAVAILABLE"),
-                instrument="MNQ SEP26",
+                instrument=topology.native_instrument,
                 side=ClassifiedSide(side),
                 size=Decimal(str(payload["size"])),
                 event_at=wire(event_at),
@@ -251,6 +288,7 @@ def certify(
     published_at = pair[1].available_at
     bias = PongProductionHost._bias_from_inputs(
         pair[0], pair[1], tuple(trades), published_at=published_at,
+        instrument=topology.native_instrument,
     )
     if not bias.configured:
         raise RuntimeError("PONG_RETAINED_DAILY_BIAS_UNCONFIGURED")
@@ -267,6 +305,7 @@ def certify(
         "journal_verified_records": rows,
         "collector_status_path": str(status_path.resolve()),
         "collector_status_hash": canonical_hash(status),
+        "topology": topology.payload() | {"binding_hash": topology.binding_hash},
         "hour_pair": [item.payload() for item in pair],
         "classified_trades": [
             {
@@ -291,6 +330,7 @@ def certify(
         "journal_verified_records": rows,
         "classified_trades": len(trades),
         "daily_bias_result_hash": bias.result_hash,
+        "topology": topology.payload() | {"binding_hash": topology.binding_hash},
         "test_only": test_only,
     }
 

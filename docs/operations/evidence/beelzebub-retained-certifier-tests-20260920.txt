@@ -1,0 +1,23 @@
+Command:
+python -m unittest tests.test_l3g_pong_inputs tests.test_l3g_pong_collection tests.test_l3g_pong_retained_certification -v
+
+Result:
+test_authenticated_completed_hours_seed_then_live_without_overlap (tests.test_l3g_pong_inputs.PongInputTests.test_authenticated_completed_hours_seed_then_live_without_overlap) ... ok
+test_market_source_sequences_are_exact_and_gaps_fail_closed (tests.test_l3g_pong_inputs.PongInputTests.test_market_source_sequences_are_exact_and_gaps_fail_closed) ... ok
+test_unsigned_or_incomplete_warm_start_never_admits (tests.test_l3g_pong_inputs.PongInputTests.test_unsigned_or_incomplete_warm_start_never_admits) ... ok
+test_source_sequence_gap_invalidates_only_the_affected_hour (tests.test_l3g_pong_collection.PongAuthenticHourCollectorTests.test_source_sequence_gap_invalidates_only_the_affected_hour) ... ok
+test_test_only_generation_change_invalidates_without_fake_sequence_inversion (tests.test_l3g_pong_collection.PongAuthenticHourCollectorTests.test_test_only_generation_change_invalidates_without_fake_sequence_inversion) ... ok
+test_test_only_hour_boundary_tracks_each_native_stream_independently (tests.test_l3g_pong_collection.PongAuthenticHourCollectorTests.test_test_only_hour_boundary_tracks_each_native_stream_independently) ... ok
+test_transient_windows_status_reader_contention_does_not_fail_collector (tests.test_l3g_pong_collection.PongAuthenticHourCollectorTests.test_transient_windows_status_reader_contention_does_not_fail_collector) ... ok
+test_verified_events_are_chained_durable_and_classified_causally (tests.test_l3g_pong_collection.PongAuthenticHourCollectorTests.test_verified_events_are_chained_durable_and_classified_causally) ... ok
+test_accelerated_fixture_certifies_only_hash_verified_eligible_hour (tests.test_l3g_pong_retained_certification.RetainedPongCertificationTests.test_accelerated_fixture_certifies_only_hash_verified_eligible_hour) ... ok
+test_dec26_hour_refuses_the_wrong_policy_identity (tests.test_l3g_pong_retained_certification.RetainedPongCertificationTests.test_dec26_hour_refuses_the_wrong_policy_identity) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.817s
+
+OK
+
+Notes:
+- Accelerated fixtures are TEST ONLY and are not authentic market history.
+- This verifies the bounded offline converter repair. It does not qualify the live collector interval, periodic path, or paper authority.

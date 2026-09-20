@@ -7,12 +7,13 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from src.l3g_paper.pong_collection import PongAuthenticHourCollector
+from src.l3g_paper.pong_contract import DEC26_TOPOLOGY
 from src.l3g_paper.pong_inputs import (
-    PONG_HOURLY_WARM_START_POLICY_HASH,
     PONG_HOURLY_WARM_START_POLICY_VERSION,
+    hourly_warm_start_policy_hash,
 )
 from tests.test_l3g_pong_inputs import KEY, verified
-from tools.certify_pong_retained_hour import certify
+from tools.certify_pong_retained_hour import certify, completed_hour
 
 
 def wire(value: datetime) -> str:
@@ -25,7 +26,11 @@ class RetainedPongCertificationTests(unittest.TestCase):
         with TemporaryDirectory(prefix="pong-retained-test-") as directory:
             root = Path(directory)
             start = datetime(2026, 9, 11, 12, tzinfo=timezone.utc)
-            collector = PongAuthenticHourCollector(root / "collection", now=start - timedelta(minutes=5))
+            collector = PongAuthenticHourCollector(
+                root / "collection",
+                now=start - timedelta(minutes=5),
+                topology=DEC26_TOPOLOGY,
+            )
             collector.collector_root.mkdir(parents=True)
             collector._transport_state = "HEALTHY"
             records = []
@@ -40,10 +45,10 @@ class RetainedPongCertificationTests(unittest.TestCase):
                     "end": wire(hour_start + timedelta(hours=1)),
                     "open": values[0], "high": values[1], "low": values[2],
                     "close": values[3], "volume": values[4],
-                    "contract_id": "MNQ SEP26",
+                    "contract_id": DEC26_TOPOLOGY.native_instrument,
                     "source": "NINJATRADER_BARS_REQUEST_PROVIDER",
                     "policy_version": PONG_HOURLY_WARM_START_POLICY_VERSION,
-                    "policy_hash": PONG_HOURLY_WARM_START_POLICY_HASH,
+                    "policy_hash": hourly_warm_start_policy_hash(DEC26_TOPOLOGY),
                     "publication_policy": "CAUSAL_LIVE_COMPLETED_HOUR_V1",
                 }
                 records.append(verified(
@@ -53,13 +58,13 @@ class RetainedPongCertificationTests(unittest.TestCase):
                 sequence += 1
             event_at = start + timedelta(minutes=1)
             quote = verified("QUOTE", {
-                "contract_id": "MNQ SEP26", "bid": 100, "ask": 101,
+                "contract_id": DEC26_TOPOLOGY.native_instrument, "bid": 100, "ask": 101,
                 "bid_size": 2, "ask_size": 3, "source_event_sequence": 1,
                 "publication_policy": "EVENT_DRIVEN_SAME_CALLBACK_QUOTE_V1",
             }, local_sequence=sequence, observed=wire(event_at))
             sequence += 1
             depth = verified("DEPTH", {
-                "contract_id": "MNQ SEP26",
+                "contract_id": DEC26_TOPOLOGY.native_instrument,
                 "bids": [{"price": 100, "size": 2}],
                 "asks": [{"price": 101, "size": 3}],
                 "source_event_sequence": 1,
@@ -69,7 +74,7 @@ class RetainedPongCertificationTests(unittest.TestCase):
             market = [quote, depth]
             for trade_sequence in range(1, 9):
                 market.append(verified("TRADE", {
-                    "contract_id": "MNQ SEP26", "price": 101, "size": 2,
+                    "contract_id": DEC26_TOPOLOGY.native_instrument, "price": 101, "size": 2,
                     "aggressor_side": "BUY", "aggressor_source": "PROVIDER_NATIVE",
                     "bid_at_trade": 100, "ask_at_trade": 101,
                     "derivation_quote_observation_id": quote.observation_id,
@@ -103,6 +108,13 @@ class RetainedPongCertificationTests(unittest.TestCase):
             status = {
                 "state": "STOPPED",
                 "collector": {"collector_id": collector.collector_id},
+                "instrument": {
+                    "native": DEC26_TOPOLOGY.native_instrument,
+                    "canonical": DEC26_TOPOLOGY.canonical_contract,
+                    "topology_version": DEC26_TOPOLOGY.version,
+                    "topology_hash": DEC26_TOPOLOGY.binding_hash,
+                    "state_namespace": DEC26_TOPOLOGY.state_namespace,
+                },
                 "producer": collector._identity_payload(collector._active_identity),
                 "durability": {
                     "journal_path": str(collector.journal_path),
@@ -130,7 +142,31 @@ class RetainedPongCertificationTests(unittest.TestCase):
                 Path(result["certificate_path"]).read_text(encoding="utf-8")
             )
             self.assertTrue(certificate["test_only"])
+            self.assertEqual(
+                certificate["daily_bias"]["instrument"],
+                DEC26_TOPOLOGY.native_instrument,
+            )
+            self.assertEqual(
+                certificate["topology"]["binding_hash"],
+                DEC26_TOPOLOGY.binding_hash,
+            )
             self.assertEqual(certificate["required_interval"]["start_utc"], wire(start))
+            mismatched_status = dict(status)
+            mismatched_status["instrument"] = {
+                **status["instrument"],
+                "native": "MNQ SEP26",
+            }
+            collector.collector_status_path.write_text(
+                json.dumps(mismatched_status), encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "RETAINED_TOPOLOGY_INVALID"):
+                certify(
+                    collector.root, root / "mismatched-state",
+                    root_key=KEY, test_only=True,
+                )
+            collector.collector_status_path.write_text(
+                json.dumps(status), encoding="utf-8",
+            )
             lines = collector.journal_path.read_text(encoding="utf-8").splitlines()
             tampered = json.loads(lines[0])
             tampered["received_by_collector_at"] = wire(start + timedelta(seconds=9))
@@ -141,6 +177,36 @@ class RetainedPongCertificationTests(unittest.TestCase):
                     collector.root, root / "tampered-state",
                     root_key=KEY, test_only=True,
                 )
+
+    def test_dec26_hour_refuses_the_wrong_policy_identity(self) -> None:
+        start = datetime(2026, 9, 11, 12, tzinfo=timezone.utc)
+        observed = start + timedelta(hours=1, seconds=1)
+        payload = {
+            "start": wire(start),
+            "end": wire(start + timedelta(hours=1)),
+            "open": 100, "high": 105, "low": 95, "close": 101,
+            "volume": 1000,
+            "contract_id": DEC26_TOPOLOGY.native_instrument,
+            "source": "NINJATRADER_BARS_REQUEST_PROVIDER",
+            "policy_version": PONG_HOURLY_WARM_START_POLICY_VERSION,
+            "policy_hash": hourly_warm_start_policy_hash(DEC26_TOPOLOGY),
+            "publication_policy": "CAUSAL_LIVE_COMPLETED_HOUR_V1",
+        }
+        for sequence, wrong_identity in enumerate((
+            {"policy_hash": hourly_warm_start_policy_hash()},
+            {"policy_version": "wrong-policy-version"},
+        ), start=1):
+            with self.subTest(wrong_identity=wrong_identity):
+                record = verified(
+                    "HOURLY_BAR", {**payload, **wrong_identity},
+                    local_sequence=sequence, observed=wire(observed),
+                )
+                with self.assertRaisesRegex(RuntimeError, "HOURLY_PROVENANCE_INVALID"):
+                    completed_hour(
+                        json.loads(record.signed_wire_bytes()),
+                        continuity_domain="NINJATRADER_HOURLY:test:source:build",
+                        topology=DEC26_TOPOLOGY,
+                    )
 
 
 if __name__ == "__main__":
