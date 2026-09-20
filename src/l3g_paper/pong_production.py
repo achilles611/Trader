@@ -53,6 +53,7 @@ from .daily_bias import (
     default_unconfigured_bias,
 )
 from .discernment import DiscernmentEngine
+from .fhb import FHBAction, FHBConfig, FocusedHorizonBand
 from .pong import PongActionKind, PongState, PongStateMachine
 from .pong_scheduler import (
     PongPeriodicDeadline,
@@ -110,7 +111,7 @@ _LOADED_SOURCE_HASHES = {
                  "src/l3g_paper/pong_production.py", "src/l3g_paper/pong_controller.py",
                  "src/l3g_paper/pong_authorization.py", "src/l3g_paper/pong_volume_history.py",
                  "src/l3g_paper/runtime.py", "src/l3g_paper/pending_lockout.py",
-                 "src/l3g_paper/ledger.py",
+                 "src/l3g_paper/ledger.py", "src/l3g_paper/fhb.py",
                  "src/l3g_paper/pong_compute.py", "src/l3g_paper/pong.py",
                  "src/l3g_paper/discernment.py", "src/l3g_paper/pong_scheduler.py",
                  "src/l3g_paper/pong_collection.py", "src/l3f_provider/ninjatrader_observation.py",
@@ -168,6 +169,10 @@ class _DepthWindow:
         self._events.append(item)
         self._by_price.setdefault(item.price, deque()).append(item)
 
+    def extend(self, items: tuple[DepthObservation, ...]) -> None:
+        for item in items:
+            self.append(item)
+
     def clear(self) -> None:
         self._events.clear()
         self._by_price.clear()
@@ -221,13 +226,19 @@ class PongProductionHost:
         launch_authorization: PongLaunchAuthorization | None = None,
         history_verification_key: bytes | None = None,
         compute_workers: int = 0,
+        fhb_config: FHBConfig | None = None,
         scheduling: PongSchedulingConfig = PongSchedulingConfig(),
         clock_ns: Callable[[], int] = time.perf_counter_ns,
+        monotonic_clock: Callable[[], float] = time.monotonic,
         topology: PongContractTopology = SEP26_TOPOLOGY,
     ) -> None:
         if not callable(native_dispatch):
             raise TypeError("Pong production host requires one native dispatcher.")
-        if type(scheduling) is not PongSchedulingConfig or not callable(clock_ns):
+        if (
+            type(scheduling) is not PongSchedulingConfig
+            or not callable(clock_ns)
+            or not callable(monotonic_clock)
+        ):
             raise ValueError("PONG_SCHEDULING_CONTRACT_INVALID")
         if (
             scheduling.enabled
@@ -236,6 +247,16 @@ class PongProductionHost:
             raise ValueError("PONG_PERIODIC_PROFILE_NOT_SELECTED")
         if scheduling.enabled and compute_workers:
             raise ValueError("PONG_PERIODIC_COMPUTE_WORKERS_NOT_SUPPORTED")
+        if fhb_config is not None and selected_profile != PONG_ENTRY_PROFILE_VERSION:
+            raise ValueError("FHB_PONG_PROFILE_NOT_SELECTED")
+        if fhb_config is not None and compute_workers:
+            raise ValueError("FHB_SERIAL_ORDERED_OWNER_REQUIRED")
+        if (
+            fhb_config is not None
+            and scheduling.enabled
+            and fhb_config.entry_evaluation_interval_ms
+        ):
+            raise ValueError("FHB_PERIODIC_DUPLICATE_ENTRY_CADENCE")
         if type(topology) is not PongContractTopology:
             raise ValueError("PONG_CONTRACT_TOPOLOGY_INVALID")
         self.state_root = Path(state_root).resolve()
@@ -267,9 +288,20 @@ class PongProductionHost:
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._observations: queue.Queue[NinjaTraderObservation] = queue.Queue(maxsize=262144)
+        self._observations: queue.Queue[
+            tuple[NinjaTraderObservation, float]
+        ] = queue.Queue(maxsize=262144)
         self._admission_lock = threading.Lock()
         self._observation_overflow = 0
+        self._last_callback_monotonic: float | None = None
+        self._last_host_queue_age_ms = 0.0
+        self._maximum_host_queue_age_ms = 0.0
+        self._last_source_receipt_age_ms = 0.0
+        self._maximum_source_receipt_age_ms = 0.0
+        self._freshness_breach_count = 0
+        self._fhb_guard_blocker: str | None = (
+            None if fhb_config is None else "FHB_WATCHDOG_WAITING_FOR_OBSERVATION"
+        )
         if type(compute_workers) is not int or not 0 <= compute_workers <= 3:
             raise ValueError('PONG_COMPUTE_WORKER_BOUND_INVALID')
         self._compute_workers = compute_workers
@@ -286,6 +318,7 @@ class PongProductionHost:
         self._compute_batch_limit = 32
         self._scheduling = scheduling
         self._clock_ns = clock_ns
+        self._monotonic_clock = monotonic_clock
         self._clock_info = vars(time.get_clock_info("perf_counter"))
         if scheduling.enabled and (
             self._clock_info["monotonic"] is not True
@@ -298,6 +331,13 @@ class PongProductionHost:
         self._authoritative_admission_records = 0
         self._event_driven_evaluations = 0
         self._periodic_evaluations = 0
+        self._microstructure_evaluations = 0
+        self._market_state_revision = 0
+        self._entry_evaluation_starts = 0
+        self._entry_evaluation_deferred = 0
+        self._last_entry_evaluation_started: float | None = None
+        self._minimum_entry_evaluation_spacing_ms: float | None = None
+        self._last_entry_evaluation: dict[str, object] | None = None
         self._last_admitted_receipt_at: datetime | None = None
         self._last_periodic_cutoff: datetime | None = None
         self._last_protection_transition: str | None = None
@@ -332,9 +372,11 @@ class PongProductionHost:
         self._certificate: dict[str, object] | None = None
         self._certificate_error: str | None = None
         self._trades: deque[ClassifiedTrade] = deque(maxlen=8192)
+        self._fhb = None if fhb_config is None else FocusedHorizonBand(fhb_config)
+        depth_capacity = 4096 if fhb_config is None else fhb_config.maximum_shadow_events
         self._depth = {
-            BookSide.BID: _DepthWindow(),
-            BookSide.ASK: _DepthWindow(),
+            BookSide.BID: _DepthWindow(depth_capacity),
+            BookSide.ASK: _DepthWindow(depth_capacity),
         }
         self._volume_buckets: dict[str, Decimal] = {}
         self._volume_windows: dict[str, VolumeWindow] = {}
@@ -431,16 +473,23 @@ class PongProductionHost:
 
     def on_observation(self, record: NinjaTraderObservation) -> None:
         """Bounded callback admission; the host worker owns processing and I/O."""
+        admitted = self._monotonic_clock()
         try:
-            self._observations.put_nowait(record)
+            self._observations.put_nowait((record, admitted))
             with self._admission_lock:
                 self._source_ingress_records += 1
+                self._last_callback_monotonic = admitted
         except queue.Full:
             with self._admission_lock:
                 self._observation_overflow += 1
                 self._input_error = "PONG_PRODUCTION_OBSERVATION_QUEUE_OVERFLOW"
 
-    def _consume_observation(self, record: NinjaTraderObservation) -> None:
+    def _consume_observation(
+        self,
+        record: NinjaTraderObservation,
+        *,
+        admitted_monotonic: float | None = None,
+    ) -> None:
         """Process exactly one queued causal event before admitting the next."""
         def cursor() -> tuple[object, ...]:
             return tuple(
@@ -448,7 +497,41 @@ class PongProductionHost:
                 for values in (self._trades, self._depth[BookSide.BID], self._depth[BookSide.ASK])
             )
         with self._lock:
+            if admitted_monotonic is not None and self._fhb is not None:
+                now_monotonic = self._monotonic_clock()
+                host_queue_age_ms = max(
+                    0.0,
+                    (now_monotonic - admitted_monotonic) * 1000.0,
+                )
+                source_receipt_age_ms = max(
+                    0.0,
+                    (_time(_now()) - _time(record.ninja_receipt_time)).total_seconds()
+                    * 1000.0,
+                )
+                self._last_callback_monotonic = max(
+                    admitted_monotonic,
+                    self._last_callback_monotonic or admitted_monotonic,
+                )
+                self._last_host_queue_age_ms = host_queue_age_ms
+                self._maximum_host_queue_age_ms = max(
+                    self._maximum_host_queue_age_ms,
+                    host_queue_age_ms,
+                )
+                self._last_source_receipt_age_ms = source_receipt_age_ms
+                self._maximum_source_receipt_age_ms = max(
+                    self._maximum_source_receipt_age_ms,
+                    source_receipt_age_ms,
+                )
+                if host_queue_age_ms > self._fhb.config.maximum_queue_age_milliseconds:
+                    self._fhb_guard_blocker = "FHB_HOST_QUEUE_AGE_EXCEEDED"
+                    self._freshness_breach_count += 1
+                elif source_receipt_age_ms > self._fhb.config.maximum_event_age_milliseconds:
+                    self._fhb_guard_blocker = "FHB_EVENT_PROCESSING_AGE_EXCEEDED"
+                    self._freshness_breach_count += 1
+                else:
+                    self._fhb_guard_blocker = None
             before = cursor()
+            stream_before = tuple(sorted(self._stream_sequences.items()))
             self._process_observation(record)
             if self._input_error is not None:
                 return
@@ -457,14 +540,62 @@ class PongProductionHost:
                 receipt, self._last_admitted_receipt_at or receipt,
             )
             self._authoritative_admission_records += 1
-            if cursor() == before:
+            feature_state_changed = cursor() != before
+            canonical_market_state_changed = (
+                tuple(sorted(self._stream_sequences.items())) != stream_before
+            )
+            if canonical_market_state_changed:
+                self._market_state_revision += 1
+            if not feature_state_changed and not canonical_market_state_changed:
                 return
             protection_reason = self._event_protection_reason_locked()
-            if not self._scheduling.enabled or protection_reason is not None:
+            evaluate_now = (
+                feature_state_changed
+                if not self._scheduling.enabled
+                else protection_reason is not None and canonical_market_state_changed
+            )
+            if evaluate_now:
                 if protection_reason is not None:
                     self._last_protection_transition = protection_reason
-                self._event_driven_evaluations += 1
-                self._evaluate_microstructure(receipt)
+                cadence_due = True
+                now_monotonic: float | None = None
+                if (
+                    not self._scheduling.enabled
+                    and self._fhb is not None
+                    and self._fhb.config.entry_evaluation_interval_ms
+                ):
+                    now_monotonic = self._monotonic_clock()
+                    interval_seconds = (
+                        self._fhb.config.entry_evaluation_interval_ms / 1000.0
+                    )
+                    cadence_due = (
+                        self._last_entry_evaluation_started is None
+                        or now_monotonic - self._last_entry_evaluation_started
+                        >= interval_seconds
+                    )
+                if cadence_due:
+                    if now_monotonic is not None:
+                        prior = self._last_entry_evaluation_started
+                        if prior is not None:
+                            spacing_ms = max(0.0, (now_monotonic - prior) * 1000.0)
+                            self._minimum_entry_evaluation_spacing_ms = (
+                                spacing_ms
+                                if self._minimum_entry_evaluation_spacing_ms is None
+                                else min(self._minimum_entry_evaluation_spacing_ms, spacing_ms)
+                            )
+                        self._last_entry_evaluation_started = now_monotonic
+                        self._entry_evaluation_starts += 1
+                        self._last_entry_evaluation = {
+                            "policy_id": self._fhb.config.entry_policy_id,
+                            "evaluation_started_at": receipt.isoformat().replace("+00:00", "Z"),
+                            "source_generation": self._source_generation,
+                            "applied_state_revision": self._market_state_revision,
+                            "source_sequences": dict(self._stream_sequences),
+                        }
+                    self._event_driven_evaluations += 1
+                    self._evaluate_microstructure(receipt)
+                else:
+                    self._entry_evaluation_deferred += 1
 
     def _event_protection_reason_locked(self) -> str | None:
         """Return why the event path must remain authoritative right now.
@@ -600,6 +731,10 @@ class PongProductionHost:
                         raise ValueError("PONG_NATIVE_SOURCE_GENERATION_INVALID")
                     if self._source_generation is not None and generation != self._source_generation:
                         self._input_error = "PONG_NATIVE_SOURCE_GENERATION_CHANGED"
+                        if self._fhb is not None:
+                            self._fhb.invalidate(self._input_error)
+                            self._depth[BookSide.BID].clear()
+                            self._depth[BookSide.ASK].clear()
                     self._source_generation = generation
                 sequence = int(record.payload["source_event_sequence"])
                 prior = self._stream_sequences.get(record.observation_type)
@@ -617,6 +752,10 @@ class PongProductionHost:
                         # The input-error latch remains fail-closed.
                         self._stream_sequences[record.observation_type] = sequence
                         self._input_error = "PONG_NATIVE_INPUT_SOURCE_SEQUENCE_GAP"
+                        if self._fhb is not None:
+                            self._fhb.invalidate(self._input_error)
+                            self._depth[BookSide.BID].clear()
+                            self._depth[BookSide.ASK].clear()
                         return
                 self._stream_sequences[record.observation_type] = sequence
                 self._stream_counts[record.observation_type] += 1
@@ -625,9 +764,22 @@ class PongProductionHost:
                 elif record.observation_type == "QUOTE":
                     self._last_quote_record = record
                 elif record.observation_type == "DEPTH":
-                    self._admit_depth(record)
-            except (KeyError, TypeError, ValueError, PongNativeInputRefused) as error:
+                    if self._fhb is None:
+                        self._admit_depth(record)
+                    else:
+                        self._admit_depth_fhb(record)
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+                RuntimeError,
+                PongNativeInputRefused,
+            ) as error:
                 self._input_error = str(error) or type(error).__name__
+                if self._fhb is not None and record.observation_type == "DEPTH":
+                    self._fhb.invalidate(self._input_error)
+                    self._depth[BookSide.BID].clear()
+                    self._depth[BookSide.ASK].clear()
 
     @staticmethod
     def _event_ref(record: NinjaTraderObservation) -> CausalEventRef:
@@ -708,7 +860,35 @@ class PongProductionHost:
             Decimal("0"), Decimal("0"), False, PriceResponse.UNAVAILABLE,
         ))
 
+    def _admit_depth_fhb(self, record: NinjaTraderObservation) -> None:
+        """Maintain all signed FHB state and forward only eligible feature work."""
+        assert self._fhb is not None
+        decision = self._fhb.process_depth(record.payload, self._event_ref(record))
+        if decision.clear_feature_windows:
+            self._depth[BookSide.BID].clear()
+            self._depth[BookSide.ASK].clear()
+        if decision.action is FHBAction.REWARM_REQUIRED:
+            self._microstructure_blockers = (decision.reason,)
+            return
+        if decision.action is FHBAction.SKIP_OUT_OF_CORE:
+            if self._microstructure_blockers and self._microstructure_blockers[0].startswith(
+                "FHB_REWARM_REQUIRED"
+            ):
+                self._microstructure_blockers = (
+                    "PONG_MICROSTRUCTURE_WAITING_FOR_FHB_ELIGIBLE_EVENT",
+                )
+            return
+        if decision.side is None or not decision.seed_observations:
+            self._microstructure_blockers = ("FHB_ELIGIBLE_EVENT_MISSING_SEED",)
+            return
+        self._depth[decision.side].extend(decision.seed_observations)
+
     def _evaluate_microstructure(self, at: datetime) -> None:
+        if self._fhb is not None and not self._fhb.entry_ready:
+            self._last_microstructure_at = at
+            self._microstructure_blockers = ("FHB_REWARM_REQUIRED",)
+            return
+        self._microstructure_evaluations += 1
         if self._compute_pool is None:
             self._last_microstructure_at = at
         cutoff = at - timedelta(seconds=5)
@@ -1423,6 +1603,16 @@ class PongProductionHost:
             blockers.append("PONG_RUNTIME_ENTRIES_PAUSED")
         if int(runtime.get("maximum_quantity") or 0) != 1:
             blockers.append("PONG_NATIVE_QUANTITY_CAPABILITY_INVALID")
+        if self._fhb is not None:
+            if self._last_callback_monotonic is None:
+                blockers.append("FHB_WATCHDOG_WAITING_FOR_OBSERVATION")
+            elif (
+                self._monotonic_clock() - self._last_callback_monotonic
+                > self._fhb.config.source_heartbeat_timeout_seconds
+            ):
+                blockers.append("FHB_SOURCE_HEARTBEAT_TIMEOUT")
+            if self._fhb_guard_blocker is not None:
+                blockers.append(self._fhb_guard_blocker)
         return list(dict.fromkeys(blockers))
 
     def authority_status(self) -> dict[str, object]:
@@ -1543,18 +1733,22 @@ class PongProductionHost:
                     if len(self._compute_pending) >= self._compute_limit:
                         self._compute_wakeup.wait(0.005)
                         self._compute_wakeup.clear()
-                        record = None  # bounded backpressure; control ticks continue
+                        queued = None  # bounded backpressure; control ticks continue
                     else:
                         timeout = 0.005 if self._compute_pending else 0.5
                         periodic_wait = self._periodic_wait_seconds()
                         if periodic_wait is not None:
                             timeout = min(timeout, periodic_wait)
-                        record = self._observations.get(timeout=timeout)
+                        queued = self._observations.get(timeout=timeout)
                 except queue.Empty:
-                    record = None
-                if record is not None:
+                    queued = None
+                if queued is not None:
+                    record, admitted_monotonic = queued
                     try:
-                        self._consume_observation(record)
+                        self._consume_observation(
+                            record,
+                            admitted_monotonic=admitted_monotonic,
+                        )
                     finally:
                         self._observations.task_done()
                 # A queued market record is applied first when it was already
@@ -1662,6 +1856,19 @@ class PongProductionHost:
                         else self._last_periodic_cutoff.isoformat().replace("+00:00", "Z")
                     ),
                     "wake_mechanism": "bounded Queue.get timeout measured by QPC grid",
+                    "entry_scoring_owner": (
+                        "PONG_PERIODIC_DEADLINE"
+                        if self._scheduling.enabled
+                        else "AUTHENTICATED_EVENT_OWNER"
+                    ),
+                    "fhb_entry_cadence_policy": (
+                        None if self._fhb is None else self._fhb.config.entry_policy_id
+                    ),
+                    "fhb_entry_cadence_interval_ms": (
+                        0 if self._fhb is None
+                        else self._fhb.config.entry_evaluation_interval_ms
+                    ),
+                    "duplicate_entry_throttle": False,
                 },
                 "registration": "PRODUCTION_REGISTERED",
                 "loaded_artifact_hash": PONG_LOADED_ARTIFACT_HASH,
@@ -1707,6 +1914,26 @@ class PongProductionHost:
                 "compute_submitted": self._compute_submitted,
                 "compute_applied": self._compute_applied,
                 "compute_refused": self._compute_refused,
+                "fhb": None if self._fhb is None else self._fhb.status(),
+                "fhb_freshness": None if self._fhb is None else {
+                    "maximum_queue_age_milliseconds": (
+                        self._fhb.config.maximum_queue_age_milliseconds
+                    ),
+                    "maximum_event_age_milliseconds": (
+                        self._fhb.config.maximum_event_age_milliseconds
+                    ),
+                    "source_heartbeat_timeout_seconds": (
+                        self._fhb.config.source_heartbeat_timeout_seconds
+                    ),
+                    "last_host_queue_age_ms": self._last_host_queue_age_ms,
+                    "maximum_host_queue_age_ms": self._maximum_host_queue_age_ms,
+                    "last_source_receipt_age_ms": self._last_source_receipt_age_ms,
+                    "maximum_source_receipt_age_ms": (
+                        self._maximum_source_receipt_age_ms
+                    ),
+                    "breach_count": self._freshness_breach_count,
+                    "current_blocker": self._fhb_guard_blocker,
+                },
                 "compute_oldest_pending_seconds": (
                     0.0 if not self._compute_pending
                     else time.monotonic() - self._compute_pending[0][4]
@@ -1734,6 +1961,21 @@ class PongProductionHost:
                 "daily_bias": self._daily_bias.payload(),
                 "microstructure_pipeline": {
                     "state": "HOSTED",
+                    "evaluation_count": self._microstructure_evaluations,
+                    "entry_policy_id": (
+                        None if self._fhb is None else self._fhb.config.entry_policy_id
+                    ),
+                    "entry_evaluation_interval_ms": (
+                        0 if self._fhb is None
+                        else self._fhb.config.entry_evaluation_interval_ms
+                    ),
+                    "entry_evaluation_starts": self._entry_evaluation_starts,
+                    "entry_evaluation_deferred": self._entry_evaluation_deferred,
+                    "minimum_entry_evaluation_spacing_ms": (
+                        self._minimum_entry_evaluation_spacing_ms
+                    ),
+                    "last_entry_evaluation": self._last_entry_evaluation,
+                    "applied_state_revision": self._market_state_revision,
                     "mapping_hash": self._mapper.policy.mapping_hash,
                     "discernment_policy_hash": self._discernment.policy.policy_hash,
                     "blockers": list(self._microstructure_blockers),

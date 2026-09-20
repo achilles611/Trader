@@ -231,6 +231,9 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
                     "BEELZEBUB_PONG_COMMISSIONING_AUTHORIZATION": "TEST-ONLY-authority.json",
                     "BEELZEBUB_PONG_SCHEDULING_MODE": "PERIODIC_FLAT_PROTECTED",
                     "BEELZEBUB_PONG_PERIODIC_INTERVAL_MS": "20",
+                    "BEELZEBUB_PONG_FHB_PROFILE": "TOP10_CORE_WITH_5S_SHADOW_V1",
+                    "BEELZEBUB_PONG_CONTRACT_TOPOLOGY": "DEC26",
+                    "BEELZEBUB_L3G_PAPER_CONTRACT_TOPOLOGY": "DEC26",
                 },
             )
             self.assertEqual(resolved.source, "EXPLICIT_MAINTENANCE")
@@ -243,6 +246,12 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
             self.assertEqual(child["BEELZEBUB_PONG_COMMISSIONING_AUTHORIZATION"], "TEST-ONLY-authority.json")
             self.assertEqual(child["BEELZEBUB_PONG_SCHEDULING_MODE"], "PERIODIC_FLAT_PROTECTED")
             self.assertEqual(child["BEELZEBUB_PONG_PERIODIC_INTERVAL_MS"], "20")
+            self.assertEqual(
+                child["BEELZEBUB_PONG_FHB_PROFILE"],
+                "TOP10_CORE_WITH_5S_SHADOW_V1",
+            )
+            self.assertEqual(child["BEELZEBUB_PONG_CONTRACT_TOPOLOGY"], "DEC26")
+            self.assertEqual(child["BEELZEBUB_L3G_PAPER_CONTRACT_TOPOLOGY"], "DEC26")
 
     def test_partial_explicit_maintenance_binding_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

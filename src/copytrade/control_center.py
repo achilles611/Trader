@@ -32,6 +32,7 @@ from src.l3g_paper.commissioning import (
     evaluate_commissioning_post_run_verification,
 )
 from src.l3g_paper.health import ledger_health_projection, sanitized_paper_health
+from src.l3g_paper.fhb import FHBConfig, FHB_PROFILE_ID
 from src.l3g_paper.ledger import LedgerCapacityError, PaperLedger, resolve_ledger_epoch
 from src.l3g_paper.ninjatrader_login import NinjaTraderLoginBootstrap, NinjaTraderLoginState
 from src.l3g_paper.ninjatrader_maintenance import (
@@ -129,6 +130,7 @@ GRACEFUL_SHUTDOWN_ACTION_VALUE = "beezconsole-graceful-shutdown-v1"
 PONG_INDEPENDENT_COLLECTION_ENV = "BEELZEBUB_PONG_INDEPENDENT_COLLECTION"
 PONG_BOUNDED_ACTIVATION_ENV = "BEELZEBUB_PONG_BOUNDED_ACTIVATION"
 PONG_CONTRACT_TOPOLOGY_ENV = "BEELZEBUB_PONG_CONTRACT_TOPOLOGY"
+PONG_FHB_PROFILE_ENV = "BEELZEBUB_PONG_FHB_PROFILE"
 PAPER_CONTRACT_TOPOLOGY_ENV = "BEELZEBUB_L3G_PAPER_CONTRACT_TOPOLOGY"
 LEDGER_CAPACITY_RECOVERY_ACTION_HEADER = (
     "X-Beelzebub-Ledger-Capacity-Recovery-Action"
@@ -1655,7 +1657,13 @@ def create_control_center_app(
         configured_paper_profile
     )
     configured_paper_topology = os.getenv(PAPER_CONTRACT_TOPOLOGY_ENV)
+    configured_pong_topology = os.getenv(PONG_CONTRACT_TOPOLOGY_ENV)
     paper_topology = resolve_pong_topology(configured_paper_topology or "SEP26")
+    pong_topology = resolve_pong_topology(
+        configured_pong_topology or configured_paper_topology or "SEP26"
+    )
+    if paper_topology.version != pong_topology.version:
+        raise RuntimeError("PONG_PAPER_CONTRACT_TOPOLOGY_MISMATCH")
     selected_paper_policy = paper_policy_for_topology(
         selected_paper_profile.policy, paper_topology,
     )
@@ -1686,7 +1694,6 @@ def create_control_center_app(
     pong_bounded_activation = _strict_environment_flag(
         PONG_BOUNDED_ACTIVATION_ENV,
     )
-    pong_topology = resolve_pong_topology(os.getenv(PONG_CONTRACT_TOPOLOGY_ENV))
     pong_authorization_path = os.getenv(PONG_AUTHORIZATION_ENV)
     pong_launch_authorization = (
         None if not pong_authorization_path
@@ -1696,6 +1703,22 @@ def create_control_center_app(
         os.getenv(PONG_SCHEDULING_MODE_ENV),
         os.getenv(PONG_PERIODIC_INTERVAL_ENV),
     )
+    configured_fhb_profile = os.getenv(PONG_FHB_PROFILE_ENV)
+    if configured_fhb_profile is None or not configured_fhb_profile.strip():
+        pong_fhb_config = None
+    elif configured_fhb_profile == FHB_PROFILE_ID:
+        pong_fhb_config = (
+            FHBConfig.periodic_protected()
+            if pong_scheduling.enabled
+            else FHBConfig()
+        )
+    else:
+        raise ValueError("FHB_PROFILE_UNSUPPORTED")
+    if (
+        pong_fhb_config is not None
+        and selected_paper_profile.selection_key != PONG_ENTRY_PROFILE_VERSION
+    ):
+        raise ValueError("FHB_PONG_PROFILE_NOT_SELECTED")
     perpetual_seed_artifact: Mapping[str, object] | None = None
     perpetual_seed_proof: Mapping[str, object] | None = None
     perpetual_seed_manifest: Mapping[str, object] | None = None
@@ -2507,6 +2530,7 @@ def create_control_center_app(
                 activation_authorized=pong_bounded_activation,
                 launch_authorization=pong_launch_authorization,
                 history_verification_key=LocalPaperSecretProvider().load_key(),
+                fhb_config=pong_fhb_config,
                 scheduling=pong_scheduling,
                 topology=pong_topology,
             )
