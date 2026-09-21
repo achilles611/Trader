@@ -164,7 +164,7 @@ class ObservationAttestationTests(unittest.TestCase):
         )
         self.assertEqual(len(adapter.normalize(raw)), 1)
 
-        self.assertEqual(SOURCE_HASH, "1825e9890fe54a71f9b495e778e07c9e523ca1b36f66569b21f9ca4549102b73")
+        self.assertEqual(SOURCE_HASH, "3c2248a8b676f35ca0b2442bb0463b9786096b1882f04f0e8f6f2eb60e6454e3")
 
 
 if __name__ == "__main__":

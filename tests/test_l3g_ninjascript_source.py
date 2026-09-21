@@ -1713,6 +1713,31 @@ class NinjaScriptSourceTests(unittest.TestCase):
         )
         self.assertIn("private readonly object bookLock = new object();", addon)
         self.assertIn("lock (bookLock)", addon)
+        mutation = addon[
+            addon.index("        private bool TryApplyDepthMutation("):
+            addon.index("        private static void ShiftKnownPositions(")
+        ]
+        self.assertIn("DepthPrefix(candidateBids, true)", mutation)
+        self.assertIn("DepthPrefix(candidateAsks, false)", mutation)
+        self.assertIn(
+            "if (bestNativeBid >= bestNativeAsk)\n"
+            "            {\n"
+            "                // Report this authentic callback as unavailable, but do not\n"
+            "                // poison the last valid retained book with a crossed candidate.\n"
+            "                failureReason = \"CROSSED_NATIVE_POSITIONAL_SNAPSHOT\";\n"
+            "                return false;\n"
+            "            }\n"
+            "            CommitDepthState(candidateBids, candidateAsks);",
+            mutation,
+        )
+        self.assertIn(
+            "if (bidPrefix.Count == 0 || askPrefix.Count == 0)\n"
+            "            {\n"
+            "                // A reset or partial rebuild must become the retained state so\n"
+            "                // subsequent callbacks can repopulate it position by position.\n"
+            "                CommitDepthState(candidateBids, candidateAsks);",
+            mutation,
+        )
         self.assertIn("MaximumObserverRecoveryAttempts = 3", addon)
         self.assertIn("ReferenceEquals(automaticObserver, candidate)", addon)
         self.assertIn("NATIVE_ADDON_OBSERVER_RECOVERY_EXHAUSTED", addon)
@@ -1723,6 +1748,15 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertIn('BeelzebubReadOnlyOutbound.Publish("DEPTH"', automatic_unavailable)
         self.assertIn('\\"status\\":\\"UNAVAILABLE\\"', automatic_unavailable)
         self.assertNotIn('BeelzebubReadOnlyOutbound.Publish("HEALTH"', automatic_unavailable)
+        for field in (
+            "mutation_operation",
+            "mutation_side",
+            "mutation_position",
+            "mutation_price",
+            "mutation_volume",
+            "mutation_is_reset",
+        ):
+            self.assertIn(field, automatic_unavailable)
         self.assertNotIn("private const int MaximumQueuedFrames = 20000;", addon)
         self.assertIn("bidAtTrade < askAtTrade", source)
         self.assertIn("bestBid < bestAsk", source)

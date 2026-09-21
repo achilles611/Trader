@@ -1193,12 +1193,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                     out bidLevels, out askLevels, out bestNativeBid,
                     out bestNativeAsk, out snapshotFailure))
                 {
-                    PublishDepthUnavailable(snapshotFailure, sourceEventSequence, e.Time);
+                    PublishDepthUnavailable(snapshotFailure, sourceEventSequence, e.Time, e);
                     return;
                 }
                 if (FinitePositive(bestNativeBid) && FinitePositive(bestNativeAsk) && bestNativeBid >= bestNativeAsk)
                 {
-                    PublishDepthUnavailable("CROSSED_NATIVE_POSITIONAL_SNAPSHOT", sourceEventSequence, e.Time);
+                    PublishDepthUnavailable("CROSSED_NATIVE_POSITIONAL_SNAPSHOT", sourceEventSequence, e.Time, e);
                     return;
                 }
                 payload = "{\"contract_id\":\"" + instrument.FullName + "\",\"bids\":" + bidLevels
@@ -1300,16 +1300,13 @@ namespace NinjaTrader.NinjaScript.AddOns
                 failureReason = "NATIVE_DEPTH_MUTATION_APPLICATION_FAILED";
                 return false;
             }
-            depthBids.Clear();
-            foreach (KeyValuePair<int, KeyValuePair<double, long>> row in candidateBids)
-                depthBids[row.Key] = row.Value;
-            depthAsks.Clear();
-            foreach (KeyValuePair<int, KeyValuePair<double, long>> row in candidateAsks)
-                depthAsks[row.Key] = row.Value;
-            List<KeyValuePair<double, long>> bidPrefix = DepthPrefix(depthBids, true);
-            List<KeyValuePair<double, long>> askPrefix = DepthPrefix(depthAsks, false);
+            List<KeyValuePair<double, long>> bidPrefix = DepthPrefix(candidateBids, true);
+            List<KeyValuePair<double, long>> askPrefix = DepthPrefix(candidateAsks, false);
             if (bidPrefix.Count == 0 || askPrefix.Count == 0)
             {
+                // A reset or partial rebuild must become the retained state so
+                // subsequent callbacks can repopulate it position by position.
+                CommitDepthState(candidateBids, candidateAsks);
                 failureReason = "NATIVE_DEPTH_POSITION_ZERO_UNAVAILABLE";
                 return false;
             }
@@ -1317,9 +1314,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             bestNativeAsk = askPrefix[0].Key;
             if (bestNativeBid >= bestNativeAsk)
             {
+                // Report this authentic callback as unavailable, but do not
+                // poison the last valid retained book with a crossed candidate.
                 failureReason = "CROSSED_NATIVE_POSITIONAL_SNAPSHOT";
                 return false;
             }
+            CommitDepthState(candidateBids, candidateAsks);
             List<string> bidRows = bidPrefix
                 .Select(row => "{\"price\":" + row.Key.ToString(CultureInfo.InvariantCulture)
                     + ",\"size\":" + row.Value + "}").ToList();
@@ -1329,6 +1329,18 @@ namespace NinjaTrader.NinjaScript.AddOns
             bidLevels = "[" + String.Join(",", bidRows) + "]";
             askLevels = "[" + String.Join(",", askRows) + "]";
             return true;
+        }
+
+        private void CommitDepthState(
+            SortedDictionary<int, KeyValuePair<double, long>> candidateBids,
+            SortedDictionary<int, KeyValuePair<double, long>> candidateAsks)
+        {
+            depthBids.Clear();
+            foreach (KeyValuePair<int, KeyValuePair<double, long>> row in candidateBids)
+                depthBids[row.Key] = row.Value;
+            depthAsks.Clear();
+            foreach (KeyValuePair<int, KeyValuePair<double, long>> row in candidateAsks)
+                depthAsks[row.Key] = row.Value;
         }
 
         private static void ShiftKnownPositions(
@@ -1379,15 +1391,26 @@ namespace NinjaTrader.NinjaScript.AddOns
             return elapsed > maximumCallbackAge.TotalSeconds;
         }
 
-        private void PublishDepthUnavailable(string reason, long sourceEventSequence, DateTime providerTime)
+        private void PublishDepthUnavailable(
+            string reason, long sourceEventSequence, DateTime providerTime,
+            MarketDepthEventArgs mutation)
         {
             // This is still one authentic depth mutation. Keep it on the
             // sequenced DEPTH stream so the consumer can distinguish explicit
             // unavailability from a missing callback. Publishing it as HEALTH
             // hid the sequence and flooded the operational-health ledger.
+            string mutationPrice = mutation == null
+                || Double.IsNaN(mutation.Price) || Double.IsInfinity(mutation.Price)
+                ? "null" : mutation.Price.ToString(CultureInfo.InvariantCulture);
             BeelzebubReadOnlyOutbound.Publish("DEPTH", null, null,
                 "{\"status\":\"UNAVAILABLE\",\"reason\":\"" + reason
                 + "\",\"contract_id\":\"" + instrument.FullName + "\",\"bids\":[],\"asks\":[]"
+                + ",\"mutation_operation\":" + (mutation == null ? "null" : "\"" + mutation.Operation + "\"")
+                + ",\"mutation_side\":" + (mutation == null ? "null" : "\"" + mutation.MarketDataType + "\"")
+                + ",\"mutation_position\":" + (mutation == null ? "null" : mutation.Position.ToString(CultureInfo.InvariantCulture))
+                + ",\"mutation_price\":" + mutationPrice
+                + ",\"mutation_volume\":" + (mutation == null ? "null" : mutation.Volume.ToString(CultureInfo.InvariantCulture))
+                + ",\"mutation_is_reset\":" + (mutation == null ? "null" : (mutation.IsReset ? "true" : "false"))
                 + ",\"source_event_sequence\":" + sourceEventSequence
                 + ",\"publication_policy\":\"" + DepthPublicationPolicy + "\"}", providerTime);
         }
@@ -1513,7 +1536,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string AttestedSchema = "lane-iii-phase-f3-ninjatrader-observation-v2";
         private const string AttestationProtocol = "l3f3-ninjatrader-observer-attestation-v1";
         private const string AttestationKeyContext = "BEELZEBUB_NINJATRADER_OBSERVATION_V2";
-        private const string ProducerSourceFingerprint = "1825e9890fe54a71f9b495e778e07c9e523ca1b36f66569b21f9ca4549102b73";
+        private const string ProducerSourceFingerprint = "3c2248a8b676f35ca0b2442bb0463b9786096b1882f04f0e8f6f2eb60e6454e3";
         // Event-driven trades/depth require burst capacity, but memory remains
         // bounded. A full queue drops the signed frame after assigning its
         // sequence; the next source_event_sequence exposes the gap.
