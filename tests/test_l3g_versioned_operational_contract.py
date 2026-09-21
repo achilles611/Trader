@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from src.copytrade.config import CopyTradeConfig
 from src.copytrade.control_center import create_control_center_app
+from src.l3f_provider.ninjatrader_observation import NinjaTraderObservation
 from src.l3g_paper.contracts import (
     ACCOUNT_BINDING,
     CAPABILITY,
@@ -15,9 +16,11 @@ from src.l3g_paper.contracts import (
     ExecutionAccountBinding,
     ExecutionCapabilityManifest,
     PaperAuthorityBundle,
+    known_paper_policy_identity,
     paper_binding_for_topology,
     paper_policy_for_topology,
     paper_risk_for_topology,
+    resolve_paper_profile,
 )
 from src.l3g_paper.ledger import PaperLedger
 from src.l3g_paper.ninjatrader_transport import PaperExecutionTransport
@@ -96,6 +99,38 @@ class VersionedOperationalContractTests(unittest.TestCase):
                 risk=self.risk,
             )
             reopened.close()
+
+    def test_integrated_dec26_pong_runtime_ingests_quote_without_sink_failure(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "dec26.sqlite3"
+            profile = resolve_paper_profile("BEELZEBUB_PONG_DISCERNMENT_V1")
+            policy = paper_policy_for_topology(profile.policy, DEC26_TOPOLOGY)
+            risk = paper_risk_for_topology(profile.risk, DEC26_TOPOLOGY)
+            ledger = PaperLedger(
+                path,
+                epoch_id="L3G-PAPER-EPOCH-DEC26-INGEST-TEST",
+                policy=policy,
+                risk=risk,
+            )
+            runtime = LaneIIIPaperRuntime(ledger)
+            observed = "2026-09-21T00:00:00Z"
+            observation = NinjaTraderObservation(
+                "dec26-quote-1", "dec26-session", "QUOTE", observed, 1,
+                {
+                    "contract_id": DEC26_TOPOLOGY.native_instrument,
+                    "bid": "30000.00", "ask": "30000.25",
+                    "bid_size": 10, "ask_size": 10,
+                },
+                provider_timestamp=observed,
+            )
+            try:
+                self.assertTrue(known_paper_policy_identity(
+                    policy.policy_id, policy.configuration_hash,
+                ))
+                runtime.ingest(observation)
+            finally:
+                runtime.stop()
+                ledger.close()
 
     def test_mixed_contract_authority_and_ledger_reopen_fail_closed(self) -> None:
         with self.assertRaisesRegex(ValueError, "PAPER_CONTRACT_TOPOLOGY_BUNDLE_MISMATCH"):

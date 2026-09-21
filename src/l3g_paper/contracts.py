@@ -1484,16 +1484,24 @@ HIGH_CONFIDENCE_POLICY = HighConfidencePaperPolicyArtifact()
 FIVE_MINUTE_POLICY = FiveMinutePaperPolicyArtifact()
 FIVE_MINUTE_PERPETUAL_POLICY = FiveMinutePerpetualPaperPolicyArtifact()
 PONG_PAPER_POLICY = PongPaperPolicyArtifact()
-KNOWN_PAPER_POLICY_IDENTITIES = frozenset({
-    (PONG_PAPER_POLICY.policy_id, PONG_PAPER_POLICY.configuration_hash),
-    (POLICY.policy_id, POLICY.configuration_hash),
-    (HIGH_CONFIDENCE_POLICY.policy_id, HIGH_CONFIDENCE_POLICY.configuration_hash),
-    (FIVE_MINUTE_POLICY.policy_id, FIVE_MINUTE_POLICY.configuration_hash),
+_COMPILED_PAPER_POLICIES = (
+    PONG_PAPER_POLICY,
+    POLICY,
+    HIGH_CONFIDENCE_POLICY,
+    FIVE_MINUTE_POLICY,
+    FIVE_MINUTE_PERPETUAL_POLICY,
+)
+KNOWN_PAPER_POLICY_IDENTITIES = frozenset(
     (
-        FIVE_MINUTE_PERPETUAL_POLICY.policy_id,
-        FIVE_MINUTE_PERPETUAL_POLICY.configuration_hash,
-    ),
-})
+        topology_policy.policy_id,
+        topology_policy.configuration_hash,
+    )
+    for policy in _COMPILED_PAPER_POLICIES
+    for topology_policy in (
+        paper_policy_for_topology(policy, SEP26_TOPOLOGY),
+        paper_policy_for_topology(policy, DEC26_TOPOLOGY),
+    )
+)
 RISK_PROFILE = PaperRiskProfile()
 HIGH_CONFIDENCE_RISK_PROFILE = HighConfidencePaperRiskProfile()
 FIVE_MINUTE_RISK_PROFILE = FiveMinutePaperRiskProfile()
