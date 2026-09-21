@@ -1,9 +1,12 @@
 # Caelum administrative closeout — no-FHB qualifying cut
 
-**Pass:** `20260921-0436Z-no-fhb-qualifying-cut`  
-**Role:** Caelum, bounded Beelzebub administrator  
-**Reviewed revision:** `efea61561e128bc44632def5d7c135e6ea7bacd9` (`archive FHB from qualifying runtime`)  
-**Qualifying artifact hash:** `18ad28ca6feaed14a8776fb53057d0df16ff55c5c0996e127551f9da2c73da2f`  
+**Pass:** `20260921-0436Z-no-fhb-qualifying-cut`
+
+**Role:** Caelum, bounded Beelzebub administrator
+
+**Reviewed revision:** `efea61561e128bc44632def5d7c135e6ea7bacd9` (`archive FHB from qualifying runtime`)
+
+**Qualifying artifact hash:** `18ad28ca6feaed14a8776fb53057d0df16ff55c5c0996e127551f9da2c73da2f`
 **Authority:** read-only requirements, source-semantics, and evidence review. Sol remained sole integrator and runtime operator. Caelum made no application/configuration changes, ran no tests or benchmarks, controlled no processes, and wrote no runtime ledger or evidence.
 
 ## Disposition
@@ -48,7 +51,8 @@ The artifact hash was independently recomputed from the committed qualifying loa
 
 ## Natural-feed receipt review
 
-**Collector:** `pong-collector-20260921T043228465785Z-0fefc92586ff`  
+**Collector:** `pong-collector-20260921T043228465785Z-0fefc92586ff`
+
 **Receipt interval:** `2026-09-21T04:32:28.520784Z` through `2026-09-21T04:33:36.119260Z` (`67.598476` seconds)
 
 | Measure | Observed result |
@@ -82,14 +86,14 @@ The guarded shutdown completed without force termination. Ports 8090, 48135, and
 
 ## Preserved evidence
 
-- Collector status:  
-  `N:\Beelzebub\runtime\profiles\beelzebub_pong_discernment_v1\runs\20260920T211544Z-ca2ceba7da11\audit\pong-authentic-hour\collectors\pong-collector-20260921T043228465785Z-0fefc92586ff\status.json`  
+- Collector status:
+  `N:\Beelzebub\runtime\profiles\beelzebub_pong_discernment_v1\runs\20260920T211544Z-ca2ceba7da11\audit\pong-authentic-hour\collectors\pong-collector-20260921T043228465785Z-0fefc92586ff\status.json`
   SHA-256 `46f9d937cf04d52dc4ddedf4f69a71e7c3ebcdf52f0309f9fb09622c8f658b8d`
-- Collector journal:  
-  `N:\Beelzebub\runtime\profiles\beelzebub_pong_discernment_v1\runs\20260920T211544Z-ca2ceba7da11\audit\pong-authentic-hour\collectors\pong-collector-20260921T043228465785Z-0fefc92586ff\authenticated-observations.jsonl`  
+- Collector journal:
+  `N:\Beelzebub\runtime\profiles\beelzebub_pong_discernment_v1\runs\20260920T211544Z-ca2ceba7da11\audit\pong-authentic-hour\collectors\pong-collector-20260921T043228465785Z-0fefc92586ff\authenticated-observations.jsonl`
   SHA-256 `361d9f5a612090475c4fa7a2a7a72d1fb6fb54defb537895dc58957d81f36087`
-- Ledger verification:  
-  `N:\Beelzebub\runtime\profiles\beelzebub_pong_discernment_v1\runs\20260920T211544Z-ca2ceba7da11\audit\ledger-verification\20260921T043538455710Z-no-fhb-brief-closeout-20260921T0433Z.json`  
+- Ledger verification:
+  `N:\Beelzebub\runtime\profiles\beelzebub_pong_discernment_v1\runs\20260920T211544Z-ca2ceba7da11\audit\ledger-verification\20260921T043538455710Z-no-fhb-brief-closeout-20260921T0433Z.json`
   SHA-256 `4bf5aeff8ee41100d56b9c35065a9d6ac4b98baf49143121f4f79f04bcdb9fd5`
 
 Earlier warm-start faults, failed epochs, certificates, FHB evidence, and depth receipts remain preserved and are not cleared or relabelled.
