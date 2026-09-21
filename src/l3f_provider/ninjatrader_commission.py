@@ -38,6 +38,71 @@ _DISPLAY_ACCOUNT_CLASSES = {
     "Lucid25kflex01": AccountClass.PROVIDER_EVALUATION.value,
 }
 
+# Fixed receiver-service histogram. It adds constant memory and reports upper
+# bounds rather than retaining or logging individual market-event latencies.
+_RECEIVER_SERVICE_LATENCY_BUCKETS_MS = (
+    0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0,
+    10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0,
+)
+_NATIVE_TRANSPORT_TELEMETRY_SCHEMA = "native-outbound-aggregate-v1"
+_NATIVE_TRANSPORT_INTEGER_FIELDS = frozenset({
+    "native_callback_cpu_samples_total",
+    "native_callback_cpu_failures_total",
+    "native_depth_callback_cpu_cycles_total",
+    "native_quote_callback_cpu_cycles_total",
+    "native_trade_callback_cpu_cycles_total",
+    "native_depth_callback_cpu_cycles_max",
+    "native_quote_callback_cpu_cycles_max",
+    "native_trade_callback_cpu_cycles_max",
+    "native_depth_callbacks_total",
+    "native_quote_callbacks_total",
+    "native_trade_callbacks_total",
+    "native_publication_attempts_total",
+    "native_depth_publication_attempts_total",
+    "native_quote_publication_attempts_total",
+    "native_trade_publication_attempts_total",
+    "native_outbound_queue_capacity",
+    "native_outbound_queue_current",
+    "native_outbound_queue_high_water",
+    "native_outbound_queue_enqueued_total",
+    "native_outbound_queue_dequeued_total",
+    "native_outbound_queue_overflow_total",
+    "native_sender_batches_total",
+    "native_sender_batch_frames_total",
+    "native_sender_batch_bytes_total",
+    "native_sender_batch_frames_max",
+    "native_sender_batch_bytes_max",
+    "native_sender_socket_writes_total",
+    "native_sender_reconnects_total",
+    "native_sender_transport_failure_events_total",
+    "native_sender_inflight_frames",
+})
+_NATIVE_TRANSPORT_NUMBER_FIELDS = frozenset({
+    "native_telemetry_elapsed_seconds",
+    "native_depth_callbacks_per_second",
+    "native_quote_callbacks_per_second",
+    "native_trade_callbacks_per_second",
+    "native_depth_callback_wall_ms_total",
+    "native_quote_callback_wall_ms_total",
+    "native_trade_callback_wall_ms_total",
+    "native_depth_callback_wall_ms_max",
+    "native_quote_callback_wall_ms_max",
+    "native_trade_callback_wall_ms_max",
+    "native_publication_attempts_per_second",
+    "native_publication_processing_ms_total",
+    "native_publication_processing_ms_max",
+    "native_outbound_queue_enqueue_per_second",
+    "native_outbound_queue_dequeue_per_second",
+    "native_outbound_queue_oldest_age_ms",
+    "native_sender_batches_per_second",
+    "native_sender_records_per_second",
+    "native_sender_bytes_per_second",
+    "native_sender_frames_per_batch",
+    "native_sender_write_ms_total",
+    "native_sender_write_ms_max",
+    "native_sender_inflight_oldest_age_ms",
+})
+
 
 def _empty_account_balances() -> dict[str, dict[str, object]]:
     """Return the fixed, credential-free account-balance read model."""
@@ -82,6 +147,49 @@ class CommissioningSummary:
     last_accepted_monotonic: float | None = None
     controlled_shutdown_partial_frames: int = 0
     controlled_shutdown_partial_bytes: int = 0
+    receiver_started_monotonic: float | None = None
+    receiver_finished_monotonic: float | None = None
+    receiver_recv_calls: int = 0
+    receiver_recv_bytes: int = 0
+    receiver_frames_extracted: int = 0
+    receiver_frame_bytes: int = 0
+    framing_buffer_current_bytes: int = 0
+    framing_buffer_high_water_bytes: int = 0
+    bridge_latency_histogram: list[int] = field(
+        default_factory=lambda: [0] * (
+            len(_RECEIVER_SERVICE_LATENCY_BUCKETS_MS) + 1
+        ),
+    )
+
+    def begin_receiver(self) -> None:
+        if self.receiver_started_monotonic is None:
+            self.receiver_started_monotonic = time.perf_counter()
+            self.receiver_finished_monotonic = None
+
+    def finish_receiver(self) -> None:
+        if self.receiver_started_monotonic is not None:
+            self.receiver_finished_monotonic = time.perf_counter()
+
+    def record_receive(self, byte_count: int) -> None:
+        if type(byte_count) is not int or byte_count < 0:
+            raise ValueError("Receiver byte count must be a non-negative integer.")
+        self.receiver_recv_calls += 1
+        self.receiver_recv_bytes += byte_count
+
+    def record_frame_extracted(self, byte_count: int) -> None:
+        if type(byte_count) is not int or byte_count < 0:
+            raise ValueError("Extracted frame size must be a non-negative integer.")
+        self.receiver_frames_extracted += 1
+        self.receiver_frame_bytes += byte_count
+
+    def record_framing_buffer(self, byte_count: int) -> None:
+        if type(byte_count) is not int or byte_count < 0:
+            raise ValueError("Framing buffer size must be a non-negative integer.")
+        self.framing_buffer_current_bytes = byte_count
+        self.framing_buffer_high_water_bytes = max(
+            self.framing_buffer_high_water_bytes,
+            byte_count,
+        )
 
     def accept(self, observation: NinjaTraderObservation | None) -> None:
         if observation is None:
@@ -108,6 +216,15 @@ class CommissioningSummary:
         self.bridge_frames += 1
         self.bridge_total_seconds += elapsed
         self.bridge_maximum_seconds = max(self.bridge_maximum_seconds, elapsed)
+        elapsed_ms = elapsed * 1000.0
+        bucket = len(_RECEIVER_SERVICE_LATENCY_BUCKETS_MS)
+        for index, upper_bound in enumerate(
+            _RECEIVER_SERVICE_LATENCY_BUCKETS_MS,
+        ):
+            if elapsed_ms <= upper_bound:
+                bucket = index
+                break
+        self.bridge_latency_histogram[bucket] += 1
 
     def record_downstream(self, elapsed_seconds: float) -> None:
         elapsed = max(0.0, elapsed_seconds)
@@ -119,7 +236,81 @@ class CommissioningSummary:
         span = 0.0
         if self.first_accepted_monotonic is not None and self.last_accepted_monotonic is not None:
             span = max(0.0, self.last_accepted_monotonic - self.first_accepted_monotonic)
+        receiver_span = 0.0
+        if self.receiver_started_monotonic is not None:
+            receiver_end = (
+                self.receiver_finished_monotonic
+                if self.receiver_finished_monotonic is not None
+                else time.perf_counter()
+            )
+            receiver_span = max(
+                0.0, receiver_end - self.receiver_started_monotonic,
+            )
+
+        def percentile_upper_bound(percentile: float) -> float:
+            if self.bridge_frames <= 0:
+                return 0.0
+            rank = max(1, math.ceil(self.bridge_frames * percentile))
+            cumulative = 0
+            for index, count in enumerate(self.bridge_latency_histogram):
+                cumulative += count
+                if cumulative >= rank:
+                    if index < len(_RECEIVER_SERVICE_LATENCY_BUCKETS_MS):
+                        return _RECEIVER_SERVICE_LATENCY_BUCKETS_MS[index]
+                    return round(self.bridge_maximum_seconds * 1000.0, 3)
+            return round(self.bridge_maximum_seconds * 1000.0, 3)
+
+        strict_decoded = self.accepted + self.duplicates
+
+        def rate(count: int) -> float | None:
+            return (
+                round(count / receiver_span, 3)
+                if receiver_span > 0
+                else None
+            )
         return {
+            "receiver_transport": {
+                "elapsed_seconds": round(receiver_span, 3),
+                "recv_calls": self.receiver_recv_calls,
+                "recv_bytes": self.receiver_recv_bytes,
+                "recv_calls_per_second": rate(self.receiver_recv_calls),
+                "recv_bytes_per_second": rate(self.receiver_recv_bytes),
+                "frames_extracted": self.receiver_frames_extracted,
+                "frame_bytes": self.receiver_frame_bytes,
+                "frames_extracted_per_second": rate(
+                    self.receiver_frames_extracted,
+                ),
+                "framing_buffer_occupancy": {
+                    "current_bytes": self.framing_buffer_current_bytes,
+                    "high_water_bytes": self.framing_buffer_high_water_bytes,
+                    "is_queue": False,
+                },
+            },
+            "strict_decode_and_admission": {
+                "attempts": self.bridge_frames,
+                "strict_decoded": strict_decoded,
+                "strict_decode_rate_per_second": rate(strict_decoded),
+                "accepted": self.accepted,
+                "accepted_rate_per_second": rate(self.accepted),
+                "rejected": self.rejected,
+                "duplicates": self.duplicates,
+                "service_latency_milliseconds": {
+                    "quantile_method": "FIXED_HISTOGRAM_UPPER_BOUND",
+                    "p50": percentile_upper_bound(0.50),
+                    "p95": percentile_upper_bound(0.95),
+                    "p99": percentile_upper_bound(0.99),
+                    "maximum": round(
+                        self.bridge_maximum_seconds * 1000.0, 3,
+                    ),
+                    "histogram_upper_bounds": [
+                        *list(_RECEIVER_SERVICE_LATENCY_BUCKETS_MS),
+                        "overflow",
+                    ],
+                    "histogram_counts": list(
+                        self.bridge_latency_histogram,
+                    ),
+                },
+            },
             "bridge_admission": {
                 "frames": self.bridge_frames,
                 "total_milliseconds": round(self.bridge_total_seconds * 1000.0, 3),
@@ -215,6 +406,7 @@ class NinjaTraderListenerRuntimeStatus:
     observer_attachment: Mapping[str, object]
     account_balances: Mapping[str, Mapping[str, object]]
     pipeline_metrics: Mapping[str, object]
+    native_transport_metrics: Mapping[str, object]
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -237,6 +429,7 @@ class NinjaTraderListenerRuntimeStatus:
                 alias: dict(values) for alias, values in self.account_balances.items()
             },
             "pipeline_metrics": dict(self.pipeline_metrics),
+            "native_transport_metrics": dict(self.native_transport_metrics),
             "authority": "OBSERVE_ONLY",
         }
 
@@ -376,11 +569,16 @@ class NinjaTraderCommissioningHarness:
             raise ValueError("Commissioning duration must be positive.")
         listener = self.bridge.open_listener()
         connections: dict[socket.socket, bytearray] = {}
+        framing_buffer_bytes = 0
 
         def close_connection(connection: socket.socket, *, admit_partial: bool = True) -> None:
+            nonlocal framing_buffer_bytes
             data = connections.pop(connection, bytearray())
+            framing_buffer_bytes -= len(data)
+            self.summary.record_framing_buffer(framing_buffer_bytes)
             if data:
                 if admit_partial:
+                    self.summary.record_frame_extracted(len(data))
                     self.ingest((bytes(data),), source_connection=connection)
                 else:
                     # Local controlled shutdown can interrupt the sender in
@@ -406,6 +604,7 @@ class NinjaTraderCommissioningHarness:
                     self._mark(NinjaTraderHealthStream.LOCAL_BRIDGE, StreamHealth.DISCONNECTED)
 
         try:
+            self.summary.begin_receiver()
             listener.setblocking(False)
             self.summary.listener_ready = True
             if self._on_listener_started is not None:
@@ -440,25 +639,40 @@ class NinjaTraderCommissioningHarness:
                         # byte. This bounds even newline-free hostile input.
                         chunk = source.recv(min(4096, self.bridge.config.maximum_frame_bytes + 1 - buffered))
                     except BlockingIOError:
+                        self.summary.record_receive(0)
                         continue
                     except OSError:
+                        self.summary.record_receive(0)
                         # NinjaTrader may terminate or reset a client socket
                         # without a graceful FIN. That is a client transport
                         # transition, not a failure of the listener owner.
                         close_connection(source)
                         continue
+                    self.summary.record_receive(len(chunk))
                     if not chunk:
                         close_connection(source)
                         continue
                     data = connections[source]
                     data.extend(chunk)
+                    framing_buffer_bytes += len(chunk)
+                    self.summary.record_framing_buffer(framing_buffer_bytes)
                     while b"\n" in data:
                         frame, _, remainder = data.partition(b"\n")
                         connections[source] = data = bytearray(remainder)
+                        framing_buffer_bytes -= len(frame) + 1
+                        self.summary.record_frame_extracted(len(frame))
+                        self.summary.record_framing_buffer(
+                            framing_buffer_bytes,
+                        )
                         self.ingest((bytes(frame),), source_connection=source)
                     if len(data) > self.bridge.config.maximum_frame_bytes:
+                        self.summary.record_frame_extracted(len(data))
                         self.ingest((bytes(data),), source_connection=source)
+                        framing_buffer_bytes -= len(data)
                         connections[source] = bytearray()
+                        self.summary.record_framing_buffer(
+                            framing_buffer_bytes,
+                        )
                         close_connection(source)
         finally:
             for connection in tuple(connections):
@@ -468,6 +682,7 @@ class NinjaTraderCommissioningHarness:
             # no client ever connected. It must not remain CONNECTING in a
             # persisted commissioning report.
             self._mark(NinjaTraderHealthStream.LOCAL_BRIDGE, StreamHealth.DISCONNECTED)
+            self.summary.finish_receiver()
         return self.summary
 
     def run_until_stopped(self, stop_event: threading.Event) -> CommissioningSummary:
@@ -529,6 +744,7 @@ class NinjaTraderListenerWorker:
             "observed_at": None,
         }
         self._account_balances = _empty_account_balances()
+        self._native_transport_metrics: dict[str, object] = {}
 
     def status(self) -> NinjaTraderListenerRuntimeStatus:
         with self._lock:
@@ -550,7 +766,50 @@ class NinjaTraderListenerWorker:
                     if self._harness is not None
                     else {}
                 ),
+                native_transport_metrics=dict(
+                    self._native_transport_metrics,
+                ),
             )
+
+    def _record_native_transport_metrics(
+        self,
+        observation: NinjaTraderObservation,
+    ) -> None:
+        """Retain only the fixed aggregate native transport telemetry model."""
+        if observation.observation_type != "HEALTH":
+            return
+        payload = observation.payload
+        if (
+            payload.get("native_transport_telemetry_schema")
+            != _NATIVE_TRANSPORT_TELEMETRY_SCHEMA
+        ):
+            return
+        started_at = payload.get("native_telemetry_started_utc")
+        cpu_supported = payload.get("native_callback_cpu_cycles_supported")
+        if not isinstance(started_at, str) or type(cpu_supported) is not bool:
+            return
+        sanitized: dict[str, object] = {
+            "native_transport_telemetry_schema": (
+                _NATIVE_TRANSPORT_TELEMETRY_SCHEMA
+            ),
+            "native_telemetry_started_utc": started_at,
+            "native_callback_cpu_cycles_supported": cpu_supported,
+            "observed_at": observation.ninja_receipt_time,
+        }
+        for key in _NATIVE_TRANSPORT_INTEGER_FIELDS:
+            value = payload.get(key)
+            if type(value) is int and value >= 0:
+                sanitized[key] = value
+        for key in _NATIVE_TRANSPORT_NUMBER_FIELDS:
+            value = payload.get(key)
+            if (
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(float(value))
+                and float(value) >= 0.0
+            ):
+                sanitized[key] = float(value)
+        self._native_transport_metrics = sanitized
 
     def _record_observer_attachment(self, observation: NinjaTraderObservation) -> None:
         """Retain only the fixed, observation-only chart attachment model."""
@@ -617,6 +876,7 @@ class NinjaTraderListenerWorker:
                 self._last_depth_at = observation.ninja_receipt_time
             self._record_observer_attachment(observation)
             self._record_account_balance(observation)
+            self._record_native_transport_metrics(observation)
             callback = self._on_observation
         if callback is not None:
             callback(observation)
@@ -690,6 +950,7 @@ class NinjaTraderListenerWorker:
                 "observed_at": None,
             }
             self._account_balances = _empty_account_balances()
+            self._native_transport_metrics = {}
             self._harness = NinjaTraderCommissioningHarness(
                 self.config,
                 attestation_key=self._attestation_key,

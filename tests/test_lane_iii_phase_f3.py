@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import socket
 import subprocess
 import tempfile
@@ -14,7 +15,12 @@ from unittest.mock import patch
 
 from src.copytrade.config import CopyTradeConfig
 from src.copytrade.control_center import create_control_center_app
-from src.l3f_provider.ninjatrader_commission import NinjaTraderCommissioningHarness, NinjaTraderListenerWorker
+from src.l3f_provider import ninjatrader_commission as commission
+from src.l3f_provider.ninjatrader_commission import (
+    CommissioningSummary,
+    NinjaTraderCommissioningHarness,
+    NinjaTraderListenerWorker,
+)
 from src.l3f_provider.ninjatrader_observation import (
     LoopbackBridgeConfig, LoopbackNinjaTraderBridge, NinjaTraderObservation,
     NinjaTraderObservationError,
@@ -98,6 +104,68 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
         self.assertEqual(result.duplicates, 1)
         self.assertEqual(result.rejected, 1)
         self.assertEqual(result.safe_report()["error_details"], {"bridge_schema": 1})
+        decode = result.safe_report()["pipeline_metrics"][
+            "strict_decode_and_admission"
+        ]
+        self.assertEqual(decode["attempts"], 3)
+        self.assertEqual(decode["strict_decoded"], 2)
+        self.assertEqual(decode["accepted"], 1)
+        self.assertEqual(decode["duplicates"], 1)
+        self.assertEqual(decode["rejected"], 1)
+
+    def test_receiver_metrics_use_fixed_bounded_latency_histogram(self):
+        summary = CommissioningSummary()
+        with patch(
+            "src.l3f_provider.ninjatrader_commission.time.perf_counter",
+            side_effect=(10.0, 12.0),
+        ):
+            summary.begin_receiver()
+            summary.record_receive(400)
+            summary.record_receive(600)
+            summary.record_frame_extracted(399)
+            summary.record_frame_extracted(599)
+            summary.record_framing_buffer(700)
+            summary.record_framing_buffer(100)
+            summary.record_framing_buffer(0)
+            for _ in range(50):
+                summary.record_bridge(0.00001)
+            for _ in range(45):
+                summary.record_bridge(0.001)
+            for _ in range(4):
+                summary.record_bridge(0.1)
+            summary.record_bridge(2.0)
+            summary.accepted = 97
+            summary.duplicates = 1
+            summary.rejected = 2
+            summary.finish_receiver()
+
+        metrics = summary.pipeline_report()
+        transport = metrics["receiver_transport"]
+        self.assertEqual(transport["elapsed_seconds"], 2.0)
+        self.assertEqual(transport["recv_calls"], 2)
+        self.assertEqual(transport["recv_bytes"], 1000)
+        self.assertEqual(transport["recv_calls_per_second"], 1.0)
+        self.assertEqual(transport["recv_bytes_per_second"], 500.0)
+        self.assertEqual(transport["frames_extracted"], 2)
+        self.assertEqual(transport["frames_extracted_per_second"], 1.0)
+        self.assertEqual(transport["framing_buffer_occupancy"], {
+            "current_bytes": 0,
+            "high_water_bytes": 700,
+            "is_queue": False,
+        })
+        decode = metrics["strict_decode_and_admission"]
+        self.assertEqual(decode["attempts"], 100)
+        self.assertEqual(decode["strict_decoded"], 98)
+        self.assertEqual(decode["strict_decode_rate_per_second"], 49.0)
+        self.assertEqual(decode["accepted_rate_per_second"], 48.5)
+        latency = decode["service_latency_milliseconds"]
+        self.assertEqual(latency["quantile_method"], "FIXED_HISTOGRAM_UPPER_BOUND")
+        self.assertEqual(latency["p50"], 0.025)
+        self.assertEqual(latency["p95"], 1.0)
+        self.assertEqual(latency["p99"], 100.0)
+        self.assertEqual(latency["maximum"], 2000.0)
+        self.assertEqual(len(latency["histogram_counts"]), 16)
+        self.assertEqual(sum(latency["histogram_counts"]), 100)
 
     def test_listener_status_tracks_latest_accepted_authentic_observation(self):
         worker = NinjaTraderListenerWorker()
@@ -176,6 +244,131 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
         self.assertFalse(status["observer_attachment"]["chart_found"])
         self.assertTrue(status["observer_attachment"]["observer_attached"])
         self.assertEqual(status["observer_attachment"]["subscription_mode"], "NATIVE_ADDON")
+
+    def test_listener_retains_only_sanitized_native_transport_aggregates(self):
+        worker = NinjaTraderListenerWorker()
+        observation = LoopbackNinjaTraderBridge().accept_observation(frame(
+            "HEALTH", 1, payload={
+                "component": "MARKET_OBSERVER_ATTACHMENT",
+                "state": "NATIVE_ADDON_OBSERVER_ACTIVE",
+                "configured_instrument": "MNQ DEC26",
+                "instrument": "MNQ DEC26",
+                "chart_found": False,
+                "observer_attached": True,
+                "subscription_mode": "NATIVE_ADDON",
+                "native_transport_telemetry_schema": (
+                    "native-outbound-aggregate-v1"
+                ),
+                "native_telemetry_started_utc": TIME,
+                "native_telemetry_elapsed_seconds": 12.5,
+                "native_callback_cpu_cycles_supported": True,
+                "native_callback_cpu_samples_total": 250,
+                "native_callback_cpu_failures_total": 1,
+                "native_depth_callback_cpu_cycles_total": 125_000,
+                "native_quote_callback_cpu_cycles_total": 25_000,
+                "native_trade_callback_cpu_cycles_total": 50_000,
+                "native_depth_callback_cpu_cycles_max": 2_500,
+                "native_quote_callback_cpu_cycles_max": 500,
+                "native_trade_callback_cpu_cycles_max": 1_000,
+                "native_depth_callbacks_total": 250,
+                "native_depth_callbacks_per_second": 20.0,
+                "native_outbound_queue_capacity": 32768,
+                "native_outbound_queue_current": 3,
+                "native_outbound_queue_high_water": 17,
+                "native_outbound_queue_overflow_total": 0,
+                "native_outbound_queue_oldest_age_ms": 0.25,
+                "native_sender_socket_writes_total": 100,
+                "native_sender_write_ms_max": 1.5,
+                "native_sender_transport_failure_events_total": 0,
+                "native_sender_inflight_frames": 2,
+                "native_sender_inflight_oldest_age_ms": 0.5,
+                "native_unapproved_counter": 999,
+                "unrelated_health_detail": "must-not-be-retained",
+            },
+        ))
+        assert observation is not None
+        worker._record_and_forward_observation(observation)
+
+        status = worker.status().as_dict()
+        native = status["native_transport_metrics"]
+        self.assertEqual(
+            native["native_transport_telemetry_schema"],
+            "native-outbound-aggregate-v1",
+        )
+        self.assertEqual(native["observed_at"], TIME)
+        self.assertEqual(native["native_depth_callbacks_total"], 250)
+        self.assertEqual(native["native_depth_callbacks_per_second"], 20.0)
+        self.assertTrue(native["native_callback_cpu_cycles_supported"])
+        self.assertEqual(native["native_callback_cpu_samples_total"], 250)
+        self.assertEqual(native["native_callback_cpu_failures_total"], 1)
+        self.assertEqual(native["native_depth_callback_cpu_cycles_total"], 125_000)
+        self.assertEqual(native["native_trade_callback_cpu_cycles_max"], 1_000)
+        self.assertEqual(native["native_outbound_queue_current"], 3)
+        self.assertEqual(native["native_sender_inflight_frames"], 2)
+        self.assertNotIn("native_unapproved_counter", native)
+        self.assertNotIn("unrelated_health_detail", native)
+        self.assertNotIn("component", native)
+        self.assertEqual(
+            status["observer_attachment"]["state"],
+            "NATIVE_ADDON_OBSERVER_ACTIVE",
+        )
+
+        malformed = LoopbackNinjaTraderBridge().accept_observation(frame(
+            "HEALTH", 2, payload={
+                "native_transport_telemetry_schema": (
+                    "native-outbound-aggregate-v1"
+                ),
+                "native_telemetry_started_utc": TIME,
+                "native_callback_cpu_cycles_supported": "true",
+                "native_outbound_queue_current": 999,
+            },
+        ))
+        assert malformed is not None
+        worker._record_and_forward_observation(malformed)
+        self.assertEqual(worker.status().as_dict()["native_transport_metrics"], native)
+
+    def test_native_transport_allowlist_matches_emitted_source_contract(self):
+        root = Path(__file__).parents[1]
+        addon = (
+            root
+            / "ninjatrader"
+            / "NinjaScript"
+            / "AddOns"
+            / "BeelzebubReadOnlyAddOn.cs"
+        ).read_text(encoding="utf-8")
+        indicator = (
+            root
+            / "ninjatrader"
+            / "NinjaScript"
+            / "Indicators"
+            / "BeelzebubReadOnlyMarketObserver.cs"
+        ).read_text(encoding="utf-8")
+        aggregate = re.search(
+            r"private static void AddAggregateTelemetryLocked\(.*?"
+            r"(?=\n\s*private static double Milliseconds)",
+            addon,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(aggregate)
+        emitted = set(re.findall(
+            r'payloadValue\["(native_[^"]+)"\]',
+            aggregate.group(0),
+        ))
+        allowed = {
+            "native_transport_telemetry_schema",
+            "native_telemetry_started_utc",
+            "native_callback_cpu_cycles_supported",
+            *commission._NATIVE_TRANSPORT_INTEGER_FIELDS,
+            *commission._NATIVE_TRANSPORT_NUMBER_FIELDS,
+        }
+        self.assertEqual(emitted, allowed)
+        self.assertNotIn("native_callback_cpu_time_supported", emitted)
+        self.assertGreaterEqual(
+            indicator.count(
+                "BeelzebubReadOnlyOutbound.RecordNativeCallback"
+            ),
+            2,
+        )
 
     def test_listener_surfaces_latest_read_only_cash_values_for_sim_and_lucid(self):
         worker = NinjaTraderListenerWorker()
@@ -368,6 +561,25 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
         self._finish_receiver(result, failures, thread)
         self.assertEqual(result[0].accepted, 1)
         self.assertEqual(result[0].rejected, 0)
+        metrics = result[0].safe_report()["pipeline_metrics"]
+        transport = metrics["receiver_transport"]
+        self.assertGreaterEqual(transport["recv_calls"], 2)
+        self.assertEqual(transport["recv_bytes"], len(encoded) + 1)
+        self.assertEqual(transport["frames_extracted"], 1)
+        self.assertEqual(transport["frame_bytes"], len(encoded))
+        self.assertGreater(
+            transport["framing_buffer_occupancy"]["high_water_bytes"],
+            0,
+        )
+        self.assertEqual(
+            transport["framing_buffer_occupancy"]["current_bytes"],
+            0,
+        )
+        decode = metrics["strict_decode_and_admission"]
+        self.assertEqual(decode["attempts"], 1)
+        self.assertEqual(decode["accepted"], 1)
+        self.assertEqual(decode["rejected"], 0)
+        self.assertEqual(decode["duplicates"], 0)
 
     def test_receiver_fails_closed_for_bad_encoding_json_and_oversized_frame(self):
         _, result, failures, thread, client = self._start_receiver(maximum_frame_bytes=1024)

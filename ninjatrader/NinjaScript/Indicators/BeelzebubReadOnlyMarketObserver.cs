@@ -84,12 +84,28 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         protected override void OnMarketData(MarketDataEventArgs e)
         {
-            if (!marketDataGate.TryRun(
-                marketDataGeneration, delegate {
-                    BeelzebubMarketPublisherLease.TryRun(publisherLease, delegate { OnMarketDataSerial(e); });
-                }))
-                BeelzebubReadOnlyOutbound.Diagnostic(
-                    "INDICATOR_STALE_MARKET_DATA_CALLBACK_REJECTED");
+            long callbackStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            long callbackCpuStarted = BeelzebubReadOnlyOutbound.CurrentThreadCpuCycles();
+            string callbackType = e != null && e.MarketDataType == MarketDataType.Last
+                ? "TRADE"
+                : e != null && (e.MarketDataType == MarketDataType.Bid || e.MarketDataType == MarketDataType.Ask)
+                    ? "QUOTE" : null;
+            try
+            {
+                if (!marketDataGate.TryRun(
+                    marketDataGeneration, delegate {
+                        BeelzebubMarketPublisherLease.TryRun(publisherLease, delegate { OnMarketDataSerial(e); });
+                    }))
+                    BeelzebubReadOnlyOutbound.Diagnostic(
+                        "INDICATOR_STALE_MARKET_DATA_CALLBACK_REJECTED");
+            }
+            finally
+            {
+                if (callbackType != null)
+                    BeelzebubReadOnlyOutbound.RecordNativeCallback(
+                        callbackType, System.Diagnostics.Stopwatch.GetTimestamp() - callbackStarted,
+                        callbackCpuStarted);
+            }
         }
 
         private void OnMarketDataSerial(MarketDataEventArgs e)
@@ -182,9 +198,20 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         protected override void OnMarketDepth(MarketDepthEventArgs e)
         {
-            marketDataGate.TryRun(marketDataGeneration, delegate {
-                BeelzebubMarketPublisherLease.TryRun(publisherLease, delegate { OnMarketDepthSerial(e); });
-            });
+            long callbackStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            long callbackCpuStarted = BeelzebubReadOnlyOutbound.CurrentThreadCpuCycles();
+            try
+            {
+                marketDataGate.TryRun(marketDataGeneration, delegate {
+                    BeelzebubMarketPublisherLease.TryRun(publisherLease, delegate { OnMarketDepthSerial(e); });
+                });
+            }
+            finally
+            {
+                BeelzebubReadOnlyOutbound.RecordNativeCallback(
+                    "DEPTH", System.Diagnostics.Stopwatch.GetTimestamp() - callbackStarted,
+                    callbackCpuStarted);
+            }
         }
 
         private void OnMarketDepthSerial(MarketDepthEventArgs e)

@@ -1804,6 +1804,60 @@ class NinjaScriptSourceTests(unittest.TestCase):
         for forbidden in ("CreateOrder(", ".Submit(", ".Cancel(", ".Flatten(", "NetworkStream.Read"):
             self.assertNotIn(forbidden, source)
 
+    def test_native_outbound_health_persists_aggregate_stage_telemetry(self) -> None:
+        root = Path(__file__).parents[1] / "ninjatrader" / "NinjaScript"
+        addon = (root / "AddOns" / "BeelzebubReadOnlyAddOn.cs").read_text(encoding="utf-8")
+        indicator = (root / "Indicators" / "BeelzebubReadOnlyMarketObserver.cs").read_text(encoding="utf-8")
+
+        telemetry = addon[
+            addon.index("        private static void AddAggregateTelemetryLocked"):
+            addon.index("        private static double Milliseconds", addon.index("        private static void AddAggregateTelemetryLocked"))
+        ]
+        for field in (
+            "native_depth_callbacks_per_second",
+            "native_quote_callbacks_per_second",
+            "native_trade_callbacks_per_second",
+            "native_callback_cpu_cycles_supported",
+            "native_callback_cpu_samples_total",
+            "native_callback_cpu_failures_total",
+            "native_depth_callback_cpu_cycles_total",
+            "native_quote_callback_cpu_cycles_total",
+            "native_trade_callback_cpu_cycles_total",
+            "native_depth_callback_wall_ms_total",
+            "native_publication_attempts_per_second",
+            "native_outbound_queue_capacity",
+            "native_outbound_queue_current",
+            "native_outbound_queue_high_water",
+            "native_outbound_queue_enqueue_per_second",
+            "native_outbound_queue_dequeue_per_second",
+            "native_outbound_queue_overflow_total",
+            "native_outbound_queue_oldest_age_ms",
+            "native_sender_batches_per_second",
+            "native_sender_records_per_second",
+            "native_sender_bytes_per_second",
+            "native_sender_frames_per_batch",
+            "native_sender_socket_writes_total",
+            "native_sender_write_ms_total",
+            "native_sender_write_ms_max",
+            "native_sender_reconnects_total",
+            "native_sender_transport_failure_events_total",
+            "native_sender_inflight_frames",
+            "native_sender_inflight_oldest_age_ms",
+        ):
+            self.assertIn(f'payloadValue["{field}"]', telemetry)
+        self.assertIn("QueryThreadCycleTime(GetCurrentThread(), out cycles)", addon)
+        self.assertIn('[DllImport("kernel32.dll", SetLastError = true)]', addon)
+        self.assertIn('String.Equals(type, "HEALTH", StringComparison.Ordinal)', addon)
+        self.assertIn("AddAggregateTelemetryLocked(payloadValue);", addon)
+        self.assertIn("Queue<OutboundFrame>", addon)
+        self.assertIn("outboundFrames.Peek().EnqueuedTicks", addon)
+        self.assertIn("RecordNativeCallback(\n                    \"DEPTH\"", addon)
+        self.assertIn("RecordNativeCallback(\n                    \"DEPTH\"", indicator)
+        self.assertEqual(addon.count("RecordNativeCallback("), 3)
+        self.assertEqual(indicator.count("RecordNativeCallback("), 2)
+        self.assertIn("private const int MaximumQueuedFrames = 32768;", addon)
+        self.assertNotIn("Thread.Sleep", addon[addon.index("public static class BeelzebubReadOnlyOutbound"):])
+
     def test_commissioning_requires_a_distinct_receiver_first_producer_boundary(self) -> None:
         root = Path(__file__).parents[1]
         commission = (root / "tools" / "commission_ninjatrader_observer.ps1").read_text(

@@ -10,6 +10,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -1083,12 +1084,28 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void OnMarketData(object sender, MarketDataEventArgs e)
         {
-            if (!marketDataGate.TryRun(
-                marketDataGeneration, delegate {
-                    BeelzebubMarketPublisherLease.TryRun(publisherLease, delegate { OnMarketDataSerial(e); });
-                }))
-                BeelzebubReadOnlyOutbound.Diagnostic(
-                    "NATIVE_ADDON_STALE_MARKET_DATA_CALLBACK_REJECTED");
+            long callbackStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            long callbackCpuStarted = BeelzebubReadOnlyOutbound.CurrentThreadCpuCycles();
+            string callbackType = e != null && e.MarketDataType == MarketDataType.Last
+                ? "TRADE"
+                : e != null && (e.MarketDataType == MarketDataType.Bid || e.MarketDataType == MarketDataType.Ask)
+                    ? "QUOTE" : null;
+            try
+            {
+                if (!marketDataGate.TryRun(
+                    marketDataGeneration, delegate {
+                        BeelzebubMarketPublisherLease.TryRun(publisherLease, delegate { OnMarketDataSerial(e); });
+                    }))
+                    BeelzebubReadOnlyOutbound.Diagnostic(
+                        "NATIVE_ADDON_STALE_MARKET_DATA_CALLBACK_REJECTED");
+            }
+            finally
+            {
+                if (callbackType != null)
+                    BeelzebubReadOnlyOutbound.RecordNativeCallback(
+                        callbackType, System.Diagnostics.Stopwatch.GetTimestamp() - callbackStarted,
+                        callbackCpuStarted);
+            }
         }
 
         private void OnMarketDataSerial(MarketDataEventArgs e)
@@ -1163,9 +1180,20 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void OnMarketDepth(object sender, MarketDepthEventArgs e)
         {
-            marketDataGate.TryRun(marketDataGeneration, delegate {
-                BeelzebubMarketPublisherLease.TryRun(publisherLease, delegate { OnMarketDepthSerial(e); });
-            });
+            long callbackStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            long callbackCpuStarted = BeelzebubReadOnlyOutbound.CurrentThreadCpuCycles();
+            try
+            {
+                marketDataGate.TryRun(marketDataGeneration, delegate {
+                    BeelzebubMarketPublisherLease.TryRun(publisherLease, delegate { OnMarketDepthSerial(e); });
+                });
+            }
+            finally
+            {
+                BeelzebubReadOnlyOutbound.RecordNativeCallback(
+                    "DEPTH", System.Diagnostics.Stopwatch.GetTimestamp() - callbackStarted,
+                    callbackCpuStarted);
+            }
         }
 
         private void OnMarketDepthSerial(MarketDepthEventArgs e)
@@ -1648,11 +1676,23 @@ namespace NinjaTrader.NinjaScript.AddOns
     // writes one observation frame. There is intentionally no stream Read.
     public static class BeelzebubReadOnlyOutbound
     {
+        private sealed class OutboundFrame
+        {
+            public readonly string Wire;
+            public readonly long EnqueuedTicks;
+
+            public OutboundFrame(string wire, long enqueuedTicks)
+            {
+                Wire = wire;
+                EnqueuedTicks = enqueuedTicks;
+            }
+        }
+
         private const int Port = 48135;
         private const string AttestedSchema = "lane-iii-phase-f3-ninjatrader-observation-v2";
         private const string AttestationProtocol = "l3f3-ninjatrader-observer-attestation-v1";
         private const string AttestationKeyContext = "BEELZEBUB_NINJATRADER_OBSERVATION_V2";
-        private const string ProducerSourceFingerprint = "585a57d4c8138665b6c5734fcb84608f16c64668b028ec960371d78957fa2344";
+        private const string ProducerSourceFingerprint = "051808624d0d91ac04e91cae27b7e8765d887774053192b909c7b7434f652a14";
         // Event-driven trades/depth require burst capacity, but memory remains
         // bounded. A full queue drops the signed frame after assigning its
         // sequence; the next source_event_sequence exposes the gap.
@@ -1662,10 +1702,50 @@ namespace NinjaTrader.NinjaScript.AddOns
         private static long sequence = 0;
         private static long queueOverflowFrames;
         private static long transportFailedFrames;
+        private static readonly long telemetryStartedTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+        private static readonly string telemetryStartedUtc = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+        private static long nativeDepthCallbacks;
+        private static long nativeQuoteCallbacks;
+        private static long nativeTradeCallbacks;
+        private static long nativeDepthCallbackTicks;
+        private static long nativeQuoteCallbackTicks;
+        private static long nativeTradeCallbackTicks;
+        private static long nativeDepthCallbackMaxTicks;
+        private static long nativeQuoteCallbackMaxTicks;
+        private static long nativeTradeCallbackMaxTicks;
+        private static long nativeDepthCallbackCpuCycles;
+        private static long nativeQuoteCallbackCpuCycles;
+        private static long nativeTradeCallbackCpuCycles;
+        private static long nativeDepthCallbackCpuMaxCycles;
+        private static long nativeQuoteCallbackCpuMaxCycles;
+        private static long nativeTradeCallbackCpuMaxCycles;
+        private static long nativeCallbackCpuSamples;
+        private static long nativeCallbackCpuFailures;
+        private static long publicationAttempts;
+        private static long depthPublicationAttempts;
+        private static long quotePublicationAttempts;
+        private static long tradePublicationAttempts;
+        private static long publicationProcessingTicks;
+        private static long publicationProcessingMaxTicks;
+        private static long queueEnqueuedFrames;
+        private static long queueDequeuedFrames;
+        private static long queueHighWaterFrames;
+        private static long senderBatches;
+        private static long senderBatchFrames;
+        private static long senderBatchBytes;
+        private static long senderBatchMaxFrames;
+        private static long senderBatchMaxBytes;
+        private static long senderSocketWrites;
+        private static long senderWriteTicks;
+        private static long senderWriteMaxTicks;
+        private static long senderReconnects;
+        private static long senderTransportFailureEvents;
+        private static long senderInFlightFrames;
+        private static long senderInFlightOldestTicks;
         private static readonly string sessionId = Guid.NewGuid().ToString("N");
         private static readonly HashSet<string> transportMarkers = new HashSet<string>();
         private static readonly object transportMarkersLock = new object();
-        private static readonly Queue<string> outboundFrames = new Queue<string>();
+        private static readonly Queue<OutboundFrame> outboundFrames = new Queue<OutboundFrame>();
         private static readonly object outboundFramesLock = new object();
         private static Thread senderThread;
         private static bool senderRunning;
@@ -1710,6 +1790,14 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         public static string Publish(string type, string alias, string accountClass, string payload, DateTime? providerTime = null)
         {
+            long publicationStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            Interlocked.Increment(ref publicationAttempts);
+            if (String.Equals(type, "DEPTH", StringComparison.Ordinal))
+                Interlocked.Increment(ref depthPublicationAttempts);
+            else if (String.Equals(type, "QUOTE", StringComparison.Ordinal))
+                Interlocked.Increment(ref quotePublicationAttempts);
+            else if (String.Equals(type, "TRADE", StringComparison.Ordinal))
+                Interlocked.Increment(ref tradePublicationAttempts);
             TransportDiagnosticOnce("BRIDGE_PUBLISH_ATTEMPT_" + type);
             lock (outboundFramesLock)
             {
@@ -1728,6 +1816,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     if (payloadValue == null)
                     {
                         TransportDiagnosticOnce("ATTESTED_PAYLOAD_PARSE_FAILED");
+                        RecordPublicationElapsed(publicationStarted);
                         return null;
                     }
                     Dictionary<string, object> accountValue = null;
@@ -1735,6 +1824,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                         payloadValue["source_generation"] = BeelzebubMarketPublisherLease.CurrentGeneration;
                     payloadValue["observer_queue_overflow_frames"] = Interlocked.Read(ref queueOverflowFrames);
                     payloadValue["observer_transport_failed_frames"] = Interlocked.Read(ref transportFailedFrames);
+                    if (String.Equals(type, "HEALTH", StringComparison.Ordinal))
+                        AddAggregateTelemetryLocked(payloadValue);
                     if (alias != null)
                         accountValue = new Dictionary<string, object>(StringComparer.Ordinal) {
                             {"alias", alias}, {"class", accountClass}
@@ -1761,15 +1852,186 @@ namespace NinjaTrader.NinjaScript.AddOns
                     };
                     frameValue["signature"] = Sign(frameValue);
                     string attestedFrame = Canonical(frameValue) + "\n";
-                    return EnqueueLocked(attestedFrame) ? observationId : null;
+                    string result = EnqueueLocked(attestedFrame) ? observationId : null;
+                    RecordPublicationElapsed(publicationStarted);
+                    return result;
                 }
                 string frame = "{\"schema\":\"lane-iii-phase-f2-ninjatrader-observation-v1\",\"observation_id\":\"" + observationId +
                     "\",\"session_id\":\"" + sessionId + "\",\"observation_type\":\"" + type + "\",\"ninja_receipt_time\":\"" + timestamp +
                     "\",\"local_monotonic_sequence\":" + number + ",\"provider_timestamp\":" + (providerTimestamp == "null" ? "null" : "\"" + providerTimestamp + "\"") +
                     ",\"provider_sequence\":null,\"exchange_timestamp\":null,\"account\":" + account + ",\"payload\":" + payload + "}\n";
-                return EnqueueLocked(frame) ? observationId : null;
+                string legacyResult = EnqueueLocked(frame) ? observationId : null;
+                RecordPublicationElapsed(publicationStarted);
+                return legacyResult;
             }
         }
+
+        public static long CurrentThreadCpuCycles()
+        {
+            try
+            {
+                ulong cycles;
+                if (QueryThreadCycleTime(GetCurrentThread(), out cycles)
+                    && cycles <= Int64.MaxValue)
+                    return (long)cycles;
+            }
+            catch (DllNotFoundException) { }
+            catch (EntryPointNotFoundException) { }
+            return -1;
+        }
+
+        public static void RecordNativeCallback(
+            string type, long elapsedTicks, long cpuStartedCycles)
+        {
+            long cpuEndedCycles = CurrentThreadCpuCycles();
+            long cpuCycles = cpuStartedCycles >= 0 && cpuEndedCycles >= cpuStartedCycles
+                ? cpuEndedCycles - cpuStartedCycles : -1;
+            if (cpuCycles >= 0)
+                Interlocked.Increment(ref nativeCallbackCpuSamples);
+            else
+                Interlocked.Increment(ref nativeCallbackCpuFailures);
+            if (String.Equals(type, "DEPTH", StringComparison.Ordinal))
+            {
+                Interlocked.Increment(ref nativeDepthCallbacks);
+                Interlocked.Add(ref nativeDepthCallbackTicks, elapsedTicks);
+                UpdateMaximum(ref nativeDepthCallbackMaxTicks, elapsedTicks);
+                if (cpuCycles >= 0)
+                {
+                    Interlocked.Add(ref nativeDepthCallbackCpuCycles, cpuCycles);
+                    UpdateMaximum(ref nativeDepthCallbackCpuMaxCycles, cpuCycles);
+                }
+            }
+            else if (String.Equals(type, "QUOTE", StringComparison.Ordinal))
+            {
+                Interlocked.Increment(ref nativeQuoteCallbacks);
+                Interlocked.Add(ref nativeQuoteCallbackTicks, elapsedTicks);
+                UpdateMaximum(ref nativeQuoteCallbackMaxTicks, elapsedTicks);
+                if (cpuCycles >= 0)
+                {
+                    Interlocked.Add(ref nativeQuoteCallbackCpuCycles, cpuCycles);
+                    UpdateMaximum(ref nativeQuoteCallbackCpuMaxCycles, cpuCycles);
+                }
+            }
+            else if (String.Equals(type, "TRADE", StringComparison.Ordinal))
+            {
+                Interlocked.Increment(ref nativeTradeCallbacks);
+                Interlocked.Add(ref nativeTradeCallbackTicks, elapsedTicks);
+                UpdateMaximum(ref nativeTradeCallbackMaxTicks, elapsedTicks);
+                if (cpuCycles >= 0)
+                {
+                    Interlocked.Add(ref nativeTradeCallbackCpuCycles, cpuCycles);
+                    UpdateMaximum(ref nativeTradeCallbackCpuMaxCycles, cpuCycles);
+                }
+            }
+        }
+
+        private static void AddAggregateTelemetryLocked(Dictionary<string, object> payloadValue)
+        {
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            double elapsedSeconds = Math.Max(0.000001,
+                (now - telemetryStartedTicks) / (double)System.Diagnostics.Stopwatch.Frequency);
+            long depthCallbacks = Interlocked.Read(ref nativeDepthCallbacks);
+            long quoteCallbacks = Interlocked.Read(ref nativeQuoteCallbacks);
+            long tradeCallbacks = Interlocked.Read(ref nativeTradeCallbacks);
+            long attempts = Interlocked.Read(ref publicationAttempts);
+            long batches = Interlocked.Read(ref senderBatches);
+            long oldestTicks = outboundFrames.Count == 0
+                ? 0 : Math.Max(0, now - outboundFrames.Peek().EnqueuedTicks);
+            long inFlightOldest = Interlocked.Read(ref senderInFlightOldestTicks);
+            payloadValue["native_transport_telemetry_schema"] = "native-outbound-aggregate-v1";
+            payloadValue["native_telemetry_started_utc"] = telemetryStartedUtc;
+            payloadValue["native_telemetry_elapsed_seconds"] = elapsedSeconds;
+            payloadValue["native_depth_callbacks_total"] = depthCallbacks;
+            payloadValue["native_quote_callbacks_total"] = quoteCallbacks;
+            payloadValue["native_trade_callbacks_total"] = tradeCallbacks;
+            payloadValue["native_depth_callbacks_per_second"] = depthCallbacks / elapsedSeconds;
+            payloadValue["native_quote_callbacks_per_second"] = quoteCallbacks / elapsedSeconds;
+            payloadValue["native_trade_callbacks_per_second"] = tradeCallbacks / elapsedSeconds;
+            payloadValue["native_callback_cpu_cycles_supported"] = Interlocked.Read(ref nativeCallbackCpuSamples) > 0;
+            payloadValue["native_callback_cpu_samples_total"] = Interlocked.Read(ref nativeCallbackCpuSamples);
+            payloadValue["native_callback_cpu_failures_total"] = Interlocked.Read(ref nativeCallbackCpuFailures);
+            payloadValue["native_depth_callback_cpu_cycles_total"] = Interlocked.Read(ref nativeDepthCallbackCpuCycles);
+            payloadValue["native_quote_callback_cpu_cycles_total"] = Interlocked.Read(ref nativeQuoteCallbackCpuCycles);
+            payloadValue["native_trade_callback_cpu_cycles_total"] = Interlocked.Read(ref nativeTradeCallbackCpuCycles);
+            payloadValue["native_depth_callback_cpu_cycles_max"] = Interlocked.Read(ref nativeDepthCallbackCpuMaxCycles);
+            payloadValue["native_quote_callback_cpu_cycles_max"] = Interlocked.Read(ref nativeQuoteCallbackCpuMaxCycles);
+            payloadValue["native_trade_callback_cpu_cycles_max"] = Interlocked.Read(ref nativeTradeCallbackCpuMaxCycles);
+            payloadValue["native_depth_callback_wall_ms_total"] = Milliseconds(Interlocked.Read(ref nativeDepthCallbackTicks));
+            payloadValue["native_quote_callback_wall_ms_total"] = Milliseconds(Interlocked.Read(ref nativeQuoteCallbackTicks));
+            payloadValue["native_trade_callback_wall_ms_total"] = Milliseconds(Interlocked.Read(ref nativeTradeCallbackTicks));
+            payloadValue["native_depth_callback_wall_ms_max"] = Milliseconds(Interlocked.Read(ref nativeDepthCallbackMaxTicks));
+            payloadValue["native_quote_callback_wall_ms_max"] = Milliseconds(Interlocked.Read(ref nativeQuoteCallbackMaxTicks));
+            payloadValue["native_trade_callback_wall_ms_max"] = Milliseconds(Interlocked.Read(ref nativeTradeCallbackMaxTicks));
+            payloadValue["native_publication_attempts_total"] = attempts;
+            payloadValue["native_depth_publication_attempts_total"] = Interlocked.Read(ref depthPublicationAttempts);
+            payloadValue["native_quote_publication_attempts_total"] = Interlocked.Read(ref quotePublicationAttempts);
+            payloadValue["native_trade_publication_attempts_total"] = Interlocked.Read(ref tradePublicationAttempts);
+            payloadValue["native_publication_attempts_per_second"] = attempts / elapsedSeconds;
+            payloadValue["native_publication_processing_ms_total"] = Milliseconds(Interlocked.Read(ref publicationProcessingTicks));
+            payloadValue["native_publication_processing_ms_max"] = Milliseconds(Interlocked.Read(ref publicationProcessingMaxTicks));
+            payloadValue["native_outbound_queue_capacity"] = MaximumQueuedFrames;
+            payloadValue["native_outbound_queue_current"] = outboundFrames.Count;
+            payloadValue["native_outbound_queue_high_water"] = Interlocked.Read(ref queueHighWaterFrames);
+            payloadValue["native_outbound_queue_enqueued_total"] = Interlocked.Read(ref queueEnqueuedFrames);
+            payloadValue["native_outbound_queue_dequeued_total"] = Interlocked.Read(ref queueDequeuedFrames);
+            payloadValue["native_outbound_queue_enqueue_per_second"] = Interlocked.Read(ref queueEnqueuedFrames) / elapsedSeconds;
+            payloadValue["native_outbound_queue_dequeue_per_second"] = Interlocked.Read(ref queueDequeuedFrames) / elapsedSeconds;
+            payloadValue["native_outbound_queue_overflow_total"] = Interlocked.Read(ref queueOverflowFrames);
+            payloadValue["native_outbound_queue_oldest_age_ms"] = Milliseconds(oldestTicks);
+            payloadValue["native_sender_batches_total"] = batches;
+            payloadValue["native_sender_batches_per_second"] = batches / elapsedSeconds;
+            payloadValue["native_sender_batch_frames_total"] = Interlocked.Read(ref senderBatchFrames);
+            payloadValue["native_sender_batch_bytes_total"] = Interlocked.Read(ref senderBatchBytes);
+            payloadValue["native_sender_records_per_second"] = Interlocked.Read(ref senderBatchFrames) / elapsedSeconds;
+            payloadValue["native_sender_bytes_per_second"] = Interlocked.Read(ref senderBatchBytes) / elapsedSeconds;
+            payloadValue["native_sender_frames_per_batch"] = batches == 0
+                ? 0.0 : Interlocked.Read(ref senderBatchFrames) / (double)batches;
+            payloadValue["native_sender_batch_frames_max"] = Interlocked.Read(ref senderBatchMaxFrames);
+            payloadValue["native_sender_batch_bytes_max"] = Interlocked.Read(ref senderBatchMaxBytes);
+            payloadValue["native_sender_socket_writes_total"] = Interlocked.Read(ref senderSocketWrites);
+            payloadValue["native_sender_write_ms_total"] = Milliseconds(Interlocked.Read(ref senderWriteTicks));
+            payloadValue["native_sender_write_ms_max"] = Milliseconds(Interlocked.Read(ref senderWriteMaxTicks));
+            payloadValue["native_sender_reconnects_total"] = Interlocked.Read(ref senderReconnects);
+            payloadValue["native_sender_transport_failure_events_total"] = Interlocked.Read(ref senderTransportFailureEvents);
+            payloadValue["native_sender_inflight_frames"] = Interlocked.Read(ref senderInFlightFrames);
+            payloadValue["native_sender_inflight_oldest_age_ms"] = inFlightOldest == 0
+                ? 0.0 : Milliseconds(Math.Max(0, now - inFlightOldest));
+        }
+
+        private static double Milliseconds(long ticks)
+        {
+            return ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        }
+
+        private static void UpdateMaximum(ref long target, long candidate)
+        {
+            long prior;
+            while (candidate > (prior = Interlocked.Read(ref target))
+                && Interlocked.CompareExchange(ref target, candidate, prior) != prior) { }
+        }
+
+        private static void RecordWriteElapsed(long startedTicks)
+        {
+            if (startedTicks == 0)
+                return;
+            long elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - startedTicks;
+            Interlocked.Add(ref senderWriteTicks, elapsed);
+            UpdateMaximum(ref senderWriteMaxTicks, elapsed);
+        }
+
+        private static void RecordPublicationElapsed(long startedTicks)
+        {
+            long elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - startedTicks;
+            Interlocked.Add(ref publicationProcessingTicks, elapsed);
+            UpdateMaximum(ref publicationProcessingMaxTicks, elapsed);
+        }
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentThread();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool QueryThreadCycleTime(IntPtr threadHandle, out ulong cycleTime);
 
         // Serialize all writes through one localhost-only sender. Market data
         // callbacks can be concurrent; opening one socket per callback permits
@@ -1782,7 +2044,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                 TransportDiagnosticOnce("BRIDGE_QUEUE_CAPACITY_REACHED");
                 return false;
             }
-            outboundFrames.Enqueue(frame);
+            outboundFrames.Enqueue(new OutboundFrame(
+                frame, System.Diagnostics.Stopwatch.GetTimestamp()));
+            Interlocked.Increment(ref queueEnqueuedFrames);
+            UpdateMaximum(ref queueHighWaterFrames, outboundFrames.Count);
             senderStopping = false;
             if (!senderRunning)
             {
@@ -1800,11 +2065,13 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             TcpClient client = null;
             NetworkStream stream = null;
+            bool connectionAttempted = false;
             try
             {
                 while (true)
                 {
                     List<string> frames = new List<string>();
+                    long batchOldestTicks = 0;
                     lock (outboundFramesLock)
                     {
                         while (!senderStopping && outboundFrames.Count == 0)
@@ -1815,18 +2082,33 @@ namespace NinjaTrader.NinjaScript.AddOns
                         while (outboundFrames.Count > 0
                             && frames.Count < MaximumSenderBatchFrames)
                         {
-                            string candidate = outboundFrames.Peek();
+                            OutboundFrame candidate = outboundFrames.Peek();
                             if (frames.Count > 0
-                                && characters + candidate.Length > MaximumSenderBatchCharacters)
+                                && characters + candidate.Wire.Length > MaximumSenderBatchCharacters)
                                 break;
-                            frames.Add(outboundFrames.Dequeue());
-                            characters += candidate.Length;
+                            if (frames.Count == 0)
+                                batchOldestTicks = candidate.EnqueuedTicks;
+                            frames.Add(outboundFrames.Dequeue().Wire);
+                            characters += candidate.Wire.Length;
                         }
+                        Interlocked.Add(ref queueDequeuedFrames, frames.Count);
                     }
+                    byte[] bytes = Encoding.UTF8.GetBytes(String.Concat(frames));
+                    Interlocked.Increment(ref senderBatches);
+                    Interlocked.Add(ref senderBatchFrames, frames.Count);
+                    Interlocked.Add(ref senderBatchBytes, bytes.Length);
+                    UpdateMaximum(ref senderBatchMaxFrames, frames.Count);
+                    UpdateMaximum(ref senderBatchMaxBytes, bytes.Length);
+                    Interlocked.Exchange(ref senderInFlightFrames, frames.Count);
+                    Interlocked.Exchange(ref senderInFlightOldestTicks, batchOldestTicks);
+                    long writeStarted = 0;
                     try
                     {
                         if (client == null)
                         {
+                            if (connectionAttempted)
+                                Interlocked.Increment(ref senderReconnects);
+                            connectionAttempted = true;
                             client = new TcpClient();
                             client.Connect(IPAddress.Loopback, Port);
                             stream = client.GetStream();
@@ -1835,12 +2117,17 @@ namespace NinjaTrader.NinjaScript.AddOns
                         // Batch ordered newline-delimited frames into one socket
                         // write. Encoding and network backpressure remain outside
                         // the callback/queue lock; FIFO order is unchanged.
-                        byte[] bytes = Encoding.UTF8.GetBytes(String.Concat(frames));
+                        writeStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+                        Interlocked.Increment(ref senderSocketWrites);
                         stream.Write(bytes, 0, bytes.Length);
+                        RecordWriteElapsed(writeStarted);
+                        writeStarted = 0;
                         TransportDiagnosticOnce("BRIDGE_PUBLISH_DELIVERED");
                     }
                     catch (SocketException error)
                     {
+                        RecordWriteElapsed(writeStarted);
+                        Interlocked.Increment(ref senderTransportFailureEvents);
                         Interlocked.Add(ref transportFailedFrames, frames.Count);
                         TransportDiagnosticOnce("BRIDGE_CONNECT_FAILED_" + error.SocketErrorCode);
                         CloseClient(client);
@@ -1849,16 +2136,22 @@ namespace NinjaTrader.NinjaScript.AddOns
                     }
                     catch (Exception error)
                     {
+                        RecordWriteElapsed(writeStarted);
+                        Interlocked.Increment(ref senderTransportFailureEvents);
                         Interlocked.Add(ref transportFailedFrames, frames.Count);
                         TransportDiagnosticOnce("BRIDGE_PUBLISH_FAILED_" + error.GetType().Name);
                         CloseClient(client);
                         client = null;
                         stream = null;
                     }
+                    Interlocked.Exchange(ref senderInFlightFrames, 0);
+                    Interlocked.Exchange(ref senderInFlightOldestTicks, 0);
                 }
             }
             finally
             {
+                Interlocked.Exchange(ref senderInFlightFrames, 0);
+                Interlocked.Exchange(ref senderInFlightOldestTicks, 0);
                 CloseClient(client);
                 lock (outboundFramesLock)
                 {
