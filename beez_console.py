@@ -33,8 +33,14 @@ from src.l3g_paper.contracts import (
     paper_risk_for_topology,
     resolve_paper_profile,
 )
-from src.l3g_paper.fhb import FHBConfig, FHB_PROFILE_ID
-from src.l3g_paper.pong_contract import resolve_pong_topology
+from src.l3g_paper.pong_contract import DEC26_TOPOLOGY, resolve_pong_topology
+from src.l3g_paper.pong_qualifying import (
+    FHB_ARCHIVE_DISPOSITION,
+    PONG_NO_FHB_QUALIFYING_ARCHITECTURE,
+    PONG_QUALIFYING_ARCHITECTURE_ENV,
+    PONG_QUALIFYING_INTERVAL_MS,
+    PONG_QUALIFYING_SCHEDULING_MODE,
+)
 from src.l3g_paper.pong_scheduler import scheduling_config_from_environment
 from src.l3g_paper.profile_switch import (
     PROFILE_SWITCH_SCHEMA,
@@ -92,8 +98,15 @@ class LaunchBinding:
     source: str
     fhb_profile: str | None = None
     fhb_policy_fingerprint: str | None = None
+    fhb_disposition: str = FHB_ARCHIVE_DISPOSITION
+    pong_qualifying_architecture: str | None = None
+    pong_activation_authorized: bool = False
     pong_scheduling_mode: str = "EVENT_DRIVEN"
     pong_periodic_interval_ms: int = 0
+    market_instrument: str | None = None
+    canonical_contract: str | None = None
+    contract_topology_version: str | None = None
+    contract_topology_hash: str | None = None
     ledger_identity: str | None = None
     operation_id: str | None = None
     expected_pid: int | None = None
@@ -113,6 +126,9 @@ class LaunchBinding:
             "risk_profile_hash": self.risk_profile_hash,
             "fhb_profile": self.fhb_profile,
             "fhb_policy_fingerprint": self.fhb_policy_fingerprint,
+            "fhb_disposition": self.fhb_disposition,
+            "pong_qualifying_architecture": self.pong_qualifying_architecture,
+            "pong_activation_authorized": self.pong_activation_authorized,
             "pong_scheduling_mode": self.pong_scheduling_mode,
             "pong_periodic_interval_ms": self.pong_periodic_interval_ms,
             "ledger_epoch": self.ledger_epoch,
@@ -124,6 +140,14 @@ class LaunchBinding:
         }
         if self.ledger_identity is not None:
             expected["ledger_identity"] = self.ledger_identity
+        for key, value in (
+            ("market_instrument", self.market_instrument),
+            ("canonical_contract", self.canonical_contract),
+            ("contract_topology_version", self.contract_topology_version),
+            ("contract_topology_hash", self.contract_topology_hash),
+        ):
+            if value is not None:
+                expected[key] = value
         if self.expected_pid is not None:
             expected["pid"] = self.expected_pid
         if self.expected_parent_pid is not None:
@@ -188,27 +212,11 @@ def resolve_fhb_launch_policy(
     profile_key: str,
     environment: Mapping[str, str],
 ) -> tuple[str | None, str | None]:
-    """Resolve the exact FHB process policy that must match the backend."""
+    """Reject archived FHB from the qualifying launcher boundary."""
     configured = environment.get("BEELZEBUB_PONG_FHB_PROFILE")
-    try:
-        scheduling = scheduling_config_from_environment(
-            environment.get("BEELZEBUB_PONG_SCHEDULING_MODE"),
-            environment.get("BEELZEBUB_PONG_PERIODIC_INTERVAL_MS"),
-        )
-        if configured is None or not configured.strip():
-            return None, None
-        if configured != FHB_PROFILE_ID:
-            raise ValueError("FHB_PROFILE_UNSUPPORTED")
-        if resolve_paper_profile(profile_key).selection_key != PONG_ENTRY_PROFILE_VERSION:
-            raise ValueError("FHB_PONG_PROFILE_NOT_SELECTED")
-        config = (
-            FHBConfig.periodic_protected()
-            if scheduling.enabled
-            else FHBConfig()
-        )
-        return config.profile_id, config.policy_fingerprint
-    except ValueError as exc:
-        raise RuntimeError("BeezConsole FHB launch policy is invalid.") from exc
+    if configured is not None and configured.strip():
+        raise RuntimeError("FHB_ARCHIVED_NOT_PART_OF_QUALIFYING_BUILD")
+    return None, None
 
 
 def resolve_pong_scheduling_launch_policy(
@@ -223,6 +231,19 @@ def resolve_pong_scheduling_launch_policy(
     except ValueError as exc:
         raise RuntimeError("BeezConsole Pong scheduling launch policy is invalid.") from exc
     return scheduling.mode.value, scheduling.interval_ms
+
+
+def resolve_pong_activation_launch_policy(
+    environment: Mapping[str, str],
+) -> bool:
+    value = environment.get("BEELZEBUB_PONG_BOUNDED_ACTIVATION")
+    if value in {None, "0"}:
+        return False
+    if value == "1":
+        return True
+    raise RuntimeError(
+        "BEELZEBUB_PONG_BOUNDED_ACTIVATION must be exactly 0 or 1."
+    )
 
 
 def _maintenance_arguments(argv: Sequence[str]) -> dict[str, str] | None:
@@ -367,6 +388,19 @@ def resolve_launch_binding(
     pong_scheduling_mode, pong_periodic_interval_ms = (
         resolve_pong_scheduling_launch_policy(source_environment)
     )
+    pong_activation_authorized = resolve_pong_activation_launch_policy(
+        source_environment,
+    )
+    pong_qualifying_architecture = None
+    if profile.selection_key == PONG_ENTRY_PROFILE_VERSION:
+        if (
+            pong_topology != DEC26_TOPOLOGY
+            or pong_scheduling_mode != PONG_QUALIFYING_SCHEDULING_MODE
+            or pong_periodic_interval_ms != PONG_QUALIFYING_INTERVAL_MS
+            or pong_activation_authorized
+        ):
+            raise RuntimeError("PONG_QUALIFYING_BUILD_IDENTITY_INVALID")
+        pong_qualifying_architecture = PONG_NO_FHB_QUALIFYING_ARCHITECTURE
     return LaunchBinding(
         runtime_root=runtime_root,
         ledger_path=ledger_path,
@@ -382,8 +416,15 @@ def resolve_launch_binding(
         source=source,
         fhb_profile=fhb_profile,
         fhb_policy_fingerprint=fhb_policy_fingerprint,
+        fhb_disposition=FHB_ARCHIVE_DISPOSITION,
+        pong_qualifying_architecture=pong_qualifying_architecture,
+        pong_activation_authorized=pong_activation_authorized,
         pong_scheduling_mode=pong_scheduling_mode,
         pong_periodic_interval_ms=pong_periodic_interval_ms,
+        market_instrument=paper_topology.native_instrument,
+        canonical_contract=paper_topology.canonical_contract,
+        contract_topology_version=paper_topology.version,
+        contract_topology_hash=paper_topology.binding_hash,
         ledger_identity=ledger_identity,
         operation_id=operation_id,
     )
@@ -630,29 +671,49 @@ def adopt_exact_requested_target_listener(
         raise RuntimeError(
             "BeezConsole requested target Pong scheduling binding is inconsistent."
         )
-    supported_fhb_policy_fingerprints = {
-        FHBConfig().policy_fingerprint,
-        FHBConfig.periodic_protected().policy_fingerprint,
-    }
-    if not (
-        (target_fhb_profile is None and target_fhb_policy_fingerprint is None)
-        or (
-            target_fhb_profile == FHB_PROFILE_ID
-            and target_fhb_policy_fingerprint
-            == (
-                FHBConfig.periodic_protected().policy_fingerprint
-                if admitted_periodic_interval_ms
-                else FHBConfig().policy_fingerprint
-            )
-            and target_fhb_policy_fingerprint in supported_fhb_policy_fingerprints
-            and manifest.get("target_profile") == PONG_ENTRY_PROFILE_VERSION
-        )
+    profile = resolve_paper_profile(str(manifest["target_profile"]))
+    expected_qualifying_architecture = (
+        PONG_NO_FHB_QUALIFYING_ARCHITECTURE
+        if profile.selection_key == PONG_ENTRY_PROFILE_VERSION
+        else None
+    )
+    adopted_policy = (
+        paper_policy_for_topology(profile.policy, DEC26_TOPOLOGY)
+        if expected_qualifying_architecture is not None
+        else profile.policy
+    )
+    adopted_risk = (
+        paper_risk_for_topology(profile.risk, DEC26_TOPOLOGY)
+        if expected_qualifying_architecture is not None
+        else profile.risk
+    )
+    if (
+        target_fhb_profile is not None
+        or target_fhb_policy_fingerprint is not None
+        or target_runtime_binding.get("fhb_disposition") != FHB_ARCHIVE_DISPOSITION
+        or target_runtime_binding.get("pong_qualifying_architecture")
+        != expected_qualifying_architecture
     ):
         raise RuntimeError("BeezConsole requested target FHB binding is inconsistent.")
+    if expected_qualifying_architecture is not None and (
+        admitted_scheduling_mode != PONG_QUALIFYING_SCHEDULING_MODE
+        or admitted_periodic_interval_ms != PONG_QUALIFYING_INTERVAL_MS
+        or target_runtime_binding.get("pong_activation_authorized") is not False
+        or target_runtime_binding.get("market_instrument")
+        != DEC26_TOPOLOGY.native_instrument
+        or target_runtime_binding.get("canonical_contract")
+        != DEC26_TOPOLOGY.canonical_contract
+        or target_runtime_binding.get("contract_topology_version")
+        != DEC26_TOPOLOGY.version
+        or target_runtime_binding.get("contract_topology_hash")
+        != DEC26_TOPOLOGY.binding_hash
+    ):
+        raise RuntimeError(
+            "BeezConsole requested target qualifying scheduling binding is inconsistent."
+        )
     target_parent_pid = actual.get("parent_pid")
     if type(target_parent_pid) is not int or target_parent_pid <= 0:
         raise RuntimeError("BeezConsole requested target parent process identity is inconsistent.")
-    profile = resolve_paper_profile(str(manifest["target_profile"]))
     ledger_identity = actual.get("ledger_identity")
     if _LEDGER_IDENTITY.fullmatch(str(ledger_identity or "")) is None:
         raise RuntimeError("BeezConsole requested target ledger identity is unavailable.")
@@ -664,10 +725,10 @@ def adopt_exact_requested_target_listener(
         profile=profile.selection_key,
         git_sha=str(manifest["git_sha"]),
         python=Path(str(manifest["python_executable"])).resolve(),
-        entry_profile=profile.policy.entry_profile,
-        entry_profile_version=profile.policy.entry_profile_version,
-        paper_policy_hash=profile.policy.configuration_hash,
-        risk_profile_hash=profile.risk.configuration_hash,
+        entry_profile=adopted_policy.entry_profile,
+        entry_profile_version=adopted_policy.entry_profile_version,
+        paper_policy_hash=adopted_policy.configuration_hash,
+        risk_profile_hash=adopted_risk.configuration_hash,
         source="REQUESTED_TARGET_EXISTING_LISTENER",
         fhb_profile=(
             None if target_fhb_profile is None else str(target_fhb_profile)
@@ -677,8 +738,31 @@ def adopt_exact_requested_target_listener(
             if target_fhb_policy_fingerprint is None
             else str(target_fhb_policy_fingerprint)
         ),
+        fhb_disposition=FHB_ARCHIVE_DISPOSITION,
+        pong_qualifying_architecture=expected_qualifying_architecture,
+        pong_activation_authorized=False,
         pong_scheduling_mode=admitted_scheduling_mode,
         pong_periodic_interval_ms=admitted_periodic_interval_ms,
+        market_instrument=(
+            DEC26_TOPOLOGY.native_instrument
+            if expected_qualifying_architecture is not None
+            else None
+        ),
+        canonical_contract=(
+            DEC26_TOPOLOGY.canonical_contract
+            if expected_qualifying_architecture is not None
+            else None
+        ),
+        contract_topology_version=(
+            DEC26_TOPOLOGY.version
+            if expected_qualifying_architecture is not None
+            else None
+        ),
+        contract_topology_hash=(
+            DEC26_TOPOLOGY.binding_hash
+            if expected_qualifying_architecture is not None
+            else None
+        ),
         ledger_identity=str(ledger_identity),
         operation_id=operation_id,
         expected_pid=target_runtime_pid,
@@ -790,6 +874,7 @@ def server_environment(
     pong_scheduling_mode, pong_periodic_interval_ms = (
         resolve_pong_scheduling_launch_policy(source)
     )
+    pong_activation_authorized = resolve_pong_activation_launch_policy(source)
     if (
         fhb_profile != binding.fhb_profile
         or fhb_policy_fingerprint != binding.fhb_policy_fingerprint
@@ -800,6 +885,8 @@ def server_environment(
         or pong_periodic_interval_ms != binding.pong_periodic_interval_ms
     ):
         raise RuntimeError("PONG_SCHEDULING_LAUNCH_BINDING_MISMATCH")
+    if pong_activation_authorized != binding.pong_activation_authorized:
+        raise RuntimeError("PONG_ACTIVATION_LAUNCH_BINDING_MISMATCH")
     child = dict(source)
     # These two paper-only Pong switches are explicit process-launch
     # authorities, not stale profile bindings. Preserve them across the clean
@@ -814,7 +901,6 @@ def server_environment(
             "BEELZEBUB_PONG_SCHEDULING_MODE",
             "BEELZEBUB_PONG_PERIODIC_INTERVAL_MS",
             "BEELZEBUB_PONG_CONTRACT_TOPOLOGY",
-            "BEELZEBUB_PONG_FHB_PROFILE",
             "BEELZEBUB_L3G_PAPER_CONTRACT_TOPOLOGY",
         )
         if name in source
@@ -826,6 +912,11 @@ def server_environment(
     child.update(pong_flags)
     child["BEELZEBUB_PROFILE_SWITCH_ROOT"] = str(binding.runtime_root)
     child["BEELZEBUB_GIT_SHA"] = binding.git_sha
+    if binding.pong_qualifying_architecture is not None:
+        child[PONG_QUALIFYING_ARCHITECTURE_ENV] = (
+            binding.pong_qualifying_architecture
+        )
+        child["BEELZEBUB_PONG_BOUNDED_ACTIVATION"] = "0"
     if binding.source == "EXPLICIT_MAINTENANCE":
         child.update({
             "BEELZEBUB_L3G_PAPER_LEDGER": str(binding.ledger_path),

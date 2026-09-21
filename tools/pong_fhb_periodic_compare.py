@@ -34,6 +34,9 @@ from src.l3g_paper.ninjatrader_transport import LocalPaperSecretProvider  # noqa
 from src.l3g_paper.pong import PongState  # noqa: E402
 from src.l3g_paper.pong_contract import DEC26_TOPOLOGY  # noqa: E402
 from src.l3g_paper.pong_production import PongProductionHost  # noqa: E402
+from src.l3g_paper.pong_qualifying import (  # noqa: E402
+    PONG_NO_FHB_QUALIFYING_ARCHITECTURE,
+)
 from src.l3g_paper.pong_scheduler import (  # noqa: E402
     PongSchedulingConfig,
     PongSchedulingMode,
@@ -151,6 +154,9 @@ def _run_pass(
             native_dispatch=lambda *args: native_dispatches.append(args) or {},
             activation_authorized=False,
             fhb_config=FHBConfig.periodic_protected() if focused else None,
+            qualifying_architecture=(
+                None if focused else PONG_NO_FHB_QUALIFYING_ARCHITECTURE
+            ),
             scheduling=PongSchedulingConfig(
                 PongSchedulingMode.PERIODIC_FLAT_PROTECTED,
                 20,

@@ -267,7 +267,6 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
                 "BEELZEBUB_PONG_CONTRACT_TOPOLOGY": "DEC26",
                 "BEELZEBUB_PONG_SCHEDULING_MODE": "PERIODIC_FLAT_PROTECTED",
                 "BEELZEBUB_PONG_PERIODIC_INTERVAL_MS": "20",
-                "BEELZEBUB_PONG_FHB_PROFILE": "TOP10_CORE_WITH_5S_SHADOW_V1",
             }
             with patch("beez_console.checkout_git_sha", return_value=GIT_SHA):
                 resolved = beez_console.resolve_launch_binding(
@@ -289,21 +288,30 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
             self.assertEqual(
                 resolved.risk_profile_hash, expected_risk.configuration_hash,
             )
-            expected_fhb = beez_console.FHBConfig.periodic_protected()
-            self.assertEqual(resolved.fhb_profile, expected_fhb.profile_id)
+            self.assertIsNone(resolved.fhb_profile)
+            self.assertIsNone(resolved.fhb_policy_fingerprint)
             self.assertEqual(
-                resolved.fhb_policy_fingerprint,
-                expected_fhb.policy_fingerprint,
+                resolved.fhb_disposition,
+                beez_console.FHB_ARCHIVE_DISPOSITION,
+            )
+            self.assertEqual(
+                resolved.pong_qualifying_architecture,
+                beez_console.PONG_NO_FHB_QUALIFYING_ARCHITECTURE,
             )
             self.assertEqual(resolved.pong_scheduling_mode, "PERIODIC_FLAT_PROTECTED")
             self.assertEqual(resolved.pong_periodic_interval_ms, 20)
+            self.assertFalse(resolved.pong_activation_authorized)
+            self.assertEqual(resolved.market_instrument, "MNQ DEC26")
+            self.assertEqual(resolved.canonical_contract, "MNQZ6")
             child = beez_console.server_environment(resolved, environment)
+            self.assertNotIn("BEELZEBUB_PONG_FHB_PROFILE", child)
             self.assertEqual(
-                child["BEELZEBUB_PONG_FHB_PROFILE"],
-                expected_fhb.profile_id,
+                child[beez_console.PONG_QUALIFYING_ARCHITECTURE_ENV],
+                beez_console.PONG_NO_FHB_QUALIFYING_ARCHITECTURE,
             )
+            self.assertEqual(child["BEELZEBUB_PONG_BOUNDED_ACTIVATION"], "0")
 
-    def test_server_environment_rejects_fhb_policy_drift_after_binding(self) -> None:
+    def test_launcher_rejects_archived_fhb_and_scheduling_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             project(root)
@@ -320,16 +328,19 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
                 "BEELZEBUB_PONG_CONTRACT_TOPOLOGY": "DEC26",
                 "BEELZEBUB_PONG_SCHEDULING_MODE": "PERIODIC_FLAT_PROTECTED",
                 "BEELZEBUB_PONG_PERIODIC_INTERVAL_MS": "20",
-                "BEELZEBUB_PONG_FHB_PROFILE": "TOP10_CORE_WITH_5S_SHADOW_V1",
             }
             with patch("beez_console.checkout_git_sha", return_value=GIT_SHA):
                 resolved = beez_console.resolve_launch_binding(
                     root, argv=argv, environment=selected,
                 )
-            drifted = dict(selected)
-            drifted.pop("BEELZEBUB_PONG_FHB_PROFILE")
-            with self.assertRaisesRegex(RuntimeError, "FHB_LAUNCH_BINDING_MISMATCH"):
-                beez_console.server_environment(resolved, drifted)
+            archived = dict(selected)
+            archived["BEELZEBUB_PONG_FHB_PROFILE"] = (
+                "TOP10_CORE_WITH_5S_SHADOW_V1"
+            )
+            with self.assertRaisesRegex(
+                RuntimeError, "FHB_ARCHIVED_NOT_PART_OF_QUALIFYING_BUILD",
+            ):
+                beez_console.server_environment(resolved, archived)
             wrong_interval = dict(selected)
             wrong_interval["BEELZEBUB_PONG_PERIODIC_INTERVAL_MS"] = "25"
             with self.assertRaisesRegex(
@@ -357,6 +368,41 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
                 ):
                     beez_console.resolve_launch_binding(
                         root, argv=argv, environment=environment,
+                    )
+
+    def test_qualifying_launch_rejects_sep26_or_activation_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project(root)
+            argv = (
+                "--maintenance-ledger-path", str(root / "ledger.sqlite3"),
+                "--maintenance-audit-root", str(root / "audit"),
+                "--maintenance-ledger-epoch", "L3G-PAPER-EPOCH-QUALIFYING-TEST",
+                "--maintenance-paper-profile", "BEELZEBUB_PONG_DISCERNMENT_V1",
+            )
+            base = {
+                "BEELZEBUB_L3G_PAPER_CONTRACT_TOPOLOGY": "DEC26",
+                "BEELZEBUB_PONG_CONTRACT_TOPOLOGY": "DEC26",
+                "BEELZEBUB_PONG_SCHEDULING_MODE": "PERIODIC_FLAT_PROTECTED",
+                "BEELZEBUB_PONG_PERIODIC_INTERVAL_MS": "20",
+            }
+            with patch("beez_console.checkout_git_sha", return_value=GIT_SHA):
+                sep26 = dict(base)
+                sep26["BEELZEBUB_L3G_PAPER_CONTRACT_TOPOLOGY"] = "SEP26"
+                sep26["BEELZEBUB_PONG_CONTRACT_TOPOLOGY"] = "SEP26"
+                with self.assertRaisesRegex(
+                    RuntimeError, "PONG_QUALIFYING_BUILD_IDENTITY_INVALID",
+                ):
+                    beez_console.resolve_launch_binding(
+                        root, argv=argv, environment=sep26,
+                    )
+                armed = dict(base)
+                armed["BEELZEBUB_PONG_BOUNDED_ACTIVATION"] = "1"
+                with self.assertRaisesRegex(
+                    RuntimeError, "PONG_QUALIFYING_BUILD_IDENTITY_INVALID",
+                ):
+                    beez_console.resolve_launch_binding(
+                        root, argv=argv, environment=armed,
                     )
 
     def test_partial_explicit_maintenance_binding_is_rejected(self) -> None:
@@ -415,17 +461,13 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "entry_profile_version"):
                 beez_console.validate_runtime_binding(actual, expected)
 
-    def test_runtime_binding_requires_exact_fhb_policy_identity(self) -> None:
+    def test_runtime_binding_requires_exact_fhb_archive_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            expected = replace(
-                binding(Path(directory)),
-                fhb_profile="TOP10_CORE_WITH_5S_SHADOW_V1",
-                fhb_policy_fingerprint="a" * 64,
-            )
+            expected = binding(Path(directory))
             actual = runtime_binding(expected)
             beez_console.validate_runtime_binding(actual, expected)
-            actual["fhb_policy_fingerprint"] = "b" * 64
-            with self.assertRaisesRegex(RuntimeError, "fhb_policy_fingerprint"):
+            actual["fhb_disposition"] = "ENABLED"
+            with self.assertRaisesRegex(RuntimeError, "fhb_disposition"):
                 beez_console.validate_runtime_binding(actual, expected)
 
     def test_runtime_binding_requires_exact_pong_scheduling_identity(self) -> None:
@@ -656,7 +698,7 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "will not compete"):
                     beez_console.assert_remembered_launch_is_not_competing(expected)
 
-    def test_exact_existing_fhb_target_is_adopted_without_competing_launch(self) -> None:
+    def test_exact_existing_non_fhb_qualifying_target_is_adopted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             project(root)
@@ -674,21 +716,39 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
                 "requested_at": manifest["created_at"],
             }
             profile = beez_console.resolve_paper_profile(str(manifest["target_profile"]))
-            fhb = beez_console.FHBConfig.periodic_protected()
+            policy = beez_console.paper_policy_for_topology(
+                profile.policy, beez_console.DEC26_TOPOLOGY,
+            )
+            risk = beez_console.paper_risk_for_topology(
+                profile.risk, beez_console.DEC26_TOPOLOGY,
+            )
             actual = {
                 "ledger": manifest["ledger_path"],
                 "audit": manifest["audit_root"],
                 "control_center": "127.0.0.1:8090",
                 "python": str(established.python),
                 "git_sha": GIT_SHA,
-                "entry_profile": profile.policy.entry_profile,
-                "entry_profile_version": profile.policy.entry_profile_version,
-                "paper_policy_hash": profile.policy.configuration_hash,
-                "risk_profile_hash": profile.risk.configuration_hash,
-                "fhb_profile": fhb.profile_id,
-                "fhb_policy_fingerprint": fhb.policy_fingerprint,
+                "entry_profile": policy.entry_profile,
+                "entry_profile_version": policy.entry_profile_version,
+                "paper_policy_hash": policy.configuration_hash,
+                "risk_profile_hash": risk.configuration_hash,
+                "fhb_profile": None,
+                "fhb_policy_fingerprint": None,
+                "fhb_disposition": beez_console.FHB_ARCHIVE_DISPOSITION,
+                "pong_qualifying_architecture": (
+                    beez_console.PONG_NO_FHB_QUALIFYING_ARCHITECTURE
+                ),
+                "pong_activation_authorized": False,
                 "pong_scheduling_mode": "PERIODIC_FLAT_PROTECTED",
                 "pong_periodic_interval_ms": 20,
+                "market_instrument": "MNQ DEC26",
+                "canonical_contract": "MNQZ6",
+                "contract_topology_version": (
+                    beez_console.DEC26_TOPOLOGY.version
+                ),
+                "contract_topology_hash": (
+                    beez_console.DEC26_TOPOLOGY.binding_hash
+                ),
                 "ledger_epoch": manifest["ledger_epoch"],
                 "ledger_identity": "l3g-ledger-" + "e" * 32,
                 "profile_selection_source": "PROFILE_SWITCH_MANIFEST",
@@ -711,8 +771,12 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
             self.assertEqual(adopted.source, "REQUESTED_TARGET_EXISTING_LISTENER")
             self.assertEqual(adopted.profile, profile.selection_key)
             self.assertEqual(adopted.operation_id, operation_id)
-            self.assertEqual(adopted.fhb_profile, fhb.profile_id)
-            self.assertEqual(adopted.fhb_policy_fingerprint, fhb.policy_fingerprint)
+            self.assertIsNone(adopted.fhb_profile)
+            self.assertIsNone(adopted.fhb_policy_fingerprint)
+            self.assertEqual(
+                adopted.pong_qualifying_architecture,
+                beez_console.PONG_NO_FHB_QUALIFYING_ARCHITECTURE,
+            )
             self.assertEqual(adopted.ledger_identity, actual["ledger_identity"])
             self.assertEqual(adopted.expected_pid, 8765)
             self.assertEqual(adopted.expected_parent_pid, 4321)
@@ -827,6 +891,9 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
                 "risk_profile_hash": profile.risk.configuration_hash,
                 "fhb_profile": None,
                 "fhb_policy_fingerprint": None,
+                "fhb_disposition": beez_console.FHB_ARCHIVE_DISPOSITION,
+                "pong_qualifying_architecture": None,
+                "pong_activation_authorized": False,
                 "pong_scheduling_mode": "EVENT_DRIVEN",
                 "pong_periodic_interval_ms": 0,
                 "ledger_epoch": manifest["ledger_epoch"],

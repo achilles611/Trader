@@ -24,7 +24,7 @@ import queue
 from pathlib import Path
 import threading
 import time
-from typing import Callable, Mapping
+from typing import TYPE_CHECKING, Callable, Mapping
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -35,6 +35,7 @@ from .contracts import PONG_ENTRY_PROFILE_VERSION
 from .pong_authorization import PongLaunchAuthorization
 from .pong_collection import PongAuthenticHourCollector
 from .pong_contract import (
+    DEC26_TOPOLOGY,
     SEP26_TOPOLOGY,
     PongContractTopology,
     validate_topology_bundle,
@@ -53,7 +54,20 @@ from .daily_bias import (
     default_unconfigured_bias,
 )
 from .discernment import DiscernmentEngine
-from .fhb import FHBAction, FHBConfig, FocusedHorizonBand
+from .pong_qualifying import (
+    FHB_ARCHIVE_DISPOSITION,
+    FHB_QUALIFYING_RUNTIME_STATE,
+    PONG_NO_FHB_QUALIFYING_ARCHITECTURE,
+    PONG_QUALIFYING_INTERVAL_MS,
+    PONG_QUALIFYING_MAXIMUM_EVENT_AGE_MS,
+    PONG_QUALIFYING_MAXIMUM_QUEUE_AGE_MS,
+    PONG_QUALIFYING_PERSISTENT_BREACH_SECONDS,
+    PONG_QUALIFYING_SCHEDULING_MODE,
+    PONG_QUALIFYING_SOURCE_HEARTBEAT_SECONDS,
+)
+
+if TYPE_CHECKING:
+    from .fhb import FHBConfig
 from .pong import PongActionKind, PongState, PongStateMachine
 from .pong_scheduler import (
     PongPeriodicDeadline,
@@ -111,9 +125,10 @@ _LOADED_SOURCE_HASHES = {
                  "src/l3g_paper/pong_production.py", "src/l3g_paper/pong_controller.py",
                  "src/l3g_paper/pong_authorization.py", "src/l3g_paper/pong_volume_history.py",
                  "src/l3g_paper/runtime.py", "src/l3g_paper/pending_lockout.py",
-                 "src/l3g_paper/ledger.py", "src/l3g_paper/fhb.py",
+                 "src/l3g_paper/ledger.py",
                  "src/l3g_paper/pong_compute.py", "src/l3g_paper/pong.py",
                  "src/l3g_paper/discernment.py", "src/l3g_paper/pong_scheduler.py",
+                 "src/l3g_paper/pong_qualifying.py",
                  "src/l3g_paper/pong_collection.py", "src/l3f_provider/ninjatrader_observation.py",
                  "src/l3f_provider/ninjatrader_commission.py", "src/l3g_paper/pong_microstructure.py")
 }
@@ -228,6 +243,7 @@ class PongProductionHost:
         compute_workers: int = 0,
         fhb_config: FHBConfig | None = None,
         fhb_requested_profile: str | None = None,
+        qualifying_architecture: str | None = None,
         scheduling: PongSchedulingConfig = PongSchedulingConfig(),
         clock_ns: Callable[[], int] = time.perf_counter_ns,
         monotonic_clock: Callable[[], float] = time.monotonic,
@@ -271,6 +287,19 @@ class PongProductionHost:
             and fhb_config.entry_evaluation_interval_ms
         ):
             raise ValueError("FHB_PERIODIC_DUPLICATE_ENTRY_CADENCE")
+        if qualifying_architecture is not None:
+            if qualifying_architecture != PONG_NO_FHB_QUALIFYING_ARCHITECTURE:
+                raise ValueError("PONG_QUALIFYING_ARCHITECTURE_UNSUPPORTED")
+            if fhb_config is not None or normalized_fhb_request is not None:
+                raise ValueError("FHB_ARCHIVED_NOT_PART_OF_QUALIFYING_BUILD")
+            if (
+                selected_profile != PONG_ENTRY_PROFILE_VERSION
+                or scheduling.mode.value != PONG_QUALIFYING_SCHEDULING_MODE
+                or scheduling.interval_ms != PONG_QUALIFYING_INTERVAL_MS
+                or topology != DEC26_TOPOLOGY
+                or activation_authorized
+            ):
+                raise ValueError("PONG_QUALIFYING_ARCHITECTURE_IDENTITY_INVALID")
         if type(topology) is not PongContractTopology:
             raise ValueError("PONG_CONTRACT_TOPOLOGY_INVALID")
         self.state_root = Path(state_root).resolve()
@@ -318,7 +347,11 @@ class PongProductionHost:
         self._fhb_guard_maximum_breach_seconds = 0.0
         self._fhb_guard_recoveries = 0
         self._fhb_guard_blocker: str | None = (
-            None if fhb_config is None else "FHB_WATCHDOG_WAITING_FOR_OBSERVATION"
+            "PONG_WATCHDOG_WAITING_FOR_OBSERVATION"
+            if qualifying_architecture is not None
+            else None
+            if fhb_config is None
+            else "FHB_WATCHDOG_WAITING_FOR_OBSERVATION"
         )
         if type(compute_workers) is not int or not 0 <= compute_workers <= 3:
             raise ValueError('PONG_COMPUTE_WORKER_BOUND_INVALID')
@@ -335,6 +368,7 @@ class PongProductionHost:
         self._compute_batch_started = 0.0
         self._compute_batch_limit = 32
         self._scheduling = scheduling
+        self._qualifying_architecture = qualifying_architecture
         self._clock_ns = clock_ns
         self._monotonic_clock = monotonic_clock
         self._clock_info = vars(time.get_clock_info("perf_counter"))
@@ -400,12 +434,29 @@ class PongProductionHost:
         self._certificate: dict[str, object] | None = None
         self._certificate_error: str | None = None
         self._trades: deque[ClassifiedTrade] = deque(maxlen=8192)
-        self._fhb = None if fhb_config is None else FocusedHorizonBand(fhb_config)
+        if fhb_config is None:
+            self._fhb = None
+        else:
+            # Archived research compatibility is lazy. The qualifying host
+            # neither imports nor instantiates the FHB implementation.
+            from .fhb import FocusedHorizonBand
+
+            self._fhb = FocusedHorizonBand(fhb_config)
         depth_capacity = 4096 if fhb_config is None else fhb_config.maximum_shadow_events
         self._depth = {
             BookSide.BID: _DepthWindow(depth_capacity),
             BookSide.ASK: _DepthWindow(depth_capacity),
         }
+        self._canonical_depth: dict[
+            BookSide, tuple[tuple[Decimal, Decimal], ...]
+        ] = {BookSide.BID: (), BookSide.ASK: ()}
+        self._canonical_depth_ready = False
+        self._canonical_depth_reason: str | None = (
+            "PONG_CANONICAL_DEPTH_WAITING_FOR_COHERENT_SNAPSHOT"
+        )
+        self._canonical_depth_source_sequence: int | None = None
+        self._canonical_depth_recoveries = 0
+        self._canonical_depth_last_receipt_at: datetime | None = None
         self._volume_buckets: dict[str, Decimal] = {}
         self._volume_windows: dict[str, VolumeWindow] = {}
         self._last_microstructure_at: datetime | None = None
@@ -444,6 +495,23 @@ class PongProductionHost:
     @property
     def controller_path(self) -> Path:
         return self._operation_root / "controller-state.json"
+
+    def _qualifying_certificate_identity(self) -> dict[str, object]:
+        return {
+            "qualifying_architecture": self._qualifying_architecture,
+            "topology_version": self.topology.version,
+            "topology_hash": self.topology.binding_hash,
+            "native_instrument": self.topology.native_instrument,
+            "canonical_contract": self.topology.canonical_contract,
+            "scheduling_mode": self._scheduling.mode.value,
+            "periodic_interval_ms": self._scheduling.interval_ms,
+            "fhb_profile": None,
+            "fhb_disposition": FHB_ARCHIVE_DISPOSITION,
+            "activation_authorized": self.activation_authorized,
+            "live_authority": self.topology.live_authority,
+            "live_capital": self.topology.live_capital,
+            "loaded_artifact_hash": PONG_LOADED_ARTIFACT_HASH,
+        }
 
     def start(self) -> None:
         with self._lock:
@@ -488,6 +556,12 @@ class PongProductionHost:
                 or value.get("eligible") is not True
             ):
                 raise ValueError("certificate identity")
+            if (
+                self._qualifying_architecture is not None
+                and value.get("qualifying_identity")
+                != self._qualifying_certificate_identity()
+            ):
+                raise ValueError("certificate qualifying identity")
             journal = Path(str(value.get("journal_path"))).resolve()
             if not journal.is_file():
                 raise ValueError("certificate journal missing")
@@ -526,7 +600,13 @@ class PongProductionHost:
                 for values in (self._trades, self._depth[BookSide.BID], self._depth[BookSide.ASK])
             )
         with self._lock:
-            if self._fhb is not None and record.observation_type == "DEPTH":
+            if (
+                record.observation_type == "DEPTH"
+                and (
+                    self._fhb is not None
+                    or self._qualifying_architecture is not None
+                )
+            ):
                 now_monotonic = self._monotonic_clock()
                 depth_admitted = (
                     now_monotonic
@@ -538,7 +618,10 @@ class PongProductionHost:
                     self._last_depth_callback_monotonic or depth_admitted,
                 )
                 if admitted_monotonic is None:
-                    if self._fhb_guard_blocker == "FHB_WATCHDOG_WAITING_FOR_OBSERVATION":
+                    if self._fhb_guard_blocker in {
+                        "FHB_WATCHDOG_WAITING_FOR_OBSERVATION",
+                        "PONG_WATCHDOG_WAITING_FOR_OBSERVATION",
+                    }:
                         self._fhb_guard_blocker = None
                 else:
                     host_queue_age_ms = max(
@@ -561,16 +644,28 @@ class PongProductionHost:
                         source_receipt_age_ms,
                     )
                     blocker = None
-                    if (
-                        host_queue_age_ms
-                        > self._fhb.config.maximum_queue_age_milliseconds
-                    ):
-                        blocker = "FHB_HOST_QUEUE_AGE_EXCEEDED"
-                    elif (
-                        source_receipt_age_ms
-                        > self._fhb.config.maximum_event_age_milliseconds
-                    ):
-                        blocker = "FHB_EVENT_PROCESSING_AGE_EXCEEDED"
+                    maximum_queue_age_ms = (
+                        PONG_QUALIFYING_MAXIMUM_QUEUE_AGE_MS
+                        if self._qualifying_architecture is not None
+                        else self._fhb.config.maximum_queue_age_milliseconds
+                    )
+                    maximum_event_age_ms = (
+                        PONG_QUALIFYING_MAXIMUM_EVENT_AGE_MS
+                        if self._qualifying_architecture is not None
+                        else self._fhb.config.maximum_event_age_milliseconds
+                    )
+                    if host_queue_age_ms > maximum_queue_age_ms:
+                        blocker = (
+                            "PONG_HOST_QUEUE_AGE_EXCEEDED"
+                            if self._qualifying_architecture is not None
+                            else "FHB_HOST_QUEUE_AGE_EXCEEDED"
+                        )
+                    elif source_receipt_age_ms > maximum_event_age_ms:
+                        blocker = (
+                            "PONG_EVENT_PROCESSING_AGE_EXCEEDED"
+                            if self._qualifying_architecture is not None
+                            else "FHB_EVENT_PROCESSING_AGE_EXCEEDED"
+                        )
                     if blocker is not None:
                         self._fhb_guard_blocker = blocker
                         self._freshness_breach_count += 1
@@ -751,6 +846,15 @@ class PongProductionHost:
             record.producer.build_fingerprint,
         )
         with self._lock:
+            # Native continuity and attestation faults are terminal for this
+            # host instance. Collection/durability is owned upstream, while
+            # this analytical projection must not silently rebuild after a
+            # sequence or generation discontinuity.
+            if (
+                self._qualifying_architecture is not None
+                and self._input_error is not None
+            ):
+                return
             if record.producer.source_fingerprint != self.expected_market_source_fingerprint:
                 self._input_error = "PONG_NATIVE_INPUT_SOURCE_FINGERPRINT_MISMATCH"
                 return
@@ -792,10 +896,11 @@ class PongProductionHost:
                         raise ValueError("PONG_NATIVE_SOURCE_GENERATION_INVALID")
                     if self._source_generation is not None and generation != self._source_generation:
                         self._input_error = "PONG_NATIVE_SOURCE_GENERATION_CHANGED"
+                        self._invalidate_canonical_depth(self._input_error)
                         if self._fhb is not None:
                             self._fhb.invalidate(self._input_error)
-                            self._depth[BookSide.BID].clear()
-                            self._depth[BookSide.ASK].clear()
+                        self._source_generation = generation
+                        return
                     self._source_generation = generation
                 sequence = int(record.payload["source_event_sequence"])
                 prior = self._stream_sequences.get(record.observation_type)
@@ -813,10 +918,9 @@ class PongProductionHost:
                         # The input-error latch remains fail-closed.
                         self._stream_sequences[record.observation_type] = sequence
                         self._input_error = "PONG_NATIVE_INPUT_SOURCE_SEQUENCE_GAP"
+                        self._invalidate_canonical_depth(self._input_error)
                         if self._fhb is not None:
                             self._fhb.invalidate(self._input_error)
-                            self._depth[BookSide.BID].clear()
-                            self._depth[BookSide.ASK].clear()
                         return
                 self._stream_sequences[record.observation_type] = sequence
                 self._stream_counts[record.observation_type] += 1
@@ -837,10 +941,10 @@ class PongProductionHost:
                 PongNativeInputRefused,
             ) as error:
                 self._input_error = str(error) or type(error).__name__
+                if record.observation_type == "DEPTH":
+                    self._invalidate_canonical_depth(self._input_error)
                 if self._fhb is not None and record.observation_type == "DEPTH":
                     self._fhb.invalidate(self._input_error)
-                    self._depth[BookSide.BID].clear()
-                    self._depth[BookSide.ASK].clear()
 
     @staticmethod
     def _event_ref(record: NinjaTraderObservation) -> CausalEventRef:
@@ -892,9 +996,106 @@ class PongProductionHost:
                 available_at=record.ninja_receipt_time, authenticated=True,
             ))
 
+    def _invalidate_canonical_depth(self, reason: str) -> None:
+        self._canonical_depth = {BookSide.BID: (), BookSide.ASK: ()}
+        self._canonical_depth_ready = False
+        self._canonical_depth_reason = reason
+        self._canonical_depth_last_receipt_at = None
+        self._depth[BookSide.BID].clear()
+        self._depth[BookSide.ASK].clear()
+
+    @staticmethod
+    def _canonical_book_side(
+        payload: Mapping[str, object],
+        *,
+        key: str,
+        side: BookSide,
+    ) -> tuple[tuple[Decimal, Decimal], ...]:
+        raw = payload.get(key)
+        if not isinstance(raw, list) or not raw or len(raw) > 10:
+            raise ValueError("PONG_CANONICAL_DEPTH_LEVEL_COUNT_INVALID")
+        rows: list[tuple[Decimal, Decimal]] = []
+        seen: set[Decimal] = set()
+        previous: Decimal | None = None
+        for item in raw:
+            if not isinstance(item, Mapping):
+                raise ValueError("PONG_CANONICAL_DEPTH_LEVEL_INVALID")
+            try:
+                price = Decimal(str(item.get("price")))
+                quantity = Decimal(str(item.get("size")))
+            except (InvalidOperation, TypeError, ValueError) as error:
+                raise ValueError("PONG_CANONICAL_DEPTH_VALUE_INVALID") from error
+            if (
+                not price.is_finite()
+                or price <= 0
+                or not quantity.is_finite()
+                or quantity <= 0
+            ):
+                raise ValueError("PONG_CANONICAL_DEPTH_VALUE_INVALID")
+            if price in seen:
+                raise ValueError("PONG_CANONICAL_DEPTH_DUPLICATE_PRICE")
+            if previous is not None and (
+                (side is BookSide.BID and previous < price)
+                or (side is BookSide.ASK and previous > price)
+            ):
+                raise ValueError("PONG_CANONICAL_DEPTH_ORDER_INVALID")
+            seen.add(price)
+            rows.append((price, quantity))
+            previous = price
+        return tuple(rows)
+
     def _admit_depth(self, record: NinjaTraderObservation) -> None:
         payload = record.payload
-        side = BookSide.BID if str(payload.get("side")).upper() == "BID" else BookSide.ASK
+        if (
+            payload.get("is_reset") is True
+            or payload.get("mutation_is_reset") is True
+        ):
+            self._invalidate_canonical_depth(
+                "PONG_CANONICAL_DEPTH_RESET_REWARM_REQUIRED",
+            )
+            return
+        if (
+            str(payload.get("status") or "").upper() == "UNAVAILABLE"
+            or payload.get("available", True) is not True
+        ):
+            reason = str(payload.get("reason") or "NATIVE_DEPTH_UNAVAILABLE")
+            self._invalidate_canonical_depth(
+                "PONG_CANONICAL_DEPTH_UNAVAILABLE:" + reason,
+            )
+            return
+        try:
+            bids = self._canonical_book_side(
+                payload, key="bids", side=BookSide.BID,
+            )
+            asks = self._canonical_book_side(
+                payload, key="asks", side=BookSide.ASK,
+            )
+            if (
+                self._qualifying_architecture is not None
+                and (len(bids) != 10 or len(asks) != 10)
+            ):
+                raise ValueError("PONG_CANONICAL_DEPTH_10X10_REQUIRED")
+            if bids[0][0] >= asks[0][0]:
+                raise ValueError("PONG_CANONICAL_DEPTH_CROSSED")
+        except ValueError:
+            if self._qualifying_architecture is not None:
+                raise
+            bids = asks = ()
+        if bids and asks:
+            was_ready = self._canonical_depth_ready
+            self._canonical_depth = {BookSide.BID: bids, BookSide.ASK: asks}
+            self._canonical_depth_ready = True
+            self._canonical_depth_reason = None
+            self._canonical_depth_source_sequence = int(
+                payload["source_event_sequence"],
+            )
+            self._canonical_depth_last_receipt_at = _time(record.ninja_receipt_time)
+            if not was_ready and self._canonical_depth_source_sequence is not None:
+                self._canonical_depth_recoveries += 1
+        raw_side = str(payload.get("side") or "").upper()
+        if raw_side not in {"BID", "ASK"}:
+            raise ValueError("PONG_CANONICAL_DEPTH_MUTATION_SIDE_INVALID")
+        side = BookSide(raw_side)
         levels = payload.get("bids" if side is BookSide.BID else "asks")
         if not isinstance(levels, list) or not levels:
             return
@@ -903,14 +1104,58 @@ class PongProductionHost:
         # their stream sequence and durable collection evidence, but are not a
         # price-bearing microstructure observation.
         try:
-            price = Decimal(str(payload["mutation_price"]))
-        except (InvalidOperation, KeyError, TypeError, ValueError):
+            price = Decimal(str(
+                payload.get("mutation_resolved_price")
+                or payload["mutation_price"]
+            ))
+        except (InvalidOperation, KeyError, TypeError, ValueError) as error:
+            if self._qualifying_architecture is not None:
+                raise ValueError(
+                    "PONG_CANONICAL_DEPTH_MUTATION_IDENTITY_UNRESOLVED",
+                ) from error
             return
         if not price.is_finite() or price <= 0:
+            if self._qualifying_architecture is not None:
+                raise ValueError(
+                    "PONG_CANONICAL_DEPTH_MUTATION_IDENTITY_UNRESOLVED",
+                )
             return
-        touch = Decimal(str(levels[0]["price"]))
-        if (side is BookSide.BID and price > touch) or (side is BookSide.ASK and price < touch):
-            return
+        operation = str(
+            payload.get("operation") or payload.get("mutation_operation") or ""
+        ).upper()
+        post_prices = {item[0] for item in self._canonical_depth[side]}
+        post_touch = Decimal(str(levels[0]["price"]))
+        if operation in {"ADD", "UPDATE"}:
+            if price not in post_prices:
+                if self._qualifying_architecture is not None:
+                    raise ValueError(
+                        "PONG_CANONICAL_DEPTH_MUTATION_NOT_IN_POST_BOOK",
+                    )
+                return
+        elif operation == "REMOVE":
+            # A removal is identified by the authenticated resolved price from
+            # the native positional cursor. The removed level is intentionally
+            # absent from the post-mutation snapshot and may have been the old
+            # best level, outside the new touch.
+            touch = (
+                price
+                if (
+                    (side is BookSide.BID and price > post_touch)
+                    or (side is BookSide.ASK and price < post_touch)
+                )
+                else post_touch
+            )
+        elif self._qualifying_architecture is not None:
+            raise ValueError("PONG_CANONICAL_DEPTH_MUTATION_OPERATION_INVALID")
+        else:
+            touch = post_touch
+            if (
+                (side is BookSide.BID and price > touch)
+                or (side is BookSide.ASK and price < touch)
+            ):
+                return
+        if operation in {"ADD", "UPDATE"}:
+            touch = post_touch
         kind = DepthEventKind.UPDATE
         if payload.get("is_reset") is True:
             kind = DepthEventKind.RECONNECT_RESET
@@ -928,10 +1173,10 @@ class PongProductionHost:
         if decision.clear_feature_windows:
             self._depth[BookSide.BID].clear()
             self._depth[BookSide.ASK].clear()
-        if decision.action is FHBAction.REWARM_REQUIRED:
+        if decision.action.value == "REWARM_REQUIRED":
             self._microstructure_blockers = (decision.reason,)
             return
-        if decision.action is FHBAction.SKIP_OUT_OF_CORE:
+        if decision.action.value == "SKIP_OUT_OF_CORE":
             if self._microstructure_blockers and self._microstructure_blockers[0].startswith(
                 "FHB_REWARM_REQUIRED"
             ):
@@ -951,6 +1196,16 @@ class PongProductionHost:
         )
 
     def _evaluate_microstructure(self, at: datetime) -> None:
+        if (
+            self._qualifying_architecture is not None
+            and not self._canonical_depth_ready
+        ):
+            self._last_microstructure_at = at
+            self._microstructure_blockers = (
+                self._canonical_depth_reason
+                or "PONG_CANONICAL_DEPTH_NOT_READY",
+            )
+            return
         if self._fhb is not None and not self._fhb.entry_ready:
             self._last_microstructure_at = at
             self._microstructure_blockers = ("FHB_REWARM_REQUIRED",)
@@ -1507,6 +1762,7 @@ class PongProductionHost:
                 "published_at": published_at,
                 "daily_bias": bias.payload(),
                 "daily_bias_result_hash": bias.result_hash,
+                "qualifying_identity": self._qualifying_certificate_identity(),
             }
             body["certificate_hash"] = canonical_hash(body)
             _atomic_write(self.certificate_path, body)
@@ -1651,6 +1907,18 @@ class PongProductionHost:
             return "FHB_SOURCE_HEARTBEAT_TIMEOUT"
         return None
 
+    def _qualifying_heartbeat_blocker_locked(self) -> str | None:
+        if self._qualifying_architecture is None:
+            return None
+        if self._last_depth_callback_monotonic is None:
+            return "PONG_WATCHDOG_WAITING_FOR_OBSERVATION"
+        if (
+            self._monotonic_clock() - self._last_depth_callback_monotonic
+            > PONG_QUALIFYING_SOURCE_HEARTBEAT_SECONDS
+        ):
+            return "PONG_SOURCE_HEARTBEAT_TIMEOUT"
+        return None
+
     def _blockers_locked(self) -> list[str]:
         blockers: list[str] = []
         if self._stop.is_set():
@@ -1694,6 +1962,12 @@ class PongProductionHost:
             blockers.append("PONG_NATIVE_QUANTITY_CAPABILITY_INVALID")
         if self._fhb is not None:
             heartbeat_blocker = self._fhb_heartbeat_blocker_locked()
+            if heartbeat_blocker is not None:
+                blockers.append(heartbeat_blocker)
+            if self._fhb_guard_blocker is not None:
+                blockers.append(self._fhb_guard_blocker)
+        if self._qualifying_architecture is not None:
+            heartbeat_blocker = self._qualifying_heartbeat_blocker_locked()
             if heartbeat_blocker is not None:
                 blockers.append(heartbeat_blocker)
             if self._fhb_guard_blocker is not None:
@@ -1916,6 +2190,9 @@ class PongProductionHost:
             bridge = self._bridge
             fhb_status = None if self._fhb is None else self._fhb.status()
             fhb_heartbeat_blocker = self._fhb_heartbeat_blocker_locked()
+            qualifying_heartbeat_blocker = (
+                self._qualifying_heartbeat_blocker_locked()
+            )
             fhb_unavailable_reason = (
                 None
                 if fhb_status is None
@@ -1925,6 +2202,13 @@ class PongProductionHost:
                 or fhb_status["unavailable_reason"]
             )
             fhb_activation = {
+                "disposition": FHB_ARCHIVE_DISPOSITION,
+                "qualifying_runtime_state": (
+                    FHB_QUALIFYING_RUNTIME_STATE
+                    if self._qualifying_architecture is not None
+                    else None
+                ),
+                "qualification_required": False,
                 "requested": self._fhb_requested_profile is not None,
                 "requested_profile": self._fhb_requested_profile,
                 "admitted": self._fhb is not None,
@@ -1998,10 +2282,77 @@ class PongProductionHost:
                 ),
                 "event_trigger_reduction_claimed": False,
             }
+            canonical_depth = {
+                "ready": self._canonical_depth_ready,
+                "required_for_qualifying_build": (
+                    self._qualifying_architecture is not None
+                ),
+                "reason": self._canonical_depth_reason,
+                "bid_levels": len(self._canonical_depth[BookSide.BID]),
+                "ask_levels": len(self._canonical_depth[BookSide.ASK]),
+                "best_bid": (
+                    None
+                    if not self._canonical_depth[BookSide.BID]
+                    else str(self._canonical_depth[BookSide.BID][0][0])
+                ),
+                "best_ask": (
+                    None
+                    if not self._canonical_depth[BookSide.ASK]
+                    else str(self._canonical_depth[BookSide.ASK][0][0])
+                ),
+                "last_source_sequence": self._canonical_depth_source_sequence,
+                "last_receipt_at": (
+                    None
+                    if self._canonical_depth_last_receipt_at is None
+                    else self._canonical_depth_last_receipt_at.isoformat().replace(
+                        "+00:00", "Z",
+                    )
+                ),
+                "recovery_count": self._canonical_depth_recoveries,
+            }
             return {
                 **authority,
                 "state": "RUNNING" if self._thread is not None and self._thread.is_alive() else "STOPPED",
                 "selected_profile": self.selected_profile,
+                "qualifying_architecture": self._qualifying_architecture,
+                "canonical_depth_state": canonical_depth,
+                "ingress_freshness": {
+                    "maximum_queue_age_milliseconds": (
+                        PONG_QUALIFYING_MAXIMUM_QUEUE_AGE_MS
+                    ),
+                    "maximum_event_age_milliseconds": (
+                        PONG_QUALIFYING_MAXIMUM_EVENT_AGE_MS
+                    ),
+                    "source_heartbeat_timeout_seconds": (
+                        PONG_QUALIFYING_SOURCE_HEARTBEAT_SECONDS
+                    ),
+                    "last_host_queue_age_ms": self._last_host_queue_age_ms,
+                    "maximum_host_queue_age_ms": self._maximum_host_queue_age_ms,
+                    "last_source_receipt_age_ms": self._last_source_receipt_age_ms,
+                    "maximum_source_receipt_age_ms": (
+                        self._maximum_source_receipt_age_ms
+                    ),
+                    "breach_count": self._freshness_breach_count,
+                    "current_blocker": (
+                        self._fhb_guard_blocker
+                        if self._qualifying_architecture is not None
+                        else None
+                    ),
+                    "current_heartbeat_blocker": (
+                        qualifying_heartbeat_blocker
+                    ),
+                    "persistent_breach_threshold_seconds": (
+                        PONG_QUALIFYING_PERSISTENT_BREACH_SECONDS
+                    ),
+                    "persistent_breach": bool(
+                        self._qualifying_architecture is not None
+                        and self._fhb_guard_breach_started is not None
+                        and self._monotonic_clock()
+                        - self._fhb_guard_breach_started
+                        >= PONG_QUALIFYING_PERSISTENT_BREACH_SECONDS
+                    ),
+                    "recovery_count": self._fhb_guard_recoveries,
+                },
                 "evaluation_schedule": {
                     "configuration": {
                         "mode": self._scheduling.mode.value,
@@ -2020,6 +2371,12 @@ class PongProductionHost:
                     "authoritative_admission_records": self._authoritative_admission_records,
                     "event_driven_analytical_evaluations": self._event_driven_evaluations,
                     "periodic_flat_analytical_evaluations": self._periodic_evaluations,
+                    "depth_events_per_analytical_evaluation": (
+                        None
+                        if self._microstructure_evaluations == 0
+                        else self._stream_counts["DEPTH"]
+                        / self._microstructure_evaluations
+                    ),
                     "periodic_last_cutoff": (
                         None if self._last_periodic_cutoff is None
                         else self._last_periodic_cutoff.isoformat().replace("+00:00", "Z")

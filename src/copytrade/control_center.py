@@ -33,7 +33,6 @@ from src.l3g_paper.commissioning import (
     evaluate_commissioning_post_run_verification,
 )
 from src.l3g_paper.health import ledger_health_projection, sanitized_paper_health
-from src.l3g_paper.fhb import FHBConfig, FHB_PROFILE_ID
 from src.l3g_paper.ledger import LedgerCapacityError, PaperLedger, resolve_ledger_epoch
 from src.l3g_paper.ninjatrader_login import NinjaTraderLoginBootstrap, NinjaTraderLoginState
 from src.l3g_paper.ninjatrader_maintenance import (
@@ -50,8 +49,15 @@ from src.l3g_paper.paper_autostart import (
 )
 from src.l3g_paper.ninjatrader_transport import LocalPaperSecretProvider, PaperExecutionTransport
 from src.l3g_paper.pong_collection import PongAuthenticHourCollector
-from src.l3g_paper.pong_contract import resolve_pong_topology
+from src.l3g_paper.pong_contract import DEC26_TOPOLOGY, resolve_pong_topology
 from src.l3g_paper.pong_production import PongProductionHost
+from src.l3g_paper.pong_qualifying import (
+    FHB_ARCHIVE_DISPOSITION,
+    PONG_NO_FHB_QUALIFYING_ARCHITECTURE,
+    PONG_QUALIFYING_ARCHITECTURE_ENV,
+    PONG_QUALIFYING_INTERVAL_MS,
+    PONG_QUALIFYING_SCHEDULING_MODE,
+)
 from src.l3g_paper.pong_authorization import PONG_AUTHORIZATION_ENV, PongLaunchAuthorization
 from src.l3g_paper.pong_scheduler import (
     PONG_PERIODIC_INTERVAL_ENV,
@@ -1834,21 +1840,25 @@ def create_control_center_app(
         os.getenv(PONG_PERIODIC_INTERVAL_ENV),
     )
     configured_fhb_profile = os.getenv(PONG_FHB_PROFILE_ENV)
-    if configured_fhb_profile is None or not configured_fhb_profile.strip():
-        pong_fhb_config = None
-    elif configured_fhb_profile == FHB_PROFILE_ID:
-        pong_fhb_config = (
-            FHBConfig.periodic_protected()
-            if pong_scheduling.enabled
-            else FHBConfig()
-        )
-    else:
-        raise ValueError("FHB_PROFILE_UNSUPPORTED")
-    if (
-        pong_fhb_config is not None
-        and selected_paper_profile.selection_key != PONG_ENTRY_PROFILE_VERSION
-    ):
-        raise ValueError("FHB_PONG_PROFILE_NOT_SELECTED")
+    if configured_fhb_profile is not None and configured_fhb_profile.strip():
+        raise ValueError("FHB_ARCHIVED_NOT_PART_OF_QUALIFYING_BUILD")
+    configured_qualifying_architecture = os.getenv(
+        PONG_QUALIFYING_ARCHITECTURE_ENV,
+    )
+    if selected_paper_profile.selection_key == PONG_ENTRY_PROFILE_VERSION:
+        if (
+            configured_qualifying_architecture
+            != PONG_NO_FHB_QUALIFYING_ARCHITECTURE
+            or pong_scheduling.mode.value != PONG_QUALIFYING_SCHEDULING_MODE
+            or pong_scheduling.interval_ms != PONG_QUALIFYING_INTERVAL_MS
+            or pong_topology != DEC26_TOPOLOGY
+            or paper_topology != DEC26_TOPOLOGY
+            or pong_bounded_activation
+        ):
+            raise ValueError("PONG_QUALIFYING_ARCHITECTURE_IDENTITY_INVALID")
+    elif configured_qualifying_architecture is not None:
+        raise ValueError("PONG_QUALIFYING_ARCHITECTURE_PROFILE_INVALID")
+    pong_qualifying_architecture = configured_qualifying_architecture
     perpetual_seed_artifact: Mapping[str, object] | None = None
     perpetual_seed_proof: Mapping[str, object] | None = None
     perpetual_seed_manifest: Mapping[str, object] | None = None
@@ -2009,14 +2019,11 @@ def create_control_center_app(
         "entry_profile_version": selected_paper_policy.entry_profile_version,
         "paper_policy_hash": selected_paper_policy.configuration_hash,
         "risk_profile_hash": selected_paper_risk.configuration_hash,
-        "fhb_profile": (
-            None if pong_fhb_config is None else pong_fhb_config.profile_id
-        ),
-        "fhb_policy_fingerprint": (
-            None
-            if pong_fhb_config is None
-            else pong_fhb_config.policy_fingerprint
-        ),
+        "fhb_profile": None,
+        "fhb_policy_fingerprint": None,
+        "fhb_disposition": FHB_ARCHIVE_DISPOSITION,
+        "pong_qualifying_architecture": pong_qualifying_architecture,
+        "pong_activation_authorized": pong_bounded_activation,
         "pong_scheduling_mode": pong_scheduling.mode.value,
         "pong_periodic_interval_ms": pong_scheduling.interval_ms,
         "ledger_epoch": resolve_ledger_epoch(paper_path, configured_paper_epoch),
@@ -2672,8 +2679,7 @@ def create_control_center_app(
                 activation_authorized=pong_bounded_activation,
                 launch_authorization=pong_launch_authorization,
                 history_verification_key=LocalPaperSecretProvider().load_key(),
-                fhb_config=pong_fhb_config,
-                fhb_requested_profile=configured_fhb_profile,
+                qualifying_architecture=pong_qualifying_architecture,
                 scheduling=pong_scheduling,
                 topology=pong_topology,
             )

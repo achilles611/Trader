@@ -18,6 +18,10 @@ from src.l3g_paper.fhb import (
 )
 from src.l3g_paper.pong_microstructure import BookSide, CausalEventRef
 from src.l3g_paper.pong_production import PongProductionHost
+from src.l3g_paper.pong_qualifying import (
+    PONG_NO_FHB_QUALIFYING_ARCHITECTURE,
+    PONG_QUALIFYING_ARCHITECTURE_ENV,
+)
 from src.l3g_paper.pong_scheduler import PongSchedulingConfig, PongSchedulingMode
 from src.copytrade.config import CopyTradeConfig
 from src.copytrade.control_center import create_control_center_app
@@ -883,7 +887,7 @@ class FHBProductionIntegrationTests(unittest.TestCase):
                 status["blocking_reasons"],
             )
 
-    def test_selected_route_requires_coherent_dec26_topology(self) -> None:
+    def test_selected_route_archives_fhb_and_keeps_dec26_topology(self) -> None:
         selected = {
             "USERPROFILE": os.environ["USERPROFILE"],
             "BEELZEBUB_L3G_PAPER_PROFILE": PONG_ENTRY_PROFILE_VERSION,
@@ -893,6 +897,16 @@ class FHBProductionIntegrationTests(unittest.TestCase):
             "BEELZEBUB_PONG_SCHEDULING_MODE": "PERIODIC_FLAT_PROTECTED",
             "BEELZEBUB_PONG_PERIODIC_INTERVAL_MS": "20",
         }
+        with patch.dict(os.environ, selected, clear=True):
+            with self.assertRaisesRegex(
+                ValueError, "FHB_ARCHIVED_NOT_PART_OF_QUALIFYING_BUILD",
+            ):
+                create_control_center_app(CopyTradeConfig())
+
+        selected.pop("BEELZEBUB_PONG_FHB_PROFILE")
+        selected[PONG_QUALIFYING_ARCHITECTURE_ENV] = (
+            PONG_NO_FHB_QUALIFYING_ARCHITECTURE
+        )
         with patch.dict(os.environ, selected, clear=True):
             app = create_control_center_app(CopyTradeConfig())
         self.assertIsNotNone(app)
