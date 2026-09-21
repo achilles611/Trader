@@ -227,6 +227,7 @@ class PongProductionHost:
         history_verification_key: bytes | None = None,
         compute_workers: int = 0,
         fhb_config: FHBConfig | None = None,
+        fhb_requested_profile: str | None = None,
         scheduling: PongSchedulingConfig = PongSchedulingConfig(),
         clock_ns: Callable[[], int] = time.perf_counter_ns,
         monotonic_clock: Callable[[], float] = time.monotonic,
@@ -251,6 +252,19 @@ class PongProductionHost:
             raise ValueError("FHB_PONG_PROFILE_NOT_SELECTED")
         if fhb_config is not None and compute_workers:
             raise ValueError("FHB_SERIAL_ORDERED_OWNER_REQUIRED")
+        normalized_fhb_request = (
+            None
+            if fhb_requested_profile is None or not fhb_requested_profile.strip()
+            else fhb_requested_profile.strip()
+        )
+        if normalized_fhb_request is not None and fhb_config is None:
+            raise ValueError("FHB_REQUEST_NOT_ADMITTED")
+        if (
+            fhb_config is not None
+            and normalized_fhb_request is not None
+            and normalized_fhb_request != fhb_config.profile_id
+        ):
+            raise ValueError("FHB_REQUEST_EFFECTIVE_POLICY_MISMATCH")
         if (
             fhb_config is not None
             and scheduling.enabled
@@ -293,12 +307,16 @@ class PongProductionHost:
         ] = queue.Queue(maxsize=262144)
         self._admission_lock = threading.Lock()
         self._observation_overflow = 0
-        self._last_callback_monotonic: float | None = None
+        self._last_depth_callback_monotonic: float | None = None
         self._last_host_queue_age_ms = 0.0
         self._maximum_host_queue_age_ms = 0.0
         self._last_source_receipt_age_ms = 0.0
         self._maximum_source_receipt_age_ms = 0.0
         self._freshness_breach_count = 0
+        self._fhb_guard_breach_started: float | None = None
+        self._fhb_guard_last_breach_seconds: float | None = None
+        self._fhb_guard_maximum_breach_seconds = 0.0
+        self._fhb_guard_recoveries = 0
         self._fhb_guard_blocker: str | None = (
             None if fhb_config is None else "FHB_WATCHDOG_WAITING_FOR_OBSERVATION"
         )
@@ -332,6 +350,16 @@ class PongProductionHost:
         self._event_driven_evaluations = 0
         self._periodic_evaluations = 0
         self._microstructure_evaluations = 0
+        self._fhb_requested_profile = (
+            None if fhb_config is None
+            else normalized_fhb_request or fhb_config.profile_id
+        )
+        self._fhb_output_batches = 0
+        self._fhb_output_observations = 0
+        self._fhb_last_output_source_sequence: int | None = None
+        self._fhb_consumer_count = 0
+        self._fhb_last_consumer_source_sequence: int | None = None
+        self._fhb_last_consumer_at: datetime | None = None
         self._market_state_revision = 0
         self._entry_evaluation_starts = 0
         self._entry_evaluation_deferred = 0
@@ -478,7 +506,8 @@ class PongProductionHost:
             self._observations.put_nowait((record, admitted))
             with self._admission_lock:
                 self._source_ingress_records += 1
-                self._last_callback_monotonic = admitted
+                if record.observation_type == "DEPTH":
+                    self._last_depth_callback_monotonic = admitted
         except queue.Full:
             with self._admission_lock:
                 self._observation_overflow += 1
@@ -497,39 +526,71 @@ class PongProductionHost:
                 for values in (self._trades, self._depth[BookSide.BID], self._depth[BookSide.ASK])
             )
         with self._lock:
-            if admitted_monotonic is not None and self._fhb is not None:
+            if self._fhb is not None and record.observation_type == "DEPTH":
                 now_monotonic = self._monotonic_clock()
-                host_queue_age_ms = max(
-                    0.0,
-                    (now_monotonic - admitted_monotonic) * 1000.0,
+                depth_admitted = (
+                    now_monotonic
+                    if admitted_monotonic is None
+                    else admitted_monotonic
                 )
-                source_receipt_age_ms = max(
-                    0.0,
-                    (_time(_now()) - _time(record.ninja_receipt_time)).total_seconds()
-                    * 1000.0,
+                self._last_depth_callback_monotonic = max(
+                    depth_admitted,
+                    self._last_depth_callback_monotonic or depth_admitted,
                 )
-                self._last_callback_monotonic = max(
-                    admitted_monotonic,
-                    self._last_callback_monotonic or admitted_monotonic,
-                )
-                self._last_host_queue_age_ms = host_queue_age_ms
-                self._maximum_host_queue_age_ms = max(
-                    self._maximum_host_queue_age_ms,
-                    host_queue_age_ms,
-                )
-                self._last_source_receipt_age_ms = source_receipt_age_ms
-                self._maximum_source_receipt_age_ms = max(
-                    self._maximum_source_receipt_age_ms,
-                    source_receipt_age_ms,
-                )
-                if host_queue_age_ms > self._fhb.config.maximum_queue_age_milliseconds:
-                    self._fhb_guard_blocker = "FHB_HOST_QUEUE_AGE_EXCEEDED"
-                    self._freshness_breach_count += 1
-                elif source_receipt_age_ms > self._fhb.config.maximum_event_age_milliseconds:
-                    self._fhb_guard_blocker = "FHB_EVENT_PROCESSING_AGE_EXCEEDED"
-                    self._freshness_breach_count += 1
+                if admitted_monotonic is None:
+                    if self._fhb_guard_blocker == "FHB_WATCHDOG_WAITING_FOR_OBSERVATION":
+                        self._fhb_guard_blocker = None
                 else:
-                    self._fhb_guard_blocker = None
+                    host_queue_age_ms = max(
+                        0.0,
+                        (now_monotonic - admitted_monotonic) * 1000.0,
+                    )
+                    source_receipt_age_ms = max(
+                        0.0,
+                        (_time(_now()) - _time(record.ninja_receipt_time)).total_seconds()
+                        * 1000.0,
+                    )
+                    self._last_host_queue_age_ms = host_queue_age_ms
+                    self._maximum_host_queue_age_ms = max(
+                        self._maximum_host_queue_age_ms,
+                        host_queue_age_ms,
+                    )
+                    self._last_source_receipt_age_ms = source_receipt_age_ms
+                    self._maximum_source_receipt_age_ms = max(
+                        self._maximum_source_receipt_age_ms,
+                        source_receipt_age_ms,
+                    )
+                    blocker = None
+                    if (
+                        host_queue_age_ms
+                        > self._fhb.config.maximum_queue_age_milliseconds
+                    ):
+                        blocker = "FHB_HOST_QUEUE_AGE_EXCEEDED"
+                    elif (
+                        source_receipt_age_ms
+                        > self._fhb.config.maximum_event_age_milliseconds
+                    ):
+                        blocker = "FHB_EVENT_PROCESSING_AGE_EXCEEDED"
+                    if blocker is not None:
+                        self._fhb_guard_blocker = blocker
+                        self._freshness_breach_count += 1
+                        if self._fhb_guard_breach_started is None:
+                            self._fhb_guard_breach_started = now_monotonic
+                    elif self._fhb_guard_breach_started is not None:
+                        duration = max(
+                            0.0,
+                            now_monotonic - self._fhb_guard_breach_started,
+                        )
+                        self._fhb_guard_last_breach_seconds = duration
+                        self._fhb_guard_maximum_breach_seconds = max(
+                            self._fhb_guard_maximum_breach_seconds,
+                            duration,
+                        )
+                        self._fhb_guard_recoveries += 1
+                        self._fhb_guard_breach_started = None
+                        self._fhb_guard_blocker = None
+                    else:
+                        self._fhb_guard_blocker = None
             before = cursor()
             stream_before = tuple(sorted(self._stream_sequences.items()))
             self._process_observation(record)
@@ -881,7 +942,13 @@ class PongProductionHost:
         if decision.side is None or not decision.seed_observations:
             self._microstructure_blockers = ("FHB_ELIGIBLE_EVENT_MISSING_SEED",)
             return
-        self._depth[decision.side].extend(decision.seed_observations)
+        for observation in decision.seed_observations:
+            self._depth[observation.side].append(observation)
+        self._fhb_output_batches += 1
+        self._fhb_output_observations += len(decision.seed_observations)
+        self._fhb_last_output_source_sequence = int(
+            record.payload["source_event_sequence"]
+        )
 
     def _evaluate_microstructure(self, at: datetime) -> None:
         if self._fhb is not None and not self._fhb.entry_ready:
@@ -935,6 +1002,16 @@ class PongProductionHost:
                                        as_of=as_of, feed_continuity_valid=self._input_error is None)
             bid = self._liquidity.evaluate(bids, as_of=as_of, feed_continuity_valid=self._input_error is None)
             ask = self._liquidity.evaluate(asks, as_of=as_of, feed_continuity_valid=self._input_error is None)
+            if self._fhb is not None:
+                # FHB forbids helper workers, so successful evaluation of both
+                # liquidity sides proves the real serial strategy adapters
+                # consumed only windows populated by _admit_depth_fhb. There
+                # is no full-depth fallback while the policy is instantiated.
+                self._fhb_consumer_count += 1
+                self._fhb_last_consumer_source_sequence = (
+                    self._stream_sequences.get("DEPTH")
+                )
+                self._fhb_last_consumer_at = at
             regime = self._volume.evaluate(window, prior, as_of=as_of)
             mapped = self._mapper.map_frame(
                 flow, bid, ask, regime,
@@ -1562,6 +1639,18 @@ class PongProductionHost:
             producer.get("source_fingerprint"),
         )
 
+    def _fhb_heartbeat_blocker_locked(self) -> str | None:
+        if self._fhb is None:
+            return None
+        if self._last_depth_callback_monotonic is None:
+            return "FHB_WATCHDOG_WAITING_FOR_OBSERVATION"
+        if (
+            self._monotonic_clock() - self._last_depth_callback_monotonic
+            > self._fhb.config.source_heartbeat_timeout_seconds
+        ):
+            return "FHB_SOURCE_HEARTBEAT_TIMEOUT"
+        return None
+
     def _blockers_locked(self) -> list[str]:
         blockers: list[str] = []
         if self._stop.is_set():
@@ -1604,13 +1693,9 @@ class PongProductionHost:
         if int(runtime.get("maximum_quantity") or 0) != 1:
             blockers.append("PONG_NATIVE_QUANTITY_CAPABILITY_INVALID")
         if self._fhb is not None:
-            if self._last_callback_monotonic is None:
-                blockers.append("FHB_WATCHDOG_WAITING_FOR_OBSERVATION")
-            elif (
-                self._monotonic_clock() - self._last_callback_monotonic
-                > self._fhb.config.source_heartbeat_timeout_seconds
-            ):
-                blockers.append("FHB_SOURCE_HEARTBEAT_TIMEOUT")
+            heartbeat_blocker = self._fhb_heartbeat_blocker_locked()
+            if heartbeat_blocker is not None:
+                blockers.append(heartbeat_blocker)
             if self._fhb_guard_blocker is not None:
                 blockers.append(self._fhb_guard_blocker)
         return list(dict.fromkeys(blockers))
@@ -1829,6 +1914,90 @@ class PongProductionHost:
             authority = self.authority_status()
             controller = self._controller
             bridge = self._bridge
+            fhb_status = None if self._fhb is None else self._fhb.status()
+            fhb_heartbeat_blocker = self._fhb_heartbeat_blocker_locked()
+            fhb_unavailable_reason = (
+                None
+                if fhb_status is None
+                else self._input_error
+                or self._fhb_guard_blocker
+                or fhb_heartbeat_blocker
+                or fhb_status["unavailable_reason"]
+            )
+            fhb_activation = {
+                "requested": self._fhb_requested_profile is not None,
+                "requested_profile": self._fhb_requested_profile,
+                "admitted": self._fhb is not None,
+                "instantiated": self._fhb is not None,
+                "enabled": self._fhb is not None,
+                "effective_profile": (
+                    None if self._fhb is None else self._fhb.config.profile_id
+                ),
+                "effective_policy": (
+                    None if self._fhb is None else self._fhb.config.payload()
+                ),
+                "effective_policy_fingerprint": (
+                    None
+                    if self._fhb is None
+                    else self._fhb.config.policy_fingerprint
+                ),
+                "ready": bool(
+                    self._fhb is not None
+                    and self._fhb.entry_ready
+                    and self._input_error is None
+                    and self._fhb_guard_blocker is None
+                    and fhb_heartbeat_blocker is None
+                ),
+                "maintained": bool(
+                    fhb_status is not None
+                    and int(fhb_status["maintenance_ticks"]) > 0
+                ),
+                "maintenance_ticks": (
+                    0 if fhb_status is None else fhb_status["maintenance_ticks"]
+                ),
+                "last_maintained_source_sequence": (
+                    None
+                    if fhb_status is None
+                    else fhb_status["last_source_sequence"]
+                ),
+                "output_batches": self._fhb_output_batches,
+                "output_observations": self._fhb_output_observations,
+                "last_output_source_sequence": (
+                    self._fhb_last_output_source_sequence
+                ),
+                "consumer_count": self._fhb_consumer_count,
+                "last_consumer_source_sequence": (
+                    self._fhb_last_consumer_source_sequence
+                ),
+                "last_consumer_at": (
+                    None
+                    if self._fhb_last_consumer_at is None
+                    else self._fhb_last_consumer_at.isoformat().replace(
+                        "+00:00", "Z",
+                    )
+                ),
+                "consumed": self._fhb_consumer_count > 0,
+                "reported": True,
+                "unavailable_reason": fhb_unavailable_reason,
+                "fallback": {
+                    "mode": "NONE",
+                    "full_depth_fallback_allowed": False,
+                    "count": 0,
+                },
+                "execution_owner": "SERIAL_SINGLE_ORDERED_OWNER",
+                "helper_enabled": False,
+                "input_retention": "ALL_AUTHENTIC_SOURCE_RECORDS",
+                "upstream_event_reduction": "NONE",
+                "entry_evaluation_trigger": (
+                    "PONG_PERIODIC_DEADLINE"
+                    if self._scheduling.enabled
+                    and self._event_protection_reason_locked() is None
+                    else "EVENT_DRIVEN_PROTECTION"
+                    if self._scheduling.enabled
+                    else "FHB_ELIGIBLE_AUTHENTIC_EVENT"
+                ),
+                "event_trigger_reduction_claimed": False,
+            }
             return {
                 **authority,
                 "state": "RUNNING" if self._thread is not None and self._thread.is_alive() else "STOPPED",
@@ -1914,7 +2083,8 @@ class PongProductionHost:
                 "compute_submitted": self._compute_submitted,
                 "compute_applied": self._compute_applied,
                 "compute_refused": self._compute_refused,
-                "fhb": None if self._fhb is None else self._fhb.status(),
+                "fhb": fhb_status,
+                "fhb_activation": fhb_activation,
                 "fhb_freshness": None if self._fhb is None else {
                     "maximum_queue_age_milliseconds": (
                         self._fhb.config.maximum_queue_age_milliseconds
@@ -1933,6 +2103,34 @@ class PongProductionHost:
                     ),
                     "breach_count": self._freshness_breach_count,
                     "current_blocker": self._fhb_guard_blocker,
+                    "current_heartbeat_blocker": fhb_heartbeat_blocker,
+                    "heartbeat_stream": "DEPTH",
+                    "last_depth_callback_monotonic": (
+                        self._last_depth_callback_monotonic
+                    ),
+                    "current_breach_seconds": (
+                        0.0
+                        if self._fhb_guard_breach_started is None
+                        else max(
+                            0.0,
+                            self._monotonic_clock()
+                            - self._fhb_guard_breach_started,
+                        )
+                    ),
+                    "persistent_breach_threshold_seconds": (
+                        self._fhb.config.persistent_breach_seconds
+                    ),
+                    "persistent_breach": bool(
+                        self._fhb_guard_breach_started is not None
+                        and self._monotonic_clock()
+                        - self._fhb_guard_breach_started
+                        >= self._fhb.config.persistent_breach_seconds
+                    ),
+                    "last_breach_seconds": self._fhb_guard_last_breach_seconds,
+                    "maximum_breach_seconds": (
+                        self._fhb_guard_maximum_breach_seconds
+                    ),
+                    "recovery_count": self._fhb_guard_recoveries,
                 },
                 "compute_oldest_pending_seconds": (
                     0.0 if not self._compute_pending

@@ -27,12 +27,15 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from src.l3g_paper.contracts import (
+    PONG_ENTRY_PROFILE_VERSION,
     paper_contract_identity_matches,
     paper_policy_for_topology,
     paper_risk_for_topology,
     resolve_paper_profile,
 )
+from src.l3g_paper.fhb import FHBConfig, FHB_PROFILE_ID
 from src.l3g_paper.pong_contract import resolve_pong_topology
+from src.l3g_paper.pong_scheduler import scheduling_config_from_environment
 from src.l3g_paper.profile_switch import (
     PROFILE_SWITCH_SCHEMA,
     _manifest as validated_profile_switch_manifest,
@@ -87,6 +90,8 @@ class LaunchBinding:
     paper_policy_hash: str
     risk_profile_hash: str
     source: str
+    fhb_profile: str | None = None
+    fhb_policy_fingerprint: str | None = None
     ledger_identity: str | None = None
     operation_id: str | None = None
     expected_pid: int | None = None
@@ -104,6 +109,8 @@ class LaunchBinding:
             "entry_profile_version": self.entry_profile_version,
             "paper_policy_hash": self.paper_policy_hash,
             "risk_profile_hash": self.risk_profile_hash,
+            "fhb_profile": self.fhb_profile,
+            "fhb_policy_fingerprint": self.fhb_policy_fingerprint,
             "ledger_epoch": self.ledger_epoch,
             "profile_selection_source": (
                 "REMEMBERED_ESTABLISHED_RUN"
@@ -171,6 +178,33 @@ def profile_switch_root(environment: Mapping[str, str] | None = None) -> Path:
     env = os.environ if environment is None else environment
     configured = env.get("BEELZEBUB_PROFILE_SWITCH_ROOT")
     return Path(configured or DEFAULT_PROFILE_SWITCH_ROOT).expanduser().resolve()
+
+
+def resolve_fhb_launch_policy(
+    profile_key: str,
+    environment: Mapping[str, str],
+) -> tuple[str | None, str | None]:
+    """Resolve the exact FHB process policy that must match the backend."""
+    configured = environment.get("BEELZEBUB_PONG_FHB_PROFILE")
+    try:
+        scheduling = scheduling_config_from_environment(
+            environment.get("BEELZEBUB_PONG_SCHEDULING_MODE"),
+            environment.get("BEELZEBUB_PONG_PERIODIC_INTERVAL_MS"),
+        )
+        if configured is None or not configured.strip():
+            return None, None
+        if configured != FHB_PROFILE_ID:
+            raise ValueError("FHB_PROFILE_UNSUPPORTED")
+        if resolve_paper_profile(profile_key).selection_key != PONG_ENTRY_PROFILE_VERSION:
+            raise ValueError("FHB_PONG_PROFILE_NOT_SELECTED")
+        config = (
+            FHBConfig.periodic_protected()
+            if scheduling.enabled
+            else FHBConfig()
+        )
+        return config.profile_id, config.policy_fingerprint
+    except ValueError as exc:
+        raise RuntimeError("BeezConsole FHB launch policy is invalid.") from exc
 
 
 def _maintenance_arguments(argv: Sequence[str]) -> dict[str, str] | None:
@@ -308,6 +342,10 @@ def resolve_launch_binding(
         raise RuntimeError("PONG_PAPER_CONTRACT_TOPOLOGY_MISMATCH")
     paper_policy = paper_policy_for_topology(profile.policy, paper_topology)
     paper_risk = paper_risk_for_topology(profile.risk, paper_topology)
+    fhb_profile, fhb_policy_fingerprint = resolve_fhb_launch_policy(
+        profile.selection_key,
+        source_environment,
+    )
     return LaunchBinding(
         runtime_root=runtime_root,
         ledger_path=ledger_path,
@@ -321,6 +359,8 @@ def resolve_launch_binding(
         paper_policy_hash=paper_policy.configuration_hash,
         risk_profile_hash=paper_risk.configuration_hash,
         source=source,
+        fhb_profile=fhb_profile,
+        fhb_policy_fingerprint=fhb_policy_fingerprint,
         ledger_identity=ledger_identity,
         operation_id=operation_id,
     )
@@ -539,6 +579,21 @@ def adopt_exact_requested_target_listener(
         or dict(target_runtime_binding) != dict(actual)
     ):
         raise RuntimeError("BeezConsole requested target runtime binding is inconsistent.")
+    target_fhb_profile = target_runtime_binding.get("fhb_profile")
+    target_fhb_policy_fingerprint = target_runtime_binding.get("fhb_policy_fingerprint")
+    supported_fhb_policy_fingerprints = {
+        FHBConfig().policy_fingerprint,
+        FHBConfig.periodic_protected().policy_fingerprint,
+    }
+    if not (
+        (target_fhb_profile is None and target_fhb_policy_fingerprint is None)
+        or (
+            target_fhb_profile == FHB_PROFILE_ID
+            and target_fhb_policy_fingerprint in supported_fhb_policy_fingerprints
+            and manifest.get("target_profile") == PONG_ENTRY_PROFILE_VERSION
+        )
+    ):
+        raise RuntimeError("BeezConsole requested target FHB binding is inconsistent.")
     target_parent_pid = actual.get("parent_pid")
     if type(target_parent_pid) is not int or target_parent_pid <= 0:
         raise RuntimeError("BeezConsole requested target parent process identity is inconsistent.")
@@ -559,6 +614,14 @@ def adopt_exact_requested_target_listener(
         paper_policy_hash=profile.policy.configuration_hash,
         risk_profile_hash=profile.risk.configuration_hash,
         source="REQUESTED_TARGET_EXISTING_LISTENER",
+        fhb_profile=(
+            None if target_fhb_profile is None else str(target_fhb_profile)
+        ),
+        fhb_policy_fingerprint=(
+            None
+            if target_fhb_policy_fingerprint is None
+            else str(target_fhb_policy_fingerprint)
+        ),
         ledger_identity=str(ledger_identity),
         operation_id=operation_id,
         expected_pid=target_runtime_pid,
@@ -663,6 +726,15 @@ def server_environment(
 ) -> dict[str, str]:
     """Create a clean child environment bound to this launch decision."""
     source = os.environ if environment is None else environment
+    fhb_profile, fhb_policy_fingerprint = resolve_fhb_launch_policy(
+        binding.profile,
+        source,
+    )
+    if (
+        fhb_profile != binding.fhb_profile
+        or fhb_policy_fingerprint != binding.fhb_policy_fingerprint
+    ):
+        raise RuntimeError("FHB_LAUNCH_BINDING_MISMATCH")
     child = dict(source)
     # These two paper-only Pong switches are explicit process-launch
     # authorities, not stale profile bindings. Preserve them across the clean

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
+from functools import lru_cache
 import hashlib
 import json
 import time
@@ -75,6 +76,30 @@ FHB_PERIODIC_ACTUAL_OFFERED_SERVICE_POLICY_HASH = hashlib.sha256(
 ).hexdigest()
 
 
+def _policy_fingerprint(payload: Mapping[str, object]) -> str:
+    """Identify the exact effective FHB policy without implying authority."""
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8"),
+    ).hexdigest()
+
+
+@lru_cache(maxsize=8192)
+def _mnq_price_ticks(value: str) -> int:
+    """Convert one exact MNQ price string under the fixed signed tick contract."""
+    price = Decimal(value)
+    if not price.is_finite() or price <= 0:
+        raise ValueError("FHB_PRICE_INVALID")
+    ticks = price / Decimal("0.25")
+    if ticks != ticks.to_integral_value():
+        raise ValueError("FHB_PRICE_NOT_ON_TICK_GRID")
+    return int(ticks)
+
+
 class FHBAction(StrEnum):
     EVALUATE = "EVALUATE"
     SKIP_OUT_OF_CORE = "SKIP_OUT_OF_CORE"
@@ -102,13 +127,13 @@ class FHBConfig:
     def __post_init__(self) -> None:
         if self.profile_id != FHB_PROFILE_ID:
             raise ValueError("FHB_PROFILE_UNSUPPORTED")
-        if self.core_levels_per_side not in {10, 20}:
+        if self.core_levels_per_side != 10:
             raise ValueError("FHB_CORE_WIDTH_UNSUPPORTED")
         if self.core_levels_per_side > FHB_SUPPORTED_SOURCE_LEVELS_PER_SIDE:
             raise ValueError("FHB_CORE_WIDTH_EXCEEDS_SIGNED_SOURCE_COVERAGE")
         if self.shadow_history_seconds != 5:
             raise ValueError("FHB_SHADOW_WINDOW_UNSUPPORTED")
-        if self.movement_reserve_ticks not in {32, 64}:
+        if self.movement_reserve_ticks != 32:
             raise ValueError("FHB_MOVEMENT_RESERVE_UNSUPPORTED")
         if self.tick_size != Decimal("0.25"):
             raise ValueError("FHB_TICK_SIZE_UNSUPPORTED")
@@ -259,6 +284,11 @@ class FHBConfig:
             }
         return None
 
+    @property
+    def policy_fingerprint(self) -> str:
+        """Hash the admitted effective policy; this is not a launch signature."""
+        return _policy_fingerprint(self.payload())
+
 
 @dataclass(frozen=True)
 class FHBDecision:
@@ -306,9 +336,13 @@ class FocusedHorizonBand:
         self._capacity_losses = 0
         self._movement_reserve_observations = 0
         self._shadow_maintenance_ns = 0
+        self._maintenance_ticks = 0
+        self._last_source_sequence: int | None = None
+        self._last_source_event_id: str | None = None
         self._last_decision: FHBDecision | None = None
         self._current_rewarm_prices: tuple[str, ...] = ()
         self._last_invalidation_reason: str | None = None
+        self._unavailable_reason: str | None = "FHB_NOT_INITIALIZED"
         self._rewarm_started_at: datetime | None = None
         self._last_rewarm_seconds: float | None = None
         self._maximum_rewarm_seconds = 0.0
@@ -323,15 +357,12 @@ class FocusedHorizonBand:
 
     def _ticks(self, value: object) -> int:
         try:
-            price = Decimal(str(value))
+            return _mnq_price_ticks(str(value))
         except (InvalidOperation, TypeError, ValueError) as error:
+            reason = str(error)
+            if reason == "FHB_PRICE_NOT_ON_TICK_GRID":
+                raise ValueError(reason) from error
             raise ValueError("FHB_PRICE_INVALID") from error
-        if not price.is_finite() or price <= 0:
-            raise ValueError("FHB_PRICE_INVALID")
-        ticks = price / self.config.tick_size
-        if ticks != ticks.to_integral_value():
-            raise ValueError("FHB_PRICE_NOT_ON_TICK_GRID")
-        return int(ticks)
 
     def _price(self, ticks: int) -> Decimal:
         return Decimal(ticks) * self.config.tick_size
@@ -345,7 +376,33 @@ class FocusedHorizonBand:
         self._current_rewarm_prices = ()
         self._rewarm_started_at = at
         self._last_invalidation_reason = reason
+        self._unavailable_reason = reason
         self._reset_count += 1
+
+    def _unavailable_decision(
+        self,
+        reason: str,
+        *,
+        at: datetime,
+        side: BookSide | None,
+        price_ticks: int | None,
+        clear: bool,
+    ) -> FHBDecision:
+        self.invalidate(reason, at=at)
+        self._rewarm_required += 1
+        decision = FHBDecision(
+            FHBAction.REWARM_REQUIRED,
+            reason,
+            side,
+            price_ticks,
+            False,
+            False,
+            (),
+            (),
+            clear,
+        )
+        self._last_decision = decision
+        return decision
 
     def _snapshot(
         self, payload: Mapping[str, object], side: BookSide,
@@ -471,6 +528,12 @@ class FocusedHorizonBand:
     ) -> FHBDecision:
         started = time.perf_counter_ns()
         self._source_depth_records += 1
+        self._maintenance_ticks += 1
+        sequence = payload.get("source_event_sequence")
+        if type(sequence) is not int or sequence <= 0:
+            raise ValueError("FHB_SOURCE_SEQUENCE_INVALID")
+        self._last_source_sequence = sequence
+        self._last_source_event_id = event.event_id
         at = event._ordering_key[0]
         clear = False
         try:
@@ -486,14 +549,63 @@ class FocusedHorizonBand:
                 clear = True
             if generation is not None:
                 self._generation = generation
-            if payload.get("is_reset") is True or str(payload.get("status") or "").upper() == "UNAVAILABLE":
-                self.invalidate("FHB_SOURCE_RESET_OR_UNAVAILABLE", at=at)
+            side_text = str(
+                payload.get("side") or payload.get("mutation_side") or ""
+            ).upper()
+            side = (
+                BookSide.BID if side_text == "BID"
+                else BookSide.ASK if side_text == "ASK"
+                else None
+            )
+            price_ticks: int | None = None
+            try:
+                price_ticks = self._ticks(payload.get("mutation_price"))
+            except ValueError:
+                pass
+            unavailable = str(payload.get("status") or "").upper() == "UNAVAILABLE"
+            reset = (
+                payload.get("is_reset") is True
+                or payload.get("mutation_is_reset") is True
+            )
+            if unavailable:
+                source_reason = str(payload.get("reason") or "SOURCE_UNAVAILABLE")
+                return self._unavailable_decision(
+                    "FHB_SOURCE_UNAVAILABLE:" + source_reason,
+                    at=at,
+                    side=side,
+                    price_ticks=price_ticks,
+                    clear=True,
+                )
+            if reset:
+                self.invalidate("FHB_SOURCE_RESET", at=at)
                 clear = True
 
             snapshots = {
                 BookSide.BID: self._snapshot(payload, BookSide.BID),
                 BookSide.ASK: self._snapshot(payload, BookSide.ASK),
             }
+            if any(
+                len(snapshots[book_side]) != self.config.core_levels_per_side
+                for book_side in (BookSide.BID, BookSide.ASK)
+            ):
+                return self._unavailable_decision(
+                    "FHB_SIGNED_CORE_INCOMPLETE",
+                    at=at,
+                    side=side,
+                    price_ticks=price_ticks,
+                    clear=True,
+                )
+            if (
+                snapshots[BookSide.BID][0][0]
+                >= snapshots[BookSide.ASK][0][0]
+            ):
+                return self._unavailable_decision(
+                    "FHB_SIGNED_BOOK_CROSSED",
+                    at=at,
+                    side=side,
+                    price_ticks=price_ticks,
+                    clear=True,
+                )
             previous = {side: self._core[side] for side in self._core}
             previous_quantities = {
                 side: {
@@ -502,24 +614,61 @@ class FocusedHorizonBand:
                 }
                 for side in (BookSide.BID, BookSide.ASK)
             }
-            current: dict[BookSide, tuple[int, ...]] = {}
-            for side in (BookSide.BID, BookSide.ASK):
-                current[side] = tuple(
-                    ticks for ticks, _ in snapshots[side][: self.config.core_levels_per_side]
+            operation = str(
+                payload.get("operation")
+                or payload.get("mutation_operation")
+                or "Update"
+            )
+            mutation_position = payload.get("mutation_position")
+            current: dict[BookSide, tuple[int, ...]] = {
+                book_side: tuple(
+                    ticks for ticks, _ in snapshots[book_side][
+                        : self.config.core_levels_per_side
+                    ]
                 )
-                current_set = set(current[side])
-                for ticks, quantity in snapshots[side]:
-                    self._ensure_price(side, ticks, quantity, at, current_set)
+                for book_side in (BookSide.BID, BookSide.ASK)
+            }
+            proven_out_of_core_remove = False
+            if (
+                price_ticks is None
+                and operation.upper() == "REMOVE"
+                and side is not None
+                and type(mutation_position) is int
+            ):
+                if 0 <= mutation_position < len(previous[side]):
+                    # NinjaTrader positional Remove callbacks can carry
+                    # price=0. The coherent pre-mutation signed cursor and
+                    # zero-based Position identify an authentic removed core
+                    # price; never guess from the post-mutation snapshot.
+                    price_ticks = previous[side][mutation_position]
+                elif (
+                    mutation_position >= self.config.core_levels_per_side
+                    and all(
+                        current[book_side] == previous[book_side]
+                        for book_side in (BookSide.BID, BookSide.ASK)
+                    )
+                ):
+                    # A deep positional removal has no signed price identity.
+                    # It is safely out of core only when both signed prefixes
+                    # prove that the core is unchanged across the mutation.
+                    proven_out_of_core_remove = True
+            if side is None or (
+                price_ticks is None and not proven_out_of_core_remove
+            ):
+                return self._unavailable_decision(
+                    "FHB_MUTATION_IDENTITY_UNRESOLVED",
+                    at=at,
+                    side=side,
+                    price_ticks=price_ticks,
+                    clear=True,
+                )
+            for book_side in (BookSide.BID, BookSide.ASK):
+                current_set = set(current[book_side])
+                for ticks, quantity in snapshots[book_side]:
+                    self._ensure_price(
+                        book_side, ticks, quantity, at, current_set,
+                    )
             self._core = current
-
-            side_text = str(payload.get("side") or "").upper()
-            side = BookSide.BID if side_text == "BID" else BookSide.ASK if side_text == "ASK" else None
-            price_ticks: int | None = None
-            if side is not None:
-                try:
-                    price_ticks = self._ticks(payload.get("mutation_price"))
-                except ValueError:
-                    price_ticks = None
 
             promoted: list[int] = []
             for book_side in (BookSide.BID, BookSide.ASK):
@@ -532,10 +681,9 @@ class FocusedHorizonBand:
             post_member = bool(side is not None and price_ticks in current[side])
             if side is not None and price_ticks is not None and snapshots[side]:
                 level_map = dict(snapshots[side])
-                operation = str(payload.get("operation") or "Update")
                 quantity = (
                     Decimal("0")
-                    if operation == "Remove"
+                    if operation.upper() == "REMOVE"
                     else Decimal(str(payload.get("mutation_volume") or level_map.get(price_ticks) or 0))
                 )
                 if not quantity.is_finite() or quantity < 0:
@@ -544,7 +692,7 @@ class FocusedHorizonBand:
                 touch = self._price(touch_ticks)
                 price = self._price(price_ticks)
                 nearby = sum((item[1] for item in snapshots[side]), Decimal("0"))
-                if operation == "Remove" and pre_member and (
+                if operation.upper() == "REMOVE" and pre_member and (
                     (side is BookSide.BID and price > touch)
                     or (side is BookSide.ASK and price < touch)
                 ):
@@ -659,6 +807,10 @@ class FocusedHorizonBand:
                     clear,
                 )
             self._last_decision = decision
+            if self.entry_ready:
+                self._unavailable_reason = None
+            elif self._unavailable_reason in {None, "FHB_NOT_INITIALIZED"}:
+                self._unavailable_reason = decision.reason
             return decision
         finally:
             self._shadow_maintenance_ns += time.perf_counter_ns() - started
@@ -671,11 +823,26 @@ class FocusedHorizonBand:
         last = self._last_decision
         return {
             "enabled": True,
+            "effective_profile": self.config.profile_id,
+            "effective_policy": self.config.payload(),
+            "effective_policy_fingerprint": self.config.policy_fingerprint,
             "configuration": self.config.payload(),
             "source_generation": self._generation,
+            "maintenance_ticks": self._maintenance_ticks,
+            "last_source_sequence": self._last_source_sequence,
+            "last_source_event_id": self._last_source_event_id,
             "signed_core_ticks": {
                 side.value: list(self._core[side])
                 for side in (BookSide.BID, BookSide.ASK)
+            },
+            "band": {
+                "dynamic": True,
+                "core_levels_per_side": self.config.core_levels_per_side,
+                "bid_ticks": list(self._core[BookSide.BID]),
+                "ask_ticks": list(self._core[BookSide.ASK]),
+                "source_levels_per_side_maximum": (
+                    FHB_SUPPORTED_SOURCE_LEVELS_PER_SIDE
+                ),
             },
             "shadow_prices": {
                 side.value: len(self._shadow[side])
@@ -697,8 +864,20 @@ class FocusedHorizonBand:
             "reset_count": self._reset_count,
             "capacity_losses": self._capacity_losses,
             "movement_reserve_observations": self._movement_reserve_observations,
+            "movement_guard": {
+                "reserve_ticks": self.config.movement_reserve_ticks,
+                "mode": "DIAGNOSTIC_ONLY_ALL_AUTHENTIC_INPUT_RETAINED",
+                "observations_outside_reserve": self._movement_reserve_observations,
+            },
             "shadow_maintenance_nanoseconds": self._shadow_maintenance_ns,
             "last_invalidation_reason": self._last_invalidation_reason,
+            "unavailable_reason": self._unavailable_reason,
+            "history": {
+                "window_seconds": self.config.shadow_history_seconds,
+                "ready": self.entry_ready,
+                "rewarm_prices": list(self._current_rewarm_prices),
+                "shadow_events": self._shadow_event_count,
+            },
             "last_decision": None if last is None else {
                 "action": last.action.value,
                 "reason": last.reason,

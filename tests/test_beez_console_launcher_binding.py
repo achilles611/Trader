@@ -64,8 +64,9 @@ def write_operation(
     *,
     git_sha: str,
     stage: str,
+    target_profile: str = "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2",
 ) -> tuple[dict[str, object], dict[str, object]]:
-    target = beez_console.resolve_paper_profile("BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2")
+    target = beez_console.resolve_paper_profile(target_profile)
     operation_root = expected.runtime_root / "profile-switch" / "operations" / operation_id
     operation_root.mkdir(parents=True)
     manifest_path = operation_root / "manifest.json"
@@ -231,7 +232,6 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
                     "BEELZEBUB_PONG_COMMISSIONING_AUTHORIZATION": "TEST-ONLY-authority.json",
                     "BEELZEBUB_PONG_SCHEDULING_MODE": "PERIODIC_FLAT_PROTECTED",
                     "BEELZEBUB_PONG_PERIODIC_INTERVAL_MS": "20",
-                    "BEELZEBUB_PONG_FHB_PROFILE": "TOP10_CORE_WITH_5S_SHADOW_V1",
                     "BEELZEBUB_PONG_CONTRACT_TOPOLOGY": "DEC26",
                     "BEELZEBUB_L3G_PAPER_CONTRACT_TOPOLOGY": "DEC26",
                 },
@@ -246,10 +246,6 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
             self.assertEqual(child["BEELZEBUB_PONG_COMMISSIONING_AUTHORIZATION"], "TEST-ONLY-authority.json")
             self.assertEqual(child["BEELZEBUB_PONG_SCHEDULING_MODE"], "PERIODIC_FLAT_PROTECTED")
             self.assertEqual(child["BEELZEBUB_PONG_PERIODIC_INTERVAL_MS"], "20")
-            self.assertEqual(
-                child["BEELZEBUB_PONG_FHB_PROFILE"],
-                "TOP10_CORE_WITH_5S_SHADOW_V1",
-            )
             self.assertEqual(child["BEELZEBUB_PONG_CONTRACT_TOPOLOGY"], "DEC26")
             self.assertEqual(child["BEELZEBUB_L3G_PAPER_CONTRACT_TOPOLOGY"], "DEC26")
 
@@ -268,6 +264,9 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
             environment = {
                 "BEELZEBUB_L3G_PAPER_CONTRACT_TOPOLOGY": "DEC26",
                 "BEELZEBUB_PONG_CONTRACT_TOPOLOGY": "DEC26",
+                "BEELZEBUB_PONG_SCHEDULING_MODE": "PERIODIC_FLAT_PROTECTED",
+                "BEELZEBUB_PONG_PERIODIC_INTERVAL_MS": "20",
+                "BEELZEBUB_PONG_FHB_PROFILE": "TOP10_CORE_WITH_5S_SHADOW_V1",
             }
             with patch("beez_console.checkout_git_sha", return_value=GIT_SHA):
                 resolved = beez_console.resolve_launch_binding(
@@ -289,6 +288,45 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
             self.assertEqual(
                 resolved.risk_profile_hash, expected_risk.configuration_hash,
             )
+            expected_fhb = beez_console.FHBConfig.periodic_protected()
+            self.assertEqual(resolved.fhb_profile, expected_fhb.profile_id)
+            self.assertEqual(
+                resolved.fhb_policy_fingerprint,
+                expected_fhb.policy_fingerprint,
+            )
+            child = beez_console.server_environment(resolved, environment)
+            self.assertEqual(
+                child["BEELZEBUB_PONG_FHB_PROFILE"],
+                expected_fhb.profile_id,
+            )
+
+    def test_server_environment_rejects_fhb_policy_drift_after_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project(root)
+            ledger = root / "explicit" / "hot" / "lane_iii_paper.sqlite3"
+            audit = root / "explicit" / "audit"
+            argv = (
+                "--maintenance-ledger-path", str(ledger),
+                "--maintenance-audit-root", str(audit),
+                "--maintenance-ledger-epoch", "L3G-PAPER-EPOCH-FHB-TEST",
+                "--maintenance-paper-profile", "BEELZEBUB_PONG_DISCERNMENT_V1",
+            )
+            selected = {
+                "BEELZEBUB_L3G_PAPER_CONTRACT_TOPOLOGY": "DEC26",
+                "BEELZEBUB_PONG_CONTRACT_TOPOLOGY": "DEC26",
+                "BEELZEBUB_PONG_SCHEDULING_MODE": "PERIODIC_FLAT_PROTECTED",
+                "BEELZEBUB_PONG_PERIODIC_INTERVAL_MS": "20",
+                "BEELZEBUB_PONG_FHB_PROFILE": "TOP10_CORE_WITH_5S_SHADOW_V1",
+            }
+            with patch("beez_console.checkout_git_sha", return_value=GIT_SHA):
+                resolved = beez_console.resolve_launch_binding(
+                    root, argv=argv, environment=selected,
+                )
+            drifted = dict(selected)
+            drifted.pop("BEELZEBUB_PONG_FHB_PROFILE")
+            with self.assertRaisesRegex(RuntimeError, "FHB_LAUNCH_BINDING_MISMATCH"):
+                beez_console.server_environment(resolved, drifted)
 
     def test_launch_binding_rejects_mixed_contract_topologies(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -366,6 +404,19 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
             beez_console.validate_runtime_binding(actual, expected)
             actual["entry_profile_version"] = "BEELZEBUB_SCALPER_V2"
             with self.assertRaisesRegex(RuntimeError, "entry_profile_version"):
+                beez_console.validate_runtime_binding(actual, expected)
+
+    def test_runtime_binding_requires_exact_fhb_policy_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            expected = replace(
+                binding(Path(directory)),
+                fhb_profile="TOP10_CORE_WITH_5S_SHADOW_V1",
+                fhb_policy_fingerprint="a" * 64,
+            )
+            actual = runtime_binding(expected)
+            beez_console.validate_runtime_binding(actual, expected)
+            actual["fhb_policy_fingerprint"] = "b" * 64
+            with self.assertRaisesRegex(RuntimeError, "fhb_policy_fingerprint"):
                 beez_console.validate_runtime_binding(actual, expected)
 
     def test_runtime_binding_requires_a_real_process_identity(self) -> None:
@@ -583,7 +634,7 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "will not compete"):
                     beez_console.assert_remembered_launch_is_not_competing(expected)
 
-    def test_exact_existing_requested_target_is_adopted_without_competing_launch(self) -> None:
+    def test_exact_existing_fhb_target_is_adopted_without_competing_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             project(root)
@@ -592,6 +643,7 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
             manifest, state = write_operation(
                 established, operation_id, git_sha=GIT_SHA,
                 stage="TARGET_ACTIVE_FLAT_BLOCKED",
+                target_profile="BEELZEBUB_PONG_DISCERNMENT_V1",
             )
             requested = {
                 "profile": manifest["target_profile"],
@@ -600,6 +652,7 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
                 "requested_at": manifest["created_at"],
             }
             profile = beez_console.resolve_paper_profile(str(manifest["target_profile"]))
+            fhb = beez_console.FHBConfig.periodic_protected()
             actual = {
                 "ledger": manifest["ledger_path"],
                 "audit": manifest["audit_root"],
@@ -610,6 +663,8 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
                 "entry_profile_version": profile.policy.entry_profile_version,
                 "paper_policy_hash": profile.policy.configuration_hash,
                 "risk_profile_hash": profile.risk.configuration_hash,
+                "fhb_profile": fhb.profile_id,
+                "fhb_policy_fingerprint": fhb.policy_fingerprint,
                 "ledger_epoch": manifest["ledger_epoch"],
                 "ledger_identity": "l3g-ledger-" + "e" * 32,
                 "profile_selection_source": "PROFILE_SWITCH_MANIFEST",
@@ -632,6 +687,8 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
             self.assertEqual(adopted.source, "REQUESTED_TARGET_EXISTING_LISTENER")
             self.assertEqual(adopted.profile, profile.selection_key)
             self.assertEqual(adopted.operation_id, operation_id)
+            self.assertEqual(adopted.fhb_profile, fhb.profile_id)
+            self.assertEqual(adopted.fhb_policy_fingerprint, fhb.policy_fingerprint)
             self.assertEqual(adopted.ledger_identity, actual["ledger_identity"])
             self.assertEqual(adopted.expected_pid, 8765)
             self.assertEqual(adopted.expected_parent_pid, 4321)
@@ -680,6 +737,26 @@ class BeezConsoleLauncherBindingTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "target process identity"):
                     beez_console.adopt_exact_requested_target_listener(
                         root, established, actual,
+                    )
+
+            invalid_fhb = {
+                **actual,
+                "fhb_policy_fingerprint": "a" * 64,
+            }
+            invalid_fhb_state = {
+                **state,
+                "target_runtime_binding": dict(invalid_fhb),
+            }
+            with (
+                patch("beez_console.validated_profile_selection", return_value=selection),
+                patch(
+                    "beez_console._validated_operation",
+                    return_value=(manifest, invalid_fhb_state),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "target FHB binding"):
+                    beez_console.adopt_exact_requested_target_listener(
+                        root, established, invalid_fhb,
                     )
 
     def test_runtime_binding_enforces_typed_expected_pid(self) -> None:

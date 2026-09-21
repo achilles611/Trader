@@ -2009,6 +2009,14 @@ def create_control_center_app(
         "entry_profile_version": selected_paper_policy.entry_profile_version,
         "paper_policy_hash": selected_paper_policy.configuration_hash,
         "risk_profile_hash": selected_paper_risk.configuration_hash,
+        "fhb_profile": (
+            None if pong_fhb_config is None else pong_fhb_config.profile_id
+        ),
+        "fhb_policy_fingerprint": (
+            None
+            if pong_fhb_config is None
+            else pong_fhb_config.policy_fingerprint
+        ),
         "ledger_epoch": resolve_ledger_epoch(paper_path, configured_paper_epoch),
         "risk_continuity_artifact_sha256": (
             None if risk_continuity_artifact is None
@@ -2663,6 +2671,7 @@ def create_control_center_app(
                 launch_authorization=pong_launch_authorization,
                 history_verification_key=LocalPaperSecretProvider().load_key(),
                 fhb_config=pong_fhb_config,
+                fhb_requested_profile=configured_fhb_profile,
                 scheduling=pong_scheduling,
                 topology=pong_topology,
             )

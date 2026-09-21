@@ -14,6 +14,7 @@ from src.l3g_paper.fhb import (
     FHBAction, FHBConfig, FocusedHorizonBand,
     FHB_ACTUAL_OFFERED_SERVICE_POLICY_ID,
     FHB_PERIODIC_ACTUAL_OFFERED_SERVICE_POLICY_ID,
+    _mnq_price_ticks,
 )
 from src.l3g_paper.pong_microstructure import BookSide, CausalEventRef
 from src.l3g_paper.pong_production import PongProductionHost
@@ -137,6 +138,34 @@ class FocusedHorizonBandTests(unittest.TestCase):
         self.assertEqual(policy["minimum_observed_event_rate"], "NONE")
         self.assertEqual(FHBConfig.from_payload(config.payload()), config)
 
+    def test_signed_policy_is_exact_top10_five_seconds_and_32_ticks(self) -> None:
+        config = FHBConfig()
+        self.assertEqual(config.core_levels_per_side, 10)
+        self.assertEqual(config.shadow_history_seconds, 5)
+        self.assertEqual(config.movement_reserve_ticks, 32)
+        self.assertEqual(
+            FHBConfig.from_payload(config.payload()).policy_fingerprint,
+            config.policy_fingerprint,
+        )
+        self.assertEqual(len(config.policy_fingerprint), 64)
+        with self.assertRaisesRegex(ValueError, "FHB_CORE_WIDTH_UNSUPPORTED"):
+            FHBConfig(core_levels_per_side=20)
+        with self.assertRaisesRegex(ValueError, "FHB_MOVEMENT_RESERVE_UNSUPPORTED"):
+            FHBConfig(movement_reserve_ticks=64)
+
+    def test_exact_price_tick_conversion_cache_is_bounded_and_semantic(self) -> None:
+        _mnq_price_ticks.cache_clear()
+        self.assertEqual(_mnq_price_ticks("30111.50"), 120446)
+        self.assertEqual(_mnq_price_ticks("30111.50"), 120446)
+        info = _mnq_price_ticks.cache_info()
+        self.assertEqual(info.maxsize, 8192)
+        self.assertEqual(info.misses, 1)
+        self.assertEqual(info.hits, 1)
+        with self.assertRaisesRegex(ValueError, "FHB_PRICE_NOT_ON_TICK_GRID"):
+            _mnq_price_ticks("30111.51")
+        with self.assertRaisesRegex(ValueError, "FHB_PRICE_INVALID"):
+            _mnq_price_ticks("0")
+
     def test_signed_bid_and_ask_prefix_membership_not_nearest_price(self) -> None:
         gapped_asks = levels(Decimal("100.25"), 1, Decimal("0.25")) + levels(
             Decimal("120.00"), 9, Decimal("1.00"),
@@ -159,7 +188,13 @@ class FocusedHorizonBandTests(unittest.TestCase):
         )
         self.assertIs(result.action, FHBAction.EVALUATE)
         self.assertTrue(result.post_core_member)
-        self.assertGreater(self.fhb.status()["movement_reserve_observations"], 0)
+        status = self.fhb.status()
+        self.assertGreater(status["movement_reserve_observations"], 0)
+        self.assertEqual(status["movement_guard"]["reserve_ticks"], 32)
+        self.assertEqual(
+            status["movement_guard"]["mode"],
+            "DIAGNOSTIC_ONLY_ALL_AUTHENTIC_INPUT_RETAINED",
+        )
 
     def test_out_of_core_mutation_is_shadowed_and_intentionally_skipped(self) -> None:
         self.fhb.process_depth(
@@ -231,6 +266,139 @@ class FocusedHorizonBandTests(unittest.TestCase):
             )
         self.assertGreater(bounded.status()["capacity_losses"], 0)
 
+    def test_unavailable_and_crossed_books_invalidate_without_fallback(self) -> None:
+        unavailable_payload = payload(sequence=1)
+        unavailable_payload.update({
+            "status": "UNAVAILABLE",
+            "reason": "CROSSED_NATIVE_POSITIONAL_SNAPSHOT",
+            "side": None,
+            "mutation_side": "Bid",
+            "bids": [],
+            "asks": [],
+        })
+        unavailable = self.fhb.process_depth(
+            unavailable_payload,
+            event(1, self.start),
+        )
+        self.assertIs(unavailable.action, FHBAction.REWARM_REQUIRED)
+        self.assertTrue(unavailable.clear_feature_windows)
+        status = self.fhb.status()
+        self.assertEqual(status["maintenance_ticks"], 1)
+        self.assertEqual(status["last_source_sequence"], 1)
+        self.assertEqual(
+            status["unavailable_reason"],
+            "FHB_SOURCE_UNAVAILABLE:CROSSED_NATIVE_POSITIONAL_SNAPSHOT",
+        )
+        self.assertFalse(status["entry_ready"])
+
+        crossed = payload(
+            sequence=2,
+            bids=levels(Decimal("100.50"), 10, Decimal("-0.25")),
+            asks=levels(Decimal("100.25"), 10, Decimal("0.25")),
+        )
+        rejected = self.fhb.process_depth(
+            crossed,
+            event(2, self.start + timedelta(seconds=1)),
+        )
+        self.assertIs(rejected.action, FHBAction.REWARM_REQUIRED)
+        self.assertEqual(
+            self.fhb.status()["unavailable_reason"],
+            "FHB_SIGNED_BOOK_CROSSED",
+        )
+
+        partial = payload(
+            sequence=3,
+            bids=levels(Decimal("100.00"), 9, Decimal("-0.25")),
+        )
+        rejected = self.fhb.process_depth(
+            partial,
+            event(3, self.start + timedelta(seconds=2)),
+        )
+        self.assertIs(rejected.action, FHBAction.REWARM_REQUIRED)
+        self.assertTrue(rejected.clear_feature_windows)
+        self.assertEqual(
+            self.fhb.status()["unavailable_reason"],
+            "FHB_SIGNED_CORE_INCOMPLETE",
+        )
+
+    def test_zero_price_positional_remove_uses_coherent_prior_core_identity(self) -> None:
+        self.fhb.process_depth(
+            payload(sequence=1, mutation_price="97.50"),
+            event(1, self.start),
+        )
+        result = self.fhb.process_depth(
+            payload(
+                sequence=2,
+                operation="Remove",
+                mutation_price="0",
+                mutation_volume=0,
+                bids=levels(Decimal("99.75"), 10, Decimal("-0.25")),
+            ),
+            event(2, self.start + timedelta(seconds=5)),
+        )
+        self.assertIs(result.action, FHBAction.EVALUATE)
+        self.assertTrue(result.pre_core_member)
+        self.assertFalse(result.post_core_member)
+        self.assertEqual(result.price_ticks, 400)
+        self.assertEqual(
+            [item.price for item in result.seed_observations],
+            [Decimal("100.00")],
+        )
+
+    def test_zero_price_remove_without_coherent_prior_position_fails_closed(self) -> None:
+        result = self.fhb.process_depth(
+            payload(
+                sequence=1,
+                operation="Remove",
+                mutation_price="0",
+                mutation_volume=0,
+            ),
+            event(1, self.start),
+        )
+        self.assertIs(result.action, FHBAction.REWARM_REQUIRED)
+        self.assertTrue(result.clear_feature_windows)
+        self.assertEqual(
+            self.fhb.status()["unavailable_reason"],
+            "FHB_MUTATION_IDENTITY_UNRESOLVED",
+        )
+
+    def test_zero_price_deep_remove_skips_only_when_signed_core_is_unchanged(self) -> None:
+        self.fhb.process_depth(payload(sequence=1), event(1, self.start))
+        deep_remove = payload(
+            sequence=2,
+            operation="Remove",
+            mutation_price="0",
+            mutation_volume=0,
+        )
+        deep_remove["mutation_position"] = 23
+        result = self.fhb.process_depth(
+            deep_remove,
+            event(2, self.start + timedelta(seconds=5)),
+        )
+        self.assertIs(result.action, FHBAction.SKIP_OUT_OF_CORE)
+        self.assertIsNone(result.price_ticks)
+        self.assertFalse(result.clear_feature_windows)
+        self.assertTrue(self.fhb.status()["entry_ready"])
+
+        changed = payload(
+            sequence=3,
+            operation="Remove",
+            mutation_price="0",
+            mutation_volume=0,
+            bids=levels(Decimal("99.75"), 10, Decimal("-0.25")),
+        )
+        changed["mutation_position"] = 25
+        blocked = self.fhb.process_depth(
+            changed,
+            event(3, self.start + timedelta(seconds=6)),
+        )
+        self.assertIs(blocked.action, FHBAction.REWARM_REQUIRED)
+        self.assertTrue(blocked.clear_feature_windows)
+        self.assertEqual(
+            self.fhb.status()["unavailable_reason"],
+            "FHB_MUTATION_IDENTITY_UNRESOLVED",
+        )
+
 
 class FHBProductionIntegrationTests(unittest.TestCase):
     @staticmethod
@@ -289,6 +457,120 @@ class FHBProductionIntegrationTests(unittest.TestCase):
             )
             self.assertEqual(status["fhb"]["out_of_core_skips"], 1)
             self.assertEqual(status["compute_workers"], 0)
+            activation = status["fhb_activation"]
+            self.assertEqual(
+                activation["requested_profile"],
+                "TOP10_CORE_WITH_5S_SHADOW_V1",
+            )
+            self.assertTrue(activation["admitted"])
+            self.assertTrue(activation["instantiated"])
+            self.assertTrue(activation["ready"])
+            self.assertEqual(activation["maintenance_ticks"], 3)
+            self.assertEqual(activation["last_maintained_source_sequence"], 3)
+            self.assertEqual(activation["last_output_source_sequence"], 3)
+            self.assertFalse(activation["consumed"])
+            self.assertEqual(activation["consumer_count"], 0)
+            self.assertEqual(activation["fallback"]["mode"], "NONE")
+            self.assertFalse(
+                activation["fallback"]["full_depth_fallback_allowed"],
+            )
+            self.assertEqual(
+                activation["effective_policy_fingerprint"],
+                status["fhb"]["effective_policy_fingerprint"],
+            )
+
+    def test_real_strategy_consumers_read_fhb_outputs_and_report_last_sequence(self) -> None:
+        with TemporaryDirectory(prefix="fhb-consumer-") as root:
+            clock = ControllableClock()
+            host = self._host(root, FHBConfig(), clock)
+            start = datetime(2026, 9, 16, 18, 0, tzinfo=timezone.utc)
+            depth_records = (
+                (1, "Bid", "100.00", 0.0),
+                (2, "Ask", "100.25", 0.1),
+                (3, "Bid", "100.00", 5.0),
+                (4, "Ask", "100.25", 5.1),
+            )
+            for sequence, side, price, seconds in depth_records:
+                host._consume_observation(verified(
+                    "DEPTH",
+                    payload(
+                        sequence=sequence,
+                        side=side,
+                        mutation_price=price,
+                    ),
+                    local_sequence=sequence,
+                    observed=wire(start + timedelta(seconds=seconds)),
+                ))
+            host._consume_observation(verified(
+                "TRADE",
+                {
+                    "contract_id": "MNQ SEP26",
+                    "price": 100,
+                    "size": 1,
+                    "aggressor_side": "BUY",
+                    "aggressor_source": "NATIVE_BID_ASK",
+                    "source_event_sequence": 1,
+                    "publication_policy": "EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1",
+                },
+                local_sequence=5,
+                observed=wire(start + timedelta(seconds=5.2)),
+            ))
+            activation = host.status()["fhb_activation"]
+            self.assertTrue(activation["maintained"])
+            self.assertTrue(activation["consumed"])
+            self.assertEqual(activation["consumer_count"], 1)
+            self.assertEqual(activation["last_consumer_source_sequence"], 4)
+            self.assertEqual(activation["output_batches"], 2)
+            self.assertGreaterEqual(activation["output_observations"], 4)
+
+    def test_requested_profile_must_match_an_admitted_effective_policy(self) -> None:
+        with TemporaryDirectory(prefix="fhb-request-binding-") as root:
+            with self.assertRaisesRegex(ValueError, "FHB_REQUEST_NOT_ADMITTED"):
+                PongProductionHost(
+                    Path(root),
+                    selected_profile=PONG_ENTRY_PROFILE_VERSION,
+                    expected_market_source_fingerprint=(
+                        expected_observer_source_fingerprint()
+                    ),
+                    runtime_snapshot=runtime_snapshot,
+                    collector_status=pending_collection,
+                    controller_dispatch=lambda _kind, _reason: True,
+                    native_dispatch=lambda _directive, _evidence: {
+                        "accepted": True,
+                    },
+                    fhb_requested_profile="TOP10_CORE_WITH_5S_SHADOW_V1",
+                )
+
+    def test_activation_readiness_inherits_elapsed_depth_heartbeat_timeout(self) -> None:
+        with TemporaryDirectory(prefix="fhb-heartbeat-") as root:
+            clock = ControllableClock()
+            host = self._host(root, FHBConfig(), clock)
+            start = datetime(2026, 9, 16, 18, 0, tzinfo=timezone.utc)
+            host._consume_observation(verified(
+                "DEPTH", payload(sequence=1), local_sequence=1,
+                observed=wire(start),
+            ))
+            host._consume_observation(verified(
+                "DEPTH", payload(sequence=2), local_sequence=2,
+                observed=wire(start + timedelta(seconds=5)),
+            ))
+            self.assertTrue(host.status()["fhb_activation"]["ready"])
+
+            clock.advance(6.0)
+            status = host.status()
+            self.assertFalse(status["fhb_activation"]["ready"])
+            self.assertEqual(
+                status["fhb_activation"]["unavailable_reason"],
+                "FHB_SOURCE_HEARTBEAT_TIMEOUT",
+            )
+            self.assertEqual(
+                status["fhb_freshness"]["current_heartbeat_blocker"],
+                "FHB_SOURCE_HEARTBEAT_TIMEOUT",
+            )
+            self.assertIn(
+                "FHB_SOURCE_HEARTBEAT_TIMEOUT",
+                status["blocking_reasons"],
+            )
 
     def test_selected_route_requires_coherent_dec26_topology(self) -> None:
         selected = {
@@ -365,6 +647,12 @@ class FHBProductionIntegrationTests(unittest.TestCase):
                 host.status()["evaluation_schedule"]["active_path"],
                 "EVENT_DRIVEN_PROTECTION",
             )
+            activation = host.status()["fhb_activation"]
+            self.assertEqual(
+                activation["entry_evaluation_trigger"],
+                "EVENT_DRIVEN_PROTECTION",
+            )
+            self.assertFalse(activation["event_trigger_reduction_claimed"])
 
         with TemporaryDirectory(prefix="fhb-double-throttle-") as root:
             with self.assertRaisesRegex(
@@ -421,6 +709,51 @@ class FHBProductionIntegrationTests(unittest.TestCase):
                 "FHB_EVENT_PROCESSING_AGE_EXCEEDED",
             )
             self.assertEqual(host.status()["fhb"]["source_depth_records"], 2)
+
+            clock.advance(6.0)
+            host._consume_observation(
+                verified(
+                    "QUOTE",
+                    {
+                        "contract_id": "MNQ SEP26",
+                        "bid": 99.75,
+                        "ask": 100,
+                        "bid_size": 1,
+                        "ask_size": 1,
+                        "source_event_sequence": 1,
+                        "publication_policy": (
+                            "EVENT_DRIVEN_SAME_CALLBACK_QUOTE_V1"
+                        ),
+                    },
+                    local_sequence=3,
+                    observed=wire(start + timedelta(seconds=8)),
+                ),
+                admitted_monotonic=clock(),
+            )
+            freshness = host.status()["fhb_freshness"]
+            self.assertEqual(
+                freshness["current_blocker"],
+                "FHB_EVENT_PROCESSING_AGE_EXCEEDED",
+            )
+            self.assertEqual(freshness["heartbeat_stream"], "DEPTH")
+            self.assertTrue(freshness["persistent_breach"])
+            self.assertGreaterEqual(freshness["current_breach_seconds"], 6.0)
+
+            with patch(
+                "src.l3g_paper.pong_production._now",
+                return_value=wire(start + timedelta(seconds=8)),
+            ):
+                host._consume_observation(
+                    verified(
+                        "DEPTH", payload(sequence=3), local_sequence=4,
+                        observed=wire(start + timedelta(seconds=8)),
+                    ),
+                    admitted_monotonic=clock(),
+                )
+            freshness = host.status()["fhb_freshness"]
+            self.assertIsNone(freshness["current_blocker"])
+            self.assertEqual(freshness["recovery_count"], 1)
+            self.assertGreaterEqual(freshness["last_breach_seconds"], 6.0)
 
     def test_option_3_uses_monotonic_start_spacing_without_catch_up(self) -> None:
         with TemporaryDirectory(prefix="fhb-cadence-") as root:
@@ -501,6 +834,8 @@ class FHBProductionIntegrationTests(unittest.TestCase):
             cadence_status = cadence._fhb.status()
             for value in (legacy_status, cadence_status):
                 value.pop("configuration")
+                value.pop("effective_policy")
+                value.pop("effective_policy_fingerprint")
                 value.pop("shadow_maintenance_nanoseconds")
             self.assertEqual(legacy_status, cadence_status)
             self.assertEqual(legacy._stream_sequences, cadence._stream_sequences)
