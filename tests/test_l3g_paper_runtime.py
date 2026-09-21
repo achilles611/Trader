@@ -915,6 +915,7 @@ class PaperRuntimeTests(unittest.TestCase):
 
     def test_pong_paper_only_fanout_preserves_paper_without_legacy_shadow(self) -> None:
         calls: list[str] = []
+        failures: list[tuple[str, str, str]] = []
         fanout = ObservationFanout(
             shadow_observation=lambda _: calls.append("shadow"),
             shadow_transport=lambda _: None,
@@ -924,10 +925,30 @@ class PaperRuntimeTests(unittest.TestCase):
             paper_transport=lambda _: None,
             paper_rejection=lambda _: None,
             paper_duplicate=lambda: None,
-            record_failure=lambda *_: None,
+            record_failure=lambda *values: failures.append(values),
         )
         fanout.on_paper_observation(object())  # type: ignore[arg-type]
         self.assertEqual(calls, ["paper"])
+        fanout.begin_startup_paper_observation_pause()
+        fanout.on_paper_observation(object())  # type: ignore[arg-type]
+        self.assertEqual(calls, ["paper"])
+        replay = fanout.end_startup_paper_observation_pause()
+        self.assertEqual(replay["replayed_observations"], 1)
+        self.assertEqual(calls, ["paper", "paper"])
+
+        failing = ObservationFanout(
+            shadow_observation=lambda _: calls.append("shadow"),
+            shadow_transport=lambda _: None,
+            shadow_rejection=lambda _: None,
+            shadow_duplicate=lambda: None,
+            paper_observation=lambda _: (_ for _ in ()).throw(ValueError("test")),
+            paper_transport=lambda _: None,
+            paper_rejection=lambda _: None,
+            paper_duplicate=lambda: None,
+            record_failure=lambda *values: failures.append(values),
+        )
+        failing.on_paper_observation(object())  # type: ignore[arg-type]
+        self.assertEqual(failures, [("EXPERIMENTAL_PAPER", "OBSERVATION", "ValueError")])
 
     def test_controlled_execution_events_cover_entry_protection_exit_and_flat(self) -> None:
         with TemporaryDirectory() as directory:

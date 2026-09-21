@@ -81,6 +81,10 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
         self.assertTrue(report["account_binding"]["sim101_identified_separately"])
         self.assertTrue(report["market_data"]["quotes"])
         self.assertNotIn("MNQ SEPT26", json.dumps(report))
+        self.assertEqual(report["pipeline_metrics"]["bridge_admission"]["frames"], 7)
+        self.assertGreaterEqual(
+            report["pipeline_metrics"]["bridge_admission"]["maximum_milliseconds"], 0,
+        )
 
     def test_harness_counts_rejection_and_duplicate_without_raising(self):
         harness = NinjaTraderCommissioningHarness()
@@ -416,6 +420,21 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
         finally:
             client.close()
         self.assertEqual(result[0].safe_report()["provider_health"]["streams"]["LOCAL_BRIDGE"], "DISCONNECTED")
+
+    def test_controlled_shutdown_classifies_trailing_partial_without_parser_rejection(self):
+        _, result, failures, thread, client = self._start_receiver(duration=0.15)
+        try:
+            client.sendall(b'{"schema":"incomplete"')
+            self._finish_receiver(result, failures, thread)
+            report = result[0].safe_report()
+            self.assertEqual(report["rejected_observations"], 0)
+            self.assertEqual(report["controlled_shutdown"]["partial_frames_discarded"], 1)
+            self.assertEqual(
+                report["controlled_shutdown"]["partial_bytes_discarded"],
+                len(b'{"schema":"incomplete"'),
+            )
+        finally:
+            client.close()
 
     def test_receiver_shutdown_without_client_is_disconnected_not_connecting(self):
         harness = NinjaTraderCommissioningHarness(LoopbackBridgeConfig(port=self._ephemeral_port()))

@@ -52,11 +52,20 @@ class PaperControlCenterTests(unittest.TestCase):
 
     def test_independent_collection_dispatch_has_no_unbound_profile_name(self) -> None:
         """TEST ONLY: execute the exact live callback branch, not a source assertion."""
-        from src.copytrade.control_center import _pong_market_collection_only, _pong_market_paper_only
+        from src.copytrade.control_center import (
+            _ObservationIngressMetrics,
+            _dispatch_pong_observation,
+            _pong_market_collection_only,
+            _pong_market_paper_only,
+        )
         for kind in ("TRADE", "QUOTE", "DEPTH"):
             observation = SimpleNamespace(observation_type=kind)
             self.assertTrue(_pong_market_collection_only(True, "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2", observation))
-            self.assertFalse(_pong_market_collection_only(True, "BEELZEBUB_PONG_DISCERNMENT_V1", observation))
+            self.assertTrue(_pong_market_collection_only(True, "BEELZEBUB_PONG_DISCERNMENT_V1", observation))
+            self.assertFalse(_pong_market_collection_only(
+                True, "BEELZEBUB_PONG_DISCERNMENT_V1", observation,
+                activation_authorized=True,
+            ))
             self.assertTrue(_pong_market_paper_only(True, "BEELZEBUB_PONG_DISCERNMENT_V1", observation))
             self.assertFalse(_pong_market_collection_only(False, "BEELZEBUB_FIVE_MINUTE_PERPETUAL_V2", observation))
         for kind in ("ACCOUNT", "POSITION", "ORDER", "HEALTH", "EXECUTION"):
@@ -64,6 +73,38 @@ class PaperControlCenterTests(unittest.TestCase):
                                                         SimpleNamespace(observation_type=kind)))
             self.assertFalse(_pong_market_paper_only(True, "BEELZEBUB_PONG_DISCERNMENT_V1",
                                                     SimpleNamespace(observation_type=kind)))
+
+        calls: list[str] = []
+        collector = SimpleNamespace(ingest=lambda _: calls.append("collector"))
+        pong = SimpleNamespace(on_observation=lambda _: calls.append("pong"))
+        fanout = SimpleNamespace(
+            on_paper_observation=lambda _: calls.append("paper"),
+            on_observation=lambda _: calls.extend(("shadow", "paper")),
+        )
+        metrics = _ObservationIngressMetrics()
+        market = SimpleNamespace(observation_type="DEPTH")
+        _dispatch_pong_observation(
+            market, collector=collector, pong_host=pong, fanout=fanout,
+            metrics=metrics, independent=True,
+            profile="BEELZEBUB_PONG_DISCERNMENT_V1", activation_authorized=False,
+        )
+        self.assertEqual(calls, ["collector", "pong"])
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["routes"], {"PONG_COLLECTION_ONLY": 1})
+        self.assertEqual(snapshot["inputs"], 1)
+        self.assertEqual(snapshot["stages"]["collector_enqueue"]["count"], 1)
+        self.assertEqual(snapshot["stages"]["pong_host"]["count"], 1)
+        self.assertEqual(snapshot["stages"]["composite_total"]["count"], 1)
+
+        calls.clear()
+        account = SimpleNamespace(observation_type="ACCOUNT")
+        _dispatch_pong_observation(
+            account, collector=collector, pong_host=pong, fanout=fanout,
+            metrics=metrics, independent=True,
+            profile="BEELZEBUB_PONG_DISCERNMENT_V1", activation_authorized=False,
+        )
+        self.assertEqual(calls, ["collector", "pong", "shadow", "paper"])
+        self.assertEqual(metrics.snapshot()["routes"]["FULL_LEGACY_FANOUT"], 1)
 
     def test_unresolved_watchdog_defers_transport_and_ledger_shutdown(self) -> None:
         """A failed AddOn grace must retain its signed callback path.

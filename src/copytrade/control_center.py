@@ -118,9 +118,19 @@ WATCHER_MAX_SUBSCRIPTIONS = 10
 NINJATRADER_RUNTIME_LOGGER = logging.getLogger("uvicorn.error")
 
 
-def _pong_market_collection_only(independent: bool, profile: str, observation: object) -> bool:
-    return (independent and getattr(observation, "observation_type", None) in {"TRADE", "QUOTE", "DEPTH"}
-            and profile != PONG_ENTRY_PROFILE_VERSION)
+def _pong_market_collection_only(
+    independent: bool,
+    profile: str,
+    observation: object,
+    *,
+    activation_authorized: bool = False,
+) -> bool:
+    market = getattr(observation, "observation_type", None) in {"TRADE", "QUOTE", "DEPTH"}
+    return bool(
+        independent
+        and market
+        and (profile != PONG_ENTRY_PROFILE_VERSION or not activation_authorized)
+    )
 
 
 def _pong_market_paper_only(independent: bool, profile: str, observation: object) -> bool:
@@ -190,6 +200,55 @@ class _ObservationIngressMetrics:
                 "observed_input_rate_per_second": round(self._inputs / elapsed, 3) if elapsed > 0 else None,
                 "stages": stages,
             }
+
+
+def _dispatch_pong_observation(
+    observation: object,
+    *,
+    collector: object,
+    pong_host: object,
+    fanout: ObservationFanout,
+    metrics: _ObservationIngressMetrics,
+    independent: bool,
+    profile: str,
+    activation_authorized: bool,
+) -> None:
+    """Dispatch one admitted record through the measured authoritative route."""
+    composite_started = time.perf_counter()
+    metrics.record_input(getattr(observation, "observation_type", None), composite_started)
+    stage_started = time.perf_counter()
+    collector.ingest(observation)  # type: ignore[attr-defined]
+    metrics.record_stage("collector_enqueue", time.perf_counter() - stage_started)
+    stage_started = time.perf_counter()
+    pong_host.on_observation(observation)  # type: ignore[attr-defined]
+    metrics.record_stage("pong_host", time.perf_counter() - stage_started)
+    if _pong_market_collection_only(
+        independent,
+        profile,
+        observation,
+        activation_authorized=activation_authorized,
+    ):
+        # The collector durably retains every authenticated market record and
+        # PongProductionHost is its sole analytical owner. In explicitly
+        # activation-disabled operation, repeating the legacy paper market
+        # policy adds no authority and was measured as the first overloaded
+        # synchronous boundary. Account/order/position/control truth still
+        # traverses the complete fanout below.
+        metrics.record_route("PONG_COLLECTION_ONLY")
+        metrics.record_stage("composite_total", time.perf_counter() - composite_started)
+        return
+    if _pong_market_paper_only(independent, profile, observation):
+        stage_started = time.perf_counter()
+        fanout.on_paper_observation(observation)  # type: ignore[arg-type]
+        metrics.record_stage("paper_fanout", time.perf_counter() - stage_started)
+        metrics.record_route("PONG_PAPER_ONLY")
+        metrics.record_stage("composite_total", time.perf_counter() - composite_started)
+        return
+    stage_started = time.perf_counter()
+    fanout.on_observation(observation)  # type: ignore[arg-type]
+    metrics.record_stage("legacy_fanout", time.perf_counter() - stage_started)
+    metrics.record_route("FULL_LEGACY_FANOUT")
+    metrics.record_stage("composite_total", time.perf_counter() - composite_started)
 LEDGER_VERIFICATION_FRESHNESS_SECONDS = 15 * 60
 MARKET_OBSERVER_ACTIVE_FRESHNESS_SECONDS = 15.0
 LEDGER_VERIFIER_SHUTDOWN_WAIT_SECONDS = 30.0
@@ -2624,48 +2683,18 @@ def create_control_center_app(
             )
 
             def collect_and_fanout_observation(observation: object) -> None:
-                composite_started = time.perf_counter()
-                ingress_metrics.record_input(
-                    getattr(observation, "observation_type", None), composite_started,
-                )
                 assert pong_collector is not None
-                stage_started = time.perf_counter()
-                pong_collector.ingest(observation)  # type: ignore[arg-type]
-                ingress_metrics.record_stage("collector_enqueue", time.perf_counter() - stage_started)
                 assert pong_host is not None
-                stage_started = time.perf_counter()
-                pong_host.on_observation(observation)  # type: ignore[arg-type]
-                ingress_metrics.record_stage("pong_host", time.perf_counter() - stage_started)
-                if _pong_market_collection_only(
-                    pong_independent_collection, selected_paper_profile.selection_key, observation,
-                ):
-                    # During the explicitly bounded evidence acquisition, the
-                    # authenticated Pong sink must not wait behind legacy
-                    # shadow interpretation or a disarmed Perpetual policy.
-                    # Account/order/position/control truth continues through
-                    # the shared fanout, and this mode creates no execution
-                    # route or authority.
-                    ingress_metrics.record_route("PONG_COLLECTION_ONLY")
-                    ingress_metrics.record_stage("composite_total", time.perf_counter() - composite_started)
-                    return
-                if _pong_market_paper_only(
-                    pong_independent_collection, selected_paper_profile.selection_key, observation,
-                ):
-                    # PongProductionHost above is the sole Pong analytical
-                    # owner.  The paper sink still receives the exact record
-                    # for durable/risk/malformed-input truth; only the legacy
-                    # non-authoritative shadow projection is omitted.
-                    stage_started = time.perf_counter()
-                    fanout.on_paper_observation(observation)  # type: ignore[arg-type]
-                    ingress_metrics.record_stage("paper_fanout", time.perf_counter() - stage_started)
-                    ingress_metrics.record_route("PONG_PAPER_ONLY")
-                    ingress_metrics.record_stage("composite_total", time.perf_counter() - composite_started)
-                    return
-                stage_started = time.perf_counter()
-                fanout.on_observation(observation)  # type: ignore[arg-type]
-                ingress_metrics.record_stage("legacy_fanout", time.perf_counter() - stage_started)
-                ingress_metrics.record_route("FULL_LEGACY_FANOUT")
-                ingress_metrics.record_stage("composite_total", time.perf_counter() - composite_started)
+                _dispatch_pong_observation(
+                    observation,
+                    collector=pong_collector,
+                    pong_host=pong_host,
+                    fanout=fanout,
+                    metrics=ingress_metrics,
+                    independent=pong_independent_collection,
+                    profile=selected_paper_profile.selection_key,
+                    activation_authorized=pong_bounded_activation,
+                )
 
             def collect_and_fanout_transport(state: object) -> None:
                 assert pong_collector is not None

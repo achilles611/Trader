@@ -161,30 +161,48 @@ class PaperPolicyTests(unittest.TestCase):
         self.assertEqual(policy.status()["paper_evidence_by_family"]["RESTING_LIQUIDITY"], 0)
 
     def test_native_positional_remove_with_zero_price_preserves_continuity_without_invented_evidence(self) -> None:
-        policy = ExperimentalPaperPolicy()
         factory = ObservationFactory()
-        remove = factory.make("DEPTH", {
+        base = {
             "contract_id": "MNQ SEP26",
             "bids": [{"price": 100, "size": 2}, {"price": 99.75, "size": 3}],
             "asks": [{"price": 100.25, "size": 4}, {"price": 100.5, "size": 5}],
             "operation": "Remove", "side": "Bid", "mutation_price": 0,
             "mutation_volume": 0, "mutation_position": 20, "is_reset": False,
             "snapshot_ordering": "NATIVE_POSITIONAL_BEST_TO_WORST_V1",
-        })
-        decision = policy.ingest(remove)
-        self.assertNotEqual(decision.reason_code, "MALFORMED_DEPTH_MUTATION")
-        status = policy.status()
-        self.assertEqual(status["counters"]["position_only_depth_removes"], 1)
-        self.assertEqual(status["counters"]["depth_mutations"], 1)
-        self.assertEqual(status["paper_evidence_by_family"]["RESTING_LIQUIDITY"], 0)
+        }
+        for side in ("Bid", "Ask"):
+            with self.subTest(valid_side=side):
+                policy = ExperimentalPaperPolicy()
+                remove = factory.make("DEPTH", {**base, "side": side})
+                decision = policy.ingest(remove)
+                self.assertNotEqual(decision.reason_code, "MALFORMED_DEPTH_MUTATION")
+                status = policy.status()
+                self.assertEqual(status["counters"]["position_only_depth_removes"], 1)
+                self.assertEqual(status["counters"]["depth_mutations"], 1)
+                self.assertEqual(status["paper_evidence_by_family"]["RESTING_LIQUIDITY"], 0)
 
-        zero_price_update = factory.make("DEPTH", {
-            **dict(remove.payload), "operation": "Update", "mutation_position": 0,
-        })
-        self.assertEqual(
-            policy.ingest(zero_price_update).reason_code,
-            "MALFORMED_DEPTH_MUTATION",
+        invalid = (
+            ("Add", {}),
+            ("Insert", {}),
+            ("Update", {}),
+            ("Remove", {"snapshot_ordering": "UNKNOWN"}),
+            ("Remove", {"snapshot_ordering": None}),
+            ("Remove", {"mutation_volume": 1}),
+            ("Remove", {"bids": []}),
+            ("Remove", {"asks": []}),
         )
+        for operation, override in invalid:
+            with self.subTest(invalid_operation=operation, override=override):
+                policy = ExperimentalPaperPolicy()
+                payload = {**base, "operation": operation, **override}
+                decision = policy.ingest(factory.make("DEPTH", payload))
+                self.assertIn(
+                    decision.reason_code,
+                    {"MALFORMED_DEPTH_MUTATION", "PARTIAL_DEPTH"},
+                )
+                self.assertEqual(
+                    policy.status()["counters"]["position_only_depth_removes"], 0,
+                )
 
     def test_opposing_hypothesis_while_positioned_exits_only(self) -> None:
         policy, factory, _ = warmed_bullish_policy()

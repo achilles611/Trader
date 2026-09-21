@@ -192,6 +192,12 @@ class PongAuthenticHourCollectorTests(unittest.TestCase):
                 time.sleep(0.02)
             status = collector.stop()
             self.assertEqual(status["durability"]["durable_records"], 3)
+            self.assertGreaterEqual(status["durability"]["queue_high_water_records"], 1)
+            self.assertGreaterEqual(status["durability"]["last_queue_age_milliseconds"], 0)
+            self.assertGreaterEqual(
+                status["durability"]["maximum_queue_age_milliseconds"],
+                status["durability"]["last_queue_age_milliseconds"],
+            )
             self.assertEqual(status["required_interval"]["classified_trades"]["BUY"], 1)
             self.assertEqual(status["required_interval"]["depth"]["available"], 1)
             rows = [json.loads(line) for line in collector.journal_path.read_text(encoding="utf-8").splitlines()]
