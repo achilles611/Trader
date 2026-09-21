@@ -222,6 +222,63 @@ def _atomic_write(path: Path, value: Mapping[str, object]) -> None:
             temporary.unlink()
 
 
+PONG_HOST_TELEMETRY_SCHEMA = "pong-host-telemetry-v1"
+_HOST_TELEMETRY_CHECKPOINT_SECONDS = 5.0
+_HOST_TELEMETRY_FAULT_RETRY_SECONDS = 5.0
+_HOST_TELEMETRY_RUNTIME_KEYS = (
+    "observed_at",
+    "runtime_state",
+    "runtime_active",
+    "entry_profile_version",
+    "entry_fence_active",
+    "evidence_sealed",
+    "entries_paused",
+    "position_quantity",
+    "working_owned_orders",
+    "working_entry_orders",
+    "unresolved_execution",
+    "reconciliation_current",
+    "protection_current",
+    "safety_lockout",
+    "lockout_reason",
+    "execution_session_id",
+    "addon_protocol_version",
+    "addon_source_fingerprint",
+    "addon_build_fingerprint",
+    "addon_provenance_valid",
+    "account_name",
+    "account_class",
+    "instrument",
+    "maximum_quantity",
+    "live_authority",
+)
+_HOST_TELEMETRY_DURABILITY_KEYS = (
+    "journal_path",
+    "collector_status_path",
+    "current_status_path",
+    "enqueued_records",
+    "written_records",
+    "durable_records",
+    "journal_bytes",
+    "journal_tip_sha256",
+    "last_fsync_at",
+    "queue_depth",
+    "queue_high_water_records",
+    "queue_capacity",
+    "last_queue_age_milliseconds",
+    "maximum_queue_age_milliseconds",
+    "queue_overflow_records",
+    "producer_queue_overflow_records",
+    "producer_queue_overflow_baseline",
+    "producer_queue_overflow_delta",
+    "producer_transport_failed_records",
+    "producer_transport_failed_baseline",
+    "producer_transport_failed_delta",
+    "rejected_records",
+    "duplicate_records",
+)
+
+
 class PongProductionHost:
     """One process owner for native Pong inputs, bridge, and controller."""
 
@@ -335,7 +392,9 @@ class PongProductionHost:
             tuple[NinjaTraderObservation, float]
         ] = queue.Queue(maxsize=262144)
         self._admission_lock = threading.Lock()
+        self._observation_queue_occupancy = 0
         self._observation_overflow = 0
+        self._observation_queue_high_water = 0
         self._last_depth_callback_monotonic: float | None = None
         self._last_host_queue_age_ms = 0.0
         self._maximum_host_queue_age_ms = 0.0
@@ -406,6 +465,30 @@ class PongProductionHost:
         self._process_instance_id = "pong-controller-process-" + uuid4().hex
         self._controller: PongBoundedController | None = None
         self._controller_error: str | None = None
+        self._host_first_fault: str | None = None
+        self._host_first_fault_persisted = False
+        self._host_first_fault_retry_after_monotonic: float | None = None
+        self._host_telemetry_error: str | None = None
+        self._last_host_checkpoint_monotonic: float | None = None
+        self._host_service_count = 0
+        self._host_service_total_ns = 0
+        self._host_service_maximum_ns = 0
+        self._observation_processing_count = 0
+        self._observation_processing_total_ns = 0
+        self._observation_processing_maximum_ns = 0
+        self._analysis_processing_count = 0
+        self._analysis_processing_total_ns = 0
+        self._analysis_processing_maximum_ns = 0
+        self._receipt_write_count = 0
+        self._receipt_write_failure_count = 0
+        self._receipt_write_total_ns = 0
+        self._receipt_write_maximum_ns = 0
+        self._protection_accounting_last_monotonic: float | None = None
+        self._protection_accounting_state: str | None = None
+        self._protection_accounting_reason: str | None = None
+        self._protection_eligible_elapsed_seconds = 0.0
+        self._protection_protected_elapsed_seconds = 0.0
+        self._protection_transition_count = 0
         self._bridge: PongRuntimeBridge | None = None
         self._bridge_error: str | None = None
         self._pending_native: deque[
@@ -496,6 +579,383 @@ class PongProductionHost:
     def controller_path(self) -> Path:
         return self._operation_root / "controller-state.json"
 
+    @property
+    def host_telemetry_root(self) -> Path:
+        return self._operation_root / "host-telemetry"
+
+    def _observation_queue_metrics_locked(
+        self,
+        now_monotonic: float,
+    ) -> tuple[int, float | None]:
+        # Admission and worker dequeue bookkeeping share one bounded counter.
+        # Queue.mutex is used only to inspect the oldest still-pending item and
+        # is never held while waiting for the host lock.
+        with self._admission_lock:
+            depth = self._observation_queue_occupancy
+        with self._observations.mutex:
+            oldest = (
+                None
+                if not self._observations.queue
+                else self._observations.queue[0][1]
+            )
+        age_ms = (
+            None
+            if oldest is None
+            else max(0.0, (now_monotonic - oldest) * 1000.0)
+        )
+        return depth, age_ms
+
+    def _update_protection_accounting_locked(
+        self,
+        now_monotonic: float | None = None,
+    ) -> str | None:
+        now = self._monotonic_clock() if now_monotonic is None else now_monotonic
+        reason = self._event_protection_reason_locked()
+        state = "ELIGIBLE" if reason is None else "PROTECTED"
+        if self._protection_accounting_last_monotonic is not None:
+            elapsed = max(
+                0.0,
+                now - self._protection_accounting_last_monotonic,
+            )
+            if self._protection_accounting_state == "ELIGIBLE":
+                self._protection_eligible_elapsed_seconds += elapsed
+            elif self._protection_accounting_state == "PROTECTED":
+                self._protection_protected_elapsed_seconds += elapsed
+        if (
+            self._protection_accounting_state is not None
+            and (
+                state != self._protection_accounting_state
+                or reason != self._protection_accounting_reason
+            )
+        ):
+            self._protection_transition_count += 1
+        self._protection_accounting_last_monotonic = now
+        self._protection_accounting_state = state
+        self._protection_accounting_reason = reason
+        return reason
+
+    def _host_receipt_payload_locked(
+        self,
+        receipt_kind: str,
+        *,
+        fault: str | None = None,
+        snapshot_stage: str = "CACHED_HOST_STATE",
+        collector_snapshot_at_utc: str | None = None,
+        collector_refresh_error: str | None = None,
+    ) -> dict[str, object]:
+        """Build one bounded process receipt without calling a status endpoint.
+
+        UTC values are wall-clock provenance and source-receipt age. Host queue
+        age/checkpoint cadence use the process monotonic clock. Scheduler and
+        bounded service timers use QPC/perf_counter_ns. Values from these clock
+        domains are reported separately and are never subtracted.
+        """
+        captured_monotonic = self._monotonic_clock()
+        protection_reason = self._update_protection_accounting_locked(
+            captured_monotonic,
+        )
+        observation_queue_depth, oldest_pending_age_ms = (
+            self._observation_queue_metrics_locked(captured_monotonic)
+        )
+        runtime = {
+            key: self._runtime.get(key)
+            for key in _HOST_TELEMETRY_RUNTIME_KEYS
+            if key in self._runtime
+        }
+        durability_source = self._collection.get("durability")
+        durability = (
+            {
+                key: durability_source.get(key)
+                for key in _HOST_TELEMETRY_DURABILITY_KEYS
+                if key in durability_source
+            }
+            if isinstance(durability_source, Mapping)
+            else {}
+        )
+        required_interval = self._collection.get("required_interval")
+        collector = self._collection.get("collector")
+        collection_producer = self._collection.get("producer")
+        return {
+            "schema": PONG_HOST_TELEMETRY_SCHEMA,
+            "receipt_kind": receipt_kind,
+            "persisted_at_utc": _now(),
+            "fault": fault,
+            "snapshot": {
+                "stage": snapshot_stage,
+                "captured_at_utc": _now(),
+                "runtime_snapshot_status": (
+                    "AVAILABLE"
+                    if runtime
+                    else "MISSING_NOT_YET_POLLED_OR_STATUS_UNAVAILABLE"
+                ),
+                "collector_snapshot_status": (
+                    "AVAILABLE"
+                    if self._collection
+                    else "MISSING_NOT_YET_POLLED_OR_STATUS_UNAVAILABLE"
+                ),
+                "collector_snapshot_at_utc": collector_snapshot_at_utc,
+                "collector_refresh_error": collector_refresh_error,
+                "collector_durability_scope": (
+                    "PRE_COLLECTOR_STOP_SNAPSHOT_NOT_FINAL_DURABILITY"
+                    if receipt_kind == "final"
+                    else "CACHED_OR_RUNNING_COLLECTOR_SNAPSHOT"
+                ),
+            },
+            "clock_domains": {
+                "persisted_at_utc": "UTC_WALL_CLOCK_RFC3339",
+                "host_queue_age_and_checkpoint": "PROCESS_MONOTONIC_SECONDS",
+                "source_receipt_age": "UTC_WALL_CLOCK_DURATION",
+                "scheduler_deadlines": "PERF_COUNTER_NS_QUERY_PERFORMANCE_COUNTER",
+                "service_and_write_aggregates": (
+                    "PERF_COUNTER_NS_QUERY_PERFORMANCE_COUNTER"
+                ),
+                "cross_domain_subtraction_allowed": False,
+            },
+            "identity": {
+                "host_process_instance_id": self._process_instance_id,
+                "experiment_id": self._experiment_id,
+                "selected_profile": self.selected_profile,
+                "qualifying_architecture": self._qualifying_architecture,
+                "loaded_artifact_hash": PONG_LOADED_ARTIFACT_HASH,
+                "module_import_source_sha256": dict(_LOADED_SOURCE_HASHES),
+                "topology_version": self.topology.version,
+                "topology_hash": self.topology.binding_hash,
+                "account": self.topology.account_name,
+                "account_class": self.topology.account_class,
+                "instrument": self.topology.native_instrument,
+                "canonical_contract": self.topology.canonical_contract,
+                "activation_authorized": self.activation_authorized,
+                "live_authority": self.topology.live_authority,
+                "live_capital": self.topology.live_capital,
+                "launch_authorization_hash": (
+                    None
+                    if self.launch_authorization is None
+                    else self.launch_authorization.manifest_hash
+                ),
+            },
+            "runtime_identity_and_authority": runtime,
+            "producer_identity": (
+                None
+                if self._producer is None
+                else {
+                    "session_id": self._producer[0],
+                    "source_fingerprint": self._producer[1],
+                    "build_fingerprint": self._producer[2],
+                    "source_generation": self._source_generation,
+                }
+            ),
+            "receiver": {
+                "source_ingress_records": self._source_ingress_records,
+                "authoritative_admission_records": self._authoritative_admission_records,
+                "stream_counts": dict(self._stream_counts),
+                "last_stream_sequences": dict(self._stream_sequences),
+                "missing_events": dict(self._stream_missing),
+                "out_of_order_events": dict(self._stream_out_of_order),
+            },
+            "host_work": {
+                "observation_queue_depth": observation_queue_depth,
+                "observation_queue_capacity": self._observations.maxsize,
+                "observation_queue_high_water": self._observation_queue_high_water,
+                "oldest_pending_queue_age_ms": oldest_pending_age_ms,
+                "observation_queue_overflow": self._observation_overflow,
+                "compute_pending": len(self._compute_pending),
+                "compute_batch_unsubmitted": len(self._compute_batch),
+                "compute_queue_limit": self._compute_limit,
+                "compute_submitted": self._compute_submitted,
+                "compute_applied": self._compute_applied,
+                "compute_refused": self._compute_refused,
+                "pending_native_directives": len(self._pending_native),
+                "unprocessed_work": (
+                    observation_queue_depth
+                    + len(self._compute_pending)
+                    + len(self._compute_batch)
+                    + len(self._pending_native)
+                ),
+            },
+            "collector": {
+                "state": self._collection.get("state"),
+                "identity": dict(collector) if isinstance(collector, Mapping) else None,
+                "producer_identity": (
+                    dict(collection_producer)
+                    if isinstance(collection_producer, Mapping)
+                    else None
+                ),
+                "watermark": (
+                    dict(required_interval)
+                    if isinstance(required_interval, Mapping)
+                    else None
+                ),
+                "durability": durability,
+            },
+            "freshness": {
+                "last_host_queue_age_ms": self._last_host_queue_age_ms,
+                "maximum_host_queue_age_ms": self._maximum_host_queue_age_ms,
+                "last_source_receipt_age_ms": self._last_source_receipt_age_ms,
+                "maximum_source_receipt_age_ms": self._maximum_source_receipt_age_ms,
+                "breach_count": self._freshness_breach_count,
+                "current_blocker": self._fhb_guard_blocker,
+                "recovery_count": self._fhb_guard_recoveries,
+            },
+            "scheduler": {
+                "metrics": self._periodic_deadline.metrics(),
+                "source_receiver_ingress_records": self._source_ingress_records,
+                "authoritative_admission_records": self._authoritative_admission_records,
+                "event_driven_analytical_evaluations": self._event_driven_evaluations,
+                "periodic_flat_analytical_evaluations": self._periodic_evaluations,
+            },
+            "protection": {
+                "active_path": (
+                    "PERIODIC_FLAT"
+                    if protection_reason is None
+                    else "EVENT_DRIVEN_PROTECTION"
+                ),
+                "reason": protection_reason,
+                "last_transition": self._last_protection_transition,
+                "elapsed_clock": "PROCESS_MONOTONIC_SECONDS",
+                "eligible_elapsed_seconds": round(
+                    self._protection_eligible_elapsed_seconds, 9,
+                ),
+                "protected_elapsed_seconds": round(
+                    self._protection_protected_elapsed_seconds, 9,
+                ),
+                "transition_count": self._protection_transition_count,
+            },
+            "bounded_aggregates": {
+                "host_service": {
+                    "count": self._host_service_count,
+                    "total_ns": self._host_service_total_ns,
+                    "maximum_ns": self._host_service_maximum_ns,
+                },
+                "observation_processing": {
+                    "count": self._observation_processing_count,
+                    "total_ns": self._observation_processing_total_ns,
+                    "maximum_ns": self._observation_processing_maximum_ns,
+                },
+                "analysis_processing": {
+                    "count": self._analysis_processing_count,
+                    "total_ns": self._analysis_processing_total_ns,
+                    "maximum_ns": self._analysis_processing_maximum_ns,
+                },
+                "receipt_write_stalls": {
+                    "completed_count_before_current_write": self._receipt_write_count,
+                    "failure_count_before_current_write": (
+                        self._receipt_write_failure_count
+                    ),
+                    "total_ns_before_current_write": self._receipt_write_total_ns,
+                    "maximum_ns_before_current_write": self._receipt_write_maximum_ns,
+                },
+            },
+            "missing_metrics": {
+                "receiver_authenticated_processing_duration": "MISSING_NOT_EXPOSED",
+                "receiver_queue_lock_wait": "MISSING_NOT_EXPOSED",
+                "host_rlock_wait": "MISSING_NOT_INSTRUMENTED",
+            },
+            "fhb": {
+                "disposition": FHB_ARCHIVE_DISPOSITION,
+                "instantiated": self._fhb is not None,
+            },
+            "test_only": False,
+        }
+
+    def _persist_host_receipt_locked(
+        self,
+        receipt_kind: str,
+        *,
+        fault: str | None = None,
+        snapshot_stage: str = "CACHED_HOST_STATE",
+        collector_snapshot_at_utc: str | None = None,
+        collector_refresh_error: str | None = None,
+    ) -> bool:
+        started_ns = time.perf_counter_ns()
+        succeeded = False
+        try:
+            _atomic_write(
+                self.host_telemetry_root / f"{receipt_kind}.json",
+                self._host_receipt_payload_locked(
+                    receipt_kind,
+                    fault=fault,
+                    snapshot_stage=snapshot_stage,
+                    collector_snapshot_at_utc=collector_snapshot_at_utc,
+                    collector_refresh_error=collector_refresh_error,
+                ),
+            )
+            self._host_telemetry_error = None
+            succeeded = True
+        except Exception as error:
+            # Telemetry cannot grant authority or change runtime decisions.
+            self._host_telemetry_error = (
+                "PONG_HOST_TELEMETRY_WRITE_FAILED:" + type(error).__name__
+            )
+        finally:
+            elapsed_ns = max(0, time.perf_counter_ns() - started_ns)
+            self._receipt_write_count += 1
+            self._receipt_write_failure_count += int(not succeeded)
+            self._receipt_write_total_ns += elapsed_ns
+            self._receipt_write_maximum_ns = max(
+                self._receipt_write_maximum_ns,
+                elapsed_ns,
+            )
+        return succeeded
+
+    def _persist_first_host_fault_locked(
+        self,
+        fault: str,
+        *,
+        now_monotonic: float | None = None,
+    ) -> None:
+        now = self._monotonic_clock() if now_monotonic is None else now_monotonic
+        if self._host_first_fault is None:
+            # A callback/compute path can set the canonical input latch before
+            # the worker reaches its next persistence point. Preserve that
+            # earlier safety fact ahead of a later host-loop exception.
+            self._host_first_fault = self._input_error or fault
+        if self._host_first_fault_persisted:
+            return
+        if (
+            self._host_first_fault_retry_after_monotonic is not None
+            and now < self._host_first_fault_retry_after_monotonic
+        ):
+            return
+        self._host_first_fault_persisted = self._persist_host_receipt_locked(
+            "first-fault",
+            fault=self._host_first_fault,
+            snapshot_stage="FIRST_FAULT_CACHED_HOST_STATE",
+        )
+        if not self._host_first_fault_persisted:
+            self._host_first_fault_retry_after_monotonic = (
+                now + _HOST_TELEMETRY_FAULT_RETRY_SECONDS
+            )
+
+    def _persist_host_checkpoint_locked(self, now_monotonic: float) -> None:
+        if (
+            self._input_error is not None
+            and self._host_first_fault is None
+        ):
+            self._persist_first_host_fault_locked(
+                self._input_error,
+                now_monotonic=now_monotonic,
+            )
+        elif (
+            self._host_first_fault is not None
+            and not self._host_first_fault_persisted
+        ):
+            self._persist_first_host_fault_locked(
+                self._host_first_fault,
+                now_monotonic=now_monotonic,
+            )
+        if (
+            self._last_host_checkpoint_monotonic is not None
+            and now_monotonic - self._last_host_checkpoint_monotonic
+            < _HOST_TELEMETRY_CHECKPOINT_SECONDS
+        ):
+            return
+        self._persist_host_receipt_locked(
+            "checkpoint",
+            snapshot_stage="RUNNING_CHECKPOINT_AFTER_STATUS_POLL",
+            collector_snapshot_at_utc=_now(),
+        )
+        self._last_host_checkpoint_monotonic = now_monotonic
+
     def _qualifying_certificate_identity(self) -> dict[str, object]:
         return {
             "qualifying_architecture": self._qualifying_architecture,
@@ -520,6 +980,11 @@ class PongProductionHost:
             if self._compute_workers and self._compute_pool is None:
                 self._compute_pool = open_compute_pool(self._compute_workers)
             self._stop.clear()
+            self._update_protection_accounting_locked()
+            self._persist_host_receipt_locked(
+                "start",
+                snapshot_stage="HOST_START_BEFORE_STATUS_POLL",
+            )
             self._thread = threading.Thread(
                 target=self._run,
                 name="PONG_PRODUCTION_CONTROLLER_HOST",
@@ -530,13 +995,45 @@ class PongProductionHost:
     def stop(self, timeout_seconds: float = 5.0) -> None:
         self._stop.set()
         thread = self._thread
+        drain_incomplete = False
         if thread is not None:
             thread.join(timeout_seconds)
             if thread.is_alive():
-                raise RuntimeError('PONG_HOST_DRAIN_INCOMPLETE')
+                drain_incomplete = True
         if self._compute_pool is not None:
             self._compute_pool.shutdown(wait=False, cancel_futures=True)
             self._compute_pool = None
+        collector_snapshot_at_utc = _now()
+        collector_refresh_error = None
+        final_collection: dict[str, object] | None = None
+        try:
+            # This is deliberately outside the host RLock. The collector owner
+            # stops later, so this is a pre-collector-stop snapshot, not proof
+            # of final collector durability.
+            final_collection = dict(self._collector_status())
+        except Exception as error:
+            collector_refresh_error = (
+                "PONG_FINAL_COLLECTOR_REFRESH_FAILED:" + type(error).__name__
+            )
+        with self._lock:
+            if final_collection is not None:
+                self._collection = final_collection
+            if self._input_error is not None and self._host_first_fault is None:
+                self._persist_first_host_fault_locked(self._input_error)
+            final_fault = (
+                "PONG_HOST_DRAIN_INCOMPLETE"
+                if drain_incomplete
+                else self._host_first_fault
+            )
+            self._persist_host_receipt_locked(
+                "final",
+                fault=final_fault,
+                snapshot_stage="POST_HOST_JOIN_PRE_COLLECTOR_STOP_REFRESH",
+                collector_snapshot_at_utc=collector_snapshot_at_utc,
+                collector_refresh_error=collector_refresh_error,
+            )
+        if drain_incomplete:
+            raise RuntimeError("PONG_HOST_DRAIN_INCOMPLETE")
 
     def _load_certificate(self) -> None:
         path = self.certificate_path
@@ -576,14 +1073,18 @@ class PongProductionHost:
     def on_observation(self, record: NinjaTraderObservation) -> None:
         """Bounded callback admission; the host worker owns processing and I/O."""
         admitted = self._monotonic_clock()
-        try:
-            self._observations.put_nowait((record, admitted))
-            with self._admission_lock:
+        with self._admission_lock:
+            try:
+                self._observations.put_nowait((record, admitted))
+                self._observation_queue_occupancy += 1
                 self._source_ingress_records += 1
+                self._observation_queue_high_water = max(
+                    self._observation_queue_high_water,
+                    self._observation_queue_occupancy,
+                )
                 if record.observation_type == "DEPTH":
                     self._last_depth_callback_monotonic = admitted
-        except queue.Full:
-            with self._admission_lock:
+            except queue.Full:
                 self._observation_overflow += 1
                 self._input_error = "PONG_PRODUCTION_OBSERVATION_QUEUE_OVERFLOW"
 
@@ -690,6 +1191,7 @@ class PongProductionHost:
             stream_before = tuple(sorted(self._stream_sequences.items()))
             self._process_observation(record)
             if self._input_error is not None:
+                self._persist_first_host_fault_locked(self._input_error)
                 return
             receipt = _time(record.ninja_receipt_time)
             self._last_admitted_receipt_at = max(
@@ -704,7 +1206,7 @@ class PongProductionHost:
                 self._market_state_revision += 1
             if not feature_state_changed and not canonical_market_state_changed:
                 return
-            protection_reason = self._event_protection_reason_locked()
+            protection_reason = self._update_protection_accounting_locked()
             evaluate_now = (
                 feature_state_changed
                 if not self._scheduling.enabled
@@ -749,7 +1251,7 @@ class PongProductionHost:
                             "source_sequences": dict(self._stream_sequences),
                         }
                     self._event_driven_evaluations += 1
-                    self._evaluate_microstructure(receipt)
+                    self._timed_evaluate_microstructure(receipt)
                 else:
                     self._entry_evaluation_deferred += 1
 
@@ -797,7 +1299,7 @@ class PongProductionHost:
             if self._stop.is_set():
                 self._periodic_deadline.mark_shutdown(due)
                 return
-            protection_reason = self._event_protection_reason_locked()
+            protection_reason = self._update_protection_accounting_locked()
             if protection_reason is not None:
                 self._last_protection_transition = protection_reason
                 self._periodic_deadline.supersede_for_protection(due)
@@ -818,7 +1320,7 @@ class PongProductionHost:
                 return
             self._last_periodic_cutoff = cutoff
             self._periodic_evaluations += 1
-            self._evaluate_microstructure(cutoff)
+            self._timed_evaluate_microstructure(cutoff)
             if (
                 self._microstructure_blockers
                 and self._discernment.last_snapshot is not None
@@ -1195,6 +1697,19 @@ class PongProductionHost:
             record.payload["source_event_sequence"]
         )
 
+    def _timed_evaluate_microstructure(self, at: datetime) -> None:
+        started_ns = time.perf_counter_ns()
+        try:
+            self._evaluate_microstructure(at)
+        finally:
+            elapsed_ns = max(0, time.perf_counter_ns() - started_ns)
+            self._analysis_processing_count += 1
+            self._analysis_processing_total_ns += elapsed_ns
+            self._analysis_processing_maximum_ns = max(
+                self._analysis_processing_maximum_ns,
+                elapsed_ns,
+            )
+
     def _evaluate_microstructure(self, at: datetime) -> None:
         if (
             self._qualifying_architecture is not None
@@ -1388,6 +1903,7 @@ class PongProductionHost:
                         self._input_error = 'PONG_COMPUTE_WORKER_FAILED:' + type(error).__name__
 
     def _apply_discernment_update(self, update: object) -> None:
+        self._update_protection_accounting_locked()
         bridge = self._bridge
         if bridge is None:
             return
@@ -1449,6 +1965,7 @@ class PongProductionHost:
             else:
                 applied = bridge.apply_transition(candidate)
         self._queue_bridge_update(applied, snapshot=snapshot, switch=switch)
+        self._update_protection_accounting_locked()
 
     def _queue_bridge_update(
         self,
@@ -1478,6 +1995,7 @@ class PongProductionHost:
             if evidence["position_side_support"] is None:
                 evidence["position_side_support"] = "0.5"
             self._pending_native.append((directive, evidence))
+        self._update_protection_accounting_locked()
 
     def _dispatch_native(
         self,
@@ -1571,6 +2089,7 @@ class PongProductionHost:
             bridge = self._bridge
             if bridge is None:
                 return
+            self._update_protection_accounting_locked()
             try:
                 message_type = str(message.get("message_type") or "").upper()
                 role = str(message.get("order_role") or "").upper()
@@ -1636,6 +2155,8 @@ class PongProductionHost:
                 self._bridge_error = (
                     "PONG_NATIVE_CALLBACK_BRIDGE_FAILED:" + type(error).__name__
                 )
+            finally:
+                self._update_protection_accounting_locked()
 
     @staticmethod
     def _bias_from_inputs(
@@ -1848,6 +2369,7 @@ class PongProductionHost:
                 self._bridge = PongRuntimeBridge.create(
                     machine, bridge_path, runtime_identity=identity,
                 )
+            self._update_protection_accounting_locked()
         except Exception as error:
             self._bridge_error = "PONG_RUNTIME_BRIDGE_START_FAILED:" + type(error).__name__
 
@@ -2083,6 +2605,7 @@ class PongProductionHost:
     def _run(self) -> None:
         next_control = 0.0
         while not self._stop.is_set() or not self._observations.empty() or self._compute_pending:
+            service_started_ns = time.perf_counter_ns()
             try:
                 if self._compute_batch and (self._stop.is_set() or self._observations.empty()
                         or time.monotonic() - self._compute_batch_started >= 0.01):
@@ -2099,10 +2622,17 @@ class PongProductionHost:
                         if periodic_wait is not None:
                             timeout = min(timeout, periodic_wait)
                         queued = self._observations.get(timeout=timeout)
+                        with self._admission_lock:
+                            if self._observation_queue_occupancy <= 0:
+                                raise RuntimeError(
+                                    "PONG_OBSERVATION_QUEUE_ACCOUNTING_UNDERFLOW"
+                                )
+                            self._observation_queue_occupancy -= 1
                 except queue.Empty:
                     queued = None
                 if queued is not None:
                     record, admitted_monotonic = queued
+                    processing_started_ns = time.perf_counter_ns()
                     try:
                         self._consume_observation(
                             record,
@@ -2110,6 +2640,19 @@ class PongProductionHost:
                         )
                     finally:
                         self._observations.task_done()
+                        processing_elapsed_ns = max(
+                            0,
+                            time.perf_counter_ns() - processing_started_ns,
+                        )
+                        with self._lock:
+                            self._observation_processing_count += 1
+                            self._observation_processing_total_ns += (
+                                processing_elapsed_ns
+                            )
+                            self._observation_processing_maximum_ns = max(
+                                self._observation_processing_maximum_ns,
+                                processing_elapsed_ns,
+                            )
                 # A queued market record is applied first when it was already
                 # available at the same QPC deadline.  Otherwise the timer
                 # uses only the admitted prefix and never invents a backlog
@@ -2126,6 +2669,7 @@ class PongProductionHost:
                             if not self._pending_native:
                                 break
                             directive, evidence = self._pending_native.popleft()
+                            self._update_protection_accounting_locked()
                         self._dispatch_native(directive, evidence)
                     continue
                 next_control = time.monotonic() + 0.5
@@ -2134,8 +2678,11 @@ class PongProductionHost:
                 prepare_activation = False
                 command: PongControllerCommand | None = None
                 with self._lock:
+                    self._update_protection_accounting_locked()
                     self._runtime = runtime
                     self._collection = collection
+                    self._update_protection_accounting_locked()
+                    self._persist_host_checkpoint_locked(self._monotonic_clock())
                     self._open_controller()
                     self._maybe_certify_hour()
                     self._maybe_create_bridge()
@@ -2162,7 +2709,9 @@ class PongProductionHost:
                         raise RuntimeError("PONG_CONTROLLER_ACTIVATION_PREPARATION_REFUSED")
                     refreshed = dict(self._runtime_snapshot())
                     with self._lock:
+                        self._update_protection_accounting_locked()
                         self._runtime = refreshed
+                        self._update_protection_accounting_locked()
                         controller = self._controller
                         if controller is None or self._stop.is_set():
                             continue
@@ -2176,15 +2725,35 @@ class PongProductionHost:
                         if not self._pending_native:
                             break
                         directive, evidence = self._pending_native.popleft()
+                        self._update_protection_accounting_locked()
                     self._dispatch_native(directive, evidence)
                 if command is not None:
                     self._dispatch_controller(command)
             except Exception as error:
                 with self._lock:
-                    self._controller_error = "PONG_PRODUCTION_HOST_LOOP_FAILED:" + type(error).__name__
+                    fault = "PONG_PRODUCTION_HOST_LOOP_FAILED:" + type(error).__name__
+                    self._controller_error = fault
+                    self._persist_first_host_fault_locked(fault)
+            finally:
+                service_elapsed_ns = max(
+                    0,
+                    time.perf_counter_ns() - service_started_ns,
+                )
+                with self._lock:
+                    self._host_service_count += 1
+                    self._host_service_total_ns += service_elapsed_ns
+                    self._host_service_maximum_ns = max(
+                        self._host_service_maximum_ns,
+                        service_elapsed_ns,
+                    )
 
     def status(self) -> dict[str, object]:
         with self._lock:
+            status_monotonic = self._monotonic_clock()
+            self._update_protection_accounting_locked(status_monotonic)
+            observation_queue_depth, oldest_pending_queue_age_ms = (
+                self._observation_queue_metrics_locked(status_monotonic)
+            )
             authority = self.authority_status()
             controller = self._controller
             bridge = self._bridge
@@ -2397,6 +2966,25 @@ class PongProductionHost:
                     "duplicate_entry_throttle": False,
                 },
                 "registration": "PRODUCTION_REGISTERED",
+                "persisted_host_telemetry": {
+                    "schema": PONG_HOST_TELEMETRY_SCHEMA,
+                    "root": str(self.host_telemetry_root),
+                    "bounded_slots": [
+                        "start.json",
+                        "first-fault.json",
+                        "checkpoint.json",
+                        "final.json",
+                    ],
+                    "first_fault": self._host_first_fault,
+                    "first_fault_persisted": self._host_first_fault_persisted,
+                    "write_error": self._host_telemetry_error,
+                    "checkpoint_interval_seconds": (
+                        _HOST_TELEMETRY_CHECKPOINT_SECONDS
+                    ),
+                    "fault_retry_interval_seconds": (
+                        _HOST_TELEMETRY_FAULT_RETRY_SECONDS
+                    ),
+                },
                 "loaded_artifact_hash": PONG_LOADED_ARTIFACT_HASH,
                 "module_import_source_sha256": dict(_LOADED_SOURCE_HASHES),
                 "activation_authorized": self.activation_authorized,
@@ -2431,7 +3019,9 @@ class PongProductionHost:
                 "stream_counts": dict(self._stream_counts),
                 "missing_events": dict(self._stream_missing),
                 "out_of_order_events": dict(self._stream_out_of_order),
-                "observation_queue_depth": self._observations.qsize(),
+                "observation_queue_depth": observation_queue_depth,
+                "observation_queue_high_water": self._observation_queue_high_water,
+                "oldest_pending_queue_age_ms": oldest_pending_queue_age_ms,
                 "observation_queue_overflow": self._observation_overflow,
                 "compute_workers": self._compute_workers,
                 "compute_build_hash": COMPUTE_BUILD_HASH,

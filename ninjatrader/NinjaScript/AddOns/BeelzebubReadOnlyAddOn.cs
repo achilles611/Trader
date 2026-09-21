@@ -1310,6 +1310,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
             bool validPrice = FinitePositive(update.Price);
             bool applied = false;
+            bool removeIdentityUnresolved = false;
             if (update.Operation == Operation.Add)
             {
                 if (validPrice && update.Volume > 0 && update.Position >= 0)
@@ -1337,6 +1338,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                     if (side.TryGetValue(update.Position, out removed)
                         && FinitePositive(removed.Key))
                         resolvedMutationPrice = removed.Key;
+                    else
+                        removeIdentityUnresolved = true;
                     side.Remove(update.Position);
                     ShiftKnownPositions(side, update.Position, false);
                     applied = true;
@@ -1365,6 +1368,19 @@ namespace NinjaTrader.NinjaScript.AddOns
                     + ",\"size\":" + row.Value + "}").ToList();
             bidLevels = "[" + String.Join(",", bidRows) + "]";
             askLevels = "[" + String.Join(",", askRows) + "]";
+            if (removeIdentityUnresolved)
+            {
+                // A zero-price Remove identifies its deleted level only by the
+                // pre-mutation positional cursor. Advance all known positions,
+                // but never invent the missing removed-price identity or call
+                // that callback available.
+                positionStateDisclosed = true;
+                depthPositionDisclosurePending = true;
+                bidPositions = DepthPositions(candidateBids);
+                askPositions = DepthPositions(candidateAsks);
+                failureReason = "NATIVE_DEPTH_REMOVE_IDENTITY_UNRESOLVED";
+                return false;
+            }
             if (bidPrefix.Count == 0 || askPrefix.Count == 0)
             {
                 positionStateDisclosed = true;
@@ -1395,6 +1411,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                 depthPositionDisclosurePending = true;
                 bidPositions = DepthPositions(candidateBids);
                 askPositions = DepthPositions(candidateAsks);
+                failureReason = "NATIVE_DEPTH_EXACT_10X10_REQUIRED";
+                return false;
             }
             else if (depthPositionDisclosurePending)
             {
@@ -1634,7 +1652,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string AttestedSchema = "lane-iii-phase-f3-ninjatrader-observation-v2";
         private const string AttestationProtocol = "l3f3-ninjatrader-observer-attestation-v1";
         private const string AttestationKeyContext = "BEELZEBUB_NINJATRADER_OBSERVATION_V2";
-        private const string ProducerSourceFingerprint = "179461968b31942f8becb3661a2f69be6025253448489821c93a9bc4513aeede";
+        private const string ProducerSourceFingerprint = "861d2d270948d6b7f78631bd50a1fc1b7f473f63739486d026130c0517533fae";
         // Event-driven trades/depth require burst capacity, but memory remains
         // bounded. A full queue drops the signed frame after assigning its
         // sequence; the next source_event_sequence exposes the gap.

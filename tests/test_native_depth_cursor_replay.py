@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -21,6 +22,7 @@ class Mutation:
     price: Decimal = Decimal("0")
     volume: int = 0
     is_reset: bool = False
+    generation: int = 1
 
 
 @dataclass(frozen=True)
@@ -40,10 +42,12 @@ class IndependentNativeDepthOracle:
         asks: tuple[Level, ...] = (),
         *,
         last_sequence: int = 0,
+        generation: int = 1,
     ) -> None:
         self.bids = dict(enumerate(bids))
         self.asks = dict(enumerate(asks))
         self.last_sequence = last_sequence
+        self.generation = generation
         self.continuity_broken = False
 
     @staticmethod
@@ -76,6 +80,9 @@ class IndependentNativeDepthOracle:
     def apply(self, mutation: Mutation) -> Publication:
         if self.continuity_broken:
             raise ValueError("oracle_continuity_broken")
+        if mutation.generation != self.generation:
+            self.continuity_broken = True
+            raise ValueError("oracle_source_generation_changed")
         if mutation.sequence != self.last_sequence + 1:
             self.continuity_broken = True
             raise ValueError("oracle_source_sequence_gap")
@@ -87,6 +94,7 @@ class IndependentNativeDepthOracle:
             self.bids.clear()
             self.asks.clear()
         levels = self.bids if mutation.side == "Bid" else self.asks
+        remove_identity_unresolved = False
         if mutation.operation == "Add":
             if mutation.position < 0 or mutation.price <= 0 or mutation.volume <= 0:
                 self.continuity_broken = True
@@ -102,6 +110,7 @@ class IndependentNativeDepthOracle:
             if mutation.position < 0:
                 self.continuity_broken = True
                 raise ValueError("oracle_remove_invalid")
+            remove_identity_unresolved = mutation.position not in levels
             levels.pop(mutation.position, None)
             self._shift(levels, mutation.position, False)
         else:
@@ -110,10 +119,16 @@ class IndependentNativeDepthOracle:
 
         bids = self._prefix(self.bids, True)
         asks = self._prefix(self.asks, False)
+        if remove_identity_unresolved:
+            return Publication(
+                False, "NATIVE_DEPTH_REMOVE_IDENTITY_UNRESOLVED", bids, asks
+            )
         if not bids or not asks:
             return Publication(False, "NATIVE_DEPTH_POSITION_ZERO_UNAVAILABLE", bids, asks)
         if bids[0][0] >= asks[0][0]:
             return Publication(False, "CROSSED_NATIVE_POSITIONAL_SNAPSHOT", bids, asks)
+        if len(bids) != 10 or len(asks) != 10:
+            return Publication(False, "NATIVE_DEPTH_EXACT_10X10_REQUIRED", bids, asks)
         return Publication(True, None, bids, asks)
 
 
@@ -503,6 +518,68 @@ CAPTURED_BID_SEAMS = (
 )
 
 
+# Compact fixture derived from, but not copying, the preserved authenticated
+# 149,996,841-byte journal.  The whole-file identity and per-record chain/wire
+# identities make the journal-47 regression traceable to the immutable source.
+AUTHENTIC_JOURNAL_47_PROVENANCE = {
+    "path": (
+        r"N:\Beelzebub\runtime\profiles\beelzebub_pong_discernment_v1\runs"
+        r"\20260920T211544Z-ca2ceba7da11\audit\pong-authentic-hour\collectors"
+        r"\pong-collector-20260921T043228465785Z-0fefc92586ff"
+        r"\authenticated-observations.jsonl"
+    ),
+    "bytes": 149_996_841,
+    "sha256": "361d9f5a612090475c4fa7a2a7a72d1fb6fb54defb537895dc58957d81f36087",
+    "source_generation": 1,
+    "records": (
+        (46, 955866, "2d9ed27bca2331a14f6cd5ad1762a502f2ec00560fe04235e447e859154e89b9", "e3df38c290f9ba13c8787fe72d1b021edf8ed5b2279699bba970074e30bf5163"),
+        (47, 955867, "9b311649f701c7968437f94e15b61cb3320d3f7ab54fc4fa23f87974f643441d", "f3aedfffc2eedd3f7cb02b4c3f5144646543ac5683fbfddc3eb34128fbc9495c"),
+        (48, 955868, "f60a94d15cfa9490c3a59d8b05c0e659fb2a57d7fa2ddfaaa9d7beae4a522d51", "dbe8b649cfc2cf9da31c9998cffb9270ce4b0e92f950282e5646c088c8c7995f"),
+        (49, 955869, "56b60de02894bc4dccde067aaa70745ca4e2a71177af960c8172a69cb1e21484", "dc6e8b8aa6e101c703d5a79e1a0599f1f5c5e9b7a0571a411326ddeb524327d5"),
+        (50, 955870, "06f5a6cf94fa441caa9f38780d003df78ece17a16dd1143fe92f45af448ecb46", "010aa50c8a73db42777e278cfe08445622001c9321e7065263d5f4befbbb5edb"),
+        (51, 955871, "11d77d364d279e6722028ee880fdc92070f2c12fe39dbc443282dc0ea88fd972", "260fb38f7eb757f3c4c3b44095d664f267d0948ce3d0a193fd3d3c0c3f6efea1"),
+        (52, 955872, "db50e9462ac3c5bc1ab83b81393d2e4c7aae9761bb1d4159a683007acbf05e30", "f3ffc2206a3ef4c81abc84114840b91f7270f26ddb0412cb3e97575e4b060f48"),
+    ),
+}
+AUTHENTIC_JOURNAL_47_FIXTURE_SHA256 = "647be4f516a1a9c58a144b43e140be1d47dd7a0728f8d914081982ffc05a8837"
+AUTHENTIC_JOURNAL_47_BIDS = levels(
+    ("30096.5", 5), ("30096.25", 9), ("30096", 8),
+    ("30095.75", 15), ("30095.5", 13), ("30095.25", 11),
+    ("30095", 16), ("30094.75", 28), ("30094.5", 24),
+    ("30094.25", 15),
+)
+AUTHENTIC_JOURNAL_46_ASKS = levels(
+    ("30097", 9), ("30097.25", 14), ("30097.5", 12),
+    ("30097.75", 11), ("30098", 14), ("30098.25", 15),
+    ("30098.5", 15), ("30098.75", 17), ("30099", 14),
+    ("30099.25", 16),
+)
+AUTHENTIC_JOURNAL_47_NEIGHBOR_MUTATIONS = (
+    Mutation(955867, "Add", "Ask", 1, Decimal("30097"), 7),
+    Mutation(955868, "Remove", "Ask", 0),
+    Mutation(955869, "Add", "Ask", 2, Decimal("30097.25"), 14),
+    Mutation(955870, "Remove", "Ask", 1),
+    Mutation(955871, "Add", "Ask", 3, Decimal("30097.5"), 12),
+    Mutation(955872, "Remove", "Ask", 2),
+)
+
+
+def authentic_journal_47_fixture_material() -> bytes:
+    value = {
+        "provenance": AUTHENTIC_JOURNAL_47_PROVENANCE,
+        "bids": [(str(price), size) for price, size in AUTHENTIC_JOURNAL_47_BIDS],
+        "asks": [(str(price), size) for price, size in AUTHENTIC_JOURNAL_46_ASKS],
+        "mutations": [
+            (
+                item.sequence, item.operation, item.side, item.position,
+                str(item.price), item.volume, item.is_reset, item.generation,
+            )
+            for item in AUTHENTIC_JOURNAL_47_NEIGHBOR_MUTATIONS
+        ],
+    }
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
 class NativeDepthCursorReplayTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -516,6 +593,28 @@ class NativeDepthCursorReplayTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         cls._harness_directory.cleanup()
+
+    def _run_production(
+        self,
+        bids: tuple[Level, ...],
+        asks: tuple[Level, ...],
+        mutations: tuple[Mutation, ...],
+    ) -> list[list[str]]:
+        executed = subprocess.run(
+            [str(self._harness)],
+            input="\n".join((
+                "SEED\tBid\t" + encode_seed(bids),
+                "SEED\tAsk\t" + encode_seed(asks),
+                *(encode_mutation(item) for item in mutations),
+            )) + "\n",
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(executed.returncode, 0, executed.stderr)
+        rows = executed.stdout.splitlines()
+        self.assertEqual(rows[:2], ["SEEDED", "SEEDED"])
+        return [row.split("\t") for row in rows[2:]]
 
     def test_all_five_captured_seams_match_executed_production_and_oracle(self) -> None:
         self.assertEqual(
@@ -603,11 +702,21 @@ class NativeDepthCursorReplayTests(unittest.TestCase):
                     self.assertEqual(decode_positions(fields[8]), oracle.asks)
                 publications.append(actual)
 
-            self.assertTrue(publications[0].available, case["journal"])
+            self.assertFalse(publications[0].available, case["journal"])
+            self.assertEqual(
+                publications[0].reason,
+                "NATIVE_DEPTH_EXACT_10X10_REQUIRED",
+                case["journal"],
+            )
             self.assertTrue(all(
                 not publication.available for publication in publications[1:-1]
             ), case["journal"])
-            self.assertTrue(publications[-1].available, case["journal"])
+            self.assertFalse(publications[-1].available, case["journal"])
+            self.assertEqual(
+                publications[-1].reason,
+                "NATIVE_DEPTH_EXACT_10X10_REQUIRED",
+                case["journal"],
+            )
             self.assertEqual(mutations[-1].sequence, case["recovered_source"])
             self.assertEqual(
                 case["recovered_journal"] - case["journal"],
@@ -636,64 +745,138 @@ class NativeDepthCursorReplayTests(unittest.TestCase):
         self.assertEqual(executed.returncode, 0, executed.stderr)
         rows = [line.split("\t") for line in executed.stdout.splitlines()[2:]]
         self.assertEqual([row[6] for row in rows], ["1", "1", "0"])
+        self.assertEqual(rows[0][0:2], ["0", "CROSSED_NATIVE_POSITIONAL_SNAPSHOT"])
+        self.assertEqual(rows[1][0:2], ["1", ""])
+        self.assertEqual(rows[2][0:2], ["1", ""])
         self.assertEqual(Decimal(rows[1][9]), Decimal("100.25"))
         self.assertEqual(decode_positions(rows[0][7])[0], (Decimal("100.25"), 7))
         self.assertEqual(decode_positions(rows[1][7]), decode_working(rows[1][4]))
 
-    def test_ask_side_mirror_never_reuses_pre_cross_cursor(self) -> None:
-        initial_bids = levels(("100", 5), ("99.75", 4), ("99.5", 3))
-        initial_asks = levels(("100.25", 6), ("100.5", 7), ("100.75", 8))
-        oracle = IndependentNativeDepthOracle(initial_bids, initial_asks)
-        self.assertTrue(oracle.apply(Mutation(1, "Remove", "Ask", 0)).available)
-        for mutation in (
-            Mutation(2, "Add", "Ask", 0, Decimal("99.75"), 2),
-            Mutation(3, "Remove", "Ask", 1),
-            Mutation(4, "Add", "Ask", 1, Decimal("100"), 3),
-            Mutation(5, "Remove", "Ask", 0),
-        ):
-            publication = oracle.apply(mutation)
-            self.assertFalse(publication.available)
-            self.assertEqual(publication.reason, "CROSSED_NATIVE_POSITIONAL_SNAPSHOT")
-        recovered = oracle.apply(Mutation(6, "Remove", "Ask", 0))
-        self.assertTrue(recovered.available)
-        self.assertEqual(recovered.asks, initial_asks[2:])
-
-    def test_deeper_positions_and_zero_price_removes_are_authentic(self) -> None:
-        oracle = IndependentNativeDepthOracle(
-            levels(("100", 5), ("99.75", 4), ("99.25", 3)),
-            levels(("100.25", 6), ("100.75", 8)),
-        )
-        inserted = oracle.apply(Mutation(1, "Add", "Bid", 2, Decimal("99.5"), 9))
+    def test_authenticated_journal_47_and_neighbors_are_truthfully_unavailable(self) -> None:
+        fixture_hash = hashlib.sha256(authentic_journal_47_fixture_material()).hexdigest()
+        self.assertEqual(fixture_hash, AUTHENTIC_JOURNAL_47_FIXTURE_SHA256)
         self.assertEqual(
-            inserted.bids,
-            levels(("100", 5), ("99.75", 4), ("99.5", 9), ("99.25", 3)),
+            [row[:2] for row in AUTHENTIC_JOURNAL_47_PROVENANCE["records"]],
+            [(46, 955866), (47, 955867), (48, 955868), (49, 955869),
+             (50, 955870), (51, 955871), (52, 955872)],
         )
-        updated = oracle.apply(Mutation(2, "Update", "Bid", 2, Decimal("99.5"), 10))
-        self.assertEqual(updated.bids[2], (Decimal("99.5"), 10))
-        removed = oracle.apply(Mutation(3, "Remove", "Bid", 2, Decimal("0"), 0))
-        self.assertEqual(
-            removed.bids,
-            levels(("100", 5), ("99.75", 4), ("99.25", 3)),
+        rows = self._run_production(
+            AUTHENTIC_JOURNAL_47_BIDS,
+            AUTHENTIC_JOURNAL_46_ASKS,
+            AUTHENTIC_JOURNAL_47_NEIGHBOR_MUTATIONS,
         )
-
-    def test_reset_rebuild_stays_unavailable_until_both_sides_are_coherent(self) -> None:
         oracle = IndependentNativeDepthOracle(
-            levels(("100", 5)), levels(("100.25", 6))
+            AUTHENTIC_JOURNAL_47_BIDS,
+            AUTHENTIC_JOURNAL_46_ASKS,
+            last_sequence=955866,
         )
-        bid_reset = oracle.apply(
-            Mutation(1, "Add", "Bid", 0, Decimal("101"), 2, is_reset=True)
+        expected = [oracle.apply(item) for item in AUTHENTIC_JOURNAL_47_NEIGHBOR_MUTATIONS]
+        actual = [
+            Publication(row[0] == "1", row[1] or None,
+                        decode_levels(row[2]), decode_levels(row[3]))
+            for row in rows
+        ]
+        self.assertEqual(actual, expected)
+        self.assertEqual(
+            [(item.available, item.reason, len(item.asks)) for item in actual],
+            [
+                (False, "NATIVE_DEPTH_EXACT_10X10_REQUIRED", 1),
+                (True, None, 10),
+                (False, "NATIVE_DEPTH_EXACT_10X10_REQUIRED", 2),
+                (True, None, 10),
+                (False, "NATIVE_DEPTH_EXACT_10X10_REQUIRED", 3),
+                (True, None, 10),
+            ],
         )
-        self.assertFalse(bid_reset.available)
-        self.assertEqual(bid_reset.reason, "NATIVE_DEPTH_POSITION_ZERO_UNAVAILABLE")
-        bid_rebuilt = oracle.apply(Mutation(2, "Add", "Ask", 0, Decimal("101.25"), 3))
-        self.assertTrue(bid_rebuilt.available)
 
-        ask_reset = oracle.apply(
-            Mutation(3, "Add", "Ask", 0, Decimal("102"), 4, is_reset=True)
+    def test_mirrored_10x1_and_1x10_are_unavailable_in_executed_production(self) -> None:
+        bids = levels(*((str(100 - Decimal(index) / 4), index + 1) for index in range(10)))
+        asks = levels(*((str(Decimal("100.25") + Decimal(index) / 4), index + 1) for index in range(10)))
+        ten_by_one = self._run_production(
+            bids, asks[:1],
+            (Mutation(1, "Update", "Ask", 0, asks[0][0], asks[0][1] + 1),),
+        )[0]
+        one_by_ten = self._run_production(
+            bids[:1], asks,
+            (Mutation(1, "Update", "Bid", 0, bids[0][0], bids[0][1] + 1),),
+        )[0]
+        for row, shape in ((ten_by_one, (10, 1)), (one_by_ten, (1, 10))):
+            self.assertEqual(row[:2], ["0", "NATIVE_DEPTH_EXACT_10X10_REQUIRED"])
+            self.assertEqual((len(decode_levels(row[2])), len(decode_levels(row[3]))), shape)
+
+    def test_partial_and_crossed_books_recover_only_at_exact_coherent_10x10(self) -> None:
+        bids = levels(*((str(100 - Decimal(index) / 4), index + 1) for index in range(10)))
+        asks = levels(*((str(Decimal("100.25") + Decimal(index) / 4), index + 1) for index in range(10)))
+        partial_rows = self._run_production(
+            bids, asks[:9],
+            (
+                Mutation(1, "Update", "Ask", 0, Decimal("100.25"), 99),
+                Mutation(2, "Add", "Ask", 9, Decimal("102.5"), 10),
+            ),
         )
-        self.assertFalse(ask_reset.available)
-        ask_rebuilt = oracle.apply(Mutation(4, "Add", "Bid", 0, Decimal("101.75"), 5))
-        self.assertTrue(ask_rebuilt.available)
+        self.assertEqual(partial_rows[0][:2], ["0", "NATIVE_DEPTH_EXACT_10X10_REQUIRED"])
+        self.assertEqual(partial_rows[1][:2], ["1", ""])
+
+        crossed_rows = self._run_production(
+            bids, asks,
+            (
+                Mutation(1, "Add", "Bid", 0, Decimal("100.25"), 7),
+                Mutation(2, "Remove", "Bid", 0),
+                Mutation(3, "Update", "Ask", 0, Decimal("100.25"), 8),
+            ),
+        )
+        self.assertEqual(crossed_rows[0][:2], ["0", "CROSSED_NATIVE_POSITIONAL_SNAPSHOT"])
+        self.assertEqual(crossed_rows[1][:2], ["1", ""])
+        self.assertEqual(crossed_rows[2][:2], ["1", ""])
+
+    def test_known_and_unknown_zero_price_removes_preserve_identity_rules(self) -> None:
+        bids = levels(*((str(100 - Decimal(index) / 4), index + 1) for index in range(11)))
+        asks = levels(*((str(Decimal("100.25") + Decimal(index) / 4), index + 1) for index in range(10)))
+        known = self._run_production(
+            bids, asks, (Mutation(1, "Remove", "Bid", 10),)
+        )[0]
+        self.assertEqual(known[:2], ["1", ""])
+        self.assertEqual(Decimal(known[9]), bids[10][0])
+
+        unknown_rows = self._run_production(
+            bids[:10], asks,
+            (
+                Mutation(1, "Remove", "Bid", 15),
+                Mutation(2, "Update", "Bid", 0, Decimal("100"), 22),
+            ),
+        )
+        self.assertEqual(
+            unknown_rows[0][:2],
+            ["0", "NATIVE_DEPTH_REMOVE_IDENTITY_UNRESOLVED"],
+        )
+        self.assertEqual(unknown_rows[0][9], "NaN")
+        self.assertEqual(unknown_rows[1][:2], ["1", ""])
+
+    def test_reset_and_sparse_rebuild_stay_unavailable_until_exact_10x10(self) -> None:
+        bids = levels(*((str(100 - Decimal(index) / 4), index + 1) for index in range(10)))
+        asks = levels(*((str(Decimal("100.25") + Decimal(index) / 4), index + 1) for index in range(10)))
+        mutations = [Mutation(1, "Add", "Bid", 0, Decimal("100"), 1, is_reset=True)]
+        sequence = 2
+        for position in range(1, 10):
+            mutations.append(Mutation(
+                sequence, "Add", "Bid", position,
+                Decimal("100") - Decimal(position) / 4, position + 1,
+            ))
+            sequence += 1
+        # Position five first proves a sparse-prefix state is unavailable.
+        mutations.append(Mutation(sequence, "Update", "Ask", 5, Decimal("101.5"), 6))
+        sequence += 1
+        for position in range(10):
+            if position == 5:
+                continue
+            mutations.append(Mutation(
+                sequence, "Update", "Ask", position,
+                Decimal("100.25") + Decimal(position) / 4, position + 1,
+            ))
+            sequence += 1
+        rows = self._run_production(bids, asks, tuple(mutations))
+        self.assertTrue(all(row[0] == "0" for row in rows[:-1]))
+        self.assertEqual(rows[-1][:2], ["1", ""])
 
     def test_sequence_gap_latches_oracle_until_authoritative_rebuild(self) -> None:
         oracle = IndependentNativeDepthOracle(
@@ -704,6 +887,34 @@ class NativeDepthCursorReplayTests(unittest.TestCase):
             oracle.apply(Mutation(12, "Update", "Bid", 0, Decimal("100"), 7))
         self.assertTrue(oracle.continuity_broken)
         self.assertEqual((oracle.bids, oracle.asks), before)
+
+        replacement = IndependentNativeDepthOracle(
+            levels(*((str(100 - Decimal(index) / 4), index + 1) for index in range(10))),
+            levels(*((str(Decimal("100.25") + Decimal(index) / 4), index + 1) for index in range(10))),
+            generation=2,
+        )
+        self.assertTrue(
+            replacement.apply(Mutation(
+                1, "Update", "Bid", 0, Decimal("100"), 8, generation=2
+            )).available
+        )
+        with self.assertRaisesRegex(ValueError, "oracle_source_generation_changed"):
+            replacement.apply(Mutation(
+                2, "Update", "Bid", 0, Decimal("100"), 9, generation=1
+            ))
+
+    def test_invalid_native_side_is_terminal_in_executed_production(self) -> None:
+        bids = levels(*((str(100 - Decimal(index) / 4), index + 1) for index in range(10)))
+        asks = levels(*((str(Decimal("100.25") + Decimal(index) / 4), index + 1) for index in range(10)))
+        rows = self._run_production(
+            bids, asks,
+            (
+                Mutation(1, "Update", "Last", 0, Decimal("100"), 1),
+                Mutation(2, "Update", "Bid", 0, Decimal("100"), 2),
+            ),
+        )
+        self.assertEqual(rows[0][:2], ["0", "NATIVE_DEPTH_SIDE_INVALID"])
+        self.assertEqual(rows[1][:2], ["0", "NATIVE_DEPTH_CONTINUITY_BROKEN"])
 
     def test_production_commits_working_cursor_before_publishability_checks(self) -> None:
         source = (

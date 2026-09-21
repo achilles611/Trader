@@ -3,12 +3,15 @@ from __future__ import annotations
 from datetime import datetime
 import json
 from pathlib import Path
+import queue
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from src.l3f_provider.ninjatrader_observation import expected_observer_source_fingerprint
 from src.l3g_paper.contracts import PONG_ENTRY_PROFILE_VERSION
@@ -17,6 +20,7 @@ from src.l3g_paper.pong import PongState
 from src.l3g_paper.pong_contract import DEC26_TOPOLOGY
 from src.l3g_paper.pong_microstructure import BookSide
 from src.l3g_paper.pong_production import (
+    PONG_HOST_TELEMETRY_SCHEMA,
     PONG_QUALIFYING_HOUR_SCHEMA,
     PongProductionHost,
 )
@@ -79,6 +83,316 @@ def pending_collection() -> dict[str, object]:
 
 
 class PongProductionHostTests(unittest.TestCase):
+    def test_successful_admission_updates_high_water_before_interleaved_drain(
+        self,
+    ) -> None:
+        with TemporaryDirectory(prefix="pong-host-admission-interleave-") as root:
+            host = self._qualifying_host(root)
+            inserted = threading.Event()
+            drained = threading.Event()
+            consumer_errors: list[str] = []
+            original_put_nowait = host._observations.put_nowait
+
+            def interleaved_put(item: object) -> None:
+                original_put_nowait(item)
+                inserted.set()
+                self.assertTrue(drained.wait(1.0))
+
+            def forced_consumer() -> None:
+                if not inserted.wait(1.0):
+                    consumer_errors.append("admission was not observed")
+                    return
+                try:
+                    host._observations.get_nowait()
+                except queue.Empty:
+                    consumer_errors.append("admitted item was not drainable")
+                    return
+                drained.set()
+                with host._admission_lock:
+                    if host._observation_queue_occupancy != 1:
+                        consumer_errors.append("occupancy was not published atomically")
+                    host._observation_queue_occupancy -= 1
+                host._observations.task_done()
+
+            host._observations.put_nowait = interleaved_put
+            consumer = threading.Thread(target=forced_consumer, daemon=True)
+            consumer.start()
+            host.on_observation(self._qualifying_depth(1))
+            consumer.join(1.0)
+
+            self.assertFalse(consumer.is_alive())
+            self.assertEqual(consumer_errors, [])
+            self.assertEqual(host._source_ingress_records, 1)
+            self.assertEqual(host._observation_queue_occupancy, 0)
+            self.assertEqual(host._observations.qsize(), 0)
+            self.assertEqual(host._observation_queue_high_water, 1)
+
+    def test_early_canonical_10x1_fault_persists_without_later_record(self) -> None:
+        with TemporaryDirectory(prefix="pong-host-10x1-fault-") as root:
+            host = self._qualifying_host(root)
+            host._consume_observation(
+                self._qualifying_depth(1, levels=10, ask_levels=1)
+            )
+
+            receipt = json.loads(
+                (host.host_telemetry_root / "first-fault.json").read_text(
+                    encoding="utf-8",
+                )
+            )
+            self.assertEqual(
+                receipt["fault"], "PONG_CANONICAL_DEPTH_10X10_REQUIRED",
+            )
+            self.assertEqual(receipt["receiver"]["last_stream_sequences"], {"DEPTH": 1})
+            self.assertEqual(receipt["host_work"]["unprocessed_work"], 0)
+            self.assertEqual(
+                receipt["clock_domains"]["host_queue_age_and_checkpoint"],
+                "PROCESS_MONOTONIC_SECONDS",
+            )
+            self.assertEqual(
+                receipt["clock_domains"]["source_receipt_age"],
+                "UTC_WALL_CLOCK_DURATION",
+            )
+
+    def test_final_latches_callback_queue_fault_without_later_record(self) -> None:
+        with TemporaryDirectory(prefix="pong-host-final-fault-") as root:
+            host = self._qualifying_host(root)
+            host._observations = queue.Queue(maxsize=1)
+            collector_refresh_lock_states: list[bool] = []
+
+            def final_collector_status() -> dict[str, object]:
+                collector_refresh_lock_states.append(host._lock._is_owned())
+                value = pending_collection()
+                value["durability"] = {
+                    **value["durability"],
+                    "written_records": 7,
+                    "durable_records": 7,
+                }
+                return value
+
+            host._collector_status = final_collector_status
+            host.on_observation(self._qualifying_depth(1))
+            host.on_observation(self._qualifying_depth(2))
+            host.stop()
+
+            fault = json.loads(
+                (host.host_telemetry_root / "first-fault.json").read_text(
+                    encoding="utf-8",
+                )
+            )
+            final = json.loads(
+                (host.host_telemetry_root / "final.json").read_text(
+                    encoding="utf-8",
+                )
+            )
+            self.assertEqual(
+                fault["fault"], "PONG_PRODUCTION_OBSERVATION_QUEUE_OVERFLOW",
+            )
+            self.assertEqual(final["fault"], fault["fault"])
+            self.assertEqual(
+                final["snapshot"]["stage"],
+                "POST_HOST_JOIN_PRE_COLLECTOR_STOP_REFRESH",
+            )
+            self.assertEqual(
+                final["snapshot"]["collector_durability_scope"],
+                "PRE_COLLECTOR_STOP_SNAPSHOT_NOT_FINAL_DURABILITY",
+            )
+            self.assertIsNotNone(final["snapshot"]["collector_snapshot_at_utc"])
+            self.assertEqual(
+                final["collector"]["durability"]["durable_records"], 7,
+            )
+            self.assertEqual(final["host_work"]["observation_queue_depth"], 1)
+            self.assertEqual(final["host_work"]["observation_queue_high_water"], 1)
+            self.assertEqual(collector_refresh_lock_states, [False])
+
+    def test_failed_first_fault_write_retry_is_monotonic_rate_limited(self) -> None:
+        with TemporaryDirectory(prefix="pong-host-fault-retry-") as root:
+            host = self._qualifying_host(root)
+            now = [10.0]
+            host._monotonic_clock = lambda: now[0]
+            with patch(
+                "src.l3g_paper.pong_production._atomic_write",
+                side_effect=OSError("disk unavailable"),
+            ) as atomic_write:
+                with host._lock:
+                    host._persist_first_host_fault_locked("EARLY_FAULT")
+                    for _ in range(100):
+                        host._persist_first_host_fault_locked("LATER_FAULT")
+                    self.assertEqual(atomic_write.call_count, 1)
+                    now[0] += 4.999
+                    host._persist_first_host_fault_locked("LATER_FAULT")
+                    self.assertEqual(atomic_write.call_count, 1)
+                    now[0] += 0.002
+                    host._persist_first_host_fault_locked("LATER_FAULT")
+                    self.assertEqual(atomic_write.call_count, 2)
+            self.assertEqual(host._host_first_fault, "EARLY_FAULT")
+
+    def test_checkpoint_latches_input_fault_without_later_record(self) -> None:
+        with TemporaryDirectory(prefix="pong-host-checkpoint-fault-") as root:
+            host = self._qualifying_host(root)
+            with host._lock:
+                host._input_error = "PONG_COMPUTE_QUEUE_OVERFLOW"
+                host._persist_host_checkpoint_locked(10.0)
+            receipt = json.loads(
+                (host.host_telemetry_root / "first-fault.json").read_text(
+                    encoding="utf-8",
+                )
+            )
+            self.assertEqual(receipt["fault"], "PONG_COMPUTE_QUEUE_OVERFLOW")
+
+    def test_queued_work_and_protection_elapsed_are_monotonic_and_bounded(self) -> None:
+        with TemporaryDirectory(prefix="pong-host-queue-metrics-") as root:
+            host = self._qualifying_host(root)
+            now = [100.0]
+            host._monotonic_clock = lambda: now[0]
+            host.on_observation(self._qualifying_depth(1))
+            now[0] = 101.0
+            host.on_observation(self._qualifying_depth(2))
+            now[0] = 105.0
+            with host._lock:
+                host._update_protection_accounting_locked()
+                now[0] = 108.0
+                host._bridge = SimpleNamespace(
+                    machine=SimpleNamespace(
+                        state=PongState.FLAT_WAIT_ALIGNMENT,
+                        actual_quantity=0,
+                        pending_action=None,
+                    ),
+                )
+                host._runtime = qualifying_runtime_snapshot()
+                host._update_protection_accounting_locked()
+                now[0] = 113.0
+                host._runtime["working_owned_orders"] = 1
+                host._update_protection_accounting_locked()
+                now[0] = 115.0
+                self.assertTrue(host._persist_host_receipt_locked("checkpoint"))
+
+            receipt = json.loads(
+                (host.host_telemetry_root / "checkpoint.json").read_text(
+                    encoding="utf-8",
+                )
+            )
+            self.assertEqual(receipt["host_work"]["observation_queue_depth"], 2)
+            self.assertEqual(receipt["host_work"]["observation_queue_high_water"], 2)
+            self.assertEqual(
+                receipt["host_work"]["oldest_pending_queue_age_ms"], 15000.0,
+            )
+            self.assertEqual(receipt["protection"]["eligible_elapsed_seconds"], 5.0)
+            self.assertEqual(receipt["protection"]["protected_elapsed_seconds"], 5.0)
+            self.assertEqual(receipt["protection"]["transition_count"], 2)
+            self.assertEqual(
+                receipt["protection"]["reason"], "RUNTIME_OWNED_ORDERS_PRESENT",
+            )
+            self.assertEqual(
+                receipt["runtime_identity_and_authority"]["account_name"],
+                "Sim101",
+            )
+            self.assertEqual(
+                receipt["runtime_identity_and_authority"]["instrument"],
+                DEC26_TOPOLOGY.native_instrument,
+            )
+            self.assertEqual(
+                receipt["missing_metrics"]["host_rlock_wait"],
+                "MISSING_NOT_INSTRUMENTED",
+            )
+
+    def test_atomic_host_receipts_survive_early_fault_and_status_unavailability(
+        self,
+    ) -> None:
+        with TemporaryDirectory(prefix="pong-host-telemetry-") as root:
+            host = self._qualifying_host(root)
+            host.start()
+            try:
+                host._consume_observation(self._qualifying_depth(1))
+                host._consume_observation(self._qualifying_depth(3))
+
+                fault_path = host.host_telemetry_root / "first-fault.json"
+                checkpoint_path = host.host_telemetry_root / "checkpoint.json"
+                deadline = time.monotonic() + 2.0
+                while (
+                    (not fault_path.is_file() or not checkpoint_path.is_file())
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+
+                with (
+                    patch.object(
+                        host,
+                        "status",
+                        side_effect=ConnectionError("status endpoint unavailable"),
+                    ),
+                    patch.object(
+                        host,
+                        "_runtime_snapshot",
+                        side_effect=TimeoutError("runtime status unavailable"),
+                    ),
+                    patch.object(
+                        host,
+                        "_collector_status",
+                        side_effect=TimeoutError("collector status unavailable"),
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        ConnectionError, "status endpoint unavailable",
+                    ):
+                        host.status()
+                    with host._lock:
+                        self.assertTrue(
+                            host._persist_host_receipt_locked("checkpoint")
+                        )
+                    fault = json.loads(fault_path.read_text(encoding="utf-8"))
+                    checkpoint = json.loads(
+                        checkpoint_path.read_text(encoding="utf-8")
+                    )
+
+                self.assertEqual(fault["schema"], PONG_HOST_TELEMETRY_SCHEMA)
+                self.assertEqual(fault["receipt_kind"], "first-fault")
+                self.assertEqual(
+                    fault["fault"], "PONG_NATIVE_INPUT_SOURCE_SEQUENCE_GAP",
+                )
+                self.assertEqual(
+                    fault["identity"]["loaded_artifact_hash"],
+                    checkpoint["identity"]["loaded_artifact_hash"],
+                )
+                self.assertEqual(
+                    fault["identity"]["host_process_instance_id"],
+                    checkpoint["identity"]["host_process_instance_id"],
+                )
+                self.assertEqual(fault["identity"]["live_authority"], "DISARMED")
+                self.assertFalse(fault["identity"]["activation_authorized"])
+                self.assertEqual(
+                    fault["producer_identity"]["session_id"],
+                    "native-session",
+                )
+                self.assertEqual(
+                    fault["producer_identity"]["build_fingerprint"], "b" * 64,
+                )
+                self.assertEqual(
+                    fault["fhb"]["disposition"], FHB_ARCHIVE_DISPOSITION,
+                )
+                self.assertFalse(fault["fhb"]["instantiated"])
+                self.assertFalse(
+                    fault["clock_domains"]["cross_domain_subtraction_allowed"]
+                )
+                self.assertIn("unprocessed_work", fault["host_work"])
+                self.assertEqual(
+                    checkpoint["collector"]["durability"]["journal_path"],
+                    "missing",
+                )
+                self.assertIn("last_stream_sequences", fault["receiver"])
+                self.assertIn("metrics", fault["scheduler"])
+                self.assertIn("reason", fault["protection"])
+            finally:
+                host.stop()
+
+            for name in ("start", "first-fault", "checkpoint", "final"):
+                receipt = json.loads(
+                    (host.host_telemetry_root / f"{name}.json").read_text(
+                        encoding="utf-8",
+                    )
+                )
+                self.assertEqual(receipt["schema"], PONG_HOST_TELEMETRY_SCHEMA)
+                self.assertEqual(receipt["receipt_kind"], name)
+
     def test_qualifying_host_import_does_not_import_or_hash_fhb(self) -> None:
         probe = subprocess.run(
             [
@@ -108,6 +422,7 @@ class PongProductionHostTests(unittest.TestCase):
         mutation_price: object = 100,
         resolved_price: object | None = None,
         levels: int = 10,
+        ask_levels: int | None = None,
         operation: str = "Update",
         side: str = "Bid",
         bid_start: float = 100,
@@ -121,7 +436,7 @@ class PongProductionHostTests(unittest.TestCase):
         ]
         asks = [
             {"price": str(ask_start + index * 0.25), "size": str(index + 1)}
-            for index in range(levels)
+            for index in range(levels if ask_levels is None else ask_levels)
         ]
         payload = {
             "contract_id": "MNQ DEC26",

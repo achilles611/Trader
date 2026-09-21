@@ -1645,6 +1645,15 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertIn("class BeelzebubMarketCallbackGate", addon)
         self.assertIn("expectedGeneration != generation", addon)
         self.assertIn("marketDataGate.Retire();", addon)
+        lease = addon[
+            addon.index("    public static class BeelzebubMarketPublisherLease"):
+            addon.index("    // BEELZEBUB_MARKET_CALLBACK_GATE_END")
+        ]
+        claim = lease[lease.index("public static long Claim"):lease.index("public static bool TryRun")]
+        self.assertIn("owner = ++generation", claim)
+        self.assertNotIn("depth = 0", claim)
+        self.assertIn("current = token", lease)
+        self.assertIn('if (stream == "DEPTH") return ++depth;', lease)
         for source in (addon, observer):
             self.assertIn("BeelzebubMarketCallbackGate marketDataGate", source)
             self.assertIn("marketDataGate.TryRun(", source)
@@ -1739,6 +1748,9 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertIn("nativeDepthWorkingBookAsks", mutation)
         self.assertIn("DepthPrefix(candidateBids, true)", mutation)
         self.assertIn("DepthPrefix(candidateAsks, false)", mutation)
+        self.assertIn("removeIdentityUnresolved", mutation)
+        self.assertIn('failureReason = "NATIVE_DEPTH_REMOVE_IDENTITY_UNRESOLVED";', mutation)
+        self.assertIn('failureReason = "NATIVE_DEPTH_EXACT_10X10_REQUIRED";', mutation)
         working_commit = mutation.index(
             "CommitNativeDepthWorkingState(candidateBids, candidateAsks);"
         )
@@ -1746,6 +1758,11 @@ class NinjaScriptSourceTests(unittest.TestCase):
         crossed_check = mutation.index("if (bestNativeBid >= bestNativeAsk)")
         self.assertLess(working_commit, partial_check)
         self.assertLess(working_commit, crossed_check)
+        exact_shape_failure = mutation.index(
+            'failureReason = "NATIVE_DEPTH_EXACT_10X10_REQUIRED";'
+        )
+        self.assertLess(partial_check, exact_shape_failure)
+        self.assertIn("return false;", mutation[exact_shape_failure:exact_shape_failure + 120])
         self.assertEqual(
             mutation.count("CommitNativeDepthWorkingState(candidateBids, candidateAsks);"),
             1,
@@ -1786,6 +1803,49 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertNotIn("bestBid <= bestAsk", source)
         for forbidden in ("CreateOrder(", ".Submit(", ".Cancel(", ".Flatten(", "NetworkStream.Read"):
             self.assertNotIn(forbidden, source)
+
+    def test_commissioning_requires_a_distinct_receiver_first_producer_boundary(self) -> None:
+        root = Path(__file__).parents[1]
+        commission = (root / "tools" / "commission_ninjatrader_observer.ps1").read_text(
+            encoding="utf-8"
+        )
+        probe = (root / "scripts" / "pong_native_input_probe.py").read_text(
+            encoding="utf-8"
+        )
+        for required in (
+            "RequireDistinctProducer",
+            "PreReloadReceiptPath",
+            "Get-ReceiverReadiness",
+            "Listener and independent collector must be ready",
+            "Get-LoadedAssemblyMatches",
+            "producer_queue_overflow_delta",
+            "producer_transport_failed_delta",
+            "source_generation",
+            "distinct_producer_verified",
+            "stream_continuity_verified",
+            "host_fault_free",
+            "host_observation_queue_overflow",
+            "pre_reload_receipt_sha256",
+            "pre_reload_journal",
+            "gate_b_deltas_begin_at",
+            "FAILED_UNKNOWN_PENDING_TAIL_NOT_DRAIN_PROOF",
+        ):
+            self.assertIn(required, commission)
+        self.assertIn(
+            "$preReload.producer_boundary.identity.session_id -ne $first.producer_session_id",
+            commission,
+        )
+        self.assertIn(
+            "$first.loaded_build_fingerprint -eq $second.loaded_build_fingerprint",
+            commission,
+        )
+        self.assertIn("partial_available_depth", commission)
+        self.assertIn("--expected-source-fingerprint", probe)
+        self.assertIn("require_attestation=bool(args.expected_source_fingerprint)", probe)
+        self.assertIn("producer_boundary", probe)
+        self.assertIn("latest_source_sequences", probe)
+        self.assertIn("hashlib.file_digest", probe)
+        self.assertIn("journal_sha256", probe)
 
 
 if __name__ == "__main__":

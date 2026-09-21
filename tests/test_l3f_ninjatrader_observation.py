@@ -141,6 +141,10 @@ class ObservationAttestationTests(unittest.TestCase):
             self.assertIn("side.Remove(update.Position)", text)
             self.assertIn("ShiftKnownPositions(side, update.Position, false)", text)
             self.assertIn("DepthPrefix", text)
+        self.assertIn("NATIVE_DEPTH_EXACT_10X10_REQUIRED", addon)
+        self.assertIn("NATIVE_DEPTH_REMOVE_IDENTITY_UNRESOLVED", addon)
+        exact_shape = addon.index('failureReason = "NATIVE_DEPTH_EXACT_10X10_REQUIRED";')
+        self.assertIn("return false;", addon[exact_shape:exact_shape + 120])
 
     def test_bounded_native_positional_snapshot_allows_a_deeper_mutation(self):
         adapter = NinjaTraderMarketDataAdapter(
@@ -164,7 +168,7 @@ class ObservationAttestationTests(unittest.TestCase):
         )
         self.assertEqual(len(adapter.normalize(raw)), 1)
 
-        self.assertEqual(SOURCE_HASH, "179461968b31942f8becb3661a2f69be6025253448489821c93a9bc4513aeede")
+        self.assertEqual(SOURCE_HASH, "861d2d270948d6b7f78631bd50a1fc1b7f473f63739486d026130c0517533fae")
 
 
 if __name__ == "__main__":
