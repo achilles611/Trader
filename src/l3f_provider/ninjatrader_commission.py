@@ -447,6 +447,7 @@ class NinjaTraderCommissioningHarness:
         on_local_bridge_state: Callable[[StreamHealth], None] | None = None,
         on_rejection: Callable[[NinjaTraderObservationError], None] | None = None,
         on_duplicate: Callable[[], None] | None = None,
+        fail_on_observation_error: bool = False,
     ) -> None:
         self.bridge = LoopbackNinjaTraderBridge(
             config,
@@ -465,6 +466,7 @@ class NinjaTraderCommissioningHarness:
         self._on_local_bridge_state = on_local_bridge_state
         self._on_rejection = on_rejection
         self._on_duplicate = on_duplicate
+        self._fail_on_observation_error = fail_on_observation_error
         self._transport_owner: object | None = None
         self._market_transport_seen = False
         self.summary.set_health(self.health)
@@ -547,7 +549,11 @@ class NinjaTraderCommissioningHarness:
                         downstream_started = time.perf_counter()
                         self._on_observation(observation)
                         self.summary.record_downstream(time.perf_counter() - downstream_started)
-                    except Exception:
+                    except Exception as error:
+                        if self._fail_on_observation_error:
+                            raise RuntimeError(
+                                "NINJATRADER_REQUIRED_OBSERVATION_SINK_FAILED"
+                            ) from error
                         logging.getLogger(__name__).exception(
                             "NINJATRADER_OBSERVER downstream observation notification refused"
                         )
@@ -888,6 +894,7 @@ class NinjaTraderListenerWorker:
         on_local_bridge_state: Callable[[StreamHealth], None],
         on_rejection: Callable[[NinjaTraderObservationError], None],
         on_duplicate: Callable[[], None],
+        fail_on_observation_error: bool = False,
     ) -> None:
         """Attach the sole downstream composite consumer before startup.
 
@@ -903,6 +910,7 @@ class NinjaTraderListenerWorker:
             self._on_local_bridge_state = on_local_bridge_state
             self._on_rejection = on_rejection
             self._on_duplicate = on_duplicate
+            self._fail_on_observation_error = fail_on_observation_error
 
     def set_shadow_sinks(
         self,
@@ -961,6 +969,7 @@ class NinjaTraderListenerWorker:
                 on_local_bridge_state=self._on_local_bridge_state,
                 on_rejection=self._on_rejection,
                 on_duplicate=self._on_duplicate,
+                fail_on_observation_error=getattr(self, "_fail_on_observation_error", False),
             )
             self._thread = threading.Thread(
                 target=self._run,

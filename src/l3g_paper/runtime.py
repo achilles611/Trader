@@ -398,6 +398,40 @@ class ObservationFanout:
                 except Exception:
                     pass
 
+    def on_required_observation(self, observation: NinjaTraderObservation) -> None:
+        """Retain the shadow control sink and require ordered paper delivery."""
+        with self._lock:
+            try:
+                self._shadow_observation(observation)
+            except Exception as exc:
+                try:
+                    self._record_failure("SHADOW", "OBSERVATION", type(exc).__name__)
+                except Exception:
+                    pass
+            self.on_required_paper_observation(observation)
+
+    def on_required_paper_observation(self, observation: NinjaTraderObservation) -> None:
+        """Deliver qualifying paper truth exactly once or fail the receiver.
+
+        A paused paper sink cannot accept qualifying records into the legacy
+        unbounded startup buffer. The caller must establish a new clean run
+        after the startup boundary, without hiding an undelivered record.
+        """
+        with self._lock:
+            try:
+                if self._paper_observations_paused:
+                    raise RuntimeError("PONG_REQUIRED_PAPER_SINK_PAUSED")
+                self._paper_observation(observation)
+            except Exception as exc:
+                try:
+                    self._record_failure(
+                        "EXPERIMENTAL_PAPER", "OBSERVATION", type(exc).__name__,
+                    )
+                except Exception:
+                    pass
+                # A failed incident write must not turn delivery into success.
+                raise
+
     def on_transport_state(self, state: StreamHealth) -> None:
         self._deliver("TRANSPORT_STATE", self._shadow_transport, self._paper_transport, state)
 

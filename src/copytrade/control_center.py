@@ -218,6 +218,7 @@ def _dispatch_pong_observation(
     independent: bool,
     profile: str,
     activation_authorized: bool,
+    qualifying_architecture: str | None = None,
 ) -> None:
     """Dispatch one admitted record through the measured authoritative route."""
     composite_started = time.perf_counter()
@@ -228,7 +229,15 @@ def _dispatch_pong_observation(
     stage_started = time.perf_counter()
     pong_host.on_observation(observation)  # type: ignore[attr-defined]
     metrics.record_stage("pong_host", time.perf_counter() - stage_started)
-    if _pong_market_collection_only(
+    qualifying_route = (
+        qualifying_architecture == PONG_NO_FHB_QUALIFYING_ARCHITECTURE
+        and profile == PONG_ENTRY_PROFILE_VERSION
+        and not activation_authorized
+    )
+    qualifying_market = qualifying_route and (
+        getattr(observation, "observation_type", None) in {"TRADE", "QUOTE", "DEPTH"}
+    )
+    if not qualifying_market and _pong_market_collection_only(
         independent,
         profile,
         observation,
@@ -243,15 +252,25 @@ def _dispatch_pong_observation(
         metrics.record_route("PONG_COLLECTION_ONLY")
         metrics.record_stage("composite_total", time.perf_counter() - composite_started)
         return
-    if _pong_market_paper_only(independent, profile, observation):
+    if qualifying_market or _pong_market_paper_only(independent, profile, observation):
+        # The qualifying host owns Pong market analysis. Keep the paper sink:
+        # its ordered ledger envelopes, freshness/warmup and risk state feed
+        # the host's runtime snapshot even while execution is disarmed. Only
+        # the separate, non-authoritative shadow projection is redundant.
         stage_started = time.perf_counter()
-        fanout.on_paper_observation(observation)  # type: ignore[arg-type]
+        if qualifying_market:
+            fanout.on_required_paper_observation(observation)  # type: ignore[arg-type]
+        else:
+            fanout.on_paper_observation(observation)  # type: ignore[arg-type]
         metrics.record_stage("paper_fanout", time.perf_counter() - stage_started)
         metrics.record_route("PONG_PAPER_ONLY")
         metrics.record_stage("composite_total", time.perf_counter() - composite_started)
         return
     stage_started = time.perf_counter()
-    fanout.on_observation(observation)  # type: ignore[arg-type]
+    if qualifying_route:
+        fanout.on_required_observation(observation)  # type: ignore[arg-type]
+    else:
+        fanout.on_observation(observation)  # type: ignore[arg-type]
     metrics.record_stage("legacy_fanout", time.perf_counter() - stage_started)
     metrics.record_route("FULL_LEGACY_FANOUT")
     metrics.record_stage("composite_total", time.perf_counter() - composite_started)
@@ -2662,7 +2681,10 @@ def create_control_center_app(
             pong_collector = PongAuthenticHourCollector(
                 pong_collection_root,
                 expected_source_fingerprint=EXPECTED_OBSERVER_SOURCE_FINGERPRINT,
-                independent_market_collection=pong_independent_collection,
+                independent_market_collection=(
+                    pong_independent_collection
+                    and pong_qualifying_architecture != PONG_NO_FHB_QUALIFYING_ARCHITECTURE
+                ),
                 topology=pong_topology,
             )
             pong_collector.start()
@@ -2711,6 +2733,7 @@ def create_control_center_app(
                     independent=pong_independent_collection,
                     profile=selected_paper_profile.selection_key,
                     activation_authorized=pong_bounded_activation,
+                    qualifying_architecture=pong_qualifying_architecture,
                 )
 
             def collect_and_fanout_transport(state: object) -> None:
@@ -2733,6 +2756,9 @@ def create_control_center_app(
                 on_local_bridge_state=collect_and_fanout_transport,
                 on_rejection=collect_and_fanout_rejection,
                 on_duplicate=collect_and_fanout_duplicate,
+                fail_on_observation_error=(
+                    pong_qualifying_architecture == PONG_NO_FHB_QUALIFYING_ARCHITECTURE
+                ),
             )
             ninjatrader_runtime["listener"] = listener
             app.state.ninjatrader_observer = listener
