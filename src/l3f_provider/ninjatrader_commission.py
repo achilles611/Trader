@@ -72,12 +72,27 @@ class CommissioningSummary:
     snapshot_counts: dict[str, dict[str, int]] = field(default_factory=dict)
     health: dict[str, str] = field(default_factory=dict)
     local_bridge_transitions: list[str] = field(default_factory=list)
+    bridge_frames: int = 0
+    bridge_total_seconds: float = 0.0
+    bridge_maximum_seconds: float = 0.0
+    downstream_callbacks: int = 0
+    downstream_total_seconds: float = 0.0
+    downstream_maximum_seconds: float = 0.0
+    first_accepted_monotonic: float | None = None
+    last_accepted_monotonic: float | None = None
+    controlled_shutdown_partial_frames: int = 0
+    controlled_shutdown_partial_bytes: int = 0
 
     def accept(self, observation: NinjaTraderObservation | None) -> None:
         if observation is None:
             self.duplicates += 1
             return
         self.accepted += 1
+        now_monotonic = time.monotonic()
+        self.first_accepted_monotonic = (
+            now_monotonic if self.first_accepted_monotonic is None else self.first_accepted_monotonic
+        )
+        self.last_accepted_monotonic = now_monotonic
         self.observation_types[observation.observation_type] = self.observation_types.get(observation.observation_type, 0) + 1
         if observation.account_alias is not None and observation.account_class is not None:
             self.aliases[observation.account_alias] = observation.account_class.value
@@ -87,6 +102,43 @@ class CommissioningSummary:
             count = None if count_key is None else observation.payload.get(count_key)
             if type(count) is int and count >= 0:
                 self.snapshot_counts.setdefault(observation.account_alias, {})[str(scope)] = count
+
+    def record_bridge(self, elapsed_seconds: float) -> None:
+        elapsed = max(0.0, elapsed_seconds)
+        self.bridge_frames += 1
+        self.bridge_total_seconds += elapsed
+        self.bridge_maximum_seconds = max(self.bridge_maximum_seconds, elapsed)
+
+    def record_downstream(self, elapsed_seconds: float) -> None:
+        elapsed = max(0.0, elapsed_seconds)
+        self.downstream_callbacks += 1
+        self.downstream_total_seconds += elapsed
+        self.downstream_maximum_seconds = max(self.downstream_maximum_seconds, elapsed)
+
+    def pipeline_report(self) -> dict[str, object]:
+        span = 0.0
+        if self.first_accepted_monotonic is not None and self.last_accepted_monotonic is not None:
+            span = max(0.0, self.last_accepted_monotonic - self.first_accepted_monotonic)
+        return {
+            "bridge_admission": {
+                "frames": self.bridge_frames,
+                "total_milliseconds": round(self.bridge_total_seconds * 1000.0, 3),
+                "mean_milliseconds": round(
+                    self.bridge_total_seconds * 1000.0 / self.bridge_frames, 3,
+                ) if self.bridge_frames else 0.0,
+                "maximum_milliseconds": round(self.bridge_maximum_seconds * 1000.0, 3),
+            },
+            "downstream_composite": {
+                "callbacks": self.downstream_callbacks,
+                "total_milliseconds": round(self.downstream_total_seconds * 1000.0, 3),
+                "mean_milliseconds": round(
+                    self.downstream_total_seconds * 1000.0 / self.downstream_callbacks, 3,
+                ) if self.downstream_callbacks else 0.0,
+                "maximum_milliseconds": round(self.downstream_maximum_seconds * 1000.0, 3),
+            },
+            "accepted_span_seconds": round(span, 3),
+            "accepted_rate_per_second": round(self.accepted / span, 3) if span > 0 else None,
+        }
 
     def reject(self, error: NinjaTraderObservationError) -> None:
         self.rejected += 1
@@ -137,6 +189,11 @@ class CommissioningSummary:
             },
             "errors": dict(sorted(self.error_codes.items())),
             "error_details": dict(sorted(self.error_details.items())),
+            "pipeline_metrics": self.pipeline_report(),
+            "controlled_shutdown": {
+                "partial_frames_discarded": self.controlled_shutdown_partial_frames,
+                "partial_bytes_discarded": self.controlled_shutdown_partial_bytes,
+            },
             "authority": "OBSERVE_ONLY",
         }
 
@@ -157,6 +214,7 @@ class NinjaTraderListenerRuntimeStatus:
     last_depth_at: str | None
     observer_attachment: Mapping[str, object]
     account_balances: Mapping[str, Mapping[str, object]]
+    pipeline_metrics: Mapping[str, object]
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -178,6 +236,7 @@ class NinjaTraderListenerRuntimeStatus:
             "account_balances": {
                 alias: dict(values) for alias, values in self.account_balances.items()
             },
+            "pipeline_metrics": dict(self.pipeline_metrics),
             "authority": "OBSERVE_ONLY",
         }
 
@@ -269,7 +328,9 @@ class NinjaTraderCommissioningHarness:
         self.summary.listener_ready = True
         for frame in frames:
             try:
+                bridge_started = time.perf_counter()
                 observation = self.bridge.accept_observation(frame)
+                self.summary.record_bridge(time.perf_counter() - bridge_started)
                 self.summary.accept(observation)
                 if observation is None:
                     if self._on_duplicate is not None:
@@ -290,12 +351,16 @@ class NinjaTraderCommissioningHarness:
                 self._record_observation_health(observation)
                 if self._on_observation is not None:
                     try:
+                        downstream_started = time.perf_counter()
                         self._on_observation(observation)
+                        self.summary.record_downstream(time.perf_counter() - downstream_started)
                     except Exception:
                         logging.getLogger(__name__).exception(
                             "NINJATRADER_OBSERVER downstream observation notification refused"
                         )
             except NinjaTraderObservationError as error:
+                if "bridge_started" in locals():
+                    self.summary.record_bridge(time.perf_counter() - bridge_started)
                 self.summary.reject(error)
                 if self._on_rejection is not None:
                     try:
@@ -312,10 +377,17 @@ class NinjaTraderCommissioningHarness:
         listener = self.bridge.open_listener()
         connections: dict[socket.socket, bytearray] = {}
 
-        def close_connection(connection: socket.socket) -> None:
+        def close_connection(connection: socket.socket, *, admit_partial: bool = True) -> None:
             data = connections.pop(connection, bytearray())
             if data:
-                self.ingest((bytes(data),), source_connection=connection)
+                if admit_partial:
+                    self.ingest((bytes(data),), source_connection=connection)
+                else:
+                    # Local controlled shutdown can interrupt the sender in
+                    # the middle of a newline-delimited frame. It is not a
+                    # provider payload and must not be relabelled as one.
+                    self.summary.controlled_shutdown_partial_frames += 1
+                    self.summary.controlled_shutdown_partial_bytes += len(data)
             try:
                 connection.close()
             except OSError:
@@ -390,7 +462,7 @@ class NinjaTraderCommissioningHarness:
                         close_connection(source)
         finally:
             for connection in tuple(connections):
-                close_connection(connection)
+                close_connection(connection, admit_partial=False)
             listener.close()
             # Stopping the listener ends the observation transport even when
             # no client ever connected. It must not remain CONNECTING in a
@@ -473,6 +545,11 @@ class NinjaTraderListenerWorker:
                 last_depth_at=self._last_depth_at,
                 observer_attachment=dict(self._observer_attachment),
                 account_balances={alias: dict(values) for alias, values in self._account_balances.items()},
+                pipeline_metrics=(
+                    self._harness.summary.pipeline_report()
+                    if self._harness is not None
+                    else {}
+                ),
             )
 
     def _record_observer_attachment(self, observation: NinjaTraderObservation) -> None:

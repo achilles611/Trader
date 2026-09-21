@@ -375,6 +375,29 @@ class ObservationFanout:
                 except Exception:
                     pass
 
+    def on_paper_observation(self, observation: NinjaTraderObservation) -> None:
+        """Deliver an observation only to the authoritative paper sink.
+
+        The independent Pong path already owns its authenticated analytical
+        projection.  Re-running the legacy shadow projection synchronously on
+        that same market record is non-authoritative duplicate work, but the
+        paper sink must still retain its ledger, reconciliation, risk, and
+        malformed-input responsibilities.
+        """
+        with self._lock:
+            if self._paper_observations_paused:
+                self._paused_paper_observations.append(observation)
+                return
+            try:
+                self._paper_observation(observation)
+            except Exception as exc:
+                try:
+                    self._record_failure(
+                        "EXPERIMENTAL_PAPER", "OBSERVATION", type(exc).__name__,
+                    )
+                except Exception:
+                    pass
+
     def on_transport_state(self, state: StreamHealth) -> None:
         self._deliver("TRANSPORT_STATE", self._shadow_transport, self._paper_transport, state)
 

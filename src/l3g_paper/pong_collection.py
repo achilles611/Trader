@@ -153,6 +153,7 @@ class _CollectorItem:
     kind: str
     value: object
     enqueued_at: str
+    enqueued_monotonic: float
 
 
 class PongAuthenticHourCollector:
@@ -210,6 +211,9 @@ class PongAuthenticHourCollector:
         self._duplicate_records = 0
         self._rejected_records = 0
         self._queue_overflow_records = 0
+        self._queue_high_water_records = 0
+        self._last_queue_age_milliseconds = 0.0
+        self._maximum_queue_age_milliseconds = 0.0
         self._enqueued_records = 0
         self._written_records = 0
         self._durable_records = 0
@@ -280,7 +284,7 @@ class PongAuthenticHourCollector:
         ):
             self._record_drop("UNVERIFIED_NATIVE_ATTESTATION")
             return
-        self._put(_CollectorItem("OBSERVATION", record, _wire(_utc_now())))
+        self._put(_CollectorItem("OBSERVATION", record, _wire(_utc_now()), time.monotonic()))
 
     def on_transport_state(self, value: object) -> None:
         state = getattr(value, "value", value)
@@ -358,7 +362,10 @@ class PongAuthenticHourCollector:
                     "journal_tip_sha256": self._journal_tip,
                     "last_fsync_at": self._last_fsync_at,
                     "queue_depth": self._queue.qsize(),
+                    "queue_high_water_records": self._queue_high_water_records,
                     "queue_capacity": self._QUEUE_CAPACITY,
+                    "last_queue_age_milliseconds": round(self._last_queue_age_milliseconds, 3),
+                    "maximum_queue_age_milliseconds": round(self._maximum_queue_age_milliseconds, 3),
                     "queue_overflow_records": self._queue_overflow_records,
                     "producer_queue_overflow_records": self._producer_overflow_records,
                     "producer_transport_failed_records": self._producer_transport_failed_records,
@@ -370,12 +377,15 @@ class PongAuthenticHourCollector:
             }
 
     def _put_control(self, kind: str, value: object) -> None:
-        self._put(_CollectorItem(kind, value, _wire(_utc_now())))
+        self._put(_CollectorItem(kind, value, _wire(_utc_now()), time.monotonic()))
 
     def _put(self, item: _CollectorItem) -> None:
         try:
             self._queue.put_nowait(item)
             with self._lock:
+                self._queue_high_water_records = max(
+                    self._queue_high_water_records, self._queue.qsize(),
+                )
                 if item.kind == "OBSERVATION":
                     self._enqueued_records += 1
         except queue.Full:
@@ -413,6 +423,15 @@ class PongAuthenticHourCollector:
                 except queue.Empty:
                     item = None
                 if item is not None:
+                    queue_age_milliseconds = max(
+                        0.0, (time.monotonic() - item.enqueued_monotonic) * 1000.0,
+                    )
+                    with self._lock:
+                        self._last_queue_age_milliseconds = queue_age_milliseconds
+                        self._maximum_queue_age_milliseconds = max(
+                            self._maximum_queue_age_milliseconds,
+                            queue_age_milliseconds,
+                        )
                     if item.kind == "STOP":
                         stopping = True
                     elif item.kind == "OBSERVATION":

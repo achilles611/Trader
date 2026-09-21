@@ -158,6 +158,7 @@ class ExperimentalPaperPolicy:
             "classified_sell": 0,
             "unknown_aggressor": 0,
             "depth_mutations": 0,
+            "position_only_depth_removes": 0,
             "resets": 0,
             "local_sequence_gaps": 0,
             "decisions_long": 0,
@@ -1032,7 +1033,22 @@ class ExperimentalPaperPolicy:
         price = self._decimal(observation.payload.get("mutation_price"))
         volume = observation.payload.get("mutation_volume")
         position = observation.payload.get("mutation_position")
-        if side not in {"BID", "ASK"} or operation not in {"ADD", "INSERT", "UPDATE", "REMOVE"} or price is None or price <= 0 or type(volume) is not int or volume < 0 or type(position) is not int or position < 0:
+        positional_remove = (
+            operation == "REMOVE"
+            and price == 0
+            and volume == 0
+            and observation.payload.get("snapshot_ordering")
+            == "NATIVE_POSITIONAL_BEST_TO_WORST_V1"
+        )
+        if (
+            side not in {"BID", "ASK"}
+            or operation not in {"ADD", "INSERT", "UPDATE", "REMOVE"}
+            or (not positional_remove and (price is None or price <= 0))
+            or type(volume) is not int
+            or volume < 0
+            or type(position) is not int
+            or position < 0
+        ):
             self._last_input_fault = {
                 "reason": "MALFORMED_DEPTH_MUTATION", "side": side, "operation": operation,
                 "price_valid": price is not None and price > 0, "volume_type": type(volume).__name__,
@@ -1047,6 +1063,29 @@ class ExperimentalPaperPolicy:
             }
             self._clear_provisional()
             return "PARTIAL_DEPTH"
+        if positional_remove:
+            # NinjaTrader positional Remove callbacks carry Price=0 and
+            # Volume=0.  The signed post-mutation snapshot is authoritative;
+            # no removed price may be invented, so this valid callback updates
+            # continuity/book state without manufacturing liquidity evidence.
+            if side == "BID":
+                current_bids: dict[Decimal, int] = {}
+                for level in observation.payload["bids"]:
+                    if not isinstance(level, Mapping):
+                        self._clear_provisional()
+                        return "MALFORMED_DEPTH_MUTATION"
+                    level_price = self._decimal(level.get("price"))
+                    level_size = level.get("size")
+                    if level_price is None or level_price <= 0 or type(level_size) is not int or level_size <= 0:
+                        self._clear_provisional()
+                        return "MALFORMED_DEPTH_MUTATION"
+                    current_bids[level_price] = level_size
+                self._bid_levels.clear()
+                self._bid_levels.update(current_bids)
+            self._depth_recovering = False
+            self._counters["depth_mutations"] += 1
+            self._counters["position_only_depth_removes"] += 1
+            return None
         prior = self._bid_levels.get(price) if side == "BID" else None
         reduction = side == "BID" and (operation == "REMOVE" or (prior is not None and volume < prior))
         increase = side == "BID" and operation != "REMOVE" and (prior is None or volume > prior)

@@ -16,6 +16,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
@@ -120,6 +121,75 @@ NINJATRADER_RUNTIME_LOGGER = logging.getLogger("uvicorn.error")
 def _pong_market_collection_only(independent: bool, profile: str, observation: object) -> bool:
     return (independent and getattr(observation, "observation_type", None) in {"TRADE", "QUOTE", "DEPTH"}
             and profile != PONG_ENTRY_PROFILE_VERSION)
+
+
+def _pong_market_paper_only(independent: bool, profile: str, observation: object) -> bool:
+    """Keep Pong market truth out of the duplicate legacy shadow hot path."""
+    return (independent and getattr(observation, "observation_type", None) in {"TRADE", "QUOTE", "DEPTH"}
+            and profile == PONG_ENTRY_PROFILE_VERSION)
+
+
+class _ObservationIngressMetrics:
+    """Bounded counters for the synchronous post-admission fanout boundary."""
+
+    _STAGES = ("collector_enqueue", "pong_host", "paper_fanout", "legacy_fanout", "composite_total")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._started_monotonic: float | None = None
+        self._last_monotonic: float | None = None
+        self._inputs = 0
+        self._types: dict[str, int] = {}
+        self._routes: dict[str, int] = {}
+        self._stage_count = {stage: 0 for stage in self._STAGES}
+        self._stage_total_seconds = {stage: 0.0 for stage in self._STAGES}
+        self._stage_maximum_seconds = {stage: 0.0 for stage in self._STAGES}
+
+    def record_input(self, observation_type: object, at: float) -> None:
+        kind = str(observation_type or "UNKNOWN")
+        with self._lock:
+            self._started_monotonic = at if self._started_monotonic is None else self._started_monotonic
+            self._last_monotonic = at
+            self._inputs += 1
+            self._types[kind] = self._types.get(kind, 0) + 1
+
+    def record_stage(self, stage: str, elapsed_seconds: float) -> None:
+        if stage not in self._stage_count:
+            return
+        elapsed = max(0.0, elapsed_seconds)
+        with self._lock:
+            self._stage_count[stage] += 1
+            self._stage_total_seconds[stage] += elapsed
+            self._stage_maximum_seconds[stage] = max(self._stage_maximum_seconds[stage], elapsed)
+
+    def record_route(self, route: str) -> None:
+        with self._lock:
+            self._routes[route] = self._routes.get(route, 0) + 1
+
+    def snapshot(self) -> dict[str, object]:
+        with self._lock:
+            elapsed = 0.0
+            if self._started_monotonic is not None and self._last_monotonic is not None:
+                elapsed = max(0.0, self._last_monotonic - self._started_monotonic)
+            stages = {}
+            for stage in self._STAGES:
+                count = self._stage_count[stage]
+                total = self._stage_total_seconds[stage]
+                stages[stage] = {
+                    "count": count,
+                    "total_milliseconds": round(total * 1000.0, 3),
+                    "mean_milliseconds": round((total * 1000.0 / count) if count else 0.0, 3),
+                    "maximum_milliseconds": round(self._stage_maximum_seconds[stage] * 1000.0, 3),
+                }
+            return {
+                "schema": "beelzebub-full-host-ingress-metrics-v1",
+                "inputs": self._inputs,
+                "observation_types": dict(sorted(self._types.items())),
+                "routes": dict(sorted(self._routes.items())),
+                "observed_span_seconds": round(elapsed, 3),
+                "observed_input_rate_per_second": round(self._inputs / elapsed, 3) if elapsed > 0 else None,
+                "stages": stages,
+            }
 LEDGER_VERIFICATION_FRESHNESS_SECONDS = 15 * 60
 MARKET_OBSERVER_ACTIVE_FRESHNESS_SECONDS = 15.0
 LEDGER_VERIFIER_SHUTDOWN_WAIT_SECONDS = 30.0
@@ -1614,6 +1684,7 @@ def create_control_center_app(
     center = CopyControlCenter(config, execution_service.database, execution_service=execution_service)
     watcher_runtime: dict[str, Any] = {}
     ninjatrader_runtime: dict[str, Any] = {}
+    ingress_metrics = _ObservationIngressMetrics()
     paper_ledger_shutdown_receipt: dict[str, object] | None = None
     profile_switch: PaperProfileSwitchService | None = None
     job_runtime: dict[str, asyncio.Task[Any]] = {}
@@ -2082,6 +2153,7 @@ def create_control_center_app(
                 "ledger_verification": ledger_verifier.status(),
                 "ledger_shutdown": paper_ledger_shutdown_receipt,
                 "pong_collection": collection_status,
+                "ingress_metrics": ingress_metrics.snapshot(),
                 "pong_production": (
                     pong_host.status()
                     if type(pong_host) is PongProductionHost
@@ -2107,6 +2179,7 @@ def create_control_center_app(
         status["ledger_verification"] = verification
         status["ledger_shutdown"] = paper_ledger_shutdown_receipt
         status["pong_collection"] = collection_status
+        status["ingress_metrics"] = ingress_metrics.snapshot()
         status["pong_production"] = (
             pong_host.status()
             if type(pong_host) is PongProductionHost
@@ -2551,10 +2624,18 @@ def create_control_center_app(
             )
 
             def collect_and_fanout_observation(observation: object) -> None:
+                composite_started = time.perf_counter()
+                ingress_metrics.record_input(
+                    getattr(observation, "observation_type", None), composite_started,
+                )
                 assert pong_collector is not None
+                stage_started = time.perf_counter()
                 pong_collector.ingest(observation)  # type: ignore[arg-type]
+                ingress_metrics.record_stage("collector_enqueue", time.perf_counter() - stage_started)
                 assert pong_host is not None
+                stage_started = time.perf_counter()
                 pong_host.on_observation(observation)  # type: ignore[arg-type]
+                ingress_metrics.record_stage("pong_host", time.perf_counter() - stage_started)
                 if _pong_market_collection_only(
                     pong_independent_collection, selected_paper_profile.selection_key, observation,
                 ):
@@ -2564,8 +2645,27 @@ def create_control_center_app(
                     # Account/order/position/control truth continues through
                     # the shared fanout, and this mode creates no execution
                     # route or authority.
+                    ingress_metrics.record_route("PONG_COLLECTION_ONLY")
+                    ingress_metrics.record_stage("composite_total", time.perf_counter() - composite_started)
                     return
+                if _pong_market_paper_only(
+                    pong_independent_collection, selected_paper_profile.selection_key, observation,
+                ):
+                    # PongProductionHost above is the sole Pong analytical
+                    # owner.  The paper sink still receives the exact record
+                    # for durable/risk/malformed-input truth; only the legacy
+                    # non-authoritative shadow projection is omitted.
+                    stage_started = time.perf_counter()
+                    fanout.on_paper_observation(observation)  # type: ignore[arg-type]
+                    ingress_metrics.record_stage("paper_fanout", time.perf_counter() - stage_started)
+                    ingress_metrics.record_route("PONG_PAPER_ONLY")
+                    ingress_metrics.record_stage("composite_total", time.perf_counter() - composite_started)
+                    return
+                stage_started = time.perf_counter()
                 fanout.on_observation(observation)  # type: ignore[arg-type]
+                ingress_metrics.record_stage("legacy_fanout", time.perf_counter() - stage_started)
+                ingress_metrics.record_route("FULL_LEGACY_FANOUT")
+                ingress_metrics.record_stage("composite_total", time.perf_counter() - composite_started)
 
             def collect_and_fanout_transport(state: object) -> None:
                 assert pong_collector is not None

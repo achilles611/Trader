@@ -913,6 +913,22 @@ class PaperRuntimeTests(unittest.TestCase):
         self.assertEqual(calls, ["shadow", "paper"])
         self.assertEqual(failures[0][0], "SHADOW")
 
+    def test_pong_paper_only_fanout_preserves_paper_without_legacy_shadow(self) -> None:
+        calls: list[str] = []
+        fanout = ObservationFanout(
+            shadow_observation=lambda _: calls.append("shadow"),
+            shadow_transport=lambda _: None,
+            shadow_rejection=lambda _: None,
+            shadow_duplicate=lambda: None,
+            paper_observation=lambda _: calls.append("paper"),
+            paper_transport=lambda _: None,
+            paper_rejection=lambda _: None,
+            paper_duplicate=lambda: None,
+            record_failure=lambda *_: None,
+        )
+        fanout.on_paper_observation(object())  # type: ignore[arg-type]
+        self.assertEqual(calls, ["paper"])
+
     def test_controlled_execution_events_cover_entry_protection_exit_and_flat(self) -> None:
         with TemporaryDirectory() as directory:
             ledger = PaperLedger(Path(directory) / "paper.sqlite3")
