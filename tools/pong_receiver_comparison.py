@@ -22,7 +22,11 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.copytrade.control_center import _dispatch_pong_observation, _ObservationIngressMetrics
+from src.copytrade.control_center import (
+    _dispatch_pong_observation,
+    _ObservationIngressMetrics,
+    _qualifying_market_fast_path_identity,
+)
 from src.l3f_provider.ninjatrader_commission import NinjaTraderListenerWorker
 from src.l3f_provider.ninjatrader_observation import (
     LoopbackBridgeConfig, NinjaTraderObservation, expected_observer_source_fingerprint,
@@ -35,7 +39,11 @@ from src.l3g_paper.ninjatrader_transport import LocalPaperSecretProvider
 from src.l3g_paper.pong_collection import PongAuthenticHourCollector
 from src.l3g_paper.pong_contract import DEC26_TOPOLOGY
 from src.l3g_paper.pong_production import PongProductionHost
-from src.l3g_paper.pong_qualifying import PONG_NO_FHB_QUALIFYING_ARCHITECTURE
+from src.l3g_paper.pong_qualifying import (
+    PONG_NO_FHB_QUALIFYING_ARCHITECTURE,
+    PONG_QUALIFYING_INTERVAL_MS,
+    PONG_QUALIFYING_SCHEDULING_MODE,
+)
 from src.l3g_paper.pong_scheduler import PongSchedulingConfig, PongSchedulingMode
 from src.l3g_paper.runtime import LaneIIIPaperRuntime, ObservationFanout
 from src.lane_iii.contracts import canonical_hash
@@ -154,7 +162,22 @@ def run(args):
         dues = [(i//8444)*4+(i%8444)/4222 if args.mode == "burst" else i/args.rate for i in range(len(frames))]
     profile = resolve_paper_profile(PONG_ENTRY_PROFILE_VERSION)
     ledger = PaperLedger(args.output/"epoch-offline"/"paper.sqlite3", policy=paper_policy_for_topology(profile.policy, DEC26_TOPOLOGY), risk=paper_risk_for_topology(profile.risk, DEC26_TOPOLOGY))
-    paper = LaneIIIPaperRuntime(ledger)
+    fast_path_identity = _qualifying_market_fast_path_identity(
+        architecture=PONG_NO_FHB_QUALIFYING_ARCHITECTURE,
+        selected_profile=PONG_ENTRY_PROFILE_VERSION,
+        paper_topology_version=DEC26_TOPOLOGY.version,
+        pong_topology_version=DEC26_TOPOLOGY.version,
+        scheduling_mode=PONG_QUALIFYING_SCHEDULING_MODE,
+        interval_ms=PONG_QUALIFYING_INTERVAL_MS,
+        activation_authorized=False,
+    )
+    assert fast_path_identity is not None
+    paper = LaneIIIPaperRuntime(
+        ledger,
+        qualifying_market_fast_path=(
+            fast_path_identity if args.paper_path == "qualifying-fast" else None
+        ),
+    )
     shadow = LaneIIIShadowRuntime()
     collector = PongAuthenticHourCollector(args.output/"collector", expected_source_fingerprint=source, topology=DEC26_TOPOLOGY)
     host = PongProductionHost(args.output/"host", selected_profile=PONG_ENTRY_PROFILE_VERSION, expected_market_source_fingerprint=source, runtime_snapshot=paper.pong_controller_snapshot, collector_status=collector.status, controller_dispatch=lambda *_: False, native_dispatch=lambda *_: (_ for _ in ()).throw(RuntimeError("OFFLINE_NATIVE_DISPATCH_FORBIDDEN")), activation_authorized=False, history_verification_key=key, qualifying_architecture=PONG_NO_FHB_QUALIFYING_ARCHITECTURE, scheduling=PongSchedulingConfig(mode=PongSchedulingMode.PERIODIC_FLAT_PROTECTED, interval_ms=20), topology=DEC26_TOPOLOGY)
@@ -173,7 +196,22 @@ def run(args):
             if name in delivery:
                 delivery[name].update((obs.wire_hash()+"\n").encode())
         return apply
-    fanout = ObservationFanout(shadow_observation=measured("shadow", shadow.ingest), shadow_transport=shadow.on_transport_state, shadow_rejection=shadow.record_raw_rejection, shadow_duplicate=shadow.record_raw_duplicate, paper_observation=measured("paper", paper.ingest), paper_transport=paper.on_observation_transport_state, paper_rejection=paper.on_observation_rejection, paper_duplicate=paper.on_observation_duplicate, record_failure=paper.record_sink_failure)
+    paper_ingest = (
+        paper.ingest_qualifying_disarmed_pong_market
+        if args.paper_path == "qualifying-fast"
+        else paper.ingest
+    )
+    fanout = ObservationFanout(
+        shadow_observation=measured("shadow", shadow.ingest),
+        shadow_transport=shadow.on_transport_state,
+        shadow_rejection=shadow.record_raw_rejection,
+        shadow_duplicate=shadow.record_raw_duplicate,
+        paper_observation=measured("paper", paper_ingest),
+        paper_transport=paper.on_observation_transport_state,
+        paper_rejection=paper.on_observation_rejection,
+        paper_duplicate=paper.on_observation_duplicate,
+        record_failure=paper.record_sink_failure,
+    )
     metrics = _ObservationIngressMetrics()
     def dispatch(obs):
         _dispatch_pong_observation(obs, collector=collector, pong_host=host, fanout=fanout, metrics=metrics, independent=False, profile=PONG_ENTRY_PROFILE_VERSION, activation_authorized=False, qualifying_architecture=PONG_NO_FHB_QUALIFYING_ARCHITECTURE if args.route == "candidate" else None)
@@ -221,6 +259,7 @@ def run(args):
         listener_status = listener.stop(timeout_seconds=15).as_dict()
         host.stop(30)
         collector_status = collector.stop(timeout_seconds=30)
+        paper_fast_path = paper.pong_controller_snapshot()["qualifying_market_fast_path"]
         paper.stop()
         ledger_close = ledger.close()
     ended = completed[-1] if completed else time.perf_counter()
@@ -242,7 +281,7 @@ def run(args):
     source_hashes = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in [ROOT/"src/copytrade/control_center.py", ROOT/"src/l3f_provider/ninjatrader_commission.py", ROOT/"src/l3g_paper/runtime.py", Path(__file__)]}
     sender_result = json.loads((args.output/"sender.json").read_text())
     started = sender_result["start_monotonic"]
-    result = dict(schema="pong-offline-receiver-comparison-v1", route=args.route, mode=args.mode, qualification="NOT_QUALIFIED", execution_transport="ABSENT", healthy_flat_analysis_proof=False, source_freshness="NOT_CURRENT_NATIVE_EVIDENCE", provenance=provenance, loaded_source_sha256=source_hashes, records=len(frames), completed=len(completed), window_monotonic=[started, ended], elapsed_seconds=ended-started, completion_rate=len(completed)/(ended-started), scheduled_span_seconds=dues[-1], receiver_end_lag_seconds=max(0, ended-started-dues[-1]), sender=sender_result, consumers=stages, ingress=metrics.snapshot(), listener=listener_status, host=host.status(), collector=collector_status, ledger_close=ledger_close, ledger_kinds=kinds, samples=samples, ordered_wire_reconciliation=dict(expected=expected.hexdigest(), receiver=delivery["receiver"].hexdigest(), paper=delivery["paper"].hexdigest(), collector=retained.hexdigest(), collector_records=count))
+    result = dict(schema="pong-offline-receiver-comparison-v2", route=args.route, paper_path=args.paper_path, mode=args.mode, offered_rate_per_second=(None if args.mode == "natural" else args.rate), offered_rate_authority="DIAGNOSTIC_ONLY_NOT_AN_ACCEPTANCE_THRESHOLD", qualification="NOT_QUALIFIED", execution_transport="ABSENT", healthy_flat_analysis_proof=False, source_freshness="NOT_CURRENT_NATIVE_EVIDENCE", provenance=provenance, loaded_source_sha256=source_hashes, records=len(frames), completed=len(completed), window_monotonic=[started, ended], elapsed_seconds=ended-started, completion_rate=len(completed)/(ended-started), scheduled_span_seconds=dues[-1], receiver_end_lag_seconds=max(0, ended-started-dues[-1]), sender=sender_result, consumers=stages, ingress=metrics.snapshot(), listener=listener_status, host=host.status(), collector=collector_status, paper_fast_path=paper_fast_path, ledger_close=ledger_close, ledger_kinds=kinds, samples=samples, ordered_wire_reconciliation=dict(expected=expected.hexdigest(), receiver=delivery["receiver"].hexdigest(), paper=delivery["paper"].hexdigest(), collector=retained.hexdigest(), collector_records=count))
     result["ordered_wire_reconciliation"]["pass"] = len(frames)==len(completed)==count and len({expected.hexdigest(), retained.hexdigest(), delivery["paper"].hexdigest(), delivery["receiver"].hexdigest()}) == 1
     dump(args.output/"result.json", result)
     print(json.dumps({"output": str(args.output), "rate": result["completion_rate"], "lag": result["receiver_end_lag_seconds"], "ordered": result["ordered_wire_reconciliation"]["pass"]}), flush=True)
@@ -252,13 +291,24 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--route", choices=("baseline", "candidate"), required=True)
+    parser.add_argument(
+        "--paper-path", choices=("full", "qualifying-fast"), required=True,
+        help="Exact paper callback under comparison; this is not a runtime qualification.",
+    )
     parser.add_argument("--journal", type=Path)
     parser.add_argument("--frames", type=Path, help="Previously sealed synthetic frames, verified with the offline test key")
     parser.add_argument("--records", type=int, default=10000)
     parser.add_argument("--mode", choices=("natural", "sustained", "burst"), default="sustained")
-    parser.add_argument("--rate", type=float, default=2111)
+    parser.add_argument(
+        "--rate", type=float,
+        help="Explicit diagnostic offered rate for sustained/burst modes; never an acceptance floor.",
+    )
     args = parser.parse_args()
-    if args.records < 1 or args.rate <= 0 or (args.mode == "natural" and not args.journal):
-        parser.error("positive records/rate and a journal for natural timing required")
+    if args.records < 1 or (args.rate is not None and args.rate <= 0):
+        parser.error("records and any supplied diagnostic rate must be positive")
+    if args.mode == "natural" and not args.journal:
+        parser.error("natural timing requires a journal")
+    if args.mode != "natural" and args.rate is None:
+        parser.error("sustained/burst timing requires an explicit diagnostic --rate")
     with BenchmarkLease(args.output):
         run(args)
