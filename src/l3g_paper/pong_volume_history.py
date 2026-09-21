@@ -10,7 +10,10 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
-from src.l3f_provider.ninjatrader_observation import NinjaTraderObservation
+from src.l3f_provider.ninjatrader_observation import (
+    NinjaTraderObservation,
+    NinjaTraderObservationError,
+)
 from src.lane_iii.contracts import canonical_hash, normalized_utc
 from .pong_microstructure import VolumeWindow, VolumeWindowKind
 from .pong_contract import SEP26_TOPOLOGY, PongContractTopology
@@ -64,7 +67,13 @@ class PongVolumeReferenceHistory:
                     raise ValueError("RECEIPT_AUTHENTICATION")
                 self.windows = self._decode(value["records"], value["received_at"])
                 self.receipt_hash = canonical_hash(value)
-            except (ValueError, TypeError, KeyError, OSError) as error:
+            except (
+                NinjaTraderObservationError,
+                ValueError,
+                TypeError,
+                KeyError,
+                OSError,
+            ) as error:
                 self.error = "PONG_VOLUME_HISTORY_RESTORE_REFUSED:" + str(error)
 
     def _seal(self, value: object) -> str:
@@ -167,7 +176,13 @@ class PongVolumeReferenceHistory:
             self.windows, self.error, self.receipt_hash = windows, None, canonical_hash(body)
             self._pending = []
             self._pending_id = None
-        except (ValueError, TypeError, KeyError, OSError) as error:
+        except (
+            NinjaTraderObservationError,
+            ValueError,
+            TypeError,
+            KeyError,
+            OSError,
+        ) as error:
             self.error = "PONG_VOLUME_HISTORY_ADMISSION_REFUSED:" + str(error)
             self._pending = []
             self._pending_id = None

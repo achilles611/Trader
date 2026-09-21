@@ -92,6 +92,33 @@ class VolumeHistoryTests(unittest.TestCase):
             self.assertEqual(restored.windows, ())
             self.assertIn("RECEIPT_AUTHENTICATION", restored.error)
 
+    def test_source_incompatible_receipt_is_retained_but_never_restored_or_admitted(self):
+        with TemporaryDirectory() as root:
+            loader = self.make(root)
+            loader.admit(record(), received_at="2026-09-14T14:01:02Z")
+            original = loader.path.read_bytes()
+            upgraded = PongVolumeReferenceHistory(
+                loader.path,
+                root_key=KEY,
+                expected_source="f" * 64,
+            )
+            self.assertEqual(upgraded.windows, ())
+            self.assertIn(
+                "PONG_VOLUME_HISTORY_RESTORE_REFUSED:AUTH_FAILED:"
+                "ninjatrader_source_fingerprint",
+                upgraded.error,
+            )
+            self.assertEqual(loader.path.read_bytes(), original)
+
+            upgraded.admit(record(), received_at="2026-09-14T14:01:03Z")
+            self.assertEqual(upgraded.windows, ())
+            self.assertIn(
+                "PONG_VOLUME_HISTORY_ADMISSION_REFUSED:AUTH_FAILED:"
+                "ninjatrader_source_fingerprint",
+                upgraded.error,
+            )
+            self.assertEqual(loader.path.read_bytes(), original)
+
     def test_invalid_contract_policy_volume_future_alignment_and_completeness_refused(self):
         variants = [payload(contract_id="MNQ DEC26"), payload(canonical_contract="MNQZ6"),
                     payload(merge_policy="MERGE_BACK_ADJUSTED"), payload(timezone="America/Chicago"),
