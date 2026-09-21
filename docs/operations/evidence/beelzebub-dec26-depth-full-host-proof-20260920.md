@@ -77,6 +77,7 @@ Accepted and durable stream facts:
 - contract mismatches: `0`
 - maximum retained depth shape: `10 bid + 10 ask`
 - explicit unavailable/partial depth records: `6,236`
+- ledger warmup resets caused by `MALFORMED_DEPTH_MUTATION`: `631`
 - duplicate/out-of-order observations: `0`
 - collector queue overflow: `0`
 - parser/admission rejection: `1`
@@ -139,9 +140,10 @@ stream in which:
 - the repaired observation sink remains free of policy-identity failures; and
 - flat Sim101 reconciliation and zero orders/commands are fresh.
 
-The next actual blocker is full-host admission/durability continuity under the
-natural observed depth rate, not native depth availability. No threshold,
-periodic, warm-start, FHB or activation work was performed.
+The next actual blockers are full-host admission/durability continuity under
+the natural observed depth rate and the admitted malformed-depth mutations,
+not native depth availability. No threshold, periodic, warm-start, FHB or
+activation work was performed.
 
 Caelum performed a bounded read-only source/evidence review and changed no
 files, processes, configuration or ledgers. Its historical lifecycle concern
