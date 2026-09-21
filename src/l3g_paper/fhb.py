@@ -584,6 +584,8 @@ class FocusedHorizonBand:
         if not isinstance(raw, list):
             raise ValueError("FHB_SIGNED_BOOK_SIDE_MISSING")
         rows: list[tuple[int, Decimal]] = []
+        seen: set[int] = set()
+        previous_ticks: int | None = None
         for item in raw:
             if not isinstance(item, Mapping):
                 raise ValueError("FHB_SIGNED_BOOK_LEVEL_INVALID")
@@ -591,35 +593,41 @@ class FocusedHorizonBand:
             quantity = Decimal(str(item.get("size")))
             if not quantity.is_finite() or quantity <= 0:
                 raise ValueError("FHB_SIGNED_BOOK_QUANTITY_INVALID")
+            if previous_ticks is not None and (
+                (side is BookSide.BID and previous_ticks < ticks)
+                or (side is BookSide.ASK and previous_ticks > ticks)
+            ):
+                raise ValueError(
+                    "FHB_SIGNED_BID_ORDER_INVALID"
+                    if side is BookSide.BID
+                    else "FHB_SIGNED_ASK_ORDER_INVALID"
+                )
+            if ticks in seen:
+                raise ValueError("FHB_SIGNED_BOOK_DUPLICATE_PRICE")
+            seen.add(ticks)
             rows.append((ticks, quantity))
-        prices = tuple(item[0] for item in rows)
-        if side is BookSide.BID and prices != tuple(sorted(prices, reverse=True)):
-            raise ValueError("FHB_SIGNED_BID_ORDER_INVALID")
-        if side is BookSide.ASK and prices != tuple(sorted(prices)):
-            raise ValueError("FHB_SIGNED_ASK_ORDER_INVALID")
-        if len(prices) != len(set(prices)):
-            raise ValueError("FHB_SIGNED_BOOK_DUPLICATE_PRICE")
-        if len(rows) > FHB_SUPPORTED_SOURCE_LEVELS_PER_SIDE:
-            raise ValueError("FHB_SIGNED_SOURCE_LEVEL_BOUND_EXCEEDED")
+            previous_ticks = ticks
+            if len(rows) > FHB_SUPPORTED_SOURCE_LEVELS_PER_SIDE:
+                raise ValueError("FHB_SIGNED_SOURCE_LEVEL_BOUND_EXCEEDED")
         return tuple(rows)
 
     def _position_snapshot(
         self,
         payload: Mapping[str, object],
     ) -> dict[BookSide, dict[int, tuple[int, Decimal]]] | None:
-        keys = {
-            BookSide.BID: "position_bids",
-            BookSide.ASK: "position_asks",
-        }
-        present = tuple(key in payload for key in keys.values())
-        if present == (False, False):
+        bid_present = "position_bids" in payload
+        ask_present = "position_asks" in payload
+        if not bid_present and not ask_present:
             return None
-        if present != (True, True):
+        if not bid_present or not ask_present:
             raise ValueError("FHB_POSITION_CURSOR_SIDE_MISSING")
         result: dict[BookSide, dict[int, tuple[int, Decimal]]] = {
             BookSide.BID: {}, BookSide.ASK: {},
         }
-        for side, key in keys.items():
+        for side, key in (
+            (BookSide.BID, "position_bids"),
+            (BookSide.ASK, "position_asks"),
+        ):
             raw = payload.get(key)
             if not isinstance(raw, list):
                 raise ValueError("FHB_POSITION_CURSOR_INVALID")
@@ -697,11 +705,17 @@ class FocusedHorizonBand:
         resolved_price = supplied_price_ticks
         if self._position_cursor_initialized:
             projected = {
-                book_side: dict(self._position_cursor[book_side])
+                book_side: self._position_cursor[book_side]
                 for book_side in (BookSide.BID, BookSide.ASK)
             }
             if reset:
                 projected = {BookSide.BID: {}, BookSide.ASK: {}}
+            else:
+                # A depth mutation can alter only its declared side. Copy that
+                # side for validation/commit and retain the immutable other
+                # side mapping rather than cloning both sparse books on every
+                # callback.
+                projected[side] = dict(self._position_cursor[side])
             target = projected[side]
             if operation == "REMOVE":
                 removed = target.get(position)
@@ -994,18 +1008,12 @@ class FocusedHorizonBand:
                 self._position_cursor_initialized = retained_initialized
                 clear = True
             previous = {side: self._core[side] for side in self._core}
-            previous_quantities = {
-                side: {
-                    ticks: value.current_quantity
-                    for ticks, value in self._shadow[side].items()
-                }
-                for side in (BookSide.BID, BookSide.ASK)
-            }
             operation = str(
                 payload.get("operation")
                 or payload.get("mutation_operation")
                 or "Update"
             )
+            operation_upper = operation.upper()
             mutation_position = payload.get("mutation_position")
             current: dict[BookSide, tuple[int, ...]] = {
                 book_side: tuple(
@@ -1022,7 +1030,7 @@ class FocusedHorizonBand:
             proven_out_of_core_remove = False
             if (
                 price_ticks is None
-                and operation.upper() == "REMOVE"
+                and operation_upper == "REMOVE"
                 and side is not None
                 and type(mutation_position) is int
             ):
@@ -1053,6 +1061,26 @@ class FocusedHorizonBand:
                     price_ticks=price_ticks,
                     clear=True,
                 )
+            previous_removed_touch_quantities: dict[int, Decimal] | None = None
+            if (
+                operation_upper == "REMOVE"
+                and side is not None
+                and price_ticks is not None
+                and price_ticks in previous[side]
+                and current[side]
+                and (
+                    (side is BookSide.BID and price_ticks > current[side][0])
+                    or (side is BookSide.ASK and price_ticks < current[side][0])
+                )
+            ):
+                previous_removed_touch_quantities = {
+                    ticks: (
+                        self._shadow[side][ticks].current_quantity
+                        if ticks in self._shadow[side]
+                        else Decimal("0")
+                    )
+                    for ticks in previous[side]
+                }
             for book_side in (BookSide.BID, BookSide.ASK):
                 current_set = set(current[book_side])
                 for ticks, quantity in snapshots[book_side]:
@@ -1063,9 +1091,10 @@ class FocusedHorizonBand:
 
             promoted: list[int] = []
             for book_side in (BookSide.BID, BookSide.ASK):
+                previous_set = set(previous[book_side])
                 promoted.extend(
                     ticks for ticks in current[book_side]
-                    if ticks not in set(previous[book_side])
+                    if ticks not in previous_set
                 )
 
             pre_member = bool(side is not None and price_ticks in previous[side])
@@ -1074,7 +1103,7 @@ class FocusedHorizonBand:
                 level_map = dict(snapshots[side])
                 quantity = (
                     Decimal("0")
-                    if operation.upper() == "REMOVE"
+                    if operation_upper == "REMOVE"
                     else Decimal(str(payload.get("mutation_volume") or level_map.get(price_ticks) or 0))
                 )
                 if not quantity.is_finite() or quantity < 0:
@@ -1083,7 +1112,7 @@ class FocusedHorizonBand:
                 touch = self._price(touch_ticks)
                 price = self._price(price_ticks)
                 nearby = sum((item[1] for item in snapshots[side]), Decimal("0"))
-                if operation.upper() == "REMOVE" and pre_member and (
+                if operation_upper == "REMOVE" and pre_member and (
                     (side is BookSide.BID and price > touch)
                     or (side is BookSide.ASK and price < touch)
                 ):
@@ -1094,7 +1123,9 @@ class FocusedHorizonBand:
                     touch_ticks = prior_touch_ticks
                     touch = self._price(prior_touch_ticks)
                     nearby = sum(
-                        (previous_quantities[side].get(item, Decimal("0"))
+                        ((previous_removed_touch_quantities or {}).get(
+                            item, Decimal("0"),
+                        )
                          for item in previous[side]),
                         Decimal("0"),
                     )
