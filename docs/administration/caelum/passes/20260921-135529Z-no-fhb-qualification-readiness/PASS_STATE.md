@@ -95,11 +95,11 @@ performance corpus and cannot be extended or relabelled.
 
 | Order | Work item | Owner | State | Evidence / release condition |
 |---:|---|---|---|---|
-| 1 | R1 truthful native availability | Native owner; Sol integrates | **SOURCE/OFFLINE ACCEPTED; identity/runtime HOLD** | Owner patch preserves the single pre-gate cursor commit, makes incomplete prefixes and unresolved Remove identity explicit unavailable, and retains crossed/empty/invalid fail-closed paths. Authentic journal 46–52, mirrored partials, recovery, five seams, reset/sparse, known/unknown removal and oracle gap/generation coverage were reviewed. Owner reports 60 focused tests PASS. Sol must complete the Python/native fingerprint integration and composite rerun; no load/runtime acceptance exists. |
+| 1 | R1 truthful native availability | Native owner; Sol integrates | **SOURCE/OFFLINE AND IDENTITY ACCEPTED; runtime HOLD** | The integrated patch preserves the single pre-gate cursor commit, makes incomplete prefixes and unresolved Remove identity explicit unavailable, and retains crossed/empty/invalid fail-closed paths. The Phase-F2 lexical correction preserves identical ordered shifts. Native, Python and computed source identities agree at `585a57d4...fa2344`; focused and affected composite receipts pass. No installed/loaded/runtime acceptance exists. |
 | 1 | R3 persisted host telemetry | Python telemetry owner; Sol integrates | **SOURCE/OFFLINE ACCEPTED; integration/runtime HOLD** | The final bounded revision covers the prior clock, first-fault, retry, exact queue occupancy/high-water/age, authority, scheduling-duration, final-stage and bounded-aggregate findings. Admission and dequeue bookkeeping now share one bounded logical-occupancy lock, and the forced drain race proves one admitted item still raises high-water to one. Caelum independently passed all 20 focused tests, Python compilation and diff checks. Composite integration and runtime receipts remain. |
 | 2 | R2 supported receiver-first source lifecycle | Sol only | **SOURCE/OFFLINE ACCEPTED; OPERATOR/RUNTIME HOLD** | The corrected commissioning workflow is accepted for integration: it hash-binds the pre-reload receipt and raw journal, proves receiver readiness first, and requires a distinct authenticated session/source/build with stable generation, zero loss totals/deltas, fault-free host state, exact 10x10 truth, safe authority and two advancing durable checkpoints. The old assembly's unknown cleared tail remains explicitly failed, not drained. Release still requires the actual operator F5 compile/load and a signed passing receipt; same-assembly reattach remains unsupported. |
-| 2 | R4 genuine periodic eligibility/current context | Sol only | **HOLD / SOURCE AUDIT** | Historical runs remained `EVENT_DRIVEN_PROTECTION`; current-source 2,016 five-minute bars, two immediately preceding completed UTC hours, DEC26 daily bias, and current bridge/reconciliation/risk/ledger context are not established. Release requires actual dependency repair and active periodic evidence; never force flat/ready. |
-| 3 | Seal `BASELINE_R` | Sol, after Caelum review | **BLOCKED BY R1–R4** | Mandatory-repairs-only no-FHB build, identities and tests complete. It becomes the optional-experiment reference; `efea615` remains negative evidence, not a timing baseline. |
+| 2 | R4 genuine periodic eligibility/current context | Sol only | **SOURCE PATH ACCEPTED; CURRENT-EVIDENCE HOLD** | The source audit found no scheduler defect: periodic work is owned by the existing deadline only when bridge state, runtime reconciliation/execution/position/order truth and pending-native state are independently cleanly flat; every unresolved or exposed state remains event-driven protection. The new source identity still lacks admissible 2,016-bar history, the two preceding UTC hours/current DEC26 bias, and same-epoch reconciliation/risk/ledger evidence. Release requires those actual dependencies and active periodic evidence; never force flat/ready. |
+| 3 | Seal `BASELINE_R` | Sol, after Caelum review | **ACCEPTED TO SEAL AT CORRECTION COMMIT** | Mandatory-repairs-only no-FHB source, final identity, independent review and bounded composite correction evidence are complete. No full-suite replacement is required before the seal. The resulting commit becomes the optional-experiment reference; `efea615` remains negative evidence, not a timing baseline. |
 | 4 | Optional experiment screens | Assigned disjoint owner; Sol holds benchmark lock | **NOT STARTED** | Execute only applicable preregistered E1–E7 candidates in `EXPERIMENTS.md` against `BASELINE_R` and a clean corpus. |
 | 5 | Composite integration/freeze | Sol | **BLOCKED** | Accepted candidates together pass semantic/security/durability regression and retain FHB-null identity. Freeze before runtime evidence. |
 | 6 | Gate B short natural proof | Sol only | **BLOCKED** | One predeclared 3–5 minute supervised disarmed proof after valid initialization; persisted start/fault/end evidence and all Gate B dimensions must pass. |
@@ -121,25 +121,26 @@ avoid reverting others, and route overlap through Sol.
 
 ### R1 integration identity note
 
-Any R1 edit to `BeelzebubReadOnlyAddOn.cs` changes the computed observer source
-fingerprint. The Native R1 owner does not own
-`src/l3f_provider/ninjatrader_observation.py`; therefore its returned patch is
-not integration-complete by itself. Sol owns the integration update and must:
+Any R1 edit to either checked-in read-only NinjaScript producer changes the
+computed observer source fingerprint. Sol completed the required integration:
 
-1. derive the new fingerprint with the repository contract implemented by
+1. derived the final fingerprint with the repository contract implemented by
    `expected_observer_source_fingerprint()` / the identical
    `Get-ExpectedFingerprint` logic in
    `tools/commission_ninjatrader_observer.ps1`;
-2. update both the native `ProducerSourceFingerprint` and Python
+2. updated both the native `ProducerSourceFingerprint` and Python
    `EXPECTED_OBSERVER_SOURCE_FINGERPRINT` to that exact value without changing
    the fingerprint material or bypassing validation;
-3. run the related identity/source tests and the commissioning script's
-   read-only source/fingerprint validation before any install/load action;
-4. treat every old source-bound history, warm-start, certificate, and runtime
+3. passed the related identity/source tests and direct supported-computation
+   congruency check; and
+4. continues to treat every old source-bound history, warm-start, certificate, and runtime
    receipt as ineligible for the changed source rather than relabelling it.
 
-Caelum must review the integrated identity diff and test receipt, not accept the
-isolated R1 patch as a loadable artifact.
+The final supported fingerprint is
+`585a57d4c8138665b6c5734fcb84608f16c64668b028ec960371d78957fa2344`.
+Caelum independently confirmed equality across the supported computation,
+native constant and Python constant. This is a source identity, not proof of an
+installed or loaded native artifact.
 
 ### R2 source-audit note
 
@@ -263,11 +264,69 @@ Evidence review:
   compiler suite while concurrent owners were active;
 - scoped `git diff --check` has no whitespace error (line-ending warnings only).
 
-The supported derived source fingerprint is
-`861d2d270948d6b7f78631bd50a1fc1b7f473f63739486d026130c0517533fae`.
-The Python expected constant remains the prior value until Sol integrates it.
-R1 is not a loadable or runtime-accepted artifact until the identity obligations
-above and composite verification pass.
+The final supported derived source fingerprint is
+`585a57d4c8138665b6c5734fcb84608f16c64668b028ec960371d78957fa2344`.
+The native producer, Python expectation and identity test constants all match.
+R1 remains uninstalled, unloaded and runtime-unverified until the supported
+operator compile/load and commissioning receipt pass.
+
+### Composite correction review
+
+The first full `pytest tests -q` composite at integrated HEAD `a065176` used
+`H:\CodexTestTemp\nofhb-baseline-a065176` and completed in 1,466.13 seconds:
+1,545 tests and 531 subtests passed; six tests failed. Three failures correctly
+encountered `PROFILE_SELECTION_CHECKOUT_MISMATCH` from the preserved N: selector
+for the prior checkout, two exposed Phase-F2 source-contract integration defects
+(`.Reverse(` and a stale reset literal), and one reproduced a Phase-F3 test
+listener-start race. The production profile-selection guard was not weakened or
+its operational state rewritten.
+
+The correction is bounded and accepted:
+
+- both read-only producers now perform descending insert shifts and ascending
+  delete shifts with explicit ordered LINQ materialization, preserving cursor
+  semantics while removing the forbidden execution-like lexeme;
+- the Phase-F2 assertion requires truthful dynamic `e.IsReset` serialization;
+- the Phase-F3 helper waits on the existing production
+  `on_listener_started` callback, which occurs after the loopback listener is
+  opened and ready, without changing shutdown or partial-frame classification;
+- the exact prior failure set plus identity passed 7/7 in 3.76 seconds under an
+  isolated selector root; the exact Phase-F3 test passed 10/10 bounded repeats;
+  and the affected suite passed 173 tests and 38 subtests in 51.27 seconds;
+- an initial affected rerun placed TEMP inside the selector root and was
+  correctly rejected by `PROFILE_SWITCH_RISK_GUARD_LAYOUT_UNSAFE`; it is retained
+  as a harness-layout error, not a product result; and
+- Caelum independently passed 63/63 Phase-F2/native cursor/source/identity tests
+  in 2.434 seconds and the exact Phase-F3 test 3/3 in 0.153–0.157 seconds per run.
+
+Scoped diff checks are clean apart from line-ending notices. The combination of
+the 1,545 unaffected full-suite passes, exact failure-set replacement, affected
+suite and independent focused checks is sufficient composite correction
+evidence; repeating the entire 24-minute suite is not required before the
+mandatory-repair commit or controlled disarmed commissioning.
+
+### R4 source-path review
+
+The existing scheduler is the required owner; no second scheduler or forced
+eligibility repair is justified. `_event_protection_reason_locked()` permits
+ordinary periodic work only when scheduling is enabled, a runtime bridge exists
+in a flat-wait state with zero actual quantity and no pending action, runtime
+reconciliation is current, execution is resolved, positions and owned/entry
+orders are zero, and no native directive is pending. Any absent, stale,
+non-flat or unresolved field selects `EVENT_DRIVEN_PROTECTION`. The worker
+services the periodic deadline only after applying any already-available queued
+record and supersedes obsolete flat-mode opportunities while protection is
+required; immediate protective processing remains event-driven.
+
+This establishes source-path correctness, not R4 readiness. The R1 source
+fingerprint change invalidates prior source-bound volume history and warm-start
+evidence. No admissible receipt yet proves exactly 2,016 completed five-minute
+bars in 16 ordered chunks, the two immediately preceding completed UTC hours,
+current DEC26 daily bias, or same-epoch Sim101 reconciliation and risk/ledger
+continuity for the new identity. Those artifacts must be acquired after the
+supported reload and revalidated at final closeout. This is a runtime evidence
+HOLD, not a blocker to sealing the mandatory-repairs-only `BASELINE_R` source
+identity.
 
 ## Benchmark lock
 
@@ -289,27 +348,31 @@ above and composite verification pass.
 
 ## Holds
 
-### HOLD H1 — Gate A and integration promotion
+### HOLD H1 — Gate A experiment and final integration closure
 
-- **Evidence:** native coherent partial prefixes are currently published as
-  available; historical journal 47 was 10-bid/1-ask and terminally latched the
-  strict host.
-- **Consequence:** the producer and qualifying consumer disagree on availability;
-  no clean baseline, performance claim, or runtime gate may use this source.
-- **Release:** R1 implementation and independent authentic/oracle tests pass;
-  R3 persisted fault evidence is integrated; R2/R4 source prerequisites are
-  traced with no unresolved deterministic defect.
-- **Owner:** Sol integrates Native R1 and Python R3 owners' work.
+- **Evidence:** R1–R4 source/offline repairs, lifecycle proof contract,
+  identities and bounded composite correction evidence are accepted. E1–E7
+  applicability and bounded outcomes are not yet closed, and no final composite
+  experiment candidate exists.
+- **Consequence:** `BASELINE_R` may be sealed and used for the preregistered
+  screens, but Gate A and Gates B–D remain closed.
+- **Release:** every E1–E7 family has an evidence-backed executed disposition or
+  `NOT_APPLICABLE_WITH_EVIDENCE`; demonstrated winners, if any, are integrated;
+  final identities and composite review pass.
+- **Owner:** Sol coordinates; Caelum records acceptance decisions.
 
 ### HOLD H2 — Runtime/native maintenance
 
-- **Evidence:** Gate A is open; no supported receiver-first new-generation
-  lifecycle receipt exists for the repaired build.
-- **Consequence:** no compile/install/load, observer replacement, listener,
-  natural proof, formal capacity run, or rehearsal is authorized yet.
-- **Release:** Sol presents integrated `BASELINE_R`, focused/composite PASS,
-  verified supported listener-first steps, exact artifact identities, and
-  Caelum clears the affected transition.
+- **Evidence:** source/offline repairs and the R2 workflow are accepted, but the
+  correction commit is not yet sealed and no supported receiver-first
+  new-generation lifecycle receipt exists for it.
+- **Consequence:** no native install/load or natural Gate-B proof may begin from
+  the unsealed working tree. Formal capacity and rehearsal remain prohibited.
+- **Release:** Sol seals the exact reviewed correction as `BASELINE_R`, rechecks
+  its source identity and clean intended diff, brings listener and collector to
+  verified readiness, then uses the Windows operator notification for the one
+  genuine F5 compile/load action. The signed R2 receipt must pass before the new
+  epoch can seed a clean corpus or R4 context.
 - **Owner:** Sol.
 
 ### HOLD H3 — Qualification/readiness claim
@@ -328,7 +391,9 @@ Independent source review and focused offline work continue under all holds.
 
 ## Next single action
 
-Complete and independently review R1's exact native availability repair and
-authentic fixture/oracle regressions. It is the earliest deterministic blocker;
-R3 may proceed concurrently in its disjoint scope. Sol must not start a runtime
-or measured workload while this action remains open.
+Seal the exact reviewed correction and Caelum pass updates as `BASELINE_R`, then
+reverify the committed `585a57d4...fa2344` source identity and intended diff.
+Only after that seal may Sol execute the accepted receiver-first commissioning
+workflow and request the one operator F5 compile/load action. Remain disarmed;
+no measured optional experiment, Gate-B window or order action is authorized by
+this step.

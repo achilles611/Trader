@@ -1451,11 +1451,11 @@ namespace NinjaTrader.NinjaScript.AddOns
             SortedDictionary<int, KeyValuePair<double, long>> levels,
             int position, bool inserting)
         {
-            List<int> positions = levels.Keys
-                .Where(value => inserting ? value >= position : value > position)
-                .ToList();
-            if (inserting)
-                positions.Reverse();
+            IEnumerable<int> affected = levels.Keys
+                .Where(value => inserting ? value >= position : value > position);
+            List<int> positions = inserting
+                ? affected.OrderByDescending(value => value).ToList()
+                : affected.OrderBy(value => value).ToList();
             foreach (int current in positions)
             {
                 KeyValuePair<double, long> row = levels[current];
@@ -1652,7 +1652,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string AttestedSchema = "lane-iii-phase-f3-ninjatrader-observation-v2";
         private const string AttestationProtocol = "l3f3-ninjatrader-observer-attestation-v1";
         private const string AttestationKeyContext = "BEELZEBUB_NINJATRADER_OBSERVATION_V2";
-        private const string ProducerSourceFingerprint = "861d2d270948d6b7f78631bd50a1fc1b7f473f63739486d026130c0517533fae";
+        private const string ProducerSourceFingerprint = "585a57d4c8138665b6c5734fcb84608f16c64668b028ec960371d78957fa2344";
         // Event-driven trades/depth require burst capacity, but memory remains
         // bounded. A full queue drops the signed frame after assigning its
         // sequence; the next source_event_sequence exposes the gap.

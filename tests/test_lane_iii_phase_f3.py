@@ -37,8 +37,10 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
 
     def _start_receiver(self, *, duration: float = 0.35, maximum_frame_bytes: int = 65536):
         port = self._ephemeral_port()
+        ready = threading.Event()
         harness = NinjaTraderCommissioningHarness(
-            LoopbackBridgeConfig(port=port, maximum_frame_bytes=maximum_frame_bytes)
+            LoopbackBridgeConfig(port=port, maximum_frame_bytes=maximum_frame_bytes),
+            on_listener_started=lambda _host, _port: ready.set(),
         )
         result: list = []
         failures: list[BaseException] = []
@@ -51,6 +53,8 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
 
         thread = threading.Thread(target=receive, daemon=True)
         thread.start()
+        if not ready.wait(timeout=1.0):
+            self.fail("commissioning listener did not report ready")
         deadline = time.monotonic() + 0.75
         while True:
             try:

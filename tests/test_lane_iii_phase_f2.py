@@ -289,7 +289,7 @@ class LaneIIIPhaseF2Tests(unittest.TestCase):
         self.assertIn("OnConnectionStatusUpdate", observer)
         self.assertIn("ClearMarketState();", observer)
         self.assertNotIn("if (e.IsReset)", observer)
-        self.assertIn('"is_reset\\\":false', observer)
+        self.assertIn('(e.IsReset ? "true" : "false")', observer)
         self.assertIn("e.Time - bestBidTime <= TimeSpan.FromSeconds(10)", observer)
         self.assertIn("e.Time - bestAskTime <= TimeSpan.FromSeconds(10)", observer)
         self.assertIn("bid_source_time", observer)

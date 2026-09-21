@@ -384,11 +384,11 @@ namespace NinjaTrader.NinjaScript.Indicators
             SortedDictionary<int, KeyValuePair<double, long>> levels,
             int position, bool inserting)
         {
-            List<int> positions = levels.Keys
-                .Where(value => inserting ? value >= position : value > position)
-                .ToList();
-            if (inserting)
-                positions.Reverse();
+            IEnumerable<int> affected = levels.Keys
+                .Where(value => inserting ? value >= position : value > position);
+            List<int> positions = inserting
+                ? affected.OrderByDescending(value => value).ToList()
+                : affected.OrderBy(value => value).ToList();
             foreach (int current in positions)
             {
                 KeyValuePair<double, long> row = levels[current];
