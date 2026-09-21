@@ -1668,6 +1668,24 @@ class NinjaScriptSourceTests(unittest.TestCase):
         self.assertNotIn("MNQ SEP26", observer)
         self.assertNotIn("MNQ September 2026", observer)
 
+    def test_native_volume_history_requires_the_complete_2016_bar_contract(self) -> None:
+        source = (
+            Path(__file__).parents[1]
+            / "ninjatrader/NinjaScript/AddOns/BeelzebubReadOnlyAddOn.cs"
+        ).read_text(encoding="utf-8")
+        request = source[
+            source.index("        private void StartVolumeReferenceRequest()"):
+            source.index("        private void StartHourlyBarsRequest()")
+        ]
+        self.assertIn("new BarsRequest(instrument, 2016)", request)
+        self.assertIn("if (rows.Count != 2016)", request)
+        self.assertIn("VOLUME_REFERENCE_INCOMPLETE_BAR_COUNT", request)
+        self.assertIn("int chunks = (rows.Count + 127) / 128;", request)
+        self.assertIn('\\"requested_bars_back\\":2016', request)
+        self.assertIn('\\"chunk_count\\":" + chunks', request)
+        self.assertIn('\\"total_bars\\":" + rows.Count', request)
+        self.assertNotIn("VOLUME_REFERENCE_EMPTY_OR_OVERSIZED", request)
+
     def test_observer_bounds_unverified_book_frames_and_stays_observation_only(self) -> None:
         source = (Path(__file__).parents[1] / "ninjatrader" / "NinjaScript" / "Indicators" / "BeelzebubReadOnlyMarketObserver.cs").read_text(encoding="utf-8")
         self.assertIn("MaximumPublishedBookLevelsPerSide = 10", source)
@@ -1717,27 +1735,26 @@ class NinjaScriptSourceTests(unittest.TestCase):
             addon.index("        private bool TryApplyDepthMutation("):
             addon.index("        private static void ShiftKnownPositions(")
         ]
+        self.assertIn("nativeDepthWorkingBookBids", mutation)
+        self.assertIn("nativeDepthWorkingBookAsks", mutation)
         self.assertIn("DepthPrefix(candidateBids, true)", mutation)
         self.assertIn("DepthPrefix(candidateAsks, false)", mutation)
-        self.assertIn(
-            "if (bestNativeBid >= bestNativeAsk)\n"
-            "            {\n"
-            "                // Report this authentic callback as unavailable, but do not\n"
-            "                // poison the last valid retained book with a crossed candidate.\n"
-            "                failureReason = \"CROSSED_NATIVE_POSITIONAL_SNAPSHOT\";\n"
-            "                return false;\n"
-            "            }\n"
-            "            CommitDepthState(candidateBids, candidateAsks);",
-            mutation,
+        working_commit = mutation.index(
+            "CommitNativeDepthWorkingState(candidateBids, candidateAsks);"
         )
-        self.assertIn(
-            "if (bidPrefix.Count == 0 || askPrefix.Count == 0)\n"
-            "            {\n"
-            "                // A reset or partial rebuild must become the retained state so\n"
-            "                // subsequent callbacks can repopulate it position by position.\n"
-            "                CommitDepthState(candidateBids, candidateAsks);",
-            mutation,
+        partial_check = mutation.index("if (bidPrefix.Count == 0 || askPrefix.Count == 0)")
+        crossed_check = mutation.index("if (bestNativeBid >= bestNativeAsk)")
+        self.assertLess(working_commit, partial_check)
+        self.assertLess(working_commit, crossed_check)
+        self.assertEqual(
+            mutation.count("CommitNativeDepthWorkingState(candidateBids, candidateAsks);"),
+            1,
         )
+        self.assertNotIn("CommitDepthState", mutation)
+        self.assertIn("Position apply to a stale pre-cross cursor", mutation)
+        self.assertIn("retaining it as the base for the next positional callback", mutation)
+        self.assertIn('failureReason = "NATIVE_DEPTH_CONTINUITY_BROKEN";', mutation)
+        self.assertIn("NeedsRecovery replaces the subscription", mutation)
         self.assertIn("MaximumObserverRecoveryAttempts = 3", addon)
         self.assertIn("ReferenceEquals(automaticObserver, candidate)", addon)
         self.assertIn("NATIVE_ADDON_OBSERVER_RECOVERY_EXHAUSTED", addon)

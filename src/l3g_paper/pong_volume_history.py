@@ -22,6 +22,7 @@ HISTORY_TYPE = "VOLUME_REFERENCE_HISTORY"
 HISTORY_POLICY = "PROVIDER_COMPLETED_UTC_5M_VOLUME_V1"
 HISTORY_BARS_BACK = 2016
 HISTORY_CHUNK_SIZE = 128
+HISTORY_CHUNK_COUNT = (HISTORY_BARS_BACK + HISTORY_CHUNK_SIZE - 1) // HISTORY_CHUNK_SIZE
 _CONTEXT = b"PONG_VOLUME_REFERENCE_RECEIPT_V1"
 
 
@@ -86,7 +87,7 @@ class PongVolumeReferenceHistory:
         )
 
     def _decode(self, records: list[dict], received_at: str) -> tuple[VolumeWindow, ...]:
-        if not records or len(records) > 16:
+        if len(records) != HISTORY_CHUNK_COUNT:
             raise ValueError("CHUNK_COUNT")
         observed = _time(received_at)
         identity = None
@@ -117,10 +118,12 @@ class PongVolumeReferenceHistory:
                 raise ValueError("MIXED_REQUEST")
             identity = current_identity
             bars = p.get("bars")
-            if not isinstance(bars, list) or not 1 <= len(bars) <= HISTORY_CHUNK_SIZE:
+            expected_chunk_bars = min(
+                HISTORY_CHUNK_SIZE,
+                HISTORY_BARS_BACK - index * HISTORY_CHUNK_SIZE,
+            )
+            if not isinstance(bars, list) or len(bars) != expected_chunk_bars:
                 raise ValueError("BARS_SHAPE")
-            if index < len(records) - 1 and len(bars) != HISTORY_CHUNK_SIZE:
-                raise ValueError("CHUNK_INCOMPLETE")
             for bar in bars:
                 start, end = _time(bar["start"]), _time(bar["end"])
                 if (start.minute % 5 or start.second or start.microsecond
@@ -139,7 +142,12 @@ class PongVolumeReferenceHistory:
                     f"UTC-{start.hour:02d}:{start.minute:02d}-5M", _wire(start), _wire(end),
                     _wire(observed), Decimal(volume), VolumeWindowKind.COMPLETED, True, True,
                 ))
-        if type(identity[-1]) is not int or identity[-1] != len(windows) or len(windows) > HISTORY_BARS_BACK:
+        if (
+            identity is None
+            or type(identity[-1]) is not int
+            or identity[-1] != HISTORY_BARS_BACK
+            or len(windows) != HISTORY_BARS_BACK
+        ):
             raise ValueError("TOTAL_BARS_INCOMPLETE")
         return tuple(windows)
 
@@ -154,7 +162,8 @@ class PongVolumeReferenceHistory:
                 self._pending_id = str(p.get("request_id"))
             if (str(p.get("request_id")) != self._pending_id
                     or p.get("chunk_index") != len(self._pending)
-                    or type(p.get("chunk_count")) is not int or not 1 <= p["chunk_count"] <= 16):
+                    or type(p.get("chunk_count")) is not int
+                    or p["chunk_count"] != HISTORY_CHUNK_COUNT):
                 raise ValueError("CHUNK_SEQUENCE")
             self._pending.append(raw)
             if len(self._pending) != p["chunk_count"]:

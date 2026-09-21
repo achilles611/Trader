@@ -710,9 +710,13 @@ namespace NinjaTrader.NinjaScript.AddOns
             new BeelzebubMarketCallbackGate();
         private readonly long marketDataGeneration = 1;
         private readonly long publisherLease;
-        private readonly SortedDictionary<int, KeyValuePair<double, long>> depthBids =
+        // This is the authentic native positional working cursor, not a
+        // last-published display book. Every interpretable callback advances
+        // it even when the resulting snapshot is crossed or partial and must
+        // be withheld from available publication.
+        private readonly SortedDictionary<int, KeyValuePair<double, long>> nativeDepthWorkingBookBids =
             new SortedDictionary<int, KeyValuePair<double, long>>();
-        private readonly SortedDictionary<int, KeyValuePair<double, long>> depthAsks =
+        private readonly SortedDictionary<int, KeyValuePair<double, long>> nativeDepthWorkingBookAsks =
             new SortedDictionary<int, KeyValuePair<double, long>>();
         private bool depthContinuityBroken;
         private readonly long startedTicks = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -898,9 +902,9 @@ namespace NinjaTrader.NinjaScript.AddOns
                             + "\",\"end\":\"" + end.ToString("o", CultureInfo.InvariantCulture)
                             + "\",\"volume\":" + result.Bars.GetVolume(index).ToString(CultureInfo.InvariantCulture) + "}");
                     }
-                    if (rows.Count == 0 || rows.Count > 2016)
+                    if (rows.Count != 2016)
                     {
-                        BeelzebubReadOnlyOutbound.Diagnostic("VOLUME_REFERENCE_EMPTY_OR_OVERSIZED");
+                        BeelzebubReadOnlyOutbound.Diagnostic("VOLUME_REFERENCE_INCOMPLETE_BAR_COUNT");
                         return;
                     }
                     int chunks = (rows.Count + 127) / 128;
@@ -1242,13 +1246,23 @@ namespace NinjaTrader.NinjaScript.AddOns
             failureReason = null;
             if (update == null)
             {
+                depthContinuityBroken = true;
                 failureReason = "NATIVE_DEPTH_MUTATION_MISSING";
                 return false;
             }
+            if (depthContinuityBroken)
+            {
+                // An uninterpretable mutation means the native positional
+                // cursor is no longer reconstructible. Publish no later book
+                // from this observer; NeedsRecovery replaces the subscription
+                // and starts a new authoritative cursor.
+                failureReason = "NATIVE_DEPTH_CONTINUITY_BROKEN";
+                return false;
+            }
             SortedDictionary<int, KeyValuePair<double, long>> candidateBids =
-                new SortedDictionary<int, KeyValuePair<double, long>>(depthBids);
+                new SortedDictionary<int, KeyValuePair<double, long>>(nativeDepthWorkingBookBids);
             SortedDictionary<int, KeyValuePair<double, long>> candidateAsks =
-                new SortedDictionary<int, KeyValuePair<double, long>>(depthAsks);
+                new SortedDictionary<int, KeyValuePair<double, long>>(nativeDepthWorkingBookAsks);
             SortedDictionary<int, KeyValuePair<double, long>> side;
             if (update.MarketDataType == MarketDataType.Bid)
                 side = candidateBids;
@@ -1300,13 +1314,17 @@ namespace NinjaTrader.NinjaScript.AddOns
                 failureReason = "NATIVE_DEPTH_MUTATION_APPLICATION_FAILED";
                 return false;
             }
+
+            // NinjaTrader has already advanced its positional book before
+            // invoking this callback. Advance our private native cursor now,
+            // before deciding whether this state is safe to publish. Rolling
+            // back a crossed candidate would make the next callback's
+            // Position apply to a stale pre-cross cursor.
+            CommitNativeDepthWorkingState(candidateBids, candidateAsks);
             List<KeyValuePair<double, long>> bidPrefix = DepthPrefix(candidateBids, true);
             List<KeyValuePair<double, long>> askPrefix = DepthPrefix(candidateAsks, false);
             if (bidPrefix.Count == 0 || askPrefix.Count == 0)
             {
-                // A reset or partial rebuild must become the retained state so
-                // subsequent callbacks can repopulate it position by position.
-                CommitDepthState(candidateBids, candidateAsks);
                 failureReason = "NATIVE_DEPTH_POSITION_ZERO_UNAVAILABLE";
                 return false;
             }
@@ -1314,12 +1332,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             bestNativeAsk = askPrefix[0].Key;
             if (bestNativeBid >= bestNativeAsk)
             {
-                // Report this authentic callback as unavailable, but do not
-                // poison the last valid retained book with a crossed candidate.
+                // The working cursor already contains this authentic
+                // transition. Withhold it from available publication while
+                // retaining it as the base for the next positional callback.
                 failureReason = "CROSSED_NATIVE_POSITIONAL_SNAPSHOT";
                 return false;
             }
-            CommitDepthState(candidateBids, candidateAsks);
             List<string> bidRows = bidPrefix
                 .Select(row => "{\"price\":" + row.Key.ToString(CultureInfo.InvariantCulture)
                     + ",\"size\":" + row.Value + "}").ToList();
@@ -1331,16 +1349,16 @@ namespace NinjaTrader.NinjaScript.AddOns
             return true;
         }
 
-        private void CommitDepthState(
+        private void CommitNativeDepthWorkingState(
             SortedDictionary<int, KeyValuePair<double, long>> candidateBids,
             SortedDictionary<int, KeyValuePair<double, long>> candidateAsks)
         {
-            depthBids.Clear();
+            nativeDepthWorkingBookBids.Clear();
             foreach (KeyValuePair<int, KeyValuePair<double, long>> row in candidateBids)
-                depthBids[row.Key] = row.Value;
-            depthAsks.Clear();
+                nativeDepthWorkingBookBids[row.Key] = row.Value;
+            nativeDepthWorkingBookAsks.Clear();
             foreach (KeyValuePair<int, KeyValuePair<double, long>> row in candidateAsks)
-                depthAsks[row.Key] = row.Value;
+                nativeDepthWorkingBookAsks[row.Key] = row.Value;
         }
 
         private static void ShiftKnownPositions(
@@ -1536,7 +1554,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string AttestedSchema = "lane-iii-phase-f3-ninjatrader-observation-v2";
         private const string AttestationProtocol = "l3f3-ninjatrader-observer-attestation-v1";
         private const string AttestationKeyContext = "BEELZEBUB_NINJATRADER_OBSERVATION_V2";
-        private const string ProducerSourceFingerprint = "3c2248a8b676f35ca0b2442bb0463b9786096b1882f04f0e8f6f2eb60e6454e3";
+        private const string ProducerSourceFingerprint = "89952a9a476d4b9c8336dfca76d868b63c3222ff7abcceb7686553dc8bd0e716";
         // Event-driven trades/depth require burst capacity, but memory remains
         // bounded. A full queue drops the signed frame after assigning its
         // sequence; the next source_event_sequence exposes the gap.
