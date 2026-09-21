@@ -4,8 +4,8 @@ Pass ID: `20260921-135529Z-no-fhb-qualification-readiness`
 Opened: `2026-09-21T13:55:29Z` / `2026-09-21T07:55:29-06:00`
 Administrator: Caelum (`beelzebub_admin`)
 Integrator, benchmark coordinator, and runtime operator: Sol parent
-Current phase: Gate B initialization prerequisites
-Overall verdict: **HOLD — runtime proof, capacity and rehearsal not complete**
+Current phase: post-R2 failed-commissioning corrective cut
+Overall verdict: **HOLD — identity boundary passed; clean initialization failed; Gates B–D not run**
 
 ## Objective and authorization
 
@@ -47,6 +47,12 @@ arm; or send orders.
   Python observer identities were reverified equal at
   `585a57d4c8138665b6c5734fcb84608f16c64668b028ec960371d78957fa2344`.
   At the seal, only pre-existing unrelated audit/evidence dirt remained.
+- **COMMISSIONING HEAD:** Sol performed the supported disarmed runtime operation
+  at `ac9b44e9d178d37c8fa1844fc36dd312a7651339`, a narrow commissioning-readiness
+  state correction after `BASELINE_R`. The signed producer source identity
+  remained `585a57d4c8138665b6c5734fcb84608f16c64668b028ec960371d78957fa2344`.
+  Gate A remains PASS; the failed runtime epoch does not amend or relabel the
+  sealed baseline.
 
 ### Process, port, and machine snapshot
 
@@ -61,6 +67,11 @@ Observed at `2026-09-21T13:55:29Z`:
   228,141,559,808 bytes.
 
 This is a point-in-time inventory, not restart or benchmark authority.
+
+Runtime closeout after Sol's supported stop again found ports `8090`, `48135`,
+`48136`, and `48137` free, with operator-owned NinjaTrader PID `17208` the only
+relevant remaining process. This is a closeout snapshot, not continuous
+monitoring or permission to stop NinjaTrader.
 
 ### Preserved evidence independently rechecked
 
@@ -101,16 +112,16 @@ performance corpus and cannot be extended or relabelled.
 
 | Order | Work item | Owner | State | Evidence / release condition |
 |---:|---|---|---|---|
-| 1 | R1 truthful native availability | Native owner; Sol integrates | **SOURCE/OFFLINE AND IDENTITY ACCEPTED; runtime HOLD** | The integrated patch preserves the single pre-gate cursor commit, makes incomplete prefixes and unresolved Remove identity explicit unavailable, and retains crossed/empty/invalid fail-closed paths. The Phase-F2 lexical correction preserves identical ordered shifts. Native, Python and computed source identities agree at `585a57d4...fa2344`; focused and affected composite receipts pass. No installed/loaded/runtime acceptance exists. |
-| 1 | R3 persisted host telemetry | Python telemetry owner; Sol integrates | **SOURCE/OFFLINE ACCEPTED; integration/runtime HOLD** | The final bounded revision covers the prior clock, first-fault, retry, exact queue occupancy/high-water/age, authority, scheduling-duration, final-stage and bounded-aggregate findings. Admission and dequeue bookkeeping now share one bounded logical-occupancy lock, and the forced drain race proves one admitted item still raises high-water to one. Caelum independently passed all 20 focused tests, Python compilation and diff checks. Composite integration and runtime receipts remain. |
-| 2 | R2 supported receiver-first source lifecycle | Sol only | **SOURCE/OFFLINE ACCEPTED; OPERATOR/RUNTIME HOLD** | The corrected commissioning workflow is accepted for integration: it hash-binds the pre-reload receipt and raw journal, proves receiver readiness first, and requires a distinct authenticated session/source/build with stable generation, zero loss totals/deltas, fault-free host state, exact 10x10 truth, safe authority and two advancing durable checkpoints. The old assembly's unknown cleared tail remains explicitly failed, not drained. Release still requires the actual operator F5 compile/load and a signed passing receipt; same-assembly reattach remains unsupported. |
-| 2 | R4 genuine periodic eligibility/current context | Sol only | **SOURCE PATH ACCEPTED; CURRENT-EVIDENCE HOLD** | The source audit found no scheduler defect: periodic work is owned by the existing deadline only when bridge state, runtime reconciliation/execution/position/order truth and pending-native state are independently cleanly flat; every unresolved or exposed state remains event-driven protection. The new source identity still lacks admissible 2,016-bar history, the two preceding UTC hours/current DEC26 bias, and same-epoch reconciliation/risk/ledger evidence. Release requires those actual dependencies and active periodic evidence; never force flat/ready. |
+| 1 | R1 truthful native availability | Native owner; Sol integrates | **PASS SOURCE/OFFLINE/LOADED TRUTH; clean epoch HOLD** | The loaded signed producer used source `585a57d4...fa2344`. Authentic journal record 149 / DEPTH source sequence 144 truthfully published an unresolved Ask Remove at position 11 as `UNAVAILABLE / NATIVE_DEPTH_REMOVE_IDENTITY_UNRESOLVED`, with `mutation_resolved_price=null`. That validates the repaired producer boundary; the host's fatal interpretation of this valid unavailable record is a separate next-cut defect. |
+| 1 | R3 persisted host telemetry | Python telemetry owner; Sol integrates | **PASS IMPLEMENTED/RUNTIME OBSERVED** | First-fault and final receipts persisted the exact host fault, producer/receiver/host/collector counters, queue age/high-water, scheduler/protection truth, authority, clock domains and aggregates. The final collector subsequently drained `100472/100472/100472`. This is instrumentation acceptance, not candidate-readiness acceptance. |
+| 2 | R2 supported receiver-first source lifecycle | Sol only | **PARTIAL PASS — DISTINCT AUTHENTICATED BOUNDARY; CLEAN INITIALIZATION FAIL/HOLD** | Receiver and collector were ready before reload; the runtime then held one distinct signed session `46adca83becf42e59e4356bb5829c88b`, source `585a57d4...fa2344`, build `70a1762e...eb759`, and generation 1 across advancing checkpoints. The commissioning receipt is nevertheless `verified=false`: host first fault was `PONG_CANONICAL_DEPTH_MUTATION_NOT_IN_POST_BOOK`, receiver rejects rose by 2,381 between checkpoints, and the final producer-overflow delta was `+45772`. No clean corpus boundary was earned. |
+| 2 | R4 genuine periodic eligibility/current context | Sol only | **SOURCE PATH ACCEPTED; RUNTIME FAIL/HOLD** | Sim101 stayed flat, disarmed, reconciled, and without orders, but the host remained on `EVENT_DRIVEN_PROTECTION / RUNTIME_BRIDGE_UNAVAILABLE`. The 24.1676-second diagnostic produced 1,063 opportunities, 907 late/protection supersessions, 156 obsolete deadlines and zero full periodic evaluations; source age ended at 81.321 seconds. Required 2,016-bar, preceding-hour and current DEC26 bias evidence remains absent. |
 | 3 | Seal `BASELINE_R` | Sol, after Caelum review | **PASS — SEALED** | Commit `c76cccc2a3242f9bda00f4677648f589f70be317`, source identity `585a57d4...fa2344`; mandatory-repairs-only no-FHB source, identity, independent review and bounded composite correction evidence complete. `efea615` remains negative evidence, not a timing baseline. |
 | 4 | Optional experiment screens | Assigned disjoint owner; Sol holds benchmark lock | **CLOSED — E4 PARKED INCONCLUSIVE; OTHERS NOT APPLICABLE** | E1–E3/E5–E7 are closed from current code/telemetry. E4 exhausted its initial plus one corrective budget: the correction still couples retained ingress to real host startup, depends on a continuously settled checkpoint the collector cannot expose, lacks a durable-prefix stream boundary, and finished 11/13 tests. It is not integrated. |
 | 5 | Composite integration/freeze | Sol | **PASS — BASELINE_R UNCHANGED** | No optional candidate earned integration. The frozen qualifying source remains `c76cccc2a3242f9bda00f4677648f589f70be317` with FHB absent and observer identity `585a57d4...fa2344`. |
-| 6 | Gate B short natural proof | Sol only | **BLOCKED** | One predeclared 3–5 minute supervised disarmed proof after valid initialization; persisted start/fault/end evidence and all Gate B dimensions must pass. |
-| 7 | Gate C formal capacity | Sol only | **BLOCKED** | Same frozen candidate must meet unchanged `2111/s`, `compute_workers=0`, three sustained plus three burst repeats, zero loss/reject/duplicate/overflow, bounded queues, durable drain, and wire/journal/decision parity. |
-| 8 | Gate D 20-minute rehearsal | Sol only | **BLOCKED** | Only after Gates B and C pass; one unchanged natural disarmed rehearsal with current context and persisted receipts. |
+| 6 | Gate B short natural proof | Sol only | **NOT RUN — BLOCKED BY FAILED R2 INITIALIZATION** | The 24.1676-second run was a diagnostic fail-stop after the commissioning fault, not the predeclared 3–5 minute Gate B window. It recorded DEPTH 305.078/s, opportunities 43.9845/s, zero full evaluations, producer overflow `+6335`, and increasing source age. A corrected fresh R2 epoch must pass before Gate B may be attempted. |
+| 7 | Gate C formal capacity | Sol only | **NOT RUN — BLOCKED** | Gate B did not start or pass. The unchanged contract remains `2111/s`, `compute_workers=0`, three sustained plus three burst repeats, zero loss/reject/duplicate/overflow, bounded queues, durable drain, and wire/journal/decision parity. |
+| 8 | Gate D 20-minute rehearsal | Sol only | **NOT RUN — BLOCKED** | Gates B and C did not pass. The stopped failed epoch and its 24.1676-second diagnostic are not a rehearsal and cannot be extended or relabelled. |
 | 9 | Readiness verdict/runbook | Caelum recommends; Sol closes | **BLOCKED** | `READY_FOR_QUALIFICATION_RUN` is possible only after every pass prerequisite. It is not qualification, arming, or order authority. |
 
 ## Active assignments and file ownership
@@ -210,17 +221,88 @@ undelivered count. The workflow therefore labels that tail
 `FAILED_UNKNOWN_PENDING_TAIL_NOT_DRAIN_PROOF`; a distinct new session starting
 at genuine zero is allowed, but is neither a relabel nor proof that the old
 queue drained. PowerShell parsing, probe compilation, and the focused source,
-identity and native-cursor tests pass. Installed, loaded and runtime-verified
-states remain false until the operator F5 action and signed receipt complete.
+identity and native-cursor tests pass. Sol subsequently exercised this workflow;
+the receiver-first identity/lifecycle portion passed, while the clean-runtime
+acceptance failed as recorded below.
 
 Same-assembly menu/automatic replacement remains unsupported for a qualifying
 epoch. Its readiness snapshot would need an atomic callback-retire/drain fence,
 receiver-observed authenticated barrier, and exact ledger schema support;
 automatic recovery cannot bypass it. Do not exercise that path in this pass.
 
+### R2 runtime closeout and acceptance
+
+Sol alone performed the authorized receiver-first reload, short diagnostic and
+supported stop at commissioning HEAD
+`ac9b44e9d178d37c8fa1844fc36dd312a7651339`. Caelum independently re-read the
+resulting receipts and hashes:
+
+- commissioning receipt
+  `H:\PongPeriodic\NoFHBQualificationReadiness-20260921\R2-commission-585a-20260921T153900Z.json`,
+  SHA-256
+  `df530f25afee14474898cb516ff8ad37c0a5e12cede908bf2f0870e6439522e7`;
+- short diagnostic receipt
+  `H:\PongPeriodic\NoFHBQualificationReadiness-20260921\R2-short-natural-chain-20260921T154100Z.json`,
+  SHA-256
+  `14662f1c4efe58c9c443944c2f74c80d1da74acde678b6e670efb398e218f7eb`;
+- first-fault host telemetry
+  `N:\Beelzebub\runtime\pong-production\pong\MNQZ6\v1\host-telemetry\first-fault.json`,
+  SHA-256
+  `e52cdbf8ae1a2f61ab62a3ad21308301ea0ad212942bfb065cf8a74eab1de68a`;
+- final host telemetry
+  `N:\Beelzebub\runtime\pong-production\pong\MNQZ6\v1\host-telemetry\final.json`,
+  SHA-256
+  `deba075a3bbf9a7ff3dc6b3117943614755f999d3c6b53dc0bf020a62fd352ea`;
+- final collector status, SHA-256
+  `565d751b7ffde65a681bcdf2213d9ab620e8dba3093d1ea2823fa0812bf36afa`,
+  and its final journal, SHA-256
+  `b5fea0bbf49cea7b0d738c84d82b36cd91c331ddde99c17472b594aecb25348d`;
+- incremental ledger closeout
+  `N:\Beelzebub\runtime\profiles\beelzebub_pong_discernment_v1\runs\20260920T211544Z-ca2ceba7da11\audit\ledger-verification\20260921T154300321406Z-no-fhb-r2-canonical-fault-closeout-20260921T1542Z.json`,
+  SHA-256
+  `1b46e2800dbdac23b2bb0a0909cf85355bcd3d991892711705800222deaf6994`.
+
+The receiver-first identity boundary itself passes: listener and collector were
+ready before reload, the exact loaded temp assembly was observed, and both
+advancing checkpoints retained session
+`46adca83becf42e59e4356bb5829c88b`, source
+`585a57d4c8138665b6c5734fcb84608f16c64668b028ec960371d78957fa2344`,
+build `70a1762e68d34ef12ff98c4ab1ca2b86619b4d02f52a2136454cd14e8c5eb759`,
+and source generation 1. Sim101 remained flat, disarmed and without orders.
+The old cleared tail remains `FAILED_UNKNOWN_PENDING_TAIL_NOT_DRAIN_PROOF`.
+
+R2 as a clean authoritative initialization **fails and remains on HOLD**. The
+commissioning receipt is `verified=false`; receiver rejects increased by 2,381
+between checkpoints and the host had already latched
+`PONG_CANONICAL_DEPTH_MUTATION_NOT_IN_POST_BOOK`. Independently reading journal
+record 149 shows the exact seam: DEPTH source sequence 144, authenticated and
+signature verified, reports a Remove on Ask position 11 with no resolved price
+and explicitly marks the observation
+`UNAVAILABLE / NATIVE_DEPTH_REMOVE_IDENTITY_UNRESOLVED`. The native producer is
+truthful; the host must not demand that unresolved mutation be present in its
+post-book. Any correction must continue to fail closed and must not make this
+record analytically available.
+
+The later diagnostic confirms a second independent blocker. Across 24.1676
+seconds, DEPTH ingress was 305.078/s and periodic opportunities 43.9845/s, but
+there were zero full evaluations, 907 late/protection supersessions, 156
+obsolete deadlines, producer overflow `+6335`, transport failure `+0`, and
+source age ended at 81.321 seconds. Final producer overflow was `+45772`.
+Although the final collector durably drained `100472/100472/100472`, with zero
+collector overflow and transport failures, durability cannot erase upstream
+producer loss or the latched host fault. The ledger verifier's PASS through
+sequence 233998 is likewise narrow closeout integrity, not R2, Gate B, or
+strategy readiness.
+
+The 24.1676-second run is classified `FAIL_STOP_AT_CANONICAL_BOOK_STAGE`, a
+diagnostic after failed initialization. It is not a Gate B attempt, is shorter
+than the authorized 3–5 minute window, and cannot be extended or relabelled.
+Gates B, C and D were not run.
+
 ### R3 corrective-revision review
 
-The final corrective revision is **ACCEPTED FOR SOURCE/OFFLINE INTEGRATION**. It
+The final corrective revision was **ACCEPTED FOR SOURCE/OFFLINE INTEGRATION** and
+is now **PASS IMPLEMENTED/RUNTIME OBSERVED** for its instrumentation contract. It
 has fixed atomic start/first-fault/checkpoint/final
 slots, factual clock-domain separation, exact canonical `10x1` and other early
 fault coverage, five-second retry bounding, current oldest pending age, actual
@@ -236,13 +318,15 @@ high-water increment. A consumer may dequeue the item but then waits for that
 same lock before decrementing logical occupancy, so every successful admission
 is counted. The forced interleaving now reports admitted `1`, final logical and
 physical occupancy `0`, and high-water `1`. No disk I/O or unbounded waiting was
-added to the external callback. Installed, loaded and runtime-verified states
-remain false until Sol integrates and Gate B produces the actual receipts.
+added to the external callback. The resulting first-fault and final runtime
+receipts captured the failed epoch accurately; this verifies telemetry behavior,
+not R2 or Gate B readiness.
 
 ### R1 first-revision review
 
-**Decision:** `PASS` for source/offline semantics and accepted for integration;
-installed, loaded, exercised, and runtime-accepted states remain false.
+**Initial decision:** `PASS` for source/offline semantics and accepted for
+integration. The subsequent supported reload installed/loaded the matching
+producer, and record 149 exercised the repaired unresolved-Remove behavior.
 
 Observed behavior:
 
@@ -273,8 +357,10 @@ Evidence review:
 The final supported derived source fingerprint is
 `585a57d4c8138665b6c5734fcb84608f16c64668b028ec960371d78957fa2344`.
 The native producer, Python expectation and identity test constants all match.
-R1 remains uninstalled, unloaded and runtime-unverified until the supported
-operator compile/load and commissioning receipt pass.
+The supported producer was subsequently installed and loaded, and authentic
+journal record 149 confirms its unresolved-Remove publication is unavailable as
+designed. This loaded R1 truth does not make the failed epoch clean or satisfy
+R2/Gate B.
 
 ### Composite correction review
 
@@ -324,15 +410,14 @@ services the periodic deadline only after applying any already-available queued
 record and supersedes obsolete flat-mode opportunities while protection is
 required; immediate protective processing remains event-driven.
 
-This establishes source-path correctness, not R4 readiness. The R1 source
-fingerprint change invalidates prior source-bound volume history and warm-start
-evidence. No admissible receipt yet proves exactly 2,016 completed five-minute
-bars in 16 ordered chunks, the two immediately preceding completed UTC hours,
-current DEC26 daily bias, or same-epoch Sim101 reconciliation and risk/ledger
-continuity for the new identity. Those artifacts must be acquired after the
-supported reload and revalidated at final closeout. This is a runtime evidence
-HOLD, not a blocker to sealing the mandatory-repairs-only `BASELINE_R` source
-identity.
+This establishes source-path correctness, not R4 readiness. The runtime did
+prove current Sim101 reconciliation, flat quantity, disarmed authority and zero
+orders, but the canonical host fault left the scheduler continuously protected:
+zero ordinary full periodic evaluations and increasing source age. No
+admissible receipt proves exactly 2,016 completed five-minute bars in 16 ordered
+chunks, the two immediately preceding completed UTC hours, or current DEC26
+daily bias for this source. This is a runtime FAIL/HOLD for the attempted epoch,
+not a reason to weaken eligibility or alter sealed Gate A evidence.
 
 ## Benchmark lock
 
@@ -369,25 +454,36 @@ identity.
   final intended source, identity and composite review remain `BASELINE_R`.
 - **Owner:** Sol coordinates; Caelum records acceptance decisions.
 
-### HOLD H2 — Runtime/native maintenance
+### HOLD H2 — Clean R2 initialization
 
-- **Evidence:** Gate A passes, but sealed `BASELINE_R` has no supported
-  receiver-first new-generation lifecycle receipt yet.
-- **Consequence:** no natural Gate-B proof may begin until the accepted R2
-  commissioning boundary passes. Formal capacity and rehearsal remain
-  prohibited.
-- **Release:** Sol rechecks the sealed source identity and intended diff, brings
-  listener and collector to
-  verified readiness, then uses the Windows operator notification for the one
-  genuine F5 compile/load action. The signed R2 receipt must pass before the new
-  epoch can seed a clean corpus or R4 context.
-- **Owner:** Sol.
+- **Evidence:** the receiver-first reload produced a distinct authenticated and
+  stable session/source/build/generation, but the signed commissioning receipt
+  is `verified=false`. Authentic record 149 / DEPTH sequence 144 is truthfully
+  unavailable because its Ask-position-11 Remove has unresolved identity; the
+  host instead latched `PONG_CANONICAL_DEPTH_MUTATION_NOT_IN_POST_BOOK`.
+  Receiver rejects increased by 2,381 between commissioning checkpoints.
+  The diagnostic then added producer overflow `+6335`, ended with source age
+  81.321 seconds, and final closeout recorded producer overflow `+45772`.
+- **Consequence:** no clean authoritative corpus exists. The 24.1676-second
+  fail-stop is not Gate B; Gates B–D remain unrun and prohibited.
+- **Release:** offline-replay the preserved record-149 seam through the host,
+  implement and independently test the smallest fail-closed consumer correction
+  that treats the explicit unresolved mutation as unavailable without analytics
+  until coherent recovery, and separately name and correct the producer
+  overflow/source-age cause. Re-enter Gate A delta/identity review for the new
+  cut, then obtain a wholly fresh R2 receipt with fault-free host state, stable
+  zero reject/loss deltas, exact availability truth and clean durable boundary.
+  An unchanged rerun is forbidden.
+- **Owner:** Sol coordinates/integrates and remains sole runtime operator;
+  implementation ownership is assigned by Sol.
 
 ### HOLD H3 — Qualification/readiness claim
 
-- **Evidence:** the last proof had producer loss, gaps, stale backlog, false
-  available partial depth, absent host receipts, no accepted periodic path, and
-  missing current-source context. The formal capacity series is absent.
+- **Evidence:** Gate A remains PASS and the loaded producer now truthfully marks
+  unresolved Remove identity unavailable, but R2 clean initialization failed as
+  described in H2. Gate B was not run; formal capacity and rehearsal are absent.
+  Safe flat/disarmed authority and narrow ledger/collector closeout do not
+  substitute for those gates.
 - **Consequence:** state remains `HOLD`; no valid qualification or paper-start
   time exists, and no readiness certificate can be reused.
 - **Release:** Gates A–D all pass on one frozen candidate with current identities,
@@ -399,10 +495,13 @@ Independent source review and focused offline work continue under all holds.
 
 ## Next single action
 
-Sol executes the accepted receiver-first commissioning workflow: preserve the
-old authenticated boundary, bring listener and collector to verified readiness,
-then use the Windows operator notification for the one genuine F5 compile/load
-action. Verify the distinct new signed session/source/build and both advancing
-zero-loss checkpoints before acquiring R4 context or declaring a clean corpus.
-Remain disarmed; no Gate-B window, capacity run, rehearsal or order action is
-authorized by this step.
+Return to a bounded offline corrective cut at the exact preserved boundary:
+replay authenticated journal record 149 / DEPTH source sequence 144 through the
+host and repair the consumer contract so
+`UNAVAILABLE / NATIVE_DEPTH_REMOVE_IDENTITY_UNRESOLVED` advances/preserves the
+truthful continuity boundary without demanding a resolved mutation, publishing
+analytics, or weakening exact 10x10. The same cut must separately isolate the
+producer-overflow/source-age cause before Sol considers another runtime epoch.
+After focused and affected tests, Caelum reviews the delta and identity; only
+then may Sol perform a fresh R2 commissioning. Gate B, capacity, rehearsal,
+arming and orders remain unauthorized.
