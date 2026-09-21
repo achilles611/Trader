@@ -111,9 +111,9 @@ class IndependentNativeDepthOracle:
         bids = self._prefix(self.bids, True)
         asks = self._prefix(self.asks, False)
         if not bids or not asks:
-            return Publication(False, "NATIVE_DEPTH_POSITION_ZERO_UNAVAILABLE", (), ())
+            return Publication(False, "NATIVE_DEPTH_POSITION_ZERO_UNAVAILABLE", bids, asks)
         if bids[0][0] >= asks[0][0]:
-            return Publication(False, "CROSSED_NATIVE_POSITIONAL_SNAPSHOT", (), ())
+            return Publication(False, "CROSSED_NATIVE_POSITIONAL_SNAPSHOT", bids, asks)
         return Publication(True, None, bids, asks)
 
 
@@ -190,6 +190,7 @@ public sealed class ProductionDepthHarness
     private readonly SortedDictionary<int, KeyValuePair<double, long>> nativeDepthWorkingBookAsks =
         new SortedDictionary<int, KeyValuePair<double, long>>();
     private bool depthContinuityBroken;
+    private bool depthPositionDisclosurePending;
 
     public void Seed(string sideName, string encoded)
     {
@@ -220,13 +221,22 @@ public sealed class ProductionDepthHarness
         string asks;
         double bestBid;
         double bestAsk;
+        double resolvedPrice;
+        string bidPositions;
+        string askPositions;
+        bool positionCursorDisclosed;
         string reason;
         bool available = TryApplyDepthMutation(
-            mutation, out bids, out asks, out bestBid, out bestAsk, out reason);
+            mutation, out bids, out asks, out bidPositions, out askPositions,
+            out bestBid, out bestAsk, out resolvedPrice,
+            out positionCursorDisclosed, out reason);
         return (available ? "1" : "0") + "\t" + (reason ?? "")
             + "\t" + bids + "\t" + asks
             + "\t" + EncodeWorking(nativeDepthWorkingBookBids)
-            + "\t" + EncodeWorking(nativeDepthWorkingBookAsks);
+            + "\t" + EncodeWorking(nativeDepthWorkingBookAsks)
+            + "\t" + (positionCursorDisclosed ? "1" : "0")
+            + "\t" + bidPositions + "\t" + askPositions
+            + "\t" + resolvedPrice.ToString("R", CultureInfo.InvariantCulture);
     }
 
     private static string EncodeWorking(
@@ -311,6 +321,13 @@ def decode_working(encoded: str) -> dict[int, Level]:
         position, price, volume = row.split(":")
         result[int(position)] = (Decimal(price), int(volume))
     return result
+
+
+def decode_positions(encoded: str) -> dict[int, Level]:
+    return {
+        int(row["position"]): (Decimal(str(row["price"])), int(row["size"]))
+        for row in json.loads(encoded)
+    }
 
 
 CAPTURED_BID_SEAMS = (
@@ -556,7 +573,7 @@ class NativeDepthCursorReplayTests(unittest.TestCase):
             for mutation, output in zip(mutations, output_rows[2:], strict=True):
                 expected = oracle.apply(mutation)
                 fields = output.split("\t")
-                self.assertEqual(len(fields), 6, (case["journal"], mutation, output))
+                self.assertEqual(len(fields), 10, (case["journal"], mutation, output))
                 actual = Publication(
                     fields[0] == "1", fields[1] or None,
                     decode_levels(fields[2]), decode_levels(fields[3]),
@@ -570,6 +587,20 @@ class NativeDepthCursorReplayTests(unittest.TestCase):
                     decode_working(fields[5]), oracle.asks,
                     (case["journal"], mutation.sequence, "asks"),
                 )
+                disclosed = fields[6] == "1"
+                expected_disclosure = (
+                    not expected.available
+                    or len(expected.bids) < 10
+                    or len(expected.asks) < 10
+                    or mutation is mutations[-1]
+                )
+                self.assertEqual(
+                    disclosed, expected_disclosure,
+                    (case["journal"], mutation.sequence, "disclosure"),
+                )
+                if disclosed:
+                    self.assertEqual(decode_positions(fields[7]), oracle.bids)
+                    self.assertEqual(decode_positions(fields[8]), oracle.asks)
                 publications.append(actual)
 
             self.assertTrue(publications[0].available, case["journal"])
@@ -582,6 +613,32 @@ class NativeDepthCursorReplayTests(unittest.TestCase):
                 case["recovered_journal"] - case["journal"],
                 case["recovered_source"] - case["cross_sequence"],
             )
+
+    def test_disclosure_covers_seam_reconciliation_once_and_resolves_remove_price(self) -> None:
+        bids = levels(*((str(100 - Decimal(index) / 4), index + 1) for index in range(10)))
+        asks = levels(*((str(Decimal("100.25") + Decimal(index) / 4), index + 1) for index in range(10)))
+        mutations = (
+            Mutation(1, "Add", "Bid", 0, Decimal("100.25"), 7),
+            Mutation(2, "Remove", "Bid", 0, Decimal("0"), 0),
+            Mutation(3, "Update", "Bid", 0, Decimal("100"), 9),
+        )
+        executed = subprocess.run(
+            [str(self._harness)],
+            input="\n".join((
+                "SEED\tBid\t" + encode_seed(bids),
+                "SEED\tAsk\t" + encode_seed(asks),
+                *(encode_mutation(item) for item in mutations),
+            )) + "\n",
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(executed.returncode, 0, executed.stderr)
+        rows = [line.split("\t") for line in executed.stdout.splitlines()[2:]]
+        self.assertEqual([row[6] for row in rows], ["1", "1", "0"])
+        self.assertEqual(Decimal(rows[1][9]), Decimal("100.25"))
+        self.assertEqual(decode_positions(rows[0][7])[0], (Decimal("100.25"), 7))
+        self.assertEqual(decode_positions(rows[1][7]), decode_working(rows[1][4]))
 
     def test_ask_side_mirror_never_reuses_pre_cross_cursor(self) -> None:
         initial_bids = levels(("100", 5), ("99.75", 4), ("99.5", 3))

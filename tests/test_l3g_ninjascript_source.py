@@ -1770,10 +1770,14 @@ class NinjaScriptSourceTests(unittest.TestCase):
             "mutation_side",
             "mutation_position",
             "mutation_price",
+            "mutation_resolved_price",
             "mutation_volume",
             "mutation_is_reset",
         ):
             self.assertIn(field, automatic_unavailable)
+        self.assertIn('(String.IsNullOrEmpty(bidLevels) ? "[]" : bidLevels)', automatic_unavailable)
+        self.assertIn('(String.IsNullOrEmpty(askLevels) ? "[]" : askLevels)', automatic_unavailable)
+        self.assertIn("snapshot_ordering", automatic_unavailable)
         self.assertNotIn("private const int MaximumQueuedFrames = 20000;", addon)
         self.assertIn("bidAtTrade < askAtTrade", source)
         self.assertIn("bestBid < bestAsk", source)

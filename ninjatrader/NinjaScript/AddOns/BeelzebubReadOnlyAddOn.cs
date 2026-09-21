@@ -719,6 +719,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private readonly SortedDictionary<int, KeyValuePair<double, long>> nativeDepthWorkingBookAsks =
             new SortedDictionary<int, KeyValuePair<double, long>>();
         private bool depthContinuityBroken;
+        private bool depthPositionDisclosurePending;
         private readonly long startedTicks = System.Diagnostics.Stopwatch.GetTimestamp();
         private long lastMarketCallbackTicks;
         private bool subscribed;
@@ -1189,27 +1190,47 @@ namespace NinjaTrader.NinjaScript.AddOns
                 long sourceEventSequence = BeelzebubMarketPublisherLease.Next("DEPTH");
                 string bidLevels;
                 string askLevels;
+                string bidPositions;
+                string askPositions;
                 double bestNativeBid;
                 double bestNativeAsk;
+                double resolvedMutationPrice;
+                bool positionStateDisclosed;
                 string snapshotFailure;
                 if (!TryApplyDepthMutation(
                     e,
-                    out bidLevels, out askLevels, out bestNativeBid,
-                    out bestNativeAsk, out snapshotFailure))
+                    out bidLevels, out askLevels, out bidPositions,
+                    out askPositions, out bestNativeBid,
+                    out bestNativeAsk, out resolvedMutationPrice,
+                    out positionStateDisclosed,
+                    out snapshotFailure))
                 {
-                    PublishDepthUnavailable(snapshotFailure, sourceEventSequence, e.Time, e);
+                    PublishDepthUnavailable(
+                        snapshotFailure, sourceEventSequence, e.Time, e,
+                        bidLevels, askLevels, bidPositions, askPositions,
+                        resolvedMutationPrice, positionStateDisclosed);
                     return;
                 }
                 if (FinitePositive(bestNativeBid) && FinitePositive(bestNativeAsk) && bestNativeBid >= bestNativeAsk)
                 {
-                    PublishDepthUnavailable("CROSSED_NATIVE_POSITIONAL_SNAPSHOT", sourceEventSequence, e.Time, e);
+                    PublishDepthUnavailable(
+                        "CROSSED_NATIVE_POSITIONAL_SNAPSHOT", sourceEventSequence,
+                        e.Time, e, bidLevels, askLevels, bidPositions,
+                        askPositions, resolvedMutationPrice,
+                        positionStateDisclosed);
                     return;
                 }
                 payload = "{\"contract_id\":\"" + instrument.FullName + "\",\"bids\":" + bidLevels
-                    + ",\"asks\":" + askLevels + ",\"operation\":\"" + e.Operation
+                    + ",\"asks\":" + askLevels
+                    + (positionStateDisclosed
+                        ? ",\"position_bids\":" + bidPositions + ",\"position_asks\":" + askPositions
+                        : "")
+                    + ",\"operation\":\"" + e.Operation
                     + "\",\"side\":\"" + e.MarketDataType + "\",\"mutation_price\":"
                     + e.Price.ToString(CultureInfo.InvariantCulture) + ",\"mutation_volume\":" + e.Volume
                     + ",\"mutation_position\":" + e.Position
+                    + ",\"mutation_resolved_price\":" + (FinitePositive(resolvedMutationPrice)
+                        ? resolvedMutationPrice.ToString(CultureInfo.InvariantCulture) : "null")
                     + ",\"is_reset\":" + (e.IsReset ? "true" : "false")
                     + ",\"snapshot_ordering\":\"NATIVE_POSITIONAL_BEST_TO_WORST_V1\""
                     + ",\"source_event_sequence\":" + sourceEventSequence
@@ -1236,13 +1257,20 @@ namespace NinjaTrader.NinjaScript.AddOns
         private bool TryApplyDepthMutation(
             MarketDepthEventArgs update,
             out string bidLevels, out string askLevels,
+            out string bidPositions, out string askPositions,
             out double bestNativeBid, out double bestNativeAsk,
+            out double resolvedMutationPrice,
+            out bool positionStateDisclosed,
             out string failureReason)
         {
             bidLevels = "[]";
             askLevels = "[]";
+            bidPositions = "[]";
+            askPositions = "[]";
             bestNativeBid = Double.NaN;
             bestNativeAsk = Double.NaN;
+            resolvedMutationPrice = Double.NaN;
+            positionStateDisclosed = false;
             failureReason = null;
             if (update == null)
             {
@@ -1288,6 +1316,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 {
                     ShiftKnownPositions(side, update.Position, true);
                     side[update.Position] = new KeyValuePair<double, long>(update.Price, update.Volume);
+                    resolvedMutationPrice = update.Price;
                     applied = true;
                 }
             }
@@ -1296,6 +1325,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 if (validPrice && update.Volume > 0 && update.Position >= 0)
                 {
                     side[update.Position] = new KeyValuePair<double, long>(update.Price, update.Volume);
+                    resolvedMutationPrice = update.Price;
                     applied = true;
                 }
             }
@@ -1303,6 +1333,10 @@ namespace NinjaTrader.NinjaScript.AddOns
             {
                 if (update.Position >= 0)
                 {
+                    KeyValuePair<double, long> removed;
+                    if (side.TryGetValue(update.Position, out removed)
+                        && FinitePositive(removed.Key))
+                        resolvedMutationPrice = removed.Key;
                     side.Remove(update.Position);
                     ShiftKnownPositions(side, update.Position, false);
                     applied = true;
@@ -1323,8 +1357,20 @@ namespace NinjaTrader.NinjaScript.AddOns
             CommitNativeDepthWorkingState(candidateBids, candidateAsks);
             List<KeyValuePair<double, long>> bidPrefix = DepthPrefix(candidateBids, true);
             List<KeyValuePair<double, long>> askPrefix = DepthPrefix(candidateAsks, false);
+            List<string> bidRows = bidPrefix
+                .Select(row => "{\"price\":" + row.Key.ToString(CultureInfo.InvariantCulture)
+                    + ",\"size\":" + row.Value + "}").ToList();
+            List<string> askRows = askPrefix
+                .Select(row => "{\"price\":" + row.Key.ToString(CultureInfo.InvariantCulture)
+                    + ",\"size\":" + row.Value + "}").ToList();
+            bidLevels = "[" + String.Join(",", bidRows) + "]";
+            askLevels = "[" + String.Join(",", askRows) + "]";
             if (bidPrefix.Count == 0 || askPrefix.Count == 0)
             {
+                positionStateDisclosed = true;
+                depthPositionDisclosurePending = true;
+                bidPositions = DepthPositions(candidateBids);
+                askPositions = DepthPositions(candidateAsks);
                 failureReason = "NATIVE_DEPTH_POSITION_ZERO_UNAVAILABLE";
                 return false;
             }
@@ -1335,17 +1381,28 @@ namespace NinjaTrader.NinjaScript.AddOns
                 // The working cursor already contains this authentic
                 // transition. Withhold it from available publication while
                 // retaining it as the base for the next positional callback.
+                positionStateDisclosed = true;
+                depthPositionDisclosurePending = true;
+                bidPositions = DepthPositions(candidateBids);
+                askPositions = DepthPositions(candidateAsks);
                 failureReason = "CROSSED_NATIVE_POSITIONAL_SNAPSHOT";
                 return false;
             }
-            List<string> bidRows = bidPrefix
-                .Select(row => "{\"price\":" + row.Key.ToString(CultureInfo.InvariantCulture)
-                    + ",\"size\":" + row.Value + "}").ToList();
-            List<string> askRows = askPrefix
-                .Select(row => "{\"price\":" + row.Key.ToString(CultureInfo.InvariantCulture)
-                    + ",\"size\":" + row.Value + "}").ToList();
-            bidLevels = "[" + String.Join(",", bidRows) + "]";
-            askLevels = "[" + String.Join(",", askRows) + "]";
+            if (bidPrefix.Count < MaximumPublishedBookLevelsPerSide
+                || askPrefix.Count < MaximumPublishedBookLevelsPerSide)
+            {
+                positionStateDisclosed = true;
+                depthPositionDisclosurePending = true;
+                bidPositions = DepthPositions(candidateBids);
+                askPositions = DepthPositions(candidateAsks);
+            }
+            else if (depthPositionDisclosurePending)
+            {
+                positionStateDisclosed = true;
+                depthPositionDisclosurePending = false;
+                bidPositions = DepthPositions(candidateBids);
+                askPositions = DepthPositions(candidateAsks);
+            }
             return true;
         }
 
@@ -1359,6 +1416,17 @@ namespace NinjaTrader.NinjaScript.AddOns
             nativeDepthWorkingBookAsks.Clear();
             foreach (KeyValuePair<int, KeyValuePair<double, long>> row in candidateAsks)
                 nativeDepthWorkingBookAsks[row.Key] = row.Value;
+        }
+
+        private static string DepthPositions(
+            SortedDictionary<int, KeyValuePair<double, long>> levels)
+        {
+            List<string> rows = levels.Select(row =>
+                "{\"position\":" + row.Key.ToString(CultureInfo.InvariantCulture)
+                + ",\"price\":" + row.Value.Key.ToString(CultureInfo.InvariantCulture)
+                + ",\"size\":" + row.Value.Value.ToString(CultureInfo.InvariantCulture)
+                + "}").ToList();
+            return "[" + String.Join(",", rows) + "]";
         }
 
         private static void ShiftKnownPositions(
@@ -1411,7 +1479,9 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void PublishDepthUnavailable(
             string reason, long sourceEventSequence, DateTime providerTime,
-            MarketDepthEventArgs mutation)
+            MarketDepthEventArgs mutation, string bidLevels, string askLevels,
+            string bidPositions, string askPositions,
+            double resolvedMutationPrice, bool positionStateDisclosed)
         {
             // This is still one authentic depth mutation. Keep it on the
             // sequenced DEPTH stream so the consumer can distinguish explicit
@@ -1420,15 +1490,25 @@ namespace NinjaTrader.NinjaScript.AddOns
             string mutationPrice = mutation == null
                 || Double.IsNaN(mutation.Price) || Double.IsInfinity(mutation.Price)
                 ? "null" : mutation.Price.ToString(CultureInfo.InvariantCulture);
+            string resolvedPrice = FinitePositive(resolvedMutationPrice)
+                ? resolvedMutationPrice.ToString(CultureInfo.InvariantCulture) : "null";
             BeelzebubReadOnlyOutbound.Publish("DEPTH", null, null,
                 "{\"status\":\"UNAVAILABLE\",\"reason\":\"" + reason
-                + "\",\"contract_id\":\"" + instrument.FullName + "\",\"bids\":[],\"asks\":[]"
+                + "\",\"contract_id\":\"" + instrument.FullName + "\",\"bids\":"
+                + (String.IsNullOrEmpty(bidLevels) ? "[]" : bidLevels) + ",\"asks\":"
+                + (String.IsNullOrEmpty(askLevels) ? "[]" : askLevels)
+                + (positionStateDisclosed
+                    ? ",\"position_bids\":" + (String.IsNullOrEmpty(bidPositions) ? "[]" : bidPositions)
+                        + ",\"position_asks\":" + (String.IsNullOrEmpty(askPositions) ? "[]" : askPositions)
+                    : "")
                 + ",\"mutation_operation\":" + (mutation == null ? "null" : "\"" + mutation.Operation + "\"")
                 + ",\"mutation_side\":" + (mutation == null ? "null" : "\"" + mutation.MarketDataType + "\"")
                 + ",\"mutation_position\":" + (mutation == null ? "null" : mutation.Position.ToString(CultureInfo.InvariantCulture))
                 + ",\"mutation_price\":" + mutationPrice
+                + ",\"mutation_resolved_price\":" + resolvedPrice
                 + ",\"mutation_volume\":" + (mutation == null ? "null" : mutation.Volume.ToString(CultureInfo.InvariantCulture))
                 + ",\"mutation_is_reset\":" + (mutation == null ? "null" : (mutation.IsReset ? "true" : "false"))
+                + ",\"snapshot_ordering\":\"NATIVE_POSITIONAL_BEST_TO_WORST_V1\""
                 + ",\"source_event_sequence\":" + sourceEventSequence
                 + ",\"publication_policy\":\"" + DepthPublicationPolicy + "\"}", providerTime);
         }
@@ -1554,7 +1634,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string AttestedSchema = "lane-iii-phase-f3-ninjatrader-observation-v2";
         private const string AttestationProtocol = "l3f3-ninjatrader-observer-attestation-v1";
         private const string AttestationKeyContext = "BEELZEBUB_NINJATRADER_OBSERVATION_V2";
-        private const string ProducerSourceFingerprint = "89952a9a476d4b9c8336dfca76d868b63c3222ff7abcceb7686553dc8bd0e716";
+        private const string ProducerSourceFingerprint = "179461968b31942f8becb3661a2f69be6025253448489821c93a9bc4513aeede";
         // Event-driven trades/depth require burst capacity, but memory remains
         // bounded. A full queue drops the signed frame after assigning its
         // sequence; the next source_event_sequence exposes the gap.

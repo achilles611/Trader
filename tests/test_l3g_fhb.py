@@ -60,6 +60,19 @@ def levels(start: Decimal, count: int, step: Decimal) -> list[dict[str, object]]
     ]
 
 
+def positions(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [
+        {"position": index, "price": row["price"], "size": row["size"]}
+        for index, row in enumerate(rows)
+    ]
+
+
+def with_positions(value: dict[str, object]) -> dict[str, object]:
+    value["position_bids"] = positions(value["bids"])  # type: ignore[arg-type]
+    value["position_asks"] = positions(value["asks"])  # type: ignore[arg-type]
+    return value
+
+
 def payload(
     *,
     sequence: int,
@@ -318,8 +331,306 @@ class FocusedHorizonBandTests(unittest.TestCase):
         self.assertTrue(rejected.clear_feature_windows)
         self.assertEqual(
             self.fhb.status()["unavailable_reason"],
-            "FHB_SIGNED_CORE_INCOMPLETE",
+            "FHB_POSITION_CURSOR_REQUIRED_FOR_INCOMPLETE_CORE",
         )
+
+    def test_dense_prefix_seams_are_rejected_without_sparse_position_contract(self) -> None:
+        self.fhb.process_depth(payload(sequence=1), event(1, self.start))
+        warmed_at = self.start + timedelta(seconds=5)
+        self.assertIs(
+            self.fhb.process_depth(payload(sequence=2), event(2, warmed_at)).action,
+            FHBAction.EVALUATE,
+        )
+        resets_before = self.fhb.status()["reset_count"]
+
+        crossed_remove = payload(
+            sequence=3,
+            operation="Remove",
+            mutation_price="0",
+            mutation_volume=0,
+            bids=[],
+            asks=[],
+        )
+        crossed_remove["status"] = "UNAVAILABLE"
+        crossed_remove["reason"] = "CROSSED_NATIVE_POSITIONAL_SNAPSHOT"
+        crossed_remove["bids"] = []
+        crossed_remove["asks"] = []
+        first = self.fhb.process_depth(
+            crossed_remove,
+            event(3, warmed_at + timedelta(milliseconds=1)),
+        )
+        self.assertIs(first.action, FHBAction.REWARM_REQUIRED)
+        self.assertTrue(first.clear_feature_windows)
+        self.assertFalse(self.fhb.status()["coherence_pending"])
+        self.assertEqual(len(self.fhb.status()["signed_core_ticks"]["BID"]), 0)
+        self.assertFalse(self.fhb.entry_ready)
+
+        crossed_add = payload(sequence=4, operation="Add", bids=[], asks=[])
+        crossed_add["status"] = "UNAVAILABLE"
+        crossed_add["reason"] = "CROSSED_NATIVE_POSITIONAL_SNAPSHOT"
+        crossed_add["bids"] = []
+        crossed_add["asks"] = []
+        second = self.fhb.process_depth(
+            crossed_add,
+            event(4, warmed_at + timedelta(milliseconds=2)),
+        )
+        self.assertIs(second.action, FHBAction.REWARM_REQUIRED)
+        self.assertEqual(len(self.fhb.status()["signed_core_ticks"]["BID"]), 0)
+
+        partial_asks = levels(Decimal("100.50"), 9, Decimal("0.25"))
+        partial_remove = payload(
+            sequence=5,
+            side="Ask",
+            operation="Remove",
+            mutation_price="0",
+            mutation_volume=0,
+            asks=partial_asks,
+        )
+        third = self.fhb.process_depth(
+            partial_remove,
+            event(5, warmed_at + timedelta(milliseconds=3)),
+        )
+        self.assertIs(third.action, FHBAction.REWARM_REQUIRED)
+        self.assertEqual(len(self.fhb.status()["signed_core_ticks"]["ASK"]), 0)
+
+        reconciled = self.fhb.process_depth(
+            payload(sequence=6, side="Ask", operation="Add", mutation_price="100.25"),
+            event(6, warmed_at + timedelta(milliseconds=4)),
+        )
+        status = self.fhb.status()
+        self.assertIs(reconciled.action, FHBAction.REWARM_REQUIRED)
+        self.assertFalse(status["entry_ready"])
+        self.assertFalse(status["coherence_pending"])
+        self.assertEqual(status["crossed_unavailable_records"], 0)
+        self.assertEqual(status["partial_signed_records"], 0)
+        self.assertEqual(status["coherence_reconciliations"], 0)
+        self.assertEqual(status["coherence_reconciliation_failures"], 0)
+        self.assertGreater(status["reset_count"], resets_before)
+
+    def test_positional_seam_ambiguity_invalidates_fail_closed(self) -> None:
+        self.fhb.process_depth(payload(sequence=1), event(1, self.start))
+        ambiguous = payload(
+            sequence=2,
+            operation="Add",
+            mutation_price="90.00",
+            bids=[],
+            asks=[],
+        )
+        ambiguous["mutation_position"] = 12
+        ambiguous["status"] = "UNAVAILABLE"
+        ambiguous["reason"] = "CROSSED_NATIVE_POSITIONAL_SNAPSHOT"
+        ambiguous["bids"] = []
+        ambiguous["asks"] = []
+        refused = self.fhb.process_depth(
+            ambiguous,
+            event(2, self.start + timedelta(milliseconds=1)),
+        )
+        self.assertIs(refused.action, FHBAction.REWARM_REQUIRED)
+        status = self.fhb.status()
+        self.assertFalse(status["coherence_pending"])
+        self.assertEqual(
+            status["unavailable_reason"],
+            "FHB_SOURCE_UNAVAILABLE:CROSSED_NATIVE_POSITIONAL_SNAPSHOT",
+        )
+        self.assertEqual(status["signed_core_ticks"], {"BID": [], "ASK": []})
+
+    def test_signed_working_prefix_recovers_without_treating_cross_as_available(self) -> None:
+        self.fhb.process_depth(with_positions(payload(sequence=1)), event(1, self.start))
+        warmed_at = self.start + timedelta(seconds=5)
+        self.fhb.process_depth(with_positions(payload(sequence=2)), event(2, warmed_at))
+        crossed = payload(
+            sequence=3,
+            operation="Add",
+            mutation_price="100.25",
+            mutation_volume=2,
+            bids=[
+                {"price": "100.25", "size": 2},
+                *levels(Decimal("100.00"), 9, Decimal("-0.25")),
+            ],
+        )
+        crossed.update({
+            "status": "UNAVAILABLE",
+            "reason": "CROSSED_NATIVE_POSITIONAL_SNAPSHOT",
+            "mutation_resolved_price": "100.25",
+        })
+        prior_bids = positions(levels(Decimal("100.00"), 10, Decimal("-0.25")))
+        crossed["position_bids"] = [
+            {"position": 0, "price": "100.25", "size": 2},
+            *[
+                {**row, "position": int(row["position"]) + 1}
+                for row in prior_bids
+            ],
+        ]
+        crossed["position_asks"] = positions(crossed["asks"])  # type: ignore[arg-type]
+        held = self.fhb.process_depth(
+            crossed,
+            event(3, warmed_at + timedelta(milliseconds=1)),
+        )
+        self.assertIs(held.action, FHBAction.REWARM_REQUIRED)
+        self.assertFalse(self.fhb.entry_ready)
+        self.assertTrue(self.fhb.status()["coherence_pending"])
+        self.assertEqual(
+            self.fhb.status()["signed_core_ticks"]["BID"][0], 401,
+        )
+
+        recovered = with_positions(payload(
+            sequence=4,
+            operation="Remove",
+            mutation_price="0",
+            mutation_volume=0,
+        ))
+        recovered["mutation_resolved_price"] = "100.25"
+        decision = self.fhb.process_depth(
+            recovered,
+            event(4, warmed_at + timedelta(milliseconds=2)),
+        )
+        status = self.fhb.status()
+        self.assertIs(decision.action, FHBAction.EVALUATE)
+        self.assertTrue(decision.clear_feature_windows)
+        self.assertFalse(status["coherence_pending"])
+        self.assertEqual(status["coherence_reconciliations"], 1)
+        self.assertEqual(status["reset_count"], 0)
+
+        ordinary_bid = payload(sequence=5, mutation_volume=4)
+        ordinary_bid["bids"][0]["size"] = 4  # type: ignore[index]
+        self.fhb.process_depth(
+            ordinary_bid,
+            event(5, warmed_at + timedelta(milliseconds=3)),
+        )
+        ordinary_ask = payload(
+            sequence=6,
+            side="Ask",
+            mutation_price="100.25",
+            mutation_volume=5,
+        )
+        ordinary_ask["bids"][0]["size"] = 4  # type: ignore[index]
+        ordinary_ask["asks"][0]["size"] = 5  # type: ignore[index]
+        self.fhb.process_depth(
+            ordinary_ask,
+            event(6, warmed_at + timedelta(milliseconds=4)),
+        )
+
+        prior_bid_rows = levels(Decimal("100.00"), 10, Decimal("-0.25"))
+        prior_bid_rows[0]["size"] = 4
+        second_cross = payload(
+            sequence=7,
+            operation="Add",
+            mutation_price="100.25",
+            mutation_volume=2,
+            bids=[
+                {"price": "100.25", "size": 2},
+                *prior_bid_rows[:9],
+            ],
+        )
+        second_cross.update({
+            "status": "UNAVAILABLE",
+            "reason": "CROSSED_NATIVE_POSITIONAL_SNAPSHOT",
+            "mutation_resolved_price": "100.25",
+        })
+        prior = positions(prior_bid_rows)
+        second_cross["position_bids"] = [
+            {"position": 0, "price": "100.25", "size": 2},
+            *[
+                {**row, "position": int(row["position"]) + 1}
+                for row in prior
+            ],
+        ]
+        second_cross["position_asks"] = positions(second_cross["asks"])  # type: ignore[arg-type]
+        second_cross["position_asks"][0]["size"] = 5  # type: ignore[index]
+        second_cross["asks"][0]["size"] = 5  # type: ignore[index]
+        held_again = self.fhb.process_depth(
+            second_cross,
+            event(7, warmed_at + timedelta(milliseconds=5)),
+        )
+        second_status = self.fhb.status()
+        self.assertIs(held_again.action, FHBAction.REWARM_REQUIRED)
+        self.assertTrue(second_status["coherence_pending"])
+        self.assertEqual(second_status["crossed_unavailable_records"], 2)
+        self.assertEqual(second_status["coherence_reconciliation_failures"], 0)
+
+    def test_sparse_authentic_rebuild_shape_keeps_hidden_positions_exact(self) -> None:
+        bid_rows = levels(Decimal("100.00"), 10, Decimal("-0.25"))
+        ask_rows = levels(Decimal("100.25"), 11, Decimal("0.25"))
+
+        def signed(
+            sequence: int,
+            current_asks: list[dict[str, object]],
+            *,
+            operation: str,
+            position: int,
+            price: str,
+            volume: int,
+        ) -> dict[str, object]:
+            ask_prefix: list[dict[str, object]] = []
+            for row in current_asks[:10]:
+                if ask_prefix and Decimal(str(ask_prefix[-1]["price"])) >= Decimal(str(row["price"])):
+                    break
+                ask_prefix.append(dict(row))
+            value = payload(
+                sequence=sequence,
+                side="Ask",
+                operation=operation,
+                mutation_price=price,
+                mutation_volume=volume,
+                bids=bid_rows,
+                asks=ask_prefix,
+            )
+            value["mutation_position"] = position
+            value["mutation_resolved_price"] = price
+            value["position_bids"] = positions(bid_rows)
+            value["position_asks"] = positions(current_asks)
+            return value
+
+        initial = with_positions(payload(sequence=1, bids=bid_rows, asks=ask_rows[:10]))
+        initial["position_asks"] = positions(ask_rows)
+        self.fhb.process_depth(initial, event(1, self.start))
+        warm = with_positions(payload(sequence=2, bids=bid_rows, asks=ask_rows[:10]))
+        warm["position_asks"] = positions(ask_rows)
+        self.fhb.process_depth(warm, event(2, self.start + timedelta(seconds=5)))
+        resets_before = self.fhb.status()["reset_count"]
+
+        after_remove = [dict(row) for row in ask_rows[1:]]
+        coherent_remove = signed(
+            3, after_remove, operation="Remove", position=0,
+            price="100.25", volume=0,
+        )
+        self.fhb.process_depth(
+            coherent_remove,
+            event(3, self.start + timedelta(seconds=5, milliseconds=1)),
+        )
+
+        after_duplicate_add = [
+            *after_remove[:2],
+            {"price": "100.75", "size": 7},
+            *after_remove[2:],
+        ]
+        partial_two = signed(
+            4, after_duplicate_add, operation="Add", position=2,
+            price="100.75", volume=7,
+        )
+        held_two = self.fhb.process_depth(
+            partial_two,
+            event(4, self.start + timedelta(seconds=5, milliseconds=2)),
+        )
+        self.assertIs(held_two.action, FHBAction.REWARM_REQUIRED)
+        self.assertEqual(len(self.fhb.status()["signed_core_ticks"]["ASK"]), 2)
+
+        after_front_remove = [dict(row) for row in after_duplicate_add[1:]]
+        partial_one = signed(
+            5, after_front_remove, operation="Remove", position=0,
+            price="100.50", volume=0,
+        )
+        held_one = self.fhb.process_depth(
+            partial_one,
+            event(5, self.start + timedelta(seconds=5, milliseconds=3)),
+        )
+        self.assertIs(held_one.action, FHBAction.REWARM_REQUIRED)
+        status = self.fhb.status()
+        self.assertTrue(status["coherence_pending"])
+        self.assertEqual(len(status["signed_core_ticks"]["ASK"]), 1)
+        self.assertEqual(status["partial_signed_records"], 2)
+        self.assertEqual(status["coherence_reconciliation_failures"], 0)
+        self.assertEqual(status["reset_count"], resets_before)
 
     def test_zero_price_positional_remove_uses_coherent_prior_core_identity(self) -> None:
         self.fhb.process_depth(

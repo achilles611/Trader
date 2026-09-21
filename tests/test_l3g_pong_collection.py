@@ -21,7 +21,14 @@ def wire(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def record(kind: str, payload: dict[str, object], sequence: int, observed: datetime) -> NinjaTraderObservation:
+def record(
+    kind: str,
+    payload: dict[str, object],
+    sequence: int,
+    observed: datetime,
+    *,
+    session_id: str = "native-test-session",
+) -> NinjaTraderObservation:
     producer = NinjaTraderProducerAttestation(
         protocol_version=NINJATRADER_ATTESTATION_PROTOCOL,
         source_fingerprint=EXPECTED_OBSERVER_SOURCE_FINGERPRINT,
@@ -32,7 +39,7 @@ def record(kind: str, payload: dict[str, object], sequence: int, observed: datet
     )
     return NinjaTraderObservation(
         observation_id=f"native-{kind}-{sequence}",
-        session_id="native-test-session",
+        session_id=session_id,
         observation_type=kind,
         ninja_receipt_time=wire(observed),
         local_monotonic_sequence=sequence,
@@ -67,8 +74,119 @@ class PongAuthenticHourCollectorTests(unittest.TestCase):
             self.assertIn("SOURCE_GENERATION_CHANGED", state["required_interval"]["blockers"])
             self.assertEqual(state["required_interval"]["streams"]["TRADE"]["duplicate_or_out_of_order"], 0)
             self.assertEqual(state["durability"]["producer_queue_overflow_records"], 3)
+            self.assertEqual(state["durability"]["producer_queue_overflow_baseline"], 3)
+            self.assertEqual(state["durability"]["producer_queue_overflow_delta"], 0)
             self.assertEqual(state["durability"]["producer_transport_failed_records"], 7)
+            self.assertEqual(state["durability"]["producer_transport_failed_baseline"], 7)
+            self.assertEqual(state["durability"]["producer_transport_failed_delta"], 0)
             self.assertEqual(state["durability"]["queue_overflow_records"], 0)
+
+    def test_producer_counters_use_same_session_baseline_and_fail_on_delta_or_regression(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            now = datetime(2026, 9, 14, 14, 55, tzinfo=timezone.utc)
+            collector = PongAuthenticHourCollector(Path(directory), now=now)
+            at = now.replace(hour=15, minute=1)
+            base = {
+                "contract_id": "MNQ SEP26",
+                "price": 100,
+                "size": 1,
+                "aggressor_side": "UNKNOWN",
+                "aggressor_source": "UNKNOWN",
+                "publication_policy": "EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1",
+                "source_generation": 1,
+            }
+            with patch("src.l3g_paper.pong_collection._utc_now", return_value=at):
+                collector._apply_observation_locked(record(
+                    "TRADE",
+                    dict(base, source_event_sequence=1,
+                         observer_queue_overflow_frames=13,
+                         observer_transport_failed_frames=21),
+                    1,
+                    at,
+                ))
+                collector._apply_observation_locked(record(
+                    "TRADE",
+                    dict(base, source_event_sequence=2,
+                         observer_queue_overflow_frames=13,
+                         observer_transport_failed_frames=21),
+                    2,
+                    at + timedelta(milliseconds=1),
+                ))
+                stable = collector.status()
+                self.assertNotIn(
+                    "PRODUCER_TRANSPORT_FAILED",
+                    stable["required_interval"]["blockers"],
+                )
+                self.assertEqual(
+                    stable["durability"]["producer_transport_failed_delta"], 0,
+                )
+
+                collector._apply_observation_locked(record(
+                    "TRADE",
+                    dict(base, source_event_sequence=3,
+                         observer_queue_overflow_frames=14,
+                         observer_transport_failed_frames=22),
+                    3,
+                    at + timedelta(milliseconds=2),
+                ))
+                increased = collector.status()
+                self.assertIn(
+                    "PRODUCER_TRANSPORT_FAILED",
+                    increased["required_interval"]["blockers"],
+                )
+                self.assertEqual(
+                    increased["durability"]["producer_transport_failed_delta"], 1,
+                )
+                self.assertEqual(
+                    increased["durability"]["producer_queue_overflow_delta"], 1,
+                )
+
+                collector._apply_observation_locked(record(
+                    "TRADE",
+                    dict(base, source_event_sequence=4,
+                         observer_queue_overflow_frames=12,
+                         observer_transport_failed_frames=22),
+                    4,
+                    at + timedelta(milliseconds=3),
+                ))
+                regressed = collector.status()
+                self.assertIn(
+                    "PRODUCER_COUNTER_REGRESSION",
+                    regressed["required_interval"]["blockers"],
+                )
+
+                collector._apply_observation_locked(record(
+                    "TRADE",
+                    dict(base, source_event_sequence=1,
+                         observer_queue_overflow_frames=40,
+                         observer_transport_failed_frames=60),
+                    5,
+                    at + timedelta(milliseconds=4),
+                    session_id="replacement-native-session",
+                ))
+                replaced = collector.status()
+                self.assertIn(
+                    "PRODUCER_IDENTITY_CHANGED",
+                    replaced["required_interval"]["blockers"],
+                )
+                self.assertEqual(
+                    replaced["durability"]["producer_queue_overflow_baseline"], 40,
+                )
+                self.assertEqual(
+                    replaced["durability"]["producer_queue_overflow_records"], 40,
+                )
+                self.assertEqual(
+                    replaced["durability"]["producer_queue_overflow_delta"], 0,
+                )
+                self.assertEqual(
+                    replaced["durability"]["producer_transport_failed_baseline"], 60,
+                )
+                self.assertEqual(
+                    replaced["durability"]["producer_transport_failed_records"], 60,
+                )
+                self.assertEqual(
+                    replaced["durability"]["producer_transport_failed_delta"], 0,
+                )
 
     def test_transient_windows_status_reader_contention_does_not_fail_collector(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

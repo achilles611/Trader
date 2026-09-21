@@ -323,6 +323,10 @@ class FocusedHorizonBand:
             BookSide.BID: (),
             BookSide.ASK: (),
         }
+        self._position_cursor: dict[
+            BookSide, dict[int, tuple[int, Decimal]]
+        ] = {BookSide.BID: {}, BookSide.ASK: {}}
+        self._position_cursor_initialized = False
         self._shadow: dict[BookSide, dict[int, _PriceShadow]] = {
             BookSide.BID: {},
             BookSide.ASK: {},
@@ -347,6 +351,12 @@ class FocusedHorizonBand:
         self._last_rewarm_seconds: float | None = None
         self._maximum_rewarm_seconds = 0.0
         self._completed_rewarms = 0
+        self._coherence_pending = False
+        self._noncoherent_records = 0
+        self._crossed_unavailable_records = 0
+        self._partial_signed_records = 0
+        self._coherence_reconciliations = 0
+        self._coherence_reconciliation_failures = 0
 
     @staticmethod
     def _at(value: str) -> datetime:
@@ -371,12 +381,15 @@ class FocusedHorizonBand:
         if not reason:
             raise ValueError("FHB_INVALIDATION_REASON_REQUIRED")
         self._core = {BookSide.BID: (), BookSide.ASK: ()}
+        self._position_cursor = {BookSide.BID: {}, BookSide.ASK: {}}
+        self._position_cursor_initialized = False
         self._shadow = {BookSide.BID: {}, BookSide.ASK: {}}
         self._shadow_event_count = 0
         self._current_rewarm_prices = ()
         self._rewarm_started_at = at
         self._last_invalidation_reason = reason
         self._unavailable_reason = reason
+        self._coherence_pending = False
         self._reset_count += 1
 
     def _unavailable_decision(
@@ -400,6 +413,166 @@ class FocusedHorizonBand:
             (),
             (),
             clear,
+        )
+        self._last_decision = decision
+        return decision
+
+    def _reset_price_coverage(
+        self,
+        side: BookSide,
+        ticks: int,
+        quantity: Decimal,
+        at: datetime,
+    ) -> None:
+        prior = self._shadow[side].pop(ticks, None)
+        if prior is not None:
+            self._shadow_event_count -= len(prior.events)
+        self._ensure_price(side, ticks, quantity, at, set(self._core[side]))
+
+    def _record_projected_event(
+        self,
+        payload: Mapping[str, object],
+        event: CausalEventRef,
+        side: BookSide,
+        price_ticks: int | None,
+        operation: str,
+        previous: tuple[int, ...],
+        current: tuple[int, ...],
+        at: datetime,
+    ) -> None:
+        if price_ticks is None:
+            return
+        quantity = (
+            Decimal("0")
+            if operation == "REMOVE"
+            else Decimal(str(payload.get("mutation_volume") or 0))
+        )
+        if not quantity.is_finite() or quantity < 0:
+            raise ValueError("FHB_MUTATION_QUANTITY_INVALID")
+        context = previous if operation == "REMOVE" and price_ticks in previous else current
+        if not context:
+            self._reset_price_coverage(side, price_ticks, quantity, at)
+            return
+        quantities = self._shadow[side]
+        known_quantities: dict[int, Decimal] = {
+            ticks: value.current_quantity for ticks, value in quantities.items()
+        }
+        if operation != "REMOVE":
+            known_quantities[price_ticks] = quantity
+        if any(ticks not in known_quantities for ticks in context):
+            self._reset_price_coverage(side, price_ticks, quantity, at)
+            return
+        touch_ticks = context[0]
+        price = self._price(price_ticks)
+        touch = self._price(touch_ticks)
+        if (
+            (side is BookSide.BID and price > touch)
+            or (side is BookSide.ASK and price < touch)
+        ):
+            self._reset_price_coverage(side, price_ticks, quantity, at)
+            return
+        observation = DepthObservation(
+            event,
+            str(payload.get("contract_id") or ""),
+            side,
+            price,
+            quantity,
+            sum((known_quantities[ticks] for ticks in context), Decimal("0")),
+            touch,
+            DepthEventKind.UPDATE,
+            Decimal("0"),
+            Decimal("0"),
+            False,
+            PriceResponse.UNAVAILABLE,
+        )
+        self._append_event(side, price_ticks, observation, at, set(current))
+
+    def _noncoherent_decision(
+        self,
+        payload: Mapping[str, object],
+        event: CausalEventRef,
+        *,
+        at: datetime,
+        side: BookSide | None,
+        price_ticks: int | None,
+        reason: str,
+        signed_prefixes: dict[BookSide, tuple[tuple[int, Decimal], ...]],
+        crossed_unavailable: bool = False,
+    ) -> FHBDecision:
+        try:
+            previous = {book_side: self._core[book_side] for book_side in self._core}
+            projected = {
+                book_side: tuple(ticks for ticks, _ in signed_prefixes[book_side])
+                for book_side in (BookSide.BID, BookSide.ASK)
+            }
+            operation = str(
+                payload.get("operation")
+                or payload.get("mutation_operation")
+                or ""
+            ).upper()
+            position = payload.get("mutation_position")
+            if side is None or operation not in {"ADD", "UPDATE", "REMOVE"}:
+                raise ValueError("FHB_POSITIONAL_MUTATION_IDENTITY_INVALID")
+            if type(position) is not int or position < 0:
+                raise ValueError("FHB_POSITIONAL_POSITION_INVALID")
+            resolved_price = price_ticks
+            if operation == "REMOVE" and resolved_price is None:
+                removed = tuple(
+                    ticks for ticks in previous[side]
+                    if ticks not in set(projected[side])
+                )
+                if len(removed) == 1:
+                    resolved_price = removed[0]
+                else:
+                    raise ValueError("FHB_POSITIONAL_REMOVE_IDENTITY_UNRESOLVED")
+            elif operation != "REMOVE" and resolved_price is None:
+                raise ValueError("FHB_POSITIONAL_UPSERT_PRICE_UNRESOLVED")
+            for book_side in (BookSide.BID, BookSide.ASK):
+                current_set = set(projected[book_side])
+                for ticks, quantity in signed_prefixes[book_side]:
+                    self._ensure_price(book_side, ticks, quantity, at, current_set)
+            self._core = projected
+            if side is None:
+                raise ValueError("FHB_POSITIONAL_SIDE_UNRESOLVED")
+            self._record_projected_event(
+                payload,
+                event,
+                side,
+                resolved_price,
+                operation,
+                previous[side],
+                projected[side],
+                at,
+            )
+        except (InvalidOperation, RuntimeError, TypeError, ValueError) as error:
+            self._coherence_reconciliation_failures += 1
+            return self._unavailable_decision(
+                f"FHB_NONCOHERENT_POSITIONAL_AMBIGUITY:{error}",
+                at=at,
+                side=side,
+                price_ticks=price_ticks,
+                clear=True,
+            )
+        self._coherence_pending = True
+        self._noncoherent_records += 1
+        if crossed_unavailable:
+            self._crossed_unavailable_records += 1
+        else:
+            self._partial_signed_records += 1
+        self._rewarm_required += 1
+        if self._rewarm_started_at is None:
+            self._rewarm_started_at = at
+        self._unavailable_reason = reason
+        decision = FHBDecision(
+            FHBAction.REWARM_REQUIRED,
+            reason,
+            side,
+            resolved_price,
+            False,
+            False,
+            (),
+            (),
+            True,
         )
         self._last_decision = decision
         return decision
@@ -429,6 +602,145 @@ class FocusedHorizonBand:
         if len(rows) > FHB_SUPPORTED_SOURCE_LEVELS_PER_SIDE:
             raise ValueError("FHB_SIGNED_SOURCE_LEVEL_BOUND_EXCEEDED")
         return tuple(rows)
+
+    def _position_snapshot(
+        self,
+        payload: Mapping[str, object],
+    ) -> dict[BookSide, dict[int, tuple[int, Decimal]]] | None:
+        keys = {
+            BookSide.BID: "position_bids",
+            BookSide.ASK: "position_asks",
+        }
+        present = tuple(key in payload for key in keys.values())
+        if present == (False, False):
+            return None
+        if present != (True, True):
+            raise ValueError("FHB_POSITION_CURSOR_SIDE_MISSING")
+        result: dict[BookSide, dict[int, tuple[int, Decimal]]] = {
+            BookSide.BID: {}, BookSide.ASK: {},
+        }
+        for side, key in keys.items():
+            raw = payload.get(key)
+            if not isinstance(raw, list):
+                raise ValueError("FHB_POSITION_CURSOR_INVALID")
+            for item in raw:
+                if not isinstance(item, Mapping):
+                    raise ValueError("FHB_POSITION_CURSOR_ROW_INVALID")
+                position = item.get("position")
+                if type(position) is not int or position < 0:
+                    raise ValueError("FHB_POSITION_CURSOR_POSITION_INVALID")
+                if position in result[side]:
+                    raise ValueError("FHB_POSITION_CURSOR_DUPLICATE_POSITION")
+                ticks = self._ticks(item.get("price"))
+                quantity = Decimal(str(item.get("size")))
+                if not quantity.is_finite() or quantity <= 0:
+                    raise ValueError("FHB_POSITION_CURSOR_QUANTITY_INVALID")
+                result[side][position] = (ticks, quantity)
+        return result
+
+    def _position_prefix(
+        self,
+        cursor: dict[int, tuple[int, Decimal]],
+        side: BookSide,
+    ) -> tuple[tuple[int, Decimal], ...]:
+        rows: list[tuple[int, Decimal]] = []
+        for position in range(self.config.core_levels_per_side):
+            row = cursor.get(position)
+            if row is None:
+                break
+            if rows and (
+                (side is BookSide.BID and rows[-1][0] <= row[0])
+                or (side is BookSide.ASK and rows[-1][0] >= row[0])
+            ):
+                break
+            rows.append(row)
+        return tuple(rows)
+
+    @staticmethod
+    def _shift_position_cursor(
+        cursor: dict[int, tuple[int, Decimal]],
+        position: int,
+        inserting: bool,
+    ) -> None:
+        positions = sorted(
+            (
+                current for current in cursor
+                if (current >= position if inserting else current > position)
+            ),
+            reverse=inserting,
+        )
+        for current in positions:
+            cursor[current + 1 if inserting else current - 1] = cursor.pop(current)
+
+    def _validate_position_transition(
+        self,
+        payload: Mapping[str, object],
+        side: BookSide | None,
+        supplied_price_ticks: int | None,
+        snapshots: dict[BookSide, tuple[tuple[int, Decimal], ...]],
+    ) -> int | None:
+        transmitted = self._position_snapshot(payload)
+        operation = str(
+            payload.get("operation")
+            or payload.get("mutation_operation")
+            or ""
+        ).upper()
+        position = payload.get("mutation_position")
+        reset = (
+            payload.get("is_reset") is True
+            or payload.get("mutation_is_reset") is True
+        )
+        if side is None or operation not in {"ADD", "UPDATE", "REMOVE"}:
+            raise ValueError("FHB_POSITION_CURSOR_MUTATION_INVALID")
+        if type(position) is not int or position < 0:
+            raise ValueError("FHB_POSITION_CURSOR_MUTATION_POSITION_INVALID")
+        resolved_price = supplied_price_ticks
+        if self._position_cursor_initialized:
+            projected = {
+                book_side: dict(self._position_cursor[book_side])
+                for book_side in (BookSide.BID, BookSide.ASK)
+            }
+            if reset:
+                projected = {BookSide.BID: {}, BookSide.ASK: {}}
+            target = projected[side]
+            if operation == "REMOVE":
+                removed = target.get(position)
+                if removed is not None:
+                    if resolved_price is not None and resolved_price != removed[0]:
+                        raise ValueError("FHB_POSITION_CURSOR_REMOVE_IDENTITY_MISMATCH")
+                    resolved_price = removed[0]
+                target.pop(position, None)
+                self._shift_position_cursor(target, position, False)
+            else:
+                if supplied_price_ticks is None:
+                    raise ValueError("FHB_POSITION_CURSOR_UPSERT_PRICE_UNRESOLVED")
+                quantity = Decimal(str(payload.get("mutation_volume") or 0))
+                if not quantity.is_finite() or quantity <= 0:
+                    raise ValueError("FHB_POSITION_CURSOR_UPSERT_QUANTITY_INVALID")
+                if operation == "ADD":
+                    self._shift_position_cursor(target, position, True)
+                target[position] = (supplied_price_ticks, quantity)
+            if transmitted is not None and projected != transmitted:
+                raise ValueError("FHB_POSITION_CURSOR_TRANSITION_MISMATCH")
+            current = projected
+        elif transmitted is not None:
+            # A signed full disclosure is the authoritative anchor for a
+            # collector that attached after the native cursor was initialized.
+            current = transmitted
+        else:
+            return supplied_price_ticks
+        derived = {
+            book_side: self._position_prefix(current[book_side], book_side)
+            for book_side in (BookSide.BID, BookSide.ASK)
+        }
+        if any(
+            derived[book_side] != snapshots[book_side]
+            for book_side in (BookSide.BID, BookSide.ASK)
+        ):
+            raise ValueError("FHB_POSITION_CURSOR_PREFIX_MISMATCH")
+        self._position_cursor = current
+        self._position_cursor_initialized = True
+        return resolved_price
 
     def _ensure_price(
         self,
@@ -532,7 +844,7 @@ class FocusedHorizonBand:
         sequence = payload.get("source_event_sequence")
         if type(sequence) is not int or sequence <= 0:
             raise ValueError("FHB_SOURCE_SEQUENCE_INVALID")
-        self._last_source_sequence = sequence
+        prior_sequence = self._last_source_sequence
         self._last_source_event_id = event.event_id
         at = event._ordering_key[0]
         clear = False
@@ -547,8 +859,19 @@ class FocusedHorizonBand:
             ):
                 self.invalidate("FHB_SOURCE_GENERATION_CHANGED", at=at)
                 clear = True
+                prior_sequence = None
             if generation is not None:
                 self._generation = generation
+            if prior_sequence is not None and sequence != prior_sequence + 1:
+                self._last_source_sequence = sequence
+                return self._unavailable_decision(
+                    "FHB_SOURCE_SEQUENCE_DISCONTINUITY",
+                    at=at,
+                    side=None,
+                    price_ticks=None,
+                    clear=True,
+                )
+            self._last_source_sequence = sequence
             side_text = str(
                 payload.get("side") or payload.get("mutation_side") or ""
             ).upper()
@@ -558,17 +881,63 @@ class FocusedHorizonBand:
                 else None
             )
             price_ticks: int | None = None
-            try:
-                price_ticks = self._ticks(payload.get("mutation_price"))
-            except ValueError:
-                pass
+            for price_field in ("mutation_resolved_price", "mutation_price"):
+                try:
+                    price_ticks = self._ticks(payload.get(price_field))
+                    break
+                except ValueError:
+                    pass
             unavailable = str(payload.get("status") or "").upper() == "UNAVAILABLE"
             reset = (
                 payload.get("is_reset") is True
                 or payload.get("mutation_is_reset") is True
             )
+            try:
+                snapshots = {
+                    BookSide.BID: self._snapshot(payload, BookSide.BID),
+                    BookSide.ASK: self._snapshot(payload, BookSide.ASK),
+                }
+                has_position_contract = (
+                    "position_bids" in payload and "position_asks" in payload
+                )
+                price_ticks = self._validate_position_transition(
+                    payload, side, price_ticks, snapshots,
+                )
+            except (InvalidOperation, TypeError, ValueError) as error:
+                self._coherence_reconciliation_failures += 1
+                return self._unavailable_decision(
+                    f"FHB_POSITION_CURSOR_INVALID:{error}",
+                    at=at,
+                    side=side,
+                    price_ticks=price_ticks,
+                    clear=True,
+                )
             if unavailable:
                 source_reason = str(payload.get("reason") or "SOURCE_UNAVAILABLE")
+                if reset:
+                    return self._unavailable_decision(
+                        "FHB_SOURCE_RESET:" + source_reason,
+                        at=at,
+                        side=side,
+                        price_ticks=price_ticks,
+                        clear=True,
+                    )
+                if has_position_contract and source_reason in {
+                    "CROSSED_NATIVE_POSITIONAL_SNAPSHOT",
+                    "NATIVE_DEPTH_POSITION_ZERO_UNAVAILABLE",
+                }:
+                    return self._noncoherent_decision(
+                        payload,
+                        event,
+                        at=at,
+                        side=side,
+                        price_ticks=price_ticks,
+                        reason="FHB_SOURCE_UNAVAILABLE:" + source_reason,
+                        signed_prefixes=snapshots,
+                        crossed_unavailable=(
+                            source_reason == "CROSSED_NATIVE_POSITIONAL_SNAPSHOT"
+                        ),
+                    )
                 return self._unavailable_decision(
                     "FHB_SOURCE_UNAVAILABLE:" + source_reason,
                     at=at,
@@ -576,24 +945,35 @@ class FocusedHorizonBand:
                     price_ticks=price_ticks,
                     clear=True,
                 )
-            if reset:
-                self.invalidate("FHB_SOURCE_RESET", at=at)
-                clear = True
-
-            snapshots = {
-                BookSide.BID: self._snapshot(payload, BookSide.BID),
-                BookSide.ASK: self._snapshot(payload, BookSide.ASK),
-            }
             if any(
                 len(snapshots[book_side]) != self.config.core_levels_per_side
                 for book_side in (BookSide.BID, BookSide.ASK)
             ):
-                return self._unavailable_decision(
-                    "FHB_SIGNED_CORE_INCOMPLETE",
+                if reset:
+                    return self._unavailable_decision(
+                        "FHB_SOURCE_RESET_INCOMPLETE",
+                        at=at,
+                        side=side,
+                        price_ticks=price_ticks,
+                        clear=True,
+                    )
+                if not has_position_contract:
+                    return self._unavailable_decision(
+                        "FHB_POSITION_CURSOR_REQUIRED_FOR_INCOMPLETE_CORE",
+                        at=at,
+                        side=side,
+                        price_ticks=price_ticks,
+                        clear=True,
+                    )
+                return self._noncoherent_decision(
+                    payload,
+                    event,
                     at=at,
                     side=side,
                     price_ticks=price_ticks,
-                    clear=True,
+                    reason="FHB_SIGNED_CORE_INCOMPLETE",
+                    signed_prefixes=snapshots,
+                    crossed_unavailable=False,
                 )
             if (
                 snapshots[BookSide.BID][0][0]
@@ -606,6 +986,13 @@ class FocusedHorizonBand:
                     price_ticks=price_ticks,
                     clear=True,
                 )
+            if reset:
+                retained_cursor = self._position_cursor
+                retained_initialized = self._position_cursor_initialized
+                self.invalidate("FHB_SOURCE_RESET", at=at)
+                self._position_cursor = retained_cursor
+                self._position_cursor_initialized = retained_initialized
+                clear = True
             previous = {side: self._core[side] for side in self._core}
             previous_quantities = {
                 side: {
@@ -628,6 +1015,10 @@ class FocusedHorizonBand:
                 )
                 for book_side in (BookSide.BID, BookSide.ASK)
             }
+            if self._coherence_pending:
+                self._coherence_pending = False
+                self._coherence_reconciliations += 1
+                clear = True
             proven_out_of_core_remove = False
             if (
                 price_ticks is None
@@ -817,7 +1208,14 @@ class FocusedHorizonBand:
 
     @property
     def entry_ready(self) -> bool:
-        return not self._current_rewarm_prices and all(self._core.values())
+        return (
+            not self._coherence_pending
+            and not self._current_rewarm_prices
+            and all(
+                len(self._core[side]) == self.config.core_levels_per_side
+                for side in (BookSide.BID, BookSide.ASK)
+            )
+        )
 
     def status(self) -> dict[str, object]:
         last = self._last_decision
@@ -861,6 +1259,19 @@ class FocusedHorizonBand:
             "last_rewarm_seconds": self._last_rewarm_seconds,
             "maximum_rewarm_seconds": self._maximum_rewarm_seconds,
             "completed_rewarms": self._completed_rewarms,
+            "coherence_pending": self._coherence_pending,
+            "noncoherent_records": self._noncoherent_records,
+            "crossed_unavailable_records": self._crossed_unavailable_records,
+            "partial_signed_records": self._partial_signed_records,
+            "coherence_reconciliations": self._coherence_reconciliations,
+            "coherence_reconciliation_failures": (
+                self._coherence_reconciliation_failures
+            ),
+            "position_cursor_initialized": self._position_cursor_initialized,
+            "position_cursor_rows": {
+                side.value: len(self._position_cursor[side])
+                for side in (BookSide.BID, BookSide.ASK)
+            },
             "reset_count": self._reset_count,
             "capacity_losses": self._capacity_losses,
             "movement_reserve_observations": self._movement_reserve_observations,

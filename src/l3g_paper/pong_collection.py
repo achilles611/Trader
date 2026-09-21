@@ -195,7 +195,11 @@ class PongAuthenticHourCollector:
         self.topology = topology
         self._source_generation: int | None = None
         self._producer_overflow_records = 0
+        self._producer_overflow_baseline: int | None = None
+        self._producer_overflow_delta = 0
         self._producer_transport_failed_records = 0
+        self._producer_transport_failed_baseline: int | None = None
+        self._producer_transport_failed_delta = 0
         self.independent_market_collection = independent_market_collection
         self.started_at = _wire(started)
         self._initial_target = _next_full_hour(started)
@@ -368,7 +372,15 @@ class PongAuthenticHourCollector:
                     "maximum_queue_age_milliseconds": round(self._maximum_queue_age_milliseconds, 3),
                     "queue_overflow_records": self._queue_overflow_records,
                     "producer_queue_overflow_records": self._producer_overflow_records,
+                    "producer_queue_overflow_baseline": self._producer_overflow_baseline,
+                    "producer_queue_overflow_delta": self._producer_overflow_delta,
                     "producer_transport_failed_records": self._producer_transport_failed_records,
+                    "producer_transport_failed_baseline": (
+                        self._producer_transport_failed_baseline
+                    ),
+                    "producer_transport_failed_delta": (
+                        self._producer_transport_failed_delta
+                    ),
                     "rejected_records": self._rejected_records,
                     "duplicate_records": self._duplicate_records,
                 },
@@ -568,15 +580,6 @@ class PongAuthenticHourCollector:
                 self._invalidate_at_locked(_utc_now(), "SOURCE_GENERATION_CHANGED")
                 self._last_quote = None
             self._source_generation = generation
-        for field, attribute, reason in (
-            ("observer_queue_overflow_frames", "_producer_overflow_records", "PRODUCER_QUEUE_OVERFLOW"),
-            ("observer_transport_failed_frames", "_producer_transport_failed_records", "PRODUCER_TRANSPORT_FAILED"),
-        ):
-            total = record.payload.get(field)
-            if type(total) is int and total > getattr(self, attribute):
-                setattr(self, attribute, total)
-                self._invalidate_at_locked(event_at, reason)
-                self._invalidate_at_locked(_utc_now(), reason)
         if self._active_identity is None:
             self._active_identity = current_identity
         elif self._active_identity != current_identity:
@@ -584,6 +587,45 @@ class PongAuthenticHourCollector:
             self._active_identity = current_identity
             self._last_source_sequences.clear()
             self._last_quote = None
+            self._producer_overflow_baseline = None
+            self._producer_overflow_delta = 0
+            self._producer_transport_failed_baseline = None
+            self._producer_transport_failed_delta = 0
+        for field, attribute, baseline_attribute, delta_attribute, reason in (
+            (
+                "observer_queue_overflow_frames",
+                "_producer_overflow_records",
+                "_producer_overflow_baseline",
+                "_producer_overflow_delta",
+                "PRODUCER_QUEUE_OVERFLOW",
+            ),
+            (
+                "observer_transport_failed_frames",
+                "_producer_transport_failed_records",
+                "_producer_transport_failed_baseline",
+                "_producer_transport_failed_delta",
+                "PRODUCER_TRANSPORT_FAILED",
+            ),
+        ):
+            total = record.payload.get(field)
+            if type(total) is not int or total < 0:
+                continue
+            baseline = getattr(self, baseline_attribute)
+            current = getattr(self, attribute)
+            if baseline is None:
+                setattr(self, baseline_attribute, total)
+                setattr(self, attribute, total)
+                continue
+            if total < current:
+                self._invalidate_at_locked(event_at, "PRODUCER_COUNTER_REGRESSION")
+                self._invalidate_at_locked(_utc_now(), "PRODUCER_COUNTER_REGRESSION")
+                setattr(self, attribute, total)
+                setattr(self, delta_attribute, max(0, total - baseline))
+            elif total > current:
+                setattr(self, attribute, total)
+                setattr(self, delta_attribute, total - baseline)
+                self._invalidate_at_locked(event_at, reason)
+                self._invalidate_at_locked(_utc_now(), reason)
 
         if record.observation_type == "QUOTE":
             self._last_quote = record
