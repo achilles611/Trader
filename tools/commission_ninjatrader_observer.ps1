@@ -4,6 +4,8 @@ param(
     [int] $Port = 8090,
     [int] $CompileTimeoutSeconds = 60,
     [int] $CheckpointSeconds = 10,
+    [ValidateSet('MNQ SEP26', 'MNQ DEC26')]
+    [string] $ExpectedInstrument = 'MNQ SEP26',
     [string] $NinjaTraderDocumentsRoot = (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'NinjaTrader 8')
 )
 
@@ -265,7 +267,7 @@ Start-Sleep -Seconds $CheckpointSeconds
 $second = Get-Checkpoint
 $observerVerified = (
     $second.observer.state -eq 'NATIVE_ADDON_OBSERVER_ACTIVE' -and
-    $second.observer.instrument -eq 'MNQ SEP26' -and
+    $second.observer.instrument -eq $ExpectedInstrument -and
     $second.observer.observer_attached -eq $true -and
     $second.observer.subscription_mode -eq 'NATIVE_ADDON' -and
     $second.observer.active -eq $true
@@ -274,7 +276,7 @@ $safetyVerified = (
     $second.safety.state -eq 'READY_DISARMED' -and
     $second.safety.account -eq 'Sim101' -and
     $second.safety.account_class -eq 'LOCAL_SIMULATION' -and
-    $second.safety.instrument -eq 'MNQ SEP26' -and
+    $second.safety.instrument -eq $ExpectedInstrument -and
     $second.safety.maximum_quantity -eq 1 -and
     $second.safety.paper_execution -eq 'DISARMED' -and
     $second.safety.session_armed_state -eq 'DISARMED' -and
@@ -313,6 +315,7 @@ $result = [ordered]@{
         installed_source_parity = $true
         compile_status = $compileStatus
         expected_source_fingerprint = $expectedFingerprint
+        expected_instrument = $ExpectedInstrument
         compiled_assembly = $compiledAssembly
         compiled_at = (Get-Item -LiteralPath $compiledAssembly).LastWriteTimeUtc.ToString('o')
         compiled_sha256_before = $assemblyHashBefore

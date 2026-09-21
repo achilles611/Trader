@@ -92,6 +92,8 @@ class LaunchBinding:
     source: str
     fhb_profile: str | None = None
     fhb_policy_fingerprint: str | None = None
+    pong_scheduling_mode: str = "EVENT_DRIVEN"
+    pong_periodic_interval_ms: int = 0
     ledger_identity: str | None = None
     operation_id: str | None = None
     expected_pid: int | None = None
@@ -111,6 +113,8 @@ class LaunchBinding:
             "risk_profile_hash": self.risk_profile_hash,
             "fhb_profile": self.fhb_profile,
             "fhb_policy_fingerprint": self.fhb_policy_fingerprint,
+            "pong_scheduling_mode": self.pong_scheduling_mode,
+            "pong_periodic_interval_ms": self.pong_periodic_interval_ms,
             "ledger_epoch": self.ledger_epoch,
             "profile_selection_source": (
                 "REMEMBERED_ESTABLISHED_RUN"
@@ -205,6 +209,20 @@ def resolve_fhb_launch_policy(
         return config.profile_id, config.policy_fingerprint
     except ValueError as exc:
         raise RuntimeError("BeezConsole FHB launch policy is invalid.") from exc
+
+
+def resolve_pong_scheduling_launch_policy(
+    environment: Mapping[str, str],
+) -> tuple[str, int]:
+    """Resolve the exact Pong cadence identity that the backend must report."""
+    try:
+        scheduling = scheduling_config_from_environment(
+            environment.get("BEELZEBUB_PONG_SCHEDULING_MODE"),
+            environment.get("BEELZEBUB_PONG_PERIODIC_INTERVAL_MS"),
+        )
+    except ValueError as exc:
+        raise RuntimeError("BeezConsole Pong scheduling launch policy is invalid.") from exc
+    return scheduling.mode.value, scheduling.interval_ms
 
 
 def _maintenance_arguments(argv: Sequence[str]) -> dict[str, str] | None:
@@ -346,6 +364,9 @@ def resolve_launch_binding(
         profile.selection_key,
         source_environment,
     )
+    pong_scheduling_mode, pong_periodic_interval_ms = (
+        resolve_pong_scheduling_launch_policy(source_environment)
+    )
     return LaunchBinding(
         runtime_root=runtime_root,
         ledger_path=ledger_path,
@@ -361,6 +382,8 @@ def resolve_launch_binding(
         source=source,
         fhb_profile=fhb_profile,
         fhb_policy_fingerprint=fhb_policy_fingerprint,
+        pong_scheduling_mode=pong_scheduling_mode,
+        pong_periodic_interval_ms=pong_periodic_interval_ms,
         ledger_identity=ledger_identity,
         operation_id=operation_id,
     )
@@ -581,6 +604,32 @@ def adopt_exact_requested_target_listener(
         raise RuntimeError("BeezConsole requested target runtime binding is inconsistent.")
     target_fhb_profile = target_runtime_binding.get("fhb_profile")
     target_fhb_policy_fingerprint = target_runtime_binding.get("fhb_policy_fingerprint")
+    target_scheduling_mode = target_runtime_binding.get("pong_scheduling_mode")
+    target_periodic_interval_ms = target_runtime_binding.get(
+        "pong_periodic_interval_ms",
+    )
+    try:
+        admitted_scheduling_mode, admitted_periodic_interval_ms = (
+            resolve_pong_scheduling_launch_policy({
+                "BEELZEBUB_PONG_SCHEDULING_MODE": str(target_scheduling_mode),
+                "BEELZEBUB_PONG_PERIODIC_INTERVAL_MS": str(
+                    target_periodic_interval_ms,
+                ),
+            })
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "BeezConsole requested target Pong scheduling binding is inconsistent."
+        ) from exc
+    if (
+        type(target_scheduling_mode) is not str
+        or type(target_periodic_interval_ms) is not int
+        or target_scheduling_mode != admitted_scheduling_mode
+        or target_periodic_interval_ms != admitted_periodic_interval_ms
+    ):
+        raise RuntimeError(
+            "BeezConsole requested target Pong scheduling binding is inconsistent."
+        )
     supported_fhb_policy_fingerprints = {
         FHBConfig().policy_fingerprint,
         FHBConfig.periodic_protected().policy_fingerprint,
@@ -589,6 +638,12 @@ def adopt_exact_requested_target_listener(
         (target_fhb_profile is None and target_fhb_policy_fingerprint is None)
         or (
             target_fhb_profile == FHB_PROFILE_ID
+            and target_fhb_policy_fingerprint
+            == (
+                FHBConfig.periodic_protected().policy_fingerprint
+                if admitted_periodic_interval_ms
+                else FHBConfig().policy_fingerprint
+            )
             and target_fhb_policy_fingerprint in supported_fhb_policy_fingerprints
             and manifest.get("target_profile") == PONG_ENTRY_PROFILE_VERSION
         )
@@ -622,6 +677,8 @@ def adopt_exact_requested_target_listener(
             if target_fhb_policy_fingerprint is None
             else str(target_fhb_policy_fingerprint)
         ),
+        pong_scheduling_mode=admitted_scheduling_mode,
+        pong_periodic_interval_ms=admitted_periodic_interval_ms,
         ledger_identity=str(ledger_identity),
         operation_id=operation_id,
         expected_pid=target_runtime_pid,
@@ -730,11 +787,19 @@ def server_environment(
         binding.profile,
         source,
     )
+    pong_scheduling_mode, pong_periodic_interval_ms = (
+        resolve_pong_scheduling_launch_policy(source)
+    )
     if (
         fhb_profile != binding.fhb_profile
         or fhb_policy_fingerprint != binding.fhb_policy_fingerprint
     ):
         raise RuntimeError("FHB_LAUNCH_BINDING_MISMATCH")
+    if (
+        pong_scheduling_mode != binding.pong_scheduling_mode
+        or pong_periodic_interval_ms != binding.pong_periodic_interval_ms
+    ):
+        raise RuntimeError("PONG_SCHEDULING_LAUNCH_BINDING_MISMATCH")
     child = dict(source)
     # These two paper-only Pong switches are explicit process-launch
     # authorities, not stale profile bindings. Preserve them across the clean

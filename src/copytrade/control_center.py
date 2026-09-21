@@ -2017,6 +2017,8 @@ def create_control_center_app(
             if pong_fhb_config is None
             else pong_fhb_config.policy_fingerprint
         ),
+        "pong_scheduling_mode": pong_scheduling.mode.value,
+        "pong_periodic_interval_ms": pong_scheduling.interval_ms,
         "ledger_epoch": resolve_ledger_epoch(paper_path, configured_paper_epoch),
         "risk_continuity_artifact_sha256": (
             None if risk_continuity_artifact is None
