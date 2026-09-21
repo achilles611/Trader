@@ -172,7 +172,9 @@ def process_memory(pid):
 
 
 def replay(corpus, output, key, *, interval_ms=0, phase_ms=0, mode="natural",
-           rate=2111, limit=900, record_capacity=262144, byte_capacity=536870912):
+           rate=None, limit=900, record_capacity=262144, byte_capacity=536870912):
+    if mode == "burst" and rate is None:
+        raise ValueError("BURST_DIAGNOSTIC_RATE_REQUIRED")
     with BenchmarkLease(output) as lease:
         return _replay(corpus, output, key, interval_ms=interval_ms, phase_ms=phase_ms,
             mode=mode, rate=rate, limit=limit, record_capacity=record_capacity,
@@ -337,7 +339,9 @@ def _replay(corpus, output, key, *, interval_ms, phase_ms, mode, rate, limit,
         write_json(output / "run-plan.json", dict(interval_ms=interval_ms, phase_ms=phase_ms,
             mode=mode, records=len(frames), scheduled_duration_seconds=dues[-1],
             frames_sha256=manifest["frames_sha256"], native_runtime_started=False,
-            execution_authority="DENIED", target_events_per_second=2111))
+            execution_authority="DENIED",
+            diagnostic_burst_rate_per_second=rate if mode == "burst" else None,
+            diagnostic_rate_authority="NOT_AN_ACCEPTANCE_THRESHOLD"))
         preflight_cpu = system_cpu_times()
         time.sleep(.5)
         preflight_end = system_cpu_times()
@@ -526,7 +530,8 @@ def _replay(corpus, output, key, *, interval_ms, phase_ms, mode, rate, limit,
     result = dict(schema="pong-periodic-independent-paced-v1", test_only=True,
         timer_clock=dict(name="perf_counter_ns", **timer_clock),
         qualification="NOT_QUALIFIED", interval_ms=interval_ms, phase_ms=phase_ms,
-        mode=mode, target_events_per_second=2111, output_root=str(output),
+        mode=mode, diagnostic_burst_rate_per_second=rate if mode == "burst" else None,
+        diagnostic_rate_authority="NOT_AN_ACCEPTANCE_THRESHOLD", output_root=str(output),
         corpus_path=str(corpus), corpus_manifest=manifest, records=len(frames),
         market_records=len(market_indices), scheduled_duration_seconds=dues[-1],
         actual_evaluations=evaluation_count, evaluation_cpu_ns=evaluation_cpu_ns,
@@ -590,13 +595,18 @@ def main():
     parser.add_argument("--interval-ms", type=int, choices=(0,10,20,25), default=0)
     parser.add_argument("--phase-ms", type=float, default=0.)
     parser.add_argument("--mode", choices=("natural","burst"), default="natural")
-    parser.add_argument("--rate", type=int, default=2111, help="Synthetic burst base rate only; acceptance floor remains 2111/s")
+    parser.add_argument(
+        "--rate", type=int,
+        help="Explicit synthetic burst base rate; diagnostic only, never an acceptance floor.",
+    )
     parser.add_argument("--limit-seconds", type=float, default=900.)
     args = parser.parse_args()
     if args.phase_ms < 0 or (args.interval_ms and args.phase_ms >= args.interval_ms) or (not args.interval_ms and args.phase_ms):
         parser.error("Phase must be nonnegative and less than one interval")
-    if args.rate <= 0 or args.limit_seconds <= 0:
-        parser.error("Rate and limit must be positive")
+    if args.mode == "burst" and args.rate is None:
+        parser.error("Burst mode requires an explicit diagnostic --rate")
+    if (args.rate is not None and args.rate <= 0) or args.limit_seconds <= 0:
+        parser.error("Any supplied rate and the limit must be positive")
     from src.l3g_paper.ninjatrader_transport import LocalPaperSecretProvider
     key = LocalPaperSecretProvider().load_key()  # Never print or persist secrets.
     result = replay(args.corpus.resolve(), args.output.resolve(), key,
