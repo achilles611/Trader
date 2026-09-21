@@ -172,7 +172,7 @@ function Get-ReceiverReadiness {
             $listener.state -eq 'LISTENING' -and
             [int]$listener.port -eq 48135 -and
             $null -eq $listener.error -and
-            $collection.state -eq 'RUNNING' -and
+            $collection.state -eq 'COLLECTING' -and
             $collection.collector.thread_alive -eq $true
         )
     }

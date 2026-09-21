@@ -1839,6 +1839,8 @@ class NinjaScriptSourceTests(unittest.TestCase):
             "$first.loaded_build_fingerprint -eq $second.loaded_build_fingerprint",
             commission,
         )
+        self.assertIn("$collection.state -eq 'COLLECTING'", commission)
+        self.assertNotIn("$collection.state -eq 'RUNNING'", commission)
         self.assertIn("partial_available_depth", commission)
         self.assertIn("--expected-source-fingerprint", probe)
         self.assertIn("require_attestation=bool(args.expected_source_fingerprint)", probe)
