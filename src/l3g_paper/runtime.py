@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from src.l3f_provider.ninjatrader_observation import (
     L3F2_SCHEMA,
+    L3F3_SCHEMA,
     NinjaTraderObservation,
     NinjaTraderObservationError,
 )
@@ -69,6 +70,12 @@ from .ninjatrader_transport import (
     PaperExecutionTransport,
 )
 from .policy import ExperimentalPaperPolicy
+from .pong_contract import DEC26_TOPOLOGY
+from .pong_qualifying import (
+    PONG_NO_FHB_QUALIFYING_ARCHITECTURE,
+    PONG_QUALIFYING_INTERVAL_MS,
+    PONG_QUALIFYING_SCHEDULING_MODE,
+)
 from .pong_runtime import PongNativeDirective, PongNativeDirectiveKind
 from .perpetual_startup_seed import (
     PERPETUAL_STARTUP_SEED_EXPORT_KIND,
@@ -452,6 +459,7 @@ class LaneIIIPaperRuntime:
         policy: ExperimentalPaperPolicy | None = None,
         risk: PaperRiskAuthority | None = None,
         risk_continuity: Mapping[str, object] | None = None,
+        qualifying_market_fast_path: Mapping[str, object] | None = None,
     ) -> None:
         if type(ledger) is not PaperLedger:
             raise ValueError("Paper runtime requires the exact durable ledger.")
@@ -488,6 +496,37 @@ class LaneIIIPaperRuntime:
             and self.policy.artifact.entry_profile_version
             == PONG_ENTRY_PROFILE_VERSION
         )
+        expected_fast_path = {
+            "architecture": PONG_NO_FHB_QUALIFYING_ARCHITECTURE,
+            "selected_profile": PONG_ENTRY_PROFILE_VERSION,
+            "paper_topology_version": DEC26_TOPOLOGY.version,
+            "pong_topology_version": DEC26_TOPOLOGY.version,
+            "scheduling_mode": PONG_QUALIFYING_SCHEDULING_MODE,
+            "interval_ms": PONG_QUALIFYING_INTERVAL_MS,
+            "activation_authorized": False,
+        }
+        if qualifying_market_fast_path is not None:
+            if (
+                dict(qualifying_market_fast_path) != expected_fast_path
+                or not self._pong_profile
+                or self._instrument != DEC26_TOPOLOGY.native_instrument
+                or self._canonical_contract != DEC26_TOPOLOGY.canonical_contract
+            ):
+                raise ValueError("PONG_QUALIFYING_MARKET_FAST_PATH_IDENTITY_INVALID")
+            self._qualifying_market_fast_path_identity: dict[str, object] | None = dict(
+                expected_fast_path
+            )
+        else:
+            self._qualifying_market_fast_path_identity = None
+        self._qualifying_market_fast_path_records = 0
+        self._qualifying_market_full_fallback_records = 0
+        self._qualifying_market_full_fallback_reasons = {
+            "CONTROL_OR_NON_MARKET": 0,
+            "RECEIVER_IDENTITY_REFUSED": 0,
+            "RUNTIME_STATE_DRIFT": 0,
+            "LEDGER_POLICY_REQUIRES_FULL_INGEST": 0,
+            "EVENT_TIMESTAMP_MOVED_BACKWARD": 0,
+        }
         self._continuous_scalper_profile = (
             self.policy.artifact.entry_profile_version
             in {PAPER_ENTRY_PROFILE_VERSION, PONG_ENTRY_PROFILE_VERSION}
@@ -3195,6 +3234,14 @@ class LaneIIIPaperRuntime:
                 "maximum_quantity": self.risk.binding.maximum_quantity,
                 "available_loss_allowance_dollars": str(loss_remaining),
                 "live_authority": "DISARMED",
+                "qualifying_market_fast_path": {
+                    "configured": self._qualifying_market_fast_path_identity is not None,
+                    "records": self._qualifying_market_fast_path_records,
+                    "full_fallback_records": self._qualifying_market_full_fallback_records,
+                    "full_fallback_reasons": dict(
+                        self._qualifying_market_full_fallback_reasons
+                    ),
+                },
                 "execution_session_id": (
                     None if transport is None else transport.execution_session_id
                 ),
@@ -5067,6 +5114,210 @@ class LaneIIIPaperRuntime:
                 # authority rather than synchronously trying to drain it.
                 self._pause_for_ledger_capacity_locked()
 
+    def _qualifying_market_runtime_state_safe_locked(self) -> bool:
+        snapshot = self._snapshot
+        return (
+            self._state in {PaperRuntimeState.DISABLED, PaperRuntimeState.READY_DISARMED}
+            and self._position is PaperDirection.FLAT
+            and self._position_quantity == 0
+            and snapshot.current_position is PaperDirection.FLAT
+            and snapshot.current_position_quantity == 0
+            and snapshot.working_owned_orders == 0
+            and snapshot.working_entry_orders == 0
+            and not snapshot.foreign_activity
+            and not snapshot.unresolved_command
+            and not snapshot.unresolved_native_order
+            and not snapshot.unresolved_execution
+            and (
+                self._state is PaperRuntimeState.DISABLED
+                or (
+                    snapshot.position_snapshot_complete
+                    and snapshot.order_snapshot_complete
+                    and snapshot.reconciliation_current
+                )
+            )
+            and self._entry_owner is PaperEntryOwner.NONE
+            and self._commissioning_ownership is None
+            and self._operational_session is None
+            and self._bounded_trial is None
+            and self._armed_session is None
+            and self._pong_entry_fence_active
+            and not self._disarm_after_flat
+            and self._pending_intent is None
+            and self._pending_grant is None
+            and self._pending_exit_command_id is None
+            and self._pending_five_minute_reversal is None
+            and not self._post_entry_reconciliation_pending
+            and not self._post_exit_reconciliation_pending
+        )
+
+    @staticmethod
+    def _qualifying_market_observation_identity_exact(
+        observation: NinjaTraderObservation,
+    ) -> bool:
+        return (
+            type(observation) is NinjaTraderObservation
+            and observation.observation_type in {"QUOTE", "TRADE", "DEPTH"}
+            and observation.schema == L3F3_SCHEMA
+            and observation.signature_verified is True
+            and observation.producer is not None
+        )
+
+    def _record_qualifying_market_fallback_locked(
+        self, reason: str, observation: NinjaTraderObservation,
+    ) -> None:
+        self._qualifying_market_full_fallback_records += 1
+        self._qualifying_market_full_fallback_reasons[reason] += 1
+        self.ingest(observation)
+
+    def ingest_qualifying_disarmed_pong_market(
+        self, observation: NinjaTraderObservation,
+    ) -> None:
+        """Ingest exact disarmed qualifying Pong market state without discarded payload work."""
+        with self._lock:
+            if self._state in {PaperRuntimeState.STOPPING, PaperRuntimeState.STOPPED}:
+                return
+            if self._qualifying_market_fast_path_identity is None:
+                self._record_qualifying_market_fallback_locked(
+                    "CONTROL_OR_NON_MARKET", observation,
+                )
+                return
+            if type(observation) is not NinjaTraderObservation:
+                raise ValueError("PONG_QUALIFYING_MARKET_OBSERVATION_TYPE_INVALID")
+            if observation.observation_type not in {"QUOTE", "TRADE", "DEPTH"}:
+                self._record_qualifying_market_fallback_locked(
+                    "CONTROL_OR_NON_MARKET", observation,
+                )
+                return
+            if (
+                not self._qualifying_market_observation_identity_exact(observation)
+                or observation.payload.get("contract_id") != self._instrument
+            ):
+                self._record_qualifying_market_fallback_locked(
+                    "RECEIVER_IDENTITY_REFUSED", observation,
+                )
+                return
+            if not self._qualifying_market_runtime_state_safe_locked():
+                self._record_qualifying_market_fallback_locked(
+                    "RUNTIME_STATE_DRIFT", observation,
+                )
+                return
+            context, session_reason = self._resolve_observation_session(observation)
+            if session_reason == "EVENT_TIMESTAMP_MOVED_BACKWARD":
+                self._record_qualifying_market_fallback_locked(
+                    "EVENT_TIMESTAMP_MOVED_BACKWARD", observation,
+                )
+                return
+            receipt = self.ledger.admit_suppressed_passive_market_observation(observation)
+            if receipt is None:
+                self._record_qualifying_market_fallback_locked(
+                    "LEDGER_POLICY_REQUIRES_FULL_INGEST", observation,
+                )
+                return
+            if not self._deferred_admission_receipt_healthy_locked(receipt):
+                self._pause_for_ledger_capacity_locked(receipt)
+                return
+            before_classified = (
+                self.policy.classified_trade_count()
+                if observation.observation_type == "TRADE" else 0
+            )
+            reset_before = self.policy.reset_count()
+            reason = self.policy.ingest_pong_runtime_state(
+                observation,
+                current_position=self._position,
+                pending_order=False,
+                session_context=context,
+            )
+            decision = self._complete_policy_ingest_locked(
+                observation,
+                None,
+                reason,
+                before_classified=before_classified,
+                reset_before=reset_before,
+            )
+            if decision is not None:
+                raise RuntimeError("PONG_QUALIFYING_MARKET_FAST_PATH_CREATED_DECISION")
+            self._qualifying_market_fast_path_records += 1
+            self._evaluate_risk_exit(observation.ninja_receipt_time)
+            self._maintain_perpetual_position_locked("HEALTH_OR_DATA_RECOVERY")
+
+    def _complete_policy_ingest_locked(
+        self,
+        observation: NinjaTraderObservation,
+        decision: PaperDecision | None,
+        decision_reason: str | None,
+        *,
+        before_classified: int,
+        reset_before: int,
+    ) -> PaperDecision | None:
+        """Apply the common snapshot, warmup, epoch, and Pong authority boundary."""
+        reset_after = self.policy.reset_count()
+        if reset_after != reset_before:
+            self._reset_commissioning_warmup(
+                decision_reason or "PROVISIONAL_OBSERVATION_DOMAIN_RESET"
+            )
+        self._last_policy_reset_count = reset_after
+        after_classified, warmed, depth_recovering = self.policy.runtime_gate_state()
+        event_at = self._market_event_timestamp(observation)
+        update: dict[str, object] = {
+            "observed_at": normalized_utc(event_at, "Runtime observation time")
+        }
+        if observation.observation_type == "QUOTE" and self._valid_quote(observation):
+            bid = Decimal(str(observation.payload["bid"]))
+            ask = Decimal(str(observation.payload["ask"]))
+            self._last_quote = (bid, ask, event_at)
+            mark = bid if self._position is PaperDirection.LONG else ask
+            self._update_unrealized_pnl_locked(mark)
+            update["quote_observed_at"] = event_at
+            update["market_price_connected"] = True
+        elif observation.observation_type == "TRADE":
+            price = self._decimal(observation.payload.get("price"))
+            if price is not None:
+                self._last_trade = (price, event_at)
+            if after_classified > before_classified:
+                update["classified_trade_observed_at"] = event_at
+        elif observation.observation_type == "DEPTH" and observation.payload.get("is_reset") is not True:
+            self._last_depth_at = event_at
+            update["depth_mutation_observed_at"] = event_at
+        if decision_reason == "LOCAL_SEQUENCE_GAP":
+            update["local_sequence_gap"] = True
+        if decision_reason in {
+            "DEPTH_RESET", "OBSERVATION_SESSION_CHANGED", "BRIDGE_RECONNECT",
+            "MARKET_DATA_RECONNECTED",
+        }:
+            update["depth_reset_recovery"] = True
+            update["evidence_warmed"] = False
+        update["evidence_warmed"] = warmed
+        update["depth_reset_recovery"] = depth_recovering
+        if decision_reason == "MARKET_DATA_DISCONNECTED":
+            update["market_price_connected"] = False
+            update["evidence_warmed"] = False
+            if self._perpetual_position_profile:
+                self._perpetual_flat_blocker = "MARKET_DATA_DISCONNECTED"
+        elif (
+            decision_reason == "MARKET_DATA_RECONNECTED"
+            and self._perpetual_position_profile
+            and self._position is PaperDirection.FLAT
+        ):
+            self._perpetual_flat_blocker = None
+        if warmed:
+            update["local_sequence_gap"] = False
+        prior_snapshot = self._snapshot
+        self._snapshot = replace(self._snapshot, **update)
+        commissioning_guard_fields = (
+            "market_price_connected", "evidence_warmed", "commissioning_session_warmed",
+            "local_sequence_gap", "depth_reset_recovery",
+        )
+        if any(
+            getattr(prior_snapshot, field) != getattr(self._snapshot, field)
+            for field in commissioning_guard_fields
+        ):
+            self._advance_commissioning_authority_epoch()
+        self._observe_commissioning_warmup(event_at)
+        if self._pong_profile:
+            return None
+        return decision
+
     def ingest(self, observation: NinjaTraderObservation) -> None:
         with self._lock:
             if self._state in {PaperRuntimeState.STOPPING, PaperRuntimeState.STOPPED}:
@@ -5185,73 +5436,14 @@ class LaneIIIPaperRuntime:
                 pending_order=self._state in {PaperRuntimeState.ENTRY_PENDING, PaperRuntimeState.EXIT_PENDING},
                 session_context=context,
             )
-            reset_after = self.policy.reset_count()
-            if reset_after != reset_before:
-                self._reset_commissioning_warmup(
-                    decision.reason_code if decision is not None else "PROVISIONAL_OBSERVATION_DOMAIN_RESET"
-                )
-            self._last_policy_reset_count = reset_after
-            after_classified, warmed, depth_recovering = self.policy.runtime_gate_state()
-            # Paper freshness follows the declared local callback authority.
-            # Provider timestamps remain source provenance but independent
-            # market-data streams do not form one provider-ordered clock.
-            event_at = self._market_event_timestamp(observation)
-            update: dict[str, object] = {"observed_at": normalized_utc(event_at, "Runtime observation time")}
-            if observation.observation_type == "QUOTE" and self._valid_quote(observation):
-                bid, ask = Decimal(str(observation.payload["bid"])), Decimal(str(observation.payload["ask"]))
-                self._last_quote = (bid, ask, event_at)
-                mark = bid if self._position is PaperDirection.LONG else ask
-                self._update_unrealized_pnl_locked(mark)
-                update["quote_observed_at"] = event_at
-                update["market_price_connected"] = True
-            elif observation.observation_type == "TRADE":
-                price = self._decimal(observation.payload.get("price"))
-                if price is not None:
-                    self._last_trade = (price, event_at)
-                if after_classified > before_classified:
-                    update["classified_trade_observed_at"] = event_at
-            elif observation.observation_type == "DEPTH" and observation.payload.get("is_reset") is not True:
-                self._last_depth_at = event_at
-                update["depth_mutation_observed_at"] = event_at
-            if decision is not None and decision.reason_code == "LOCAL_SEQUENCE_GAP":
-                update["local_sequence_gap"] = True
-            if decision is not None and decision.reason_code in {"DEPTH_RESET", "OBSERVATION_SESSION_CHANGED", "BRIDGE_RECONNECT", "MARKET_DATA_RECONNECTED"}:
-                update["depth_reset_recovery"] = True
-                update["evidence_warmed"] = False
-            update["evidence_warmed"] = warmed
-            update["depth_reset_recovery"] = depth_recovering
-            if decision is not None and decision.reason_code == "MARKET_DATA_DISCONNECTED":
-                update["market_price_connected"] = False
-                update["evidence_warmed"] = False
-                if self._perpetual_position_profile:
-                    self._perpetual_flat_blocker = "MARKET_DATA_DISCONNECTED"
-            elif (
-                decision is not None
-                and decision.reason_code == "MARKET_DATA_RECONNECTED"
-                and self._perpetual_position_profile
-                and self._position is PaperDirection.FLAT
-            ):
-                self._perpetual_flat_blocker = None
-            if warmed:
-                update["local_sequence_gap"] = False
-            prior_snapshot = self._snapshot
-            self._snapshot = replace(self._snapshot, **update)
-            commissioning_guard_fields = (
-                "market_price_connected", "evidence_warmed", "commissioning_session_warmed",
-                "local_sequence_gap", "depth_reset_recovery",
+            decision = self._complete_policy_ingest_locked(
+                observation,
+                decision,
+                None if decision is None else decision.reason_code,
+                before_classified=before_classified,
+                reset_before=reset_before,
             )
-            if any(
-                getattr(prior_snapshot, field) != getattr(self._snapshot, field)
-                for field in commissioning_guard_fields
-            ):
-                self._advance_commissioning_authority_epoch()
-            self._observe_commissioning_warmup(event_at)
-            if self._pong_profile:
-                # Pong uses this admission only for the shared authenticated
-                # freshness/reconciliation risk snapshot.  Its sole strategy
-                # authority is the durable Pong bridge; legacy policy output
-                # must never create a second entry producer.
-                decision = None
+            event_at = self._market_event_timestamp(observation)
             if (
                 decision is None
                 and self._perpetual_position_profile

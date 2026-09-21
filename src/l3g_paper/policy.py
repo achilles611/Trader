@@ -379,6 +379,36 @@ class ExperimentalPaperPolicy:
             session_context=session_context,
         )
 
+    def ingest_pong_runtime_state(
+        self,
+        observation: NinjaTraderObservation,
+        *,
+        current_position: PaperDirection = PaperDirection.FLAT,
+        pending_order: bool = False,
+        session_context: PaperSessionContext | None = None,
+    ) -> str:
+        """Apply the exact Pong policy state transition without allocating its discarded decision."""
+        if not self._pong_profile:
+            raise ValueError("Pong state-only ingestion requires the exact Pong policy profile.")
+        if (
+            type(observation) is not NinjaTraderObservation
+            or observation.observation_type not in {"QUOTE", "TRADE", "DEPTH"}
+        ):
+            raise ValueError("Pong state-only ingestion requires an exact passive market observation.")
+        with self._lock:
+            self._pong_state_only_reason: str | None = None
+            decision = self._ingest(
+                observation,
+                current_position=current_position,
+                pending_order=pending_order,
+                evaluate_passive=False,
+                session_context=session_context,
+                suppress_pong_decision=True,
+            )
+            if decision is not None or self._pong_state_only_reason is None:
+                raise RuntimeError("PONG_STATE_ONLY_INGESTION_DID_NOT_SUPPRESS_DECISION")
+            return self._pong_state_only_reason
+
     def _ingest(
         self,
         observation: NinjaTraderObservation,
@@ -387,10 +417,24 @@ class ExperimentalPaperPolicy:
         pending_order: bool,
         evaluate_passive: bool,
         session_context: PaperSessionContext | None,
+        suppress_pong_decision: bool = False,
     ) -> PaperDecision | None:
         if type(observation) is not NinjaTraderObservation:
             raise ValueError("Paper policy consumes exact admitted NinjaTrader observations.")
         with self._lock:
+            if suppress_pong_decision and not self._pong_profile:
+                raise ValueError("Pong decision suppression requires the exact Pong policy profile.")
+
+            def no_trade(reason: str) -> PaperDecision | None:
+                if not suppress_pong_decision:
+                    return self._decision(
+                        observation, PaperDecisionKind.NO_TRADE, None, reason,
+                    )
+                self._pong_state_only_reason = reason
+                self._counters["decisions_no_trade"] += 1
+                self._suppress(reason)
+                return None
+
             resolution = None if session_context is not None else self._session_resolver.resolve(
                 self._market_event_timestamp(observation), generation=self._paper_session_context.session_generation,
             )
@@ -398,29 +442,29 @@ class ExperimentalPaperPolicy:
                 if observation.observation_type in {"QUOTE", "TRADE", "DEPTH"}:
                     time_fault = self._validate_time(observation)
                     if time_fault is not None:
-                        return self._decision(observation, PaperDecisionKind.NO_TRADE, None, time_fault)
+                        return no_trade(time_fault)
                 self._clear_provisional()
-                return self._decision(observation, PaperDecisionKind.NO_TRADE, None, "TIMESTAMP_MOVED_BACKWARD")
+                return no_trade("TIMESTAMP_MOVED_BACKWARD")
             context = session_context or resolution.context  # type: ignore[union-attr]
             self._activate_session(context)
             fault = self._continuity(observation)
             if fault is not None:
-                return self._decision(observation, PaperDecisionKind.NO_TRADE, None, fault)
+                return no_trade(fault)
 
             if observation.observation_type in {"QUOTE", "TRADE", "DEPTH"}:
                 time_fault = self._validate_time(observation)
                 if time_fault is not None:
-                    return self._decision(observation, PaperDecisionKind.NO_TRADE, None, time_fault)
+                    return no_trade(time_fault)
 
             if observation.observation_type == "CONNECTION" and observation.payload.get("scope") == "MARKET_DATA":
                 state = str(observation.payload.get("price_status", "UNKNOWN")).upper()
                 self._price_connected = state == "CONNECTED"
                 if not self._price_connected:
                     self._clear_provisional()
-                    return self._decision(observation, PaperDecisionKind.NO_TRADE, None, "MARKET_DATA_DISCONNECTED")
+                    return no_trade("MARKET_DATA_DISCONNECTED")
                 # A connection recovery creates a new provisional evidence domain.
                 self._clear_provisional()
-                return self._decision(observation, PaperDecisionKind.NO_TRADE, None, "MARKET_DATA_RECONNECTED")
+                return no_trade("MARKET_DATA_RECONNECTED")
 
             if self._perpetual_position_profile or self._continuous_scalper_profile:
                 exchange_blocker = perpetual_exchange_blocker(
@@ -428,17 +472,15 @@ class ExperimentalPaperPolicy:
                 )
                 if exchange_blocker is not None:
                     self._clear_provisional()
-                    return self._decision(
-                        observation, PaperDecisionKind.NO_TRADE, None, exchange_blocker,
-                    )
+                    return no_trade(exchange_blocker)
             elif context.session_kind is PaperSessionKind.OFF_SESSION:
-                return self._decision(observation, PaperDecisionKind.NO_TRADE, None, "OFF_SESSION")
+                return no_trade("OFF_SESSION")
 
             if observation.observation_type not in {"QUOTE", "TRADE", "DEPTH"}:
-                return self._decision(observation, PaperDecisionKind.NO_TRADE, None, "NON_MARKET_OBSERVATION")
+                return no_trade("NON_MARKET_OBSERVATION")
             if not self._contract_matches(observation):
                 self._clear_provisional()
-                return self._decision(observation, PaperDecisionKind.NO_TRADE, None, "CONTRACT_MISMATCH")
+                return no_trade("CONTRACT_MISMATCH")
             five_minute_boundary = (
                 self._claim_five_minute_boundary(observation)
                 if self._five_minute_profile else None
@@ -460,7 +502,7 @@ class ExperimentalPaperPolicy:
             else:
                 reason = self._ingest_depth(observation)
             if reason is not None:
-                return self._decision(observation, PaperDecisionKind.NO_TRADE, None, reason)
+                return no_trade(reason)
             self._market_observation_history.append(observation)
             # An admitted callback for the exact bound instrument is itself
             # truthful evidence that the price stream is delivering.  This is
@@ -471,8 +513,7 @@ class ExperimentalPaperPolicy:
                 # Legacy loopback validation does not authenticate a Pong
                 # producer or prove complete hourly trade/depth coverage.
                 # Profile registration must never fall through to Scalper.
-                return self._decision(observation, PaperDecisionKind.NO_TRADE, None,
-                                      "PONG_NATIVE_INPUT_CONTRACT_UNCOMMISSIONED")
+                return no_trade("PONG_NATIVE_INPUT_CONTRACT_UNCOMMISSIONED")
             if self._five_minute_profile:
                 if five_minute_decision is not None:
                     return five_minute_decision

@@ -124,6 +124,37 @@ WATCHER_MAX_SUBSCRIPTIONS = 10
 NINJATRADER_RUNTIME_LOGGER = logging.getLogger("uvicorn.error")
 
 
+def _qualifying_market_fast_path_identity(
+    *,
+    architecture: str | None,
+    selected_profile: str,
+    paper_topology_version: str,
+    pong_topology_version: str,
+    scheduling_mode: str,
+    interval_ms: int,
+    activation_authorized: bool,
+) -> dict[str, object] | None:
+    identity: dict[str, object] = {
+        "architecture": architecture,
+        "selected_profile": selected_profile,
+        "paper_topology_version": paper_topology_version,
+        "pong_topology_version": pong_topology_version,
+        "scheduling_mode": scheduling_mode,
+        "interval_ms": interval_ms,
+        "activation_authorized": activation_authorized,
+    }
+    expected: dict[str, object] = {
+        "architecture": PONG_NO_FHB_QUALIFYING_ARCHITECTURE,
+        "selected_profile": PONG_ENTRY_PROFILE_VERSION,
+        "paper_topology_version": DEC26_TOPOLOGY.version,
+        "pong_topology_version": DEC26_TOPOLOGY.version,
+        "scheduling_mode": PONG_QUALIFYING_SCHEDULING_MODE,
+        "interval_ms": PONG_QUALIFYING_INTERVAL_MS,
+        "activation_authorized": False,
+    }
+    return expected if identity == expected else None
+
+
 def _pong_market_collection_only(
     independent: bool,
     profile: str,
@@ -1878,6 +1909,15 @@ def create_control_center_app(
     elif configured_qualifying_architecture is not None:
         raise ValueError("PONG_QUALIFYING_ARCHITECTURE_PROFILE_INVALID")
     pong_qualifying_architecture = configured_qualifying_architecture
+    qualifying_market_fast_path_identity = _qualifying_market_fast_path_identity(
+        architecture=pong_qualifying_architecture,
+        selected_profile=selected_paper_profile.selection_key,
+        paper_topology_version=paper_topology.version,
+        pong_topology_version=pong_topology.version,
+        scheduling_mode=pong_scheduling.mode.value,
+        interval_ms=pong_scheduling.interval_ms,
+        activation_authorized=pong_bounded_activation,
+    )
     perpetual_seed_artifact: Mapping[str, object] | None = None
     perpetual_seed_proof: Mapping[str, object] | None = None
     perpetual_seed_manifest: Mapping[str, object] | None = None
@@ -2612,6 +2652,7 @@ def create_control_center_app(
                     None if risk_continuity_artifact is None
                     else risk_continuity_artifact["snapshot"]  # type: ignore[arg-type]
                 ),
+                qualifying_market_fast_path=qualifying_market_fast_path_identity,
             )
             if type(paper_runtime) is not LaneIIIPaperRuntime:
                 raise RuntimeError("LANE_III_PAPER factory must return the exact paper runtime")
@@ -2658,7 +2699,12 @@ def create_control_center_app(
                 shadow_transport=shadow.on_transport_state,
                 shadow_rejection=shadow.record_raw_rejection,
                 shadow_duplicate=shadow.record_raw_duplicate,
-                paper_observation=paper_runtime.ingest,
+                paper_observation=(
+                    paper_runtime.ingest_qualifying_disarmed_pong_market
+                    if qualifying_market_fast_path_identity is not None
+                    and lane_iii_paper_factory is None
+                    else paper_runtime.ingest
+                ),
                 paper_transport=paper_runtime.on_observation_transport_state,
                 paper_rejection=paper_runtime.on_observation_rejection,
                 paper_duplicate=paper_runtime.on_observation_duplicate,

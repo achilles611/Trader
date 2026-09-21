@@ -21,6 +21,7 @@ import time
 from typing import Iterator, Mapping
 from uuid import uuid4
 
+from src.l3f_provider.ninjatrader_observation import L3F3_SCHEMA, NinjaTraderObservation
 from src.lane_iii.contracts import canonical_hash, normalized_utc
 
 from .contracts import (
@@ -3016,6 +3017,31 @@ class PaperLedger:
                 })
                 return receipt
         return self._enqueue_deferred_prepared(prepared)
+
+    def admit_suppressed_passive_market_observation(
+        self, observation: NinjaTraderObservation,
+    ) -> dict[str, object] | None:
+        """Atomically account for one exact suppressed market envelope without preparing it."""
+        if (
+            self._persist_high_frequency_records
+            or type(self.policy) is not PongPaperPolicyArtifact
+            or type(observation) is not NinjaTraderObservation
+            or observation.observation_type not in _PASSIVE_MARKET_OBSERVATION_TYPES
+            or observation.schema != L3F3_SCHEMA
+            or observation.signature_verified is not True
+            or observation.producer is None
+            or observation.payload.get("contract_id") != self.binding.instrument
+        ):
+            return None
+        with self._deferred_condition:
+            self._suppressed_high_frequency_records += 1
+            self._suppressed_high_frequency_by_domain["OBSERVATION"] += 1
+            receipt = self._capacity_snapshot_locked(time.perf_counter())
+            receipt.update({
+                "persistence_action": "SUPPRESSED",
+                "persistence_reason": "AUTHORITY_LEDGER_HIGH_FREQUENCY_DISABLED",
+            })
+            return receipt
 
     def append_commissioning_attestation_deferred(
         self,
