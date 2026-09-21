@@ -1,8 +1,11 @@
 # Experiment registry — no-FHB qualification readiness
 
-All optional experiments are **not authorized for timing yet**. `BASELINE_R`
-and a clean authoritative-initialization corpus do not exist. Mandatory R1–R4
-repairs are correctness/lifecycle work and are not required to show a speedup.
+`BASELINE_R` is sealed at `c76cccc2a3242f9bda00f4677648f589f70be317`
+with observer source identity `585a57d4...fa2344`. No clean authoritative-
+initialization corpus exists, so no performance timing is authorized. E1–E3
+and E5–E7 are closed below from current-code/telemetry evidence. E4 was the only
+applicable reliability prototype; it is now parked inconclusive and excluded
+from the qualifying source.
 
 ## Common finite budget and adoption rule
 
@@ -29,8 +32,7 @@ repairs are correctness/lifecycle work and are not required to show a speedup.
 
 ## E1 — validated event representation and reusable canonical material
 
-- **Status:** `PREREGISTERED_CONDITIONAL`; first performance family after
-  `BASELINE_R`.
+- **Status:** `NOT_APPLICABLE_WITH_EVIDENCE`.
 - **Measured bottleneck required:** current production-path counts/timing must
   confirm repeat encode/decode, canonicalization, parsing/sorting/copying, or
   digest reconstruction after the trust boundary.
@@ -49,11 +51,17 @@ repairs are correctness/lifecycle work and are not required to show a speedup.
 - **Dependency impact:** prefer existing dependencies/in-process refactor.
 - **Acceptance:** common 5%/10% rule; arbitrary caller `verified=True`, mutable
   aliasing, lost independent verification, or weak gain is rejected/parked.
+- **Disposition evidence:** baseline already parses once into one frozen typed
+  observation, freezes nested JSON on ownership transfer, caches signed and
+  unsigned canonical bytes plus wire hash, and fans that same admitted object
+  to collector and host. No current telemetry isolates residual repeat
+  representation work as a material bottleneck; a duplicate prototype would
+  not test a distinct hypothesis.
 - **Attempts used:** 0 implementation, 0 corrective, 0 warmup/screen/pairs.
 
 ## E2 — bounded batch drain and byte-stream framing
 
-- **Status:** `PREREGISTERED_CONDITIONAL_ON_MEASUREMENT`.
+- **Status:** `NOT_APPLICABLE_WITH_EVIDENCE`.
 - **Measured bottleneck required:** current exact-path read/write/encode call
   counts or framing/buffer overhead remain material after repairs/E1.
 - **Hypothesis:** drain already-waiting complete frames in bounded writes and
@@ -70,11 +78,17 @@ repairs are correctness/lifecycle work and are not required to show a speedup.
 - **Acceptance:** common gate, unchanged latency/security/delivery semantics.
   Buffer growth, batch delivery without proof, duplicates, or low-rate delay
   rejects the candidate.
+- **Disposition evidence:** baseline native transport already drains a bounded
+  maximum of 256 frames/524,288 characters into one ordered write outside the
+  callback lock. The receiver consumes every complete newline frame in each
+  bounded read and retains partial/oversize/controlled-shutdown semantics. The
+  failed natural epoch attributes loss to absent receiver/transport availability,
+  not missing batching or one-frame parsing.
 - **Attempts used:** 0.
 
 ## E3 — sequence-owned pooled buffers or bounded ring storage
 
-- **Status:** `DEFERRED_CONDITIONAL`; cannot run before E1/E2 measurement.
+- **Status:** `NOT_APPLICABLE_WITH_EVIDENCE`.
 - **Measured bottleneck required:** residual allocation or lock pressure at the
   native producer/sender boundary.
 - **Hypothesis:** a compatible bounded short-lock pool or sequence-owned queue
@@ -88,19 +102,25 @@ repairs are correctness/lifecycle work and are not required to show a speedup.
 - **Acceptance:** stronger 15% gate if it adds dependency/ownership complexity.
   Broad rewrite, false single-producer premise, busy-spin contention, or weak
   whole-path gain parks/rejects it.
+- **Disposition evidence:** E1 and E2 mechanisms are already present, and no
+  residual allocation/lock bottleneck is measured. Native callbacks are
+  multi-producer into an existing bounded FIFO, so a single-producer ring premise
+  is false; no new dependency or hand-written lock-free structure is justified.
 - **Attempts used:** 0.
 
 ## E4 — collector/host lifecycle separation
 
-- **Status:** `APPLICABLE_RELIABILITY_PROTOTYPE_AFTER_R1_R3`; supports R2.
+- **Status:** `PARKED_INCONCLUSIVE`; fixed budget exhausted; not integrated.
 - **Observed blocker:** last proof started with stale pre-start producer backlog
   and large failure deltas; receiver readiness and producer generation were not
   a clean authoritative boundary.
 - **Hypothesis:** the smallest supported lifecycle extension around the existing
   independently owned collector removes receiver-downtime/stale-start coupling
   without introducing an always-on service or another analytical owner.
-- **Owner/files:** Sol owns lifecycle/shared configuration. A specialist may
-  prepare isolated source/tests only with disjoint paths; Sol alone operates.
+- **Owner/files:** `/root/python_r3` owns only new
+  `src/l3g_paper/pong_lifecycle.py` and
+  `tests/test_l3g_pong_lifecycle.py`. Sol owns any later integration/shared
+  configuration and alone operates.
 - **Primary metric:** reliability: listener-ready handshake, attributable new
   source boundary, lossless bounded capture across planned host stop/reattach.
 - **Comparator:** source absent, host stop with collector retained, authoritative
@@ -110,11 +130,30 @@ repairs are correctness/lifecycle work and are not required to show a speedup.
 - **Acceptance:** reproducibly remove stale-start coupling with non-regressing
   admission/latency/durability. Prefer a smaller existing-collector lifecycle
   change over process splitting.
-- **Attempts used:** 0.
+- **Initial review:** not accepted. The first prototype had an unbounded
+  in-flight delivery wait and no authoritative collector/source-generation/
+  sequence/durability checkpoint passed to the replacement host, so it could
+  hang lifecycle control or attach mid-mutation without an attributable prefix.
+- **Corrective result:** not accepted. The two untracked prototype files were
+  `src/l3g_paper/pong_lifecycle.py` (695 lines, SHA-256
+  `1196d21ff5d18f6b603d2bde130c38df16a03d898cee4df0bbc81de7af0fe474`)
+  and `tests/test_l3g_pong_lifecycle.py` (542 lines, SHA-256
+  `f3a435a539bf39f996a621ac9c6693c9ba09f9b3b45bf7e21e08bea3fbf39f53`).
+  Compilation and no-index diff checks passed; focused tests were 11/13, with
+  two stale expectations. The material failures are architectural: lifecycle
+  ingress is held across real host startup; a continuously settled
+  enqueued=written=durable boundary may not exist; and the collector has no
+  durable-prefix per-stream source-sequence checkpoint for authoritative
+  reattach. A second corrective is forbidden.
+- **Disposition path:** preserve these hashes and findings, delete the two
+  untracked prototype files, and keep them absent from the qualifying import/
+  hash graph. Reopening requires a separately authorized architecture pass.
+- **Attempts used:** one initial implementation and one corrective revision;
+  no runtime, timing, warmup or paired runs.
 
 ## E5 — strict faster decoder alternatives
 
-- **Status:** `DEFERRED_CONDITIONAL_AFTER_E1`.
+- **Status:** `NOT_APPLICABLE_WITH_EVIDENCE`.
 - **Measured bottleneck required:** strict decode/adapter work remains material
   in E1-repaired production path.
 - **Hypothesis:** one preregistered msgspec or orjson role reduces whole-path
@@ -130,11 +169,14 @@ repairs are correctness/lifecycle work and are not required to show a speedup.
   rollback; alternatives are named before results, not an open sweep.
 - **Acceptance:** stronger 15% gate for a new dependency. A second full parse,
   canonical drift, unsupported wheel/runtime, or weak whole-path benefit parks.
+- **Disposition evidence:** baseline E1 behavior is already present, no strict
+  decoder dominance is measured, and neither named binary codec is an existing
+  dependency. The stronger dependency gate therefore has no admissible trigger.
 - **Attempts used:** 0.
 
 ## E6 — DBN-inspired compact internal record layout
 
-- **Status:** `DEFERRED_CONDITIONAL_AFTER_E1`; avoid double-counting E1.
+- **Status:** `NOT_APPLICABLE_WITH_EVIDENCE`.
 - **Measured bottleneck required:** representation/materialization cost remains
   material after E1.
 - **Hypothesis:** compact typed internal fields, exact integer ticks where valid,
@@ -150,11 +192,15 @@ repairs are correctness/lifecycle work and are not required to show a speedup.
   is parked for a separately approved architecture pass.
 - **Acceptance:** common gate for internal-only; 15% and full installer/
   certificate coverage for substantial representation or wire migration.
+- **Disposition evidence:** the baseline already has a frozen typed observation,
+  immutable nested payload and cached canonical material. No remaining
+  representation/materialization cost is measured; another internal format
+  would double-count E1 and a wire migration is outside this pass.
 - **Attempts used:** 0.
 
 ## E7 — staged durability preparation with truthful barriers
 
-- **Status:** `DEFERRED_CONDITIONAL_ON_MEASURED_STALL`.
+- **Status:** `NOT_APPLICABLE_WITH_EVIDENCE`.
 - **Measured bottleneck required:** current full path shows disk, encoding, lock,
   or writer wait on the critical path after prior repairs.
 - **Hypothesis:** prepare journal material once and batch already-pending writes
@@ -169,6 +215,11 @@ repairs are correctness/lifecycle work and are not required to show a speedup.
   or risk-ledger batching shortcut.
 - **Acceptance:** common gate; if writer is not the bottleneck or buffering merely
   relocates latency, disposition is not applicable or parked.
+- **Disposition evidence:** the collector already has a bounded writer queue,
+  buffered append, 1,024-record/bounded-interval flush policy, explicit fsync
+  durable watermark and final drain. The failed epoch drained
+  52,517/52,517/52,517 with collector overflow zero; its admitted failures were
+  producer overflow and transport loss, not an attributed disk/lock stall.
 - **Attempts used:** 0.
 
 ## Composite rule

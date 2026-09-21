@@ -4,8 +4,8 @@ Pass ID: `20260921-135529Z-no-fhb-qualification-readiness`
 Opened: `2026-09-21T13:55:29Z` / `2026-09-21T07:55:29-06:00`
 Administrator: Caelum (`beelzebub_admin`)
 Integrator, benchmark coordinator, and runtime operator: Sol parent
-Current phase: mandatory repairs, Gate A
-Overall verdict: **HOLD — Gate A and all runtime/performance promotion**
+Current phase: Gate B initialization prerequisites
+Overall verdict: **HOLD — runtime proof, capacity and rehearsal not complete**
 
 ## Objective and authorization
 
@@ -41,6 +41,12 @@ arm; or send orders.
   `FULL_NATIVE_DEPTH_PERIODIC_20MS_NO_FHB_V1`, scheduling
   `PERIODIC_FLAT_PROTECTED / 20 ms`, and disposition
   `EXPERIMENTAL_ARCHIVED_NOT_PART_OF_QUALIFYING_BUILD`.
+- **SEALED BASELINE_R:** commit
+  `c76cccc2a3242f9bda00f4677648f589f70be317` contains the exact reviewed
+  mandatory-repair correction and Caelum pass state. The supported derived and
+  Python observer identities were reverified equal at
+  `585a57d4c8138665b6c5734fcb84608f16c64668b028ec960371d78957fa2344`.
+  At the seal, only pre-existing unrelated audit/evidence dirt remained.
 
 ### Process, port, and machine snapshot
 
@@ -99,9 +105,9 @@ performance corpus and cannot be extended or relabelled.
 | 1 | R3 persisted host telemetry | Python telemetry owner; Sol integrates | **SOURCE/OFFLINE ACCEPTED; integration/runtime HOLD** | The final bounded revision covers the prior clock, first-fault, retry, exact queue occupancy/high-water/age, authority, scheduling-duration, final-stage and bounded-aggregate findings. Admission and dequeue bookkeeping now share one bounded logical-occupancy lock, and the forced drain race proves one admitted item still raises high-water to one. Caelum independently passed all 20 focused tests, Python compilation and diff checks. Composite integration and runtime receipts remain. |
 | 2 | R2 supported receiver-first source lifecycle | Sol only | **SOURCE/OFFLINE ACCEPTED; OPERATOR/RUNTIME HOLD** | The corrected commissioning workflow is accepted for integration: it hash-binds the pre-reload receipt and raw journal, proves receiver readiness first, and requires a distinct authenticated session/source/build with stable generation, zero loss totals/deltas, fault-free host state, exact 10x10 truth, safe authority and two advancing durable checkpoints. The old assembly's unknown cleared tail remains explicitly failed, not drained. Release still requires the actual operator F5 compile/load and a signed passing receipt; same-assembly reattach remains unsupported. |
 | 2 | R4 genuine periodic eligibility/current context | Sol only | **SOURCE PATH ACCEPTED; CURRENT-EVIDENCE HOLD** | The source audit found no scheduler defect: periodic work is owned by the existing deadline only when bridge state, runtime reconciliation/execution/position/order truth and pending-native state are independently cleanly flat; every unresolved or exposed state remains event-driven protection. The new source identity still lacks admissible 2,016-bar history, the two preceding UTC hours/current DEC26 bias, and same-epoch reconciliation/risk/ledger evidence. Release requires those actual dependencies and active periodic evidence; never force flat/ready. |
-| 3 | Seal `BASELINE_R` | Sol, after Caelum review | **ACCEPTED TO SEAL AT CORRECTION COMMIT** | Mandatory-repairs-only no-FHB source, final identity, independent review and bounded composite correction evidence are complete. No full-suite replacement is required before the seal. The resulting commit becomes the optional-experiment reference; `efea615` remains negative evidence, not a timing baseline. |
-| 4 | Optional experiment screens | Assigned disjoint owner; Sol holds benchmark lock | **NOT STARTED** | Execute only applicable preregistered E1–E7 candidates in `EXPERIMENTS.md` against `BASELINE_R` and a clean corpus. |
-| 5 | Composite integration/freeze | Sol | **BLOCKED** | Accepted candidates together pass semantic/security/durability regression and retain FHB-null identity. Freeze before runtime evidence. |
+| 3 | Seal `BASELINE_R` | Sol, after Caelum review | **PASS — SEALED** | Commit `c76cccc2a3242f9bda00f4677648f589f70be317`, source identity `585a57d4...fa2344`; mandatory-repairs-only no-FHB source, identity, independent review and bounded composite correction evidence complete. `efea615` remains negative evidence, not a timing baseline. |
+| 4 | Optional experiment screens | Assigned disjoint owner; Sol holds benchmark lock | **CLOSED — E4 PARKED INCONCLUSIVE; OTHERS NOT APPLICABLE** | E1–E3/E5–E7 are closed from current code/telemetry. E4 exhausted its initial plus one corrective budget: the correction still couples retained ingress to real host startup, depends on a continuously settled checkpoint the collector cannot expose, lacks a durable-prefix stream boundary, and finished 11/13 tests. It is not integrated. |
+| 5 | Composite integration/freeze | Sol | **PASS — BASELINE_R UNCHANGED** | No optional candidate earned integration. The frozen qualifying source remains `c76cccc2a3242f9bda00f4677648f589f70be317` with FHB absent and observer identity `585a57d4...fa2344`. |
 | 6 | Gate B short natural proof | Sol only | **BLOCKED** | One predeclared 3–5 minute supervised disarmed proof after valid initialization; persisted start/fault/end evidence and all Gate B dimensions must pass. |
 | 7 | Gate C formal capacity | Sol only | **BLOCKED** | Same frozen candidate must meet unchanged `2111/s`, `compute_workers=0`, three sustained plus three burst repeats, zero loss/reject/duplicate/overflow, bounded queues, durable drain, and wire/journal/decision parity. |
 | 8 | Gate D 20-minute rehearsal | Sol only | **BLOCKED** | Only after Gates B and C pass; one unchanged natural disarmed rehearsal with current context and persisted receipts. |
@@ -348,28 +354,30 @@ identity.
 
 ## Holds
 
-### HOLD H1 — Gate A experiment and final integration closure
+### CLOSED C1 — Gate A structural and semantic readiness
 
 - **Evidence:** R1–R4 source/offline repairs, lifecycle proof contract,
-  identities and bounded composite correction evidence are accepted. E1–E7
-  applicability and bounded outcomes are not yet closed, and no final composite
-  experiment candidate exists.
-- **Consequence:** `BASELINE_R` may be sealed and used for the preregistered
-  screens, but Gate A and Gates B–D remain closed.
-- **Release:** every E1–E7 family has an evidence-backed executed disposition or
-  `NOT_APPLICABLE_WITH_EVIDENCE`; demonstrated winners, if any, are integrated;
-  final identities and composite review pass.
+  identities and bounded composite correction evidence are accepted.
+  `BASELINE_R` is sealed. E1–E3 and E5–E7 are closed
+  `NOT_APPLICABLE_WITH_EVIDENCE`; E4 is `PARKED_INCONCLUSIVE` after its fixed
+  budget. No candidate earned integration, so the final source remains the
+  reviewed baseline with unchanged identity.
+- **Consequence:** Gate A passes. This grants only entry to controlled disarmed
+  initialization; it is not Gate B, qualification, arming or order authority.
+- **Closure:** every E1–E7 family has an evidence-backed disposition; the
+  unsuccessful E4 prototype is excluded from the qualifying import/hash graph;
+  final intended source, identity and composite review remain `BASELINE_R`.
 - **Owner:** Sol coordinates; Caelum records acceptance decisions.
 
 ### HOLD H2 — Runtime/native maintenance
 
-- **Evidence:** source/offline repairs and the R2 workflow are accepted, but the
-  correction commit is not yet sealed and no supported receiver-first
-  new-generation lifecycle receipt exists for it.
-- **Consequence:** no native install/load or natural Gate-B proof may begin from
-  the unsealed working tree. Formal capacity and rehearsal remain prohibited.
-- **Release:** Sol seals the exact reviewed correction as `BASELINE_R`, rechecks
-  its source identity and clean intended diff, brings listener and collector to
+- **Evidence:** Gate A passes, but sealed `BASELINE_R` has no supported
+  receiver-first new-generation lifecycle receipt yet.
+- **Consequence:** no natural Gate-B proof may begin until the accepted R2
+  commissioning boundary passes. Formal capacity and rehearsal remain
+  prohibited.
+- **Release:** Sol rechecks the sealed source identity and intended diff, brings
+  listener and collector to
   verified readiness, then uses the Windows operator notification for the one
   genuine F5 compile/load action. The signed R2 receipt must pass before the new
   epoch can seed a clean corpus or R4 context.
@@ -391,9 +399,10 @@ Independent source review and focused offline work continue under all holds.
 
 ## Next single action
 
-Seal the exact reviewed correction and Caelum pass updates as `BASELINE_R`, then
-reverify the committed `585a57d4...fa2344` source identity and intended diff.
-Only after that seal may Sol execute the accepted receiver-first commissioning
-workflow and request the one operator F5 compile/load action. Remain disarmed;
-no measured optional experiment, Gate-B window or order action is authorized by
-this step.
+Sol executes the accepted receiver-first commissioning workflow: preserve the
+old authenticated boundary, bring listener and collector to verified readiness,
+then use the Windows operator notification for the one genuine F5 compile/load
+action. Verify the distinct new signed session/source/build and both advancing
+zero-loss checkpoints before acquiring R4 context or declaring a clean corpus.
+Remain disarmed; no Gate-B window, capacity run, rehearsal or order action is
+authorized by this step.
