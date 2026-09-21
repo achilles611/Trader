@@ -1629,6 +1629,27 @@ class PongProductionHost:
         post_touch = Decimal(str(levels[0]["price"]))
         if operation in {"ADD", "UPDATE"}:
             if price not in post_prices:
+                mutation_position = payload.get("mutation_position")
+                outside_retained_book = (
+                    type(mutation_position) is int
+                    and mutation_position >= len(levels)
+                    and (
+                        (
+                            side is BookSide.BID
+                            and price < self._canonical_depth[side][-1][0]
+                        )
+                        or (
+                            side is BookSide.ASK
+                            and price > self._canonical_depth[side][-1][0]
+                        )
+                    )
+                )
+                if outside_retained_book:
+                    # The signed exact 10x10 snapshot remains coherent when a
+                    # native mutation occurs strictly beyond its retained
+                    # core. Preserve the source cursor/canonical recovery but
+                    # do not manufacture a visible analytical observation.
+                    return
                 if self._qualifying_architecture is not None:
                     raise ValueError(
                         "PONG_CANONICAL_DEPTH_MUTATION_NOT_IN_POST_BOOK",

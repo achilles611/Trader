@@ -13,7 +13,10 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from src.l3f_provider.ninjatrader_observation import expected_observer_source_fingerprint
+from src.l3f_provider.ninjatrader_observation import (
+    NinjaTraderObservation,
+    expected_observer_source_fingerprint,
+)
 from src.l3g_paper.contracts import PONG_ENTRY_PROFILE_VERSION
 from src.l3g_paper.fhb import FHBConfig
 from src.l3g_paper.pong import PongState
@@ -419,8 +422,10 @@ class PongProductionHostTests(unittest.TestCase):
         sequence: int,
         *,
         available: bool = True,
+        unavailable_reason: str = "CROSSED_NATIVE_POSITIONAL_SNAPSHOT",
         mutation_price: object = 100,
         resolved_price: object | None = None,
+        mutation_position: int | None = None,
         levels: int = 10,
         ask_levels: int | None = None,
         operation: str = "Update",
@@ -446,7 +451,7 @@ class PongProductionHostTests(unittest.TestCase):
             "mutation_volume": 1,
             "is_reset": reset,
             "status": "AVAILABLE" if available else "UNAVAILABLE",
-            "reason": None if available else "CROSSED_NATIVE_POSITIONAL_SNAPSHOT",
+            "reason": None if available else unavailable_reason,
             "bids": bids,
             "asks": asks,
             "source_event_sequence": sequence,
@@ -455,13 +460,49 @@ class PongProductionHostTests(unittest.TestCase):
         }
         if resolved_price is not None:
             payload["mutation_resolved_price"] = resolved_price
+        if mutation_position is not None:
+            payload["mutation_position"] = mutation_position
         return verified("DEPTH", payload, local_sequence=sequence)
 
-    def _qualifying_host(self, root: str) -> PongProductionHost:
+    @staticmethod
+    def _authentic_record_149_seam() -> list[tuple[int, NinjaTraderObservation]]:
+        fixture = (
+            Path(__file__).parent
+            / "fixtures"
+            / "pong_record_149_authentic_seam.jsonl"
+        )
+        result: list[tuple[int, NinjaTraderObservation]] = []
+        previous_hash: str | None = None
+        for line in fixture.read_text(encoding="utf-8").splitlines():
+            raw = json.loads(line)
+            if previous_hash is not None:
+                if raw["previous_record_hash"] != previous_hash:
+                    raise AssertionError("authentic replay fixture chain is broken")
+            if raw["signature_verified"] is not True:
+                raise AssertionError("authentic replay fixture was not collector verified")
+            observation = NinjaTraderObservation.from_wire(json.dumps(
+                raw["observation"], sort_keys=True, separators=(",", ":"),
+            ))
+            if observation.wire_hash() != raw["wire_hash"]:
+                raise AssertionError("authentic replay fixture wire hash changed")
+            object.__setattr__(observation, "signature_verified", True)
+            result.append((int(raw["journal_sequence"]), observation))
+            previous_hash = str(raw["record_hash"])
+        return result
+
+    def _qualifying_host(
+        self,
+        root: str,
+        *,
+        expected_source_fingerprint: str | None = None,
+    ) -> PongProductionHost:
         return PongProductionHost(
             Path(root),
             selected_profile=PONG_ENTRY_PROFILE_VERSION,
-            expected_market_source_fingerprint=expected_observer_source_fingerprint(),
+            expected_market_source_fingerprint=(
+                expected_source_fingerprint
+                or expected_observer_source_fingerprint()
+            ),
             runtime_snapshot=qualifying_runtime_snapshot,
             collector_status=pending_collection,
             controller_dispatch=lambda _kind, _reason: True,
@@ -543,6 +584,138 @@ class PongProductionHostTests(unittest.TestCase):
             self.assertEqual(recovered["ask_levels"], 10)
             self.assertEqual(recovered["last_source_sequence"], 3)
             self.assertEqual(host._depth[next(iter(host._depth))][-1].price, 100)
+
+    def test_authentic_record_149_seam_is_fail_closed_and_recovers(self) -> None:
+        records = self._authentic_record_149_seam()
+        self.assertEqual([item[0] for item in records], [146, 147, 148, 149, 150])
+        self.assertEqual(
+            [item[1].payload["source_event_sequence"] for item in records],
+            [141, 142, 143, 144, 145],
+        )
+        with TemporaryDirectory(prefix="pong-no-fhb-authentic-seam-") as root:
+            host = self._qualifying_host(
+                root,
+                expected_source_fingerprint=(
+                    records[0][1].producer.source_fingerprint
+                ),
+            )
+
+            journal_sequence, available = records[0]
+            host._consume_observation(available)
+            status = host.status()
+            self.assertEqual(journal_sequence, 146)
+            self.assertTrue(status["canonical_depth_state"]["ready"])
+            self.assertEqual(status["microstructure_pipeline"]["evaluation_count"], 1)
+
+            host._consume_observation(records[1][1])
+            status = host.status()
+            self.assertFalse(status["canonical_depth_state"]["ready"])
+            self.assertIsNone(status["input_error"])
+            self.assertEqual(status["microstructure_pipeline"]["evaluation_count"], 1)
+
+            # Record 148 is a coherent exact 10x10 recovery whose native Add
+            # occurred just outside the retained core. It must restore the
+            # canonical snapshot without inventing a visible depth event.
+            ask_events = len(host._depth[BookSide.ASK])
+            host._consume_observation(records[2][1])
+            status = host.status()
+            self.assertTrue(status["canonical_depth_state"]["ready"])
+            self.assertIsNone(status["input_error"])
+            self.assertEqual(len(host._depth[BookSide.ASK]), ask_events)
+            self.assertEqual(status["microstructure_pipeline"]["evaluation_count"], 2)
+
+            journal_sequence, unavailable = records[3]
+            self.assertEqual(journal_sequence, 149)
+            self.assertEqual(unavailable.payload["source_event_sequence"], 144)
+            self.assertEqual(unavailable.payload["mutation_operation"], "Remove")
+            self.assertEqual(unavailable.payload["mutation_position"], 11)
+            self.assertEqual(unavailable.payload["mutation_price"], 0)
+            self.assertIsNone(unavailable.payload["mutation_resolved_price"])
+            self.assertEqual(unavailable.payload["status"], "UNAVAILABLE")
+            self.assertEqual(
+                unavailable.payload["reason"],
+                "NATIVE_DEPTH_REMOVE_IDENTITY_UNRESOLVED",
+            )
+            host._consume_observation(unavailable)
+            status = host.status()
+            self.assertFalse(status["canonical_depth_state"]["ready"])
+            self.assertEqual(
+                status["canonical_depth_state"]["reason"],
+                "PONG_CANONICAL_DEPTH_UNAVAILABLE:"
+                "NATIVE_DEPTH_REMOVE_IDENTITY_UNRESOLVED",
+            )
+            self.assertEqual(host._stream_sequences["DEPTH"], 144)
+            self.assertIsNone(status["input_error"])
+            self.assertEqual(status["microstructure_pipeline"]["evaluation_count"], 2)
+
+            host._consume_observation(records[4][1])
+            status = host.status()
+            self.assertTrue(status["canonical_depth_state"]["ready"])
+            self.assertEqual(status["canonical_depth_state"]["last_source_sequence"], 145)
+            self.assertEqual(status["canonical_depth_state"]["recovery_count"], 3)
+            self.assertIsNone(status["input_error"])
+            self.assertEqual(status["microstructure_pipeline"]["evaluation_count"], 3)
+
+    def test_unavailable_shapes_never_weaken_exact_available_contract(self) -> None:
+        cases = (
+            ("unresolved", dict(
+                mutation_price=0,
+                operation="Remove",
+                unavailable_reason="NATIVE_DEPTH_REMOVE_IDENTITY_UNRESOLVED",
+            )),
+            ("partial-10x1", dict(
+                levels=10,
+                ask_levels=1,
+                unavailable_reason="NATIVE_DEPTH_EXACT_10X10_REQUIRED",
+            )),
+            ("partial-1x10", dict(
+                levels=1,
+                ask_levels=10,
+                unavailable_reason="NATIVE_DEPTH_EXACT_10X10_REQUIRED",
+            )),
+            ("crossed", dict(
+                bid_start=100.5,
+                ask_start=100.25,
+                unavailable_reason="CROSSED_NATIVE_POSITIONAL_SNAPSHOT",
+            )),
+        )
+        for name, overrides in cases:
+            with self.subTest(name=name), TemporaryDirectory(
+                prefix=f"pong-no-fhb-unavailable-{name}-",
+            ) as root:
+                host = self._qualifying_host(root)
+                host._consume_observation(self._qualifying_depth(
+                    1, available=False, **overrides,
+                ))
+                status = host.status()
+                self.assertFalse(status["canonical_depth_state"]["ready"])
+                self.assertIsNone(status["input_error"])
+                self.assertEqual(host._stream_sequences["DEPTH"], 1)
+                self.assertEqual(
+                    status["microstructure_pipeline"]["evaluation_count"], 0,
+                )
+
+    def test_malformed_available_mutation_remains_terminal(self) -> None:
+        cases = (
+            ("operation", dict(operation="Unknown"),
+             "PONG_CANONICAL_DEPTH_MUTATION_OPERATION_INVALID"),
+            ("inside-position-missing-price", dict(
+                mutation_price=99.875,
+                mutation_position=10,
+                operation="Add",
+            ), "PONG_CANONICAL_DEPTH_MUTATION_NOT_IN_POST_BOOK"),
+        )
+        for name, overrides, expected in cases:
+            with self.subTest(name=name), TemporaryDirectory(
+                prefix=f"pong-no-fhb-malformed-{name}-",
+            ) as root:
+                host = self._qualifying_host(root)
+                host._consume_observation(self._qualifying_depth(
+                    1, **overrides,
+                ))
+                status = host.status()
+                self.assertEqual(status["input_error"], expected)
+                self.assertFalse(status["canonical_depth_state"]["ready"])
 
     def test_qualifying_depth_admits_removed_best_level_identity(self) -> None:
         with TemporaryDirectory(prefix="pong-no-fhb-remove-identity-") as root:
