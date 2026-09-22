@@ -5,6 +5,7 @@ param(
     [int] $CompileTimeoutSeconds = 60,
     [int] $CheckpointSeconds = 10,
     [switch] $RequireDistinctProducer,
+    [switch] $PrepareSourceOnly,
     [string] $PreReloadReceiptPath,
     [string] $EvidencePath,
     [ValidateSet('MNQ SEP26', 'MNQ DEC26')]
@@ -24,6 +25,12 @@ if ($CheckpointSeconds -lt 5 -or $CheckpointSeconds -gt 60) {
 }
 if ($RequireDistinctProducer -and [String]::IsNullOrWhiteSpace($PreReloadReceiptPath)) {
     throw 'RequireDistinctProducer requires -PreReloadReceiptPath.'
+}
+if ($PrepareSourceOnly -and -not $InstallSource) {
+    throw 'PrepareSourceOnly requires -InstallSource.'
+}
+if ($PrepareSourceOnly -and [String]::IsNullOrWhiteSpace($EvidencePath)) {
+    throw 'PrepareSourceOnly requires -EvidencePath.'
 }
 
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -299,9 +306,11 @@ if ($RequireDistinctProducer) {
     ) {
         throw 'Pre-reload producer receipt is not one stable authenticated observe-only identity.'
     }
-    $receiverReadiness = Get-ReceiverReadiness
-    if ($receiverReadiness.ready -ne $true) {
-        throw 'Listener and independent collector must be ready before the native reload boundary.'
+    if (-not $PrepareSourceOnly) {
+        $receiverReadiness = Get-ReceiverReadiness
+        if ($receiverReadiness.ready -ne $true) {
+            throw 'Listener and independent collector must be ready before the native reload boundary.'
+        }
     }
 }
 
@@ -381,6 +390,50 @@ if (-not (Test-CompiledIdentity $expectedFingerprint) -or -not $installedCurrent
 }
 if (-not (Test-CompiledIdentity $expectedFingerprint)) {
     throw 'The compiled NinjaTrader assembly did not load the expected observer identity before timeout.'
+}
+
+if ($PrepareSourceOnly) {
+    $preparation = [ordered]@{
+        schema = 'beelzebub-unattended-ninjatrader-observer-preparation-v1'
+        milestone = 'SOURCE_INSTALLED_COMPILED_POST_RELOAD_PROOF_REQUIRED'
+        verified = $false
+        authority = 'OBSERVE_ONLY'
+        validation = $validation
+        deployment = [ordered]@{
+            install_requested = $true
+            prepare_source_only = $true
+            installed_source_parity = $installedCurrent
+            compile_status = $compileStatus
+            expected_source_fingerprint = $expectedFingerprint
+            expected_instrument = $ExpectedInstrument
+            receiver_ready_before_reload = $null
+            receiver_readiness_disposition = 'DEFERRED_TO_DISTINCT_POST_INSTALL_PRODUCER_VERIFICATION'
+            pre_reload_receipt_path = if ($RequireDistinctProducer) { $resolvedPreReload } else { $null }
+            pre_reload_receipt_sha256 = $preReloadReceiptSha256
+            pre_reload_journal = $preReloadJournal
+            pre_reload_producer = if ($RequireDistinctProducer) { $preReload.producer_boundary } else { $null }
+            compiled_assembly = $compiledAssembly
+            compiled_at = (Get-Item -LiteralPath $compiledAssembly).LastWriteTimeUtc.ToString('o')
+            compiled_sha256_before = $assemblyHashBefore
+            compiled_sha256 = Get-Sha256 $compiledAssembly
+        }
+        loaded_identity_claimed = $false
+        distinct_producer_verified = $false
+        next_required_action = 'START_EXACT_DISARMED_RECEIVER_AND_RUN_DISTINCT_PRODUCER_VERIFICATION'
+    }
+    $preparationJson = $preparation | ConvertTo-Json -Depth 10
+    $target = [IO.Path]::GetFullPath($EvidencePath)
+    [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target)) | Out-Null
+    $temporary = "$target.tmp-$([Guid]::NewGuid().ToString('N'))"
+    try {
+        [IO.File]::WriteAllText($temporary, $preparationJson + "`n", [Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temporary -Destination $target -Force
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    }
+    $preparationJson
+    exit 0
 }
 
 $first = Get-Checkpoint
