@@ -237,3 +237,101 @@ Sol must complete the current native identity/R2, fresh Full/recovery/Full and
 authenticated safety preflight early enough to review before `08:00Z`. If any
 item remains pending at the boundary, record a missed interval and stop; do not
 start a merely diagnostic 30-minute capture under a qualification label.
+
+## Final superseding review — London qualifying hour
+
+### Controlling objective change
+
+Before any qualification interval started, Joseph replaced the 30-minute
+objective with one exact qualifying hour:
+`[2026-09-22T08:00:00Z, 2026-09-22T09:00:00Z)` / `02:00–03:00 MDT`.
+The earlier 30-minute contract and Adam's interval are preserved as historical
+pre-start administration; no 30-minute collection began and none may be
+relabelled. Caelum supersedes only their interval/duration. Their identity,
+continuity, freshness, depth, durability, safety, no-repair and no-trading
+requirements remain the minimum governing conditions for the hour.
+
+The persisted `00-predeclaration.json` still names the withdrawn
+`08:00Z–08:30Z` interval, SHA-256
+`2FA884C6797B4A47201FB81EE7F788DE188B4645E73B3E0CEDD04E9EA957D7E1`.
+No qualifying-hour capture may be claimed from that artifact. The authoritative
+prestart failure receipt instead names the hour, explicitly records
+`started=false` and `qualified_seconds=0`, and preserves the no-rerun outcome.
+
+### Final disposition
+
+**`HOLD_LONDON_QUALIFYING_HOUR_PRESTART_NATIVE_LOSS_AND_SEQUENCE_GAPS`**
+
+The hold was correctly raised before `08:00Z`. The hour did not start and must
+not be slid, shortened, restarted, backfilled or rerun.
+
+### Evidence and concrete violations
+
+- R2 was consumed once (`1/1`); a second attempt is not permitted. Preparation
+  installed source `17995c2795e16bf52bedd9644a865261e3a20473f1e2bb7b75b4947bc558a525`
+  and rebuilt the on-disk DLL to SHA-256
+  `B70556DDCCE897C018255B7CFD49E2D5EC03B96CDF6A6EC6A0A06328A2CB8756`.
+  The preparation receipt itself correctly withheld loaded/distinct-producer
+  proof.
+- The subsequent prewindow run did authenticate a distinct producer: source
+  `17995c...`, build
+  `215e96a96913f37d3da3312c91f141d2e4d46f7b43aab37671a503cd9bc1a7d0`,
+  session `8916026d85734e5097e50af83ca9fcb8`, generation 1. This proves exercised
+  producer identity, but not an eligible feed interval.
+- The collector admitted, wrote and durably fsynced `1885/1885/1885` records
+  and drained to zero; its maximum queue age was 63 ms. Those narrow passes do
+  not cure producer loss. Producer queue-overflow delta was `+17218`, transport-
+  failure delta `+5617`, DEPTH source gaps `534`, freshness breaches `1796`,
+  signed rejection count `1`, and transport ended `DISCONNECTED`. The host
+  latched `PONG_NATIVE_INPUT_SOURCE_SEQUENCE_GAP`; warm start remained false.
+- Exact Git identity also failed. The prestart receipt records repository HEAD
+  `15db37034bec3c4af504777f1e49c8dd5d4e9e50` / tree
+  `ce120e257b930eae773b4c615a89d44c52ad1a78`, while the already-started runtime
+  binding reported `5998a8dd462f09e274183054c31ef6b34ee4535d`. This arose from the required
+  post-start administrative receipt update and was correctly treated as
+  `RUNTIME_GIT_IDENTITY_PRE_FREEZE_MISMATCH`, not waived as documentation-only.
+- The prestart safety snapshot remained narrowly safe: Sim101 /
+  `LOCAL_SIMULATION`, MNQ DEC26/MNQZ6, flat runtime and broker quantity, zero
+  working owned/entry/foreign orders, complete snapshots, current
+  reconciliation, `DISARMED`, activation false and live capital denied. It did
+  not authorize qualification in the presence of the feed and identity faults.
+
+Primary failure receipt:
+`N:\Beelzebub\london-qualification-20260922T080000Z\03-prestart-hold.json`,
+SHA-256
+`D2513C03FABC12AF9AD86A2DE5044C6FFAA5B0260D71A249F55CCC56F3585F26`.
+Collector projection:
+`N:\Beelzebub\runtime\profiles\beelzebub_pong_discernment_v1\runs\20260920T211544Z-ca2ceba7da11\audit\pong-authentic-hour\collection-status.json`,
+SHA-256
+`AC0E3A6356248099380E663E03144CEB6DD7C7E9FB3EBE800CC180980C93882B`.
+
+### Shutdown and ledger closeout
+
+Sol reports supported shutdown completed cleanly at `07:45:45Z`, with no paper
+start, arming, native directive, order, execution or fill. At `07:50:01Z`,
+Caelum independently observed no listeners on `8090`, `48135` or `48136`, no
+Python process, and operator-owned NinjaTrader PID `17208` still present.
+
+Supported Full verification completed `PASS` at `07:47:26Z` through all
+`334199` rows, tip
+`68489dee27649957a6a2b401bba28a824da0ea6da99b745e3d4adc94d35c5ea5`,
+with `quick_check=ok`, chain/checkpoint/risk guard valid, WAL zero, no storage
+warnings and N: free `225697296384` bytes. Artifact:
+`N:\Beelzebub\runtime\profiles\beelzebub_pong_discernment_v1\runs\20260920T211544Z-ca2ceba7da11\audit\ledger-verification\20260922T074726710984Z-lv-london-hour-prestart-hold-20260922T0746Z.json`,
+SHA-256
+`CAD752F7B015A78D34299A0BFAF29AB6341CAE5A2FD1EDC8DACA6868474ECC05`.
+This proves ledger integrity after safe stop; it does not retroactively qualify
+the feed or recover the capacity latch. The 8 GiB warning, 4 GiB minimum and
+24-hour runway requirements remain unchanged.
+
+### Release condition and smallest next action
+
+This exact hour is closed as not started. Before any separately authorized
+future interval, the responsible engineering owner must diagnose and correct
+the producer overflow/transport-loss/source-gap/freshness failure without
+discarding records or weakening thresholds, and prove a stable authenticated
+source with zero new deltas under a bounded preflight. Exact repository/runtime
+identity, current Full/recovery/Full, writer health and the complete safety
+sandwich must then pass before a new immutable predeclaration. Because R2 is
+exhausted, any action requiring another install/reload needs new explicit Joseph
+authorization; no retry is inferred here.
