@@ -1884,13 +1884,13 @@ class NinjaScriptSourceTests(unittest.TestCase):
             "pre_reload_journal",
             "gate_b_deltas_begin_at",
             "FAILED_UNKNOWN_PENDING_TAIL_NOT_DRAIN_PROOF",
-            "SOURCE_INSTALLED_COMPILED_POST_RELOAD_PROOF_REQUIRED",
-            "DEFERRED_TO_DISTINCT_POST_INSTALL_PRODUCER_VERIFICATION",
-            "loaded_identity_claimed = $false",
+            "PREPARE_SOURCE_ONLY_REFUSED_RECEIVER_FIRST_REQUIRED",
+            "Assert-ReceiverFirstBoundary",
+            "COMMISSIONING_RUNTIME_GIT_MISMATCH",
         ):
             self.assertIn(required, commission)
-        self.assertIn("PrepareSourceOnly requires -InstallSource.", commission)
-        self.assertIn("if (-not $PrepareSourceOnly) {", commission)
+        self.assertNotIn("DEFERRED_TO_DISTINCT_POST_INSTALL_PRODUCER_VERIFICATION", commission)
+        self.assertIn("if ($InstallSource -or $RequireDistinctProducer)", commission)
         self.assertIn(
             "$preReload.producer_boundary.identity.session_id -ne $first.producer_session_id",
             commission,

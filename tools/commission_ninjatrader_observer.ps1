@@ -6,6 +6,8 @@ param(
     [int] $CheckpointSeconds = 10,
     [switch] $RequireDistinctProducer,
     [switch] $PrepareSourceOnly,
+    [ValidatePattern('^[0-9a-fA-F]{40}$')]
+    [string] $ExpectedGitSha,
     [string] $PreReloadReceiptPath,
     [string] $EvidencePath,
     [ValidateSet('MNQ SEP26', 'MNQ DEC26')]
@@ -26,14 +28,21 @@ if ($CheckpointSeconds -lt 5 -or $CheckpointSeconds -gt 60) {
 if ($RequireDistinctProducer -and [String]::IsNullOrWhiteSpace($PreReloadReceiptPath)) {
     throw 'RequireDistinctProducer requires -PreReloadReceiptPath.'
 }
-if ($PrepareSourceOnly -and -not $InstallSource) {
-    throw 'PrepareSourceOnly requires -InstallSource.'
-}
-if ($PrepareSourceOnly -and [String]::IsNullOrWhiteSpace($EvidencePath)) {
-    throw 'PrepareSourceOnly requires -EvidencePath.'
+if ($PrepareSourceOnly) {
+    # Installing watched source activates a producer immediately. Deferring the
+    # receiver until afterward accumulated a lossy five-minute native backlog.
+    # Retain the switch only to refuse old runbooks before any native access.
+    throw 'PREPARE_SOURCE_ONLY_REFUSED_RECEIVER_FIRST_REQUIRED: source installation cannot precede the ready receiver. Use a separately authorized receiver-first lifecycle.'
 }
 
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$frozenGitSha = (& git -C $repositoryRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $frozenGitSha -notmatch '^[0-9a-f]{40}$') {
+    throw 'COMMISSIONING_CHECKOUT_IDENTITY_UNAVAILABLE'
+}
+if ($ExpectedGitSha -and $ExpectedGitSha.ToLowerInvariant() -cne $frozenGitSha) {
+    throw 'COMMISSIONING_EXPECTED_GIT_MISMATCH'
+}
 $repositoryAddOn = Join-Path $repositoryRoot 'ninjatrader\NinjaScript\AddOns\BeelzebubReadOnlyAddOn.cs'
 $repositoryIndicator = Join-Path $repositoryRoot 'ninjatrader\NinjaScript\Indicators\BeelzebubReadOnlyMarketObserver.cs'
 $installedAddOn = Join-Path $NinjaTraderDocumentsRoot 'bin\Custom\AddOns\BeelzebubReadOnlyAddOn.cs'
@@ -50,6 +59,15 @@ foreach ($required in @($repositoryAddOn, $repositoryIndicator, $compiledAssembl
 
 function Get-Sha256([string] $Path) {
     return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+}
+
+$frozenGitTree = (& git -C $repositoryRoot show -s --format=%T HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $frozenGitTree -notmatch '^[0-9a-f]{40}$') {
+    throw 'COMMISSIONING_TREE_IDENTITY_UNAVAILABLE'
+}
+$frozenSourceHashes = @{}
+foreach ($sourcePath in @($repositoryAddOn, $repositoryIndicator, $validator, $pythonContract, $PSCommandPath)) {
+    $frozenSourceHashes[$sourcePath] = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourcePath).Hash
 }
 
 function Get-LoadedAssemblyMatches([string] $BuildFingerprint) {
@@ -174,14 +192,64 @@ function Get-ReceiverReadiness {
         collector_state = $collection.state
         collector_id = $collection.collector.collector_id
         collector_thread_alive = $collection.collector.thread_alive
+        collector_error = $collection.error
+        instrument = $collection.instrument.native
         expected_source_fingerprint = $collection.collector.expected_source_fingerprint
         ready = (
             $listener.state -eq 'LISTENING' -and
+            $listener.host -eq '127.0.0.1' -and
             [int]$listener.port -eq 48135 -and
             $null -eq $listener.error -and
             $collection.state -eq 'COLLECTING' -and
-            $collection.collector.thread_alive -eq $true
+            $collection.collector.thread_alive -eq $true -and
+            $null -eq $collection.error -and
+            $collection.instrument.native -eq $ExpectedInstrument -and
+            $paper.market_instrument -eq $ExpectedInstrument
         )
+    }
+}
+
+function Assert-FrozenCommissioningSource {
+    $head = (& git -C $repositoryRoot rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $head -cne $frozenGitSha) {
+        throw 'COMMISSIONING_CHECKOUT_CHANGED'
+    }
+    $tree = (& git -C $repositoryRoot show -s --format=%T HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $tree -cne $frozenGitTree) {
+        throw 'COMMISSIONING_TREE_CHANGED'
+    }
+    $sourceStatus = @(& git -C $repositoryRoot status --porcelain=v1 --untracked-files=all -- @($frozenSourceHashes.Keys))
+    if ($LASTEXITCODE -ne 0 -or $sourceStatus.Count -ne 0) {
+        throw 'COMMISSIONING_SOURCE_DIFFERS_FROM_HEAD'
+    }
+    foreach ($sourcePath in $frozenSourceHashes.Keys) {
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $sourcePath).Hash -cne $frozenSourceHashes[$sourcePath]) {
+            throw 'COMMISSIONING_SOURCE_CHANGED'
+        }
+    }
+}
+
+function Assert-ReceiverFirstBoundary([string] $ExpectedFingerprint) {
+    Assert-FrozenCommissioningSource
+    $binding = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/runtime-binding" -TimeoutSec 10
+    $readiness = Get-ReceiverReadiness
+    Assert-FrozenCommissioningSource
+    if ($binding.git_sha -cne $frozenGitSha) {
+        throw 'COMMISSIONING_RUNTIME_GIT_MISMATCH'
+    }
+    if ($readiness.ready -ne $true -or
+        [String]::IsNullOrWhiteSpace([string]$readiness.collector_id) -or
+        $readiness.expected_source_fingerprint -cne $ExpectedFingerprint) {
+        throw 'Listener and independent collector must be ready for the exact source before the native reload boundary.'
+    }
+    return $readiness
+}
+
+function Assert-SingleSourceLiveInstall([int] $ChangedFiles) {
+    # Watched files cannot be replaced atomically as a set. Multiple changes
+    # require a cold native lifecycle, keeping mixed source out of compilation.
+    if ($ChangedFiles -gt 1 -and @(Get-Process -Name NinjaTrader -ErrorAction SilentlyContinue).Count -ne 0) {
+        throw 'COMMISSIONING_MULTI_SOURCE_LIVE_INSTALL_REFUSED: stop NinjaTrader before staging multiple changed files; require the receiver before native startup.'
     }
 }
 
@@ -306,12 +374,14 @@ if ($RequireDistinctProducer) {
     ) {
         throw 'Pre-reload producer receipt is not one stable authenticated observe-only identity.'
     }
-    if (-not $PrepareSourceOnly) {
-        $receiverReadiness = Get-ReceiverReadiness
-        if ($receiverReadiness.ready -ne $true) {
-            throw 'Listener and independent collector must be ready before the native reload boundary.'
-        }
-    }
+}
+
+$expectedFingerprint = Get-ExpectedFingerprint
+# Installation is itself the activation boundary, regardless of whether the
+# caller requested distinct-producer verification. Refuse before compilation
+# or installed-file backup/write when receiver or checkout provenance is absent.
+if ($InstallSource -or $RequireDistinctProducer) {
+    $receiverReadiness = Assert-ReceiverFirstBoundary $expectedFingerprint
 }
 
 $validationText = (& $validator | Out-String).Trim()
@@ -352,16 +422,30 @@ $installedCurrent = (
 $assemblyBefore = Get-Item -LiteralPath $compiledAssembly
 $assemblyHashBefore = Get-Sha256 $compiledAssembly
 $compileStatus = 'SKIPPED_CURRENT'
+$addOnNeedsInstall = (-not (Test-Path -LiteralPath $installedAddOn) -or
+    (Get-CanonicalSource $repositoryAddOn) -cne (Get-CanonicalSource $installedAddOn))
+$indicatorNeedsInstall = (-not (Test-Path -LiteralPath $installedIndicator) -or
+    (Get-CanonicalSource $repositoryIndicator) -cne (Get-CanonicalSource $installedIndicator -WithoutGeneratedRegion) -or
+    -not $installedGeneratedValid)
 
 if (-not $installedCurrent) {
     if (-not $InstallSource) {
         throw 'Installed observer source differs from the repository. Re-run with -InstallSource.'
     }
-    if (-not (Test-Path -LiteralPath $installedAddOn) -or
-        (Get-CanonicalSource $repositoryAddOn) -cne (Get-CanonicalSource $installedAddOn)) {
+    $changedFiles = [int]$addOnNeedsInstall + [int]$indicatorNeedsInstall
+    Assert-SingleSourceLiveInstall $changedFiles
+    # Stage the indicator first and the fingerprint-bearing AddOn last.
+    # The multi-file case requires a stopped native process throughout staging.
+    if ($indicatorNeedsInstall) {
+        $receiverReadiness = Assert-ReceiverFirstBoundary $expectedFingerprint
+        Assert-SingleSourceLiveInstall $changedFiles
+        Install-ObserverSource -Source $repositoryIndicator -Target $installedIndicator -PreserveGeneratedRegion
+    }
+    if ($addOnNeedsInstall) {
+        $receiverReadiness = Assert-ReceiverFirstBoundary $expectedFingerprint
+        Assert-SingleSourceLiveInstall $changedFiles
         Install-ObserverSource -Source $repositoryAddOn -Target $installedAddOn
     }
-    Install-ObserverSource -Source $repositoryIndicator -Target $installedIndicator -PreserveGeneratedRegion
     $compileStatus = 'WAITING_FOR_NINJATRADER_SOURCE_WATCHER'
     $installedText = [IO.File]::ReadAllText($installedIndicator)
     $preparedText = Get-ObserverInstallText -SourceText ([IO.File]::ReadAllText($repositoryIndicator)) -CurrentText $installedText -PreserveGeneratedRegion
@@ -392,53 +476,10 @@ if (-not (Test-CompiledIdentity $expectedFingerprint)) {
     throw 'The compiled NinjaTrader assembly did not load the expected observer identity before timeout.'
 }
 
-if ($PrepareSourceOnly) {
-    $preparation = [ordered]@{
-        schema = 'beelzebub-unattended-ninjatrader-observer-preparation-v1'
-        milestone = 'SOURCE_INSTALLED_COMPILED_POST_RELOAD_PROOF_REQUIRED'
-        verified = $false
-        authority = 'OBSERVE_ONLY'
-        validation = $validation
-        deployment = [ordered]@{
-            install_requested = $true
-            prepare_source_only = $true
-            installed_source_parity = $installedCurrent
-            compile_status = $compileStatus
-            expected_source_fingerprint = $expectedFingerprint
-            expected_instrument = $ExpectedInstrument
-            receiver_ready_before_reload = $null
-            receiver_readiness_disposition = 'DEFERRED_TO_DISTINCT_POST_INSTALL_PRODUCER_VERIFICATION'
-            pre_reload_receipt_path = if ($RequireDistinctProducer) { $resolvedPreReload } else { $null }
-            pre_reload_receipt_sha256 = $preReloadReceiptSha256
-            pre_reload_journal = $preReloadJournal
-            pre_reload_producer = if ($RequireDistinctProducer) { $preReload.producer_boundary } else { $null }
-            compiled_assembly = $compiledAssembly
-            compiled_at = (Get-Item -LiteralPath $compiledAssembly).LastWriteTimeUtc.ToString('o')
-            compiled_sha256_before = $assemblyHashBefore
-            compiled_sha256 = Get-Sha256 $compiledAssembly
-        }
-        loaded_identity_claimed = $false
-        distinct_producer_verified = $false
-        next_required_action = 'START_EXACT_DISARMED_RECEIVER_AND_RUN_DISTINCT_PRODUCER_VERIFICATION'
-    }
-    $preparationJson = $preparation | ConvertTo-Json -Depth 10
-    $target = [IO.Path]::GetFullPath($EvidencePath)
-    [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target)) | Out-Null
-    $temporary = "$target.tmp-$([Guid]::NewGuid().ToString('N'))"
-    try {
-        [IO.File]::WriteAllText($temporary, $preparationJson + "`n", [Text.UTF8Encoding]::new($false))
-        Move-Item -LiteralPath $temporary -Destination $target -Force
-    }
-    finally {
-        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
-    }
-    $preparationJson
-    exit 0
-}
-
 $first = Get-Checkpoint
 Start-Sleep -Seconds $CheckpointSeconds
 $second = Get-Checkpoint
+$receiverReadiness = Assert-ReceiverFirstBoundary $expectedFingerprint
 $loadedAssemblyMatches = Get-LoadedAssemblyMatches $second.loaded_build_fingerprint
 $streamContinuityVerified = (
     @($second.missing_events.PSObject.Properties.Value | Where-Object { [int64]$_ -ne 0 }).Count -eq 0 -and

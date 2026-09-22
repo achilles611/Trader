@@ -635,6 +635,7 @@ class NinjaTraderSessionLedger:
     def __init__(self) -> None:
         self._current_session_ids: dict[str, str] = {}
         self._last_sequences: dict[str, int] = {}
+        self._last_sequence_verified: dict[str, bool] = {}
         self._seen: dict[str, set[str]] = {}
         self._retired_sessions: dict[str, set[str]] = {}
 
@@ -649,12 +650,49 @@ class NinjaTraderSessionLedger:
             return "ACCOUNT_STATE"
         return "CONTROL"
 
+    def _ordering_refusal(
+        self, reason: str, observation: NinjaTraderObservation, channel: str,
+    ) -> NinjaTraderObservationError:
+        detail = reason
+        # The bridge verifies attestation before ledger admission. Legacy or
+        # merely decoded records must retain the original refusal without
+        # presenting their fields as authenticated diagnostic evidence.
+        if observation.signature_verified is True:
+            def session_label(value: str) -> str:
+                # Native sessions are GUIDs in N format. Hash other accepted
+                # identifiers rather than copying arbitrary text into logs.
+                if re.fullmatch(r"[0-9a-f]{32}", value):
+                    return value
+                return "sha256:" + hashlib.sha256(
+                    value.encode("utf-8", errors="surrogatepass"),
+                ).hexdigest()
+
+            def sequence_label(value: int) -> int | str:
+                # Do not change admission for non-native integers, but keep
+                # even their rejection diagnostics bounded in size.
+                return value if -1 <= value <= (1 << 63) - 1 else "OUT_OF_NATIVE_INT64_RANGE"
+
+            provenance = {
+                "channel": channel,
+                "session_id": session_label(observation.session_id),
+                "global_sequence": sequence_label(observation.local_monotonic_sequence),
+                "prior_session_id": session_label(self._current_session_ids[channel]),
+                "prior_global_sequence": sequence_label(self._last_sequences[channel]),
+                "prior_signature_verified": self._last_sequence_verified[channel],
+                "wire_sha256": observation.wire_hash(),
+            }
+            detail += ";authenticated_ordering=" + json.dumps(
+                provenance, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+            )
+        return NinjaTraderObservationError(ProviderErrorCode.STALE_PROVIDER_STATE, detail)
+
     def admit(self, observation: NinjaTraderObservation) -> bool:
         channel = self._channel(observation)
         current_session_id = self._current_session_ids.get(channel)
         if current_session_id is None:
             self._current_session_ids[channel] = observation.session_id
             self._last_sequences[channel] = -1
+            self._last_sequence_verified[channel] = False
             self._seen[channel] = set()
             self._retired_sessions[channel] = set()
         elif observation.session_id != current_session_id:
@@ -662,19 +700,21 @@ class NinjaTraderSessionLedger:
             # ordered stream. A prior session must never overwrite it.
             retired = self._retired_sessions[channel]
             if observation.session_id in retired:
-                raise NinjaTraderObservationError(ProviderErrorCode.STALE_PROVIDER_STATE, "prior_session_callback")
+                raise self._ordering_refusal("prior_session_callback", observation, channel)
             retired.add(current_session_id)
             self._current_session_ids[channel] = observation.session_id
             self._last_sequences[channel] = -1
+            self._last_sequence_verified[channel] = False
             self._seen[channel] = set()
         identity = observation.wire_hash()
         seen = self._seen[channel]
         if identity in seen:
             return False
         if observation.local_monotonic_sequence <= self._last_sequences[channel]:
-            raise NinjaTraderObservationError(ProviderErrorCode.STALE_PROVIDER_STATE, "out_of_order_or_prior_session")
+            raise self._ordering_refusal("out_of_order_or_prior_session", observation, channel)
         seen.add(identity)
         self._last_sequences[channel] = observation.local_monotonic_sequence
+        self._last_sequence_verified[channel] = observation.signature_verified is True
         return True
 
 

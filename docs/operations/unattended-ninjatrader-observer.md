@@ -7,13 +7,36 @@ profile, or copy a compiled DLL.
 ## One command
 
 Run from the repository root while NinjaTrader and the bound independent Pong
-collector are running:
+collector are running, after all implementation and administrative commits are
+complete and the exact launch HEAD/tree have been frozen:
 
 ```powershell
-pwsh -NoProfile -File .\tools\commission_ninjatrader_observer.ps1 -InstallSource
+pwsh -NoProfile -File .\tools\commission_ninjatrader_observer.ps1 -InstallSource -ExpectedInstrument 'MNQ DEC26' -ExpectedGitSha <frozen-final-head>
 ```
 
 The command performs the complete build/load/feed check:
+
+Before validation or installation, every `-InstallSource` invocation requires
+the exact candidate's loopback listener and error-free collector to be ready.
+The runtime Git SHA must match the frozen checkout; HEAD, tree and commissioning
+source hashes are checked again immediately before each changed file is written
+and after loaded-producer checkpoints. Keep the worktree frozen through shutdown.
+`-PrepareSourceOnly` is refused before native-file access: watched source can
+activate a producer immediately, so installing first and starting the receiver
+later is unsafe. A refusal is a HOLD, never permission to clear a native queue
+or rebase its loss counters.
+
+Two changed source files cannot be replaced atomically while NinjaTrader's
+watcher is active. Such an installation is refused while NinjaTrader is running.
+A separately authorized cold native lifecycle must keep NinjaTrader stopped
+during staging; the indicator is written first and the fingerprint-bearing
+AddOn last. The collector must already be ready before native startup. The
+command does not stop or start NinjaTrader. A partial staging failure is held
+and must not be represented as a loaded candidate. Unchanged source files are
+not rewritten. Cold staging alone cannot complete the script's watcher/loaded
+checks: native startup must be separately coordinated inside its bounded wait.
+The guard is not a complete cold-start orchestrator. These rules do not grant
+another R2 attempt.
 
 1. It compiles the checked-in AddOn and Indicator in memory with NinjaTrader's
    bundled Roslyn compiler and refuses any error.
@@ -28,13 +51,13 @@ The command performs the complete build/load/feed check:
    `NinjaTrader.Custom.dll`, then verifies that the assembly contains the exact
    source identity and current observer implementation. If the installed source
    and assembly are already current, the result reports `SKIPPED_CURRENT`.
-5. It requires one active `NATIVE_ADDON` attachment for `MNQ SEP26`, an
+5. It requires one active `NATIVE_ADDON` attachment for the requested instrument, an
    authenticated producer with matching build/source identity, healthy
    loopback transport, and two advancing durable checkpoints separated by ten
    seconds. Both checkpoints must contain usable native depth, and collector
    rejection, duplicate, and overflow counters must remain zero.
 6. It independently requires `READY_DISARMED`, exact
-   `Sim101 / LOCAL_SIMULATION / MNQ SEP26 / quantity 1`, reconciled flat/no-order
+   `Sim101 / LOCAL_SIMULATION / requested instrument / quantity 1`, reconciled flat/no-order
    truth, and `live_capital=DENIED`.
 
 Success is emitted as `UNATTENDED_BUILD_AND_FEED_VERIFIED`. Any source mismatch,
