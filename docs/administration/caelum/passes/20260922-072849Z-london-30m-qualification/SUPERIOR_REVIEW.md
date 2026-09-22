@@ -35,7 +35,7 @@ manual ledger/latch edit, database migration, or force-kill is authorized.
 - At `2026-09-22T07:30:05Z`, ports `8090`, `48135` and `48136` had no listener,
   no Python process was present, and operator-owned NinjaTrader PID `17208`
   remained running.
-- Installed observer source SHA-256 remained
+- At `07:30:05Z`, before source preparation, installed observer source SHA-256 remained
   `ED4486F49CE3F8050D169418D4C74DCC458D875310A71E14662B73D85DBFA229`
   with obsolete embedded fingerprint `051808624d...`; installed compiled DLL
   SHA-256 remained
@@ -44,6 +44,17 @@ manual ledger/latch edit, database migration, or force-kill is authorized.
   `FFBB655D60A392E20DBEEA9DD8F8DB1ECBD4E68A1CD56B9C4F5A258F11E619E5`
   and requires fingerprint
   `17995c2795e16bf52bedd9644a865261e3a20473f1e2bb7b75b4947bc558a525`.
+- This historical installed state was superseded by the source-preparation
+  receipt
+  `N:\Beelzebub\london-qualification-20260922T080000Z\01-R2-source-preparation.json`,
+  SHA-256
+  `E34912EB88DB3BC68AE4305180643B81417CF0A00FF6811B966BA74F5D47D33F`.
+  It proves repository validation success, installed-source parity, expected
+  source `17995c...`, and a rebuilt on-disk DLL SHA-256
+  `B70556DDCCE897C018255B7CFD49E2D5EC03B96CDF6A6EC6A0A06328A2CB8756`.
+  It deliberately reports `verified=false`, `loaded_identity_claimed=false`
+  and `distinct_producer_verified=false`; loaded/authenticated identity remains
+  UNKNOWN pending the distinct post-install producer verification.
 - The prior London packet at
   `N:\Beelzebub\london-diagnostic-20260922` closed at `06:50:41Z` as
   `ABORTED_R2_PREACTION_RECEIVER_STATUS_TIMEOUT`. It records `r2_used=0`, one
@@ -66,6 +77,7 @@ manual ledger/latch edit, database migration, or force-kill is authorized.
 ### UNKNOWN / not yet accepted
 
 - Current loaded observer source/build/session/generation and distinct producer.
+  Installed and compiled preparation is not loaded proof.
 - Current account, flatness, orders, reconciliation and disarmed state after a
   future restart/reload; the `06:46Z` receipt is historical.
 - Current Full verification through a stable tip, supported capacity recovery,
