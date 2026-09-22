@@ -24,18 +24,18 @@ Do not copy, move, or replace the ledger. The operational ledger is already on N
 
 ## Fixed proposed window
 
-The proposed next session is Tuesday, 2026-09-22. Recheck the [official CME trading-hours/holiday calendar](https://www.cmegroup.com/trading-hours.html) and [CME Micro E-mini hours](https://www.cmegroup.com/articles/faqs/micro-e-mini-equity-index-futures-frequently-asked-questions.html) immediately before execution; abort rather than improvise if the venue schedule differs.
+The proposed next session is Monday, 2026-09-21 MDT / Tuesday, 2026-09-22 UTC. Recheck the [official CME trading-hours/holiday calendar](https://www.cmegroup.com/trading-hours.html) and [CME Micro E-mini hours](https://www.cmegroup.com/articles/faqs/micro-e-mini-equity-index-futures-frequently-asked-questions.html) immediately before execution; abort rather than improvise if the venue schedule differs.
 
 | Event | America/Denver | America/New_York | UTC |
 | --- | --- | --- | --- |
-| Manual preflight begins | 15:30 MDT | 17:30 EDT | 21:30Z |
-| Asia observation/session start | 16:00 MDT | 18:00 EDT | 22:00Z |
-| Fixed diagnostic ratio window | 16:05–16:10 MDT | 18:05–18:10 EDT | 22:05–22:10Z |
+| Manual preflight begins | 22:01 MDT | 00:01 EDT, Sep 22 | 04:01Z, Sep 22 |
+| Asia observation/session start | Only after Steps 0–4; no later than 22:15 MDT | Only after Steps 0–4; no later than 00:15 EDT, Sep 22 | Only after Steps 0–4; no later than 04:15Z, Sep 22 |
+| Fixed diagnostic ratio window | 22:15–22:20 MDT | 00:15–00:20 EDT, Sep 22 | 04:15–04:20Z, Sep 22 |
 | Entry cutoff from local profile | 23:30 MDT | 01:30 EDT, Sep 23 | 05:30Z, Sep 23 |
 | Hard-flat deadline | 23:58 MDT | 01:58 EDT, Sep 23 | 05:58Z, Sep 23 |
 | Session end | 00:00 MDT, Sep 23 | 02:00 EDT, Sep 23 | 06:00Z, Sep 23 |
 
-The ratio window is diagnostic until Joseph approves a numeric threshold, direction, tolerance, and minimum denominator. Never slide, trim, backfill, or rerun the window after observing its result. If R2 and the preflight are not clean before 22:05Z, abort this window and predeclare a wholly new one.
+The ratio window is diagnostic until Joseph approves a numeric threshold, direction, tolerance, and minimum denominator. Never slide, trim, backfill, or rerun the window after observing its result. If Steps 0–4 are not clean before 04:15Z, abort this window and predeclare a wholly new one.
 
 ## Offline repair release and remaining HOLDs
 
@@ -148,11 +148,11 @@ The traced C: refusal was a test-only temporary ledger at `C:\Users\atlas\AppDat
 
 ## Step 5 — predeclare and capture the fixed periodic diagnostic window
 
-At or before 22:04:30Z, write a signed/operator-stamped predeclaration naming exactly 22:05:00Z–22:10:00Z, the selected identity, the unchanged formula `R = ΔDEPTH / Δordinary completed full analyses`, and the no-rerun rule. At 22:05Z and 22:10Z capture the complete `/api/lane-iii/pong` response without restarting anything:
+At or before 04:14:30Z, write a signed/operator-stamped predeclaration naming exactly 04:15:00Z–04:20:00Z, the selected identity, the unchanged formula `R = ΔDEPTH / Δordinary completed full analyses`, and the no-rerun rule. At 04:15Z and 04:20Z capture the complete `/api/lane-iii/pong` response without restarting anything:
 
 ```powershell
 Invoke-RestMethod "$base/api/lane-iii/pong" | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath "$evidence\05-pong-window-start.json"
-# Wait manually until the fixed 22:10:00Z boundary; do not move the boundary.
+# Wait manually until the fixed 04:20:00Z boundary; do not move the boundary.
 Invoke-RestMethod "$base/api/lane-iii/pong" | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath "$evidence\05-pong-window-end.json"
 ```
 
