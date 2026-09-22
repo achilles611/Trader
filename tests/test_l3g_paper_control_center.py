@@ -18,9 +18,142 @@ from src.copytrade.config import CopyTradeConfig
 from src.l3g_paper.ledger import PaperLedger
 from src.l3g_paper.ninjatrader_transport import PaperExecutionTransport
 from src.l3g_paper.runtime import LaneIIIPaperRuntime
+from src.lsc.shadow_runtime import LSCShadowConfig, LSCShadowRuntime
+from tests.lsc.test_codec import observation
 
 
 class PaperControlCenterTests(unittest.TestCase):
+    def test_lsc_shadow_is_default_off_and_selected_lifecycle_is_authority_independent(self) -> None:
+        events: list[str] = []
+        listener_instances: list[object] = []
+        original_ledger_close = PaperLedger.close
+
+        class ListeningObserver:
+            class Status:
+                def as_dict(self) -> dict[str, object]:
+                    return {
+                        "state": "LISTENING", "host": "127.0.0.1", "port": 48135,
+                        "accepted_connections": 1, "rejected_connections": 0,
+                        "received_frames": 1, "emitted_events": 1,
+                        "invalid_events": 0, "error": None,
+                    }
+
+            def __init__(self) -> None:
+                self.on_observation = None
+                listener_instances.append(self)
+
+            def set_observation_sinks(self, **sinks: object) -> None:
+                events.append("listener_sinks")
+                self.on_observation = sinks["on_observation"]
+
+            def start(self) -> SimpleNamespace:
+                events.append("listener_start")
+                return SimpleNamespace(
+                    state="LISTENING", host="127.0.0.1", port=48135, error=None,
+                )
+
+            def stop(self) -> None:
+                events.append("listener_stop")
+
+            def status(self) -> Status:
+                return self.Status()
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            defaults = CopyTradeConfig()
+            config = replace(
+                defaults,
+                storage=replace(defaults.storage, cold_root=root / "cold"),
+                artifacts=replace(
+                    defaults.artifacts,
+                    database_path=root / "hot" / "copytrade.sqlite3",
+                ),
+            )
+            default_app = create_control_center_app(config)
+            self.assertIsNone(default_app.state.lsc_shadow)
+            self.assertFalse((root / "lsc").exists())
+
+            runtime = LSCShadowRuntime(LSCShadowConfig(
+                root=root / "lsc",
+                journal_id="test-integration",
+                profile_id="beelzebub_pong_discernment_v1",
+                native_contract_id="MNQ DEC26",
+                canonical_contract_id="MNQZ6",
+            ))
+            original_lsc_start = runtime.start
+            original_lsc_submit = runtime.submit
+            original_lsc_close = runtime.close
+
+            def traced_lsc_start() -> dict[str, object]:
+                events.append("lsc_start")
+                return original_lsc_start()
+
+            def traced_lsc_submit(value: object) -> bool:
+                events.append("lsc_submit")
+                return original_lsc_submit(value)  # type: ignore[arg-type]
+
+            def traced_lsc_close(*, timeout_seconds: float = 30.0) -> dict[str, object]:
+                events.append("lsc_close")
+                return original_lsc_close(timeout_seconds=timeout_seconds)
+
+            runtime.start = traced_lsc_start  # type: ignore[method-assign]
+            runtime.submit = traced_lsc_submit  # type: ignore[method-assign]
+            runtime.close = traced_lsc_close  # type: ignore[method-assign]
+
+            def runtime_start(_: LaneIIIPaperRuntime) -> None:
+                events.append("runtime_start")
+
+            def runtime_stop(_: LaneIIIPaperRuntime) -> dict[str, object]:
+                events.append("runtime_stop")
+                return {
+                    "required": False, "completed": True, "flat_confirmed": True,
+                    "durable_confirmation": True, "reason": "TEST_FLAT",
+                }
+
+            def transport_start(self: PaperExecutionTransport, **_: object) -> object:
+                events.append("transport_start")
+                return self.status()
+
+            def transport_stop(self: PaperExecutionTransport, **_: object) -> object:
+                events.append("transport_stop")
+                return self.status()
+
+            def ledger_close(self: PaperLedger) -> dict[str, object]:
+                events.append("ledger_close")
+                return original_ledger_close(self)
+
+            app = create_control_center_app(
+                config,
+                ninjatrader_listener_factory=ListeningObserver,
+                paper_ledger_factory=lambda path: PaperLedger(path),
+                lsc_shadow_factory=lambda: runtime,
+            )
+
+            async def exercise() -> None:
+                async with app.router.lifespan_context(app):
+                    self.assertIs(app.state.lsc_shadow, runtime)
+                    listener = listener_instances[-1]
+                    assert listener.on_observation is not None
+                    listener.on_observation(observation("QUOTE", 1))
+
+            with (
+                patch.object(LaneIIIPaperRuntime, "start", runtime_start),
+                patch.object(LaneIIIPaperRuntime, "stop", runtime_stop),
+                patch.object(PaperExecutionTransport, "start", transport_start),
+                patch.object(PaperExecutionTransport, "stop", transport_stop),
+                patch.object(PaperLedger, "close", ledger_close),
+            ):
+                asyncio.run(exercise())
+
+            self.assertLess(events.index("lsc_start"), events.index("listener_sinks"))
+            self.assertLess(events.index("listener_sinks"), events.index("listener_start"))
+            self.assertEqual(events.count("lsc_submit"), 1)
+            self.assertLess(events.index("runtime_stop"), events.index("transport_stop"))
+            self.assertLess(events.index("transport_stop"), events.index("ledger_close"))
+            self.assertLess(events.index("ledger_close"), events.index("lsc_close"))
+            self.assertIsNone(app.state.lsc_shadow)
+            self.assertTrue(app.state.lsc_shadow_shutdown_receipt["proof_valid"])
+
     def test_pending_evidence_recovery_endpoint_is_scoped_and_dispatches_without_arming(self):
         app = create_control_center_app(CopyTradeConfig())
         endpoint = next(route.endpoint for route in app.routes
@@ -116,6 +249,7 @@ class PaperControlCenterTests(unittest.TestCase):
         """
         events: list[str] = []
         ledgers: list[PaperLedger] = []
+        lsc_runtimes: list[LSCShadowRuntime] = []
         original_close = PaperLedger.close
 
         class ListeningObserver:
@@ -190,10 +324,32 @@ class PaperControlCenterTests(unittest.TestCase):
                 storage=replace(defaults.storage, cold_root=root / "cold"),
                 artifacts=replace(defaults.artifacts, database_path=root / "hot" / "copytrade.sqlite3"),
             )
+            lsc_runtime = LSCShadowRuntime(LSCShadowConfig(
+                root=root / "lsc",
+                journal_id="test-unresolved-watchdog",
+                profile_id="beelzebub_pong_discernment_v1",
+                native_contract_id="MNQ DEC26",
+                canonical_contract_id="MNQZ6",
+            ))
+            lsc_runtimes.append(lsc_runtime)
+            original_lsc_start = lsc_runtime.start
+            original_lsc_close = lsc_runtime.close
+
+            def traced_lsc_start() -> dict[str, object]:
+                events.append("lsc_start")
+                return original_lsc_start()
+
+            def traced_lsc_close(*, timeout_seconds: float = 30.0) -> dict[str, object]:
+                events.append("lsc_close")
+                return original_lsc_close(timeout_seconds=timeout_seconds)
+
+            lsc_runtime.start = traced_lsc_start  # type: ignore[method-assign]
+            lsc_runtime.close = traced_lsc_close  # type: ignore[method-assign]
             app = create_control_center_app(
                 config,
                 ninjatrader_listener_factory=ListeningObserver,
                 paper_ledger_factory=ledger_factory,
+                lsc_shadow_factory=lambda: lsc_runtime,
             )
             endpoint = next(route.endpoint for route in app.routes if route.path == "/api/lane-iii/paper")
 
@@ -235,13 +391,20 @@ class PaperControlCenterTests(unittest.TestCase):
                     self.assertLess(events.index("runtime_stop"), events.index("watchdog_status"))
                     self.assertNotIn("transport_stop", events)
                     self.assertNotIn("ledger_close", events)
+                    self.assertIn("lsc_start", events)
+                    self.assertNotIn("lsc_close", events)
                     self.assertIsNotNone(app.state.lane_iii_paper_transport)
+                    self.assertIs(app.state.lsc_shadow, lsc_runtime)
             finally:
                 # The production path deliberately leaves this writer alive
                 # when the independent watchdog is unresolved.  The test
                 # must close it explicitly after asserting that behavior.
                 for ledger in ledgers:
                     original_close(ledger)
+                for lsc in lsc_runtimes:
+                    # Close the test-owned daemon only after the production
+                    # HOLD behavior above has been established.
+                    lsc.close()
 
     def test_startup_rejects_active_ledger_below_cold_root_before_factory(self) -> None:
         with TemporaryDirectory() as folder:

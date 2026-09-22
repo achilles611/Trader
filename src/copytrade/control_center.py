@@ -95,6 +95,7 @@ from src.l3g_paper.sessions import session_catalog
 from src.l3g_paper.slim_status import derive_slim_paper_status, unavailable_slim_status
 from src.l3g_paper.verification import LocalLedgerVerificationController
 from src.l3h_live.status import fail_closed_status
+from src.lsc.shadow_runtime import LSCShadowRuntime
 from src.ops_scheduler.api_models import PreviewRequest, RunNowRequest, ScheduleRequest, ScheduleUpdateRequest, TemplateRequest
 from src.ops_scheduler.engine import SchedulerEngine, SchedulerSettings
 from src.ops_scheduler.models import ScheduleLifecycle
@@ -321,6 +322,22 @@ def _dispatch_pong_observation(
     metrics.record_stage("legacy_fanout", time.perf_counter() - stage_started)
     metrics.record_route("FULL_LEGACY_FANOUT")
     metrics.record_stage("composite_total", time.perf_counter() - composite_started)
+
+
+def _offer_lsc_shadow(
+    observation: object,
+    runtime: LSCShadowRuntime | None,
+) -> None:
+    """Offer an admitted record without allowing shadow failure to propagate."""
+    if runtime is None:
+        return
+    try:
+        runtime.submit(observation)  # type: ignore[arg-type]
+    except Exception as error:
+        runtime.record_callback_failure(error)
+        NINJATRADER_RUNTIME_LOGGER.exception(
+            "LSC shadow callback failed; authority dispatch remains independent."
+        )
 LEDGER_VERIFICATION_FRESHNESS_SECONDS = 15 * 60
 MARKET_OBSERVER_ACTIVE_FRESHNESS_SECONDS = 15.0
 LEDGER_VERIFIER_SHUTDOWN_WAIT_SECONDS = 30.0
@@ -1787,6 +1804,7 @@ def create_control_center_app(
     watcher_stop_timeout_seconds: float = 3.0, discovery_source: HyperCoreSourceAcquisition | None = None,
     ninjatrader_listener_factory: Callable[[], NinjaTraderListenerWorker] | None = None,
     lane_iii_shadow_factory: Callable[[], LaneIIIShadowRuntime] | None = None,
+    lsc_shadow_factory: Callable[[], LSCShadowRuntime] | None = None,
     lane_iii_paper_factory: Callable[[PaperLedger], LaneIIIPaperRuntime] | None = None,
     paper_execution_transport_factory: Callable[[PaperLedger, Callable[[dict[str, object]], None], Callable[[str], None]], PaperExecutionTransport] | None = None,
     paper_ledger_factory: Callable[[Path], PaperLedger] | None = None,
@@ -2604,6 +2622,7 @@ def create_control_center_app(
         paper_transport: PaperExecutionTransport | None = None
         paper_runtime: LaneIIIPaperRuntime | None = None
         paper_ledger: PaperLedger | None = None
+        lsc_shadow: LSCShadowRuntime | None = None
         verifier_shutdown: dict[str, object] | None = None
         runtime_watchdog_shutdown: dict[str, object] = {
             "required": False,
@@ -2772,6 +2791,16 @@ def create_control_center_app(
             pong_host.start()
             ninjatrader_runtime["pong_production"] = pong_host
             app.state.pong_production = pong_host
+            if lsc_shadow_factory is not None:
+                candidate = lsc_shadow_factory()
+                if type(candidate) is not LSCShadowRuntime:
+                    raise RuntimeError(
+                        "LSC_SHADOW factory must return the exact LSC shadow runtime"
+                    )
+                candidate.start()
+                lsc_shadow = candidate
+                ninjatrader_runtime["lsc_shadow"] = lsc_shadow
+                app.state.lsc_shadow = lsc_shadow
             listener = (
                 ninjatrader_listener_factory()
                 if ninjatrader_listener_factory is not None
@@ -2784,6 +2813,7 @@ def create_control_center_app(
             )
 
             def collect_and_fanout_observation(observation: object) -> None:
+                _offer_lsc_shadow(observation, lsc_shadow)
                 assert pong_collector is not None
                 assert pong_host is not None
                 _dispatch_pong_observation(
@@ -3039,6 +3069,17 @@ def create_control_center_app(
                                     )
                                     if profile_switch is not None:
                                         profile_switch.record_shutdown_receipt(paper_ledger_shutdown_receipt)
+                                    if lsc_shadow is not None:
+                                        try:
+                                            lsc_status = lsc_shadow.close(timeout_seconds=30.0)
+                                        except Exception as error:
+                                            lsc_shadow.record_callback_failure(error)
+                                            lsc_status = lsc_shadow.status()
+                                            NINJATRADER_RUNTIME_LOGGER.exception(
+                                                "LSC shadow shutdown failed after authority ledger close."
+                                            )
+                                        app.state.lsc_shadow_shutdown_receipt = lsc_status
+                                        app.state.lsc_shadow = None
 
     app = FastAPI(title="Trader Copy Control Center", version="1.0", docs_url=None, redoc_url=None,
                   lifespan=lifespan)
@@ -3050,6 +3091,8 @@ def create_control_center_app(
     app.state.reconciliation_recovery = reconciliation_recovery
     app.state.ninjatrader_observer = None
     app.state.lane_iii_shadow = None
+    app.state.lsc_shadow = None
+    app.state.lsc_shadow_shutdown_receipt = None
     app.state.lane_iii_paper = None
     app.state.lane_iii_paper_transport = None
     app.state.ninjatrader_login_bootstrap = None
