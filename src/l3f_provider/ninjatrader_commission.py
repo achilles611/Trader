@@ -76,6 +76,13 @@ _NATIVE_TRANSPORT_INTEGER_FIELDS = frozenset({
     "native_sender_reconnects_total",
     "native_sender_transport_failure_events_total",
     "native_sender_inflight_frames",
+    "native_sender_shutdown_discarded_frames_total",
+    "native_sender_generation",
+})
+_NATIVE_TRANSPORT_BOOLEAN_FIELDS = frozenset({
+    "native_sender_accepting",
+    "native_sender_running",
+    "native_sender_stopping",
 })
 _NATIVE_TRANSPORT_NUMBER_FIELDS = frozenset({
     "native_telemetry_elapsed_seconds",
@@ -820,6 +827,10 @@ class NinjaTraderListenerWorker:
         for key in _NATIVE_TRANSPORT_INTEGER_FIELDS:
             value = payload.get(key)
             if type(value) is int and value >= 0:
+                sanitized[key] = value
+        for key in _NATIVE_TRANSPORT_BOOLEAN_FIELDS:
+            value = payload.get(key)
+            if type(value) is bool:
                 sanitized[key] = value
         for key in _NATIVE_TRANSPORT_NUMBER_FIELDS:
             value = payload.get(key)

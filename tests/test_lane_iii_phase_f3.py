@@ -282,6 +282,11 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
                 "native_sender_transport_failure_events_total": 0,
                 "native_sender_inflight_frames": 2,
                 "native_sender_inflight_oldest_age_ms": 0.5,
+                "native_sender_shutdown_discarded_frames_total": 4,
+                "native_sender_generation": 7,
+                "native_sender_accepting": True,
+                "native_sender_running": True,
+                "native_sender_stopping": False,
                 "native_unapproved_counter": 999,
                 "unrelated_health_detail": "must-not-be-retained",
             },
@@ -305,6 +310,11 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
         self.assertEqual(native["native_trade_callback_cpu_cycles_max"], 1_000)
         self.assertEqual(native["native_outbound_queue_current"], 3)
         self.assertEqual(native["native_sender_inflight_frames"], 2)
+        self.assertEqual(native["native_sender_shutdown_discarded_frames_total"], 4)
+        self.assertEqual(native["native_sender_generation"], 7)
+        self.assertIs(native["native_sender_accepting"], True)
+        self.assertIs(native["native_sender_running"], True)
+        self.assertIs(native["native_sender_stopping"], False)
         self.assertNotIn("native_unapproved_counter", native)
         self.assertNotIn("unrelated_health_detail", native)
         self.assertNotIn("component", native)
@@ -359,6 +369,7 @@ class LaneIIIPhaseF3Tests(unittest.TestCase):
             "native_telemetry_started_utc",
             "native_callback_cpu_cycles_supported",
             *commission._NATIVE_TRANSPORT_INTEGER_FIELDS,
+            *commission._NATIVE_TRANSPORT_BOOLEAN_FIELDS,
             *commission._NATIVE_TRANSPORT_NUMBER_FIELDS,
         }
         self.assertEqual(emitted, allowed)
