@@ -379,7 +379,19 @@ def run(args):
         count += 1
     with sqlite3.connect(f"file:{ledger.path.as_posix()}?mode=ro", uri=True) as db:
         kinds = dict(db.execute("SELECT kind,count(*) FROM lane_iii_paper_audit GROUP BY kind"))
-    source_hashes = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in [ROOT/"src/copytrade/control_center.py", ROOT/"src/l3f_provider/ninjatrader_commission.py", ROOT/"src/l3g_paper/pong_collection.py", ROOT/"src/l3g_paper/runtime.py", Path(__file__)]}
+    measured_sources = [
+        ROOT/"src/copytrade/control_center.py",
+        ROOT/"src/l3f_provider/ninjatrader_commission.py",
+        ROOT/"src/l3f_provider/ninjatrader_observation.py",
+        ROOT/"src/l3g_paper/policy.py",
+        ROOT/"src/l3g_paper/pong_collection.py",
+        ROOT/"src/l3g_paper/runtime.py",
+        Path(__file__),
+    ]
+    source_hashes = {
+        str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in measured_sources
+    }
     sender_result = json.loads((args.output/"sender.json").read_text())
     sender_started = sender_result["start_monotonic"]
     receiver_elapsed = ended - receiver_go_monotonic
