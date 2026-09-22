@@ -74,6 +74,7 @@ from .pong_scheduler import (
     PongSchedulingConfig,
     PongSchedulingMode,
 )
+from .pong_periodic_telemetry import PONG_PERIODIC_TELEMETRY_SCHEMA
 from .pong_controller import (
     PONG_ACTIVATION_DATE_LOCAL,
     PongBoundedController,
@@ -128,6 +129,7 @@ _LOADED_SOURCE_HASHES = {
                  "src/l3g_paper/ledger.py",
                  "src/l3g_paper/pong_compute.py", "src/l3g_paper/pong.py",
                  "src/l3g_paper/discernment.py", "src/l3g_paper/pong_scheduler.py",
+                 "src/l3g_paper/pong_periodic_telemetry.py",
                  "src/l3g_paper/pong_qualifying.py",
                  "src/l3g_paper/pong_collection.py", "src/l3f_provider/ninjatrader_observation.py",
                  "src/l3f_provider/ninjatrader_commission.py", "src/l3g_paper/pong_microstructure.py")
@@ -442,6 +444,8 @@ class PongProductionHost:
         self._authoritative_admission_records = 0
         self._event_driven_evaluations = 0
         self._periodic_evaluations = 0
+        self._ordinary_completed_full_analyses = 0
+        self._protection_completed_full_analyses = 0
         self._microstructure_evaluations = 0
         self._fhb_requested_profile = (
             None if fhb_config is None
@@ -463,6 +467,8 @@ class PongProductionHost:
         self._last_periodic_cutoff: datetime | None = None
         self._last_protection_transition: str | None = None
         self._process_instance_id = "pong-controller-process-" + uuid4().hex
+        self._periodic_counter_epoch_id = "pong-periodic-counter-" + uuid4().hex
+        self._periodic_counter_reset_ordinal = 0
         self._controller: PongBoundedController | None = None
         self._controller_error: str | None = None
         self._host_first_fault: str | None = None
@@ -802,6 +808,11 @@ class PongProductionHost:
                 "authoritative_admission_records": self._authoritative_admission_records,
                 "event_driven_analytical_evaluations": self._event_driven_evaluations,
                 "periodic_flat_analytical_evaluations": self._periodic_evaluations,
+                "periodic_ratio_telemetry": self._periodic_telemetry_snapshot_locked(
+                    captured_monotonic=captured_monotonic,
+                    observation_queue_depth=observation_queue_depth,
+                    oldest_pending_queue_age_ms=oldest_pending_age_ms,
+                ),
             },
             "protection": {
                 "active_path": (
@@ -1251,7 +1262,8 @@ class PongProductionHost:
                             "source_sequences": dict(self._stream_sequences),
                         }
                     self._event_driven_evaluations += 1
-                    self._timed_evaluate_microstructure(receipt)
+                    if self._timed_evaluate_microstructure(receipt):
+                        self._protection_completed_full_analyses += 1
                 else:
                     self._entry_evaluation_deferred += 1
 
@@ -1319,8 +1331,13 @@ class PongProductionHost:
                 self._periodic_deadline.complete(due, applied=False)
                 return
             self._last_periodic_cutoff = cutoff
+            self._periodic_deadline.dispatch(due)
             self._periodic_evaluations += 1
-            self._timed_evaluate_microstructure(cutoff)
+            completed_full_analysis = bool(
+                self._timed_evaluate_microstructure(cutoff)
+            )
+            if completed_full_analysis:
+                self._ordinary_completed_full_analyses += 1
             if (
                 self._microstructure_blockers
                 and self._discernment.last_snapshot is not None
@@ -1330,7 +1347,10 @@ class PongProductionHost:
                 )
                 self._apply_discernment_update(update)
             self._periodic_deadline.complete(
-                due, applied=self._input_error is None,
+                due,
+                applied=(
+                    completed_full_analysis and self._input_error is None
+                ),
             )
 
     def _periodic_wait_seconds(self) -> float | None:
@@ -1718,10 +1738,10 @@ class PongProductionHost:
             record.payload["source_event_sequence"]
         )
 
-    def _timed_evaluate_microstructure(self, at: datetime) -> None:
+    def _timed_evaluate_microstructure(self, at: datetime) -> bool:
         started_ns = time.perf_counter_ns()
         try:
-            self._evaluate_microstructure(at)
+            return self._evaluate_microstructure(at)
         finally:
             elapsed_ns = max(0, time.perf_counter_ns() - started_ns)
             self._analysis_processing_count += 1
@@ -1731,7 +1751,7 @@ class PongProductionHost:
                 elapsed_ns,
             )
 
-    def _evaluate_microstructure(self, at: datetime) -> None:
+    def _evaluate_microstructure(self, at: datetime) -> bool:
         if (
             self._qualifying_architecture is not None
             and not self._canonical_depth_ready
@@ -1741,11 +1761,11 @@ class PongProductionHost:
                 self._canonical_depth_reason
                 or "PONG_CANONICAL_DEPTH_NOT_READY",
             )
-            return
+            return False
         if self._fhb is not None and not self._fhb.entry_ready:
             self._last_microstructure_at = at
             self._microstructure_blockers = ("FHB_REWARM_REQUIRED",)
-            return
+            return False
         self._microstructure_evaluations += 1
         if self._compute_pool is None:
             self._last_microstructure_at = at
@@ -1763,7 +1783,7 @@ class PongProductionHost:
                 self._microstructure_blockers = blockers
             else:
                 self._queue_compute(None, at, blockers)
-            return
+            return False
         as_of = at.isoformat().replace("+00:00", "Z")
         try:
             bucket = at.replace(minute=(at.minute // 5) * 5, second=0, microsecond=0)
@@ -1788,7 +1808,7 @@ class PongProductionHost:
                     trades, bids, asks, window, prior, self._input_error is None,
                     self._flow.policy, self._liquidity.policy, self._volume.policy, self._mapper.policy)
                 self._queue_compute(request, at)
-                return
+                return False
             flow = self._flow.evaluate(trades, window_start=cutoff.isoformat().replace('+00:00', 'Z'),
                                        as_of=as_of, feed_continuity_valid=self._input_error is None)
             bid = self._liquidity.evaluate(bids, as_of=as_of, feed_continuity_valid=self._input_error is None)
@@ -1818,6 +1838,7 @@ class PongProductionHost:
             # A bucket observed only partially since process startup is not a
             # completed historical reference. Only the verified provider loader
             # supplies prior windows; no zero-fill or shortened history fallback.
+            return True
         except Exception as error:
             blockers = (
                 "PONG_MICROSTRUCTURE_EVALUATION_BLOCKED:" + type(error).__name__,
@@ -1826,6 +1847,7 @@ class PongProductionHost:
                 self._microstructure_blockers = blockers
             elif self._input_error is None:
                 self._queue_compute(None, at, blockers)
+            return False
 
     def _queue_compute(self, request: PongWindowRequest | None, at: datetime,
                        blockers: tuple[str, ...] = ()) -> None:
@@ -2768,6 +2790,150 @@ class PongProductionHost:
                         service_elapsed_ns,
                     )
 
+    def _periodic_telemetry_snapshot_locked(
+        self,
+        *,
+        captured_monotonic: float,
+        observation_queue_depth: int,
+        oldest_pending_queue_age_ms: float | None,
+    ) -> dict[str, object]:
+        deadline = self._periodic_deadline.metrics()
+        durability = self._collection.get("durability")
+        durability = durability if isinstance(durability, Mapping) else {}
+        enqueued = durability.get("enqueued_records")
+        durable = durability.get("durable_records")
+        durable_lag = (
+            enqueued - durable
+            if type(enqueued) is int and type(durable) is int
+            else None
+        )
+        producer = self._producer
+        return {
+            "schema": PONG_PERIODIC_TELEMETRY_SCHEMA,
+            "captured_at_utc": _now(),
+            "captured_monotonic_ns": max(
+                0, int(captured_monotonic * 1_000_000_000),
+            ),
+            "identity": {
+                "counter_epoch_id": self._periodic_counter_epoch_id,
+                "counter_reset_ordinal": self._periodic_counter_reset_ordinal,
+                "counter_reset_reason": "HOST_CONSTRUCTION",
+                "host_process_instance_id": self._process_instance_id,
+                "experiment_id": self._experiment_id,
+                "loaded_artifact_hash": PONG_LOADED_ARTIFACT_HASH,
+                "selected_profile": self.selected_profile,
+                "qualifying_architecture": self._qualifying_architecture,
+                "topology_hash": self.topology.binding_hash,
+                "runtime_execution_session_id": self._runtime.get(
+                    "execution_session_id",
+                ),
+                "runtime_addon_source_fingerprint": self._runtime.get(
+                    "addon_source_fingerprint",
+                ),
+                "runtime_addon_build_fingerprint": self._runtime.get(
+                    "addon_build_fingerprint",
+                ),
+                "source_session_id": None if producer is None else producer[0],
+                "source_fingerprint": None if producer is None else producer[1],
+                "source_build_fingerprint": None if producer is None else producer[2],
+                "source_generation": self._source_generation,
+            },
+            "counters": {
+                "depth_events": self._stream_counts["DEPTH"],
+                "ordinary_evaluation_dispatches": self._periodic_evaluations,
+                "ordinary_completed_full_analyses": (
+                    self._ordinary_completed_full_analyses
+                ),
+                "protection_evaluation_dispatches": self._event_driven_evaluations,
+                "protection_completed_full_analyses": (
+                    self._protection_completed_full_analyses
+                ),
+                "scheduled_opportunities": deadline["scheduled_opportunities"],
+                "claimed_current_opportunities": deadline[
+                    "claimed_current_opportunities"
+                ],
+                "dispatched_opportunities": deadline["dispatched"],
+                "completed_opportunities": deadline["completed"],
+                "applied_opportunities": deadline["applied"],
+                "late_opportunities": deadline["late_opportunities"],
+                "on_time_opportunities": deadline["on_time_opportunities"],
+                "obsolete_opportunities": deadline["obsolete_opportunities"],
+                "protection_supersessions": deadline[
+                    "protection_mode_supersessions"
+                ],
+                "intentional_no_work": deadline["intentional_no_work"],
+                "shutdown_opportunities": deadline["shutdown_deadlines"],
+            },
+            "scheduler": {
+                "origin_qpc_ns": deadline["origin_qpc_ns"],
+                "interval_ms": deadline["interval_ms"],
+                "deadline_reconciliation": deadline["deadline_reconciliation"],
+                "completion_reconciliation": deadline[
+                    "completion_reconciliation"
+                ],
+            },
+            "context": {
+                "active_path": (
+                    "PERIODIC_FLAT"
+                    if self._event_protection_reason_locked() is None
+                    else "EVENT_DRIVEN_PROTECTION"
+                ),
+                "protection_reason": self._event_protection_reason_locked(),
+                "input_error": self._input_error,
+                "canonical_depth_ready": self._canonical_depth_ready,
+                "canonical_depth_reason": self._canonical_depth_reason,
+                "host_observation_queue_depth": observation_queue_depth,
+                "host_observation_queue_high_water": (
+                    self._observation_queue_high_water
+                ),
+                "host_oldest_pending_queue_age_ms": (
+                    oldest_pending_queue_age_ms
+                ),
+                "host_queue_overflow": self._observation_overflow,
+                "compute_pending": len(self._compute_pending),
+                "last_host_queue_age_ms": self._last_host_queue_age_ms,
+                "maximum_host_queue_age_ms": self._maximum_host_queue_age_ms,
+                "last_source_receipt_age_ms": self._last_source_receipt_age_ms,
+                "maximum_source_receipt_age_ms": (
+                    self._maximum_source_receipt_age_ms
+                ),
+                "freshness_blocker": self._fhb_guard_blocker,
+                "collector_enqueued_records": enqueued,
+                "collector_durable_records": durable,
+                "collector_durable_lag_records": durable_lag,
+                "collector_queue_depth": durability.get("queue_depth"),
+                "collector_queue_high_water": durability.get(
+                    "queue_high_water_records",
+                ),
+                "collector_last_queue_age_ms": durability.get(
+                    "last_queue_age_milliseconds",
+                ),
+                "collector_maximum_queue_age_ms": durability.get(
+                    "maximum_queue_age_milliseconds",
+                ),
+                "collector_queue_overflow_records": durability.get(
+                    "queue_overflow_records",
+                ),
+            },
+            "semantics": {
+                "ratio": (
+                    "aligned delta DEPTH / aligned delta ordinary completed "
+                    "full analyses"
+                ),
+                "ordinary_completion": (
+                    "serial full microstructure adapters returned after all "
+                    "readiness and native-window prerequisites"
+                ),
+                "protection_separated": True,
+                "missed_opportunities": (
+                    "alias of obsolete_opportunities; never an additional "
+                    "additive outcome"
+                ),
+                "numeric_threshold": None,
+                "numeric_threshold_reason": "POLICY_NOT_DEFINED",
+            },
+        }
+
     def status(self) -> dict[str, object]:
         with self._lock:
             status_monotonic = self._monotonic_clock()
@@ -2961,11 +3127,20 @@ class PongProductionHost:
                     "authoritative_admission_records": self._authoritative_admission_records,
                     "event_driven_analytical_evaluations": self._event_driven_evaluations,
                     "periodic_flat_analytical_evaluations": self._periodic_evaluations,
-                    "depth_events_per_analytical_evaluation": (
-                        None
-                        if self._microstructure_evaluations == 0
-                        else self._stream_counts["DEPTH"]
-                        / self._microstructure_evaluations
+                    "ordinary_completed_full_analyses": (
+                        self._ordinary_completed_full_analyses
+                    ),
+                    "protection_completed_full_analyses": (
+                        self._protection_completed_full_analyses
+                    ),
+                    "depth_events_per_analytical_evaluation": None,
+                    "depth_events_per_analytical_evaluation_unavailable_reason": (
+                        "UNALIGNED_MIXED_TRIGGER_METRIC_RETIRED"
+                    ),
+                    "periodic_ratio_telemetry": self._periodic_telemetry_snapshot_locked(
+                        captured_monotonic=status_monotonic,
+                        observation_queue_depth=observation_queue_depth,
+                        oldest_pending_queue_age_ms=oldest_pending_queue_age_ms,
                     ),
                     "periodic_last_cutoff": (
                         None if self._last_periodic_cutoff is None

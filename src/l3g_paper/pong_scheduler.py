@@ -71,6 +71,7 @@ def scheduling_config_from_environment(
 class PeriodicDue:
     """One current opportunity on the fixed QPC grid."""
 
+    ordinal: int
     scheduled_deadline_ns: int
     started_ns: int
     missed_obsolete: int
@@ -110,6 +111,8 @@ class PongPeriodicDeadline:
         self._protection_supersession = 0
         self._intentional_no_work = 0
         self._shutdown = 0
+        self._active_due_ordinal: int | None = None
+        self._active_due_state: str | None = None
 
     def _validate_now(self, now_ns: int) -> None:
         if type(now_ns) is not int or now_ns < self._last_now_ns:
@@ -134,6 +137,9 @@ class PongPeriodicDeadline:
         deadline = self.origin_ns + self._next_ordinal * self.interval_ns
         if current < deadline:
             return None
+        if self._active_due_state in {"CLAIMED", "DISPATCHED"}:
+            raise ValueError("PONG_SCHEDULER_OUTSTANDING_DUE")
+        first_ordinal = self._next_ordinal
         missed = (current - deadline) // self.interval_ns
         self._scheduled += missed + 1
         self._missed_obsolete += missed
@@ -142,29 +148,51 @@ class PongPeriodicDeadline:
             self._on_time += 1
         else:
             self._late += 1
-        return PeriodicDue(deadline, current, missed)
+        due = PeriodicDue(first_ordinal + missed, deadline, current, missed)
+        self._active_due_ordinal = due.ordinal
+        self._active_due_state = "CLAIMED"
+        return due
 
     def supersede_for_protection(self, due: PeriodicDue) -> None:
-        self._require_due(due)
+        self._require_state(due, "CLAIMED")
+        self._active_due_state = "PROTECTION_SUPERSEDED"
         self._protection_supersession += 1
 
+    def dispatch(self, due: PeriodicDue) -> None:
+        """Record transfer of one claimed opportunity to ordinary service."""
+        self._require_state(due, "CLAIMED")
+        self._active_due_state = "DISPATCHED"
+        self._dispatched += 1
+
     def complete(self, due: PeriodicDue, *, applied: bool, intentional_no_work: bool = False) -> None:
-        self._require_due(due)
         if type(applied) is not bool or type(intentional_no_work) is not bool:
             raise ValueError("PONG_SCHEDULER_COMPLETION_CONTRACT_INVALID")
-        self._dispatched += 1
+        # Keep the public completion API compatible for direct users while
+        # production records dispatch explicitly before ordinary work starts.
+        state = self._require_state(due, "CLAIMED", "DISPATCHED")
+        if state == "CLAIMED":
+            self.dispatch(due)
+        self._active_due_state = "COMPLETED"
         self._completed += 1
         self._applied += int(applied)
         self._intentional_no_work += int(intentional_no_work)
 
     def mark_shutdown(self, due: PeriodicDue) -> None:
-        self._require_due(due)
+        self._require_state(due, "CLAIMED")
+        self._active_due_state = "SHUTDOWN"
         self._shutdown += 1
 
-    @staticmethod
-    def _require_due(due: PeriodicDue) -> None:
+    def _require_state(self, due: PeriodicDue, *states: str) -> str:
         if type(due) is not PeriodicDue:
             raise ValueError("PONG_SCHEDULER_DUE_REQUIRED")
+        state = (
+            self._active_due_state
+            if due.ordinal == self._active_due_ordinal
+            else None
+        )
+        if state not in states:
+            raise ValueError("PONG_SCHEDULER_DUE_STATE_INVALID")
+        return state
 
     def metrics(self) -> dict[str, int | str | bool | None]:
         terminal = (
@@ -180,9 +208,19 @@ class PongPeriodicDeadline:
             "clock": "perf_counter_ns/QueryPerformanceCounter",
             "origin_qpc_ns": self.origin_ns,
             "scheduled_opportunities": self._scheduled,
+            "claimed_current_opportunities": (
+                self._scheduled - self._missed_obsolete
+            ),
             "dispatched": self._dispatched,
             "completed": self._completed,
             "applied": self._applied,
+            "late_opportunities": self._late,
+            "on_time_opportunities": self._on_time,
+            "obsolete_opportunities": self._missed_obsolete,
+            "missed_opportunities": self._missed_obsolete,
+            "missed_opportunities_is_alias_of": "obsolete_opportunities",
+            # Compatibility names remain aliases, never additional terminal
+            # buckets in deadline reconciliation.
             "late_evaluations": self._late,
             "on_time_evaluations": self._on_time,
             "skipped_obsolete_deadlines": self._missed_obsolete,
@@ -190,4 +228,5 @@ class PongPeriodicDeadline:
             "protection_mode_supersessions": self._protection_supersession,
             "shutdown_deadlines": self._shutdown,
             "deadline_reconciliation": terminal == self._scheduled,
+            "completion_reconciliation": self._completed <= self._dispatched,
         }
