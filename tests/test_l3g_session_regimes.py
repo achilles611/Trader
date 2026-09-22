@@ -17,8 +17,11 @@ from src.l3g_paper.risk import PaperRiskAuthority, PaperRiskSnapshot
 from src.l3g_paper.runtime import LaneIIIPaperRuntime
 from src.l3g_paper.sessions import (
     ASIA_PROFILE, NEW_YORK_RTH_PROFILE, NY_AFTER_PROFILE, PaperCalendarState,
-    PaperSessionCalendar, PaperSessionKind, PaperSessionResolver,
+    PaperSessionCalendar, PaperSessionKind, PaperSessionProfile,
+    PaperSessionResolver,
 )
+from src.lane_iii.contracts import canonical_hash
+from unittest.mock import patch
 from src.l3f_provider.tradovate_observation import StreamHealth
 
 from tests.l3g_helpers import ObservationFactory, warmed_bullish_policy
@@ -56,6 +59,26 @@ def healthy(context, at: str, **changes: object) -> PaperRiskSnapshot:
 
 
 class SessionClassificationTests(unittest.TestCase):
+    def test_immutable_profile_hash_is_computed_once(self) -> None:
+        profile = PaperSessionProfile(
+            PaperSessionKind.ASIA,
+            "America/New_York",
+            "18:00",
+            "18:05",
+            "01:30",
+            "01:58",
+            "02:00",
+            (6, 0, 1, 2, 3),
+        )
+        with patch(
+            "src.l3g_paper.sessions.canonical_hash",
+            wraps=canonical_hash,
+        ) as hasher:
+            first = profile.profile_hash
+            second = profile.profile_hash
+        self.assertEqual(first, second)
+        self.assertEqual(hasher.call_count, 1)
+
     def test_asia_and_new_york_boundaries_use_america_new_york(self) -> None:
         cases = (
             ("2026-08-24T22:00:00Z", PaperSessionKind.ASIA, "2026-08-25", False),  # Sunday 18:00 warmup

@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from enum import StrEnum
+from functools import cached_property, lru_cache
 from types import MappingProxyType
 from typing import Mapping
 from dateutil import tz
@@ -106,6 +107,7 @@ def _gregorian_easter(year: int) -> date:
     return date(year, (h + l - 7 * m + 114) // 31, (h + l - 7 * m + 114) % 31 + 1)
 
 
+@lru_cache(maxsize=16)
 def _conservative_holiday_fence_dates(year: int) -> frozenset[date]:
     """Known US market-holiday candidates, deliberately not a CME timetable.
 
@@ -134,6 +136,7 @@ def _conservative_holiday_fence_dates(year: int) -> frozenset[date]:
     return frozenset(fixed | variable)
 
 
+@lru_cache(maxsize=64)
 def _requires_holiday_override(trade_date: date) -> bool:
     # Include adjacent years because a New Year's observed date can fall on
     # December 31 of the prior calendar year.
@@ -142,6 +145,7 @@ def _requires_holiday_override(trade_date: date) -> bool:
     })
 
 
+@lru_cache(maxsize=32)
 def _clock(value: str) -> time:
     try:
         parsed = time.fromisoformat(value)
@@ -177,7 +181,7 @@ class PaperSessionProfile:
         elif not self.valid_start_weekdays or any(type(day) is not int or day < 0 or day > 6 for day in self.valid_start_weekdays):
             raise ValueError("A market session requires explicit valid start weekdays.")
 
-    @property
+    @cached_property
     def profile_hash(self) -> str:
         payload = asdict(self)
         payload["session_kind"] = self.session_kind.value
