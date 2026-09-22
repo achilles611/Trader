@@ -296,6 +296,22 @@ def _dispatch_pong_observation(
         metrics.record_stage("paper_fanout", time.perf_counter() - stage_started)
         metrics.record_route("PONG_PAPER_ONLY")
         metrics.record_stage("composite_total", time.perf_counter() - composite_started)
+        local_sequence = getattr(observation, "local_monotonic_sequence", None)
+        if (
+            qualifying_market
+            and type(local_sequence) is int
+            and local_sequence > 0
+            and local_sequence % 64 == 0
+        ):
+            # The collector and host are required ordered consumers with
+            # independent bounded queues. Under sustained canonical depth,
+            # the synchronous paper callback can otherwise retain the GIL
+            # long enough for their truthful queue-age clocks to breach the
+            # same 1,000 ms freshness fence even though neither worker is I/O
+            # bound. Yielding at a fixed authenticated sequence cadence adds
+            # no buffering, reordering, retry, or authority; it only lets the
+            # already-admitted workers service their queues.
+            time.sleep(0)
         return
     stage_started = time.perf_counter()
     if qualifying_route:

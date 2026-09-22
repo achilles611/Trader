@@ -5,6 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from src.copytrade.control_center import _dispatch_pong_observation, _ObservationIngressMetrics
 from src.l3f_provider.ninjatrader_observation import AccountClass
@@ -20,6 +21,17 @@ from tests.l3g_helpers import ObservationFactory
 
 
 class ReceiverRepairDispatchTests(unittest.TestCase):
+    def test_qualifying_route_yields_to_required_workers_at_fixed_sequence_cadence(self):
+        with patch("src.copytrade.control_center.time.sleep") as pause:
+            self.dispatch(SimpleNamespace(
+                observation_type="DEPTH", local_monotonic_sequence=63,
+            ))
+            pause.assert_not_called()
+            self.dispatch(SimpleNamespace(
+                observation_type="DEPTH", local_monotonic_sequence=64,
+            ))
+            pause.assert_called_once_with(0)
+
     def setUp(self):
         self.events = []
         self.failures = []
