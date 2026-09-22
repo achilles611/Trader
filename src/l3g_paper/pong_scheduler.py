@@ -195,8 +195,11 @@ class PongPeriodicDeadline:
         return state
 
     def metrics(self) -> dict[str, int | str | bool | None]:
+        outstanding_claimed = int(self._active_due_state == "CLAIMED")
+        outstanding_dispatched = int(self._active_due_state == "DISPATCHED")
+        outstanding = outstanding_claimed + outstanding_dispatched
         terminal = (
-            self._dispatched
+            self._completed
             + self._missed_obsolete
             + self._protection_supersession
             + self._shutdown
@@ -214,6 +217,9 @@ class PongPeriodicDeadline:
             "dispatched": self._dispatched,
             "completed": self._completed,
             "applied": self._applied,
+            "outstanding_claimed": outstanding_claimed,
+            "outstanding_dispatched": outstanding_dispatched,
+            "outstanding_opportunities": outstanding,
             "late_opportunities": self._late,
             "on_time_opportunities": self._on_time,
             "obsolete_opportunities": self._missed_obsolete,
@@ -227,6 +233,11 @@ class PongPeriodicDeadline:
             "intentional_no_work": self._intentional_no_work,
             "protection_mode_supersessions": self._protection_supersession,
             "shutdown_deadlines": self._shutdown,
-            "deadline_reconciliation": terminal == self._scheduled,
-            "completion_reconciliation": self._completed <= self._dispatched,
+            "deadline_reconciliation": (
+                terminal + outstanding == self._scheduled
+            ),
+            "completion_reconciliation": (
+                self._dispatched
+                == self._completed + outstanding_dispatched
+            ),
         }

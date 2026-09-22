@@ -74,7 +74,10 @@ from .pong_scheduler import (
     PongSchedulingConfig,
     PongSchedulingMode,
 )
-from .pong_periodic_telemetry import PONG_PERIODIC_TELEMETRY_SCHEMA
+from .pong_periodic_telemetry import (
+    PERIODIC_DISQUALIFIER_KEYS,
+    PONG_PERIODIC_TELEMETRY_SCHEMA,
+)
 from .pong_controller import (
     PONG_ACTIVATION_DATE_LOCAL,
     PongBoundedController,
@@ -495,6 +498,16 @@ class PongProductionHost:
         self._protection_eligible_elapsed_seconds = 0.0
         self._protection_protected_elapsed_seconds = 0.0
         self._protection_transition_count = 0
+        self._periodic_protection_reason_events = {
+            key: 0 for key in PERIODIC_DISQUALIFIER_KEYS
+            if key.endswith("_events") and key not in {
+                "durability_lag_events",
+            }
+        }
+        self._periodic_durability_lag_events = 0
+        self._periodic_durability_counter_regressions = 0
+        self._periodic_durability_lag_active: bool | None = None
+        self._periodic_last_durability_counts: tuple[int, int, int] | None = None
         self._bridge: PongRuntimeBridge | None = None
         self._bridge_error: str | None = None
         self._pending_native: deque[
@@ -545,6 +558,7 @@ class PongProductionHost:
         )
         self._canonical_depth_source_sequence: int | None = None
         self._canonical_depth_recoveries = 0
+        self._canonical_depth_losses = 0
         self._canonical_depth_last_receipt_at: datetime | None = None
         self._volume_buckets: dict[str, Decimal] = {}
         self._volume_windows: dict[str, VolumeWindow] = {}
@@ -627,18 +641,70 @@ class PongProductionHost:
                 self._protection_eligible_elapsed_seconds += elapsed
             elif self._protection_accounting_state == "PROTECTED":
                 self._protection_protected_elapsed_seconds += elapsed
-        if (
+        transitioned = (
             self._protection_accounting_state is not None
             and (
                 state != self._protection_accounting_state
                 or reason != self._protection_accounting_reason
             )
-        ):
+        )
+        if transitioned:
             self._protection_transition_count += 1
+            if reason is not None:
+                key = self._periodic_protection_reason_key(reason)
+                self._periodic_protection_reason_events[key] += 1
         self._protection_accounting_last_monotonic = now
         self._protection_accounting_state = state
         self._protection_accounting_reason = reason
         return reason
+
+    @staticmethod
+    def _periodic_protection_reason_key(reason: str) -> str:
+        if reason == "RUNTIME_BRIDGE_UNAVAILABLE":
+            return "bridge_unavailable_events"
+        if reason.startswith("BRIDGE_STATE_REQUIRES_PROTECTION:"):
+            return "bridge_state_protection_events"
+        if reason == "BRIDGE_EXPOSURE_OR_INTENT_UNRESOLVED":
+            return "bridge_exposure_or_intent_events"
+        if reason == "RUNTIME_RECONCILIATION_UNRESOLVED":
+            return "runtime_reconciliation_loss_events"
+        if reason == "RUNTIME_EXECUTION_UNRESOLVED":
+            return "runtime_execution_unresolved_events"
+        if reason == "RUNTIME_POSITION_NOT_FLAT":
+            return "runtime_position_not_flat_events"
+        if reason == "RUNTIME_OWNED_ORDERS_PRESENT":
+            return "runtime_owned_orders_events"
+        if reason == "RUNTIME_ENTRY_ORDERS_PRESENT":
+            return "runtime_entry_orders_events"
+        if reason == "NATIVE_DIRECTIVE_PENDING":
+            return "native_directive_pending_events"
+        return "other_protection_events"
+
+    def _observe_periodic_durability_locked(self) -> None:
+        durability = self._collection.get("durability")
+        if not isinstance(durability, Mapping):
+            return
+        values = tuple(
+            durability.get(key)
+            for key in ("enqueued_records", "written_records", "durable_records")
+        )
+        if not all(type(value) is int and value >= 0 for value in values):
+            return
+        counts = (int(values[0]), int(values[1]), int(values[2]))
+        prior = self._periodic_last_durability_counts
+        if prior is not None and any(
+            current < previous for current, previous in zip(counts, prior)
+        ):
+            self._periodic_durability_counter_regressions += 1
+        queue_depth = durability.get("queue_depth")
+        lag_active = (
+            len(set(counts)) != 1
+            or (type(queue_depth) is int and queue_depth != 0)
+        )
+        if lag_active and self._periodic_durability_lag_active is not True:
+            self._periodic_durability_lag_events += 1
+        self._periodic_durability_lag_active = lag_active
+        self._periodic_last_durability_counts = counts
 
     def _host_receipt_payload_locked(
         self,
@@ -1029,6 +1095,7 @@ class PongProductionHost:
         with self._lock:
             if final_collection is not None:
                 self._collection = final_collection
+                self._observe_periodic_durability_locked()
             if self._input_error is not None and self._host_first_fault is None:
                 self._persist_first_host_fault_locked(self._input_error)
             final_fault = (
@@ -1519,6 +1586,8 @@ class PongProductionHost:
             ))
 
     def _invalidate_canonical_depth(self, reason: str) -> None:
+        if self._canonical_depth_ready:
+            self._canonical_depth_losses += 1
         self._canonical_depth = {BookSide.BID: (), BookSide.ASK: ()}
         self._canonical_depth_ready = False
         self._canonical_depth_reason = reason
@@ -2724,6 +2793,7 @@ class PongProductionHost:
                     self._update_protection_accounting_locked()
                     self._runtime = runtime
                     self._collection = collection
+                    self._observe_periodic_durability_locked()
                     self._update_protection_accounting_locked()
                     self._persist_host_checkpoint_locked(self._monotonic_clock())
                     self._open_controller()
@@ -2797,6 +2867,7 @@ class PongProductionHost:
         observation_queue_depth: int,
         oldest_pending_queue_age_ms: float | None,
     ) -> dict[str, object]:
+        self._observe_periodic_durability_locked()
         deadline = self._periodic_deadline.metrics()
         durability = self._collection.get("durability")
         durability = durability if isinstance(durability, Mapping) else {}
@@ -2807,6 +2878,27 @@ class PongProductionHost:
             if type(enqueued) is int and type(durable) is int
             else None
         )
+        durability_counts_available = all(
+            type(durability.get(key)) is int
+            for key in ("enqueued_records", "written_records", "durable_records")
+        )
+        collector_transport_counters_available = all(
+            type(durability.get(key)) is int
+            for key in (
+                "queue_overflow_records",
+                "producer_queue_overflow_records",
+                "producer_transport_failed_records",
+            )
+        )
+        collector_durability_coherent = bool(
+            durability_counts_available
+            and enqueued == durability.get("written_records") == durable
+            and durability.get("queue_depth") == 0
+        )
+        def collector_counter(key: str) -> int:
+            value = durability.get(key)
+            return value if type(value) is int and value >= 0 else 0
+
         producer = self._producer
         return {
             "schema": PONG_PERIODIC_TELEMETRY_SCHEMA,
@@ -2864,12 +2956,41 @@ class PongProductionHost:
                 "intentional_no_work": deadline["intentional_no_work"],
                 "shutdown_opportunities": deadline["shutdown_deadlines"],
             },
+            "disqualifier_counters": {
+                "protection_transitions": self._protection_transition_count,
+                **self._periodic_protection_reason_events,
+                "freshness_breaches": self._freshness_breach_count,
+                "host_queue_overflows": self._observation_overflow,
+                "collector_queue_overflows": collector_counter(
+                    "queue_overflow_records",
+                ),
+                "producer_queue_overflows": collector_counter(
+                    "producer_queue_overflow_records",
+                ),
+                "producer_transport_failures": collector_counter(
+                    "producer_transport_failed_records",
+                ),
+                "durability_lag_events": self._periodic_durability_lag_events,
+                "durability_counter_regressions": (
+                    self._periodic_durability_counter_regressions
+                ),
+                "canonical_depth_losses": self._canonical_depth_losses,
+                "stream_missing_events": sum(self._stream_missing.values()),
+                "stream_out_of_order_events": sum(
+                    self._stream_out_of_order.values()
+                ),
+            },
             "scheduler": {
                 "origin_qpc_ns": deadline["origin_qpc_ns"],
                 "interval_ms": deadline["interval_ms"],
                 "deadline_reconciliation": deadline["deadline_reconciliation"],
                 "completion_reconciliation": deadline[
                     "completion_reconciliation"
+                ],
+                "outstanding_claimed": deadline["outstanding_claimed"],
+                "outstanding_dispatched": deadline["outstanding_dispatched"],
+                "outstanding_opportunities": deadline[
+                    "outstanding_opportunities"
                 ],
             },
             "context": {
@@ -2899,8 +3020,16 @@ class PongProductionHost:
                 ),
                 "freshness_blocker": self._fhb_guard_blocker,
                 "collector_enqueued_records": enqueued,
+                "collector_written_records": durability.get("written_records"),
                 "collector_durable_records": durable,
                 "collector_durable_lag_records": durable_lag,
+                "durability_counts_available": durability_counts_available,
+                "collector_durability_coherent": (
+                    collector_durability_coherent
+                ),
+                "collector_transport_counters_available": (
+                    collector_transport_counters_available
+                ),
                 "collector_queue_depth": durability.get("queue_depth"),
                 "collector_queue_high_water": durability.get(
                     "queue_high_water_records",
@@ -2913,6 +3042,12 @@ class PongProductionHost:
                 ),
                 "collector_queue_overflow_records": durability.get(
                     "queue_overflow_records",
+                ),
+                "producer_queue_overflow_records": durability.get(
+                    "producer_queue_overflow_records",
+                ),
+                "producer_transport_failed_records": durability.get(
+                    "producer_transport_failed_records",
                 ),
             },
             "semantics": {

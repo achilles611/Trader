@@ -61,6 +61,8 @@ def _collector_snapshot() -> dict[str, object]:
             "last_queue_age_milliseconds": 0.0,
             "maximum_queue_age_milliseconds": 0.0,
             "queue_overflow_records": 0,
+            "producer_queue_overflow_records": 0,
+            "producer_transport_failed_records": 0,
         },
     }
 
