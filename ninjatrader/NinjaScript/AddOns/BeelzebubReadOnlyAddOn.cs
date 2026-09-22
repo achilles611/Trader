@@ -141,6 +141,8 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (State == State.Active)
             {
                 addonActive = true;
+                if (!BeelzebubReadOnlyOutbound.Start())
+                    BeelzebubReadOnlyOutbound.Diagnostic("ADDON_OUTBOUND_START_REFUSED");
                 Account.AccountStatusUpdate += OnAccountStatusUpdate;
                 BeelzebubReadOnlyOutbound.Diagnostic("ADDON_ACTIVE");
                 AttachKnownAccounts();
@@ -154,7 +156,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                 Account.AccountStatusUpdate -= OnAccountStatusUpdate;
                 DetachAutomaticObserver();
                 DetachKnownAccounts();
-                BeelzebubReadOnlyOutbound.Shutdown();
+                if (!BeelzebubReadOnlyOutbound.Shutdown())
+                    BeelzebubReadOnlyOutbound.Diagnostic("ADDON_OUTBOUND_SHUTDOWN_INCOMPLETE");
                 BeelzebubReadOnlyOutbound.Diagnostic("ADDON_TERMINATED");
             }
         }
@@ -1692,13 +1695,15 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string AttestedSchema = "lane-iii-phase-f3-ninjatrader-observation-v2";
         private const string AttestationProtocol = "l3f3-ninjatrader-observer-attestation-v1";
         private const string AttestationKeyContext = "BEELZEBUB_NINJATRADER_OBSERVATION_V2";
-        private const string ProducerSourceFingerprint = "051808624d0d91ac04e91cae27b7e8765d887774053192b909c7b7434f652a14";
+        private const string ProducerSourceFingerprint = "17995c2795e16bf52bedd9644a865261e3a20473f1e2bb7b75b4947bc558a525";
         // Event-driven trades/depth require burst capacity, but memory remains
         // bounded. A full queue drops the signed frame after assigning its
         // sequence; the next source_event_sequence exposes the gap.
         private const int MaximumQueuedFrames = 32768;
         private const int MaximumSenderBatchFrames = 256;
         private const int MaximumSenderBatchCharacters = 524288;
+        private const int SenderTeardownTimeoutMilliseconds = 5000;
+        private const int SenderSocketTimeoutMilliseconds = 2000;
         private static long sequence = 0;
         private static long queueOverflowFrames;
         private static long transportFailedFrames;
@@ -1740,6 +1745,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private static long senderWriteMaxTicks;
         private static long senderReconnects;
         private static long senderTransportFailureEvents;
+        private static long senderShutdownDiscardedFrames;
         private static long senderInFlightFrames;
         private static long senderInFlightOldestTicks;
         private static readonly string sessionId = Guid.NewGuid().ToString("N");
@@ -1748,8 +1754,11 @@ namespace NinjaTrader.NinjaScript.AddOns
         private static readonly Queue<OutboundFrame> outboundFrames = new Queue<OutboundFrame>();
         private static readonly object outboundFramesLock = new object();
         private static Thread senderThread;
+        private static TcpClient senderClient;
         private static bool senderRunning;
         private static bool senderStopping;
+        private static bool senderAccepting;
+        private static long senderGeneration;
         private static bool signingKeyLoadAttempted;
         private static byte[] signingKey;
         private static readonly string producerBuildFingerprint = AssemblyHash();
@@ -1993,6 +2002,11 @@ namespace NinjaTrader.NinjaScript.AddOns
             payloadValue["native_sender_write_ms_max"] = Milliseconds(Interlocked.Read(ref senderWriteMaxTicks));
             payloadValue["native_sender_reconnects_total"] = Interlocked.Read(ref senderReconnects);
             payloadValue["native_sender_transport_failure_events_total"] = Interlocked.Read(ref senderTransportFailureEvents);
+            payloadValue["native_sender_shutdown_discarded_frames_total"] = Interlocked.Read(ref senderShutdownDiscardedFrames);
+            payloadValue["native_sender_generation"] = senderGeneration;
+            payloadValue["native_sender_accepting"] = senderAccepting;
+            payloadValue["native_sender_running"] = senderRunning;
+            payloadValue["native_sender_stopping"] = senderStopping;
             payloadValue["native_sender_inflight_frames"] = Interlocked.Read(ref senderInFlightFrames);
             payloadValue["native_sender_inflight_oldest_age_ms"] = inFlightOldest == 0
                 ? 0.0 : Milliseconds(Math.Max(0, now - inFlightOldest));
@@ -2019,6 +2033,14 @@ namespace NinjaTrader.NinjaScript.AddOns
             UpdateMaximum(ref senderWriteMaxTicks, elapsed);
         }
 
+        private static void RecordBatchFailure(int frameCount, bool shutdown)
+        {
+            Interlocked.Increment(ref senderTransportFailureEvents);
+            Interlocked.Add(ref transportFailedFrames, frameCount);
+            if (shutdown)
+                Interlocked.Add(ref senderShutdownDiscardedFrames, frameCount);
+        }
+
         private static void RecordPublicationElapsed(long startedTicks)
         {
             long elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - startedTicks;
@@ -2033,11 +2055,33 @@ namespace NinjaTrader.NinjaScript.AddOns
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool QueryThreadCycleTime(IntPtr threadHandle, out ulong cycleTime);
 
+        public static bool Start()
+        {
+            lock (outboundFramesLock)
+            {
+                // Repeated activation of the same owner is harmless. A prior
+                // generation that has not completed teardown retains ownership
+                // and blocks replacement rather than permitting two senders.
+                if (senderRunning || senderThread != null || senderClient != null)
+                    return senderAccepting && !senderStopping;
+                senderGeneration++;
+                senderStopping = false;
+                senderAccepting = true;
+                return true;
+            }
+        }
+
         // Serialize all writes through one localhost-only sender. Market data
         // callbacks can be concurrent; opening one socket per callback permits
         // frame reordering and can exhaust local ephemeral ports.
         private static bool EnqueueLocked(string frame)
         {
+            if (!senderAccepting || senderStopping)
+            {
+                RecordBatchFailure(1, true);
+                TransportDiagnosticOnce("BRIDGE_ENQUEUE_REFUSED_STOPPED_GENERATION");
+                return false;
+            }
             if (outboundFrames.Count >= MaximumQueuedFrames)
             {
                 Interlocked.Increment(ref queueOverflowFrames);
@@ -2048,20 +2092,33 @@ namespace NinjaTrader.NinjaScript.AddOns
                 frame, System.Diagnostics.Stopwatch.GetTimestamp()));
             Interlocked.Increment(ref queueEnqueuedFrames);
             UpdateMaximum(ref queueHighWaterFrames, outboundFrames.Count);
-            senderStopping = false;
             if (!senderRunning)
             {
-                senderRunning = true;
-                senderThread = new Thread(SenderLoop);
-                senderThread.IsBackground = true;
-                senderThread.Name = "BeelzebubReadOnlyOutbound";
-                senderThread.Start();
+                long generation = senderGeneration;
+                try
+                {
+                    senderRunning = true;
+                    senderThread = new Thread(delegate() { SenderLoop(generation); });
+                    senderThread.IsBackground = true;
+                    senderThread.Name = "BeelzebubReadOnlyOutbound-" + generation.ToString(CultureInfo.InvariantCulture);
+                    senderThread.Start();
+                }
+                catch (Exception error)
+                {
+                    int refused = outboundFrames.Count;
+                    outboundFrames.Clear();
+                    senderRunning = false;
+                    senderThread = null;
+                    RecordBatchFailure(refused, false);
+                    TransportDiagnosticOnce("BRIDGE_SENDER_START_FAILED_" + error.GetType().Name);
+                    return false;
+                }
             }
             Monitor.Pulse(outboundFramesLock);
             return true;
         }
 
-        private static void SenderLoop()
+        private static void SenderLoop(long generation)
         {
             TcpClient client = null;
             NetworkStream stream = null;
@@ -2074,9 +2131,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                     long batchOldestTicks = 0;
                     lock (outboundFramesLock)
                     {
-                        while (!senderStopping && outboundFrames.Count == 0)
+                        while (!senderStopping && generation == senderGeneration
+                            && outboundFrames.Count == 0)
                             Monitor.Wait(outboundFramesLock);
-                        if (senderStopping)
+                        if (senderStopping || generation != senderGeneration)
                             return;
                         int characters = 0;
                         while (outboundFrames.Count > 0
@@ -2093,23 +2151,36 @@ namespace NinjaTrader.NinjaScript.AddOns
                         }
                         Interlocked.Add(ref queueDequeuedFrames, frames.Count);
                     }
-                    byte[] bytes = Encoding.UTF8.GetBytes(String.Concat(frames));
-                    Interlocked.Increment(ref senderBatches);
-                    Interlocked.Add(ref senderBatchFrames, frames.Count);
-                    Interlocked.Add(ref senderBatchBytes, bytes.Length);
-                    UpdateMaximum(ref senderBatchMaxFrames, frames.Count);
-                    UpdateMaximum(ref senderBatchMaxBytes, bytes.Length);
                     Interlocked.Exchange(ref senderInFlightFrames, frames.Count);
                     Interlocked.Exchange(ref senderInFlightOldestTicks, batchOldestTicks);
                     long writeStarted = 0;
                     try
                     {
+                        byte[] bytes = Encoding.UTF8.GetBytes(String.Concat(frames));
+                        Interlocked.Increment(ref senderBatches);
+                        Interlocked.Add(ref senderBatchFrames, frames.Count);
+                        Interlocked.Add(ref senderBatchBytes, bytes.Length);
+                        UpdateMaximum(ref senderBatchMaxFrames, frames.Count);
+                        UpdateMaximum(ref senderBatchMaxBytes, bytes.Length);
                         if (client == null)
                         {
                             if (connectionAttempted)
                                 Interlocked.Increment(ref senderReconnects);
                             connectionAttempted = true;
-                            client = new TcpClient();
+                            TcpClient next = new TcpClient();
+                            next.SendTimeout = SenderSocketTimeoutMilliseconds;
+                            lock (outboundFramesLock)
+                            {
+                                if (senderStopping || generation != senderGeneration)
+                                {
+                                    CloseClient(next);
+                                    RecordBatchFailure(frames.Count, true);
+                                    TransportDiagnosticOnce("BRIDGE_STOPPED_BEFORE_CONNECT");
+                                    return;
+                                }
+                                senderClient = next;
+                                client = next;
+                            }
                             client.Connect(IPAddress.Loopback, Port);
                             stream = client.GetStream();
                             TransportDiagnosticOnce("BRIDGE_CHANNEL_CONNECTED");
@@ -2117,30 +2188,54 @@ namespace NinjaTrader.NinjaScript.AddOns
                         // Batch ordered newline-delimited frames into one socket
                         // write. Encoding and network backpressure remain outside
                         // the callback/queue lock; FIFO order is unchanged.
+                        lock (outboundFramesLock)
+                        {
+                            if (senderStopping || generation != senderGeneration)
+                            {
+                                RecordBatchFailure(frames.Count, true);
+                                TransportDiagnosticOnce("BRIDGE_STOPPED_BEFORE_WRITE");
+                                return;
+                            }
+                        }
                         writeStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                         Interlocked.Increment(ref senderSocketWrites);
                         stream.Write(bytes, 0, bytes.Length);
                         RecordWriteElapsed(writeStarted);
                         writeStarted = 0;
-                        TransportDiagnosticOnce("BRIDGE_PUBLISH_DELIVERED");
+                        // A completed socket write is not a receiver ACK or a
+                        // durable collector acknowledgement. Never label it as
+                        // delivery.
+                        TransportDiagnosticOnce("BRIDGE_SOCKET_WRITE_COMPLETED_NO_RECEIVER_ACK");
                     }
                     catch (SocketException error)
                     {
                         RecordWriteElapsed(writeStarted);
-                        Interlocked.Increment(ref senderTransportFailureEvents);
-                        Interlocked.Add(ref transportFailedFrames, frames.Count);
-                        TransportDiagnosticOnce("BRIDGE_CONNECT_FAILED_" + error.SocketErrorCode);
                         CloseClient(client);
+                        bool stopped;
+                        lock (outboundFramesLock)
+                        {
+                            stopped = senderStopping || generation != senderGeneration;
+                            if (Object.ReferenceEquals(senderClient, client))
+                                senderClient = null;
+                        }
+                        RecordBatchFailure(frames.Count, stopped);
+                        TransportDiagnosticOnce("BRIDGE_CONNECT_FAILED_" + error.SocketErrorCode);
                         client = null;
                         stream = null;
                     }
                     catch (Exception error)
                     {
                         RecordWriteElapsed(writeStarted);
-                        Interlocked.Increment(ref senderTransportFailureEvents);
-                        Interlocked.Add(ref transportFailedFrames, frames.Count);
-                        TransportDiagnosticOnce("BRIDGE_PUBLISH_FAILED_" + error.GetType().Name);
                         CloseClient(client);
+                        bool stopped;
+                        lock (outboundFramesLock)
+                        {
+                            stopped = senderStopping || generation != senderGeneration;
+                            if (Object.ReferenceEquals(senderClient, client))
+                                senderClient = null;
+                        }
+                        RecordBatchFailure(frames.Count, stopped);
+                        TransportDiagnosticOnce("BRIDGE_PUBLISH_FAILED_" + error.GetType().Name);
                         client = null;
                         stream = null;
                     }
@@ -2155,8 +2250,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                 CloseClient(client);
                 lock (outboundFramesLock)
                 {
+                    if (Object.ReferenceEquals(senderClient, client))
+                        senderClient = null;
                     senderRunning = false;
-                    senderThread = null;
+                    if (Object.ReferenceEquals(senderThread, Thread.CurrentThread))
+                        senderThread = null;
+                    Monitor.PulseAll(outboundFramesLock);
                 }
             }
         }
@@ -2252,17 +2351,63 @@ namespace NinjaTrader.NinjaScript.AddOns
             catch { return "1970-01-01T00:00:00.0000000Z"; }
         }
 
-        public static void Shutdown()
+        public static bool Shutdown()
         {
+            Thread thread;
+            TcpClient client;
+            int discardedFrames;
             lock (outboundFramesLock)
             {
+                senderAccepting = false;
                 senderStopping = true;
+                discardedFrames = outboundFrames.Count;
                 outboundFrames.Clear();
+                if (discardedFrames > 0)
+                {
+                    RecordBatchFailure(discardedFrames, true);
+                    TransportDiagnosticOnce("BRIDGE_SHUTDOWN_DISCARDED_PENDING_FRAMES");
+                }
                 if (signingKey != null)
                     Array.Clear(signingKey, 0, signingKey.Length);
                 signingKey = null;
                 signingKeyLoadAttempted = false;
+                thread = senderThread;
+                client = senderClient;
                 Monitor.PulseAll(outboundFramesLock);
+            }
+
+            // The owning thread may be blocked outside the queue lock in
+            // Connect or Write. Closing its exact client is the supported
+            // cancellation mechanism; joining while holding the lock would
+            // deadlock the sender's finally block.
+            CloseClient(client);
+            if (thread != null)
+            {
+                if (Object.ReferenceEquals(thread, Thread.CurrentThread))
+                {
+                    TransportDiagnosticOnce("BRIDGE_SENDER_TEARDOWN_SELF_JOIN_REFUSED");
+                    return false;
+                }
+                bool joined;
+                try { joined = thread.Join(SenderTeardownTimeoutMilliseconds); }
+                catch (ThreadStateException)
+                {
+                    TransportDiagnosticOnce("BRIDGE_SENDER_TEARDOWN_THREAD_STATE_INVALID");
+                    return false;
+                }
+                if (!joined)
+                {
+                    TransportDiagnosticOnce("BRIDGE_SENDER_TEARDOWN_TIMEOUT");
+                    return false;
+                }
+            }
+            lock (outboundFramesLock)
+            {
+                bool complete = !senderRunning && senderThread == null && senderClient == null;
+                TransportDiagnosticOnce(complete
+                    ? "BRIDGE_SENDER_TEARDOWN_COMPLETE"
+                    : "BRIDGE_SENDER_TEARDOWN_INCOMPLETE");
+                return complete;
             }
         }
 
