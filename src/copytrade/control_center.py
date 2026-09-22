@@ -301,7 +301,7 @@ def _dispatch_pong_observation(
             qualifying_market
             and type(local_sequence) is int
             and local_sequence > 0
-            and local_sequence % 64 == 0
+            and local_sequence % 16 == 0
         ):
             # The collector and host are required ordered consumers with
             # independent bounded queues. Under sustained canonical depth,

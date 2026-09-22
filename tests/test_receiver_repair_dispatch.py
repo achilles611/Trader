@@ -24,11 +24,11 @@ class ReceiverRepairDispatchTests(unittest.TestCase):
     def test_qualifying_route_yields_to_required_workers_at_fixed_sequence_cadence(self):
         with patch("src.copytrade.control_center.time.sleep") as pause:
             self.dispatch(SimpleNamespace(
-                observation_type="DEPTH", local_monotonic_sequence=63,
+                observation_type="DEPTH", local_monotonic_sequence=15,
             ))
             pause.assert_not_called()
             self.dispatch(SimpleNamespace(
-                observation_type="DEPTH", local_monotonic_sequence=64,
+                observation_type="DEPTH", local_monotonic_sequence=16,
             ))
             pause.assert_called_once_with(0)
 
