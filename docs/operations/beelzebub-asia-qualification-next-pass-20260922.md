@@ -6,8 +6,8 @@ This is a manual, single-operator, disarmed Sim101 runbook. It does not authoriz
 
 - Operator/owner: Joseph.
 - Repository: `C:\Users\atlas\Documents\Trader`.
-- Repair-code head: `b4a46c2d73030f008e305a687069456c5d1bda0d`.
-- Repair-code tree: `c3e5ca334e63f8332883a5f31ac9013785be905a`.
+- Repair-code head: `7ac86fac1e3d4e775df151cacd75ae220394a8be`.
+- Repair-code tree: `f266fa9b68e94d5b9f1cb3c9f48538bd53a5c5b1`.
 - Profile: `BEELZEBUB_PONG_DISCERNMENT_V1`.
 - Account/environment: `Sim101` / `LOCAL_SIMULATION`.
 - Native/canonical contract: `MNQ DEC26` / `MNQZ6`.
@@ -37,9 +37,13 @@ The proposed next session is Tuesday, 2026-09-22. Recheck the [official CME trad
 
 The ratio window is diagnostic until Joseph approves a numeric threshold, direction, tolerance, and minimum denominator. Never slide, trim, backfill, or rerun the window after observing its result. If R2 and the preflight are not clean before 22:05Z, abort this window and predeclare a wholly new one.
 
-## Known HOLD before natural-feed work
+## Offline repair release and remaining HOLDs
 
-The final identical-input offline comparison is `NOT_QUALIFIED`: the repaired candidate retained all 10,000 records in order with zero overflow and transport-failure deltas, but achieved only 288.665 records/s with 24.643 seconds receiver lag against a 1,000 records/s offered schedule. This repairs observability and correctness; it does not establish capacity or a natural-feed qualification.
+The bounded receiver/collector service defect is released for the offline repair scope by `N:\Beelzebub\asia-repair-readiness\collector-service-final-20260922T025634Z\SERVICE_RELEASE_EVIDENCE.md` (SHA-256 `0F3599C199689D48A50083174188425B3074BFEDB052E71BAA1EEECACC5399A4`). The predeclaration SHA-256 is `B7E13DF9A6414642721D915D35DF076054F7E61CBBAC5953B52E93476784C8CB`; the candidate result SHA-256 is `3CE5CE6A1688BA33D5E8211D8674D3D076C6B0876A1E6CB3752B851D016E2660`.
+
+The final candidate retained and durably closed all 10,000 records with one ordered digest; zero rejection, duplication, host/collector overflow, producer-overflow delta, transport-failure delta, or native dispatch; zero host and collector queue depth at receiver completion; `156 ms` host maximum queue age; `203 ms` collector maximum queue age; `97.418 ms` maximum scheduled-to-receiver completion age across all 10,000 records; and `0.002095 s` final schedule lag. Completion was `999.891 records/s`, recorded as a diagnostic rather than an acceptance floor. Host, collector, paper, and ledger closed cleanly.
+
+Natural-feed capacity/qualification, periodic-ratio acceptance, current loaded identity, and capacity-latch recovery remain HOLDs. No natural feed was exercised and no current authenticated flat/reconciled Full was available during repair closeout. Do not interpret the offline service release as permission to skip Steps 0–4, consume R2, move into Gates B–D, arm, or place orders.
 
 ## Step 0 — create evidence root on N: and record host facts
 
@@ -175,6 +179,6 @@ Require stopped/drained collector and host queues, clean ledger shutdown/checkpo
 - `CAPACITY_RECOVERY_DEFERRED`: current authenticated flat/reconciled/Full proof is absent or recovery refuses.
 - `PERIODIC_WINDOW_INELIGIBLE`: any identity drift, protection, loss, gap, stale data, overflow, failure, durability issue, or queue non-equilibrium occurs.
 - `PERIODIC_DIAGNOSTIC_COMPLETE_POLICY_PENDING`: the window is structurally eligible and R is computed, but numeric policy remains unapproved.
-- `NOT_QUALIFIED_CAPACITY`: the known service-rate/freshness floor remains unmet.
+- `NOT_QUALIFIED_CAPACITY`: no separately predeclared representative natural-feed capacity qualification has passed.
 
 None of these labels authorizes Gates B–D, paper start, arming, or orders. A later full natural-feed qualification needs its own predeclared acceptance contract and evidence packet.
