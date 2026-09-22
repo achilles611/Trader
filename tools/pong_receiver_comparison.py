@@ -7,6 +7,7 @@ historical, and synthetic input is explicitly incapable of qualification.
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_left
 from collections import Counter
 from datetime import datetime, timezone, timedelta
 import hashlib
@@ -50,6 +51,11 @@ from src.lane_iii.contracts import canonical_hash
 from tools.pong_periodic_support import BenchmarkLease
 
 TEST_KEY = b"receiver-comparison-offline-only-test-key"
+_SOCKET_TIMING_BUCKETS_MS = (
+    0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0,
+    50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0,
+    10_000.0, 30_000.0,
+)
 
 
 def dump(path, value):
@@ -58,6 +64,54 @@ def dump(path, value):
 
 def wire(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+
+
+def new_bounded_timing():
+    return {
+        "count": 0,
+        "total_seconds": 0.0,
+        "maximum_seconds": 0.0,
+        "histogram_counts": [0] * (len(_SOCKET_TIMING_BUCKETS_MS) + 1),
+    }
+
+
+def record_bounded_timing(timing, elapsed_seconds):
+    elapsed = max(0.0, elapsed_seconds)
+    timing["count"] += 1
+    timing["total_seconds"] += elapsed
+    timing["maximum_seconds"] = max(timing["maximum_seconds"], elapsed)
+    elapsed_ms = elapsed * 1000.0
+    bucket = bisect_left(_SOCKET_TIMING_BUCKETS_MS, elapsed_ms)
+    timing["histogram_counts"][bucket] += 1
+
+
+def bounded_timing_report(timing):
+    def percentile_upper_bound(percentile):
+        if not timing["count"]:
+            return 0.0
+        rank = max(1, int(timing["count"] * percentile + 0.999999999))
+        cumulative = 0
+        for index, count in enumerate(timing["histogram_counts"]):
+            cumulative += count
+            if cumulative >= rank:
+                if index < len(_SOCKET_TIMING_BUCKETS_MS):
+                    return _SOCKET_TIMING_BUCKETS_MS[index]
+                return round(timing["maximum_seconds"] * 1000.0, 3)
+        return round(timing["maximum_seconds"] * 1000.0, 3)
+
+    count = timing["count"]
+    return {
+        "count": count,
+        "total_milliseconds": round(timing["total_seconds"] * 1000.0, 3),
+        "mean_milliseconds": round(timing["total_seconds"] * 1000.0 / count, 3) if count else 0.0,
+        "maximum_milliseconds": round(timing["maximum_seconds"] * 1000.0, 3),
+        "p50_milliseconds": percentile_upper_bound(0.50),
+        "p95_milliseconds": percentile_upper_bound(0.95),
+        "p99_milliseconds": percentile_upper_bound(0.99),
+        "quantile_method": "FIXED_HISTOGRAM_UPPER_BOUND",
+        "histogram_upper_bounds_milliseconds": [*_SOCKET_TIMING_BUCKETS_MS, "overflow"],
+        "histogram_counts": list(timing["histogram_counts"]),
+    }
 
 
 def corpus(args):
@@ -124,7 +178,8 @@ def corpus(args):
 
 
 def sender(port, frames, dues, ready, go, result_path):
-    writes, late = [], []
+    writes = new_bounded_timing()
+    late = new_bounded_timing()
     result = {"sent": 0, "bytes": 0}
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=10) as conn:
@@ -139,17 +194,29 @@ def sender(port, frames, dues, ready, go, result_path):
                 if remaining > 0:
                     time.sleep(remaining)
                 before = time.perf_counter()
-                late.append(max(0, before-epoch-due))
+                record_bounded_timing(late, before-epoch-due)
                 conn.sendall(raw)
-                writes.append(time.perf_counter()-before)
+                record_bounded_timing(writes, time.perf_counter()-before)
                 result["sent"] += 1
                 result["bytes"] += len(raw)
             result["end_monotonic"] = time.perf_counter()
+            result["sender_elapsed_seconds"] = result["end_monotonic"] - epoch
+            result["sender_schedule_overrun_seconds"] = max(
+                0.0, result["sender_elapsed_seconds"] - dues[-1],
+            )
             # Receiver must finish before peer disconnect changes host safety.
             conn.shutdown(socket.SHUT_WR)
     except Exception as exc:
         result["error"] = repr(exc)
-    result.update(socket_write_total_seconds=sum(writes), socket_write_max_seconds=max(writes, default=0), release_lateness_max_seconds=max(late, default=0))
+    write_report = bounded_timing_report(writes)
+    late_report = bounded_timing_report(late)
+    result.update(
+        socket_write_total_seconds=writes["total_seconds"],
+        socket_write_max_seconds=writes["maximum_seconds"],
+        release_lateness_max_seconds=late["maximum_seconds"],
+        socket_write_distribution=write_report,
+        release_lateness_distribution=late_report,
+    )
     dump(Path(result_path), result)
 
 
@@ -240,15 +307,18 @@ def run(args):
     proc.start()
     if not ready.wait(20):
         raise RuntimeError("OFFLINE_SENDER_NOT_READY")
-    started = time.perf_counter()
+    receiver_go_monotonic = time.perf_counter()
     go.set()
     samples = []
-    deadline = started + dues[-1] + 120
+    deadline = receiver_go_monotonic + dues[-1] + 120
+    collector_at_receiver_completion = None
+    host_at_receiver_completion = None
+    shutdown_timings = {}
     try:
         while len(completed) < len(frames) and time.perf_counter() < deadline:
             now = time.perf_counter()
             # Bounded cheap counters only; no expensive status calls while timed.
-            samples.append({"t": now-started, "completed": len(completed), "host_queue": host._observations.qsize(), "collector_queue": collector._queue.qsize()})
+            samples.append({"t": now-receiver_go_monotonic, "completed": len(completed), "host_queue": host._observations.qsize(), "collector_queue": collector._queue.qsize()})
             if not proc.is_alive() and (args.output/"sender.json").exists() and json.loads((args.output/"sender.json").read_text()).get("error"):
                 break
             time.sleep(.25)
@@ -256,12 +326,25 @@ def run(args):
         proc.join(35)
         if proc.is_alive():
             raise RuntimeError("OFFLINE_SENDER_SHUTDOWN_UNPROVEN")
+        # These snapshots happen only after the timed receiver loop. They make
+        # writer/host backlog at receiver completion explicit without adding a
+        # status serialization call to any market callback.
+        collector_at_receiver_completion = collector.status()
+        host_at_receiver_completion = host.status()
+        phase_started = time.perf_counter()
         listener_status = listener.stop(timeout_seconds=15).as_dict()
+        shutdown_timings["listener_stop"] = time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
         host.stop(30)
+        shutdown_timings["host_drain_and_stop"] = time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
         collector_status = collector.stop(timeout_seconds=30)
+        shutdown_timings["collector_drain_and_stop"] = time.perf_counter() - phase_started
         paper_fast_path = paper.pong_controller_snapshot()["qualifying_market_fast_path"]
+        phase_started = time.perf_counter()
         paper.stop()
         ledger_close = ledger.close()
+        shutdown_timings["paper_and_ledger_close"] = time.perf_counter() - phase_started
     ended = completed[-1] if completed else time.perf_counter()
     expected = hashlib.sha256()
     for frame in frames:
@@ -278,10 +361,23 @@ def run(args):
         count += 1
     with sqlite3.connect(f"file:{ledger.path.as_posix()}?mode=ro", uri=True) as db:
         kinds = dict(db.execute("SELECT kind,count(*) FROM lane_iii_paper_audit GROUP BY kind"))
-    source_hashes = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in [ROOT/"src/copytrade/control_center.py", ROOT/"src/l3f_provider/ninjatrader_commission.py", ROOT/"src/l3g_paper/runtime.py", Path(__file__)]}
+    source_hashes = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in [ROOT/"src/copytrade/control_center.py", ROOT/"src/l3f_provider/ninjatrader_commission.py", ROOT/"src/l3g_paper/pong_collection.py", ROOT/"src/l3g_paper/runtime.py", Path(__file__)]}
     sender_result = json.loads((args.output/"sender.json").read_text())
-    started = sender_result["start_monotonic"]
-    result = dict(schema="pong-offline-receiver-comparison-v2", route=args.route, paper_path=args.paper_path, mode=args.mode, offered_rate_per_second=(None if args.mode == "natural" else args.rate), offered_rate_authority="DIAGNOSTIC_ONLY_NOT_AN_ACCEPTANCE_THRESHOLD", qualification="NOT_QUALIFIED", execution_transport="ABSENT", healthy_flat_analysis_proof=False, source_freshness="NOT_CURRENT_NATIVE_EVIDENCE", provenance=provenance, loaded_source_sha256=source_hashes, records=len(frames), completed=len(completed), window_monotonic=[started, ended], elapsed_seconds=ended-started, completion_rate=len(completed)/(ended-started), scheduled_span_seconds=dues[-1], receiver_end_lag_seconds=max(0, ended-started-dues[-1]), sender=sender_result, consumers=stages, ingress=metrics.snapshot(), listener=listener_status, host=host.status(), collector=collector_status, paper_fast_path=paper_fast_path, ledger_close=ledger_close, ledger_kinds=kinds, samples=samples, ordered_wire_reconciliation=dict(expected=expected.hexdigest(), receiver=delivery["receiver"].hexdigest(), paper=delivery["paper"].hexdigest(), collector=retained.hexdigest(), collector_records=count))
+    sender_started = sender_result["start_monotonic"]
+    receiver_elapsed = ended - receiver_go_monotonic
+    receiver_clock = {
+        "clock": "PARENT_PROCESS_PERF_COUNTER",
+        "go_to_first_completion_seconds": (
+            None if not completed else completed[0] - receiver_go_monotonic
+        ),
+        "go_to_last_completion_seconds": receiver_elapsed,
+        "first_to_last_completion_seconds": (
+            0.0 if len(completed) < 2 else completed[-1] - completed[0]
+        ),
+        "scheduled_span_seconds": dues[-1],
+        "schedule_overrun_seconds": max(0.0, receiver_elapsed - dues[-1]),
+    }
+    result = dict(schema="pong-offline-receiver-comparison-v3", route=args.route, paper_path=args.paper_path, mode=args.mode, offered_rate_per_second=(None if args.mode == "natural" else args.rate), offered_rate_authority="DIAGNOSTIC_ONLY_NOT_AN_ACCEPTANCE_THRESHOLD", qualification="NOT_QUALIFIED", execution_transport="ABSENT", healthy_flat_analysis_proof=False, source_freshness="NOT_CURRENT_NATIVE_EVIDENCE", provenance=provenance, loaded_source_sha256=source_hashes, records=len(frames), completed=len(completed), window_monotonic=[sender_started, ended], elapsed_seconds=ended-sender_started, completion_rate=len(completed)/(ended-sender_started), scheduled_span_seconds=dues[-1], receiver_end_lag_seconds=max(0, ended-sender_started-dues[-1]), receiver_local_timing=receiver_clock, sender=sender_result, consumers=stages, ingress=metrics.snapshot(), listener=listener_status, host=host.status(), host_at_receiver_completion=host_at_receiver_completion, collector=collector_status, collector_at_receiver_completion=collector_at_receiver_completion, shutdown_timings_seconds=shutdown_timings, paper_fast_path=paper_fast_path, ledger_close=ledger_close, ledger_kinds=kinds, samples=samples, ordered_wire_reconciliation=dict(expected=expected.hexdigest(), receiver=delivery["receiver"].hexdigest(), paper=delivery["paper"].hexdigest(), collector=retained.hexdigest(), collector_records=count))
     result["ordered_wire_reconciliation"]["pass"] = len(frames)==len(completed)==count and len({expected.hexdigest(), retained.hexdigest(), delivery["paper"].hexdigest(), delivery["receiver"].hexdigest()}) == 1
     dump(args.output/"result.json", result)
     print(json.dumps({"output": str(args.output), "rate": result["completion_rate"], "lag": result["receiver_end_lag_seconds"], "ordered": result["ordered_wire_reconciliation"]["pass"]}), flush=True)

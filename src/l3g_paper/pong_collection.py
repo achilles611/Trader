@@ -8,6 +8,7 @@ at the loopback boundary can enter its append-only journal.
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -44,6 +45,14 @@ _RETAINED_TYPES = _MARKET_TYPES | frozenset({"HISTORICAL_WARM_START", "HOURLY_BA
 _ZERO_HASH = "0" * 64
 _STATUS_REPLACE_RETRY_SECONDS = 1.0
 _STATUS_REPLACE_RETRY_INTERVAL_SECONDS = 0.01
+# Fixed, process-local timing buckets. The collector retains no per-record
+# samples: authentic hours can contain millions of callbacks, so diagnostics
+# must remain constant-memory and leave the ordered writer as durability owner.
+_COLLECTOR_TIMING_BUCKETS_MS = (
+    0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0,
+    50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0,
+    10_000.0, 30_000.0, 60_000.0,
+)
 
 
 def _utc_now() -> datetime:
@@ -98,6 +107,60 @@ def _add_record_hash(canonical_body: bytes, digest: str) -> bytes:
         + b'"'
         + canonical_body[index:]
     )
+
+
+@dataclass
+class _BoundedTiming:
+    count: int = 0
+    total_nanoseconds: int = 0
+    maximum_nanoseconds: int = 0
+    histogram_counts: list[int] | None = None
+
+    def __post_init__(self) -> None:
+        if self.histogram_counts is None:
+            self.histogram_counts = [0] * (len(_COLLECTOR_TIMING_BUCKETS_MS) + 1)
+
+    def record_nanoseconds(self, elapsed_nanoseconds: int) -> None:
+        elapsed = max(0, elapsed_nanoseconds)
+        self.count += 1
+        self.total_nanoseconds += elapsed
+        self.maximum_nanoseconds = max(self.maximum_nanoseconds, elapsed)
+        elapsed_ms = elapsed / 1_000_000.0
+        bucket = bisect_left(_COLLECTOR_TIMING_BUCKETS_MS, elapsed_ms)
+        assert self.histogram_counts is not None
+        self.histogram_counts[bucket] += 1
+
+    def snapshot(self) -> dict[str, object]:
+        def percentile_upper_bound(percentile: float) -> float:
+            if self.count <= 0:
+                return 0.0
+            rank = max(1, int(self.count * percentile + 0.999999999))
+            cumulative = 0
+            assert self.histogram_counts is not None
+            for index, value in enumerate(self.histogram_counts):
+                cumulative += value
+                if cumulative >= rank:
+                    if index < len(_COLLECTOR_TIMING_BUCKETS_MS):
+                        return _COLLECTOR_TIMING_BUCKETS_MS[index]
+                    return round(self.maximum_nanoseconds / 1_000_000.0, 3)
+            return round(self.maximum_nanoseconds / 1_000_000.0, 3)
+
+        return {
+            "count": self.count,
+            "total_milliseconds": round(self.total_nanoseconds / 1_000_000.0, 3),
+            "mean_milliseconds": round(
+                self.total_nanoseconds / self.count / 1_000_000.0, 3,
+            ) if self.count else 0.0,
+            "maximum_milliseconds": round(self.maximum_nanoseconds / 1_000_000.0, 3),
+            "p50_milliseconds": percentile_upper_bound(0.50),
+            "p95_milliseconds": percentile_upper_bound(0.95),
+            "p99_milliseconds": percentile_upper_bound(0.99),
+            "quantile_method": "FIXED_HISTOGRAM_UPPER_BOUND",
+            "histogram_upper_bounds_milliseconds": [
+                *list(_COLLECTOR_TIMING_BUCKETS_MS), "overflow",
+            ],
+            "histogram_counts": list(self.histogram_counts or ()),
+        }
 
 
 def _finite_decimal(value: object, *, positive: bool = False) -> Decimal | None:
@@ -224,6 +287,19 @@ class PongAuthenticHourCollector:
         self._journal_bytes = 0
         self._last_fsync_at: str | None = None
         self._journal_tip = _ZERO_HASH
+        self._timings = {
+            name: _BoundedTiming()
+            for name in (
+                "observation_enqueue_service",
+                "queue_wait",
+                "record_encode_and_hash",
+                "journal_buffer_write",
+                "collector_state_apply",
+                "journal_flush",
+                "journal_fsync",
+                "status_persist",
+            )
+        }
         self._active_identity: tuple[str, str, str, str] | None = None
         self._last_source_sequences: dict[str, int] = {}
         self._last_quote: NinjaTraderObservation | None = None
@@ -274,6 +350,7 @@ class PongAuthenticHourCollector:
             return self.status()
 
     def ingest(self, record: NinjaTraderObservation) -> None:
+        enqueue_started = time.perf_counter_ns()
         if type(record) is not NinjaTraderObservation:
             self._record_drop("UNVERIFIED_OBSERVATION_TYPE")
             return
@@ -288,7 +365,10 @@ class PongAuthenticHourCollector:
         ):
             self._record_drop("UNVERIFIED_NATIVE_ATTESTATION")
             return
-        self._put(_CollectorItem("OBSERVATION", record, _wire(_utc_now()), time.monotonic()))
+        self._put(
+            _CollectorItem("OBSERVATION", record, _wire(_utc_now()), time.monotonic()),
+            observation_enqueue_started=enqueue_started,
+        )
 
     def on_transport_state(self, value: object) -> None:
         state = getattr(value, "value", value)
@@ -383,6 +463,10 @@ class PongAuthenticHourCollector:
                     ),
                     "rejected_records": self._rejected_records,
                     "duplicate_records": self._duplicate_records,
+                    "bounded_timing": {
+                        name: timing.snapshot()
+                        for name, timing in self._timings.items()
+                    },
                 },
                 "required_interval": target_status,
                 "recent_completed_intervals": completed,
@@ -391,15 +475,29 @@ class PongAuthenticHourCollector:
     def _put_control(self, kind: str, value: object) -> None:
         self._put(_CollectorItem(kind, value, _wire(_utc_now()), time.monotonic()))
 
-    def _put(self, item: _CollectorItem) -> None:
+    def _put(
+        self,
+        item: _CollectorItem,
+        *,
+        observation_enqueue_started: int | None = None,
+    ) -> None:
         try:
             self._queue.put_nowait(item)
+            enqueue_elapsed = (
+                None
+                if observation_enqueue_started is None
+                else time.perf_counter_ns() - observation_enqueue_started
+            )
             with self._lock:
                 self._queue_high_water_records = max(
                     self._queue_high_water_records, self._queue.qsize(),
                 )
                 if item.kind == "OBSERVATION":
                     self._enqueued_records += 1
+                    if enqueue_elapsed is not None:
+                        self._timings["observation_enqueue_service"].record_nanoseconds(
+                            enqueue_elapsed,
+                        )
         except queue.Full:
             self._record_drop("COLLECTOR_QUEUE_OVERFLOW")
 
@@ -425,7 +523,11 @@ class PongAuthenticHourCollector:
             with self._lock:
                 self._state = "COLLECTING"
                 self._error = None
-            self._persist_status()
+            self._timed_persist_status()
+            # The initial status is already current and fully fsynced. Start
+            # the cadence here instead of forcing a redundant two-file status
+            # fsync immediately after the first queued item.
+            last_status = time.monotonic()
             self._ready.set()
             stopping = False
             while not stopping:
@@ -444,17 +546,34 @@ class PongAuthenticHourCollector:
                             self._maximum_queue_age_milliseconds,
                             queue_age_milliseconds,
                         )
+                        self._timings["queue_wait"].record_nanoseconds(
+                            int(queue_age_milliseconds * 1_000_000.0),
+                        )
                     if item.kind == "STOP":
                         stopping = True
                     elif item.kind == "OBSERVATION":
                         assert isinstance(item.value, NinjaTraderObservation)
+                        encode_started = time.perf_counter_ns()
                         line = self._observation_line(item.value, item.enqueued_at)
+                        encode_elapsed = time.perf_counter_ns() - encode_started
+                        write_started = time.perf_counter_ns()
                         journal.write(line)
+                        write_elapsed = time.perf_counter_ns() - write_started
                         pending_records += 1
                         with self._lock:
+                            self._timings["record_encode_and_hash"].record_nanoseconds(
+                                encode_elapsed,
+                            )
+                            self._timings["journal_buffer_write"].record_nanoseconds(
+                                write_elapsed,
+                            )
                             self._written_records += 1
                             self._journal_bytes += len(line)
+                            apply_started = time.perf_counter_ns()
                             self._apply_observation_locked(item.value)
+                            self._timings["collector_state_apply"].record_nanoseconds(
+                                time.perf_counter_ns() - apply_started,
+                            )
                     else:
                         with self._lock:
                             self._apply_control_locked(item)
@@ -468,34 +587,46 @@ class PongAuthenticHourCollector:
                     or pending_records >= 1024
                     or now_monotonic - last_flush >= self._FLUSH_INTERVAL_SECONDS
                 ):
+                    flush_started = time.perf_counter_ns()
                     journal.flush()
+                    flush_elapsed = time.perf_counter_ns() - flush_started
+                    fsync_started = time.perf_counter_ns()
                     os.fsync(journal.fileno())
+                    fsync_elapsed = time.perf_counter_ns() - fsync_started
                     with self._lock:
+                        self._timings["journal_flush"].record_nanoseconds(flush_elapsed)
+                        self._timings["journal_fsync"].record_nanoseconds(fsync_elapsed)
                         self._durable_records = self._written_records
                         self._last_fsync_at = _wire(_utc_now())
                     pending_records = 0
                     last_flush = now_monotonic
                 if stopping or now_monotonic - last_status >= self._STATUS_INTERVAL_SECONDS:
-                    self._persist_status()
+                    self._timed_persist_status()
                     last_status = now_monotonic
             # Queue order guarantees STOP follows every record accepted before
             # stop(); perform one final durable checkpoint and status write.
             if pending_records:
+                flush_started = time.perf_counter_ns()
                 journal.flush()
+                flush_elapsed = time.perf_counter_ns() - flush_started
+                fsync_started = time.perf_counter_ns()
                 os.fsync(journal.fileno())
+                fsync_elapsed = time.perf_counter_ns() - fsync_started
                 with self._lock:
+                    self._timings["journal_flush"].record_nanoseconds(flush_elapsed)
+                    self._timings["journal_fsync"].record_nanoseconds(fsync_elapsed)
                     self._durable_records = self._written_records
                     self._last_fsync_at = _wire(_utc_now())
             with self._lock:
                 self._state = "STOPPED"
-            self._persist_status()
+            self._timed_persist_status()
         except Exception as exc:
             with self._lock:
                 self._state = "FAILED"
                 self._error = f"{type(exc).__name__}: {exc}"
             self._ready.set()
             try:
-                self._persist_status()
+                self._timed_persist_status()
             except Exception:
                 pass
         finally:
@@ -911,3 +1042,10 @@ class PongAuthenticHourCollector:
                     if time.monotonic() >= deadline:
                         raise
                     time.sleep(_STATUS_REPLACE_RETRY_INTERVAL_SECONDS)
+
+    def _timed_persist_status(self) -> None:
+        started = time.perf_counter_ns()
+        self._persist_status()
+        elapsed = time.perf_counter_ns() - started
+        with self._lock:
+            self._timings["status_persist"].record_nanoseconds(elapsed)
