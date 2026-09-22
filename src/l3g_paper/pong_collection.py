@@ -43,6 +43,12 @@ PONG_COLLECTION_TIMEZONE = "America/Denver"
 _MARKET_TYPES = frozenset({"TRADE", "QUOTE", "DEPTH"})
 _RETAINED_TYPES = _MARKET_TYPES | frozenset({"HISTORICAL_WARM_START", "HOURLY_BAR", "VOLUME_REFERENCE_HISTORY"})
 _ZERO_HASH = "0" * 64
+# CPython releases the GIL when hashlib receives more than 2,047 bytes in one
+# constructor or update call.  Authentic observation records are commonly just
+# over that boundary, so a busy receiver can preempt the sole ordered writer on
+# nearly every chain hash.  Bounded updates preserve the exact SHA-256 digest
+# while keeping this small writer-owned operation contiguous.
+_HASHLIB_GIL_RELEASE_BYTES = 2048
 _STATUS_REPLACE_RETRY_SECONDS = 1.0
 _STATUS_REPLACE_RETRY_INTERVAL_SECONDS = 0.01
 # Fixed, process-local timing buckets. The collector retains no per-record
@@ -107,6 +113,15 @@ def _add_record_hash(canonical_body: bytes, digest: str) -> bytes:
         + b'"'
         + canonical_body[index:]
     )
+
+
+def _writer_sha256(value: bytes) -> str:
+    """Return exact SHA-256 without a per-record hashlib GIL handoff."""
+    digest = hashlib.sha256()
+    maximum_update = _HASHLIB_GIL_RELEASE_BYTES - 1
+    for offset in range(0, len(value), maximum_update):
+        digest.update(value[offset:offset + maximum_update])
+    return digest.hexdigest()
 
 
 @dataclass
@@ -672,7 +687,7 @@ class PongAuthenticHourCollector:
             b',"wire_hash":', _canonical_bytes(record.wire_hash()),
             b'}',
         ))
-        digest = hashlib.sha256(canonical_body).hexdigest()
+        digest = _writer_sha256(canonical_body)
         self._journal_tip = digest
         return _add_record_hash(canonical_body, digest) + b"\n"
 

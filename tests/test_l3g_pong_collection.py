@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import time
@@ -14,7 +15,7 @@ from src.l3f_provider.ninjatrader_observation import (
     NinjaTraderObservation,
     NinjaTraderProducerAttestation,
 )
-from src.l3g_paper.pong_collection import PongAuthenticHourCollector
+from src.l3g_paper.pong_collection import PongAuthenticHourCollector, _writer_sha256
 
 
 def wire(value: datetime) -> str:
@@ -58,6 +59,34 @@ def record(
 
 
 class PongAuthenticHourCollectorTests(unittest.TestCase):
+    def test_writer_hash_preserves_sha256_without_large_update(self) -> None:
+        """Journal-sized values stay below hashlib's GIL-release boundary."""
+        value = bytes(range(256)) * 40
+        updates: list[bytes] = []
+        original_sha256 = hashlib.sha256
+
+        class TrackingDigest:
+            def __init__(self) -> None:
+                self._digest = original_sha256()
+
+            def update(self, chunk: bytes) -> None:
+                updates.append(chunk)
+                self._digest.update(chunk)
+
+            def hexdigest(self) -> str:
+                return self._digest.hexdigest()
+
+        with patch(
+            "src.l3g_paper.pong_collection.hashlib.sha256",
+            return_value=TrackingDigest(),
+        ):
+            actual = _writer_sha256(value)
+
+        self.assertEqual(actual, original_sha256(value).hexdigest())
+        self.assertEqual(b"".join(updates), value)
+        self.assertTrue(updates)
+        self.assertLessEqual(max(map(len, updates)), 2047)
+
     def test_fifo_writer_builds_chain_without_main_state_lock_handoffs(self) -> None:
         """Encoding stays writer-owned while preserving exact chain bytes."""
         with tempfile.TemporaryDirectory() as directory:
