@@ -14,7 +14,7 @@ from decimal import Decimal
 import threading
 from typing import Iterable, Mapping
 
-from src.l3f_provider.ninjatrader_observation import NinjaTraderObservation
+from src.l3f_provider.ninjatrader_observation import L3F3_SCHEMA, NinjaTraderObservation
 from src.l3f_provider.tradovate_observation import StreamHealth
 from src.lane_iii.contracts import canonical_hash, normalized_utc
 
@@ -182,6 +182,17 @@ class ExperimentalPaperPolicy:
 
     @staticmethod
     def _payload_hash(observation: NinjaTraderObservation) -> str:
+        # The L3F3 receiver verifies this exact digest against the payload
+        # before setting ``signature_verified``. Preserve that authenticated
+        # provenance coordinate instead of serializing and hashing the same
+        # payload again inside the synchronous policy fanout. Legacy/unverified
+        # observations retain the existing local derivation.
+        if (
+            observation.schema == L3F3_SCHEMA
+            and observation.signature_verified is True
+            and observation.payload_hash is not None
+        ):
+            return observation.payload_hash
         return canonical_hash(dict(observation.payload))
 
     def _contract_matches(self, observation: NinjaTraderObservation) -> bool:
@@ -336,11 +347,13 @@ class ExperimentalPaperPolicy:
             return "TIMESTAMP_MOVED_BACKWARD", receipt_time
         if observation.provider_timestamp is not None:
             provider_time = self._time(observation.provider_timestamp, "Provider event time")
-            receipt = self._time(observation.ninja_receipt_time, "NinjaTrader receipt time")
-            if provider_time > receipt + MAXIMUM_PROVIDER_FUTURE_SKEW:
+            # ``receipt_time`` was parsed from the same Ninja receipt value
+            # above. Reuse that validated authority instant instead of parsing
+            # the identical timestamp a second time on every market callback.
+            if provider_time > receipt_time + MAXIMUM_PROVIDER_FUTURE_SKEW:
                 self._clear_provisional()
                 return "FUTURE_EVENT_TIMESTAMP", receipt_time
-            if receipt - provider_time > timedelta(seconds=self.artifact.hypothesis_idle_lifetime_seconds):
+            if receipt_time - provider_time > timedelta(seconds=self.artifact.hypothesis_idle_lifetime_seconds):
                 self._clear_provisional()
                 return "STALE_EVENT_TIMESTAMP", receipt_time
         self._last_receipt_time = receipt_time

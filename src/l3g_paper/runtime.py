@@ -2935,10 +2935,11 @@ class LaneIIIPaperRuntime:
             context = self._session_resolver.resolve(
                 self._market_event_timestamp(observation), generation=self._session_generation,
             ).context
-        elif context.session_kind is PaperSessionKind.OFF_SESSION:
-            context = self._session_resolver.resolve(
-                self._market_event_timestamp(observation), generation=self._session_generation,
-            ).context
+        # OFF_SESSION does not advance the session generation, so the first
+        # resolution already carries the exact context to project. Repeating
+        # the same calendar classification here used to double the pure
+        # session work for every off-session market callback without changing
+        # identity, continuity, or the reason code.
         self._set_session_context(context, reason=resolution.reason_code or "MARKET_EVENT_SESSION")
         return context, resolution.reason_code
 

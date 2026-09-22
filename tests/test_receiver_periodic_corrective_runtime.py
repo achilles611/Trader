@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from src.l3f_provider.ninjatrader_observation import NinjaTraderObservation
 from src.l3g_paper.contracts import PaperRuntimeState
@@ -136,6 +137,27 @@ class ReceiverPeriodicCorrectiveRuntimeTests(unittest.TestCase):
                     projection["full_fallback_reasons"][
                         "EVENT_TIMESTAMP_MOVED_BACKWARD"
                     ], 1,
+                )
+            finally:
+                ledger.close()
+
+    def test_off_session_fast_path_classifies_each_callback_once(self) -> None:
+        with TemporaryDirectory() as directory:
+            ledger = pong_ledger(Path(directory) / "paper.sqlite3")
+            runtime = LaneIIIPaperRuntime(
+                ledger, qualifying_market_fast_path=FAST_IDENTITY,
+            )
+            try:
+                with patch.object(
+                    runtime._session_resolver,
+                    "resolve",
+                    wraps=runtime._session_resolver.resolve,
+                ) as resolve:
+                    runtime.ingest_qualifying_disarmed_pong_market(quote(1))
+                self.assertEqual(resolve.call_count, 1)
+                self.assertEqual(
+                    runtime._session_context.session_kind.value,
+                    "OFF_SESSION",
                 )
             finally:
                 ledger.close()

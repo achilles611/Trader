@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from src.l3g_paper.contracts import (
     PONG_ENTRY_PROFILE_VERSION,
@@ -29,6 +30,18 @@ def quote(sequence: int, observed: str = "2026-09-11T12:30:00Z"):
 
 
 class ReceiverPeriodicCorrectivePolicyTests(unittest.TestCase):
+    def test_attested_payload_hash_is_reused_without_rehashing(self) -> None:
+        observation = quote(1)
+        self.assertIsNotNone(observation.payload_hash)
+        with patch(
+            "src.l3g_paper.policy.canonical_hash",
+            side_effect=AssertionError("attested payload rehashed"),
+        ):
+            self.assertEqual(
+                pong_policy()._payload_hash(observation),
+                observation.payload_hash,
+            )
+
     def test_atomic_pong_state_ingest_returns_exact_pre_post_gate_facts(self) -> None:
         policy = pong_policy()
         observation = quote(1)
