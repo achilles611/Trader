@@ -1,8 +1,8 @@
-# Adam admissions report — London 30-minute natural-feed qualification
+# Adam admissions report — London natural-feed qualifying-hour closeout
 
 Pass ID: `20260922-072920Z-london-30m-qualification`
 Opened: `2026-09-22T07:29:20Z`
-Closed: `OPEN`
+Closed: `2026-09-22T07:50:24Z`
 Parent integrator and sole operator: `Sol (/root)`
 Caelum record: `docs/administration/caelum/passes/20260922-045541Z-aggressive-expedited-recovery/OVERSIGHT.md` (historical entry state); current superior review pending
 Adam report: `docs/administration/adam/passes/20260922-072920Z-london-30m-qualification/ADMISSIONS_REPORT.md`
@@ -11,20 +11,19 @@ Adam report: `docs/administration/adam/passes/20260922-072920Z-london-30m-qualif
 
 `HOLD`
 
-One-sentence decision: preparation for one fixed natural-feed interval is admitted only under the contract below; actual London collection qualification, periodic-ratio acceptance, engineering-capacity qualification, recovery, operational paper, arming and orders remain held until attributable closeout evidence passes every applicable condition and Caelum completes superior review.
+One-sentence decision: the final exact qualifying hour `[2026-09-22T08:00:00Z,09:00:00Z)` was correctly **not started** and earned `0` qualified seconds because pre-window producer loss, transport failure, DEPTH sequence gaps, freshness breaches, receiver fail-closure, missing warm-up, retained capacity lockout and runtime Git mismatch violated the admission contract; no rerun, ratio/capacity claim, recovery, paper start, arming or order is admitted.
 
 ## Frozen interval and no-repair rule
 
-- **Sole governing interval:** `[2026-09-22T08:00:00Z, 2026-09-22T08:30:00Z)`.
-- Europe/London civil time: `[2026-09-22 09:00:00, 09:30:00)` under the current IANA time-zone rules.
+- **Final sole governing interval:** `[2026-09-22T08:00:00Z, 2026-09-22T09:00:00Z)` / `[02:00,03:00) MDT` / `[09:00,10:00) Europe/London`.
 - Repository session contract: `LONDON / EUROPE`, `Europe/London`, inside the half-open weekday session `[08:00, 11:30)`.
-- The earlier `07:40Z–08:10Z` suggestion was an internal Adam draft rejected before the operator predeclaration because commissioning prerequisites could not complete. It is `REJECTED_NOT_PREDECLARED`, carries no attempt status, and is not a moved or repaired observation.
-- The `08:00Z–08:30Z` interval is the first and only operator-facing predeclaration for this pass. It cannot be started late, shortened, extended, slid, trimmed, restarted, backfilled, relabelled, substituted with replay/diagnostic data, or rerun in this pass after any result is known.
-- Sol must seal a pre-window receipt before `08:00:00Z` containing this exact interval, all identities below, baseline counters, current safety/storage proof, and hashes of the measurement/runtime artifacts. Missing or late predeclaration means `WINDOW_NOT_STARTED / HOLD`, not a shortened window.
+- The earlier `07:40Z–08:10Z` internal draft was rejected before freeze. The prior 30-minute `[08:00Z,08:30Z)` preparation artifact was superseded before start by Joseph's final one-hour objective. Neither earlier interval started or carries qualified time.
+- The exact hour cannot be started late, shortened, extended, slid, trimmed, restarted, backfilled, relabelled, substituted with replay/diagnostic data, or rerun in this pass.
+- `03-prestart-hold.json` was sealed at `07:45:00Z`, before the boundary, and records `started=false`, `qualified_seconds=0` and `HOLD_LONDON_QUALIFYING_HOUR_PRESTART_NATIVE_LOSS_AND_SEQUENCE_GAPS`. The no-repair rule therefore closes the pass without a collection attempt.
 
 ## Authority and scope
 
-- Joseph's assignment: Adam owns admissions review for a London 30-minute natural-feed qualification pass; Caelum is superior; Sol remains sole runtime, ledger, install, reload, recovery and window operator.
+- Joseph's final assignment: Adam closes the same report against one exact London qualifying hour; Caelum is superior; Sol remains sole runtime, ledger, install, reload, recovery and window operator.
 - Adam's bounded scope: establish the admission contract before the window, review routed evidence read-only, maintain exactly this report, and classify transitions without operating any system.
 - Caelum's superior scope: review this contract and resulting evidence, and confirm, modify or supersede Adam's disposition.
 - Adam's writable scope: only this report and its containing new directory.
@@ -34,12 +33,12 @@ One-sentence decision: preparation for one fixed natural-feed interval is admitt
 
 | Item | State | Evidence |
 |---|---|---|
-| Repository/branch/HEAD | **OBSERVED** | Adam opened at `ea388a86558729bd7c0c08e7a15347a7e5e254ea`; before contract freeze Sol integrated the two-phase commissioning implementation at `2331c744ccaa09d6644496142daa4682a0476f72`, tree `8b14f35e8c6bb4c3395dadf756a226803b37e6be`, on `codex/lane-iii-perpetual-corrective-20260906`. This implementation identity, plus later report-only descendants, must be reconciled exactly in the pre-window tuple. |
+| Repository/branch/HEAD | **OBSERVED** | Two-phase implementation `2331c744ccaa09d6644496142daa4682a0476f72`, tree `8b14f35e8c6bb4c3395dadf756a226803b37e6be`, preceded Adam/Caelum records. Prestart evidence named repository HEAD `15db37034bec3c4af504777f1e49c8dd5d4e9e50`, tree `ce120e257b930eae773b4c615a89d44c52ad1a78`, but the running binding reported Git `5998a8dd462f09e274183054c31ef6b34ee4535d`; `RUNTIME_GIT_IDENTITY_PRE_FREEZE_MISMATCH` was correctly disqualifying. |
 | Local modifications | **OBSERVED** | Pre-existing unrelated Caelum audit and operations evidence paths were dirty/untracked. Adam will neither stage nor edit them. |
-| Current runtime/evidence tuple | **UNKNOWN** | Sol must freeze exact checkout HEAD/tree, executable/source hashes, command/CWD/import hashes, selected profile/topology, native producer/build/source/session/generation, ledger path/identity/epoch/tip and evidence root before the window. |
-| Current account/position/orders/reconciliation/arming | **UNKNOWN** | Prior clean Sim101 evidence is historical. A fresh authenticated sandwich is required before and after any recovery and at window boundaries. |
-| R2/install/load status | **UNKNOWN current** | Caelum's `05:15:45Z` record observed R2 `0/1`, obsolete installed source `051808...`, and no authenticated listener. The new pass must prove whether the single R2 was authorized/consumed and whether the exact current source is installed, loaded and producing a distinct authenticated generation. |
-| Ledger verification/latch/capacity | **UNKNOWN current** | Historical Full through sequence `334116` and N:-destination observations are not current authority. Stable-tip Full, current writer health/runway, recovery result if needed, and post-recovery Full are required. |
+| Runtime/evidence tuple | **OBSERVED, not admissible** | Correct profile/architecture/topology/ledger tuple appeared, and the native source was `17995c...`, build `215e96...`, session `891602...`, generation `1`; however repository/runtime Git identity disagreed, transport disconnected, native receiver failed closed and continuity was invalid. |
+| Account/position/orders/reconciliation/arming | **OBSERVED safe at prestart** | `READY_DISARMED`; Sim101/local simulation; runtime and broker flat quantity `0`; zero owned/entry orders; complete snapshots; reconciliation current; activation unauthorized; live capital denied. No paper start, arming or order occurred. |
+| R2/install/load status | **OBSERVED, exhausted** | R2 was consumed `1/1`; no second attempt is permitted. `01-R2-source-preparation.json` proves source parity/compile preparation but is itself `verified=false`; the later authenticated runtime snapshot proves distinct producer source/build/session/generation. This success does not override the loss/continuity failures. |
+| Ledger verification/latch/capacity | **OBSERVED closeout integrity; recovery not admitted** | The capacity latch remained `LEDGER_CAPACITY_INADEQUATE:DEGRADED`; no supported recovery completed. Supported shutdown closed at `07:45:45Z`, and Full passed at `07:47:26Z` through stable tip `334199`, `quick_check=ok`, no storage warnings, WAL `0`, N: free `225,697,296,384` bytes. This proves closeout integrity, not qualification or latch recovery. |
 | Official venue availability | **UNKNOWN** | Sol must recheck the official CME schedule immediately before the window. Application-session eligibility does not prove venue availability. |
 
 ## Governing admission contract
@@ -87,7 +86,7 @@ If the capacity latch remains set, recovery is permitted only after the first Fu
 
 At the `08:00:00Z` boundary, all preconditions above must already pass. The session resolver must return the exact current `LONDON / EUROPE` generation and trade date under `Europe/London`; official venue availability must be confirmed; required listeners and the distinct authenticated native producer must already be stable; and the collector/host must already be running disarmed with zero queues or a fully reconciled bounded pre-boundary warm-up state.
 
-Only source events whose authentic source/receipt times fall in `[08:00:00Z,08:30:00Z)` belong to the qualification interval. Pre-boundary warm-up may establish readiness but cannot be counted as interval evidence. If the first attributable event/counter snapshot is late, the interval fails; no partial 30-minute claim is allowed.
+Only source events whose authentic source/receipt times fall in `[08:00:00Z,09:00:00Z)` could belong to the final qualification interval. Pre-boundary warm-up may establish readiness but cannot be counted as interval evidence. If the first attributable event/counter snapshot is late, the interval fails; no partial-hour claim is allowed.
 
 ### 5. Continuous natural-feed collection requirements
 
@@ -111,7 +110,7 @@ Any missing prerequisite or any in-window violation above immediately classifies
 
 ### 7. End, durable drain and closeout rule
 
-At `08:30:00Z`, Sol must capture the exact end boundary before any reset or restart, stop new qualification accounting, and preserve the complete interval. Then:
+Had the interval started, at `09:00:00Z` Sol would have captured the exact end boundary before any reset or restart. Because the start gate failed before `08:00Z`, the applicable closeout was immediate supported shutdown, durable preservation and final Full. The following requirements remain the standard for any future separately authorized pass:
 
 - receiver admitted count, paper/host accepted count, collector enqueued/written/durable count and per-stream counts must reconcile exactly for the governed scope;
 - expected/receiver/paper/collector ordered digests must match where the instrumentation defines them;
@@ -126,20 +125,20 @@ Eventual finite drain does not repair an in-window freshness, continuity, queue-
 
 ### 8. Qualification categories kept separate
 
-1. **Natural-feed collection qualification:** may pass only if the single continuous 30-minute interval satisfies Sections 1–7. This proves the named collection under its exact identity and conditions; it does not authorize trading.
+1. **Natural-feed collection qualification:** could pass only if the single continuous one-hour interval satisfied Sections 1–7. This pass recorded zero qualified seconds, so it did not qualify collection.
 2. **Periodic-ratio qualification:** not admitted in this pass. Telemetry formula remains `R = aligned delta DEPTH / aligned delta ordinary completed full analyses`. Protection/event-driven evaluations are not denominator evidence. Numeric threshold, comparison direction, tolerance and minimum denominator are `POLICY_NOT_DEFINED`. If the denominator is zero, the ratio must be null with an explicit reason. The observed value, if any, is diagnostic only.
-3. **Engineering-capacity qualification:** not admitted from a 30-minute natural interval, exact drain or observed average rate. No new threshold may be inferred. Any capacity decision must use the separately applicable predeclared contract, representative load, unchanged accepted floor(s), stable queues, zero loss and required repeat structure.
+3. **Engineering-capacity qualification:** not admitted from a natural hour, exact drain or observed average rate. No new threshold may be inferred. Any capacity decision must use the separately applicable predeclared contract, representative load, unchanged accepted floor(s), stable queues, zero loss and required repeat structure.
 4. **Operational/trading admission:** never follows automatically from any category above. No Gates B-D, operational paper start, arming, native directive or order is authorized.
 
 ## Transition decisions
 
 | Transition | Required evidence | Current result | Owner / release condition |
 |---|---|---|---|
-| Prepare exact disarmed runtime and evidence packet | Sections 1–3 complete before boundary; no state-changing authority beyond Joseph-approved R2 and supported recovery | **ADMITTED_WITH_CONDITIONS** | Sol only; Caelum reviews. Any unresolved prerequisite before `08:00Z` means do not start the window. |
-| Start fixed London interval | Pre-window receipt sealed before `08:00Z`; exact eligible session and every start rule passes | **HOLD** | Sol releases only on contemporaneous evidence. Adam cannot infer release from preparation. |
-| Natural-feed collection qualification | One genuine continuous `[08:00Z,08:30Z)` span plus exact durable closeout and final Full | **HOLD** | Await immutable evidence; Caelum may supersede Adam's later finding. |
+| Prepare exact disarmed runtime and evidence packet | Sections 1–3 complete before boundary; no state-changing authority beyond Joseph-approved R2 and supported recovery | **HOLD / FAILED PRESTART** | Correct native producer and safe account state were observed, but current loss, gaps, staleness, warm-up, lockout and Git identity gates failed. |
+| Start fixed London interval | Pre-window receipt sealed before `08:00Z`; exact eligible session and every start rule passes | **HOLD — WINDOW NOT STARTED** | `03-prestart-hold.json` records `started=false`, `qualified_seconds=0`. No later start or rerun is permitted. |
+| Natural-feed collection qualification | One genuine continuous `[08:00Z,09:00Z)` span plus exact durable closeout and final Full | **HOLD — NOT QUALIFIED** | The qualifying hour does not exist. Pre-window events cannot be relabelled into it. |
 | Periodic-ratio acceptance | Approved threshold/direction/tolerance/minimum denominator plus eligible ordinary-analysis window | **HOLD — POLICY DECISION REQUIRED** | Joseph owns policy. Do not derive policy from this interval. |
-| Engineering-capacity acceptance | Separate applicable predeclared contract and evidence | **HOLD — OUT OF SCOPE** | A natural 30-minute collection is insufficient. |
+| Engineering-capacity acceptance | Separate applicable predeclared contract and evidence | **HOLD — OUT OF SCOPE** | Pre-window drain and a later clean Full are not capacity qualification. |
 | Gates B-D, paper start, arming or orders | Separate explicit authority and all operational gates | **REJECTED for this pass** | No such action is authorized regardless of collection outcome. |
 
 ## Evidence register
@@ -150,27 +149,30 @@ Eventual finite drain does not repair an in-window freshness, continuity, queue-
 | `src/l3g_paper/sessions.py` and `docs/operations/lane-iii-commissioning-runbook.md` | **OBSERVED** | London is `LONDON / EUROPE`, IANA `Europe/London`, weekday half-open `[08:00,11:30)`. |
 | `docs/administration/caelum/passes/20260922-045541Z-aggressive-expedited-recovery/OVERSIGHT.md` | **OBSERVED historical** | At `05:15Z`, current native identity, runtime exercise and writer-capacity health were held; R2 was `0/1`; stable-tip Full passed historically; no recovery/window occurred. Every drift-prone fact requires fresh proof. |
 | Implementation commit `2331c744ccaa09d6644496142daa4682a0476f72`, tree `8b14f35e8c6bb4c3395dadf756a226803b37e6be` | **OBSERVED repository identity; test receipt pending** | Two-phase commissioning repair is integrated. Sol reports 62 focused tests passed, but Adam has not received the immutable test receipt path/hash; runtime installation/loading/exercise remains pending. |
-| Exact operator predeclaration, identity tuple, Full/recovery/safety evidence | **UNKNOWN / pending** | Must exist and pass before `08:00Z`. |
-| Continuous 30-minute collector/host/native evidence | **UNKNOWN / not yet observed** | Cannot be substituted with diagnostics, replay, partial interval or restarted capture. |
-| Closeout drain, final safety sandwich and post-close Full | **UNKNOWN / pending** | Required before any natural-feed qualification finding. |
+| `N:\Beelzebub\london-qualification-20260922T080000Z\00-predeclaration.json`, SHA-256 `2FA884C6797B4A47201FB81EE7F788DE188B4645E73B3E0CEDD04E9EA957D7E1` | **OBSERVED historical preparation** | Names the superseded 30-minute draft and N:-rooted identity/storage gates. It is not evidence that the final hour started. |
+| `N:\Beelzebub\london-qualification-20260922T080000Z\01-R2-source-preparation.json`, SHA-256 `E34912EB88DB3BC68AE4305180643B81417CF0A00FF6811B966BA74F5D47D33F` | **OBSERVED** | R2 source install/parity/compile preparation succeeded, but receipt says `verified=false`, loaded identity unclaimed and distinct producer pending. R2 became `1/1`. |
+| `N:\Beelzebub\london-qualification-20260922T080000Z\03-prestart-hold.json`, SHA-256 `D2513C03FABC12AF9AD86A2DE5044C6FFAA5B0260D71A249F55CCC56F3585F26` | **OBSERVED controlling decision** | Final hour `[08:00Z,09:00Z)` not started; `0` qualified seconds; correct producer identity observed, but +17,218 overflow, +5,617 transport failures, 534 DEPTH gaps, 1,796 freshness breaches, receiver fail-closure and Git mismatch forced HOLD. |
+| Current `...\audit\pong-authentic-hour\collection-status.json`, SHA-256 `AC0E3A6356248099380E663E03144CEB6DD7C7E9FB3EBE800CC180980C93882B` | **OBSERVED closeout** | Collector stopped/disconnected; `1,885` enqueued/written/durable pre-window records; queue depth `0`, collector max age `63 ms`, rejected `1`; producer deltas remained disqualifying; required hour state `PENDING`, `0%`, incomplete and ineligible. |
+| `...\audit\ledger-verification\20260922T074726710984Z-lv-london-hour-prestart-hold-20260922T0746Z.json`, SHA-256 `CAD752F7B015A78D34299A0BFAF29AB6341CAE5A2FD1EDC8DACA6868474ECC05` | **OBSERVED** | Post-shutdown Full `PASS` through all `334199` rows, stable tip hash `68489dee...c5ea5`, chain/checkpoint/risk guard valid, `quick_check=ok`, WAL `0`, no storage warnings, N: free `225,697,296,384`. |
+| Continuous qualifying-hour evidence | **OBSERVED absent** | `started=false` and `qualified_seconds=0`; no replay, partial span or pre-window journal may substitute. |
 
 ## Holds and unresolved items
 
 ### `HOLD_WINDOW_START_PREREQUISITES`
 
-- Action held: beginning qualification accounting at `08:00Z` unless every pre-window requirement is already satisfied.
-- Evidence: current runtime/native/profile/ledger/safety/storage/recovery state is presently unknown to Adam.
-- Consequence: a late or incomplete start receives no partial credit.
-- Release condition: Sol seals the exact pre-window packet before the boundary; Caelum may independently HOLD.
-- Owner: Sol; Joseph alone authorizes any R2; Caelum is superior reviewer.
-- Independent work: read-only evidence preparation and hashing may continue.
+- Action held: beginning the final `[08:00Z,09:00Z)` qualification hour.
+- Evidence: the prestart packet records nonzero producer overflow/transport-failure deltas, 534 DEPTH gaps, 1,796 freshness breaches, one rejection, failed-closed receiver, no warm-up, retained capacity lockout and Git identity mismatch.
+- Consequence: the hour was not started and receives exactly zero qualified seconds; R2 is exhausted `1/1`.
+- Release condition: none within this pass. A future attempt requires new explicit authority, a genuinely new predeclaration and correction of every causal defect; it cannot reuse or repair this hour.
+- Owner: Joseph controls any future pass; Sol remains sole operator; Caelum is superior reviewer.
+- Independent work: read-only causal diagnosis and evidence preservation may continue without retrying runtime actions.
 
 ### `HOLD_NATURAL_FEED_QUALIFICATION`
 
 - Action held: labelling the pass `NATURAL_FEED_COLLECTION_QUALIFIED`.
-- Evidence: the governed natural interval and closeout do not yet exist.
+- Evidence: the governed hour was explicitly not started; pre-window records are disqualified and the qualifying interval contains zero admitted evidence.
 - Consequence: tests, prior windows, replay, queue drain or short diagnostics remain non-qualifying.
-- Release condition: Sections 1–7 pass with attributable immutable evidence and no disqualifier.
+- Release condition: not releasable in this pass under the no-rerun rule.
 - Owner: Sol captures; Adam reviews admissions; Caelum may supersede.
 - Independent work: none may modify or repair the fixed interval after observation.
 
@@ -197,15 +199,19 @@ Eventual finite drain does not repair an in-window freshness, continuity, queue-
 - No numeric periodic-ratio acceptance policy exists; Adam will not invent one.
 - Exact `10 x 10` and explicit unavailable depth are honest source states, but explicit unavailable depth cannot be promoted into the canonical-depth/warm-up proof required for full qualification.
 - A clean continuous natural interval can qualify collection only; it cannot itself prove the separate engineering capacity floor or grant operational authority.
+- The `1,885` pre-window records were exactly enqueued/written/durable and collector queues drained, but producer loss/gaps/staleness make them disqualifying diagnostics, not qualifying-hour evidence.
+- Correct loaded native source identity is necessary but not sufficient: source `17995c...` / build `215e96...` / session `891602...` / generation `1` coexisted with large new loss counters and failed continuity.
+- The final Full `PASS` proves preserved ledger integrity after safe shutdown; it does not retroactively start the hour, clear the retained capacity latch or qualify feed/capacity.
 - The earlier Caelum instruction prohibited an improvised London substitution for the failed Asia pass. This is a new, separately assigned and predeclared London pass; it does not rewrite or backfill Asia evidence.
 - Caelum is superior and may narrow, add conditions to, HOLD or supersede this contract.
 
 ## Closeout
 
-- Implemented: two-phase commissioning repair is present at `2331c744ccaa09d6644496142daa4682a0476f72`, tree `8b14f35e8c6bb4c3395dadf756a226803b37e6be`; immutable test receipt and runtime identity admission remain pending.
-- Installed: **UNKNOWN current**.
-- Loaded: **UNKNOWN current**.
-- Exercised: **NOT YET OBSERVED for this pass**.
-- Accepted: preparation only, conditionally; no qualification outcome yet.
-- Remaining live-only checks: every item in Sections 1–7, official venue schedule, and final superior review.
-- Smallest next action: Sol either seals the complete pre-window identity/Full/recovery/safety/storage packet before `08:00Z` or records `WINDOW_NOT_STARTED / HOLD`; no partial or later substitute is admissible.
+- Implemented: two-phase commissioning repair is present at `2331c744ccaa09d6644496142daa4682a0476f72`, tree `8b14f35e8c6bb4c3395dadf756a226803b37e6be`.
+- Installed: source parity and compile preparation **OBSERVED**; R2 consumed `1/1`.
+- Loaded: exact repaired producer source/build/session/generation **OBSERVED**, but runtime admission failed on identity/continuity/loss/freshness.
+- Exercised: pre-window only; `1,885` collector records durably retained before fail-closed stop. The qualifying hour was **NOT STARTED**.
+- Accepted: fail-closed refusal, supported clean shutdown, evidence preservation and final stable-tip Full only.
+- Not accepted: natural-feed collection, canonical-depth/warm-up, periodic ratio, engineering capacity, latch recovery, paper start, Gates B-D, arming or orders.
+- Remaining live-only checks: none in this closed no-rerun pass. A future pass must begin from a new authority and predeclaration after causal producer loss/transport/sequence/freshness and identity issues are resolved.
+- Smallest next action: preserve this packet and diagnose the first causal source of the +17,218 overflow / +5,617 transport-failure deltas without consuming another R2 or attempting to reconstruct the missed hour.
