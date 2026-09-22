@@ -58,6 +58,38 @@ def record(
 
 
 class PongAuthenticHourCollectorTests(unittest.TestCase):
+    def test_fifo_writer_builds_chain_without_main_state_lock_handoffs(self) -> None:
+        """Encoding stays writer-owned while preserving exact chain bytes."""
+        with tempfile.TemporaryDirectory() as directory:
+            collector = PongAuthenticHourCollector(Path(directory))
+            observed = datetime(2026, 9, 22, 1, 0, tzinfo=timezone.utc)
+            quote = record(
+                "QUOTE",
+                {
+                    "contract_id": "MNQ SEP26", "bid": 100, "ask": 101,
+                    "bid_size": 2, "ask_size": 3, "source_event_sequence": 1,
+                    "publication_policy": "EVENT_DRIVEN_SAME_CALLBACK_QUOTE_V1",
+                },
+                1,
+                observed,
+            )
+
+            class RefuseLockHandoff:
+                def __enter__(self) -> None:
+                    raise AssertionError("journal writer attempted main-state lock handoff")
+
+                def __exit__(self, *args: object) -> None:
+                    return None
+
+            collector._lock = RefuseLockHandoff()  # type: ignore[assignment]
+            line = collector._observation_line(quote, quote.ninja_receipt_time)
+            row = json.loads(line)
+            digest = row.pop("record_hash")
+            self.assertEqual(row["journal_sequence"], 1)
+            self.assertEqual(row["previous_record_hash"], "0" * 64)
+            self.assertEqual(digest, canonical_hash(row))
+            self.assertEqual(collector._journal_tip, digest)
+
     def test_test_only_generation_change_invalidates_without_fake_sequence_inversion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             now = datetime(2026, 9, 14, 14, 55, tzinfo=timezone.utc)

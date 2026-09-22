@@ -540,17 +540,10 @@ class PongAuthenticHourCollector:
                     queue_age_milliseconds = max(
                         0.0, (time.monotonic() - item.enqueued_monotonic) * 1000.0,
                     )
-                    with self._lock:
-                        self._last_queue_age_milliseconds = queue_age_milliseconds
-                        self._maximum_queue_age_milliseconds = max(
-                            self._maximum_queue_age_milliseconds,
-                            queue_age_milliseconds,
-                        )
-                        self._timings["queue_wait"].record_nanoseconds(
-                            int(queue_age_milliseconds * 1_000_000.0),
-                        )
                     if item.kind == "STOP":
-                        stopping = True
+                        with self._lock:
+                            self._record_queue_wait_locked(queue_age_milliseconds)
+                            stopping = True
                     elif item.kind == "OBSERVATION":
                         assert isinstance(item.value, NinjaTraderObservation)
                         encode_started = time.perf_counter_ns()
@@ -561,6 +554,7 @@ class PongAuthenticHourCollector:
                         write_elapsed = time.perf_counter_ns() - write_started
                         pending_records += 1
                         with self._lock:
+                            self._record_queue_wait_locked(queue_age_milliseconds)
                             self._timings["record_encode_and_hash"].record_nanoseconds(
                                 encode_elapsed,
                             )
@@ -576,6 +570,7 @@ class PongAuthenticHourCollector:
                             )
                     else:
                         with self._lock:
+                            self._record_queue_wait_locked(queue_age_milliseconds)
                             self._apply_control_locked(item)
                     self._queue.task_done()
                 now_monotonic = time.monotonic()
@@ -635,10 +630,25 @@ class PongAuthenticHourCollector:
             self._ready.set()
             self._stopped.set()
 
+    def _record_queue_wait_locked(self, queue_age_milliseconds: float) -> None:
+        self._last_queue_age_milliseconds = queue_age_milliseconds
+        self._maximum_queue_age_milliseconds = max(
+            self._maximum_queue_age_milliseconds,
+            queue_age_milliseconds,
+        )
+        self._timings["queue_wait"].record_nanoseconds(
+            int(queue_age_milliseconds * 1_000_000.0),
+        )
+
     def _observation_line(self, record: NinjaTraderObservation, enqueued_at: str) -> bytes:
-        with self._lock:
-            prior = self._journal_tip
-            journal_sequence = self._written_records + 1
+        # The FIFO writer thread is the sole owner of the journal sequence and
+        # hash-chain tip.  Reading and advancing them here therefore needs no
+        # cross-thread state-lock handoff.  Status readers can still observe
+        # the new tip before the matching written watermark, exactly as they
+        # could when the old method released its second lock before write().
+        # Durability authority remains the later flush/fsync watermark.
+        prior = self._journal_tip
+        journal_sequence = self._written_records + 1
         body: dict[str, object] = {
             "schema": PONG_COLLECTION_RECORD_SCHEMA,
             "collector_id": self.collector_id,
@@ -655,8 +665,7 @@ class PongAuthenticHourCollector:
             b'"observation":null', b'"observation":' + record.signed_wire_bytes(), 1,
         )
         digest = hashlib.sha256(canonical_body).hexdigest()
-        with self._lock:
-            self._journal_tip = digest
+        self._journal_tip = digest
         return _add_record_hash(canonical_body, digest) + b"\n"
 
     def _classify_trade(self, trade: NinjaTraderObservation) -> dict[str, object]:
