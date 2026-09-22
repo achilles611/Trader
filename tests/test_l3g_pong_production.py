@@ -566,6 +566,43 @@ class PongProductionHostTests(unittest.TestCase):
             )
             self.assertEqual(status["microstructure_pipeline"]["evaluation_count"], 1)
 
+    def test_protected_incomplete_side_keeps_evaluation_without_scanning_windows(
+        self,
+    ) -> None:
+        with TemporaryDirectory(prefix="pong-protected-incomplete-window-") as root:
+            host = self._qualifying_host(root)
+            host._consume_observation(verified("TRADE", {
+                "contract_id": "MNQ DEC26",
+                "price": 100,
+                "size": 1,
+                "aggressor_side": "BUY",
+                "aggressor_source": "BID_ASK_CLASSIFICATION",
+                "bid_at_trade": 99.75,
+                "ask_at_trade": 100,
+                "source_event_sequence": 1,
+                "source_generation": 1,
+                "publication_policy": "EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1",
+            }, local_sequence=1))
+
+            with patch(
+                "src.l3g_paper.pong_production._DepthWindow.price_window",
+                side_effect=AssertionError("incomplete windows must not scan"),
+            ):
+                host._consume_observation(self._qualifying_depth(1))
+
+            status = host.status()
+            self.assertEqual(
+                host._microstructure_blockers,
+                ("PONG_MICROSTRUCTURE_NATIVE_WINDOW_INCOMPLETE",),
+            )
+            self.assertEqual(
+                status["evaluation_schedule"]
+                ["event_driven_analytical_evaluations"],
+                2,
+            )
+            self.assertEqual(host._analysis_processing_count, 2)
+            self.assertEqual(host._protection_completed_full_analyses, 0)
+
     def test_qualifying_depth_recovers_after_unavailable_and_resolves_zero_price(self) -> None:
         with TemporaryDirectory(prefix="pong-no-fhb-depth-") as root:
             host = self._qualifying_host(root)

@@ -1839,6 +1839,24 @@ class PongProductionHost:
         if self._compute_pool is None:
             self._last_microstructure_at = at
         cutoff = at - timedelta(seconds=5)
+        # Protected mode deliberately evaluates every canonical market
+        # update.  When one required input family has never been observed,
+        # materializing the other rolling windows cannot change the exact
+        # fail-closed result.  In particular, scanning a growing BID history
+        # for every callback while ASK is empty creates avoidable receiver
+        # backpressure without performing an analysis.  Preserve the
+        # evaluation count and blocker, but prove incompleteness in O(1).
+        if (
+            not self._trades
+            or not self._depth[BookSide.BID]
+            or not self._depth[BookSide.ASK]
+        ):
+            blockers = ("PONG_MICROSTRUCTURE_NATIVE_WINDOW_INCOMPLETE",)
+            if self._compute_pool is None:
+                self._microstructure_blockers = blockers
+            else:
+                self._queue_compute(None, at, blockers)
+            return False
         # Flow's frozen window is event-time based. A delayed receipt must not
         # pull an older trade into it; all trades remain in durable retention.
         trades = tuple(item for item in self._trades
