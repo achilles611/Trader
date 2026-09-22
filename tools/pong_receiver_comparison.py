@@ -114,6 +114,24 @@ def bounded_timing_report(timing):
     }
 
 
+def scheduled_completion_age_report(completed, dues, schedule_epoch):
+    """Summarize end-to-end age from each scheduled release to receiver completion."""
+    timing = new_bounded_timing()
+    for completion, due in zip(completed, dues):
+        record_bounded_timing(timing, completion - (schedule_epoch + due))
+    report = bounded_timing_report(timing)
+    report.update(
+        expected_count=len(dues),
+        complete=(len(completed) == len(dues)),
+        clock="SYSTEM_WIDE_PERF_COUNTER",
+        formula=(
+            "receiver_completion_monotonic - "
+            "(sender_start_monotonic + scheduled_release_offset_seconds)"
+        ),
+    )
+    return report
+
+
 def corpus(args):
     frames, dues = [], []
     if args.frames:
@@ -365,6 +383,7 @@ def run(args):
     sender_result = json.loads((args.output/"sender.json").read_text())
     sender_started = sender_result["start_monotonic"]
     receiver_elapsed = ended - receiver_go_monotonic
+    scheduled_age = scheduled_completion_age_report(completed, dues, sender_started)
     receiver_clock = {
         "clock": "PARENT_PROCESS_PERF_COUNTER",
         "go_to_first_completion_seconds": (
@@ -376,8 +395,9 @@ def run(args):
         ),
         "scheduled_span_seconds": dues[-1],
         "schedule_overrun_seconds": max(0.0, receiver_elapsed - dues[-1]),
+        "scheduled_to_receiver_completion_age": scheduled_age,
     }
-    result = dict(schema="pong-offline-receiver-comparison-v3", route=args.route, paper_path=args.paper_path, mode=args.mode, offered_rate_per_second=(None if args.mode == "natural" else args.rate), offered_rate_authority="DIAGNOSTIC_ONLY_NOT_AN_ACCEPTANCE_THRESHOLD", qualification="NOT_QUALIFIED", execution_transport="ABSENT", healthy_flat_analysis_proof=False, source_freshness="NOT_CURRENT_NATIVE_EVIDENCE", provenance=provenance, loaded_source_sha256=source_hashes, records=len(frames), completed=len(completed), window_monotonic=[sender_started, ended], elapsed_seconds=ended-sender_started, completion_rate=len(completed)/(ended-sender_started), scheduled_span_seconds=dues[-1], receiver_end_lag_seconds=max(0, ended-sender_started-dues[-1]), receiver_local_timing=receiver_clock, sender=sender_result, consumers=stages, ingress=metrics.snapshot(), listener=listener_status, host=host.status(), host_at_receiver_completion=host_at_receiver_completion, collector=collector_status, collector_at_receiver_completion=collector_at_receiver_completion, shutdown_timings_seconds=shutdown_timings, paper_fast_path=paper_fast_path, ledger_close=ledger_close, ledger_kinds=kinds, samples=samples, ordered_wire_reconciliation=dict(expected=expected.hexdigest(), receiver=delivery["receiver"].hexdigest(), paper=delivery["paper"].hexdigest(), collector=retained.hexdigest(), collector_records=count))
+    result = dict(schema="pong-offline-receiver-comparison-v4", route=args.route, paper_path=args.paper_path, mode=args.mode, offered_rate_per_second=(None if args.mode == "natural" else args.rate), offered_rate_authority="DIAGNOSTIC_ONLY_NOT_AN_ACCEPTANCE_THRESHOLD", qualification="NOT_QUALIFIED", execution_transport="ABSENT", healthy_flat_analysis_proof=False, source_freshness="NOT_CURRENT_NATIVE_EVIDENCE", provenance=provenance, loaded_source_sha256=source_hashes, records=len(frames), completed=len(completed), window_monotonic=[sender_started, ended], elapsed_seconds=ended-sender_started, completion_rate=len(completed)/(ended-sender_started), scheduled_span_seconds=dues[-1], receiver_end_lag_seconds=max(0, ended-sender_started-dues[-1]), receiver_local_timing=receiver_clock, sender=sender_result, consumers=stages, ingress=metrics.snapshot(), listener=listener_status, host=host.status(), host_at_receiver_completion=host_at_receiver_completion, collector=collector_status, collector_at_receiver_completion=collector_at_receiver_completion, shutdown_timings_seconds=shutdown_timings, paper_fast_path=paper_fast_path, ledger_close=ledger_close, ledger_kinds=kinds, samples=samples, ordered_wire_reconciliation=dict(expected=expected.hexdigest(), receiver=delivery["receiver"].hexdigest(), paper=delivery["paper"].hexdigest(), collector=retained.hexdigest(), collector_records=count))
     result["ordered_wire_reconciliation"]["pass"] = len(frames)==len(completed)==count and len({expected.hexdigest(), retained.hexdigest(), delivery["paper"].hexdigest(), delivery["receiver"].hexdigest()}) == 1
     dump(args.output/"result.json", result)
     print(json.dumps({"output": str(args.output), "rate": result["completion_rate"], "lag": result["receiver_end_lag_seconds"], "ordered": result["ordered_wire_reconciliation"]["pass"]}), flush=True)
