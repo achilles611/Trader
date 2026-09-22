@@ -22,7 +22,10 @@ from typing import Literal, Mapping
 
 from src.l3f_provider.ninjatrader_observation import (
     AccountClass,
+    L3F2_SCHEMA,
+    L3F3_SCHEMA,
     NinjaTraderObservation,
+    NinjaTraderProducerAttestation,
 )
 
 
@@ -60,6 +63,12 @@ _STATIC_STRINGS = (
     "mutation_volume", "mutation_position", "is_reset",
     "UNKNOWN", "BID_ASK_CLASSIFICATION", "PROVIDER_NATIVE", "BUY", "SELL",
     "Add", "Update", "Remove", "Bid", "Ask", "BOUNDED_LATEST_STATE_2HZ",
+    "source_generation", "source_event_sequence",
+    "observer_queue_overflow_frames", "observer_transport_failed_frames",
+    "MARKET_DATA_BID_ASK", "MARKET_DATA_LAST", "MARKET_DEPTH",
+    "EVENT_DRIVEN_SAME_CALLBACK_QUOTE_V1",
+    "EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1",
+    "EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1",
 )
 _STATIC_INDEX = {value: index for index, value in enumerate(_STATIC_STRINGS)}
 
@@ -81,6 +90,9 @@ _STRING_CONTEXT = 2
 _TIMESTAMP_NONE = 0
 _TIMESTAMP_DELTA_NS = 1
 _TIMESTAMP_RAW = 2
+
+_CONTEXT_LEGACY = 0
+_CONTEXT_ATTESTED = 1
 
 
 class LSCCodecError(ValueError):
@@ -121,24 +133,55 @@ class LSCContext:
     as integer nanosecond deltas from it.
     """
 
+    observation_schema: str
     source: str
     provider: str
     environment: str
-    source_identity: str
-    build_identity: str
-    contract_identity: str
-    contract_id: str
+    producer_protocol_version: str | None
+    producer_source_fingerprint: str | None
+    producer_build_fingerprint: str | None
+    producer_build_timestamp: str | None
+    native_contract_id: str
+    canonical_contract_id: str
     tick_size: str
     session_id: str
     generation: int
     timestamp_origin: str
+    legacy_mode: bool = False
 
     def __post_init__(self) -> None:
         for name in (
-            "source", "provider", "environment", "source_identity",
-            "build_identity", "contract_identity", "contract_id", "session_id",
+            "source", "provider", "environment", "native_contract_id",
+            "canonical_contract_id", "session_id",
         ):
             _nonempty_text(getattr(self, name), name)
+        producer_names = (
+            "producer_protocol_version", "producer_source_fingerprint",
+            "producer_build_fingerprint", "producer_build_timestamp",
+        )
+        if self.observation_schema == L3F3_SCHEMA:
+            if self.legacy_mode:
+                raise LSCCodecError("attested contexts cannot be legacy mode")
+            for name in producer_names:
+                _nonempty_text(getattr(self, name), name)
+            try:
+                NinjaTraderProducerAttestation(
+                    protocol_version=self.producer_protocol_version,  # type: ignore[arg-type]
+                    source_fingerprint=self.producer_source_fingerprint,  # type: ignore[arg-type]
+                    build_fingerprint=self.producer_build_fingerprint,  # type: ignore[arg-type]
+                    build_timestamp=self.producer_build_timestamp,  # type: ignore[arg-type]
+                    source_stream="LSC_RECORD_BOUND_STREAM",
+                    publication_policy="LSC_RECORD_BOUND_POLICY",
+                )
+            except ValueError as exc:
+                raise LSCCodecError("producer attestation context is invalid") from exc
+        elif self.observation_schema == L3F2_SCHEMA:
+            if not self.legacy_mode or any(getattr(self, name) is not None for name in producer_names):
+                raise LSCCodecError(
+                    "legacy observations require explicit legacy_mode and no producer attestation"
+                )
+        else:
+            raise LSCCodecError("observation schema is unsupported")
         _tick_text(self.tick_size)
         _u64(self.generation, "generation")
         if _parse_canonical_timestamp(self.timestamp_origin) is None:
@@ -149,17 +192,21 @@ class LSCContext:
 
     @property
     def dictionary(self) -> tuple[str, ...]:
-        return (
+        values = (
+            self.observation_schema,
             self.source,
             self.provider,
             self.environment,
-            self.source_identity,
-            self.build_identity,
-            self.contract_identity,
-            self.contract_id,
+            self.producer_protocol_version,
+            self.producer_source_fingerprint,
+            self.producer_build_fingerprint,
+            self.producer_build_timestamp,
+            self.native_contract_id,
+            self.canonical_contract_id,
             self.tick_size,
             self.session_id,
         )
+        return tuple(value for value in values if value is not None)
 
 
 @dataclass(frozen=True)
@@ -168,6 +215,9 @@ class EncodedRecord:
     observation_type: Literal["QUOTE", "TRADE", "DEPTH"]
     observation_id: str
     local_sequence: int
+    source_sequence: int
+    source_generation: int
+    schema: str
     payload_hash: str
     wire_hash: str
     event_digest: str
@@ -289,7 +339,22 @@ def _format_canonical_timestamp(nanoseconds: int, precision: int) -> str:
 def _encode_context_content(context: LSCContext) -> bytes:
     body = bytearray(CONTEXT_MAGIC)
     body.append(FORMAT_VERSION)
-    for value in context.dictionary:
+    body.extend(_text_bytes(context.observation_schema))
+    for value in (context.source, context.provider, context.environment):
+        body.extend(_text_bytes(value))
+    body.append(_CONTEXT_LEGACY if context.legacy_mode else _CONTEXT_ATTESTED)
+    if not context.legacy_mode:
+        for value in (
+            context.producer_protocol_version,
+            context.producer_source_fingerprint,
+            context.producer_build_fingerprint,
+            context.producer_build_timestamp,
+        ):
+            body.extend(_text_bytes(value))  # type: ignore[arg-type]
+    for value in (
+        context.native_contract_id, context.canonical_contract_id,
+        context.tick_size, context.session_id,
+    ):
         body.extend(_text_bytes(value))
     body.extend(_encode_uvarint(context.generation))
     body.extend(_text_bytes(context.timestamp_origin))
@@ -321,16 +386,40 @@ def _decode_context_verified(data: bytes) -> tuple[LSCContext, str]:
         raise LSCCodecError("unknown LSC context magic")
     if cursor.byte() != FORMAT_VERSION:
         raise LSCCodecError("unknown LSC context version")
-    values = [cursor.text(maximum=4_096) for _ in range(9)]
+    schema = cursor.text(maximum=4_096)
+    source, provider, environment = (
+        cursor.text(maximum=4_096) for _ in range(3)
+    )
+    mode = cursor.byte()
+    if mode == _CONTEXT_ATTESTED:
+        producer_values: tuple[str | None, ...] = tuple(
+            cursor.text(maximum=4_096) for _ in range(4)
+        )
+        legacy_mode = False
+    elif mode == _CONTEXT_LEGACY:
+        producer_values = (None,) * 4
+        legacy_mode = True
+    else:
+        raise LSCCodecError("unknown LSC context attestation mode")
+    native_contract_id, canonical_contract_id, tick_size, session_id = (
+        cursor.text(maximum=4_096) for _ in range(4)
+    )
     generation = cursor.uvarint(maximum_bytes=10)
     timestamp_origin = cursor.text(maximum=128)
     cursor.finish()
     context = LSCContext(
-        source=values[0], provider=values[1], environment=values[2],
-        source_identity=values[3], build_identity=values[4],
-        contract_identity=values[5], contract_id=values[6], tick_size=values[7],
-        session_id=values[8], generation=generation,
+        observation_schema=schema,
+        source=source, provider=provider, environment=environment,
+        producer_protocol_version=producer_values[0],
+        producer_source_fingerprint=producer_values[1],
+        producer_build_fingerprint=producer_values[2],
+        producer_build_timestamp=producer_values[3],
+        native_contract_id=native_contract_id,
+        canonical_contract_id=canonical_contract_id,
+        tick_size=tick_size,
+        session_id=session_id, generation=generation,
         timestamp_origin=timestamp_origin,
+        legacy_mode=legacy_mode,
     )
     if encode_context(context) != data:
         raise LSCCodecError("context is not canonically encoded")
@@ -660,10 +749,44 @@ def _encode_observation(
         or observation.environment != context.environment
     ):
         raise LSCCodecError("observation source provenance does not match its LSC context")
+    if observation.schema != context.observation_schema:
+        raise LSCCodecError("observation schema does not match its LSC context")
     sequence = _u64(observation.local_monotonic_sequence, "local_sequence")
-    payload, canonical_payload, payload_hash = _canonical_payload(observation.payload)
-    if payload.get("contract_id") != context.contract_id:
+    payload, canonical_payload, computed_payload_hash = _canonical_payload(observation.payload)
+    if payload.get("contract_id") != context.native_contract_id:
         raise LSCCodecError("observation contract does not match its LSC context")
+    source_sequence = _u64(payload.get("source_event_sequence"), "source_event_sequence")
+    source_generation = _u64(payload.get("source_generation"), "source_generation")
+    if source_generation != context.generation:
+        raise LSCCodecError("observation source generation does not match its LSC context")
+    if context.legacy_mode:
+        if observation.signature_verified is not None:
+            raise LSCCodecError("legacy observation cannot claim signature verification")
+        native_payload_hash = computed_payload_hash
+        signature_bytes = None
+        source_stream = None
+        publication_policy = None
+    else:
+        producer = observation.producer
+        if producer is None or (
+            producer.protocol_version != context.producer_protocol_version
+            or producer.source_fingerprint != context.producer_source_fingerprint
+            or producer.build_fingerprint != context.producer_build_fingerprint
+            or producer.build_timestamp != context.producer_build_timestamp
+        ):
+            raise LSCCodecError("observation producer attestation does not match its LSC context")
+        source_stream = producer.source_stream
+        publication_policy = producer.publication_policy
+        if payload.get("publication_policy") != publication_policy:
+            raise LSCCodecError("payload publication policy does not match producer attestation")
+        if observation.signature_verified is not True:
+            raise LSCCodecError("attested LSC records require verified signatures")
+        if observation.payload_hash != computed_payload_hash:
+            raise LSCCodecError("native payload hash does not match canonical payload")
+        if not isinstance(observation.signature, str) or re.fullmatch(r"[0-9a-f]{64}", observation.signature) is None:
+            raise LSCCodecError("attested observation signature is invalid")
+        native_payload_hash = observation.payload_hash
+        signature_bytes = bytes.fromhex(observation.signature)
     payload_bytes = _encode_value(payload, context, kind, ())
 
     body = bytearray(FORMAT_MAGIC)
@@ -685,9 +808,17 @@ def _encode_observation(
         None if observation.account_class is None else observation.account_class.value,
         context,
     ))
+    if not context.legacy_mode:
+        body.extend(_encode_string_token(source_stream, context))  # type: ignore[arg-type]
+        body.extend(_encode_string_token(publication_policy, context))  # type: ignore[arg-type]
     body.extend(_encode_uvarint(len(payload_bytes)))
     body.extend(payload_bytes)
-    body.extend(bytes.fromhex(payload_hash))
+    body.extend(bytes.fromhex(native_payload_hash))
+    if signature_bytes is None:
+        body.append(0)
+    else:
+        body.append(1)
+        body.extend(signature_bytes)
     wire_hash = observation.wire_hash()
     body.extend(bytes.fromhex(wire_hash))
     event_digest_bytes = hashlib.sha256(_EVENT_DOMAIN + bytes(body)).digest()
@@ -696,14 +827,17 @@ def _encode_observation(
         raise LSCCodecError("encoded record exceeds the LSC v1 limit")
     # The canonical bytes are intentionally computed before binary encoding;
     # keep this assertion adjacent to the emitted hash to prevent drift.
-    if hashlib.sha256(canonical_payload).hexdigest() != payload_hash:
+    if hashlib.sha256(canonical_payload).hexdigest() != native_payload_hash:
         raise AssertionError("canonical payload hash changed during encoding")
     return EncodedRecord(
         record_bytes=record_bytes,
         observation_type=kind,  # type: ignore[arg-type]
         observation_id=observation.observation_id,
         local_sequence=sequence,
-        payload_hash=payload_hash,
+        source_sequence=source_sequence,
+        source_generation=source_generation,
+        schema=observation.schema,
+        payload_hash=native_payload_hash,
         wire_hash=wire_hash,
         event_digest=event_digest_bytes.hex(),
         context_digest=context_digest_hex,
@@ -766,6 +900,12 @@ def decode_observation(
     account_class_text = _decode_optional_text(cursor, frozen_context)
     if (account_alias is None) != (account_class_text is None):
         raise LSCCodecError("account alias and class must be jointly present")
+    if frozen_context.legacy_mode:
+        source_stream = None
+        publication_policy = None
+    else:
+        source_stream = _decode_string_token(cursor, frozen_context)
+        publication_policy = _decode_string_token(cursor, frozen_context)
     payload_length = cursor.uvarint(maximum_bytes=10)
     if payload_length > MAX_ENCODED_RECORD_BYTES:
         raise LSCCodecError("encoded payload exceeds the LSC v1 limit")
@@ -775,6 +915,15 @@ def decode_observation(
     if not isinstance(payload, dict):
         raise LSCCodecError("decoded observation payload is not an object")
     supplied_payload_hash = cursor.take(32).hex()
+    signature_marker = cursor.byte()
+    if signature_marker == 0:
+        signature = None
+        signature_verified = None
+    elif signature_marker == 1:
+        signature = cursor.take(32).hex()
+        signature_verified = True
+    else:
+        raise LSCCodecError("unknown signature verification encoding")
     supplied_wire_hash = cursor.take(32).hex()
     cursor.finish()
 
@@ -783,8 +932,29 @@ def decode_observation(
         raise LSCCodecError("canonical payload hash mismatch")
     if hashlib.sha256(canonical_payload).hexdigest() != supplied_payload_hash:
         raise LSCCodecError("canonical payload bytes do not match their hash")
+    if payload.get("contract_id") != frozen_context.native_contract_id:
+        raise LSCCodecError("decoded payload contract does not match its LSC context")
+    source_sequence = _u64(payload.get("source_event_sequence"), "source_event_sequence")
+    source_generation = _u64(payload.get("source_generation"), "source_generation")
+    if source_generation != frozen_context.generation:
+        raise LSCCodecError("decoded source generation does not match its LSC context")
+    if not frozen_context.legacy_mode and payload.get("publication_policy") != publication_policy:
+        raise LSCCodecError("decoded payload publication policy does not match producer attestation")
     try:
         account_class = None if account_class_text is None else AccountClass(account_class_text)
+        producer = None if frozen_context.legacy_mode else NinjaTraderProducerAttestation(
+            protocol_version=frozen_context.producer_protocol_version,  # type: ignore[arg-type]
+            source_fingerprint=frozen_context.producer_source_fingerprint,  # type: ignore[arg-type]
+            build_fingerprint=frozen_context.producer_build_fingerprint,  # type: ignore[arg-type]
+            build_timestamp=frozen_context.producer_build_timestamp,  # type: ignore[arg-type]
+            source_stream=source_stream,  # type: ignore[arg-type]
+            publication_policy=publication_policy,  # type: ignore[arg-type]
+        )
+        if frozen_context.legacy_mode:
+            if signature is not None:
+                raise LSCCodecError("legacy record contains an attested signature")
+        elif signature is None or signature_verified is not True:
+            raise LSCCodecError("attested record lacks verified signature state")
         observation = NinjaTraderObservation(
             observation_id=observation_id,
             session_id=frozen_context.session_id,
@@ -797,6 +967,11 @@ def decode_observation(
             provider_timestamp=provider_timestamp,
             provider_sequence=provider_sequence,
             exchange_timestamp=exchange_timestamp,
+            schema=frozen_context.observation_schema,
+            payload_hash=None if frozen_context.legacy_mode else supplied_payload_hash,
+            producer=producer,
+            signature=signature,
+            signature_verified=signature_verified,
             source=frozen_context.source,
             provider=frozen_context.provider,
             environment=frozen_context.environment,
@@ -805,6 +980,8 @@ def decode_observation(
         raise LSCCodecError("decoded observation violates the admitted schema") from exc
     if observation.wire_hash() != supplied_wire_hash:
         raise LSCCodecError("observation wire hash mismatch")
+    if hashlib.sha256(observation.signed_wire_bytes()).hexdigest() != supplied_wire_hash:
+        raise LSCCodecError("signed wire bytes do not match their hash")
     # Canonical re-encoding refuses alternate varints, dictionary choices,
     # price escapes, timestamp encodings, and observation-ID spellings.
     if _encode_observation(observation, frozen_context, context_digest_hex).record_bytes != record_bytes:

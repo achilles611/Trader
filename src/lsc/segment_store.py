@@ -26,7 +26,15 @@ import zlib
 SEGMENT_SCHEMA = "beelzebub-lsc-segment-v1"
 CONTAINER_MAGIC = b"LSCSEG01"
 CONTAINER_VERSION = 1
-COMPRESSION = "zlib-1.2.13-level-6"
+COMPRESSION_LEVEL = 6
+COMPRESSION_WBITS = zlib.MAX_WBITS
+COMPRESSION_MEM_LEVEL = zlib.DEF_MEM_LEVEL
+COMPRESSION_STRATEGY = zlib.Z_DEFAULT_STRATEGY
+COMPRESSION = (
+    f"zlib-runtime-{zlib.ZLIB_RUNTIME_VERSION}-deflate-"
+    f"wbits{COMPRESSION_WBITS}-mem{COMPRESSION_MEM_LEVEL}-"
+    f"level{COMPRESSION_LEVEL}-default"
+)
 GENESIS_COMMITMENT = "0" * 64
 
 MAX_ENCODED_CONTEXT_BYTES = 65_536
@@ -70,6 +78,9 @@ class EncodedRecordLike(Protocol):
     observation_id: str
     observation_type: str
     local_sequence: int
+    source_sequence: int
+    source_generation: int
+    schema: str
     payload_hash: str
     wire_hash: str
     event_digest: str
@@ -85,6 +96,9 @@ class VerifiedRecordMetadata:
     observation_id: str
     observation_type: str
     local_sequence: int
+    source_sequence: int
+    source_generation: int
+    schema: str
     payload_hash: str
     wire_hash: str
     event_digest: str
@@ -149,6 +163,9 @@ class StoredEvent:
     observation_id: str
     observation_type: str
     local_sequence: int
+    source_sequence: int
+    source_generation: int
+    schema: str
     payload_hash: str
     wire_hash: str
     event_digest: str
@@ -254,18 +271,22 @@ def _default_context_digest(encoded_context: bytes) -> str:
 
 
 def _default_record_verifier(record_bytes: bytes, encoded_context: bytes) -> VerifiedRecordMetadata:
-    from src.lsc.codec import context_digest, decode_observation
+    from src.lsc.codec import context_digest, decode_observation, encode_observation
 
     observation = decode_observation(record_bytes, encoded_context)
-    if len(record_bytes) < 96:
-        raise LSCStoreIntegrityError("LSC_ENCODED_RECORD_TRAILER_MISSING")
+    verified = encode_observation(observation, encoded_context)
+    if verified.record_bytes != record_bytes:
+        raise LSCStoreIntegrityError("LSC_ENCODED_RECORD_NOT_CANONICAL")
     return VerifiedRecordMetadata(
-        observation_id=observation.observation_id,
-        observation_type=observation.observation_type,
-        local_sequence=observation.local_monotonic_sequence,
-        payload_hash=record_bytes[-96:-64].hex(),
-        wire_hash=record_bytes[-64:-32].hex(),
-        event_digest=record_bytes[-32:].hex(),
+        observation_id=verified.observation_id,
+        observation_type=verified.observation_type,
+        local_sequence=verified.local_sequence,
+        source_sequence=verified.source_sequence,
+        source_generation=verified.source_generation,
+        schema=verified.schema,
+        payload_hash=verified.payload_hash,
+        wire_hash=verified.wire_hash,
+        event_digest=verified.event_digest,
         context_digest=context_digest(encoded_context),
     )
 
@@ -369,7 +390,7 @@ def _atomic_write(
 
 def _bounded_decompress(value: bytes, maximum: int) -> bytes:
     try:
-        decompressor = zlib.decompressobj()
+        decompressor = zlib.decompressobj(wbits=COMPRESSION_WBITS)
         output = decompressor.decompress(value, maximum + 1)
         if len(output) > maximum or decompressor.unconsumed_tail:
             raise LSCStoreLimitError("LSC_DECOMPRESSED_BODY_LIMIT_EXCEEDED")
@@ -381,6 +402,17 @@ def _bounded_decompress(value: bytes, maximum: int) -> bytes:
     if not decompressor.eof or decompressor.unused_data or decompressor.unconsumed_tail:
         raise LSCStoreIntegrityError("LSC_COMPRESSED_BODY_TRAILING_OR_TRUNCATED")
     return output
+
+
+def _compress_body(value: bytes) -> bytes:
+    compressor = zlib.compressobj(
+        level=COMPRESSION_LEVEL,
+        method=zlib.DEFLATED,
+        wbits=COMPRESSION_WBITS,
+        memLevel=COMPRESSION_MEM_LEVEL,
+        strategy=COMPRESSION_STRATEGY,
+    )
+    return compressor.compress(value) + compressor.flush(zlib.Z_FINISH)
 
 
 class SegmentBuilder:
@@ -431,6 +463,15 @@ class SegmentBuilder:
         local_sequence = getattr(record, "local_sequence", None)
         if type(local_sequence) is not int or local_sequence < 0:
             raise LSCStoreError("LSC_LOCAL_SEQUENCE_INVALID")
+        if (
+            type(getattr(record, "source_sequence", None)) is not int
+            or record.source_sequence < 0
+            or type(getattr(record, "source_generation", None)) is not int
+            or record.source_generation < 0
+            or not isinstance(getattr(record, "schema", None), str)
+            or not record.schema
+        ):
+            raise LSCStoreError("LSC_SOURCE_METADATA_INVALID")
         if self._last_local_sequence is not None and local_sequence <= self._last_local_sequence:
             raise LSCStoreError("LSC_NON_MONOTONIC_LOCAL_SEQUENCE")
         for field in ("payload_hash", "wire_hash", "event_digest"):
@@ -445,6 +486,9 @@ class SegmentBuilder:
             "observation_id": observation_id,
             "observation_type": record.observation_type,
             "local_sequence": local_sequence,
+            "source_sequence": record.source_sequence,
+            "source_generation": record.source_generation,
+            "schema": record.schema,
             "payload_hash": record.payload_hash,
             "wire_hash": record.wire_hash,
             "event_digest": record.event_digest,
@@ -522,8 +566,9 @@ class SegmentStore:
             raise LSCStoreError("LSC_BUILDER_STORE_MISMATCH")
         if not builder._records:
             raise LSCStoreError("LSC_EMPTY_SEGMENT_REFUSED")
-        if self._monotonic() - builder._opened_monotonic > self.limits.max_segment_age_seconds:
-            raise LSCStoreLimitError("LSC_SEGMENT_AGE_LIMIT_EXCEEDED")
+        # Age closes admission; it must never strand the prefix already
+        # accepted into this builder.  A stalled or low-traffic owner may seal
+        # after the rotation deadline, but cannot append another event then.
         chain = self.verify_chain()
         expected_previous = GENESIS_COMMITMENT if not chain else chain[-1].segment_commitment
         if builder.ordinal != len(chain) or builder.previous_commitment != expected_previous:
@@ -546,12 +591,15 @@ class SegmentStore:
                 "observation_id": record.observation_id,
                 "observation_type": record.observation_type,
                 "payload_hash": record.payload_hash,
+                "schema": record.schema,
+                "source_generation": record.source_generation,
+                "source_sequence": record.source_sequence,
                 "wire_hash": record.wire_hash,
             })
         raw_bytes = bytes(raw)
         if len(raw_bytes) > self.limits.max_raw_body_bytes:
             raise LSCStoreLimitError("LSC_RAW_BODY_LIMIT_EXCEEDED")
-        compressed = zlib.compress(raw_bytes, level=6)
+        compressed = _compress_body(raw_bytes)
         if len(compressed) > self.limits.max_compressed_body_bytes:
             raise LSCStoreLimitError("LSC_COMPRESSED_BODY_LIMIT_EXCEEDED")
 
@@ -731,7 +779,8 @@ class SegmentStore:
         normalized_index: list[Mapping[str, object]] = []
         fields = {
             "context_digest", "event_digest", "event_index", "frame_length", "frame_offset",
-            "local_sequence", "observation_id", "observation_type", "payload_hash", "wire_hash",
+            "local_sequence", "observation_id", "observation_type", "payload_hash", "schema",
+            "source_generation", "source_sequence", "wire_hash",
         }
         for event_index, entry in enumerate(index):
             if not isinstance(entry, dict) or set(entry) != fields:
@@ -742,6 +791,9 @@ class SegmentStore:
             sequence = entry["local_sequence"]
             observation_id = entry["observation_id"]
             observation_type = entry["observation_type"]
+            source_sequence = entry["source_sequence"]
+            source_generation = entry["source_generation"]
+            schema = entry["schema"]
             if type(length) is not int or not 0 < length <= self.limits.max_record_bytes:
                 raise LSCStoreIntegrityError("LSC_INDEX_FRAME_LENGTH_INVALID")
             if type(sequence) is not int or sequence < 0 or not isinstance(observation_id, str) or not observation_id:
@@ -750,6 +802,12 @@ class SegmentStore:
                 raise LSCStoreIntegrityError("LSC_INDEX_SEQUENCE_NOT_STRICTLY_INCREASING")
             if observation_type not in {"QUOTE", "TRADE", "DEPTH"} or entry["context_digest"] != context_digest:
                 raise LSCStoreIntegrityError("LSC_INDEX_TYPE_OR_CONTEXT_INVALID")
+            if (
+                type(source_sequence) is not int or source_sequence < 0
+                or type(source_generation) is not int or source_generation < 0
+                or not isinstance(schema, str) or not schema
+            ):
+                raise LSCStoreIntegrityError("LSC_INDEX_SOURCE_IDENTITY_INVALID")
             if observation_id in seen_ids or sequence in seen_sequences:
                 raise LSCStoreIntegrityError("LSC_INDEX_DUPLICATE_IDENTITY")
             for field in ("event_digest", "payload_hash", "wire_hash"):
@@ -773,7 +831,8 @@ class SegmentStore:
                 getattr(verified, key) != entry[key]
                 for key in (
                     "observation_id", "observation_type", "local_sequence", "payload_hash",
-                    "wire_hash", "event_digest", "context_digest",
+                    "source_sequence", "source_generation", "schema", "wire_hash", "event_digest",
+                    "context_digest",
                 )
             ):
                 raise LSCStoreIntegrityError("LSC_INDEX_RECORD_METADATA_MISMATCH")
@@ -890,6 +949,9 @@ class SegmentStore:
             observation_id=str(entry["observation_id"]),
             observation_type=str(entry["observation_type"]),
             local_sequence=local_sequence,
+            source_sequence=int(entry["source_sequence"]),
+            source_generation=int(entry["source_generation"]),
+            schema=str(entry["schema"]),
             payload_hash=str(entry["payload_hash"]),
             wire_hash=str(entry["wire_hash"]),
             event_digest=str(entry["event_digest"]),

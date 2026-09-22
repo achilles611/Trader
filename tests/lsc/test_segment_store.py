@@ -11,6 +11,7 @@ import unittest
 import zlib
 
 from src.lsc.segment_store import (
+    COMPRESSION,
     GENESIS_COMMITMENT,
     LSCStoreError,
     LSCStoreIntegrityError,
@@ -39,6 +40,9 @@ class FakeRecord:
     observation_type: str
     observation_id: str
     local_sequence: int
+    source_sequence: int
+    source_generation: int
+    schema: str
     payload_hash: str
     wire_hash: str
     event_digest: str
@@ -56,6 +60,9 @@ def fake_record(context: bytes, sequence: int, kind: str = "QUOTE", *, size: int
         "observation_id": f"observation-{sequence}",
         "observation_type": kind,
         "payload_hash": payload_hash,
+        "schema": "test-attested-schema-v1",
+        "source_generation": 7,
+        "source_sequence": sequence + 1_000,
         "wire_hash": wire_hash,
     })
     event_digest = hashlib.sha256(b"fake-event\0" + core).hexdigest()
@@ -64,6 +71,9 @@ def fake_record(context: bytes, sequence: int, kind: str = "QUOTE", *, size: int
         observation_type=kind,
         observation_id=f"observation-{sequence}",
         local_sequence=sequence,
+        source_sequence=sequence + 1_000,
+        source_generation=7,
+        schema="test-attested-schema-v1",
         payload_hash=payload_hash,
         wire_hash=wire_hash,
         event_digest=event_digest,
@@ -84,6 +94,9 @@ def verify_fake_record(record_bytes: bytes, context: bytes) -> VerifiedRecordMet
         observation_id=value["observation_id"],
         observation_type=value["observation_type"],
         local_sequence=value["local_sequence"],
+        source_sequence=value["source_sequence"],
+        source_generation=value["source_generation"],
+        schema=value["schema"],
         payload_hash=value["payload_hash"],
         wire_hash=value["wire_hash"],
         event_digest=supplied,
@@ -172,29 +185,41 @@ class SegmentStoreTests(unittest.TestCase):
             builder.append(fake_record(b"CTX:a", 2))
             with self.assertRaisesRegex(LSCStoreLimitError, "RECORD_LIMIT"):
                 builder.append(fake_record(b"CTX:a", 3))
+            builder.seal()
 
             aging = store.new_segment(b"CTX:a")
+            aging.append(fake_record(b"CTX:a", 10))
             clock.value = 2.0
             with self.assertRaisesRegex(LSCStoreLimitError, "AGE_LIMIT"):
-                aging.append(fake_record(b"CTX:a", 10))
+                aging.append(fake_record(b"CTX:a", 11))
+            sealed_after_deadline = aging.seal()
+            self.assertEqual(sealed_after_deadline.record_count, 1)
+            self.assertEqual(
+                store.lookup(sealed_after_deadline.segment_id, 0, 10).observation_id,
+                "observation-10",
+            )
 
     def test_default_codec_boundary_reverifies_context_record_and_lookup(self) -> None:
-        from src.l3f_provider.ninjatrader_observation import NinjaTraderObservation
+        from src.l3f_provider.ninjatrader_observation import L3F2_SCHEMA, NinjaTraderObservation
         from src.lsc.codec import LSCContext, encode_context, encode_observation
 
         session = "0123456789abcdef0123456789abcdef"
         context = LSCContext(
+            observation_schema=L3F2_SCHEMA,
             source="NINJATRADER",
             provider="LUCID_CQG",
             environment="PROP_SIM",
-            source_identity="source-" + "1" * 64,
-            build_identity="build-" + "2" * 64,
-            contract_identity="MNQZ6-CME-2026-12",
-            contract_id="MNQ DEC26-MNQZ6",
+            producer_protocol_version=None,
+            producer_source_fingerprint=None,
+            producer_build_fingerprint=None,
+            producer_build_timestamp=None,
+            native_contract_id="MNQ DEC26-MNQZ6",
+            canonical_contract_id="MNQZ6",
             tick_size="0.25",
             session_id=session,
             generation=7,
             timestamp_origin="2026-09-23T00:00:00.0000000Z",
+            legacy_mode=True,
         )
         observation = NinjaTraderObservation(
             observation_id=f"nt-{session}-1",
@@ -208,9 +233,12 @@ class SegmentStoreTests(unittest.TestCase):
                 "ask": "20000.25",
                 "bid_size": 2,
                 "ask_size": 3,
+                "source_event_sequence": 101,
+                "source_generation": 7,
             },
             provider_timestamp="2026-09-23T00:00:00.0000000Z",
             provider_sequence=1,
+            schema=L3F2_SCHEMA,
         )
         encoded_context = encode_context(context)
         encoded_record = encode_observation(observation, encoded_context)
@@ -314,6 +342,42 @@ class SegmentStoreTests(unittest.TestCase):
             _bounded_decompress(compressed + b"junk", 2_000)
         with self.assertRaises(LSCStoreIntegrityError):
             _bounded_decompress(compressed[:-2], 2_000)
+
+    def test_compressor_identity_is_runtime_true_reproducible_and_incompatible_versions_refuse(self) -> None:
+        expected = (
+            f"zlib-runtime-{zlib.ZLIB_RUNTIME_VERSION}-deflate-"
+            "wbits15-mem8-level6-default"
+        )
+        self.assertEqual(COMPRESSION, expected)
+        context = b"CTX:compression-identity"
+        with tempfile.TemporaryDirectory() as first_folder, tempfile.TemporaryDirectory() as second_folder:
+            first_store = self.store(Path(first_folder))
+            first_builder = first_store.new_segment(context)
+            first_builder.append(fake_record(context, 1))
+            first = first_builder.seal()
+
+            second_store = self.store(Path(second_folder))
+            second_builder = second_store.new_segment(context)
+            second_builder.append(fake_record(context, 1))
+            second = second_builder.seal()
+            self.assertEqual(first.segment_id, second.segment_id)
+            self.assertEqual(first.path.read_bytes(), second.path.read_bytes())
+
+            incompatible = COMPRESSION.replace(
+                zlib.ZLIB_RUNTIME_VERSION,
+                "9" * len(zlib.ZLIB_RUNTIME_VERSION),
+                1,
+            )
+            self.assertEqual(len(incompatible), len(COMPRESSION))
+            mutated = first.path.read_bytes().replace(
+                COMPRESSION.encode("ascii"),
+                incompatible.encode("ascii"),
+                1,
+            )
+            self.assertNotEqual(mutated, first.path.read_bytes())
+            first.path.write_bytes(mutated)
+            with self.assertRaisesRegex(LSCStoreIntegrityError, "COMPRESSION_UNSUPPORTED"):
+                first_store.verify_chain()
 
     def test_atomic_publication_never_overwrites_existing_destination(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

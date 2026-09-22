@@ -43,6 +43,12 @@ STATIC_STRINGS = (
     "mutation_volume", "mutation_position", "is_reset",
     "UNKNOWN", "BID_ASK_CLASSIFICATION", "PROVIDER_NATIVE", "BUY", "SELL",
     "Add", "Update", "Remove", "Bid", "Ask", "BOUNDED_LATEST_STATE_2HZ",
+    "source_generation", "source_event_sequence",
+    "observer_queue_overflow_frames", "observer_transport_failed_frames",
+    "MARKET_DATA_BID_ASK", "MARKET_DATA_LAST", "MARKET_DEPTH",
+    "EVENT_DRIVEN_SAME_CALLBACK_QUOTE_V1",
+    "EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1",
+    "EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1",
 )
 STATIC_INDEX = {value: index for index, value in enumerate(STATIC_STRINGS)}
 KIND_BY_CODE = {1: "QUOTE", 2: "TRADE", 3: "DEPTH"}
@@ -63,26 +69,33 @@ class VerificationError(ValueError):
 
 @dataclass(frozen=True)
 class IndependentContext:
+    observation_schema: str
     source: str
     provider: str
     environment: str
-    source_identity: str
-    build_identity: str
-    contract_identity: str
-    contract_id: str
+    producer_protocol_version: str | None
+    producer_source_fingerprint: str | None
+    producer_build_fingerprint: str | None
+    producer_build_timestamp: str | None
+    native_contract_id: str
+    canonical_contract_id: str
     tick_size: str
     session_id: str
     generation: int
     timestamp_origin: str
+    legacy_mode: bool
     digest: str
 
     @property
     def dictionary(self) -> tuple[str, ...]:
-        return (
-            self.source, self.provider, self.environment, self.source_identity,
-            self.build_identity, self.contract_identity, self.contract_id,
+        values = (
+            self.observation_schema, self.source, self.provider, self.environment,
+            self.producer_protocol_version, self.producer_source_fingerprint,
+            self.producer_build_fingerprint, self.producer_build_timestamp,
+            self.native_contract_id, self.canonical_contract_id,
             self.tick_size, self.session_id,
         )
+        return tuple(value for value in values if value is not None)
 
 
 @dataclass(frozen=True)
@@ -98,6 +111,13 @@ class VerifiedObservation:
     provider_timestamp: str | None
     provider_sequence: int | None
     exchange_timestamp: str | None
+    schema: str
+    producer: Mapping[str, str] | None
+    signature: str | None
+    signature_verified: bool | None
+    signed_wire_bytes: bytes
+    source_sequence: int
+    source_generation: int
     payload_hash: str
     wire_hash: str
     event_digest: str
@@ -126,13 +146,22 @@ class VerifiedObservation:
             "payload": dict(self.payload),
             "payload_hash": self.payload_hash,
             "wire_hash": self.wire_hash,
+            "schema": self.schema,
+            "producer": None if self.producer is None else dict(self.producer),
+            "signature": self.signature,
+            "signature_verified": self.signature_verified,
+            "signed_wire_hex": self.signed_wire_bytes.hex(),
+            "source_sequence": self.source_sequence,
+            "source_generation": self.source_generation,
             "source": self.context.source,
             "provider": self.context.provider,
             "environment": self.context.environment,
-            "source_identity": self.context.source_identity,
-            "build_identity": self.context.build_identity,
-            "contract_identity": self.context.contract_identity,
-            "contract_id": self.context.contract_id,
+            "producer_protocol_version": self.context.producer_protocol_version,
+            "producer_source_fingerprint": self.context.producer_source_fingerprint,
+            "producer_build_fingerprint": self.context.producer_build_fingerprint,
+            "producer_build_timestamp": self.context.producer_build_timestamp,
+            "native_contract_id": self.context.native_contract_id,
+            "canonical_contract_id": self.context.canonical_contract_id,
             "generation": self.context.generation,
             "book_checkpoint": checkpoint,
         }
@@ -259,7 +288,24 @@ def _validate_iso(value: str) -> None:
 
 def _encode_context_content(context: IndependentContext) -> bytes:
     result = bytearray(b"LSCC\x01")
-    for value in context.dictionary:
+    for value in (
+        context.observation_schema, context.source, context.provider,
+        context.environment,
+    ):
+        result.extend(_text(value))
+    result.append(0 if context.legacy_mode else 1)
+    if not context.legacy_mode:
+        for value in (
+            context.producer_protocol_version,
+            context.producer_source_fingerprint,
+            context.producer_build_fingerprint,
+            context.producer_build_timestamp,
+        ):
+            result.extend(_text(value))  # type: ignore[arg-type]
+    for value in (
+        context.native_contract_id, context.canonical_contract_id,
+        context.tick_size, context.session_id,
+    ):
         result.extend(_text(value))
     result.extend(_uvarint(context.generation))
     result.extend(_text(context.timestamp_origin))
@@ -276,8 +322,25 @@ def verify_context(data: bytes) -> IndependentContext:
     cursor = Cursor(content)
     if cursor.take(4) != b"LSCC" or cursor.byte() != FORMAT_VERSION:
         raise VerificationError("context magic or version unsupported")
-    values = [cursor.text(4_096) for _ in range(9)]
-    if any(not value for value in values):
+    schema = cursor.text(4_096)
+    source, provider, environment = (cursor.text(4_096) for _ in range(3))
+    mode = cursor.byte()
+    if mode == 1:
+        producer = tuple(cursor.text(4_096) for _ in range(4))
+        legacy_mode = False
+    elif mode == 0:
+        producer = (None, None, None, None)
+        legacy_mode = True
+    else:
+        raise VerificationError("context attestation mode unsupported")
+    native_contract, canonical_contract, tick_text, session_id = (
+        cursor.text(4_096) for _ in range(4)
+    )
+    values = (
+        schema, source, provider, environment, *producer,
+        native_contract, canonical_contract, tick_text, session_id,
+    )
+    if any(value is not None and not value for value in values):
         raise VerificationError("empty context identity")
     generation = cursor.uvarint(10)
     if generation > MAX_SEQUENCE:
@@ -287,12 +350,28 @@ def verify_context(data: bytes) -> IndependentContext:
     if _parse_timestamp(origin) is None:
         raise VerificationError("context timestamp origin is not canonical UTC")
     try:
-        tick = Decimal(values[7])
+        tick = Decimal(tick_text)
     except InvalidOperation as exc:
         raise VerificationError("tick size invalid") from exc
     if not tick.is_finite() or tick <= 0:
         raise VerificationError("tick size invalid")
-    context = IndependentContext(*values, generation, origin, supplied.hex())
+    if legacy_mode:
+        if schema != "lane-iii-phase-f2-ninjatrader-observation-v1":
+            raise VerificationError("legacy context schema mismatch")
+    else:
+        if schema != "lane-iii-phase-f3-ninjatrader-observation-v2":
+            raise VerificationError("attested context schema mismatch")
+        if producer[0] != "l3f3-ninjatrader-observer-attestation-v1":
+            raise VerificationError("producer protocol unsupported")
+        if any(re.fullmatch(r"[0-9a-f]{64}", str(value)) is None for value in producer[1:3]):
+            raise VerificationError("producer fingerprint invalid")
+        _validate_iso(str(producer[3]))
+    context = IndependentContext(
+        schema, source, provider, environment,
+        producer[0], producer[1], producer[2], producer[3],
+        native_contract, canonical_contract, tick_text, session_id,
+        generation, origin, legacy_mode, supplied.hex(),
+    )
     if _encode_context_content(context) + supplied != data:
         raise VerificationError("context encoding is not canonical")
     return context
@@ -371,6 +450,8 @@ def _value(
     tag = cursor.byte()
     if price_wrapper and _price_path(kind, path) and tag not in {8, 9}:
         raise VerificationError("price path lacks its canonical tick or escape wrapper")
+    if not price_wrapper and tag in {8, 9}:
+        raise VerificationError("nested price wrapper is non-canonical")
     if tag == 0:
         return None
     if tag == 1:
@@ -504,15 +585,30 @@ def verify_record(record: bytes, context_bytes: bytes) -> VerifiedObservation:
         raise VerificationError("partial account provenance")
     if account_class not in {None, "PROVIDER_EVALUATION", "LOCAL_SIMULATION"}:
         raise VerificationError("account class unsupported")
+    if context.legacy_mode:
+        source_stream = None
+        publication_policy = None
+    else:
+        source_stream = _string_token(cursor, context)
+        publication_policy = _string_token(cursor, context)
     payload_length = cursor.uvarint(10)
     if payload_length > MAX_RECORD_BYTES:
         raise VerificationError("encoded payload exceeds bound")
     payload_cursor = Cursor(cursor.take(payload_length))
     payload = _value(payload_cursor, context, kind, ())
     payload_cursor.finish()
-    if not isinstance(payload, dict) or payload.get("contract_id") != context.contract_id:
+    if not isinstance(payload, dict) or payload.get("contract_id") != context.native_contract_id:
         raise VerificationError("payload contract or shape mismatch")
     payload_hash = cursor.take(32).hex()
+    signature_marker = cursor.byte()
+    if signature_marker == 0:
+        signature = None
+        signature_verified = None
+    elif signature_marker == 1:
+        signature = cursor.take(32).hex()
+        signature_verified = True
+    else:
+        raise VerificationError("signature marker unsupported")
     wire_hash = cursor.take(32).hex()
     cursor.finish()
     canonical_payload = _canonical_json(payload)
@@ -520,34 +616,65 @@ def verify_record(record: bytes, context_bytes: bytes) -> VerifiedObservation:
         raise VerificationError("canonical payload exceeds bound")
     if hashlib.sha256(canonical_payload).hexdigest() != payload_hash:
         raise VerificationError("payload hash mismatch")
-    wire_material = {
-        "schema": "lane-iii-phase-f2-ninjatrader-observation-v1",
+    source_sequence = payload.get("source_event_sequence")
+    source_generation = payload.get("source_generation")
+    if type(source_sequence) is not int or not 0 <= source_sequence <= MAX_SEQUENCE:
+        raise VerificationError("source event sequence invalid")
+    if type(source_generation) is not int or source_generation != context.generation:
+        raise VerificationError("source generation mismatch")
+    producer = None
+    if context.legacy_mode:
+        if signature is not None:
+            raise VerificationError("legacy record contains attestation signature")
+    else:
+        if signature is None or signature_verified is not True:
+            raise VerificationError("attested record lacks signature")
+        if payload.get("publication_policy") != publication_policy:
+            raise VerificationError("payload publication policy mismatch")
+        producer = {
+            "protocol_version": str(context.producer_protocol_version),
+            "source_fingerprint": str(context.producer_source_fingerprint),
+            "build_fingerprint": str(context.producer_build_fingerprint),
+            "build_timestamp": str(context.producer_build_timestamp),
+            "source_stream": source_stream,
+            "publication_policy": publication_policy,
+        }
+    unsigned_wire = {
+        "schema": context.observation_schema,
         "observation_id": observation_id,
         "session_id": context.session_id,
         "observation_type": kind,
         "ninja_receipt_time": ninja_time,
         "local_monotonic_sequence": sequence,
-        "payload": payload,
-        "account_alias": account_alias,
-        "account_class": account_class,
         "provider_timestamp": provider_time,
         "provider_sequence": provider_sequence,
         "exchange_timestamp": exchange_time,
+        "account": None if account_alias is None else {
+            "alias": account_alias, "class": account_class,
+        },
+        "payload": payload,
     }
-    if hashlib.sha256(_canonical_json(wire_material)).hexdigest() != wire_hash:
+    if not context.legacy_mode:
+        unsigned_wire["payload_hash"] = payload_hash
+        unsigned_wire["producer"] = producer
+    signed_wire = _canonical_json({**unsigned_wire, "signature": signature})
+    if hashlib.sha256(signed_wire).hexdigest() != wire_hash:
         raise VerificationError("wire hash mismatch")
     return VerifiedObservation(
         observation_id, context.session_id, kind, ninja_time, sequence, payload,
         account_alias, account_class, provider_time, provider_sequence, exchange_time,
+        context.observation_schema, producer, signature, signature_verified,
+        signed_wire, source_sequence, source_generation,
         payload_hash, wire_hash, supplied_event.hex(), context,
     )
 
 
 def verify_golden_vectors(path: Path) -> dict[str, object]:
     value = json.loads(path.read_text(encoding="utf-8"))
-    context_bytes = bytes.fromhex(value["context_hex"])
+    context_value = value["context"]
+    context_bytes = bytes.fromhex(context_value["context_hex"])
     context = verify_context(context_bytes)
-    if context.digest != value["context_digest"]:
+    if context.digest != context_value["context_digest"]:
         raise VerificationError("golden context digest mismatch")
     records: dict[str, object] = {}
     for name in ("quote", "trade", "depth"):
@@ -558,6 +685,9 @@ def verify_golden_vectors(path: Path) -> dict[str, object]:
             or verified.payload_hash != expected["payload_hash"]
             or verified.wire_hash != expected["wire_hash"]
             or verified.event_digest != expected["event_digest"]
+            or verified.source_sequence != expected["source_sequence"]
+            or verified.source_generation != expected["source_generation"]
+            or verified.schema != expected["schema"]
         ):
             raise VerificationError(f"golden {name} metadata mismatch")
         records[name] = verified.parity_view()
@@ -618,31 +748,49 @@ def _legacy_view(row: Mapping[str, object]) -> dict[str, object]:
     if supplied_payload_hash != payload_hash:
         raise VerificationError("legacy payload hash mismatch")
     required = (
-        "observation_id", "session_id", "observation_type", "ninja_receipt_time",
-        "local_monotonic_sequence", "source", "provider", "environment",
-        "source_identity", "build_identity", "contract_identity", "contract_id",
-        "generation",
+        "schema", "observation_id", "session_id", "observation_type",
+        "ninja_receipt_time", "local_monotonic_sequence", "source", "provider",
+        "environment", "native_contract_id", "canonical_contract_id", "generation",
+        "source_sequence", "source_generation", "signature_verified",
     )
     missing = [key for key in required if key not in row]
     if missing:
         raise VerificationError("legacy parity identity missing: " + ",".join(missing))
     account_alias = None if account is None else account.get("alias")
     account_class = None if account is None else account.get("class")
-    wire_material = {
-        "schema": "lane-iii-phase-f2-ninjatrader-observation-v1",
+    schema = row["schema"]
+    producer = row.get("producer")
+    signature = row.get("signature")
+    if schema == "lane-iii-phase-f3-ninjatrader-observation-v2":
+        if not isinstance(producer, Mapping) or not isinstance(signature, str):
+            raise VerificationError("attested source row lacks producer or signature")
+        if row["signature_verified"] is not True:
+            raise VerificationError("attested source row is not verified")
+    elif schema == "lane-iii-phase-f2-ninjatrader-observation-v1":
+        if producer is not None or signature is not None or row["signature_verified"] is not None:
+            raise VerificationError("legacy source row claims attestation")
+    else:
+        raise VerificationError("source row schema unsupported")
+    unsigned_wire = {
+        "schema": schema,
         "observation_id": row["observation_id"],
         "session_id": row["session_id"],
         "observation_type": row["observation_type"],
         "ninja_receipt_time": row["ninja_receipt_time"],
         "local_monotonic_sequence": row["local_monotonic_sequence"],
-        "payload": payload_plain,
-        "account_alias": account_alias,
-        "account_class": account_class,
         "provider_timestamp": row.get("provider_timestamp"),
         "provider_sequence": row.get("provider_sequence"),
         "exchange_timestamp": row.get("exchange_timestamp"),
+        "account": None if account_alias is None else {
+            "alias": account_alias, "class": account_class,
+        },
+        "payload": payload_plain,
     }
-    wire_hash = hashlib.sha256(_canonical_json(wire_material)).hexdigest()
+    if schema == "lane-iii-phase-f3-ninjatrader-observation-v2":
+        unsigned_wire["payload_hash"] = payload_hash
+        unsigned_wire["producer"] = dict(producer)  # type: ignore[arg-type]
+    signed_wire = _canonical_json({**unsigned_wire, "signature": signature})
+    wire_hash = hashlib.sha256(signed_wire).hexdigest()
     supplied_wire_hash = row.get("wire_hash", wire_hash)
     if supplied_wire_hash != wire_hash:
         raise VerificationError("legacy wire hash mismatch")
@@ -663,10 +811,19 @@ def _legacy_view(row: Mapping[str, object]) -> dict[str, object]:
         "exchange_timestamp": row.get("exchange_timestamp"),
         "account_alias": account_alias, "account_class": account_class,
         "payload": payload_plain, "payload_hash": payload_hash, "wire_hash": wire_hash,
+        "schema": schema, "producer": None if producer is None else dict(producer),
+        "signature": signature, "signature_verified": row["signature_verified"],
+        "signed_wire_hex": signed_wire.hex(),
+        "source_sequence": row["source_sequence"],
+        "source_generation": row["source_generation"],
         "source": row["source"], "provider": row["provider"],
-        "environment": row["environment"], "source_identity": row["source_identity"],
-        "build_identity": row["build_identity"],
-        "contract_identity": row["contract_identity"], "contract_id": row["contract_id"],
+        "environment": row["environment"],
+        "producer_protocol_version": row.get("producer_protocol_version"),
+        "producer_source_fingerprint": row.get("producer_source_fingerprint"),
+        "producer_build_fingerprint": row.get("producer_build_fingerprint"),
+        "producer_build_timestamp": row.get("producer_build_timestamp"),
+        "native_contract_id": row["native_contract_id"],
+        "canonical_contract_id": row["canonical_contract_id"],
         "generation": row["generation"], "book_checkpoint": checkpoint,
     }
     for key in PROOF_FIELDS:

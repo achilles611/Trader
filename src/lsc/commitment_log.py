@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import os
 from pathlib import Path
 import re
 from typing import Callable, Mapping
@@ -44,6 +45,8 @@ LSC_FORMAT_IDENTITY = "LSC-V1-LSCR-SEG01"
 _JOURNAL_NAME = re.compile(r"^(?P<sequence>[0-9]{20})-(?P<hash>[0-9a-f]{64})\.json$")
 _JOURNAL_DOMAIN = b"beelzebub.lsc.v1.shadow.commitment\0"
 _IDENTITY_DOMAIN = b"beelzebub.lsc.v1.shadow.identity\0"
+_STORAGE_IDENTITY_DOMAIN = b"beelzebub.lsc.v1.storage.identity\0"
+STORAGE_IDENTITY_PREFIX = "beelzebub-lsc-storage-v1:"
 
 
 class LSCCommitmentError(LSCStoreError):
@@ -75,37 +78,126 @@ def _commitment_time(value: object) -> str:
     return value
 
 
+def _resolved_storage_path(path: Path, label: str, *, require_exists: bool = True) -> str:
+    """Return one stable spelling of an existing destination path."""
+
+    try:
+        resolved = path.resolve(strict=require_exists)
+    except (OSError, RuntimeError) as exc:
+        raise LSCCommitmentError(f"LSC_STORAGE_{label}_UNRESOLVED") from exc
+    if require_exists and not resolved.is_dir():
+        raise LSCCommitmentError(f"LSC_STORAGE_{label}_NOT_DIRECTORY")
+    # normcase collapses Windows drive/path case and separator aliases.  The
+    # resolved absolute spelling also collapses symlink, junction, dot, and
+    # dot-dot aliases before it is committed.
+    return os.path.normcase(str(resolved))
+
+
+def canonical_storage_identity(
+    store: SegmentStore,
+    journal_root: str | Path | None = None,
+    *,
+    require_journal_root: bool = False,
+) -> str:
+    """Bind a shadow identity to the store's actual resolved destination."""
+
+    if not isinstance(store, SegmentStore):
+        raise TypeError("store must be SegmentStore")
+    journal_path = Path(journal_root) if journal_root is not None else store.root / "shadow-commitments"
+    payload = {
+        "journal_root": _resolved_storage_path(
+            journal_path,
+            "JOURNAL_ROOT",
+            require_exists=require_journal_root,
+        ),
+        "root": _resolved_storage_path(store.root, "ROOT"),
+        "schema": "beelzebub-lsc-storage-identity-v1",
+        "segment_root": _resolved_storage_path(store.segment_root, "SEGMENT_ROOT"),
+    }
+    return STORAGE_IDENTITY_PREFIX + _domain_hash(
+        _STORAGE_IDENTITY_DOMAIN,
+        _canonical_json(payload),
+    )
+
+
 @dataclass(frozen=True)
 class ShadowIdentityContext:
     """Immutable identity of one independent shadow evidence journal."""
 
     journal_id: str
     profile_id: str
-    source_identity: str
-    build_identity: str
-    contract_identity: str
+    context_digest: str
+    observation_schema: str
+    source: str
+    provider: str
+    environment: str
+    producer_protocol_version: str | None
+    producer_source_fingerprint: str | None
+    producer_build_fingerprint: str | None
+    producer_build_timestamp: str | None
+    native_contract_id: str
+    canonical_contract_id: str
+    tick_size: str
+    session_id: str
+    generation: int
+    legacy_mode: bool
     format_identity: str
     storage_identity: str
 
     def __post_init__(self) -> None:
         for name in (
-            "journal_id", "profile_id", "source_identity", "build_identity",
-            "contract_identity", "format_identity", "storage_identity",
+            "journal_id", "profile_id", "observation_schema", "source", "provider",
+            "environment", "native_contract_id", "canonical_contract_id", "tick_size",
+            "session_id", "format_identity", "storage_identity",
         ):
             _identity_text(getattr(self, name), name)
+        _hex64(self.context_digest, "CONTEXT_DIGEST")
+        if type(self.generation) is not int or self.generation < 0:
+            raise ValueError("generation must be a non-negative integer")
+        if type(self.legacy_mode) is not bool:
+            raise ValueError("legacy_mode must be boolean")
+        producer_names = (
+            "producer_protocol_version", "producer_source_fingerprint",
+            "producer_build_fingerprint", "producer_build_timestamp",
+        )
+        if self.legacy_mode:
+            if any(getattr(self, name) is not None for name in producer_names):
+                raise ValueError("legacy identity cannot claim producer attestation")
+        else:
+            for name in producer_names:
+                _identity_text(getattr(self, name), name)
         if self.format_identity != LSC_FORMAT_IDENTITY:
             raise ValueError(f"format_identity must be {LSC_FORMAT_IDENTITY}")
+        storage_digest = self.storage_identity.removeprefix(STORAGE_IDENTITY_PREFIX)
+        if (
+            not self.storage_identity.startswith(STORAGE_IDENTITY_PREFIX)
+            or len(storage_digest) != 64
+            or any(character not in "0123456789abcdef" for character in storage_digest)
+        ):
+            raise ValueError("storage_identity must be a canonical LSC storage identity")
 
-    def payload(self) -> dict[str, str]:
+    def payload(self) -> dict[str, object]:
         return {
-            "build_identity": self.build_identity,
-            "contract_identity": self.contract_identity,
+            "canonical_contract_id": self.canonical_contract_id,
+            "context_digest": self.context_digest,
+            "environment": self.environment,
             "format_identity": self.format_identity,
+            "generation": self.generation,
             "journal_id": self.journal_id,
+            "legacy_mode": self.legacy_mode,
+            "native_contract_id": self.native_contract_id,
+            "observation_schema": self.observation_schema,
             "profile_id": self.profile_id,
+            "producer_build_fingerprint": self.producer_build_fingerprint,
+            "producer_build_timestamp": self.producer_build_timestamp,
+            "producer_protocol_version": self.producer_protocol_version,
+            "producer_source_fingerprint": self.producer_source_fingerprint,
+            "provider": self.provider,
             "schema": IDENTITY_SCHEMA,
-            "source_identity": self.source_identity,
+            "session_id": self.session_id,
+            "source": self.source,
             "storage_identity": self.storage_identity,
+            "tick_size": self.tick_size,
         }
 
     @property
@@ -220,8 +312,24 @@ class ShadowCommitmentLog:
             or resolved_segments in resolved_root.parents
         ):
             raise LSCCommitmentError("LSC_COMMITMENT_ROOT_MUST_BE_DISTINCT_FROM_SEGMENT_ROOT")
+        actual_storage_identity = canonical_storage_identity(store, self.root)
+        if identity.storage_identity != actual_storage_identity:
+            raise LSCCommitmentError("LSC_STORAGE_IDENTITY_DESTINATION_MISMATCH")
         self.root.mkdir(parents=True, exist_ok=True)
         self.quarantine_root.mkdir(parents=True, exist_ok=True)
+        self._verify_storage_identity()
+
+    def _verify_storage_identity(self) -> None:
+        try:
+            actual = canonical_storage_identity(
+                self.store,
+                self.root,
+                require_journal_root=True,
+            )
+        except LSCCommitmentError as exc:
+            raise LSCCommitmentIntegrityError("LSC_STORAGE_IDENTITY_UNVERIFIED") from exc
+        if actual != self.identity.storage_identity:
+            raise LSCCommitmentIntegrityError("LSC_STORAGE_IDENTITY_DESTINATION_MISMATCH")
 
     @property
     def identity_digest(self) -> str:
@@ -306,6 +414,7 @@ class ShadowCommitmentLog:
         )
 
     def verify(self) -> tuple[ShadowCommitmentRecord, ...]:
+        self._verify_storage_identity()
         sealed = self.store.verify_chain()
         segments = {item.segment_id: item for item in sealed}
         paths = sorted(self.root.glob("*.json"), key=lambda item: item.name)
@@ -317,17 +426,31 @@ class ShadowCommitmentLog:
                 raise LSCCommitmentIntegrityError("LSC_SHADOW_JOURNAL_SEGMENT_FORK_REFUSED")
             result.append(record)
             previous_hash = record.journal_hash
+        self._verify_storage_identity()
         return tuple(result)
 
     def _validate_segment_identity(self, segment: SealedSegment) -> None:
+        if segment.context_digest != self.identity.context_digest:
+            raise LSCCommitmentIntegrityError("LSC_SEGMENT_CONTEXT_DIGEST_IDENTITY_MISMATCH")
         try:
             context = decode_context(self.store.read_context(segment.segment_id))
         except Exception as exc:
             raise LSCCommitmentIntegrityError("LSC_COMMITTED_SEGMENT_CONTEXT_UNVERIFIED") from exc
         expected = {
-            "source_identity": self.identity.source_identity,
-            "build_identity": self.identity.build_identity,
-            "contract_identity": self.identity.contract_identity,
+            "observation_schema": self.identity.observation_schema,
+            "source": self.identity.source,
+            "provider": self.identity.provider,
+            "environment": self.identity.environment,
+            "producer_protocol_version": self.identity.producer_protocol_version,
+            "producer_source_fingerprint": self.identity.producer_source_fingerprint,
+            "producer_build_fingerprint": self.identity.producer_build_fingerprint,
+            "producer_build_timestamp": self.identity.producer_build_timestamp,
+            "native_contract_id": self.identity.native_contract_id,
+            "canonical_contract_id": self.identity.canonical_contract_id,
+            "tick_size": self.identity.tick_size,
+            "session_id": self.identity.session_id,
+            "generation": self.identity.generation,
+            "legacy_mode": self.identity.legacy_mode,
         }
         if any(getattr(context, name) != value for name, value in expected.items()):
             raise LSCCommitmentIntegrityError("LSC_SEGMENT_CROSS_IDENTITY_REFUSED")
@@ -396,6 +519,9 @@ class ShadowCommitmentLog:
         )
 
     def recover(self) -> CommitmentRecoveryReport:
+        # Destination identity is checked before quarantine can mutate any
+        # recovery artifact, then again after full segment/journal validation.
+        self._verify_storage_identity()
         quarantined: list[QuarantinedTemporary] = []
         for path in sorted(self.root.glob("*.tmp"), key=lambda item: item.name):
             if path.is_symlink() or not path.is_file():
@@ -409,12 +535,14 @@ class ShadowCommitmentLog:
         sealed_ids = tuple(item.segment_id for item in sealed)
         if sealed_ids[:len(committed_ids)] != committed_ids:
             raise LSCCommitmentIntegrityError("LSC_SHADOW_COMMITMENT_NOT_SEALED_PREFIX")
-        return CommitmentRecoveryReport(
+        report = CommitmentRecoveryReport(
             quarantined=tuple(quarantined),
             committed_segment_ids=committed_ids,
             uncommitted_segment_ids=sealed_ids[len(committed_ids):],
             identity_digest=self.identity_digest,
         )
+        self._verify_storage_identity()
+        return report
 
     def _committed_record(self, segment_id: str) -> ShadowCommitmentRecord:
         segment_id = _hex64(segment_id, "SEGMENT_ID")
@@ -486,4 +614,6 @@ __all__ = [
     "ShadowCommitmentRecord",
     "ShadowIdentityContext",
     "LSC_FORMAT_IDENTITY",
+    "STORAGE_IDENTITY_PREFIX",
+    "canonical_storage_identity",
 ]

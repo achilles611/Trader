@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from copy import deepcopy
+import hashlib
 import json
 from pathlib import Path
 import unittest
@@ -32,7 +33,7 @@ def golden_data() -> dict[str, object]:
 def legacy_row(verified) -> dict[str, object]:
     context = verified.context
     return {
-        "schema": "lane-iii-phase-f2-ninjatrader-observation-v1",
+        "schema": verified.schema,
         "observation_id": verified.observation_id,
         "session_id": verified.session_id,
         "observation_type": verified.observation_type,
@@ -48,13 +49,20 @@ def legacy_row(verified) -> dict[str, object]:
         "payload": dict(verified.payload),
         "payload_hash": verified.payload_hash,
         "wire_hash": verified.wire_hash,
+        "producer": None if verified.producer is None else dict(verified.producer),
+        "signature": verified.signature,
+        "signature_verified": verified.signature_verified,
+        "source_sequence": verified.source_sequence,
+        "source_generation": verified.source_generation,
         "source": context.source,
         "provider": context.provider,
         "environment": context.environment,
-        "source_identity": context.source_identity,
-        "build_identity": context.build_identity,
-        "contract_identity": context.contract_identity,
-        "contract_id": context.contract_id,
+        "producer_protocol_version": context.producer_protocol_version,
+        "producer_source_fingerprint": context.producer_source_fingerprint,
+        "producer_build_fingerprint": context.producer_build_fingerprint,
+        "producer_build_timestamp": context.producer_build_timestamp,
+        "native_contract_id": context.native_contract_id,
+        "canonical_contract_id": context.canonical_contract_id,
         "generation": context.generation,
     }
 
@@ -145,17 +153,19 @@ class IndependentVerifierTests(unittest.TestCase):
         trade = report["records"]["trade"]
         self.assertEqual(trade["payload"]["price"], "20000.10")
         depth = report["records"]["depth"]
-        self.assertEqual(depth["ninja_receipt_time"], "2026-09-23T00:00:01.0000001Z")
-        self.assertEqual(depth["exchange_timestamp"], "2026-09-23T00:00:00.999999999Z")
+        self.assertEqual(depth["ninja_receipt_time"], "2026-09-23T00:00:00.0000003Z")
+        self.assertIsNone(depth["exchange_timestamp"])
+        self.assertTrue(depth["signature_verified"])
+        self.assertEqual(depth["producer"]["source_stream"], "MARKET_DEPTH")
 
     def test_context_and_event_corruption_are_refused(self):
         value = golden_data()
-        context_bytes = bytearray.fromhex(value["context_hex"])
+        context_bytes = bytearray.fromhex(value["context"]["context_hex"])
         context_bytes[-1] ^= 1
         with self.assertRaisesRegex(VerificationError, "context digest mismatch"):
             verify_context(bytes(context_bytes))
 
-        clean_context = bytes.fromhex(value["context_hex"])
+        clean_context = bytes.fromhex(value["context"]["context_hex"])
         for name in ("quote", "trade", "depth"):
             with self.subTest(name=name):
                 record = bytearray.fromhex(value["records"][name]["record_hex"])
@@ -163,9 +173,28 @@ class IndependentVerifierTests(unittest.TestCase):
                 with self.assertRaisesRegex(VerificationError, "event digest mismatch"):
                     verify_record(bytes(record), clean_context)
 
+    def test_nested_price_wrapper_fails_even_with_recomputed_event_digest(self):
+        value = golden_data()
+        context_bytes = bytes.fromhex(value["context"]["context_hex"])
+        record = bytearray.fromhex(value["records"]["depth"]["record_hex"])
+        content = bytearray(record[:-32])
+        # DEPTH mutation_price encodes as PRICE_TICKS, tick projection 80000,
+        # then the exact FLOAT64 scalar. Change that scalar tag into a second
+        # PRICE_TICKS wrapper and recompute the outer event digest. The
+        # independent semantic parser, not the digest check, must refuse it.
+        needle = bytes.fromhex("0880e20904")
+        offset = content.find(needle)
+        self.assertGreaterEqual(offset, 0)
+        content[offset + len(needle) - 1] = 8
+        forged = bytes(content) + hashlib.sha256(
+            b"BEELZEBUB_LSC_V1_EVENT\0" + bytes(content)
+        ).digest()
+        with self.assertRaisesRegex(VerificationError, "nested price wrapper"):
+            verify_record(forged, context_bytes)
+
     def test_legacy_lsc_parity_and_typed_first_mismatch(self):
         value = golden_data()
-        context_hex = value["context_hex"]
+        context_hex = value["context"]["context_hex"]
         events = []
         lsc_events = []
         for name in ("quote", "trade", "depth"):
@@ -207,7 +236,7 @@ class IndependentVerifierTests(unittest.TestCase):
 
     def test_parity_reports_count_and_proof_mismatch(self):
         value = golden_data()
-        context_hex = value["context_hex"]
+        context_hex = value["context"]["context_hex"]
         quote_hex = value["records"]["quote"]["record_hex"]
         verified = verify_record(bytes.fromhex(quote_hex), bytes.fromhex(context_hex))
         legacy_path = Path(self._testMethodName + "-legacy.json")
