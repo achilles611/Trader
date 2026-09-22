@@ -157,6 +157,11 @@ class IndependentVerifierTests(unittest.TestCase):
         self.assertIsNone(depth["exchange_timestamp"])
         self.assertTrue(depth["signature_verified"])
         self.assertEqual(depth["producer"]["source_stream"], "MARKET_DEPTH")
+        self.assertEqual(depth["payload"]["mutation_resolved_price"], 20000.0)
+        self.assertIs(type(depth["payload"]["mutation_resolved_price"]), float)
+        self.assertEqual(depth["payload"]["position_bids"][1]["price"], "19999.75")
+        self.assertIs(type(depth["payload"]["position_bids"][1]["price"]), str)
+        self.assertEqual(depth["payload"]["position_asks"][0]["price"], "20000.25")
 
     def test_context_and_event_corruption_are_refused(self):
         value = golden_data()

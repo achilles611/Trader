@@ -108,7 +108,9 @@ Known price locations are:
 
 - `QUOTE`: `bid`, `ask`
 - `TRADE`: `price`, `bid_at_trade`, `ask_at_trade`
-- `DEPTH`: `mutation_price`, and each `bids[*].price` / `asks[*].price`
+- `DEPTH`: `mutation_price`, `mutation_resolved_price`, and every
+  `bids[*].price`, `asks[*].price`, `position_bids[*].price`, and
+  `position_asks[*].price`
 
 When a scalar is finite, positive, and exactly divisible by the context tick
 size, the record stores its signed integer-tick projection plus the exact

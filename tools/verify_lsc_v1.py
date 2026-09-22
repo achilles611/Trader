@@ -49,6 +49,9 @@ STATIC_STRINGS = (
     "EVENT_DRIVEN_SAME_CALLBACK_QUOTE_V1",
     "EVENT_DRIVEN_EVERY_LAST_CALLBACK_V1",
     "EVENT_DRIVEN_EVERY_DEPTH_MUTATION_V1",
+    "mutation_resolved_price", "snapshot_ordering",
+    "position_bids", "position_asks", "position",
+    "NATIVE_POSITIONAL_BEST_TO_WORST_V1",
 )
 STATIC_INDEX = {value: index for index, value in enumerate(STATIC_STRINGS)}
 KIND_BY_CODE = {1: "QUOTE", 2: "TRADE", 3: "DEPTH"}
@@ -413,8 +416,10 @@ def _price_path(kind: str, path: tuple[object, ...]) -> bool:
     if kind == "TRADE":
         return path in {("price",), ("bid_at_trade",), ("ask_at_trade",)}
     return kind == "DEPTH" and (
-        path == ("mutation_price",)
-        or len(path) == 3 and path[0] in {"bids", "asks"}
+        path in {("mutation_price",), ("mutation_resolved_price",)}
+        or len(path) == 3 and path[0] in {
+            "bids", "asks", "position_bids", "position_asks",
+        }
         and type(path[1]) is int and path[2] == "price"
     )
 

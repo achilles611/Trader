@@ -20,6 +20,7 @@ from src.lane_iii.contracts import canonical_hash
 from src.lsc.codec import (
     LSCCodecError,
     LSCContext,
+    _is_price_path,
     context_digest,
     decode_context,
     decode_observation,
@@ -312,12 +313,25 @@ class LSCCodecTests(unittest.TestCase):
         self.assertEqual(decoded, source)
         self.assertEqual(decoded.payload["mutation_position"], 0)
         self.assertEqual(decoded.payload["snapshot_ordering"], "NATIVE_POSITIONAL_BEST_TO_WORST_V1")
+        self.assertEqual(decoded.payload["mutation_resolved_price"], 20000.0)
+        self.assertIs(type(decoded.payload["mutation_resolved_price"]), float)
         bids = decoded.payload["bids"]
+        position_bids = decoded.payload["position_bids"]
+        position_asks = decoded.payload["position_asks"]
         self.assertIsInstance(bids, list)
         self.assertEqual(bids[0], {"price": 20000.0, "size": 5})
         self.assertEqual(bids[1], {"price": "19999.75", "size": 3})
         self.assertIs(type(bids[0]["price"]), float)
         self.assertIs(type(bids[1]["price"]), str)
+        self.assertEqual(position_bids[0]["price"], 20000.0)
+        self.assertIs(type(position_bids[0]["price"]), float)
+        self.assertEqual(position_bids[1]["price"], "19999.75")
+        self.assertIs(type(position_bids[1]["price"]), str)
+        self.assertEqual(position_asks[0]["price"], "20000.25")
+        self.assertIs(type(position_asks[0]["price"]), str)
+        self.assertTrue(_is_price_path("DEPTH", ("mutation_resolved_price",)))
+        self.assertTrue(_is_price_path("DEPTH", ("position_bids", 0, "price")))
+        self.assertTrue(_is_price_path("DEPTH", ("position_asks", 0, "price")))
 
     def test_payload_key_order_does_not_change_canonical_record(self) -> None:
         source = observation("QUOTE", 1)
