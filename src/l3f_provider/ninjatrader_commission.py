@@ -574,6 +574,15 @@ class NinjaTraderCommissioningHarness:
                         logging.getLogger(__name__).exception(
                             "NINJATRADER_OBSERVER downstream rejection notification refused"
                         )
+                if self._fail_on_observation_error:
+                    # The qualifying receiver owns a required, authenticated
+                    # observation boundary. Persist the first rejection above,
+                    # then fail the listener closed instead of accepting an
+                    # unbounded stream of identically invalid frames.
+                    raise RuntimeError(
+                        "NINJATRADER_REQUIRED_OBSERVATION_REJECTED:"
+                        f"{error.code.value}:{error.detail}"
+                    ) from error
         return self.summary
 
     def run(self, duration_seconds: float, *, stop_event: threading.Event | None = None) -> CommissioningSummary:

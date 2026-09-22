@@ -85,6 +85,46 @@ class ReceiverRepairSafetyTests(unittest.TestCase):
             worker.stop()
         self.assertEqual(worker.status().state, "FAILED", "Stop cannot erase first consumer failure")
 
+    def test_required_auth_rejection_records_once_then_fails_receiver_closed(self):
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+        rejection = Mock()
+        worker = NinjaTraderListenerWorker(
+            LoopbackBridgeConfig(port=port),
+            attestation_key=KEY,
+            require_attestation=True,
+            expected_source_fingerprint="0" * 64,
+        )
+        worker.set_observation_sinks(
+            on_observation=Mock(),
+            on_local_bridge_state=Mock(),
+            on_rejection=rejection,
+            on_duplicate=Mock(),
+            fail_on_observation_error=True,
+        )
+        try:
+            self.assertEqual(worker.start().state, "LISTENING")
+            wire = production_fixtures.PongProductionHostTests._qualifying_depth(1).signed_wire_bytes()
+            with socket.create_connection(("127.0.0.1", port), timeout=2) as sender:
+                sender.sendall((wire + b"\n") * 2)
+                self.assertTrue(worker._finished_event.wait(2), "Required rejection must terminate receiver")
+            state = worker.status()
+            self.assertEqual(state.state, "FAILED")
+            self.assertIn(
+                "NINJATRADER_REQUIRED_OBSERVATION_REJECTED:AUTH_FAILED:ninjatrader_source_fingerprint",
+                state.error,
+            )
+            self.assertEqual(rejection.call_count, 1)
+            self.assertEqual(worker._harness.summary.rejected, 1)
+            self.assertEqual(worker._harness.summary.health["LOCAL_BRIDGE"], "DISCONNECTED")
+            self.assertFalse(worker._thread.is_alive())
+            with self.assertRaises(OSError):
+                socket.create_connection(("127.0.0.1", port), timeout=0.2)
+        finally:
+            worker.stop()
+        self.assertEqual(worker.status().state, "FAILED", "Stop cannot erase first auth rejection")
+
     def test_optional_legacy_consumer_failure_remains_compatible(self):
         sink = Mock(side_effect=ValueError("TEST ONLY optional consumer"))
         harness = NinjaTraderCommissioningHarness(
