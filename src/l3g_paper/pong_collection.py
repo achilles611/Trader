@@ -649,21 +649,29 @@ class PongAuthenticHourCollector:
         # Durability authority remains the later flush/fsync watermark.
         prior = self._journal_tip
         journal_sequence = self._written_records + 1
-        body: dict[str, object] = {
-            "schema": PONG_COLLECTION_RECORD_SCHEMA,
-            "collector_id": self.collector_id,
-            "journal_sequence": journal_sequence,
-            "received_by_collector_at": enqueued_at,
-            "signature_verified": True,
-            "wire_hash": record.wire_hash(),
-            "previous_record_hash": prior,
-            "observation": None,
-        }
+        prefix = b"{"
         if record.observation_type == "TRADE":
-            body["aggressor_classification"] = self._classify_trade(record)
-        canonical_body = _canonical_bytes(body).replace(
-            b'"observation":null', b'"observation":' + record.signed_wire_bytes(), 1,
-        )
+            prefix += (
+                b'"aggressor_classification":'
+                + _canonical_bytes(self._classify_trade(record))
+                + b','
+            )
+        # These fragments are the exact sorted-key canonical representation
+        # previously produced from the small wrapper dict. The already-cached
+        # signed observation bytes remain embedded verbatim; only immutable
+        # scalar wrapper fields are encoded here.
+        canonical_body = b"".join((
+            prefix,
+            b'"collector_id":', _canonical_bytes(self.collector_id),
+            b',"journal_sequence":', str(journal_sequence).encode("ascii"),
+            b',"observation":', record.signed_wire_bytes(),
+            b',"previous_record_hash":', _canonical_bytes(prior),
+            b',"received_by_collector_at":', _canonical_bytes(enqueued_at),
+            b',"schema":', _canonical_bytes(PONG_COLLECTION_RECORD_SCHEMA),
+            b',"signature_verified":true',
+            b',"wire_hash":', _canonical_bytes(record.wire_hash()),
+            b'}',
+        ))
         digest = hashlib.sha256(canonical_body).hexdigest()
         self._journal_tip = digest
         return _add_record_hash(canonical_body, digest) + b"\n"

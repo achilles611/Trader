@@ -367,6 +367,51 @@ UNSPECIFIED_OFF_SESSION_CONTEXT = PaperSessionContext(
 )
 
 
+@lru_cache(maxsize=512)
+def _profile_context(
+    profile: PaperSessionProfile,
+    trade_day: date,
+    generation: int,
+    state: PaperCalendarState,
+    session_contract: str,
+) -> PaperSessionContext:
+    """Reuse an immutable session identity without caching event decisions."""
+    return PaperSessionContext(
+        profile.session_kind,
+        f"{session_contract}:{profile.session_kind.value}:{trade_day.isoformat()}",
+        trade_day.isoformat(),
+        profile.timezone,
+        profile.observation_start,
+        profile.entry_start,
+        profile.entry_cutoff,
+        profile.hard_flat_deadline,
+        profile.session_end,
+        profile.profile_hash,
+        generation,
+        state,
+        session_contract,
+    )
+
+
+@lru_cache(maxsize=128)
+def _off_session_context(
+    local_date: date,
+    generation: int,
+    state: PaperCalendarState,
+    session_contract: str,
+) -> PaperSessionContext:
+    return PaperSessionContext(
+        PaperSessionKind.OFF_SESSION,
+        f"{session_contract}:OFF_SESSION:{local_date.isoformat()}",
+        local_date.isoformat(),
+        NEW_YORK_TIMEZONE,
+        "00:00", "00:00", "00:00", "00:00", "00:00",
+        OFF_SESSION_PROFILE.profile_hash,
+        generation,
+        state,
+    )
+
+
 def context_from_identity(
     session_kind: PaperSessionKind,
     session_id: str,
@@ -506,11 +551,8 @@ class PaperSessionResolver:
         self._last_event_at: datetime | None = None
 
     def _off_context(self, local: datetime, generation: int, state: PaperCalendarState) -> PaperSessionContext:
-        return PaperSessionContext(
-            PaperSessionKind.OFF_SESSION,
-            f"{self.session_contract}:OFF_SESSION:{local.date().isoformat()}",
-            local.date().isoformat(), NEW_YORK_TIMEZONE, "00:00", "00:00", "00:00", "00:00", "00:00",
-            OFF_SESSION_PROFILE.profile_hash, generation, state,
+        return _off_session_context(
+            local.date(), generation, state, self.session_contract,
         )
 
     def resolve(self, event_timestamp: str | datetime | None, *, generation: int = 0) -> PaperSessionResolution:
@@ -562,11 +604,8 @@ class PaperSessionResolver:
             )
             return PaperSessionResolution(self._off_context(local, generation, closed), False, reason)
         state = self.calendar.state_for(trade_day)
-        context = PaperSessionContext(
-            profile.session_kind, f"{self.session_contract}:{profile.session_kind.value}:{trade_day.isoformat()}",
-            trade_day.isoformat(), profile.timezone, profile.observation_start, profile.entry_start,
-            profile.entry_cutoff, profile.hard_flat_deadline, profile.session_end, profile.profile_hash,
-            generation, state, self.session_contract,
+        context = _profile_context(
+            profile, trade_day, generation, state, self.session_contract,
         )
         if state is PaperCalendarState.HOLIDAY_OVERRIDE_REQUIRED:
             return PaperSessionResolution(context, False, "HOLIDAY_SESSION_UNVERIFIED")

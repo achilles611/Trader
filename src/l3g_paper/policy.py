@@ -327,22 +327,24 @@ class ExperimentalPaperPolicy:
         # checked below for bounded freshness.
         return observation.ninja_receipt_time
 
-    def _validate_time(self, observation: NinjaTraderObservation) -> str | None:
+    def _validate_time(
+        self, observation: NinjaTraderObservation,
+    ) -> tuple[str | None, datetime]:
         receipt_time = self._time(self._market_event_timestamp(observation), "Paper market event time")
         if self._last_receipt_time is not None and receipt_time < self._last_receipt_time:
             self._clear_provisional()
-            return "TIMESTAMP_MOVED_BACKWARD"
+            return "TIMESTAMP_MOVED_BACKWARD", receipt_time
         if observation.provider_timestamp is not None:
             provider_time = self._time(observation.provider_timestamp, "Provider event time")
             receipt = self._time(observation.ninja_receipt_time, "NinjaTrader receipt time")
             if provider_time > receipt + MAXIMUM_PROVIDER_FUTURE_SKEW:
                 self._clear_provisional()
-                return "FUTURE_EVENT_TIMESTAMP"
+                return "FUTURE_EVENT_TIMESTAMP", receipt_time
             if receipt - provider_time > timedelta(seconds=self.artifact.hypothesis_idle_lifetime_seconds):
                 self._clear_provisional()
-                return "STALE_EVENT_TIMESTAMP"
+                return "STALE_EVENT_TIMESTAMP", receipt_time
         self._last_receipt_time = receipt_time
-        return None
+        return None, receipt_time
 
     def ingest(
         self,
@@ -409,6 +411,47 @@ class ExperimentalPaperPolicy:
                 raise RuntimeError("PONG_STATE_ONLY_INGESTION_DID_NOT_SUPPRESS_DECISION")
             return self._pong_state_only_reason
 
+    def ingest_pong_runtime_state_with_gate(
+        self,
+        observation: NinjaTraderObservation,
+        *,
+        current_position: PaperDirection = PaperDirection.FLAT,
+        pending_order: bool = False,
+        session_context: PaperSessionContext | None = None,
+    ) -> tuple[str, int, int, int, int, bool, bool]:
+        """Apply state and return its exact pre/post gate facts atomically.
+
+        The qualifying no-authority receiver previously acquired this same
+        re-entrant lock four extra times around ``ingest_pong_runtime_state``.
+        Keeping the observations in one outer critical section preserves the
+        existing transition and freshness semantics while avoiding redundant
+        hot-path lock handoffs.
+        """
+        with self._lock:
+            before_classified = (
+                self._counters["classified_buy"]
+                + self._counters["classified_sell"]
+            )
+            reset_before = self._reset_count
+            reason = self.ingest_pong_runtime_state(
+                observation,
+                current_position=current_position,
+                pending_order=pending_order,
+                session_context=session_context,
+            )
+            after_classified, warmed, depth_recovering = (
+                self._runtime_gate_state_locked()
+            )
+            return (
+                reason,
+                before_classified,
+                reset_before,
+                self._reset_count,
+                after_classified,
+                warmed,
+                depth_recovering,
+            )
+
     def _ingest(
         self,
         observation: NinjaTraderObservation,
@@ -440,7 +483,7 @@ class ExperimentalPaperPolicy:
             )
             if resolution is not None and resolution.reason_code == "EVENT_TIMESTAMP_MOVED_BACKWARD":
                 if observation.observation_type in {"QUOTE", "TRADE", "DEPTH"}:
-                    time_fault = self._validate_time(observation)
+                    time_fault, _ = self._validate_time(observation)
                     if time_fault is not None:
                         return no_trade(time_fault)
                 self._clear_provisional()
@@ -451,8 +494,9 @@ class ExperimentalPaperPolicy:
             if fault is not None:
                 return no_trade(fault)
 
+            event_time: datetime | None = None
             if observation.observation_type in {"QUOTE", "TRADE", "DEPTH"}:
-                time_fault = self._validate_time(observation)
+                time_fault, event_time = self._validate_time(observation)
                 if time_fault is not None:
                     return no_trade(time_fault)
 
@@ -498,9 +542,11 @@ class ExperimentalPaperPolicy:
             if observation.observation_type == "QUOTE":
                 reason = self._ingest_quote(observation)
             elif observation.observation_type == "TRADE":
-                reason = self._ingest_trade(observation)
+                assert event_time is not None
+                reason = self._ingest_trade(observation, event_time)
             else:
-                reason = self._ingest_depth(observation)
+                assert event_time is not None
+                reason = self._ingest_depth(observation, event_time)
             if reason is not None:
                 return no_trade(reason)
             self._market_observation_history.append(observation)
@@ -880,7 +926,9 @@ class ExperimentalPaperPolicy:
         self._counters["quotes"] += 1
         return None
 
-    def _ingest_trade(self, observation: NinjaTraderObservation) -> str | None:
+    def _ingest_trade(
+        self, observation: NinjaTraderObservation, observed_time: datetime,
+    ) -> str | None:
         price = self._decimal(observation.payload.get("price"))
         size = observation.payload.get("size")
         if price is None or price <= 0 or type(size) is not int or size <= 0:
@@ -904,7 +952,7 @@ class ExperimentalPaperPolicy:
             and bid_at_trade == quote.bid
             and ask_at_trade == quote.ask
             and quote.bid < quote.ask
-            and self._time(observed_at) >= self._time(quote.observed_at)
+            and observed_time >= self._time(quote.observed_at)
         ):
             if price >= quote.ask:
                 side = "BUY"
@@ -1057,7 +1105,9 @@ class ExperimentalPaperPolicy:
             self._put_evidence(HypothesisKind.BULLISH_REVERSAL, EvidenceFamily.ORDER_FLOW, "SELLING_WITHOUT_DOWNWARD_PROGRESS", strength, True, current.observed_at, self.artifact.flow_evidence_lifetime_seconds, window)
         self._put_evidence(HypothesisKind.BEARISH_CONTINUATION, EvidenceFamily.ORDER_FLOW, "AGGRESSIVE_SELL_IMBALANCE", strength, True, current.observed_at, self.artifact.flow_evidence_lifetime_seconds, window)
 
-    def _ingest_depth(self, observation: NinjaTraderObservation) -> str | None:
+    def _ingest_depth(
+        self, observation: NinjaTraderObservation, mutation_time: datetime,
+    ) -> str | None:
         if observation.payload.get("is_reset") is True:
             self._clear_provisional()
             return "DEPTH_RESET"
@@ -1135,7 +1185,6 @@ class ExperimentalPaperPolicy:
                 self._bid_levels.pop(price, None)
             else:
                 self._bid_levels[price] = volume
-        mutation_time = self._event_time(observation)
         mutation = DepthMutation(
             observation.observation_id, observation.local_monotonic_sequence, self._payload_hash(observation),
             self._market_event_timestamp(observation), mutation_time, side, operation, price, volume,
@@ -1292,20 +1341,23 @@ class ExperimentalPaperPolicy:
     def runtime_gate_state(self) -> tuple[int, bool, bool]:
         """Return minimal preflight state without building public status."""
         with self._lock:
-            now = datetime.now(timezone.utc)
-            warmed = all(
-                any(
-                    value.family is family and self._time(value.expires_at) >= now
-                    for value in self._evidence.values()
-                )
-                for family in (
-                    EvidenceFamily.STRUCTURAL_CONTEXT,
-                    EvidenceFamily.ORDER_FLOW,
-                    EvidenceFamily.RESTING_LIQUIDITY,
-                )
+            return self._runtime_gate_state_locked()
+
+    def _runtime_gate_state_locked(self) -> tuple[int, bool, bool]:
+        now = datetime.now(timezone.utc)
+        warmed = all(
+            any(
+                value.family is family and self._time(value.expires_at) >= now
+                for value in self._evidence.values()
             )
-            classified = self._counters["classified_buy"] + self._counters["classified_sell"]
-            return classified, warmed, self._depth_recovering
+            for family in (
+                EvidenceFamily.STRUCTURAL_CONTEXT,
+                EvidenceFamily.ORDER_FLOW,
+                EvidenceFamily.RESTING_LIQUIDITY,
+            )
+        )
+        classified = self._counters["classified_buy"] + self._counters["classified_sell"]
+        return classified, warmed, self._depth_recovering
 
     def _decision_sources(self, hypothesis: HypothesisKind | None, at: datetime, fallback: NinjaTraderObservation) -> tuple[tuple[str, ...], tuple[int, ...], tuple[str, ...]]:
         if hypothesis is None:

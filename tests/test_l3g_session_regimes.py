@@ -79,6 +79,14 @@ class SessionClassificationTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(hasher.call_count, 1)
 
+    def test_immutable_session_context_is_reused_without_caching_entry_decision(self) -> None:
+        resolver = PaperSessionResolver()
+        before_entry = resolver.resolve("2026-09-21T22:01:00Z")
+        after_entry = resolver.resolve("2026-09-21T22:06:00Z")
+        self.assertIs(before_entry.context, after_entry.context)
+        self.assertFalse(before_entry.entry_authorized)
+        self.assertTrue(after_entry.entry_authorized)
+
     def test_asia_and_new_york_boundaries_use_america_new_york(self) -> None:
         cases = (
             ("2026-08-24T22:00:00Z", PaperSessionKind.ASIA, "2026-08-25", False),  # Sunday 18:00 warmup

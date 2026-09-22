@@ -15,6 +15,7 @@ from src.l3f_provider.ninjatrader_observation import (
     LoopbackNinjaTraderBridge,
     NinjaTraderContract,
     NinjaTraderMarketDataAdapter,
+    NinjaTraderObservation,
     NinjaTraderObservationError,
     expected_observer_source_fingerprint,
 )
@@ -54,6 +55,19 @@ def signed_record(kind="TRADE", sequence=1, payload=None):
 
 
 class ObservationAttestationTests(unittest.TestCase):
+    def test_canonical_fast_decode_still_rejects_duplicate_keys(self):
+        value = signed_record()
+        wire = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        )
+        duplicate = wire.replace(
+            '"observation_type":"TRADE"',
+            '"observation_type":"QUOTE","observation_type":"TRADE"',
+            1,
+        )
+        with self.assertRaises(NinjaTraderObservationError):
+            NinjaTraderObservation.from_wire(duplicate)
+
     def test_bridge_verifies_source_build_payload_and_signature(self):
         bridge = LoopbackNinjaTraderBridge(attestation_key=ROOT_KEY, require_attestation=True)
         admitted = bridge.accept_observation((json.dumps(signed_record()) + "\n").encode())

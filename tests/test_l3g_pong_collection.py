@@ -89,6 +89,15 @@ class PongAuthenticHourCollectorTests(unittest.TestCase):
             self.assertEqual(row["previous_record_hash"], "0" * 64)
             self.assertEqual(digest, canonical_hash(row))
             self.assertEqual(collector._journal_tip, digest)
+            self.assertEqual(
+                line.rstrip(b"\n"),
+                json.dumps(
+                    {**row, "record_hash": digest},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ).encode("utf-8"),
+            )
 
     def test_test_only_generation_change_invalidates_without_fake_sequence_inversion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

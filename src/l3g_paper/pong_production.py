@@ -1687,9 +1687,15 @@ class PongProductionHost:
         if raw_side not in {"BID", "ASK"}:
             raise ValueError("PONG_CANONICAL_DEPTH_MUTATION_SIDE_INVALID")
         side = BookSide(raw_side)
-        levels = payload.get("bids" if side is BookSide.BID else "asks")
-        if not isinstance(levels, list) or not levels:
+        raw_levels = payload.get("bids" if side is BookSide.BID else "asks")
+        if not isinstance(raw_levels, list) or not raw_levels:
             return
+        # Reuse the exact validated Decimal snapshot above. Re-parsing the
+        # selected side's prices and sizes here duplicated eleven Decimal
+        # conversions on every native depth callback without adding a safety
+        # check; the canonical tuple is already finite, positive, unique and
+        # correctly ordered.
+        levels = self._canonical_depth[side]
         # Native position-shift notifications can carry mutation_price=0
         # while the signed post-mutation book snapshot is valid. They retain
         # their stream sequence and durable collection evidence, but are not a
@@ -1715,13 +1721,13 @@ class PongProductionHost:
             payload.get("operation") or payload.get("mutation_operation") or ""
         ).upper()
         post_prices = {item[0] for item in self._canonical_depth[side]}
-        post_touch = Decimal(str(levels[0]["price"]))
+        post_touch = levels[0][0]
         if operation in {"ADD", "UPDATE"}:
             if price not in post_prices:
                 mutation_position = payload.get("mutation_position")
                 outside_retained_book = (
                     type(mutation_position) is int
-                    and mutation_position >= len(levels)
+                    and mutation_position >= len(raw_levels)
                     and (
                         (
                             side is BookSide.BID
@@ -1771,7 +1777,7 @@ class PongProductionHost:
         kind = DepthEventKind.UPDATE
         if payload.get("is_reset") is True:
             kind = DepthEventKind.RECONNECT_RESET
-        nearby = sum((Decimal(str(item["size"])) for item in levels), Decimal("0"))
+        nearby = sum((item[1] for item in levels), Decimal("0"))
         self._depth[side].append(DepthObservation(
             self._event_ref(record), self.topology.native_instrument, side, price,
             Decimal(str(payload.get("mutation_volume") or 0)), nearby, touch, kind,

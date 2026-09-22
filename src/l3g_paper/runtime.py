@@ -5217,12 +5217,15 @@ class LaneIIIPaperRuntime:
             if not self._deferred_admission_receipt_healthy_locked(receipt):
                 self._pause_for_ledger_capacity_locked(receipt)
                 return
-            before_classified = (
-                self.policy.classified_trade_count()
-                if observation.observation_type == "TRADE" else 0
-            )
-            reset_before = self.policy.reset_count()
-            reason = self.policy.ingest_pong_runtime_state(
+            (
+                reason,
+                before_classified,
+                reset_before,
+                reset_after,
+                after_classified,
+                warmed,
+                depth_recovering,
+            ) = self.policy.ingest_pong_runtime_state_with_gate(
                 observation,
                 current_position=self._position,
                 pending_order=False,
@@ -5234,6 +5237,12 @@ class LaneIIIPaperRuntime:
                 reason,
                 before_classified=before_classified,
                 reset_before=reset_before,
+                post_gate_state=(
+                    reset_after,
+                    after_classified,
+                    warmed,
+                    depth_recovering,
+                ),
             )
             if decision is not None:
                 raise RuntimeError("PONG_QUALIFYING_MARKET_FAST_PATH_CREATED_DECISION")
@@ -5249,15 +5258,19 @@ class LaneIIIPaperRuntime:
         *,
         before_classified: int,
         reset_before: int,
+        post_gate_state: tuple[int, int, bool, bool] | None = None,
     ) -> PaperDecision | None:
         """Apply the common snapshot, warmup, epoch, and Pong authority boundary."""
-        reset_after = self.policy.reset_count()
+        if post_gate_state is None:
+            reset_after = self.policy.reset_count()
+            after_classified, warmed, depth_recovering = self.policy.runtime_gate_state()
+        else:
+            reset_after, after_classified, warmed, depth_recovering = post_gate_state
         if reset_after != reset_before:
             self._reset_commissioning_warmup(
                 decision_reason or "PROVISIONAL_OBSERVATION_DOMAIN_RESET"
             )
         self._last_policy_reset_count = reset_after
-        after_classified, warmed, depth_recovering = self.policy.runtime_gate_state()
         event_at = self._market_event_timestamp(observation)
         update: dict[str, object] = {
             "observed_at": normalized_utc(event_at, "Runtime observation time")

@@ -29,6 +29,19 @@ def quote(sequence: int, observed: str = "2026-09-11T12:30:00Z"):
 
 
 class ReceiverPeriodicCorrectivePolicyTests(unittest.TestCase):
+    def test_atomic_pong_state_ingest_returns_exact_pre_post_gate_facts(self) -> None:
+        policy = pong_policy()
+        observation = quote(1)
+        result = policy.ingest_pong_runtime_state_with_gate(observation)
+        reason, before, reset_before, reset_after, after, warmed, recovering = result
+        self.assertEqual(
+            reason,
+            pong_policy().ingest_pong_runtime_state(observation),
+        )
+        self.assertEqual((before, after), (0, 0))
+        self.assertEqual(reset_before, reset_after)
+        self.assertEqual((after, warmed, recovering), policy.runtime_gate_state())
+
     def test_state_only_ingest_reuses_exact_continuity_and_suppression_state(self) -> None:
         ordinary = pong_policy()
         state_only = pong_policy()

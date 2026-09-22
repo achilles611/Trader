@@ -101,10 +101,25 @@ def _freeze_json(value: object) -> object:
     kind = type(value)
     if kind is _FrozenJsonDict or kind is _FrozenJsonList:
         return value
+    if kind is dict:
+        return _FrozenJsonDict({
+            key: _freeze_json(item) for key, item in value.items()
+        })
+    if kind is list:
+        return _FrozenJsonList([_freeze_json(item) for item in value])
+    if kind is tuple:
+        return tuple(_freeze_json(item) for item in value)
+    # JSON scalars dominate signed depth snapshots. Avoid three abstract-type
+    # checks for every already-immutable price, size, flag and string while
+    # retaining the prior fallback for caller-supplied container subclasses.
+    if kind in {str, int, float, bool, type(None)}:
+        return value
     if isinstance(value, dict):
-        return _FrozenJsonDict((key, _freeze_json(item)) for key, item in value.items())
+        return _FrozenJsonDict({
+            key: _freeze_json(item) for key, item in value.items()
+        })
     if isinstance(value, list):
-        return _FrozenJsonList(_freeze_json(item) for item in value)
+        return _FrozenJsonList([_freeze_json(item) for item in value])
     if isinstance(value, tuple):
         return tuple(_freeze_json(item) for item in value)
     return value
@@ -230,7 +245,13 @@ def _contains_prohibited_identity(value: object) -> bool:
         current = pending.pop()
         if type(current) is dict:
             for key, item in current.items():
-                if _prohibited_identity_key(key):
+                if (
+                    key in _PROHIBITED_IDENTITY_KEYS
+                    or (
+                        ("-" in key or not key.islower())
+                        and _prohibited_identity_key(key)
+                    )
+                ):
                     return True
                 if type(item) is dict or type(item) is list:
                     pending.append(item)
@@ -443,7 +464,7 @@ class NinjaTraderObservation:
     @classmethod
     def from_wire(cls, text: str) -> "NinjaTraderObservation":
         try:
-            raw = json.loads(text, object_pairs_hook=_wire_json_object)
+            raw = json.loads(text)
         except (json.JSONDecodeError, ValueError):
             raise NinjaTraderObservationError(ProviderErrorCode.MALFORMED_PROVIDER_PAYLOAD, "bridge_json") from None
         value = _mapping(raw, "bridge_record")
@@ -458,7 +479,7 @@ class NinjaTraderObservation:
         aliases = value.get("account")
         account = _mapping(aliases, "account") if aliases is not None else None
         try:
-            return cls(
+            observation = cls(
                 observation_id=str(value["observation_id"]), session_id=str(value["session_id"]),
                 observation_type=str(value["observation_type"]), ninja_receipt_time=str(value["ninja_receipt_time"]),
                 local_monotonic_sequence=_wire_integer(value["local_monotonic_sequence"], "Local ordering sequence"), payload=_mapping(value["payload"], "payload"),
@@ -474,6 +495,27 @@ class NinjaTraderObservation:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise NinjaTraderObservationError(ProviderErrorCode.MALFORMED_PROVIDER_PAYLOAD, "bridge_record_fields") from exc
+        # Native L3F3 frames are emitted in this exact canonical form. Exact
+        # byte equality proves that the decoded object had no duplicate keys:
+        # reconstruction from a mapping emits every key once. It also lets the
+        # later HMAC and all sinks reuse the canonical bytes already built.
+        # Non-canonical/legacy input retains the prior strict duplicate-key
+        # parser, so compatibility never weakens the fail-closed boundary.
+        raw_wire = (
+            text.strip().encode("utf-8")
+            if isinstance(text, str)
+            else bytes(text).strip()
+        )
+        if schema == L3F3_SCHEMA and raw_wire == observation.signed_wire_bytes():
+            return observation
+        try:
+            json.loads(text, object_pairs_hook=_wire_json_object)
+        except (json.JSONDecodeError, ValueError):
+            raise NinjaTraderObservationError(
+                ProviderErrorCode.MALFORMED_PROVIDER_PAYLOAD,
+                "bridge_json",
+            ) from None
+        return observation
 
     def wire_hash(self) -> str:
         cached = self._cached_wire_hash
