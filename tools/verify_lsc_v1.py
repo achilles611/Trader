@@ -892,7 +892,26 @@ def compare_corpora(legacy_path: Path, lsc_path: Path) -> dict[str, object]:
                 break
             matched += 1
         if mismatch is None:
-            mismatch = _first_mismatch(dict(legacy_meta), dict(lsc_meta), "$.proof")
+            missing_legacy = [key for key in PROOF_FIELDS if key not in legacy_meta]
+            missing_lsc = [key for key in PROOF_FIELDS if key not in lsc_meta]
+            if missing_legacy or missing_lsc:
+                mismatch = {
+                    "path": "$.proof",
+                    "reason": "MISSING_PROOF_FIELDS",
+                    "legacy_missing": missing_legacy,
+                    "lsc_missing": missing_lsc,
+                }
+            else:
+                mismatch = _first_mismatch(dict(legacy_meta), dict(lsc_meta), "$.proof")
+    proof_complete = all(
+        key in legacy_meta and key in lsc_meta for key in PROOF_FIELDS
+    )
+    proof_matches = proof_complete and (
+        _first_mismatch(dict(legacy_meta), dict(lsc_meta), "$.proof") is None
+    )
+    event_parity_passed = (
+        len(legacy_rows) == len(lsc_rows) and matched == len(legacy_rows)
+    )
     passed = mismatch is None
     return {
         "schema": "beelzebub-lsc-parity-report-v1",
@@ -904,9 +923,9 @@ def compare_corpora(legacy_path: Path, lsc_path: Path) -> dict[str, object]:
         "matched_event_count": matched,
         "checks": {
             "count": len(legacy_rows) == len(lsc_rows),
-            "order_sequences_payload_types_hashes_timestamps_provenance": passed,
-            "depth_book_checkpoints": passed,
-            "optional_evidence_decision_final_replay": _first_mismatch(dict(legacy_meta), dict(lsc_meta), "$.proof") is None,
+            "order_sequences_payload_types_hashes_timestamps_provenance": event_parity_passed,
+            "depth_book_checkpoints": event_parity_passed,
+            "evidence_decision_final_replay_complete_and_equal": proof_matches,
         },
         "first_mismatch": mismatch,
     }

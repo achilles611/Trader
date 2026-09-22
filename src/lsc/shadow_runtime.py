@@ -67,6 +67,52 @@ def _canonical_json(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def _process_liveness(process_id: int) -> bool | None:
+    """Return True/False only when process liveness is safely knowable."""
+    if type(process_id) is not int or process_id <= 0:
+        return None
+    if os.name == "nt":
+        import ctypes
+
+        process_synchronize = 0x00100000
+        wait_object_0 = 0x00000000
+        wait_timeout = 0x00000102
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        open_process.restype = ctypes.c_void_p
+        wait_for_single_object = kernel32.WaitForSingleObject
+        wait_for_single_object.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        wait_for_single_object.restype = ctypes.c_uint32
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [ctypes.c_void_p]
+        close_handle.restype = ctypes.c_int
+        handle = open_process(process_synchronize, False, process_id)
+        if not handle:
+            # ERROR_INVALID_PARAMETER is the documented result for a process
+            # identifier that does not exist. Access denied and every other
+            # result remain UNKNOWN and therefore fail closed.
+            return False if ctypes.get_last_error() == 87 else None
+        try:
+            state = wait_for_single_object(handle, 0)
+            if state == wait_timeout:
+                return True
+            if state == wait_object_0:
+                return False
+            return None
+        finally:
+            close_handle(handle)
+    try:
+        os.kill(process_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
 @dataclass(frozen=True)
 class LSCShadowConfig:
     root: Path
@@ -166,6 +212,7 @@ class LSCShadowRuntime:
             "profile_id": self.config.profile_id,
             "native_contract_id": self.config.native_contract_id,
             "canonical_contract_id": self.config.canonical_contract_id,
+            "tick_size": self.config.tick_size,
         }
         payload = _canonical_json(value) + b"\n"
         with destination.open("xb") as handle:
@@ -211,6 +258,139 @@ class LSCShadowRuntime:
             raise LSCShadowRuntimeError("LSC_SHADOW_ACTIVE_MARKER_ARCHIVE_COLLISION")
         os.replace(self._active_run_path, archived)
         self._completion_receipt = destination
+
+    @classmethod
+    def recover_unclean(cls, config: LSCShadowConfig) -> dict[str, object]:
+        """Preserve an unclean run as failed and recover its sealed prefix.
+
+        This is an explicit administrative transition, never an automatic
+        success path.  The recovered prefix is verified and any sealed but
+        uncommitted segment is committed.  The prior active latch and a
+        durable recovery receipt remain immutable evidence; the receipt keeps
+        ``proof_valid`` false because an in-memory tail may have been lost.
+        A new runtime instance may start only after this method succeeds.
+        """
+        runtime = cls(config)
+        active = runtime._active_run_path
+        if not active.is_file():
+            raise LSCShadowRuntimeError("LSC_SHADOW_UNCLEAN_RUN_MARKER_NOT_FOUND")
+        marker_bytes = active.read_bytes()
+        try:
+            marker = json.loads(marker_bytes)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise LSCShadowRuntimeError("LSC_SHADOW_ACTIVE_RUN_MARKER_INVALID") from exc
+        expected = {
+            "schema": _RUN_STATE_SCHEMA,
+            "state": "ACTIVE",
+            "root": str(config.root.resolve()),
+            "journal_id": config.journal_id,
+            "profile_id": config.profile_id,
+            "native_contract_id": config.native_contract_id,
+            "canonical_contract_id": config.canonical_contract_id,
+            "tick_size": config.tick_size,
+        }
+        if not isinstance(marker, dict) or any(marker.get(key) != value for key, value in expected.items()):
+            raise LSCShadowRuntimeError("LSC_SHADOW_ACTIVE_RUN_IDENTITY_MISMATCH")
+        marker_pid = marker.get("pid")
+        liveness = _process_liveness(marker_pid)  # type: ignore[arg-type]
+        if liveness is True:
+            raise LSCShadowRuntimeError("LSC_SHADOW_ACTIVE_WRITER_PROCESS_ALIVE")
+        if liveness is None:
+            raise LSCShadowRuntimeError("LSC_SHADOW_ACTIVE_WRITER_PROCESS_STATE_UNKNOWN")
+
+        store = SegmentStore(
+            config.root,
+            limits=config.segment_limits,
+            wall_clock=runtime._wall_clock,
+            monotonic=runtime._monotonic,
+        )
+        runtime._store = store
+        store_recovery = store.recover()
+        chain = store.verify_chain()
+        committed_before = 0
+        recovered_commitments: list[str] = []
+        commitment_head = None
+        if chain:
+            context_bytes = store.read_context(chain[0].segment_id)
+            context = decode_context(context_bytes)
+            if any(item.context_digest != chain[0].context_digest for item in chain):
+                raise LSCShadowRuntimeError("LSC_SHADOW_MULTIPLE_CONTEXTS_REFUSED")
+            runtime._bind_context(context, context_bytes)
+            assert runtime._commitments is not None
+            commitment_recovery = runtime._commitments.recover()
+            committed_before = len(commitment_recovery.committed_segment_ids)
+            for segment_id in commitment_recovery.uncommitted_segment_ids:
+                runtime._commitments.commit_segment(segment_id)
+                recovered_commitments.append(segment_id)
+            verified_commitments = runtime._commitments.verify()
+            if len(verified_commitments) != len(chain):
+                raise LSCShadowRuntimeError("LSC_SHADOW_RECOVERY_COMMITMENT_COUNT_MISMATCH")
+            if verified_commitments:
+                commitment_head = {
+                    "journal_hash": verified_commitments[-1].journal_hash,
+                    "journal_sequence": verified_commitments[-1].journal_sequence,
+                    "identity_digest": verified_commitments[-1].identity_digest,
+                    "segment_id": verified_commitments[-1].segment_id,
+                }
+
+        marker_digest = hashlib.sha256(marker_bytes).hexdigest()
+        receipt = {
+            "schema": _RUN_STATE_SCHEMA,
+            "state": "RECOVERED_UNCLEAN_AS_FAILED",
+            "recorded_at": runtime._wall_clock(),
+            "proof_valid": False,
+            "failure_reason": "LSC_SHADOW_UNCLEAN_PREVIOUS_RUN",
+            "possible_unsealed_tail_loss": True,
+            "active_marker_sha256": marker_digest,
+            "prior_process_id": marker_pid,
+            "prior_process_confirmed_absent": True,
+            "root": str(config.root.resolve()),
+            "journal_id": config.journal_id,
+            "profile_id": config.profile_id,
+            "native_contract_id": config.native_contract_id,
+            "canonical_contract_id": config.canonical_contract_id,
+            "tick_size": config.tick_size,
+            "sealed_segments": len(chain),
+            "committed_segments_before": committed_before,
+            "recovered_commitment_segment_ids": recovered_commitments,
+            "committed_segments_after": len(chain),
+            "quarantined_temporaries": [
+                {
+                    "source_name": item.source_name,
+                    "quarantine_path": str(item.quarantine_path),
+                    "sha256": item.sha256,
+                    "reason": item.reason,
+                }
+                for item in store_recovery.quarantined
+            ],
+            "segment_head": None if not chain else {
+                "segment_id": chain[-1].segment_id,
+                "segment_commitment": chain[-1].segment_commitment,
+                "ordinal": chain[-1].ordinal,
+            },
+            "commitment_head": commitment_head,
+        }
+        recovery_root = active.parent / "unclean-recovery"
+        recovery_root.mkdir(parents=True, exist_ok=True)
+        destination = recovery_root / f"{marker_digest}.json"
+        payload = _canonical_json(receipt) + b"\n"
+        if destination.exists():
+            existing = json.loads(destination.read_text(encoding="utf-8"))
+            if not isinstance(existing, dict) or existing.get("active_marker_sha256") != marker_digest:
+                raise LSCShadowRuntimeError("LSC_SHADOW_UNCLEAN_RECOVERY_RECEIPT_COLLISION")
+            receipt = existing
+        else:
+            with destination.open("xb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        failed_root = active.parent / "failed-active"
+        failed_root.mkdir(parents=True, exist_ok=True)
+        archived = failed_root / f"{marker_digest}.json"
+        if archived.exists():
+            raise LSCShadowRuntimeError("LSC_SHADOW_FAILED_ACTIVE_MARKER_COLLISION")
+        os.replace(active, archived)
+        return {**receipt, "recovery_receipt": str(destination), "archived_active_marker": str(archived)}
 
     def start(self) -> dict[str, object]:
         with self._state_lock:
@@ -463,6 +643,9 @@ class LSCShadowRuntime:
                 try:
                     item = self._queue.get(timeout=0.05)
                 except queue.Empty:
+                    if self._failure_reason is not None:
+                        self._write_failure_receipt()
+                        return
                     if self._closing and self._queue.empty():
                         self._rotate()
                         return

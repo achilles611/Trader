@@ -256,6 +256,41 @@ class IndependentVerifierTests(unittest.TestCase):
             legacy_path.unlink(missing_ok=True)
             lsc_path.unlink(missing_ok=True)
 
+    def test_observation_only_parity_cannot_satisfy_full_proof_gate(self):
+        value = golden_data()
+        context_hex = value["context"]["context_hex"]
+        record_hex = value["records"]["quote"]["record_hex"]
+        verified = verify_record(bytes.fromhex(record_hex), bytes.fromhex(context_hex))
+        legacy_path = Path(self._testMethodName + "-legacy.json")
+        lsc_path = Path(self._testMethodName + "-lsc.json")
+        try:
+            legacy_path.write_text(
+                json.dumps({"events": [legacy_row(verified)]}), encoding="utf-8",
+            )
+            lsc_path.write_text(
+                json.dumps({
+                    "events": [{"context_hex": context_hex, "record_hex": record_hex}],
+                }),
+                encoding="utf-8",
+            )
+            report = compare_corpora(legacy_path, lsc_path)
+            self.assertEqual(report["result"], "FAIL")
+            self.assertEqual(report["matched_event_count"], 1)
+            self.assertEqual(report["first_mismatch"]["path"], "$.proof")
+            self.assertEqual(report["first_mismatch"]["reason"], "MISSING_PROOF_FIELDS")
+            self.assertTrue(
+                report["checks"][
+                    "order_sequences_payload_types_hashes_timestamps_provenance"
+                ]
+            )
+            self.assertTrue(report["checks"]["depth_book_checkpoints"])
+            self.assertFalse(
+                report["checks"]["evidence_decision_final_replay_complete_and_equal"]
+            )
+        finally:
+            legacy_path.unlink(missing_ok=True)
+            lsc_path.unlink(missing_ok=True)
+
     def test_benchmark_accepts_only_three_sustained_and_three_burst_clean_runs(self):
         report = evaluate_receipt(passing_receipt())
         self.assertTrue(report["accepted"])

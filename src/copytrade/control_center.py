@@ -334,10 +334,10 @@ def _offer_lsc_shadow(
     try:
         runtime.submit(observation)  # type: ignore[arg-type]
     except Exception as error:
+        # The admitted listener path must remain memory-only even when the
+        # adapter itself misbehaves. The worker observes this latch and owns
+        # durable failure-receipt I/O.
         runtime.record_callback_failure(error)
-        NINJATRADER_RUNTIME_LOGGER.exception(
-            "LSC shadow callback failed; authority dispatch remains independent."
-        )
 LEDGER_VERIFICATION_FRESHNESS_SECONDS = 15 * 60
 MARKET_OBSERVER_ACTIVE_FRESHNESS_SECONDS = 15.0
 LEDGER_VERIFIER_SHUTDOWN_WAIT_SECONDS = 30.0

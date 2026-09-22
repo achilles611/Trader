@@ -6,6 +6,7 @@ import inspect
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -13,7 +14,11 @@ from unittest.mock import patch
 from fastapi import HTTPException
 from starlette.requests import Request
 
-from src.copytrade.control_center import UnsafePaperExecutionShutdown, create_control_center_app
+from src.copytrade.control_center import (
+    UnsafePaperExecutionShutdown,
+    _offer_lsc_shadow,
+    create_control_center_app,
+)
 from src.copytrade.config import CopyTradeConfig
 from src.l3g_paper.ledger import PaperLedger
 from src.l3g_paper.ninjatrader_transport import PaperExecutionTransport
@@ -23,6 +28,29 @@ from tests.lsc.test_codec import observation
 
 
 class PaperControlCenterTests(unittest.TestCase):
+    def test_lsc_callback_exception_only_latches_worker_owned_failure(self) -> None:
+        with TemporaryDirectory() as folder:
+            runtime = LSCShadowRuntime(LSCShadowConfig(
+                root=Path(folder) / "lsc",
+                journal_id="test-callback-failure",
+                profile_id="beelzebub_pong_discernment_v1",
+                native_contract_id="MNQ DEC26",
+                canonical_contract_id="MNQZ6",
+            ))
+            runtime.start()
+
+            def broken_submit(_: object) -> bool:
+                raise RuntimeError("TEST_CALLBACK_FAILURE")
+
+            runtime.submit = broken_submit  # type: ignore[method-assign]
+            started = time.perf_counter()
+            _offer_lsc_shadow(observation("QUOTE", 1), runtime)
+            self.assertLess(time.perf_counter() - started, 0.05)
+            status = runtime.close()
+            self.assertFalse(status["proof_valid"])
+            self.assertEqual(status["failure_reason"], "LSC_SHADOW_CALLBACK_FAILED")
+            self.assertTrue(Path(str(status["failure_receipt"])).is_file())
+
     def test_lsc_shadow_is_default_off_and_selected_lifecycle_is_authority_independent(self) -> None:
         events: list[str] = []
         listener_instances: list[object] = []

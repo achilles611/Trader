@@ -7,15 +7,16 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
-from src.lsc.codec import decode_observation
+from src.lsc.codec import decode_observation, encode_context, encode_observation
 from src.lsc.segment_store import SegmentLimits, SegmentStore
 from src.lsc.shadow_runtime import (
     LSCShadowConfig,
     LSCShadowRuntime,
     LSCShadowRuntimeError,
 )
-from tests.lsc.test_codec import CANONICAL_CONTRACT, _payload, observation
+from tests.lsc.test_codec import CANONICAL_CONTRACT, _payload, context, observation
 
 
 class LSCShadowRuntimeTests(unittest.TestCase):
@@ -103,6 +104,62 @@ class LSCShadowRuntimeTests(unittest.TestCase):
             ):
                 runtime.start()
             self.assertTrue(marker.exists())
+
+    def test_supported_unclean_recovery_preserves_failed_run_and_commits_sealed_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self._config(root)
+            interrupted = LSCShadowRuntime(config)
+            interrupted._started_at = "2026-09-23T00:00:00.000000Z"
+            root.mkdir(parents=True, exist_ok=True)
+            interrupted._write_active_run_marker()
+            source = observation("QUOTE", 1)
+            source_context = context(source)
+            context_bytes = encode_context(source_context)
+            store = SegmentStore(root, limits=config.segment_limits)
+            builder = store.new_segment(context_bytes)
+            builder.append(encode_observation(source, context_bytes))
+            sealed = builder.seal()
+            self.assertFalse((root / "shadow-commitments").exists())
+
+            with patch("src.lsc.shadow_runtime._process_liveness", return_value=False):
+                recovery = LSCShadowRuntime.recover_unclean(config)
+
+            self.assertFalse(recovery["proof_valid"])
+            self.assertTrue(recovery["possible_unsealed_tail_loss"])
+            self.assertEqual(recovery["sealed_segments"], 1)
+            self.assertEqual(recovery["committed_segments_before"], 0)
+            self.assertEqual(recovery["recovered_commitment_segment_ids"], [sealed.segment_id])
+            self.assertEqual(recovery["committed_segments_after"], 1)
+            self.assertFalse((root / "runtime-state" / "active.json").exists())
+            self.assertTrue(Path(str(recovery["recovery_receipt"])).is_file())
+            self.assertTrue(Path(str(recovery["archived_active_marker"])).is_file())
+
+            continued = LSCShadowRuntime(config)
+            self.assertEqual(continued.start()["recovered_segments"], 1)
+            self.assertTrue(continued.submit(observation("TRADE", 2)))
+            status = continued.close()
+            self.assertTrue(status["proof_valid"])
+            self.assertEqual(status["last_local_sequence"], 2)
+
+    def test_unclean_recovery_refuses_live_writer_process_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self._config(root)
+            runtime = LSCShadowRuntime(config)
+            runtime._started_at = "2026-09-23T00:00:00.000000Z"
+            root.mkdir(parents=True, exist_ok=True)
+            runtime._write_active_run_marker()
+            marker = root / "runtime-state" / "active.json"
+            before = marker.read_bytes()
+
+            with self.assertRaisesRegex(
+                LSCShadowRuntimeError, "LSC_SHADOW_ACTIVE_WRITER_PROCESS_ALIVE",
+            ):
+                LSCShadowRuntime.recover_unclean(config)
+
+            self.assertEqual(marker.read_bytes(), before)
+            self.assertFalse((root / "runtime-state" / "unclean-recovery").exists())
 
     def test_queue_overflow_latches_without_blocking_submitter(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
