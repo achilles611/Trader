@@ -167,10 +167,26 @@ class NinjaTraderHealthTracker:
         self._times: dict[NinjaTraderHealthStream, str | None] = {stream: None for stream in NinjaTraderHealthStream}
 
     def mark(self, stream: NinjaTraderHealthStream, state: StreamHealth, at: str) -> NinjaTraderProviderHealth:
-        if type(stream) is not NinjaTraderHealthStream or type(state) is not StreamHealth:
-            raise ValueError("NinjaTrader health state must be explicit.")
-        self._states[stream], self._times[stream] = state, normalized_utc(at, "NinjaTrader health time")
+        return self.mark_many(((stream, state),), at)
+
+    def mark_many(
+        self,
+        updates: Iterable[tuple[NinjaTraderHealthStream, StreamHealth]],
+        at: str,
+    ) -> NinjaTraderProviderHealth:
+        batch = tuple(updates)
+        for stream, state in batch:
+            if type(stream) is not NinjaTraderHealthStream or type(state) is not StreamHealth:
+                raise ValueError("NinjaTrader health state must be explicit.")
+        normalized_at = normalized_utc(at, "NinjaTrader health time")
+        for stream, state in batch:
+            self._states[stream], self._times[stream] = state, normalized_at
         return self.snapshot()
+
+    def state(self, stream: NinjaTraderHealthStream) -> StreamHealth:
+        if type(stream) is not NinjaTraderHealthStream:
+            raise ValueError("NinjaTrader health state must be explicit.")
+        return self._states[stream]
 
     def assess_stale(self, at: str, maximum_age: timedelta) -> NinjaTraderProviderHealth:
         now = datetime.fromisoformat(normalized_utc(at, "NinjaTrader health check").replace("Z", "+00:00"))

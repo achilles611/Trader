@@ -20,7 +20,7 @@ from typing import Callable, Iterable, Mapping
 from .ninjatrader_observation import (
     AccountClass, LOOPBACK_HOST, LoopbackBridgeConfig, LoopbackNinjaTraderBridge,
     NinjaTraderHealthStream, NinjaTraderHealthTracker, NinjaTraderObservation,
-    NinjaTraderObservationError,
+    NinjaTraderObservationError, NinjaTraderProviderHealth,
 )
 from .tradovate_observation import StreamHealth
 
@@ -338,7 +338,9 @@ class CommissioningSummary:
         self.error_details[detail] = self.error_details.get(detail, 0) + 1
 
     def set_health(self, tracker: NinjaTraderHealthTracker) -> None:
-        snapshot = tracker.snapshot()
+        self.set_health_snapshot(tracker.snapshot())
+
+    def set_health_snapshot(self, snapshot: NinjaTraderProviderHealth) -> None:
         self.health = {
             stream.value: snapshot.streams[stream].value
             for stream in NinjaTraderHealthStream
@@ -476,9 +478,9 @@ class NinjaTraderCommissioningHarness:
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     def _mark(self, stream: NinjaTraderHealthStream, state: StreamHealth, at: str | None = None) -> None:
-        prior = self.health.snapshot().streams[stream]
-        self.health.mark(stream, state, at or self._now())
-        self.summary.set_health(self.health)
+        prior = self.health.state(stream)
+        snapshot = self.health.mark(stream, state, at or self._now())
+        self.summary.set_health_snapshot(snapshot)
         if (
             stream is NinjaTraderHealthStream.LOCAL_BRIDGE
             and prior is not state
@@ -495,29 +497,33 @@ class NinjaTraderCommissioningHarness:
         at = observation.ninja_receipt_time
         # A decoded observation proves only the stream that carried it. These
         # independent marks deliberately do not infer account truth from MNQ.
-        self._mark(NinjaTraderHealthStream.NINJATRADER_PROCESS, StreamHealth.HEALTHY, at)
+        updates = [
+            (NinjaTraderHealthStream.NINJATRADER_PROCESS, StreamHealth.HEALTHY),
+        ]
         if observation.observation_type in {"TRADE", "QUOTE"}:
-            self._mark(NinjaTraderHealthStream.MARKET_DATA_STREAM, StreamHealth.HEALTHY, at)
+            updates.append((NinjaTraderHealthStream.MARKET_DATA_STREAM, StreamHealth.HEALTHY))
         elif observation.observation_type == "DEPTH":
-            self._mark(NinjaTraderHealthStream.DEPTH_STREAM, StreamHealth.HEALTHY, at)
+            updates.append((NinjaTraderHealthStream.DEPTH_STREAM, StreamHealth.HEALTHY))
         elif observation.observation_type == "ACCOUNT":
-            self._mark(NinjaTraderHealthStream.ACCOUNT_STREAM, StreamHealth.HEALTHY, at)
+            updates.append((NinjaTraderHealthStream.ACCOUNT_STREAM, StreamHealth.HEALTHY))
         elif observation.observation_type == "POSITION":
-            self._mark(NinjaTraderHealthStream.POSITION_STREAM, StreamHealth.HEALTHY, at)
+            updates.append((NinjaTraderHealthStream.POSITION_STREAM, StreamHealth.HEALTHY))
         elif observation.observation_type == "ORDER":
-            self._mark(NinjaTraderHealthStream.ORDER_STREAM, StreamHealth.HEALTHY, at)
+            updates.append((NinjaTraderHealthStream.ORDER_STREAM, StreamHealth.HEALTHY))
         elif observation.observation_type == "SNAPSHOT_COMPLETE":
             scope = observation.payload.get("scope")
             if scope == "POSITION":
-                self._mark(NinjaTraderHealthStream.POSITION_STREAM, StreamHealth.HEALTHY, at)
+                updates.append((NinjaTraderHealthStream.POSITION_STREAM, StreamHealth.HEALTHY))
             elif scope == "ORDER":
-                self._mark(NinjaTraderHealthStream.ORDER_STREAM, StreamHealth.HEALTHY, at)
+                updates.append((NinjaTraderHealthStream.ORDER_STREAM, StreamHealth.HEALTHY))
         elif (
             observation.observation_type == "CONNECTION"
             and observation.account_alias == "Lucid25kflex01"
             and observation.payload.get("state") == "ACCOUNT_BOUND"
         ):
-            self._mark(NinjaTraderHealthStream.LUCID_CONNECTION, StreamHealth.HEALTHY, at)
+            updates.append((NinjaTraderHealthStream.LUCID_CONNECTION, StreamHealth.HEALTHY))
+        snapshot = self.health.mark_many(updates, at)
+        self.summary.set_health_snapshot(snapshot)
 
     def ingest(self, frames: Iterable[bytes], *, source_connection: object | None = None) -> CommissioningSummary:
         self.summary.listener_ready = True
