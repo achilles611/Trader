@@ -90,9 +90,18 @@ class NetworkBoundary:
         elif event == "urllib.Request":
             self.authorize_request(args[0], args[3], args[2])
         elif event == "subprocess.Popen":
-            argv = args[1]
+            if self.role != "worker" or not self.helper_path or len(args) != 4:
+                self.deny("UNBOUND_CHILD")
+            executable, argv, cwd, env = args
             expected = [sys.executable, "-I", "-S", "-B", self.helper_path, "net"]
-            if self.role != "worker" or list(argv) != expected:
+            # CPython audits the serialized command line on Windows, but the
+            # argument sequence on POSIX. Match its exact representation; do
+            # not parse or accept alternative quoting or execution overrides.
+            if os.name == "nt":
+                bound_command = executable is None and argv == subprocess.list2cmdline(expected)
+            else:
+                bound_command = executable == sys.executable and isinstance(argv, (list, tuple)) and list(argv) == expected
+            if not bound_command or cwd is not None or env is not None:
                 self.deny("UNBOUND_CHILD")
             self.counters["owned_http_helper_starts"] += 1
         elif event in ("os.system", "os.posix_spawn", "os.spawn"):

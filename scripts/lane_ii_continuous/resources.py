@@ -43,7 +43,13 @@ def storage_required(remaining_seconds, limits=DEFAULT_LIMITS, observed_ingest_r
 
 def sample(runtime_root, *, cpu_interval=None, include_owned=True):
     import psutil
-    system = os.environ.get("SystemDrive",Path.home().anchor) + ("\\" if os.name == "nt" else "")
+    if os.name == 'nt':
+        drive = os.environ.get('SystemDrive')
+        system = Path(drive + '\\' if drive else os.environ.get('SystemRoot', '')).anchor
+        if not system or not Path(system).drive:
+            raise ValueError('WINDOWS_SYSTEM_VOLUME_UNRESOLVED')
+    else:
+        system = '/'
     proc = psutil.Process()
     processes = [proc]
     if include_owned:

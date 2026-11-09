@@ -311,15 +311,16 @@ def analyze_closeout(evidence, output_dir):
     """Publish a bounded descriptive closeout from hash-bound local artifacts.
 
     ``artifacts`` accepts terminal_receipt (raw worker receipt), raw_audit
-    (LANE_II_READONLY_CAPTURE_AUDIT_V1), and accounting (retained CLOSEOUT.json).
+    (LANE_II_READONLY_CAPTURE_AUDIT_V1), accounting (retained CLOSEOUT.json), and
+    optional verified prospective replay.
     Missing artifacts remain explicit holds. Present artifacts must match their
-    exact hashes; at most three 4 MiB documents and 512 alternatives are read.
+    exact hashes; at most four 4 MiB documents and 512 alternatives are read.
     No ledger/tape scan, replay, process, account, or network action occurs.
     """
     from .reports import closeout_summary, render_closeout
 
     supplied = evidence.get("artifacts", {})
-    if not isinstance(supplied, dict) or set(supplied) - {"terminal_receipt", "raw_audit", "accounting"}:
+    if not isinstance(supplied, dict) or set(supplied) - {"terminal_receipt", "raw_audit", "accounting", "prospective_replay"}:
         raise ValueError("EXACT_CLOSEOUT_ARTIFACT_ROLES_REQUIRED")
     documents, bindings, holds, rejected = {}, {}, [], []
     for role in ("terminal_receipt", "raw_audit", "accounting"):
@@ -327,6 +328,8 @@ def analyze_closeout(evidence, output_dir):
             holds.append("MISSING_" + role.upper())
             continue
         documents[role], bindings[role] = _bound_document(supplied[role])
+    if supplied.get('prospective_replay'):
+        documents['prospective_replay'], bindings['prospective_replay'] = _bound_document(supplied['prospective_replay'])
     output = Path(output_dir).resolve()
     receipt, audit, accounting = (documents.get(key, {}) for key in ("terminal_receipt", "raw_audit", "accounting"))
     protected = []
@@ -419,6 +422,18 @@ def analyze_closeout(evidence, output_dir):
             accounts.append(account)
     if not components:
         holds.append("NO_BOUND_COMPONENT_ACCOUNTING")
+    replay_verified = False
+    if 'prospective_replay' in documents:
+        from .qualification import prospective_replay_pass
+        replay = documents['prospective_replay']
+        replay_verified = (audit_pass and 'study' in components and prospective_replay_pass(replay)
+                           and assess_replay_results(replay)['all_requested_parity_passed']
+                           and replay['source_events_sha256'] == receipt['events_sha256']
+                           and replay['source_state'] == receipt['state'])
+        if replay_verified:
+            components['study']['closure']['replay'] = 'PASS_PROSPECTIVE_CAUSAL_PARITY'
+        else:
+            rejected.append('PROSPECTIVE_REPLAY_BINDING_OR_PARITY_FAILED')
     pending = {key: {"status": "PENDING", "reason": reason} for key, reason in {
         "cost_and_latency_stress": "EXECUTABLE_DEPTH_DELAY_AND_FEE_STRESS_NOT_SUPPLIED",
         "drawdown_and_exposure_time": "ORDERED_MARK_AND_EXPOSURE_SERIES_NOT_SUPPLIED",
@@ -427,6 +442,8 @@ def analyze_closeout(evidence, output_dir):
         "sample_power_and_duration": "STRUCTURED_VERIFIED_DISCOVERY_POWER_RESULT_NOT_SUPPLIED",
         "untouched_confirmation": "PREREGISTERED_UNUSED_CONFIRMATION_NOT_SUPPLIED",
         "causal_replay": "SEALED_ADAPTER_PREREQUISITES_AND_FULL_PARITY_NOT_ESTABLISHED"}.items()}
+    if replay_verified:
+        del pending['causal_replay']
     holds.extend(row["reason"] for row in pending.values())
     report = closeout_summary({"schema": "LANE_II_DESCRIPTIVE_CLOSEOUT_V1",
         "evidence_as_of_utc": receipt.get("actual_end_utc"), "source_sha256": evidence.get("source_sha256"),

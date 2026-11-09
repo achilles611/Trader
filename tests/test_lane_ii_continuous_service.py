@@ -70,6 +70,21 @@ class IntegratedTests(unittest.TestCase):
         seal=next(j for j in self.queue.jobs() if j['type']=='seal');self.queue.hold_pending(seal['id'],'missing','restore')
         reconcile_terminal_jobs(self.queue,self.config)
         self.assertEqual(len([j for j in self.queue.jobs() if j['type']=='report']),2)
+    def test_completed_clock_is_not_full_until_qualified_phase_is_projected(self):
+        from scripts.lane_ii_continuous.qualification import POLICY,phase_payload,write_phase_assessment
+        self.config.update(qualification_policy=POLICY,campaign_id='fixture',
+                           candidate={'source_manifest_sha256':'b'*64},paper_risk_manifest={'sha256':'c'*64})
+        job=self.job('forward',payload=phase_payload(self.config,'short'),experiment_id='fixture',segment_id='short-001')
+        claimed=self.queue.claim(process_identity(),job_id=job['id'])
+        self.queue.publish(job['id'],claimed['fence'],self.root/'outputs',{'execution':{'reason':'DEADLINE'}})
+        self.queue.fact('latest_evidence',{'coverage':{'planned_seconds':900,'observed_seconds':900,'gap_seconds':0}},set_value=True)
+        service=Service(self.root,config=self.config)
+        self.assertEqual(service.status()['public']['coverage']['designation'],'PARTIAL_OR_UNKNOWN')
+        reference=write_phase_assessment(self.config,self.queue,'short',{'status':'QUALIFIED','holds':[],
+            'coverage':{'expected_scheduled_tick_seconds':900,'distinct_paper_scheduled_tick_seconds':900,
+                        'missing_scheduled_tick_seconds':0}})
+        self.queue.fact('qualification',{'phase_assessments':{'short':reference}},set_value=True)
+        self.assertEqual(service.status()['public']['coverage']['designation'],'FULL')
     def test_persisted_live_owner_blocks_competing_admission(self):
         busy=self.job('integrity');self.queue.claim(process_identity(),job_id=busy['id'])
         candidate=self.job('forward',payload={'seconds':10,'run_dir':str(self.root/'new')})
@@ -77,6 +92,16 @@ class IntegratedTests(unittest.TestCase):
                      'available_ram_bytes':10*2**30,'owned_rss_bytes':100*2**20,'owned_process_count':1}
         reasons=admission_reasons(candidate,self.config,[observation],{'state':'accepted'},self.queue)
         self.assertIn('PERSISTED_OWNER_NOT_PROVEN_ABSENT',reasons)
+    def test_worker_accepts_same_windows_boot_jitter_but_not_wrong_boot_or_expiry(self):
+        from scripts.lane_ii_continuous.common import fresh_coordinator_clock
+        from scripts.lane_ii_continuous.clock import assess_calibration
+        record=assess_calibration({'a':[.01]*3,'b':[.02]*3},host_epoch=1100.,monotonic=100.,boot_id=1000.)
+        self.assertTrue(fresh_coordinator_clock(record,boot_epoch=1000.000187,monotonic=120.))
+        self.assertFalse(fresh_coordinator_clock(record,boot_epoch=1003.,monotonic=120.))
+        self.assertFalse(fresh_coordinator_clock(record,boot_epoch=1000.,monotonic=700.1))
+        self.assertFalse(fresh_coordinator_clock(record,boot_epoch=1000.,monotonic=99.))
+        record['anchor']['boot_id']+=.1
+        self.assertFalse(fresh_coordinator_clock(record,boot_epoch=1000.,monotonic=120.))
     def test_owner_sensitive_facts_are_fenced(self):
         job=self.job();claim=self.queue.claim(process_identity(),job_id=job['id'])
         self.queue.fact_owned(job['id'],claim['fence'],'test',1)
@@ -97,10 +122,49 @@ class IntegratedTests(unittest.TestCase):
         with patch.dict(os.environ,{'OPENAI_API_KEY':'fixture','HTTPS_PROXY':'fixture','KALSHI_KEY':'fixture'}):
             env=worker_environment(self.root)
         for key in ('OPENAI_API_KEY','HTTPS_PROXY','KALSHI_KEY'):self.assertNotIn(key,env)
+    def test_resource_measurement_in_real_reduced_environment_worker(self):
+        script=self.root/'sample.py'
+        script.write_text("import os,sys\nsys.path.insert(0,sys.argv[1])\n"
+            "from scripts.lane_ii_continuous.resources import sample\n"
+            "assert not any(os.environ.get(k) for k in ('HOME','USERPROFILE','HOMEDRIVE','HOMEPATH'))\n"
+            "v=sample(sys.argv[2],cpu_interval=.05)\n"
+            "assert os.getpid() in {p['pid'] for p in v['owned_processes']}\n"
+            "assert v['system_free_bytes'] >= 0 and v['runtime_free_bytes'] >= 0\n"
+            "print('RESOURCE_SAMPLE_OK')\n",encoding='utf-8')
+        result=subprocess.run([sys.executable,'-I','-B',str(script),str(REPO),str(self.root)],
+            env=worker_environment(self.root),capture_output=True,timeout=10,
+            creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        self.assertEqual(result.returncode,0,result.stderr.decode(errors='replace'))
+        self.assertIn(b'RESOURCE_SAMPLE_OK',result.stdout)
+    @unittest.skipUnless(os.name=='nt','Windows Job membership')
+    def test_retained_root_exit_does_not_hide_a_different_job_member(self):
+        from scripts.lane_ii_continuous.worker import exited_owned_descendants
+        from scripts.slim_paper_operator.owned_job import OwnedJob
+        process=subprocess.Popen([sys.executable,'-I','-B','-c','import sys;sys.stdin.buffer.read(1)'],
+            stdin=subprocess.PIPE,creationflags=subprocess.CREATE_NO_WINDOW)
+        owned=OwnedJob(process)
+        try:
+            with self.assertRaisesRegex(ValueError,'ROOT_EXIT_NOT_OBSERVED'):
+                exited_owned_descendants(owned,process)
+            process.communicate(input=b'1',timeout=10)
+            self.assertEqual(exited_owned_descendants(owned,process),set())
+            other=process.pid+1
+            with patch.object(owned,'pids',return_value={process.pid,other}):
+                self.assertEqual(exited_owned_descendants(owned,process,settle_seconds=0),{other})
+        finally:
+            owned.close()
     def test_offline_subprocess_blocks_dns_before_network(self):
         script=self.root/'network.py';script.write_text('import socket\nsocket.getaddrinfo("api.openai.com",443)\n')
         result=subprocess.run([sys.executable,'-I','-B',str(REPO/'scripts/lane_ii_continuous/offline.py'),'--',str(script)],capture_output=True)
         self.assertNotEqual(result.returncode,0);self.assertIn(b'OFFLINE_REPLAY_NETWORK_OR_DESCENDANT_DENIED',result.stderr)
+    def test_in_package_offline_driver_imports_standard_queue(self):
+        offline=self.root/'offline.py'
+        offline.write_bytes((REPO/'scripts/lane_ii_continuous/offline.py').read_bytes())
+        (self.root/'queue.py').write_text("raise RuntimeError('LOCAL_QUEUE_MUST_NOT_SHADOW_STDLIB')\n",encoding='utf-8')
+        probe=self.root/'probe.py'
+        probe.write_text('import queue\nq=queue.Queue();q.put(7);assert q.get()==7\n',encoding='utf-8')
+        result=subprocess.run([sys.executable,'-I','-B',str(offline),'--',str(probe)],capture_output=True,timeout=10)
+        self.assertEqual(result.returncode,0,result.stderr.decode(errors='replace'))
     def test_application_lock_excludes_actual_second_process(self):
         script=self.root/'lock.py';script.write_text('import sys,time\nsys.path.insert(0,sys.argv[1])\nfrom scripts.lane_ii_continuous.common import application_lock\nwith application_lock(sys.argv[2]) as ok:\n print(ok,flush=True)\n time.sleep(15)\n')
         child=subprocess.Popen([sys.executable,'-I','-B',str(script),str(REPO),str(self.root/'lock')],stdout=subprocess.PIPE,

@@ -278,7 +278,7 @@ def closeout_summary(analysis):
     return {"schema": "LANE_II_DESCRIPTIVE_CLOSEOUT_V1", "evidence_as_of_utc": _iso(analysis.get("evidence_as_of_utc")),
         "source_sha256": _identity(analysis.get("source_sha256")), "config_sha256": _identity(analysis.get("config_sha256")),
         "input_bindings": [{"role": _text(row.get("role")), "sha256": _identity(row.get("sha256")), "bytes": _number(row.get("bytes"))}
-                           for row in analysis.get("input_bindings", [])[:3]],
+                           for row in analysis.get("input_bindings", [])[:4]],
         "components": components, "accounts": accounts,
         "pending_research": {key: {"status": "PENDING", "reason": _text(value.get("reason"))}
                              for key, value in analysis.get("pending_research", {}).items()
@@ -320,5 +320,5 @@ def render_closeout(analysis):
     lines.extend(f"- {key}: {value['reason']}." for key, value in report["pending_research"].items())
     lines += ["", "Evidence-package rejections: " + ("; ".join(report["rejected_reasons"]) or "None recorded.")]
     lines += ["", "Holds: " + ("; ".join(report["holds"]) or "None recorded."), "",
-              "Publication does not establish full-window completion, causal replay, a strategy edge or capital eligibility. Funded authority remains false.", ""]
+              "Full-window qualification is assessed separately from this report. Funded authority remains false.", ""]
     return "\n".join(lines)

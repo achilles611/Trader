@@ -16,7 +16,8 @@ import sys
 import threading
 import time
 
-from .common import atomic_bytes, atomic_json, application_lock, binding, digest, file_hash, process_identity, read_json, same_process, utc
+from .common import (BOOT_EPOCH_TOLERANCE_SECONDS, atomic_bytes, atomic_json, application_lock, binding, digest,
+                     file_hash, fresh_coordinator_clock, process_identity, read_json, same_process, utc)
 from .queue import Registry, TERMINAL, QueueFull, RESERVED_TYPES
 from .resources import admission, sample, Guard
 from .reports import build_status, render_latest, daily_digest, weekly_review
@@ -67,7 +68,8 @@ def reconcile_terminal_jobs(registry,config):
         pending=[j for j in registry.jobs({'queued','leased','running'}) if j['type']=='report' and j['parent_id']==job['id']]
         if not pending:
             report=enqueue(registry,config,'report',{'forward_job':job['id'],'closure_snapshot':snapshot},
-                           parent_id=job['id'],experiment_id=job['experiment_id'],priority=5,estimated_bytes=2**20)
+                           parent_id=job['id'],experiment_id=job['experiment_id'],segment_id=job['segment_id'],
+                           priority=5,estimated_bytes=2**20)
             added.append(report['id'])
     return added
 
@@ -81,10 +83,14 @@ def admission_reasons(job,config,measurements,clock,registry):
         if other['state']=='admission-held' and other['terminal_reason'] not in {'OWNERSHIP_STILL_ALIVE','OWNERSHIP_UNKNOWN'}:continue
         if same_process(other['owner']) is not False:reasons.append('PERSISTED_OWNER_NOT_PROVEN_ABSENT');break
     if job['type']=='forward':
-        gates=registry.fact('qualification') or {}
-        for key in ('engineering_reviewed','paper_scope_reviewed','replay_reproduced'):
-            if gates.get(key) is not True:reasons.append(key.upper()+'_REQUIRED')
-        if clock.get('state')!='accepted':reasons.append('CLOCK_ADMISSION_HOLD')
+        if config.get('qualification_policy'):
+            from .qualification import launch_reasons
+            reasons.extend(launch_reasons(config,registry,job))
+        else:
+            gates=registry.fact('qualification') or {}
+            for key in ('engineering_reviewed','paper_scope_reviewed','replay_reproduced'):
+                if gates.get(key) is not True:reasons.append(key.upper()+'_REQUIRED')
+        if not fresh_coordinator_clock(clock):reasons.append('CLOCK_ADMISSION_HOLD')
         if (Path(job['payload']['run_dir'])/'capture').exists():reasons.append('EXISTING_ACCOUNT_REQUIRES_RECONCILIATION')
     return reasons
 
@@ -104,6 +110,7 @@ class Service:
         self.control='run';self.error=None;self.stop_started=None;self.execution='running'
 
     def _observe_workers(self):
+        exited=False
         for ident,entry in list(self.workers.items()):
             if entry['process'].poll() is None:continue
             code=entry['process'].returncode
@@ -112,6 +119,8 @@ class Service:
                 'utc':utc(),'job_id':ident,'owner':entry['identity'],'exit_code':code,
                 'all_owned_descendants_closed':True})
             del self.workers[ident]
+            exited=True
+        return exited
 
     def _pressure(self,measurement):
         reason=self.guard.check(measurement,0)
@@ -166,6 +175,9 @@ class Service:
                 self.queue.recovery_attempt(job['experiment_id'],'FORWARD_ACCOUNT_CONTINUITY_UNPROVEN',eligible=False,
                     release_condition='Reconcile original account, exit and immutable closeout; never restart a fresh account in this segment')
         reconcile_terminal_jobs(self.queue,self.config)
+        if self.config.get('qualification_policy'):
+            from .qualification import reconcile_phases
+            reconcile_phases(self.config,self.queue)
         # Recover publication-before-checkpoint gaps from the sealed output, never
         # from a mutable attempt pointer. Replaying this projection is idempotent.
         partitions=sorted((j for j in self.queue.jobs({'completed'}) if j['type']=='partition'),key=lambda j:j['payload']['hour'])
@@ -180,8 +192,8 @@ class Service:
         for job in self.queue.jobs({'running','leased'}):
             if job['type']!='forward':continue
             state=self.queue.fact('forward:'+job['id']) or {}
-            started=state.get('started_monotonic');boot=state.get('boot_epoch')
-            if started is None or boot!=self.owner['boot_epoch']:continue
+            started=state.get('paper_start_monotonic',state.get('started_monotonic'));boot=state.get('boot_epoch')
+            if started is None or boot is None or abs(boot-self.owner['boot_epoch'])>BOOT_EPOCH_TOLERANCE_SECONDS:continue
             hour=int((time.monotonic()-started)//3600)
             previous=self.queue.fact('partition:'+job['id'])
             completed_hour=0 if previous is None else previous['hour']
@@ -198,7 +210,7 @@ class Service:
         self._observe_workers();self._reconcile();self._schedule_partitions()
         jobs=self.queue.jobs()
         for job in jobs:
-            if job['state']=='admission-held' and job['terminal_reason'].startswith('RESOURCE:'):
+            if job['state']=='admission-held' and (job['terminal_reason'] or '').startswith('RESOURCE:'):
                 reasons=admission_reasons(job,self.config,list(self.measurements),self.clock,self.queue)
                 if reasons:self.stable.pop(job['id'],None)
                 else:
@@ -219,6 +231,11 @@ class Service:
             if job['type']=='forward' and self.workers:continue
             if job['type'] in HEAVY and active_types:continue
             if job['type'] in LIGHT and any(t!='forward' for t in active_types):continue
+            if (self.config.get('qualification_policy') and job['type']=='analysis'
+                    and any(j['parent_id']==job['parent_id'] and j['type']=='replay'
+                            and (j['state'] in {'queued','leased','running'} or (j['state']=='admission-held'
+                                 and (j['terminal_reason'] or '').startswith('RESOURCE:'))) for j in jobs)):
+                continue
             if job['type'] in HEAVY|{'forward'} and len(self.measurements)<3:continue
             reasons=admission_reasons(job,self.config,list(self.measurements),self.clock,self.queue)
             if reasons:
@@ -226,7 +243,8 @@ class Service:
                     'All named gates verified; measured capacity and clock stable for 300 seconds across at least 3 samples')
                 continue
             deps=[self.queue.get(x) for x in job['dependencies']]
-            if any(d is None or d['state'] in {'failed','cancelled','admission-held'} for d in deps):
+            if any(d is None or d['state'] in {'failed','cancelled'} or (d['state']=='admission-held'
+                   and not (d.get('terminal_reason') or '').startswith('RESOURCE:')) for d in deps):
                 self.queue.hold_pending(job['id'],'DEPENDENCY_UNAVAILABLE','Reconcile named dependency; no automatic evidence substitution')
                 continue
             if any(d['state']!='completed' for d in deps):continue
@@ -239,7 +257,8 @@ class Service:
         evidence=self.queue.fact('latest_evidence') or {'as_of_utc':now,'execution':{'state':'admission-held'},
             'coverage':{'planned_seconds':900,'observed_seconds':0,'gap_seconds':0},'closure':{}}
         forwards=[j for j in jobs if j['type']=='forward' and j['state'] in TERMINAL]
-        if forwards:
+        active_forward=any(w['type']=='forward' for w in self.workers.values())
+        if forwards and not active_forward:
             latest=forwards[-1];closure={}
             for kind,key,good in [('seal','seal','SEALED'),('integrity','integrity','PASS'),('accounting','accounting','RECONCILED'),
                                   ('replay','replay','PASS'),('analysis','analysis','PUBLISHED')]:
@@ -251,8 +270,33 @@ class Service:
                     component=result.get('components',{}).get('study',{})
                     evidence={**evidence,'paper_accounts':component.get('accounting',{}).get('accounts',[]),
                         'coverage':component.get('coverage',evidence.get('coverage',{}))}
-            evidence={**evidence,'closure':closure,'execution':{'state':latest['state'],'reason':latest['terminal_reason']}}
-        blockers=[j['terminal_reason'] for j in jobs if j['state']=='admission-held']
+            reason=latest['terminal_reason']
+            if latest.get('artifact_manifest'):
+                terminal=read_json(latest['artifact_manifest']['path'])['result']
+                reason=terminal.get('execution',{}).get('reason') or reason
+            evidence={**evidence,'closure':closure,'execution':{'state':latest['state'],'reason':reason}}
+        blockers=[];next_action='Resolve recorded admission gates; keep failed evidence unchanged'
+        for job in jobs:
+            if job['state']!='admission-held':continue
+            reason=job['terminal_reason'] or 'ADMISSION_HELD'
+            if reason.startswith('RESOURCE:'):
+                current=admission_reasons(job,self.config,list(self.measurements),self.clock,self.queue)
+                reason='RESOURCE:'+','.join(current) if current else 'ADMISSION_STABILITY_WINDOW'
+            blockers.append(reason)
+        gates=self.queue.fact('qualification')
+        if self.config.get('qualification_policy'):
+            from .qualification import bound_json
+            for phase,reference in (gates or {}).get('phase_assessments',{}).items():
+                assessment=bound_json(reference)
+                blockers.extend(phase+':'+hold for hold in assessment['holds'])
+                coverage=assessment.get('coverage')
+                if coverage and forwards and forwards[-1]['payload']['phase']==phase and not active_forward:
+                    evidence={**evidence,'coverage':{'planned_seconds':coverage['expected_scheduled_tick_seconds'],
+                        'observed_seconds':coverage['distinct_paper_scheduled_tick_seconds'],
+                        'gap_seconds':coverage['missing_scheduled_tick_seconds'],
+                        'requirements_met':assessment['status']=='QUALIFIED'}}
+                    if assessment['status']=='QUALIFIED':
+                        next_action='Qualify hourly replay before eight-hour admission'
         state={**evidence,'source_sha256':self.config['source_sha256'],'config_sha256':digest(self.config),
             'components':{**evidence.get('components',{}),'supervisor':{'state':self.execution,'as_of_utc':now,
                 'currently_running_verified':self.execution=='running'},'report':{'state':'completed','as_of_utc':now}},
@@ -263,13 +307,14 @@ class Service:
                 'disk_reserve_bytes':self.config['limits']['runtime_free_floor_bytes'],'process_count':resource.get('owned_process_count'),
                 'optional_analysis_paused':self.control!='run' or bool(blockers)},
             'clock':self.clock,'blockers':blockers+([] if not self.error else [self.error]),'paper_only':True,
-            'runtime_model_calls_observed':0,'next_action':'Resolve recorded admission gates; keep failed evidence unchanged',
+            'runtime_model_calls_observed':0,'next_action':next_action,
             'experiment_decision':'INSUFFICIENT_EVIDENCE','cohort_decision':'FROZEN_OBSERVATION_ONLY_COPYING_INELIGIBLE',
             'evidence_links':['https://github.com/achilles611/Trader/pull/3']}
         public=build_status(state,now_utc=now)
         private={'schema':'LANE_II_SERVICE_STATUS_V1','utc':now,'heartbeat_monotonic':time.monotonic(),
             'owner':self.owner,'control':self.control,'source_sha256':self.config['source_sha256'],
             'config_sha256':digest(self.config),'workers':[{'job_id':k,'identity':v['identity'],'type':v['type']} for k,v in self.workers.items()],
+            'qualification':gates,
             'resources':resource,'public':public,'model_call_evidence':'No model client; Python socket connects denied in coordinator/offline workers; fixed public-only collector allowlist'}
         atomic_json(self.root/'STATUS.json',private);atomic_json(self.root/'public/STATUS.json',public)
         atomic_bytes(self.root/'public/LATEST.md',render_latest(public).encode('utf-8'))
@@ -310,9 +355,9 @@ class Service:
                 while seconds is None or time.monotonic()-started<seconds:
                     measurement=sample(self.root,cpu_interval=None);self.measurements.append(measurement)
                     self._pressure(measurement)
-                    self._observe_workers()
+                    exited=self._observe_workers()
                     if time.monotonic()-self.last_clock>=300:self._clock_refresh()
-                    if time.monotonic()-self.last_tick>=60:self.tick()
+                    if exited or time.monotonic()-self.last_tick>=60:self.tick()
                     if time.monotonic()-self.last_status>=5:self.status()
                     if self.control=='stop' and not self.workers:break
                     if self.stop_started and time.monotonic()-self.stop_started>120:break

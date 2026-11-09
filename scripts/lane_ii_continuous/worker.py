@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import os
+import math
 from pathlib import Path
 import subprocess
 import sys
 import threading
 import time
 
-from .common import atomic_json, binding, digest, process_identity, read_json, same_process, utc
+from .common import atomic_json, binding, digest, fresh_coordinator_clock, process_identity, read_json, same_process, utc
 from .queue import Registry, FenceLost
 from .resources import sample, admission, Guard
 
@@ -42,6 +43,28 @@ def source_result(queue,job_id,kind):
     return verified(matches[-1]['artifact_manifest'])
 
 
+def offline_child(config, script, arguments, log_path):
+    command=[config['interpreter'],'-I','-B',str(Path(config['cli']).with_name('offline.py')),'--',
+             str(Path(config['cli']).with_name(script)),*map(str,arguments)]
+    with Path(log_path).open('wb') as log:
+        return subprocess.run(command,stdout=log,stderr=log,check=False,timeout=config['maximum_replay_seconds'],
+                              env=worker_environment(config['root']),
+                              creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0)).returncode
+
+
+def exited_owned_descendants(owned, process, *, settle_seconds=1.0):
+    """Distinguish a verified root exit from Job members that still remain."""
+    if process.poll() is None:
+        raise ValueError('ROOT_EXIT_NOT_OBSERVED')
+    deadline=time.monotonic()+settle_seconds
+    while True:
+        # Windows can list the exited root while its retained handle is open.
+        # The handle proves this PID's exit; never ignore a different member.
+        children=owned.pids()-{process.pid}
+        if not children or time.monotonic()>=deadline:return children
+        time.sleep(.05)
+
+
 def forward(job,config,queue,attempt):
     from scripts.slim_paper_operator.owned_job import OwnedJob
     from .capture import build_forward_command, request_stop, read_terminal, capture_state
@@ -49,22 +72,40 @@ def forward(job,config,queue,attempt):
     root=Path(config['root']);run=Path(job['payload']['run_dir']);candidate=job['payload']['candidate']
     if (run/'capture').exists():raise Held('EXISTING_ACCOUNT_CANNOT_BE_RESET')
     clock=read_json(root/'CLOCK_CONTROL.json')
-    import psutil
-    anchor=clock.get('anchor',{})
-    if (clock.get('state')!='accepted' or clock.get('boot_id')!=psutil.boot_time()
-            or not 0<=time.monotonic()-anchor.get('monotonic',-1e9)<=600):raise Held('CLOCK_ADMISSION_HOLD')
+    if not fresh_coordinator_clock(clock):raise Held('RESOURCE:CLOCK_ADMISSION_HOLD')
     measures=[sample(root,cpu_interval=.15) for _ in range(3)]
     decision=admission(measures,job['payload']['seconds'],limits=config['limits'])
     if not decision['admitted']:raise Held('RESOURCE:'+','.join(decision['reasons']))
-    if not all((queue.fact('qualification') or {}).get(k) is True for k in ('engineering_reviewed','paper_scope_reviewed','replay_reproduced')):
+    prospective=config.get('qualification_policy') is not None
+    if prospective:
+        from .qualification import launch_reasons
+        reasons=launch_reasons(config,queue,job)
+        if reasons:raise Held('QUALIFICATION:'+','.join(reasons))
+    elif not all((queue.fact('qualification') or {}).get(k) is True for k in ('engineering_reviewed','paper_scope_reviewed','replay_reproduced')):
         raise Held('QUALIFICATION_REQUIRED')
     run.mkdir(parents=True,exist_ok=True)
     # Existing collector retains its validated decision cadence and prewarm.
-    start=project(clock['anchor'])+config['prewarm_seconds'];cutoff=start+job['payload']['seconds']
+    start=project(clock['anchor'])+config['prewarm_seconds']
+    if prospective:
+        alignment=config['qualification_policy']['alignment_seconds']
+        start=math.ceil(start/alignment)*alignment
+    cutoff=start+job['payload']['seconds']
     argv=build_forward_command(candidate,run,utc(start),utc(cutoff));argv[0]=config['interpreter']
     env=worker_environment(root)
     env.update(LANE_II_CLOCK_CONTROL=str(root/'CLOCK_CONTROL.json'),LANE_II_BOOT_ID=str(clock['boot_id']),
                PYTHONDONTWRITEBYTECODE='1',TEMP=str(root/'temp'),TMP=str(root/'temp'))
+    if prospective:
+        paper_manifest=config['paper_risk_manifest']
+        env.update(LANE_II_PAPER_RISK_MANIFEST=paper_manifest['path'],
+                   LANE_II_PAPER_RISK_MANIFEST_SHA256=paper_manifest['sha256'],LANE_II_PAPER_SEGMENT_ID=job['segment_id'])
+        predecessor=job['payload'].get('predecessor')
+        env['LANE_II_PAPER_PREDECESSOR_RECEIPT_SHA256']=predecessor['sha256'] if predecessor else 'GENESIS'
+        atomic_json(run/'ADMISSION.json',{'schema':'LANE_II_FORWARD_ADMISSION_V1','utc':utc(),
+            'source_sha256':config['source_sha256'],'config_sha256':digest(config),'candidate_sha256':candidate['source_manifest_sha256'],
+            'qualification_phase':job['payload']['phase'],'job_id':job['id'],'segment_id':job['segment_id'],
+            'paper_risk_manifest':paper_manifest,'predecessor':predecessor,
+            'paper_start_utc':utc(start),'cutoff_utc':utc(cutoff),'clock':clock,'resources':decision,
+            'resource_samples':measures,'release':queue.fact('short_release')})
     log=(attempt/'collector.log').open('wb',buffering=0)
     process=subprocess.Popen(argv,stdin=subprocess.PIPE,stdout=log,stderr=log,cwd=candidate['candidate_dir'],env=env,
                              creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
@@ -76,7 +117,8 @@ def forward(job,config,queue,attempt):
             **identity,'command':argv,'source_manifest_sha256':candidate['source_manifest_sha256'],
             'owned_job_before_startup_gate':True,'parent_job':job['id'],'fence':job['fence']})
         queue.fact_owned(job['id'],job['fence'],'forward:'+job['id'],{'started_monotonic':time.monotonic(),'boot_epoch':identity['boot_epoch'],
-            'child_owner':identity,'run_dir':str(run),'paper_start_utc':utc(start),'cutoff_utc':utc(cutoff)})
+            'child_owner':identity,'run_dir':str(run),'paper_start_utc':utc(start),'cutoff_utc':utc(cutoff),
+            'paper_start_monotonic':cutoff_mono-job['payload']['seconds']})
         process.stdin.write(candidate['startup_release'].encode());process.stdin.flush();process.stdin.close()
         previous_bytes=0;previous_mono=time.monotonic()
         while process.poll() is None:
@@ -110,10 +152,12 @@ def forward(job,config,queue,attempt):
                 forced=True;owned.close();owned=None;process.wait(timeout=15);break
             time.sleep(1)
         exit_code=process.wait(timeout=15)
-        children=owned.pids() if owned is not None else set()
+        children=exited_owned_descendants(owned,process) if owned is not None else set()
         forced=forced or bool(children)
         if owned is not None:owned.close();owned=None
         atomic_json(run/'exit.json',{'pid':process.pid,'exit_code':exit_code,'observed_exit_utc':utc(),
+            'creation_epoch':identity['creation_epoch'],'boot_epoch':identity['boot_epoch'],
+            'executable_sha256':identity['executable_sha256'],'observed_exit_monotonic':time.monotonic(),
             'owned_children_at_parent_exit':sorted(children),'owned_job_closed':True,
             'retained_handle_exit_observed':True,'forced_closure':forced,
             'reason':stop_reason,'source_manifest_sha256':candidate['source_manifest_sha256']})
@@ -128,10 +172,27 @@ def forward(job,config,queue,attempt):
                   'closure':{'capture_sealed':False,'accounting_reconciled':False}}
     terminal['supervisor_exit']=binding(run/'exit.json')
     successful=(exit_code==0 and not forced and terminal['execution']['state']=='complete' and terminal['closure']['capture_sealed'])
+    paths=[run/'operator.json',run/'exit.json']+([run/'ADMISSION.json'] if prospective else [])
+    if prospective:
+        from .paper_risk import validate_closure
+        try:
+            risk=validate_closure(run,expected_anchor_sha256=config['paper_risk_manifest']['sha256'])
+            risk_path=run/'RISK_CLOSURE.json'
+            risk_binding=binding(risk_path)
+            if (risk['valid'] is not True or risk['campaign_id']!=job['experiment_id']
+                    or risk['segment_id']!=job['segment_id']
+                    or risk['closure_sha256']!=risk_binding['sha256']
+                    or risk['receipt_sha256']!=binding(run/'capture/receipt.json')['sha256']):
+                raise ValueError('RISK_CLOSURE_JOB_BINDING_MISMATCH')
+            terminal.update(risk_continuity=risk_binding,risk_validation=risk)
+            paths.append(risk_path)
+        except (OSError,ValueError,KeyError,TypeError) as exc:
+            terminal['risk_hold']='RISK_CLOSURE_UNPROVEN:'+type(exc).__name__+':'+str(exc)[:120]
+            successful=False
     queue.fact_owned(job['id'],job['fence'],'latest_evidence',{'as_of_utc':utc(),'execution':{'state':'completed' if successful else 'failed',
         'reason':terminal['execution'].get('reason')},'coverage':terminal['coverage'],'closure':{},
         'current_experiment':job['experiment_id']})
-    return terminal,[binding(run/'operator.json'),binding(run/'exit.json')],('completed' if successful else 'failed')
+    return terminal,[binding(path) for path in paths],('completed' if successful else 'failed')
 
 
 def handle(job,config,queue,attempt):
@@ -164,13 +225,50 @@ def handle(job,config,queue,attempt):
         from .closeout import audit_capture_readonly
         result=audit_capture_readonly(run/'capture',p['candidate']['candidate_dir'],attempt/'audit')
         if result['problem_counts']:raise Held('RAW_INTEGRITY_FAILED')
-        return result,[binding(attempt/'audit/RAW_CAPTURE_AUDIT.json')],'completed'
+        audit_path=attempt/'audit/RAW_CAPTURE_AUDIT.json';artifacts=[binding(audit_path)]
+        if config.get('qualification_policy') and result['execution']['state'] in {'COMPLETE','STOPPED'}:
+            supervisor_path=attempt/'audit/PAPER_RUN_RESULT.json'
+            code=offline_child(config,'prospective_supervisor.py',[
+                '--candidate',p['candidate']['candidate_dir'],'--run-dir',run,'--raw-audit',audit_path,
+                '--manifest-sha256',p['candidate']['source_manifest_sha256'],'--output',supervisor_path],attempt/'supervisor-audit.log')
+            if code or not supervisor_path.is_file():
+                # Raw integrity and genuine replay eligibility are distinct.
+                # A valid raw audit still supports bounded partial accounting.
+                return {**result,'supervisor_bridge':'FAILED','worker_exit_code':code},artifacts,'completed'
+            result={**result,'supervisor_bridge':'PASS','supervisor_exit_proved':True}
+            artifacts.append(binding(supervisor_path))
+        return result,artifacts,'completed'
     if kind=='accounting':
         from .closeout import closeout_capture
         result=closeout_capture(run,attempt/'accounting',p['candidate']['candidate_dir'])
         return result,[binding(attempt/'accounting/CLOSEOUT.json')],'completed'
     if kind=='replay':
         from .research import build_replay_commands, assess_replay_results
+        if config.get('qualification_policy'):
+            from .qualification import prospective_replay_pass
+            integrity=source_result(queue,p['forward_job'],'integrity')
+            artifact_paths={a['name']:a['path'] for a in integrity['artifacts']}
+            if 'PAPER_RUN_RESULT.json' not in artifact_paths:raise Held('GENUINE_PROSPECTIVE_SUPERVISOR_PROOF_REQUIRED')
+            # The supervisor was bound to the original streaming audit. Both
+            # original and published audit must still have the same sealed bytes.
+            supervisor_path=Path(artifact_paths['PAPER_RUN_RESULT.json'])
+            supervisor=read_json(supervisor_path)
+            audit_binding=supervisor['bindings']['raw_audit']
+            if binding(audit_binding['path'])!=audit_binding or binding(artifact_paths['RAW_CAPTURE_AUDIT.json'])['sha256']!=audit_binding['sha256']:
+                raise Held('PROSPECTIVE_RAW_AUDIT_ARTIFACT_CHANGED')
+            for artifact in integrity['artifacts']:
+                if binding(artifact['path'])['sha256']!=artifact['sha256']:raise Held('PROSPECTIVE_INTEGRITY_ARTIFACT_CHANGED')
+            out=attempt/'replay'
+            code=offline_child(config,'qualification_replay.py',[
+                '--candidate',p['candidate']['candidate_dir'],'--run-dir',run,'--raw-audit',audit_binding['path'],
+                '--supervisor-result',supervisor_path,'--manifest-sha256',p['candidate']['source_manifest_sha256'],
+                '--output',out],attempt/'replay.log')
+            result_path=out/'RESULT.json'
+            if not result_path.exists():raise Held('PROSPECTIVE_REPLAY_NO_RESULT_EXIT_'+str(code))
+            result=read_json(result_path)
+            parity=assess_replay_results(result)
+            return {'driver_result':binding(result_path),'parity':parity,'driver_exit_code':code},[binding(result_path)],\
+                'completed' if code==0 and parity['all_requested_parity_passed'] and prospective_replay_pass(result) else 'failed'
         plan=build_replay_commands(config['app'],config['interpreter'],candidate=p['candidate']['candidate_dir'],study=run,output=attempt/'replay')
         atomic_json(attempt/'REPLAY_PLAN.json',plan)
         if plan['state']!='READY_FOR_ADMISSION':raise Held(';'.join(plan['reasons']))
@@ -191,6 +289,10 @@ def handle(job,config,queue,attempt):
         evidence={'artifacts':{'terminal_receipt':binding(run/'capture/receipt.json'),
             'raw_audit':audit['artifacts'][0],'accounting':accounting['artifacts'][0]},
             'source_sha256':config['source_sha256'],'config_sha256':digest(config)}
+        if config.get('qualification_policy'):
+            try:replay=source_result(queue,p['forward_job'],'replay')
+            except Held:pass
+            else:evidence['artifacts']['prospective_replay']=replay['artifacts'][0]
         result=analyze_closeout(evidence,attempt/'analysis')
         return result,result.get('artifacts',[]),'completed'
     if kind=='decision':

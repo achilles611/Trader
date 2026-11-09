@@ -74,10 +74,32 @@ def process_identity(pid=None):
             "executable_sha256": file_hash(executable)}
 
 
+BOOT_EPOCH_TOLERANCE_SECONDS = 2.0
+
+
+def fresh_coordinator_clock(clock, *, boot_epoch=None, monotonic=None):
+    """Check a serialized coordinator anchor in a separate worker process."""
+    import math
+    import psutil
+    boot_epoch = psutil.boot_time() if boot_epoch is None else boot_epoch
+    monotonic = time.monotonic() if monotonic is None else monotonic
+    try:
+        anchor = clock['anchor']
+        recorded_boot = clock['boot_id']
+        values = (recorded_boot, boot_epoch, anchor['monotonic'], monotonic, anchor['utc_epoch'])
+        return (clock['schema'] == 'LANE_II_CLOCK_CONTROL_V1' and clock['state'] == 'accepted'
+                and all(type(v) in {int, float} and math.isfinite(v) for v in values)
+                and anchor['boot_id'] == recorded_boot
+                and abs(recorded_boot - boot_epoch) <= BOOT_EPOCH_TOLERANCE_SECONDS
+                and 0 <= monotonic - anchor['monotonic'] <= 600)
+    except (KeyError, TypeError):
+        return False
+
+
 def same_process(identity):
     import psutil
     try:
-        if abs(psutil.boot_time() - identity["boot_epoch"]) > 2:
+        if abs(psutil.boot_time() - identity["boot_epoch"]) > BOOT_EPOCH_TOLERANCE_SECONDS:
             return False
         proc = psutil.Process(identity["pid"])
         return (abs(proc.create_time() - identity["creation_epoch"]) < .01

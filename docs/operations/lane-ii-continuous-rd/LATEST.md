@@ -1,34 +1,35 @@
-# Lane II Continuous Research — Installed, Qualification Held
+# Lane II continuous research: short paper qualification
 
-Service observation: **2026-11-08T16:55:53.725653+00:00**. Last study evidence: **2026-11-07T18:35:47.544248+00:00** — **stale**, from the failed November 7 follow-up. A fresh report does not make that study current.
+Capture evidence as of **2026-11-09T05:50:00.099125+00:00**. At report generation, source evidence was **1015 seconds old**. The local status service continues to report current heartbeat and source freshness.
 
-| Gate | Observed result |
+| Dimension | Observed result |
 | --- | --- |
-| Implementation | Coordinator, durable queue, capture repairs, audit/accounting, registries and descriptive reports implemented; prospective integration remains held |
-| Installation | User-logon coordinator and five-minute watchdog installed; unattended boot registration denied by Windows |
-| Exercise | Actual scheduled launch, watchdog, duplicate-start exclusion, queued analysis, graceful stop and restart observed |
-| Tests | 85 passed, including actual subprocess crash and fencing recovery |
-| Existing sealed replay | 60/60 study financial states and recorded decisions; 240 cohort accounts, 206 fills and 264 recorded dispatch decisions reconciled |
-| New short pipeline | Not started: zero attempts; planned 900 seconds, observed zero |
-| Eight-hour / 24-hour qualification | Neither started or qualified |
-| Profitability / capital readiness | Insufficient evidence; no funded activation |
+| Implemented / installed / exercised | Yes; scheduled collector and watchdog observed |
+| Short paper execution | COMPLETE (DEADLINE); 900.0 elapsed / 900.0 planned seconds |
+| Short operational qualification | **QUALIFIED**; 900 independently replayed seconds; 3/3 matched fresh eligible windows |
+| Closeout | Raw audit PASS_RETAINED_CAPTURE_INTEGRITY_ONLY; accounting PASS_RETAINED_PROFILE_ACCOUNTING; causal replay PASS (scheduled recovery) |
+| Owner exit | Code 0; forced closure false |
+| Eight-hour and 24-hour qualification | Neither run started |
+| Profitability | Insufficient evidence |
 
-The queue contains **2 completed jobs and 1 admission-held forward job**, with no duplicate economic output after restart. Automatic local analysis preserves the November 7 study failure and interrupted cohort. Its 27 study entries and 27 cash exits reconcile with no open study positions in the retained ledgers. Ninety alternative cohort accounts reconcile from a verified disposable DB/WAL/SHM copy; a genuine cohort terminal receipt and historical supervisor exit remain missing.
+The first prewarm failed before any paper tick. Its raw integrity and unchanged flat accounts were reconciled. The transport repair was verified against the public HTTP and price feeds; the replacement used the same campaign and the original sealed predecessor receipt. The cumulative $25 paper limit did not reset.
 
-The failed study's raw audit passed: **74,866 events, 11,568 HTTP raw files and 41,490 websocket frames**, with no reported integrity problems. This does not prove full coverage, causal strategy replay or profitability. The separate sealed historical replay used a STOPPED partial capture. Its first cohort attempt stopped on an isolated timezone dependency; bound local timezone data fixed that dependency, and only that step was rerun. Originals and the failed attempt remain retained.
+The original automatic closeout held when the audit import failed. A scheduled retry verified the same sealed capture with a corrected offline import and a replay that uses the collector's directly recorded missing-feature diagnostic order. It published a revised report, including exact decision, accounting and risk parity. All 148 tests for the corrected build passed. The first-pass hold remains in the original records.
 
-## Open blockers and next action
+The final receipt records one HTTP request canceled at cutoff. The sealed journal contains every scheduled paper second.
 
-- System free space was **115.7 MiB**, below the unchanged **1 GiB** admission floor. The runtime volume had **303.5 GiB** free and retains an **80 GiB** floor plus calculated reserves. No capacity gate was lowered.
-- The $25 cumulative controller belongs to a separate US-market PAPER ledger. The international slim simulator is unjoined; its scope must be resolved before release. Monetary limits remain unchanged.
-- New clock-admission holds still need a qualified replay event contract, genuine supervisor/audit integration and a fresh full-pipeline test. Byte partitions are implemented; actual hourly incremental accounting/replay remains unqualified.
-- User-logon installation requires a logged-in session. Unattended boot registration and actual reboot qualification remain outstanding.
-- Daily digests are local. This publication uses the reviewed GitHub path; the daemon has no remote publishing credential. No fresh wallet collection or copying qualification is claimed.
+Admission measured CPU p95 **36.4%** and at least **5.25 GiB** available RAM. The system disk had **29.35 GiB** free. All **141 tests** passed against the frozen build. Unattended boot remains unqualified; the installed tasks require user logon.
 
-Keep prospective jobs held. Resolve capacity, paper scope and replay integration, then audit the smallest prospective slim-plus-controls run before eight-hour and 24-hour expansion. The installed held service remains useful for bounded local evidence and status work.
+Original coordinator queue: 1 admission-held, 8 completed.
 
-No runtime model calls or funded exchange mutations were made. Model-request denial was exercised before DNS in offline/collector fixtures; a fresh collector has not run.
+Current short qualification holds: none recorded.
 
-Source identity: `e4234936c0f93a91c52adf3f387b1a34d33fa025900b9d8f351ac6143a84989e`. Configuration identity: `a99428b51eaa6a82a4fc37de1f3ad15f8d4e00a4448f2bdabc7ca783e4ebb4f9`.
+Next action: Qualify hourly incremental accounting and causal replay before eight-hour admission. No funded orders or model calls were recorded.
 
-[Evidence](EVIDENCE.json) · [Implementation and operator contract](README.md) · [Caelum assessment](../../administration/caelum/passes/20261108-continuous-rd/PUBLIC_ASSESSMENT.md) · [Handoff PR](https://github.com/achilles611/Trader/pull/3)
+Frozen application `0174929829a5863be53fb0c05ea9c035798491978f206012fcec2006477e60f5`; configuration `c34001602fdbe232aaa7d7cccad430fab3fc94d9e906ec6ea8f16a38b2fe753b`; collector `f48a341499ae69257aea03ac1e7599172fa430123a26063b940c597cb7b6a46f`.
+
+See [sanitized evidence](EVIDENCE.json), the [operator contract](README.md), and [PR #3](https://github.com/achilles611/Trader/pull/3). Raw tapes, account details and exact local bindings remain on Atlas.
+
+The [earlier held commissioning record](https://github.com/achilles611/Trader/blob/84d137cf601f216d94c6cdc1a9ee857c2335fd38/docs/operations/lane-ii-continuous-rd/EVIDENCE.json) preserves the November 7 capture findings and the original scheduler exercise.
+
+[Independent Caelum assessment](../../administration/caelum/passes/20261108-continuous-rd-resume/PUBLIC_ASSESSMENT.md) accepted the recovered short only.

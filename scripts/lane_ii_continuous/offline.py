@@ -16,5 +16,9 @@ if __name__=='__main__':
     if len(sys.argv)<3 or sys.argv[1]!='--':raise SystemExit('Exact replay script required')
     sys.addaudithook(deny)
     sys.argv=sys.argv[2:]
-    sys.path.insert(0,str(Path(sys.argv[0]).resolve().parent))
-    runpy.run_path(sys.argv[0],run_name='__main__')
+    target=Path(sys.argv[0]).resolve()
+    # In-package drivers load through the application root. Adding this
+    # package directory as a top-level path shadows stdlib queue with queue.py.
+    if target.parent!=Path(__file__).resolve().parent:
+        sys.path.insert(0,str(target.parent))
+    runpy.run_path(str(target),run_name='__main__')
