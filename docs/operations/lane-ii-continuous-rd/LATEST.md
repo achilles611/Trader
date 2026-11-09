@@ -6,10 +6,10 @@ Atlas started the owned collector in prewarm on November 9, 2026. The fixed pape
 
 | Gate | Observed state |
 | --- | --- |
-| Hourly replay and accounting release | Passed retained split-versus-contiguous replay and native checkpoint fixtures |
-| Eight-hour qualification | Prewarm observed. The scheduled paper interval and live checkpoint evidence are pending. |
+| Hourly replay and accounting release | Passed retained split-versus-contiguous replay, native checkpoint fixtures, and the first live hour |
+| Eight-hour qualification | In progress. The 03:45–04:45 MST prefix verified 3,600 of 3,600 paper seconds, both profile accounts, and four contiguous quarter-hour receipts. |
 | 24-hour qualification | Requires the sealed eight-hour pass and fresh admission on the same campaign. |
-| Discovery | Offline study started with five P-model families and 50 preregistered variations. |
+| Discovery | The isolated worker completed all 50 variations across five retained P-model families and reconciled the five baseline profiles. |
 
 Both retrospective passes processed 22,314 sealed events and agreed on causal decisions, financial accounting, risk, and coverage. The reviewed release also passed 150 continuous-service tests and 22 campaign-risk tests. The collector, offline replay, health task, and dashboard task are installed on Atlas. Windows triggers the health check each quarter hour and refreshes the dashboard one minute later. The current task principal requires a logged-in session.
 
