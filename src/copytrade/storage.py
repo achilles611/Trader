@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Protocol
+from typing import Any, Iterable, Iterator, Mapping, Protocol
 
 from .models import (
     BacktestRun,
@@ -31,6 +32,16 @@ from .models import (
     jsonable,
     stable_id,
 )
+
+
+@dataclass
+class DiscoveryStageStats:
+    """Mutable bounded-run accounting, kept even if a source later fails."""
+
+    normalized_observations: int = 0
+    duplicate_events: int = 0
+    invalid_wallets: int = 0
+    rejections: list[dict[str, Any]] = field(default_factory=list)
 
 
 class CopyTradeStore(Protocol):
@@ -170,7 +181,8 @@ class CopyTradeDatabase:
                     component_scores_json TEXT NOT NULL, penalties_json TEXT NOT NULL, eligible INTEGER NOT NULL,
                     reasons_json TEXT NOT NULL, source_quality REAL NOT NULL,
                     provenance TEXT NOT NULL DEFAULT 'legacy', analysis_run_id TEXT,
-                    config_fingerprint TEXT,
+                    config_fingerprint TEXT, confidence_score REAL NOT NULL DEFAULT 0,
+                    hard_gates_json TEXT NOT NULL DEFAULT '[]', score_version TEXT NOT NULL DEFAULT 'phase_b_suitability_v3',
                     PRIMARY KEY(target_wallet, calculated_at)
                 );
                 CREATE INDEX IF NOT EXISTS idx_copy_scores_wallet_time ON copy_candidate_scores(target_wallet, calculated_at DESC);
@@ -234,7 +246,11 @@ class CopyTradeDatabase:
                     wallets_seen INTEGER NOT NULL DEFAULT 0, eligible_wallets INTEGER NOT NULL DEFAULT 0,
                     limit_deferred_wallets INTEGER NOT NULL DEFAULT 0, new_wallets INTEGER NOT NULL DEFAULT 0,
                     existing_wallets_refreshed INTEGER NOT NULL DEFAULT 0, filtered_wallets INTEGER NOT NULL DEFAULT 0,
-                    queued_for_analysis INTEGER NOT NULL DEFAULT 0, errors_json TEXT NOT NULL DEFAULT '[]'
+                    queued_for_analysis INTEGER NOT NULL DEFAULT 0, errors_json TEXT NOT NULL DEFAULT '[]',
+                    valid_events INTEGER NOT NULL DEFAULT 0, normalized_observations INTEGER NOT NULL DEFAULT 0,
+                    duplicate_events INTEGER NOT NULL DEFAULT 0, invalid_wallets INTEGER NOT NULL DEFAULT 0,
+                    malformed_events INTEGER NOT NULL DEFAULT 0, unsupported_records INTEGER NOT NULL DEFAULT 0,
+                    fatal_source_errors INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS copy_discovery_candidates (
                     wallet TEXT PRIMARY KEY, discovered_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
@@ -255,6 +271,12 @@ class CopyTradeDatabase:
                 CREATE INDEX IF NOT EXISTS idx_copy_discovery_observations_run ON copy_discovery_observations(run_id, source);
                 CREATE INDEX IF NOT EXISTS idx_copy_discovery_observations_source_wallet ON copy_discovery_observations(source, wallet);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_copy_discovery_observations_event ON copy_discovery_observations(run_id, source_event_id);
+                CREATE TABLE IF NOT EXISTS copy_discovery_rejections (
+                    rejection_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, category TEXT NOT NULL,
+                    message TEXT NOT NULL, source TEXT, record_index INTEGER, event_index INTEGER,
+                    raw_record_json TEXT NOT NULL DEFAULT '{}', recorded_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_copy_discovery_rejections_run ON copy_discovery_rejections(run_id, rejection_id);
                 CREATE TABLE IF NOT EXISTS copy_analysis_runs (
                     run_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT,
                     status TEXT NOT NULL, configuration_json TEXT NOT NULL,
@@ -279,6 +301,21 @@ class CopyTradeDatabase:
                     ON copy_analysis_run_wallet_events(run_id, wallet, event_id);
                 CREATE INDEX IF NOT EXISTS idx_copy_analysis_wallet_events_run_stage
                     ON copy_analysis_run_wallet_events(run_id, stage, status);
+                CREATE TABLE IF NOT EXISTS copy_analysis_market_evidence (
+                    analysis_run_id TEXT NOT NULL, symbol TEXT NOT NULL, bucket_timestamp TEXT NOT NULL,
+                    price REAL, source TEXT NOT NULL, quality TEXT NOT NULL, market_timestamp TEXT,
+                    requested_for_timestamp TEXT NOT NULL, resolution TEXT NOT NULL, recorded_at TEXT NOT NULL,
+                    PRIMARY KEY(analysis_run_id, symbol, bucket_timestamp)
+                );
+                CREATE TABLE IF NOT EXISTS copy_analysis_finalist_recommendations (
+                    analysis_run_id TEXT NOT NULL, config_fingerprint TEXT NOT NULL, wallet TEXT NOT NULL,
+                    finalist_eligible INTEGER NOT NULL, finalist_rejection_reasons_json TEXT NOT NULL DEFAULT '[]',
+                    diversification_penalty REAL, final_selection_score REAL, selection_rank INTEGER,
+                    evaluated_at TEXT NOT NULL,
+                    PRIMARY KEY(analysis_run_id, config_fingerprint, wallet)
+                );
+                CREATE INDEX IF NOT EXISTS idx_copy_finalist_recommendations_run
+                    ON copy_analysis_finalist_recommendations(analysis_run_id, config_fingerprint, selection_rank);
                 CREATE TABLE IF NOT EXISTS copy_candidate_analyses (
                     wallet TEXT PRIMARY KEY, lifecycle_status TEXT NOT NULL, last_run_id TEXT,
                     started_at TEXT, completed_at TEXT, prefilter_reasons_json TEXT NOT NULL DEFAULT '[]',
@@ -318,8 +355,18 @@ class CopyTradeDatabase:
             self._ensure_column(connection, "copy_candidate_scores", "provenance", "TEXT NOT NULL DEFAULT 'legacy'")
             self._ensure_column(connection, "copy_candidate_scores", "analysis_run_id", "TEXT")
             self._ensure_column(connection, "copy_candidate_scores", "config_fingerprint", "TEXT")
+            self._ensure_column(connection, "copy_candidate_scores", "confidence_score", "REAL NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "copy_candidate_scores", "hard_gates_json", "TEXT NOT NULL DEFAULT '[]'")
+            self._ensure_column(connection, "copy_candidate_scores", "score_version", "TEXT NOT NULL DEFAULT 'phase_b_suitability_v3'")
             self._ensure_column(connection, "copy_discovery_runs", "eligible_wallets", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "copy_discovery_runs", "limit_deferred_wallets", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "copy_discovery_runs", "valid_events", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "copy_discovery_runs", "normalized_observations", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "copy_discovery_runs", "duplicate_events", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "copy_discovery_runs", "invalid_wallets", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "copy_discovery_runs", "malformed_events", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "copy_discovery_runs", "unsupported_records", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "copy_discovery_runs", "fatal_source_errors", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "copy_discovery_observations", "source_event_id", "TEXT")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_copy_targets_status ON copy_targets(status)")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_copy_discovery_candidates_run ON copy_discovery_candidates(last_discovery_run_id)")
@@ -328,14 +375,53 @@ class CopyTradeDatabase:
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_copy_discovery_observations_event ON copy_discovery_observations(run_id, source_event_id)"
             )
             # B.1 could leave an orphan score if a process died after scoring
-            # and before qualification. Keep the latest as the authoritative
-            # historical record before enforcing the B.2 run-level invariant.
+            # and before qualification. Preserve superseded records in a
+            # migration archive before enforcing the B.2 run-level invariant.
+            # The archive makes existing-database upgrades auditable instead
+            # of silently deleting historical evidence.
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS copy_candidate_score_archive (
+                    archive_id INTEGER PRIMARY KEY AUTOINCREMENT, original_score_rowid INTEGER NOT NULL UNIQUE,
+                    archived_at TEXT NOT NULL, archive_reason TEXT NOT NULL, target_wallet TEXT NOT NULL,
+                    calculated_at TEXT NOT NULL, total_score REAL NOT NULL, component_scores_json TEXT NOT NULL,
+                    penalties_json TEXT NOT NULL, eligible INTEGER NOT NULL, reasons_json TEXT NOT NULL,
+                    source_quality REAL NOT NULL, provenance TEXT NOT NULL, analysis_run_id TEXT,
+                    config_fingerprint TEXT, confidence_score REAL NOT NULL DEFAULT 0,
+                    hard_gates_json TEXT NOT NULL DEFAULT '[]', score_version TEXT NOT NULL DEFAULT 'phase_b_suitability_v3'
+                )"""
+            )
+            self._ensure_column(connection, "copy_candidate_score_archive", "confidence_score", "REAL NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "copy_candidate_score_archive", "hard_gates_json", "TEXT NOT NULL DEFAULT '[]'")
+            self._ensure_column(connection, "copy_candidate_score_archive", "score_version", "TEXT NOT NULL DEFAULT 'phase_b_suitability_v3'")
+            connection.execute(
+                """INSERT OR IGNORE INTO copy_candidate_score_archive(
+                    original_score_rowid, archived_at, archive_reason, target_wallet, calculated_at, total_score,
+                    component_scores_json, penalties_json, eligible, reasons_json, source_quality, provenance,
+                    analysis_run_id, config_fingerprint, confidence_score, hard_gates_json, score_version)
+                   SELECT score.rowid, ?, 'duplicate_phase_b_authority_migration', score.target_wallet, score.calculated_at, score.total_score,
+                    score.component_scores_json, score.penalties_json, score.eligible, score.reasons_json, score.source_quality, score.provenance,
+                    score.analysis_run_id, score.config_fingerprint, score.confidence_score, score.hard_gates_json, score.score_version
+                   FROM copy_candidate_scores AS score
+                   WHERE score.provenance='phase_b' AND score.analysis_run_id IS NOT NULL AND EXISTS (
+                     SELECT 1 FROM copy_candidate_scores AS newer
+                     WHERE newer.target_wallet=score.target_wallet AND newer.analysis_run_id=score.analysis_run_id
+                       AND newer.provenance='phase_b' AND (
+                         newer.calculated_at > score.calculated_at OR
+                         (newer.calculated_at=score.calculated_at AND newer.rowid > score.rowid)
+                       )
+                   )""",
+                (iso(None),),
+            )
             connection.execute(
                 """DELETE FROM copy_candidate_scores
-                   WHERE provenance='phase_b' AND analysis_run_id IS NOT NULL AND rowid NOT IN (
-                     SELECT MAX(rowid) FROM copy_candidate_scores
-                     WHERE provenance='phase_b' AND analysis_run_id IS NOT NULL
-                     GROUP BY target_wallet, analysis_run_id, provenance
+                   WHERE provenance='phase_b' AND analysis_run_id IS NOT NULL AND EXISTS (
+                     SELECT 1 FROM copy_candidate_scores AS newer
+                     WHERE newer.target_wallet=copy_candidate_scores.target_wallet
+                       AND newer.analysis_run_id=copy_candidate_scores.analysis_run_id
+                       AND newer.provenance='phase_b' AND (
+                         newer.calculated_at > copy_candidate_scores.calculated_at OR
+                         (newer.calculated_at=copy_candidate_scores.calculated_at AND newer.rowid > copy_candidate_scores.rowid)
+                       )
                    )"""
             )
             connection.execute(
@@ -408,53 +494,76 @@ class CopyTradeDatabase:
             connection.execute(
                 """INSERT INTO copy_discovery_runs(run_id, started_at, finished_at, status, sources_json, configuration_json,
                 wallets_seen, eligible_wallets, limit_deferred_wallets, new_wallets, existing_wallets_refreshed,
-                filtered_wallets, queued_for_analysis, errors_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                filtered_wallets, queued_for_analysis, errors_json, valid_events, normalized_observations,
+                duplicate_events, invalid_wallets, malformed_events, unsupported_records, fatal_source_errors)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (run.run_id, iso(run.started_at), iso(run.finished_at) if run.finished_at else None, run.status,
                  _dump(run.sources), _dump(run.configuration), run.wallets_seen, run.eligible_wallets,
                  run.limit_deferred_wallets, run.new_wallets, run.existing_wallets_refreshed,
-                 run.filtered_wallets, run.queued_for_analysis, _dump(run.errors)),
+                 run.filtered_wallets, run.queued_for_analysis, _dump(run.errors), run.valid_events,
+                 run.normalized_observations, run.duplicate_events, run.invalid_wallets, run.malformed_events,
+                 run.unsupported_records, run.fatal_source_errors),
             )
 
     def finish_discovery_run(
         self, run_id: str, *, status: str, errors: tuple[str, ...] = (), wallets_seen: int = 0,
         eligible_wallets: int = 0, limit_deferred_wallets: int = 0, new_wallets: int = 0,
         existing_wallets_refreshed: int = 0, filtered_wallets: int = 0, queued_for_analysis: int = 0,
+        valid_events: int = 0, normalized_observations: int = 0, duplicate_events: int = 0,
+        invalid_wallets: int = 0, malformed_events: int = 0, unsupported_records: int = 0,
+        fatal_source_errors: int = 0,
     ) -> None:
         with self._connect() as connection:
             connection.execute(
                 """UPDATE copy_discovery_runs SET finished_at=?, status=?, wallets_seen=?, eligible_wallets=?,
                 limit_deferred_wallets=?, new_wallets=?, existing_wallets_refreshed=?, filtered_wallets=?,
-                queued_for_analysis=?, errors_json=? WHERE run_id=?""",
+                queued_for_analysis=?, errors_json=?, valid_events=?, normalized_observations=?, duplicate_events=?,
+                invalid_wallets=?, malformed_events=?, unsupported_records=?, fatal_source_errors=? WHERE run_id=?""",
                 (iso(None), status, wallets_seen, eligible_wallets, limit_deferred_wallets, new_wallets,
-                 existing_wallets_refreshed, filtered_wallets, queued_for_analysis, _dump(errors), run_id),
+                 existing_wallets_refreshed, filtered_wallets, queued_for_analysis, _dump(errors), valid_events,
+                 normalized_observations, duplicate_events, invalid_wallets, malformed_events, unsupported_records,
+                 fatal_source_errors, run_id),
             )
+
+    @staticmethod
+    def new_discovery_stage_stats() -> DiscoveryStageStats:
+        return DiscoveryStageStats()
 
     def stage_discovery_observations(
         self, run_id: str, observations: Iterable[DiscoveryObservation], *, batch_size: int = 500,
-    ) -> int:
+        statistics: DiscoveryStageStats | None = None,
+    ) -> DiscoveryStageStats:
         """Append de-duplicated run evidence in bounded transactions before candidate selection."""
         if batch_size <= 0:
             raise ValueError("Discovery observation batch size must be positive.")
-        invalid_wallets = 0
+        statistics = statistics or DiscoveryStageStats()
         batch: list[tuple[Any, ...]] = []
 
         def flush() -> None:
             if not batch:
                 return
             with self._connect() as connection:
-                connection.executemany(
-                    """INSERT OR IGNORE INTO copy_discovery_observations(observation_id, run_id, wallet, source, observed_at,
-                    recent_activity_at, discovery_rank, source_score, metadata_json, raw_evidence_json, evidence_id, source_event_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    batch,
-                )
+                for row in batch:
+                    cursor = connection.execute(
+                        """INSERT OR IGNORE INTO copy_discovery_observations(observation_id, run_id, wallet, source, observed_at,
+                        recent_activity_at, discovery_rank, source_score, metadata_json, raw_evidence_json, evidence_id, source_event_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        row,
+                    )
+                    if cursor.rowcount == 0:
+                        statistics.duplicate_events += 1
             batch.clear()
 
         for observation in observations:
+            statistics.normalized_observations += 1
             wallet = observation.normalized_wallet()
             if not _is_wallet(wallet) or not observation.source:
-                invalid_wallets += 1
+                statistics.invalid_wallets += 1
+                statistics.rejections.append({
+                    "category": "invalid_wallet", "message": "Discovery observation has an invalid wallet or missing source.",
+                    "source": observation.source, "record_index": None, "event_index": None,
+                    "raw_record": observation.raw_evidence,
+                })
                 continue
             source_event_id = _discovery_source_event_id(observation)
             batch.append((
@@ -466,7 +575,35 @@ class CopyTradeDatabase:
             if len(batch) >= batch_size:
                 flush()
         flush()
-        return invalid_wallets
+        return statistics
+
+    def record_discovery_rejections(self, run_id: str, rejections: Iterable[object]) -> None:
+        rows: list[tuple[Any, ...]] = []
+        for rejection in rejections:
+            if isinstance(rejection, Mapping):
+                value = rejection
+            else:
+                value = {
+                    "category": getattr(rejection, "category", "malformed_event"),
+                    "message": getattr(rejection, "message", str(rejection)),
+                    "source": getattr(rejection, "source", None),
+                    "record_index": getattr(rejection, "record_index", None),
+                    "event_index": getattr(rejection, "event_index", None),
+                    "raw_record": getattr(rejection, "raw_record", {}),
+                }
+            rows.append((
+                run_id, str(value.get("category") or "malformed_event"), str(value.get("message") or "rejected discovery record"),
+                value.get("source"), value.get("record_index"), value.get("event_index"),
+                _dump(value.get("raw_record") or {}), iso(None),
+            ))
+        if not rows:
+            return
+        with self._connect() as connection:
+            connection.executemany(
+                """INSERT INTO copy_discovery_rejections(run_id, category, message, source, record_index, event_index,
+                raw_record_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                rows,
+            )
 
     def discard_discovery_observations(self, run_id: str) -> None:
         with self._connect() as connection:
@@ -474,7 +611,8 @@ class CopyTradeDatabase:
 
     def complete_discovery_run(
         self, run: DiscoveryRun, *, limit: int, min_activity: int, max_activity_age_seconds: float | None,
-        invalid_wallets: int = 0,
+        valid_events: int = 0, normalized_observations: int = 0, duplicate_events: int = 0,
+        invalid_wallets: int = 0, malformed_events: int = 0, unsupported_records: int = 0,
     ) -> DiscoverySummary:
         """Aggregate staged evidence without retaining the raw input in process memory."""
         cutoff = run.started_at.timestamp() - max_activity_age_seconds if max_activity_age_seconds is not None else None
@@ -486,6 +624,35 @@ class CopyTradeDatabase:
                 (run.run_id,),
             ).fetchall()
             aggregates = [dict(row) for row in rows]
+            # Stage A.1 statistics are intentionally computed from the staged,
+            # de-duplicated evidence rather than from mutable candidate state.
+            # This single run-scoped read avoids one query per candidate.
+            evidence_rows = connection.execute(
+                """SELECT wallet, source, recent_activity_at, source_score, metadata_json
+                   FROM copy_discovery_observations WHERE run_id=?""",
+                (run.run_id,),
+            ).fetchall()
+            evidence_by_wallet: dict[str, list[sqlite3.Row]] = {}
+            for evidence in evidence_rows:
+                evidence_by_wallet.setdefault(str(evidence["wallet"]), []).append(evidence)
+            cheap_stats_by_wallet: dict[str, dict[str, Any]] = {}
+            for wallet, evidence in evidence_by_wallet.items():
+                activity_times = [as_utc(item["recent_activity_at"]) for item in evidence if item["recent_activity_at"]]
+                metadata_values = [_load(item["metadata_json"], {}) for item in evidence]
+                symbols = {str(value.get("coin") or "").upper() for value in metadata_values if value.get("coin")}
+                cheap_stats_by_wallet[wallet] = {
+                    "distinct_observed_events": len(evidence),
+                    "distinct_active_hours": len({value.strftime("%Y-%m-%dT%H") for value in activity_times}),
+                    "distinct_active_days": len({value.date().isoformat() for value in activity_times}),
+                    "observation_span_hours": max(
+                        0.0, (max(activity_times) - min(activity_times)).total_seconds() / 3600,
+                    ) if len(activity_times) > 1 else 0.0,
+                    "distinct_symbols": len(symbols), "symbols": sorted(symbols),
+                    "approximate_observed_notional": sum(max(float(item["source_score"] or 0), 0.0) for item in evidence),
+                    "independent_source_count": len({str(item["source"]) for item in evidence}),
+                    "first_observed_activity": min(activity_times).isoformat() if activity_times else None,
+                    "last_observed_activity": max(activity_times).isoformat() if activity_times else None,
+                }
             eligible = [
                 row for row in aggregates
                 if int(row["activity_count"]) >= min_activity
@@ -504,7 +671,13 @@ class CopyTradeDatabase:
             eligible_wallets = len(eligible)
             limit_deferred_wallets = eligible_wallets - len(selected)
             filtered_wallets = wallets_seen - eligible_wallets
-            errors = (f"invalid_wallets_rejected:{invalid_wallets}",) if invalid_wallets else ()
+            errors = tuple(
+                f"{name}:{count}" for name, count in (
+                    ("duplicate_events", duplicate_events), ("invalid_wallets_rejected", invalid_wallets),
+                    ("malformed_events_rejected", malformed_events), ("unsupported_records_rejected", unsupported_records),
+                ) if count
+            )
+            status = "completed_with_warnings" if errors else "completed"
             new_wallets = 0
             existing_wallets_refreshed = 0
             queued_for_analysis = 0
@@ -524,6 +697,7 @@ class CopyTradeDatabase:
                         "SELECT DISTINCT source FROM copy_discovery_observations WHERE run_id=? AND wallet=?", (run.run_id, wallet)
                     ).fetchall()),
                     "latest_activity_observations": int(aggregate["activity_count"]),
+                    "cheap_stats": cheap_stats_by_wallet.get(wallet, {}),
                 }
                 if target is None:
                     connection.execute(
@@ -558,17 +732,21 @@ class CopyTradeDatabase:
                 if candidate_status in {TargetStatus.NEW.value, TargetStatus.QUEUED.value, TargetStatus.PENDING.value}:
                     queued_for_analysis += 1
             connection.execute(
-                """UPDATE copy_discovery_runs SET finished_at=?, status='completed', wallets_seen=?, eligible_wallets=?,
+                """UPDATE copy_discovery_runs SET finished_at=?, status=?, wallets_seen=?, eligible_wallets=?,
                 limit_deferred_wallets=?, new_wallets=?, existing_wallets_refreshed=?, filtered_wallets=?,
-                queued_for_analysis=?, errors_json=? WHERE run_id=?""",
-                (iso(None), wallets_seen, eligible_wallets, limit_deferred_wallets, new_wallets,
-                 existing_wallets_refreshed, filtered_wallets, queued_for_analysis, _dump(errors), run.run_id),
+                queued_for_analysis=?, errors_json=?, valid_events=?, normalized_observations=?, duplicate_events=?,
+                invalid_wallets=?, malformed_events=?, unsupported_records=?, fatal_source_errors=0 WHERE run_id=?""",
+                (iso(None), status, wallets_seen, eligible_wallets, limit_deferred_wallets, new_wallets,
+                 existing_wallets_refreshed, filtered_wallets, queued_for_analysis, _dump(errors), valid_events,
+                 normalized_observations, duplicate_events, invalid_wallets, malformed_events, unsupported_records, run.run_id),
             )
         return DiscoverySummary(
-            run_id=run.run_id, status="completed", sources=run.sources, wallets_seen=wallets_seen,
+            run_id=run.run_id, status=status, sources=run.sources, wallets_seen=wallets_seen,
             eligible_wallets=eligible_wallets, limit_deferred_wallets=limit_deferred_wallets,
             new_wallets=new_wallets, existing_wallets_refreshed=existing_wallets_refreshed,
             filtered_wallets=filtered_wallets, queued_for_analysis=queued_for_analysis, errors=errors,
+            valid_events=valid_events, normalized_observations=normalized_observations, duplicate_events=duplicate_events,
+            invalid_wallets=invalid_wallets, malformed_events=malformed_events, unsupported_records=unsupported_records,
         )
 
     def list_discovery_candidates(self, *, limit: int = 100, source: str | None = None) -> list[dict[str, Any]]:
@@ -733,6 +911,126 @@ class CopyTradeDatabase:
             "rejected": len(rejected), "deferred": len(deferred),
         }
 
+    def analysis_funnel(
+        self, run_id: str, *, high_suitability_score: float, config_fingerprint: str | None = None,
+    ) -> dict[str, dict[str, float | int]]:
+        """Durable funnel projection for an immutable analysis run."""
+        counters = self.analysis_run_counters(run_id)
+        with self._connect() as connection:
+            quarantined = int(connection.execute(
+                """SELECT COUNT(DISTINCT wallet) FROM copy_analysis_run_wallet_events
+                   WHERE run_id=? AND stage='backfill' AND status='quarantined'""", (run_id,),
+            ).fetchone()[0])
+            high_suitability = int(connection.execute(
+                """SELECT COUNT(*) FROM copy_candidate_scores
+                   WHERE provenance='phase_b' AND analysis_run_id=? AND eligible=1 AND total_score>=?""",
+                (run_id, high_suitability_score),
+            ).fetchone()[0])
+            selection_query = """SELECT COUNT(*) FROM copy_analysis_finalist_recommendations
+                                 WHERE analysis_run_id=? AND selection_rank IS NOT NULL"""
+            selection_values: list[Any] = [run_id]
+            if config_fingerprint is not None:
+                selection_query += " AND config_fingerprint=?"
+                selection_values.append(config_fingerprint)
+            diversification_selected = int(connection.execute(selection_query, selection_values).fetchone()[0])
+        observed = int(counters["wallets_considered"])
+        stages = {
+            "wallets_observed": observed,
+            "cheap_eligible": max(0, observed - int(counters["cheap_rejected"])),
+            "cheap_rejected": int(counters["cheap_rejected"]),
+            "backfill_attempted": int(counters["backfill_attempted"]),
+            "coverage_quarantined": quarantined,
+            "reconstructed": int(counters["reconstructed"]),
+            "scored": int(counters["scored"]),
+            "eligible": int(counters["eligible"]),
+            "high_suitability": high_suitability,
+            "diversification_selected": diversification_selected,
+            "shadow_finalists": diversification_selected,
+        }
+        return {
+            name: {"count": count, "percent_of_observed": 100.0 * count / observed if observed else 0.0}
+            for name, count in stages.items()
+        }
+
+    def get_analysis_market_evidence(
+        self, analysis_run_id: str, symbol: str, bucket_timestamp: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT symbol, bucket_timestamp, price, source, quality, market_timestamp AS timestamp,
+                          requested_for_timestamp, resolution
+                   FROM copy_analysis_market_evidence
+                   WHERE analysis_run_id=? AND symbol=? AND bucket_timestamp=?""",
+                (analysis_run_id, symbol.upper(), bucket_timestamp),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def insert_analysis_market_evidence(self, analysis_run_id: str, evidence: Mapping[str, object]) -> dict[str, Any]:
+        """Persist the first selected market observation; never rewrite it in a completed run."""
+        symbol = str(evidence["symbol"]).upper()
+        bucket = str(evidence["bucket_timestamp"])
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO copy_analysis_market_evidence(
+                    analysis_run_id, symbol, bucket_timestamp, price, source, quality, market_timestamp,
+                    requested_for_timestamp, resolution, recorded_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (analysis_run_id, symbol, bucket, evidence.get("price"), str(evidence.get("source") or "unavailable"),
+                 str(evidence.get("quality") or "missing_historical_price"), evidence.get("timestamp"),
+                 str(evidence.get("requested_for_timestamp") or bucket), str(evidence.get("resolution") or "unspecified"), iso(None)),
+            )
+            row = connection.execute(
+                """SELECT symbol, bucket_timestamp, price, source, quality, market_timestamp AS timestamp,
+                          requested_for_timestamp, resolution
+                   FROM copy_analysis_market_evidence
+                   WHERE analysis_run_id=? AND symbol=? AND bucket_timestamp=?""",
+                (analysis_run_id, symbol, bucket),
+            ).fetchone()
+        assert row is not None
+        return dict(row)
+
+    def upsert_finalist_recommendations(
+        self, config_fingerprint: str, recommendations: Iterable[Mapping[str, object]],
+    ) -> None:
+        """Persist recommendation-only finalist evidence without changing any target state or score."""
+        with self._connect() as connection:
+            for item in recommendations:
+                connection.execute(
+                    """INSERT INTO copy_analysis_finalist_recommendations(
+                        analysis_run_id, config_fingerprint, wallet, finalist_eligible,
+                        finalist_rejection_reasons_json, diversification_penalty, final_selection_score,
+                        selection_rank, evaluated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(analysis_run_id, config_fingerprint, wallet) DO UPDATE SET
+                         finalist_eligible=excluded.finalist_eligible,
+                         finalist_rejection_reasons_json=excluded.finalist_rejection_reasons_json,
+                         diversification_penalty=excluded.diversification_penalty,
+                         final_selection_score=excluded.final_selection_score,
+                         selection_rank=excluded.selection_rank,
+                         evaluated_at=excluded.evaluated_at""",
+                    (str(item["analysis_run_id"]), config_fingerprint, str(item["wallet"]).lower(),
+                     int(bool(item.get("finalist_eligible"))), _dump(item.get("finalist_rejection_reasons", ())),
+                     item.get("diversification_penalty"), item.get("final_selection_score"), item.get("selection_rank"), iso(None)),
+                )
+
+    def get_finalist_recommendation(
+        self, analysis_run_id: str | None, config_fingerprint: str, wallet: str,
+    ) -> dict[str, Any] | None:
+        if not analysis_run_id:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT * FROM copy_analysis_finalist_recommendations
+                   WHERE analysis_run_id=? AND config_fingerprint=? AND wallet=?""",
+                (analysis_run_id, config_fingerprint, wallet.lower()),
+            ).fetchone()
+        if not row:
+            return None
+        value = dict(row)
+        value["finalist_eligible"] = bool(value["finalist_eligible"])
+        value["finalist_rejection_reasons"] = _load(value.pop("finalist_rejection_reasons_json"), [])
+        return value
+
     def get_analysis_wallet(self, run_id: str, wallet: str) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -789,22 +1087,31 @@ class CopyTradeDatabase:
         query = """SELECT candidate.*, target.status AS current_status, analysis.lifecycle_status,
                    analysis.last_run_id AS analysis_run_id, analysis.completed_at AS analysis_completed_at,
                    analysis.prefilter_reasons_json, analysis.errors_json, analysis.summary_json,
-                   score.total_score, score.eligible AS score_eligible, score.reasons_json,
-                   phase_score.config_fingerprint AS candidate_config_fingerprint
+                   phase_score.total_score, phase_score.eligible AS score_eligible, phase_score.reasons_json,
+                   phase_score.provenance AS score_provenance, phase_score.analysis_run_id AS score_analysis_run_id,
+                   phase_score.config_fingerprint AS candidate_config_fingerprint, phase_score.confidence_score,
+                   phase_score.hard_gates_json, phase_score.score_version,
+                   legacy_score.total_score AS legacy_total_score, legacy_score.eligible AS legacy_score_eligible,
+                   legacy_score.reasons_json AS legacy_reasons_json, legacy_score.calculated_at AS legacy_calculated_at
                    FROM copy_discovery_candidates candidate
                    JOIN copy_targets target ON target.wallet=candidate.wallet
                    LEFT JOIN copy_candidate_analyses analysis ON analysis.wallet=candidate.wallet
-                   LEFT JOIN copy_candidate_scores score ON score.target_wallet=candidate.wallet
-                     AND score.calculated_at=(SELECT MAX(calculated_at) FROM copy_candidate_scores WHERE target_wallet=candidate.wallet)
                    LEFT JOIN copy_candidate_scores phase_score ON phase_score.target_wallet=candidate.wallet
                      AND phase_score.analysis_run_id=analysis.last_run_id AND phase_score.provenance='phase_b'
-                     AND phase_score.rowid=(SELECT MAX(current_score.rowid) FROM copy_candidate_scores current_score
+                     AND phase_score.rowid=(SELECT current_score.rowid FROM copy_candidate_scores current_score
                                             WHERE current_score.target_wallet=candidate.wallet
                                               AND current_score.analysis_run_id=analysis.last_run_id
-                                              AND current_score.provenance='phase_b')"""
+                                              AND current_score.provenance='phase_b'
+                                            ORDER BY current_score.calculated_at DESC, current_score.rowid DESC LIMIT 1)
+                   LEFT JOIN copy_candidate_scores legacy_score ON legacy_score.target_wallet=candidate.wallet
+                     AND legacy_score.provenance<>'phase_b'
+                     AND legacy_score.rowid=(SELECT current_legacy.rowid FROM copy_candidate_scores current_legacy
+                                              WHERE current_legacy.target_wallet=candidate.wallet
+                                                AND current_legacy.provenance<>'phase_b'
+                                              ORDER BY current_legacy.calculated_at DESC, current_legacy.rowid DESC LIMIT 1)"""
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY score.total_score DESC NULLS LAST, candidate.recent_activity_at DESC, candidate.wallet LIMIT ?"
+        query += " ORDER BY phase_score.total_score DESC NULLS LAST, candidate.recent_activity_at DESC, candidate.wallet LIMIT ?"
         values.append(limit)
         with self._connect() as connection:
             rows = connection.execute(query, values).fetchall()
@@ -815,6 +1122,8 @@ class CopyTradeDatabase:
             value["analysis_errors"] = _load(value.pop("errors_json", None), [])
             value["analysis_summary"] = _load(value.pop("summary_json", None), {})
             value["score_reasons"] = _load(value.pop("reasons_json", None), [])
+            value["score_hard_gates"] = _load(value.pop("hard_gates_json", None), [])
+            value["legacy_score_reasons"] = _load(value.pop("legacy_reasons_json", None), [])
             result.append(value)
         return result
 
@@ -1042,37 +1351,41 @@ class CopyTradeDatabase:
             values = (
                 score.target_wallet, iso(score.calculated_at), score.total_score, _dump(score.component_scores),
                 _dump(score.penalties), int(score.eligible), _dump(score.reasons), score.source_quality,
-                score.provenance, score.analysis_run_id, score.config_fingerprint,
+                score.provenance, score.analysis_run_id, score.config_fingerprint, score.confidence_score,
+                _dump(score.hard_gates), score.score_version,
             )
             if score.provenance == "phase_b" and score.analysis_run_id:
                 connection.execute(
                     """INSERT INTO copy_candidate_scores(target_wallet, calculated_at, total_score,
                     component_scores_json, penalties_json, eligible, reasons_json, source_quality,
-                    provenance, analysis_run_id, config_fingerprint)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    provenance, analysis_run_id, config_fingerprint, confidence_score, hard_gates_json, score_version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(target_wallet, analysis_run_id, provenance)
                     WHERE provenance='phase_b' AND analysis_run_id IS NOT NULL DO UPDATE SET
                       calculated_at=excluded.calculated_at, total_score=excluded.total_score,
                       component_scores_json=excluded.component_scores_json, penalties_json=excluded.penalties_json,
                       eligible=excluded.eligible, reasons_json=excluded.reasons_json,
-                      source_quality=excluded.source_quality, config_fingerprint=excluded.config_fingerprint""",
+                      source_quality=excluded.source_quality, config_fingerprint=excluded.config_fingerprint,
+                      confidence_score=excluded.confidence_score, hard_gates_json=excluded.hard_gates_json,
+                      score_version=excluded.score_version""",
                     values,
                 )
             else:
                 connection.execute(
                     """INSERT OR REPLACE INTO copy_candidate_scores(target_wallet, calculated_at, total_score,
                     component_scores_json, penalties_json, eligible, reasons_json, source_quality,
-                    provenance, analysis_run_id, config_fingerprint)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    provenance, analysis_run_id, config_fingerprint, confidence_score, hard_gates_json, score_version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     values,
                 )
 
     def latest_scores(self) -> list[CandidateScore]:
         with self._connect() as connection:
             rows = connection.execute(
-                """SELECT s.* FROM copy_candidate_scores s JOIN (
-                       SELECT target_wallet, MAX(calculated_at) calculated_at FROM copy_candidate_scores GROUP BY target_wallet
-                   ) newest ON newest.target_wallet=s.target_wallet AND newest.calculated_at=s.calculated_at
+                """SELECT s.* FROM copy_candidate_scores s
+                   WHERE s.rowid=(SELECT current_score.rowid FROM copy_candidate_scores current_score
+                                  WHERE current_score.target_wallet=s.target_wallet
+                                  ORDER BY current_score.calculated_at DESC, current_score.rowid DESC LIMIT 1)
                    ORDER BY s.total_score DESC, s.target_wallet"""
             ).fetchall()
         return [
@@ -1081,7 +1394,31 @@ class CopyTradeDatabase:
                            penalties=_load(row["penalties_json"], {}), eligible=bool(row["eligible"]),
                            reasons=tuple(_load(row["reasons_json"], [])), source_quality=float(row["source_quality"]),
                            provenance=str(row["provenance"] or "legacy"), analysis_run_id=row["analysis_run_id"],
-                           config_fingerprint=row["config_fingerprint"])
+                           config_fingerprint=row["config_fingerprint"], confidence_score=float(row["confidence_score"] or 0),
+                           hard_gates=tuple(_load(row["hard_gates_json"], [])), score_version=str(row["score_version"] or "phase_b_suitability_v3"))
+            for row in rows
+        ]
+
+    def latest_legacy_scores(self) -> list[CandidateScore]:
+        """Latest research-only score per wallet, explicitly excluding Phase B evidence."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT score.* FROM copy_candidate_scores score
+                   WHERE score.provenance<>'phase_b'
+                     AND score.rowid=(SELECT current_score.rowid FROM copy_candidate_scores current_score
+                                      WHERE current_score.target_wallet=score.target_wallet
+                                        AND current_score.provenance<>'phase_b'
+                                      ORDER BY current_score.calculated_at DESC, current_score.rowid DESC LIMIT 1)
+                   ORDER BY score.total_score DESC, score.target_wallet"""
+            ).fetchall()
+        return [
+            CandidateScore(target_wallet=row["target_wallet"], calculated_at=as_utc(row["calculated_at"]),
+                           total_score=float(row["total_score"]), component_scores=_load(row["component_scores_json"], {}),
+                           penalties=_load(row["penalties_json"], {}), eligible=bool(row["eligible"]),
+                           reasons=tuple(_load(row["reasons_json"], [])), source_quality=float(row["source_quality"]),
+                           provenance=str(row["provenance"] or "legacy"), analysis_run_id=row["analysis_run_id"],
+                           config_fingerprint=row["config_fingerprint"], confidence_score=float(row["confidence_score"] or 0),
+                           hard_gates=tuple(_load(row["hard_gates_json"], [])), score_version=str(row["score_version"] or "phase_b_suitability_v3"))
             for row in rows
         ]
 
@@ -1099,10 +1436,11 @@ class CopyTradeDatabase:
                    WHERE analysis.lifecycle_status='qualified' AND analysis.completed_at IS NOT NULL
                      AND run.status IN ('completed', 'completed_with_errors')
                      AND target.status NOT IN ('muted', 'rejected', 'active') AND score.eligible=1
-                     AND score.rowid=(SELECT MAX(current_score.rowid) FROM copy_candidate_scores current_score
+                     AND score.rowid=(SELECT current_score.rowid FROM copy_candidate_scores current_score
                                       WHERE current_score.target_wallet=score.target_wallet
                                         AND current_score.analysis_run_id=score.analysis_run_id
-                                        AND current_score.provenance='phase_b')""" + fingerprint_clause +
+                                        AND current_score.provenance='phase_b'
+                                      ORDER BY current_score.calculated_at DESC, current_score.rowid DESC LIMIT 1)""" + fingerprint_clause +
                 " ORDER BY score.total_score DESC, score.target_wallet",
                 values,
             ).fetchall()
@@ -1113,6 +1451,8 @@ class CopyTradeDatabase:
                 eligible=bool(row["eligible"]), reasons=tuple(_load(row["reasons_json"], [])),
                 source_quality=float(row["source_quality"]), provenance=str(row["provenance"] or "legacy"),
                 analysis_run_id=row["analysis_run_id"], config_fingerprint=row["config_fingerprint"],
+                confidence_score=float(row["confidence_score"] or 0), hard_gates=tuple(_load(row["hard_gates_json"], [])),
+                score_version=str(row["score_version"] or "phase_b_suitability_v3"),
             )
             for row in rows
         ]

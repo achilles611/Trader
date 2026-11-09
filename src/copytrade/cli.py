@@ -68,6 +68,11 @@ def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
 
     rank = command("copy-rank", "Rank eligible candidates and choose a lower-correlation target set.")
     rank.add_argument("--count", type=int, default=7, help="Maximum selected targets (default: 7).")
+    rank.add_argument("--output", help="Optional path for canonical finalist JSON.")
+
+    suitability = command("copy-suitability-report", "Show the stored deterministic suitability evidence for one wallet.")
+    suitability.add_argument("--wallet", required=True, help="Discovered public wallet to inspect; this never changes status.")
+    suitability.add_argument("--output", help="Optional path for the report JSON.")
 
     approve = command("copy-approve", "Approve a target for paper-mode websocket monitoring.")
     approve.add_argument("--wallet", required=True)
@@ -129,6 +134,10 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
             "eligible_wallets": summary.eligible_wallets, "limit_deferred_wallets": summary.limit_deferred_wallets,
             "new_candidates": summary.new_wallets, "existing_refreshed": summary.existing_wallets_refreshed,
             "filtered": summary.filtered_wallets, "queued_for_analysis": summary.queued_for_analysis,
+            "valid_events": summary.valid_events, "normalized_observations": summary.normalized_observations,
+            "duplicate_events": summary.duplicate_events, "invalid_wallets": summary.invalid_wallets,
+            "malformed_events": summary.malformed_events, "unsupported_records": summary.unsupported_records,
+            "fatal_source_errors": summary.fatal_source_errors,
             "errors": summary.errors,
         }
         if args.output:
@@ -182,15 +191,30 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
         fingerprint = _config_fingerprint(config.snapshot())
         phase_b_scores = service.database.phase_b_qualified_scores(config_fingerprint=fingerprint)
         finalists = pipeline.shadow_finalists(count=args.count)
-        _print({
+        payload = {
             "ranked_phase_b": [_score_payload(score) for score in phase_b_scores],
             "selected": finalists,
             "shadow_finalists": finalists,
             "current_config_fingerprint": fingerprint,
             "stale_qualified_candidates": service.database.count_stale_qualified_candidates(fingerprint),
-            "legacy_scores": [_score_payload(score) for score in service.database.latest_scores()],
+            "legacy_scores": [_score_payload(score) for score in service.database.latest_legacy_scores()],
             "legacy_scores_label": "research_compatibility_only",
-        })
+        }
+        if getattr(args, "output", None):
+            output = Path(args.output)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(dumps(payload, indent=2, default=str), encoding="utf-8")
+            payload["output"] = str(output)
+        _print(payload)
+        return 0
+    if command == "copy-suitability-report":
+        payload = CandidateAnalysisPipeline(service).suitability_report(args.wallet)
+        if args.output:
+            output = Path(args.output)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(dumps(payload, indent=2, default=str), encoding="utf-8")
+            payload["output"] = str(output)
+        _print(payload)
         return 0
     if command in {"copy-approve", "copy-reject"}:
         service.set_status(args.wallet, "approved" if command == "copy-approve" else "rejected")
@@ -264,6 +288,9 @@ def _score_payload(score: Any) -> dict[str, Any]:
         "reasons": score.reasons, "provenance": getattr(score, "provenance", "legacy"),
         "analysis_run_id": getattr(score, "analysis_run_id", None),
         "config_fingerprint": getattr(score, "config_fingerprint", None),
+        "confidence_score": getattr(score, "confidence_score", 0.0),
+        "hard_gates": getattr(score, "hard_gates", ()),
+        "score_version": getattr(score, "score_version", None),
     }
 
 

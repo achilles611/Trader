@@ -91,11 +91,47 @@ candidates:
   max_follower_drawdown_preferred: 0.15
   max_follower_drawdown_hard: 0.30
   liquidation_frequency_hard: 0.10
+  minimum_copyability_hard: 0.05
+  pnl_concentration_preferred: 0.50
+  pnl_concentration_hard: 0.95
   profit_factor_preferred: 1.40
   require_positive_expectancy: true
   require_positive_follower_expectancy: true
   activity_max_age_days: 30
   require_proven_history: false
+
+# Stage A.2 gates run before expensive public historical acquisition. Zero keeps
+# a dimension informational while preserving it in the discovery evidence.
+prefilter:
+  min_activity_observations: 2
+  min_distinct_active_days: 1
+  min_distinct_active_hours: 1
+  min_observation_span_hours: 0
+  min_observed_notional: 0
+  min_distinct_symbols: 1
+  exclude_operator_managed: true
+
+confidence:
+  closed_campaigns_reference: 100
+  active_days_reference: 30
+  history_days_reference: 180
+  walk_forward_windows_reference: 4
+  # Directional and volatility are the two independent regime dimensions.
+  regimes_reference: 2
+
+regimes:
+  enabled: true
+  volatility_move_threshold: 0.03
+  minimum_campaigns_per_regime: 3
+
+# Finalist selection is stricter than the exploratory per-wallet estimate.
+# These gates never overwrite the stored Phase-B suitability score.
+finalist_requirements:
+  minimum_confidence_score: 60
+  require_copyability_evidence: true
+  require_walk_forward_evidence: false
+  require_latency_evidence: false
+  require_regime_evidence: false
 
 # Phase B candidate-analysis orchestration remains public-data research only.
 analysis:
@@ -106,6 +142,10 @@ analysis:
   min_discovery_activity: 2
   shadow_finalist_count: 20
   walk_forward_min_windows: 2
+  high_suitability_score: 70
+  # Public one-minute candle-close evidence is an immutable coarse proxy, not L2.
+  market_evidence_enabled: true
+  market_evidence_bucket_seconds: 60
 
 artifacts: {}
 

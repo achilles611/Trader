@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.copytrade.analysis import CandidateAnalysisPipeline, _config_fingerprint, _copyability, _walk_forward_evidence
-from src.copytrade.config import AnalysisConfig, ArtifactConfig, CandidateConfig, CopyTradeConfig, PaperExecutionConfig, RiskConfig, SizingConfig
+from src.copytrade.config import AnalysisConfig, ArtifactConfig, CandidateConfig, CopyTradeConfig, FinalistRequirementsConfig, PaperExecutionConfig, RiskConfig, SizingConfig
 from src.copytrade.discovery import DiscoveryPipeline
 from src.copytrade.hyperliquid import BackfillCoverage
 from src.copytrade.models import AnalysisRun, CandidateAnalysis, CandidateScore, DiscoveryObservation, RawFill, as_utc, utc_now
@@ -45,7 +45,8 @@ def config(root: Path) -> CopyTradeConfig:
                                    require_positive_expectancy=False, require_positive_follower_expectancy=False,
                                    activity_max_age_days=30),
         analysis=AnalysisConfig(default_workers=2, retry_attempts=2, retry_initial_seconds=0, history_days=90,
-                                min_discovery_activity=1, shadow_finalist_count=2),
+                                min_discovery_activity=1, shadow_finalist_count=2, market_evidence_enabled=False),
+        finalist_requirements=FinalistRequirementsConfig(minimum_confidence_score=0, require_copyability_evidence=False),
     )
 
 
@@ -431,6 +432,17 @@ class PhaseBAnalysisTests(unittest.TestCase):
             self.assertEqual(count, 1)
             current = service.database.phase_b_qualified_scores(config_fingerprint=fingerprint)
             self.assertEqual([(score.target_wallet, score.total_score) for score in current], [(GOOD, 60.0)])
+            # A later legacy/research score is visible separately but cannot
+            # create a hybrid candidate row with Phase B provenance/config.
+            service.database.upsert_candidate_score(CandidateScore(
+                GOOD, utc_now() + timedelta(seconds=1), 999, {"legacy": 1}, {}, True,
+            ))
+            candidate = service.database.list_analysis_candidates(wallets=[GOOD], limit=1)[0]
+            self.assertEqual((candidate["total_score"], candidate["score_provenance"], candidate["score_analysis_run_id"]),
+                             (60.0, "phase_b", "analysis_authoritative"))
+            self.assertEqual(candidate["candidate_config_fingerprint"], fingerprint)
+            self.assertEqual((candidate["legacy_total_score"], candidate["legacy_score_reasons"]), (999.0, []))
+            self.assertEqual([(score.target_wallet, score.total_score) for score in service.database.latest_legacy_scores()], [(GOOD, 999.0)])
             pipeline = CandidateAnalysisPipeline(service)
             finalist_wallets = [item["wallet"] for item in pipeline.shadow_finalists()]
             self.assertEqual(finalist_wallets, [GOOD])
@@ -466,6 +478,27 @@ class PhaseBAnalysisTests(unittest.TestCase):
             outcome = pipeline._retry_backfill(GOOD, start, end)
             self.assertEqual((outcome[1], outcome[3]), (1, None))
             self.assertIn("known_incomplete", pipeline._cheap_prefilter(candidate, start, end))
+
+    def test_default_backfill_and_callback_always_receive_immutable_required_end(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            service.import_wallets([GOOD])
+            start = FILL_AT
+            end = FILL_AT + timedelta(minutes=10)
+            service.database.insert_raw_fills(fills(GOOD))
+            captured: list[tuple[object, object]] = []
+            def service_backfill(wallet: str, *, start: object, end: object) -> dict[str, object]:
+                captured.append((start, end))
+                return {"new_raw_fills": 0}
+            service.backfill_for_analysis = service_backfill  # type: ignore[method-assign]
+            CandidateAnalysisPipeline(service)._default_backfill(GOOD, start, end)
+            self.assertEqual(captured[0][1], end)
+            callback_bounds: list[tuple[object, object]] = []
+            def callback(wallet: str, requested_start: object, requested_end: object) -> dict[str, object]:
+                callback_bounds.append((requested_start, requested_end))
+                return {"new_raw_fills": 0}
+            CandidateAnalysisPipeline(service, backfill_wallet=callback)._retry_backfill(GOOD, start, end)
+            self.assertEqual(callback_bounds, [(start, end)])
 
     def test_copy_rank_selected_is_canonical_phase_b_finalists(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
