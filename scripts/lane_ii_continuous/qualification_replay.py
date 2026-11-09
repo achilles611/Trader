@@ -821,7 +821,7 @@ class ProspectiveReplay(retained.StudyReplay):
         return result
 
 
-def verify_initial_risk(context, risk_module):
+def verify_initial_risk(context, risk_module, *, require_terminal=True):
     prereg, sources = context["preregistration"], context["sources"]
     initial = prereg["paper_risk_initial_state"]
     anchor, anchor_sha = prereg["paper_risk_anchor"], prereg["paper_risk_anchor_sha256"]
@@ -837,15 +837,31 @@ def verify_initial_risk(context, risk_module):
         require(risk_module.digest(expected) == anchor["genesis_state_sha256"], "RISK_GENESIS_OR_FRESH_ACCOUNT_RESET")
     else:
         endpoint = initial["last_terminal"]
-        previous = Path(endpoint["receipt_path"]).resolve()
+        crashed = endpoint.get("kind") == "CRASH_HANDOFF"
+        previous = Path(endpoint["handoff_path"] if crashed else endpoint["receipt_path"]).resolve()
         source = binding(previous, 8 * MIB)
-        require(source["sha256"] == endpoint["receipt_sha256"], "PREDECESSOR_RISK_RECEIPT_CHANGED")
+        require(source["sha256"] == endpoint["handoff_sha256" if crashed else "receipt_sha256"], "PREDECESSOR_RISK_RECEIPT_CHANGED")
         prior = load(previous)
-        expected = deepcopy(prior["paper_risk_terminal_state"])
-        expected.update(phase="ACTIVE", segment_id=initial["segment_id"], last_terminal=endpoint,
-                        carry_accounts=prior["account_carryover"])
+        if crashed:
+            helper_path = context["candidate"] / "continuous_capture_checkpoint.py"
+            require("continuous_capture_checkpoint.py" in context["manifest"]["files"], "FROZEN_CRASH_VALIDATOR_REQUIRED")
+            helper = sys.modules["next12_imports"].bound_module("continuous_capture_checkpoint", helper_path)
+            validated = helper.validate_crash_handoff(previous, anchor_sha)
+            require(validated["valid"] is True and validated["qualified"] is False and validated["flat"] is True
+                    and validated["closed_state"]["last_terminal"] == endpoint
+                    and context["start"] >= validated["restart_not_before_epoch"]
+                    and context["cutoff"] == validated["fixed_cutoff_epoch"], "CRASH_PREDECESSOR_FIXED_CONTINUITY")
+            expected = deepcopy(validated["closed_state"])
+            expected.update(phase="ACTIVE", segment_id=initial["segment_id"])
+            require(prereg.get("paper_risk_initial_action_cursor") == prior["paper_risk_action_cursor"], "CRASH_PREDECESSOR_ACTION_CURSOR")
+        else:
+            expected = deepcopy(prior["paper_risk_terminal_state"])
+            expected.update(phase="ACTIVE", segment_id=initial["segment_id"], last_terminal=endpoint,
+                            carry_accounts=prior["account_carryover"])
         require(expected == initial, "PREDECESSOR_RISK_AND_ACCOUNT_CONTINUITY_MISMATCH")
-        sources["previous_risk_receipt"] = source
+        sources["previous_crash_handoff" if crashed else "previous_risk_receipt"] = source
+    if not require_terminal:
+        return None
     closure_path = context["run_dir"] / "RISK_CLOSURE.json"
     sources["risk_closure"] = binding(closure_path, 8 * MIB)
     closure = risk_module.validate_closure(context["run_dir"], anchor_sha)
@@ -857,7 +873,9 @@ def risk_result(engine, receipt, closure):
     risk = engine.risk_module
     require(engine.risk.state == receipt["paper_risk_terminal_state"]
             and risk.snapshot(engine.risk.state) == receipt["paper_risk"], "TERMINAL_INDEPENDENT_RISK_STATE_MISMATCH")
-    require(canonical(engine.source_risk_actions) == canonical(engine.risk.actions), "COMPLETE_RISK_ACTION_PARITY_REQUIRED")
+    require(len(engine.source_risk_actions) == len(engine.risk.actions)
+            and all(canonical(left) == canonical(right) for left, right in zip(engine.source_risk_actions, engine.risk.actions)),
+            "COMPLETE_RISK_ACTION_PARITY_REQUIRED")
     carry = engine.decision_module.account_carryover(list(engine.profiles.values()), engine.controller.initial_accounts)
     require(carry == receipt["account_carryover"], "TERMINAL_ACCOUNT_CARRYOVER_PARITY_REQUIRED")
     reservations = engine.risk.state["reservations"]

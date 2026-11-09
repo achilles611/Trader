@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lane II paper qualification</title>
+<style>
+  :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #101522; color: #edf2fb; }
+  body { max-width: 65rem; margin: 2rem auto; padding: 0 1rem; }
+  section { background: #1b2334; border-radius: .55rem; padding: 1rem 1.25rem; margin: 1rem 0; }
+  h1 { margin-bottom: .25rem; }
+  h2 { margin: 0 0 .75rem; font-size: 1.12rem; }
+  p { margin: .5rem 0; }
+  .muted { color: #b4bfd4; }
+  .crash { color: #ff7d85; }
+  svg { width: 100%; height: auto; display: block; overflow: visible; }
+  table { width: 100%; border-collapse: collapse; text-align: left; }
+  th, td { padding: .45rem .7rem .45rem 0; border-bottom: 1px solid #384156; }
+</style>
+<main>
+  <h1>Lane II paper qualification</h1>
+  <p id="window" class="muted">Waiting for the scheduled window.</p>
+  <section aria-live="polite">
+    <h2 id="phase">Awaiting first dashboard refresh</h2>
+    <p id="freshness" class="muted"></p>
+    <p id="replay"></p>
+    <p id="hold"></p>
+    <p id="risk"></p>
+  </section>
+  <section>
+    <h2>Paper results at scheduled checkpoints</h2>
+    <svg id="graph" viewBox="0 0 940 248" role="img" aria-label="Paper results with a red X at each interruption"></svg>
+    <p class="muted">P13 in blue. P2 in gold. Red X marks an interruption at the recorded time. Lines break across missing checkpoints.</p>
+    <p id="crash-count" class="crash"></p>
+    <ol id="crashes"></ol>
+  </section>
+  <section>
+    <h2>Current paper accounts</h2>
+    <table><thead><tr><th>Profile</th><th>Realized net</th><th>Entries</th><th>Open positions</th></tr></thead>
+    <tbody id="profiles"></tbody></table>
+    <p id="research" class="muted"></p>
+  </section>
+</main>
+<script>
+  const byId = id => document.getElementById(id);
+  const money = amount => Number.isFinite(amount) ? `$${amount.toFixed(2)}` : '—';
+  const local = new Intl.DateTimeFormat('en-US', {timeZone:'America/Denver', month:'short', day:'numeric', hour:'numeric', minute:'2-digit', second:'2-digit', timeZoneName:'short'});
+  const readable = value => local.format(new Date(value));
+  const svgNs = 'http://www.w3.org/2000/svg';
+  const colors = {'5m-P13':'#77baff', '5m-P2':'#f6cb72'};
+  function graphic(parent, name, attributes, label) {
+    const node = document.createElementNS(svgNs, name);
+    for (const [key,value] of Object.entries(attributes)) node.setAttribute(key,value);
+    if (label) node.textContent = label;
+    parent.append(node);
+    return node;
+  }
+  function plot(data) {
+    const svg = byId('graph');
+    svg.replaceChildren();
+    const {start_epoch:start,cutoff_epoch:end} = data.plan;
+    const amounts = data.history.flatMap(row => row.profiles.map(profile => profile.realized_net)).filter(Number.isFinite);
+    const low = Math.min(-1,...amounts), high = Math.max(1,...amounts);
+    const x = epoch => 72 + Math.min(1,Math.max(0,(epoch-start)/(end-start))) * 846;
+    const y = amount => 192 - ((amount-low)/(high-low))*148;
+    graphic(svg,'path',{d:`M72 36 V196 H920 M72 ${y(0)} H920`,stroke:'#697991',fill:'none'});
+    graphic(svg,'text',{x:4,y:y(high)+4,fill:'#b4bfd4'},money(high));
+    graphic(svg,'text',{x:4,y:y(low)+4,fill:'#b4bfd4'},money(low));
+    graphic(svg,'text',{x:72,y:228,fill:'#b4bfd4'},readable(start*1000));
+    graphic(svg,'text',{x:918,y:228,fill:'#b4bfd4','text-anchor':'end'},readable(end*1000));
+    for (const [id,color] of Object.entries(colors)) {
+      let last = null;
+      for (const row of data.history) {
+        const point = row.profiles.find(profile=>profile.id===id);
+        if (!row.healthy || !Number.isFinite(point?.realized_net)) { last = null; continue; }
+        const position = [x(row.epoch),y(point.realized_net)];
+        if (last && row.epoch-last.epoch===900) {
+          graphic(svg,'line',{x1:last.position[0],y1:last.position[1],x2:position[0],y2:position[1],stroke:color,'stroke-width':2});
+        }
+        graphic(svg,'circle',{cx:position[0],cy:position[1],r:2.7,fill:color});
+        last = {epoch:row.epoch,position};
+      }
+    }
+    for (const crash of data.crashes) {
+      const position = x(Date.parse(crash.utc)/1000);
+      graphic(svg,'line',{x1:position,y1:35,x2:position,y2:194,stroke:'#a93b50','stroke-dasharray':'3 5'});
+      const marker = graphic(svg,'path',{d:`M${position-6} 20 l12 12 m0 -12 l-12 12`,stroke:'#ff606c','stroke-width':3.5});
+      graphic(marker,'title',{},`${readable(crash.utc)} ${crash.component} ${crash.reason}`);
+    }
+  }
+  function render(data) {
+    byId('window').textContent = `${readable(data.plan.start_epoch*1000)} to ${readable(data.plan.cutoff_epoch*1000)}`;
+    byId('phase').textContent = `${data.plan.phase} paper · ${data.state}`;
+    byId('freshness').textContent = `Evidence as of ${readable(data.as_of_utc)}. Dashboard refreshed ${readable(data.generated_utc)}.`;
+    byId('replay').textContent = `Incremental replay ${data.replay?.state || 'pending'} · verified hours ${data.replay?.hours || 0}`;
+    byId('hold').textContent = data.hold ? `Hold · ${data.hold}` : '';
+    byId('risk').textContent = data.risk ? `Shared $25 paper campaign · $${data.risk.remaining} remaining` : 'Campaign state pending.';
+    byId('crash-count').textContent = `${data.collector_crash_count || 0} trading-system interruptions · ${data.crashes.length-(data.collector_crash_count || 0)} offline interruptions`;
+    byId('crashes').replaceChildren(...data.crashes.map(crash => {
+      const row = document.createElement('li');
+      row.textContent = `${readable(crash.utc)} · ${crash.component} · ${crash.reason}`;
+      return row;
+    }));
+    byId('profiles').replaceChildren(...data.profiles.map(profile => {
+      const row = document.createElement('tr');
+      for (const value of [profile.id,money(profile.realized_net),profile.entries,profile.open_positions]) {
+        const cell = document.createElement('td');
+        cell.textContent = value ?? '—'; row.append(cell);
+      }
+      return row;
+    }));
+    const study = data.research;
+    byId('research').textContent = study ? `Retained P-model study · ${study.state}${study.variants ? ` · ${study.variants} variants` : ''}${study.source_events ? ` · ${study.source_events} source events` : ''}` : '';
+    plot(data);
+  }
+  async function refresh() {
+    try {
+      const response = await fetch('/status.json',{cache:'no-store'});
+      if (response.ok) render(await response.json());
+    } catch { byId('freshness').textContent = 'Dashboard connection interrupted. The last visible data is retained.'; }
+    const now = Date.now(), offset = 67000, period = 900000;
+    setTimeout(refresh,(Math.floor((now-offset)/period)+1)*period+offset-now);
+  }
+  refresh();
+</script>
+</html>

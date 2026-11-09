@@ -1,4 +1,21 @@
-# Lane II continuous research: short paper qualification
+# Lane II paper qualification
+
+## Eight-hour window
+
+Atlas started the owned collector in prewarm on November 9, 2026. The fixed paper window runs from **03:45 to 11:45 MST**. The collector is preregistered for P13, P2, and a cash control under the same cumulative $25 paper campaign accepted at short closeout.
+
+| Gate | Observed state |
+| --- | --- |
+| Hourly replay and accounting release | Passed retained split-versus-contiguous replay and native checkpoint fixtures |
+| Eight-hour qualification | Prewarm observed. The scheduled paper interval and live checkpoint evidence are pending. |
+| 24-hour qualification | Requires the sealed eight-hour pass and fresh admission on the same campaign. |
+| Discovery | Offline study started with five P-model families and 50 preregistered variations. |
+
+Both retrospective passes processed 22,314 sealed events and agreed on causal decisions, financial accounting, risk, and coverage. The reviewed release also passed 150 continuous-service tests and 22 campaign-risk tests. The collector, offline replay, health task, and dashboard task are installed on Atlas. Windows triggers the health check each quarter hour and refreshes the dashboard one minute later. The current task principal requires a logged-in session.
+
+The exact release, independent admission review, and scheduler evidence are retained on Atlas. The runtime report and crash graph are available through the [local dashboard](http://127.0.0.1:8889/). See the [operator contract](README.md) and [PR #3](https://github.com/achilles611/Trader/pull/3).
+
+## Accepted short window
 
 Capture evidence as of **2026-11-09T05:50:00.099125+00:00**. At report generation, source evidence was **1015 seconds old**. The local status service continues to report current heartbeat and source freshness.
 
@@ -9,7 +26,6 @@ Capture evidence as of **2026-11-09T05:50:00.099125+00:00**. At report generatio
 | Short operational qualification | **QUALIFIED**; 900 independently replayed seconds; 3/3 matched fresh eligible windows |
 | Closeout | Raw audit PASS_RETAINED_CAPTURE_INTEGRITY_ONLY; accounting PASS_RETAINED_PROFILE_ACCOUNTING; causal replay PASS (scheduled recovery) |
 | Owner exit | Code 0; forced closure false |
-| Eight-hour and 24-hour qualification | Neither run started |
 | Profitability | Insufficient evidence |
 
 The first prewarm failed before any paper tick. Its raw integrity and unchanged flat accounts were reconciled. The transport repair was verified against the public HTTP and price feeds; the replacement used the same campaign and the original sealed predecessor receipt. The cumulative $25 paper limit did not reset.
@@ -24,7 +40,7 @@ Original coordinator queue: 1 admission-held, 8 completed.
 
 Current short qualification holds: none recorded.
 
-Next action: Qualify hourly incremental accounting and causal replay before eight-hour admission. No funded orders or model calls were recorded.
+The short receipt recorded zero funded orders and zero model calls.
 
 Frozen application `0174929829a5863be53fb0c05ea9c035798491978f206012fcec2006477e60f5`; configuration `c34001602fdbe232aaa7d7cccad430fab3fc94d9e906ec6ea8f16a38b2fe753b`; collector `f48a341499ae69257aea03ac1e7599172fa430123a26063b940c597cb7b6a46f`.
 

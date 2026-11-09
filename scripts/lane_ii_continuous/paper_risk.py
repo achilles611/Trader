@@ -232,9 +232,19 @@ class RiskLedger:
             require(digest(self.state) == anchor["genesis_state_sha256"], "PAPER_RISK_GENESIS_CHANGED")
         elif self.state["phase"] == "CLOSED":
             endpoint = self.state["last_terminal"]
-            previous_raw = Path(endpoint["receipt_path"]).read_bytes()
-            require(hashlib.sha256(previous_raw).hexdigest() == endpoint["receipt_sha256"], "PAPER_RISK_PREDECESSOR_CHANGED")
+            crashed = endpoint.get("kind") == "CRASH_HANDOFF"
+            previous_raw = Path(endpoint["handoff_path"] if crashed else endpoint["receipt_path"]).read_bytes()
+            require(hashlib.sha256(previous_raw).hexdigest() == endpoint["handoff_sha256" if crashed else "receipt_sha256"], "PAPER_RISK_PREDECESSOR_CHANGED")
             previous = json.loads(previous_raw)
+            if crashed:
+                require(previous["schema"] == "LANE_II_CRASH_HANDOFF_V1" and previous["normal_terminal_receipt"] is False
+                        and previous["anchor_sha256"] == expected_sha256, "PAPER_RISK_CRASH_HANDOFF_BINDING")
+                try:
+                    from continuous_capture_checkpoint import validate_crash_handoff
+                except ImportError:
+                    from .capture_checkpoint import validate_crash_handoff
+                require(validate_crash_handoff(endpoint["handoff_path"], expected_sha256)["closed_state"] == self.state,
+                        "PAPER_RISK_CRASH_CLOSURE_CHANGED")
             expected = deepcopy(previous["paper_risk_terminal_state"])
             expected.update(phase="CLOSED", last_terminal=endpoint, carry_accounts=previous["account_carryover"])
             require(expected == self.state, "PAPER_RISK_TERMINAL_STATE_CHANGED")
@@ -246,13 +256,24 @@ class RiskLedger:
     def _write(self, state):
         self.connection.execute("UPDATE state SET value_json=? WHERE singleton=1", (canonical(state).decode(),))
 
-    def begin_segment(self, segment_id, previous_receipt_sha256="GENESIS"):
+    def action_cursor(self):
+        row = self.connection.execute("SELECT sequence,event_id,action,payload_json,result_json FROM actions ORDER BY sequence DESC LIMIT 1").fetchone()
+        return {"sequence": 0 if row is None else row[0], "event_id": None if row is None else row[1],
+                "sha256": None if row is None else digest(list(row))}
+
+    def begin_segment(self, segment_id, previous_receipt_sha256="GENESIS", *, paper_start_epoch=None, cutoff_epoch=None):
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             state = self._read()
             require(state["phase"] in ("GENESIS", "CLOSED") and not state["reservations"] and not state["holds"], "PAPER_ACCOUNT_CONTINUITY_UNKNOWN_OR_OPEN")
-            expected = "GENESIS" if state["phase"] == "GENESIS" else state["last_terminal"]["receipt_sha256"]
+            endpoint = state["last_terminal"]
+            crashed = state["phase"] == "CLOSED" and endpoint.get("kind") == "CRASH_HANDOFF"
+            expected = "GENESIS" if state["phase"] == "GENESIS" else "CRASH:" + endpoint["handoff_sha256"] if crashed else endpoint["receipt_sha256"]
             require(previous_receipt_sha256 == expected, "PAPER_PREDECESSOR_RECEIPT_REQUIRED")
+            if crashed:
+                require(cutoff_epoch == endpoint["fixed_cutoff_epoch"] and paper_start_epoch is not None
+                        and endpoint["restart_not_before_epoch"] <= paper_start_epoch < cutoff_epoch
+                        and paper_start_epoch % 300 == 0, "PAPER_CRASH_FIXED_CUTOFF_OR_RESTART_WINDOW")
             require(self.connection.execute("SELECT 1 FROM segments WHERE segment_id=?", (segment_id,)).fetchone() is None, "PAPER_SEGMENT_CANNOT_RESTART")
             self.connection.execute("INSERT INTO segments VALUES(?,?,?,NULL)", (segment_id, previous_receipt_sha256, "ACTIVE"))
             state.update(phase="ACTIVE", segment_id=segment_id)
@@ -305,6 +326,45 @@ class RiskLedger:
             self.connection.execute("UPDATE segments SET state='CLOSED',terminal_json=? WHERE segment_id=?", (canonical(terminal).decode(), self.segment_id))
             self.connection.execute("COMMIT")
             self.state = state
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def finish_crashed_segment(self, handoff_path):
+        """Bind a typed, externally verified crash handoff without resetting risk."""
+        path = Path(handoff_path).resolve()
+        try:
+            from continuous_capture_checkpoint import validate_crash_handoff
+        except ImportError:
+            from .capture_checkpoint import validate_crash_handoff
+        validated = validate_crash_handoff(path, hashlib.sha256(self.manifest_path.read_bytes()).hexdigest())
+        require(path.stat().st_size <= 2 * 1024**2, "PAPER_CRASH_HANDOFF_SIZE")
+        raw = path.read_bytes(); handoff = json.loads(raw)
+        require(handoff["schema"] == "LANE_II_CRASH_HANDOFF_V1" and handoff["normal_terminal_receipt"] is False
+                and handoff["anchor_sha256"] == hashlib.sha256(self.manifest_path.read_bytes()).hexdigest()
+                and handoff["excluded_tail"]["financial_rows"] == 0, "PAPER_CRASH_HANDOFF_BINDING")
+        before = handoff["paper_risk_terminal_state"]
+        require(before["phase"] == "ACTIVE" and before["segment_id"] == handoff["segment_id"]
+                and not before["reservations"] and not snapshot(before)["holds"]
+                and not any(row["positions"] for row in handoff["account_carryover"].values()), "PAPER_CRASH_ACCOUNT_NOT_FLAT")
+        terminal = {"kind": "CRASH_HANDOFF", "handoff_path": str(path), "handoff_sha256": hashlib.sha256(raw).hexdigest(),
+                    "source_manifest_sha256": handoff["source_manifest_sha256"], "state": "FAILED_CRASH_HANDOFF",
+                    "fixed_cutoff_epoch": handoff["fixed_cutoff_epoch"], "restart_not_before_epoch": handoff["restart_not_before_epoch"]}
+        after = deepcopy(before)
+        after.update(phase="CLOSED", last_terminal=terminal, carry_accounts=deepcopy(handoff["account_carryover"]))
+        require(validated["closed_state"] == after, "PAPER_CRASH_CLOSURE_BINDING")
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            state = self._read()
+            require(self.action_cursor() == handoff["paper_risk_action_cursor"], "CRASH_UNACCOUNTED_RISK_TRANSACTIONS")
+            if state != after:
+                require(state == before, "CRASH_UNACCOUNTED_RISK_TRANSACTIONS")
+                require(self.connection.execute("SELECT state FROM segments WHERE segment_id=?", (before["segment_id"],)).fetchone() == ("ACTIVE",), "PAPER_CRASH_SEGMENT_BINDING")
+                self._write(after)
+                self.connection.execute("UPDATE segments SET state='FAILED_CRASH_HANDOFF',terminal_json=? WHERE segment_id=?",
+                                        (canonical(terminal).decode(), before["segment_id"]))
+            self.connection.execute("COMMIT")
+            self.state = after
         except BaseException:
             self.connection.execute("ROLLBACK")
             raise

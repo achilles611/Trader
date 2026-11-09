@@ -178,7 +178,10 @@ def _same_bytes(left, right):
 
 
 def prospective_replay_pass(result):
-    return (result.get('schema') == 'LANE_II_PROSPECTIVE_REPLAY_RESULT_V1' and result.get('pass') is True
+    exact_schema = (result.get('schema') == 'LANE_II_PROSPECTIVE_REPLAY_RESULT_V1' or
+                    (result.get('schema') == 'LANE_II_HOURLY_REPLAY_RESULT_V1'
+                     and result.get('sealed_retrospective_validation_only') is False))
+    return (exact_schema and result.get('pass') is True
             and set(result.get('parity', {})) == PROFILES
             and all(result.get(key, {}).get('pass') is True
                     for key in ('admission_parity', 'raw_feed_reconstruction', 'risk_parity'))

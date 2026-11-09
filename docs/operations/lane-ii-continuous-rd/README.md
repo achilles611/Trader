@@ -9,7 +9,7 @@ This is the local paper research service requested in [PR #3](https://github.com
 - Frozen P13 and P2 source policies with cash as a nonexecuting control, using one existing study collector. Their existing $5/$6 entry budgets differ; this is a sizing comparison, not an equal-risk confirmation. No strategy economics were optimized in this pass.
 - Safe observation retries, bounded backoff and pacing, cancellation, an enforced public-data endpoint policy and stale-book rejection. Same-boot process-clock calibration is renewable; uncertainty holds decisions. This does not repair Windows time.
 - Streaming capture audit, ledger reconciliation, disposable DB/WAL/SHM recovery, descriptive analysis and sanitized reporting. For prospective replay, the supervisor bridge binds the actual collector exit, PID/creation/boot/executable identity, closed-producer marker and frozen native cold audit. Replay independently rebuilds feed marks, decision admissions, paper risk actions and financial state.
-- Byte partitions preserve account state and contiguous complete-line offsets. Prior manifests, payloads, source identity and the preceding source range are verified. Completed partition progress can be reconstructed after a checkpoint crash. Actual hourly capture, incremental accounting and causal replay remain unqualified.
+- The collector flushes and seals a four-stream boundary each quarter hour. The offline consumer carries the causal replay, profile accounting and shared paper risk forward through new byte ranges. It publishes an hourly receipt after four verified quarters. On worker restart it reconstructs verified prefixes before accepting a new range.
 - Versioned bounded hypothesis and wallet registries. The ten canonical wallets retain their eight PRIMARY/two PROBATION lineage. Stored eligibility expires; no fresh copying qualification or wallet collection is claimed. Capital review requires preregistered untouched evidence, source-bound power, adequate blocks, family correction, execution stress and complete accounting. Descriptive analysis cannot open that gate.
 - Local read-only HTTP status, pause/stop/resume commands, daily local digests and frozen weekly review artifacts. No model client or paid cloud fallback runs in the loop. Offline child processes deny network and descendant creation; collector processes receive a reduced environment and public-data-only network policy.
 
@@ -50,6 +50,14 @@ A sealed completed short can be recovered from a failed offline closeout with th
 Task names are `Trader-LaneII-Continuous-Coordinator` and `Trader-LaneII-Continuous-Watchdog`. The preferred startup/S4U registration was denied by Windows. The installed fallback uses the current user's logon trigger and InteractiveToken; it requires that user's logged-in session. It is not a verified unattended boot service. Exported XML and actual scheduled-launch/watchdog receipts are retained locally. The six earlier Lane II tasks were exported with hashes and disabled to avoid competing controllers.
 
 Routine remote publication is not configured: the desktop GitHub connector is used for this reviewed publication, and no GitHub credential was copied into the daemon. Daily reports are generated locally. Automatic remote daily publication remains an explicit deployment dependency.
+
+## Long paper windows
+
+`long_qualification.py` starts from the accepted short and its existing $25 campaign. `install_long.ps1` registers the interactive supervisor, a quarter-hour health check and a dashboard refresh one minute after each check. The local dashboard records interruption times and counts and draws a red X for each event. It retains a snapshot for each phase.
+
+The eight-hour and 24-hour plans have fixed cutoffs. After an interruption, the supervisor checks the original owner, the durable action cursor and the financial tapes before continuing from a proven flat state. A replacement inherits the same campaign and deadline. Gaps in the paper interval block promotion. The 24-hour gate requires a sealed eight-hour assessment, complete hourly replay and accounting, flat exposure, and fresh host admission.
+
+An optional network-isolated worker evaluates one-factor P-model variations on a separately retained tape. Its results are discovery evidence. The prospective qualification keeps its frozen P13 and P2 profiles and cash control.
 
 ## Evidence and acceptance
 

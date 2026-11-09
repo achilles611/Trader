@@ -90,7 +90,8 @@ class DecisionCapture:
         segment = os.environ.get("LANE_II_PAPER_SEGMENT_ID")
         risk.require(path and expected and segment, "EXTERNALLY_ANCHORED_PAPER_CAMPAIGN_REQUIRED")
         ledger = risk.RiskLedger(path, expected, roster_sha256=roster_sha256)
-        ledger.begin_segment(segment, os.environ.get("LANE_II_PAPER_PREDECESSOR_RECEIPT_SHA256", "GENESIS"))
+        ledger.begin_segment(segment, os.environ.get("LANE_II_PAPER_PREDECESSOR_RECEIPT_SHA256", "GENESIS"),
+                             paper_start_epoch=study.paper_start, cutoff_epoch=study.cutoff)
         return cls(study, ledger)
 
     def attach_profile(self, profile):
