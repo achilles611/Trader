@@ -2,16 +2,20 @@
 
 ## Eight-hour window
 
-Atlas started the owned collector in prewarm on November 9, 2026. The fixed paper window runs from **03:45 to 11:45 MST**. The collector is preregistered for P13, P2, and a cash control under the same cumulative $25 paper campaign accepted at short closeout.
+Atlas ran the fixed paper window from **03:45 to 11:45 MST on November 9, 2026**. P13 and P2 ran with a cash control and the cumulative $25 paper campaign accepted at short closeout.
 
 | Gate | Observed state |
 | --- | --- |
-| Hourly replay and accounting release | Passed retained split-versus-contiguous replay, native checkpoint fixtures, and the first live hour |
-| Eight-hour qualification | In progress. The 03:45–04:45 MST prefix verified 3,600 of 3,600 paper seconds, both profile accounts, and four contiguous quarter-hour receipts. |
-| 24-hour qualification | Requires the sealed eight-hour pass and fresh admission on the same campaign. |
-| Discovery | The isolated worker completed all 50 variations across five retained P-model families and reconciled the five baseline profiles. |
+| Hourly replay and accounting | Six full live hours verified. Both attempts reconciled through their exact retained endpoints. |
+| Eight-hour qualification | **HOLD**. Replay verified 28,114 of 28,800 scheduled paper seconds across two attempts. |
+| 24-hour qualification | **Held at the eight-hour gate.** |
+| Discovery | The isolated worker completed 50 variations and reconciled five baseline profiles across 140,310 retained events. |
 
-Both retrospective passes processed 22,314 sealed events and agreed on causal decisions, financial accounting, risk, and coverage. The reviewed release also passed 150 continuous-service tests and 22 campaign-risk tests. The collector, offline replay, health task, and dashboard task are installed on Atlas. Windows triggers the health check each quarter hour and refreshes the dashboard one minute later. The current task principal requires a logged-in session.
+The host CPU guard stopped the first collector at **10:43:41 MST**. It exited cleanly with both profiles flat. The replacement resumed paper collection at **10:55 MST**, inherited the same ledger, and exited cleanly at the original **11:45 MST** cutoff. The dashboard records one interruption with a red X. All 32 Windows health receipts and 32 Codex checks are retained, including the checkpoint during recovery.
+
+Each attempt passed the raw audit, independent accounting, and causal replay through its terminal receipt. The first attempt exposed a legacy ledger size limit and a STOP receipt binding mismatch. The follow-up analysis used duration-scaled streaming bounds and checked the supervisor's exact STOP binding. All 154 continuous-service tests and 22 campaign-risk tests passed after the fixes. The dashboard counts complete hours across attempts and preserves partial coverage separately in the reconciliation record.
+
+The paper campaign closed flat with **$4.69732 remaining**. The run stayed paper-only. P5, P2, and P1 variants traded in the retained discovery sample. P3 and P4 were exploratory controls with zero trades. The current Windows task principal requires a logged-in session.
 
 The exact release, independent admission review, and scheduler evidence are retained on Atlas. The runtime report and crash graph are available through the [local dashboard](http://127.0.0.1:8889/). See the [operator contract](README.md) and [PR #3](https://github.com/achilles611/Trader/pull/3).
 

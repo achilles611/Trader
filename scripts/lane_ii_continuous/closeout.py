@@ -114,7 +114,8 @@ def reconcile_profiles(capture: Path, receipt: dict, max_ledger_bytes: int = 64 
         positions, counts, sides = {}, Counter(), Counter()
         realized = fees = 0.
         with path.open("rb") as stream:
-            for raw in stream:
+            while raw := stream.readline(8 * MIB + 1):
+                require(len(raw) <= 8 * MIB, "LEDGER_LINE_SIZE_LIMIT:" + profile_id)
                 event = json.loads(raw)
                 kind = event.get("kind")
                 if kind not in ("PAPER_ENTRY", "PAPER_EXIT", "PAPER_SETTLEMENT"):
@@ -389,7 +390,8 @@ def closeout_capture(run_dir, output_dir, source_dir=None, *, run_raw_audit=Fals
 
 
 def audit_capture_readonly(capture_dir, source_dir, output_dir, *, process_probe=owner_observation,
-                           maximum_line_bytes=8 * MIB, maximum_raw_files=250000) -> dict:
+                           maximum_line_bytes=8 * MIB, maximum_raw_files=250000,
+                           maximum_ledger_bytes=64 * MIB) -> dict:
     """One streaming pass per tape; never import or write retained runtime code.
 
     The caller schedules this as an admitted heavy local job.  Event memory is
@@ -399,7 +401,8 @@ def audit_capture_readonly(capture_dir, source_dir, output_dir, *, process_probe
     """
     capture, source, output = map(lambda p: Path(p).resolve(), (capture_dir, source_dir, output_dir))
     require(not output.is_relative_to(capture) and not output.is_relative_to(source), "AUDIT_OUTPUT_INSIDE_RETAINED_INPUT")
-    require(0 < maximum_line_bytes <= 16 * MIB and 0 < maximum_raw_files <= 1000000, "AUDIT_RESOURCE_BOUNDS")
+    require(0 < maximum_line_bytes <= 16 * MIB and 0 < maximum_raw_files <= 1000000
+            and 0 < maximum_ledger_bytes <= 24 * 64 * MIB, "AUDIT_RESOURCE_BOUNDS")
     output.mkdir(parents=True, exist_ok=True)
     receipt = load(capture / "receipt.json")
     operator = load(capture.parent / "operator.json")
@@ -407,6 +410,10 @@ def audit_capture_readonly(capture_dir, source_dir, output_dir, *, process_probe
     require(owner.get("state") in ("ABSENT", "PID_REUSED"), "RETAINED_OWNER_NOT_PROVEN_ABSENT")
     marker = load(capture / "COLLECTION_CLOSED.json")
     require(marker.get("collection_closed") is True and marker.get("network_closed") is True and marker.get("worker_pid") == operator["pid"] == receipt["pid"] and marker.get("source_manifest_sha256") == receipt["source_manifest_sha256"], "GENUINE_COLLECTION_CLOSURE_REQUIRED")
+    ledgers = {key: (capture / (key + "-ledger.jsonl")).resolve() for key in receipt["ledger_sha256"]}
+    for path in ledgers.values():
+        require(path.parent == capture, "LEDGER_PATH_ESCAPE")
+        require(path.stat().st_size <= maximum_ledger_bytes, "INPUT_SIZE_LIMIT:" + path.name)
     problems = Counter()
     examples, inputs = [], []
     def problem(reason, detail=None):
@@ -517,9 +524,7 @@ def audit_capture_readonly(capture_dir, source_dir, output_dir, *, process_probe
     if receipt.get("ws_frames") != ws_count:
         problem("RECEIPT_WS_COUNT")
     for key, expected in receipt["ledger_sha256"].items():
-        path = (capture / (key + "-ledger.jsonl")).resolve()
-        require(path.parent == capture, "LEDGER_PATH_ESCAPE")
-        inputs.append(exact_file(path, expected, 64 * MIB))
+        inputs.append(exact_file(ledgers[key], expected, maximum_ledger_bytes))
         if ledger_hashes[key].hexdigest() != expected:
             problem("CHAIN_TO_LEDGER_BINDING", key)
     # Recheck small control/receipt bytes; large immutable tapes already had a

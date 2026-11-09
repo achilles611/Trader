@@ -322,9 +322,17 @@ class LongRun:
             '--maximum-input-bytes', 16 * 2**30, '--maximum-events', 8_000_000, '--maximum-rss-bytes', 256 * 2**20,
             '--maximum-seconds', seconds, '--restart-policy', 'rebuild' if count > 1 else 'hold'], folder, attempt['segment_id'])
 
-    def evidence_dir(self):
-        run = Path(self.current['path'])
+    def evidence_dir(self, attempt=None):
+        run = Path((attempt or self.current)['path'])
         return run.parent / 'verification' / run.name
+
+    def verified_hour_epochs(self):
+        epochs = set()
+        for attempt in self.attempts:
+            directory = self.evidence_dir(attempt) / 'replay' / 'hours'
+            epochs.update(int(path.stem) for path in directory.glob('*.json')
+                          if path.stem.isdecimal() and int(path.stem) - 3600 >= attempt['start_epoch'])
+        return epochs
 
     def service_research(self, control):
         plan = self.plan
@@ -636,7 +644,7 @@ class LongRun:
                 replay_state = read_json(path)
             if attempt.get('replay_hold'):
                 replay_state.update(state='HOLD', reason=attempt['replay_hold'])
-            replay_state['hours'] = len(list((replay / 'hours').glob('*.json')))
+            replay_state['hours'] = len(self.verified_hour_epochs())
         crashes = self.data['crashes'][plan['phase']] if plan else []
         observations = self.samples[-1] if self.samples else None
         value = {'schema': SCHEMA, 'as_of_utc': utc(), 'owner': self.owner, 'plan': plan, 'state': self.data['state'],

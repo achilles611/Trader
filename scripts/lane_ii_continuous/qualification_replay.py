@@ -135,8 +135,10 @@ def preflight(candidate, run_dir, audit_path, supervisor_path, output, *, expect
             "GENUINE_COMPLETE_OR_USER_STOP_ENDPOINT_REQUIRED_LEGACY_FAILURES_INELIGIBLE")
     require(supervisor.get("schema") == "LANE_II_PROSPECTIVE_SUPERVISOR_RESULT_V1"
             and supervisor.get("receipt") == receipt, "GENUINE_PROSPECTIVE_SUPERVISOR_REQUIRED")
-    require(supervisor.get("bindings") == {key: sources[key] for key in
-            ("receipt", "preregistration", "collection_closed", "worker_exit", "worker_identity", "raw_audit", "source_manifest")},
+    supervisor_bindings = {key: ref for key, ref in sources.items() if key != "supervisor_result"}
+    if receipt["state"] == "STOPPED":
+        sources["stop_request"] = supervisor_bindings["stop_request"] = binding(capture / "STOP", MIB)
+    require(supervisor.get("bindings") == supervisor_bindings,
             "SUPERVISOR_EXACT_ARTIFACT_BINDINGS_REQUIRED")
     require(exited.get("exit_code") == supervisor.get("worker_exit_code") == 0
             and exited.get("forced_closure") is supervisor.get("forced_closure") is False
@@ -191,9 +193,9 @@ def preflight(candidate, run_dir, audit_path, supervisor_path, output, *, expect
     require(total <= maximum_input_bytes, "REPLAY_INPUT_BYTE_BUDGET_EXCEEDED")
     decision_bound = cutoff
     if receipt["state"] == "STOPPED":
-        sources["stop_request"] = binding(capture / "STOP", MIB)
         stop = load(capture / "STOP", MIB)
-        require(stop.get("schema") == "LANE_II_COORDINATOR_STOP_V1", "GENUINE_COORDINATOR_STOP_REQUIRED")
+        require(stop.get("schema") == "LANE_II_COORDINATOR_STOP_V1"
+                and binding(capture / "STOP", MIB) == sources["stop_request"], "GENUINE_COORDINATOR_STOP_REQUIRED")
         decision_bound = stamp(stop["utc"])
         require(start < decision_bound <= min(cutoff, end), "EXACT_STOP_BOUND_REQUIRED")
     return {"candidate": candidate, "capture": capture, "run_dir": run_dir, "output": output,

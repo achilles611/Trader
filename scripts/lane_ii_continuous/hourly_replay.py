@@ -581,6 +581,8 @@ class Consumer:
                 "full_duration_qualified": False}
 
     def publish_hour(self, epoch, rebuilding=False):
+        if epoch - 3600 < self.start:
+            return
         path = self.output / "hours" / (str(int(epoch)) + ".json")
         record = {"schema": "LANE_II_HOURLY_REPLAY_HOUR_V1", "epoch": epoch, "quarters": 4,
                   "range_receipts": [strict.binding(self.output / "ranges" / f"{index:06d}.json")

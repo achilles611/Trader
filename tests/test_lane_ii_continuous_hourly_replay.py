@@ -47,6 +47,14 @@ class CursorTests(unittest.TestCase):
 
 
 class StreamingStateTests(unittest.TestCase):
+    def test_replacement_start_mid_hour_cannot_publish_a_full_hour(self):
+        with tempfile.TemporaryDirectory() as folder:
+            consumer = hourly.Consumer.__new__(hourly.Consumer)
+            consumer.start, consumer.output, consumer.hour_bindings = 300, Path(folder), []
+            consumer.publish_hour(3600)
+            self.assertFalse((consumer.output / 'hours').exists())
+            self.assertEqual(consumer.hour_bindings, [])
+
     def test_disk_sequences_preserve_strict_event_comparison(self):
         with tempfile.TemporaryDirectory() as folder:
             store = hourly.Store(Path(folder) / "analysis.sqlite", 16 * hourly.MIB)

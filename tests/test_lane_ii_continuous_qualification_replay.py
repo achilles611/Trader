@@ -17,7 +17,7 @@ def write(path, value):
     return replay.binding(path)
 
 
-def preflight_fixture(root):
+def preflight_fixture(root, *, stopped=False):
     candidate, run = root / "candidate", root / "run"
     candidate.mkdir(); (run / "capture").mkdir(parents=True)
     files = {name: b"# fixture only\n" for name in ("continuous_decision_capture.py", "continuous_paper_risk.py", "slim_roster.py", "study.py")}
@@ -29,20 +29,21 @@ def preflight_fixture(root):
                 "files": {name: hashlib.sha256(raw).hexdigest() for name, raw in files.items()}}
     source = write(candidate / "SOURCE_MANIFEST.json", manifest)
     start, cutoff = "2026-11-08T12:00:00Z", "2026-11-08T12:05:00Z"
+    state, reason, end = ("STOPPED", "USER_STOP", "2026-11-08T12:03:00Z") if stopped else ("COMPLETE", "DEADLINE", cutoff)
     counters = {"real_orders": 0, "model_api_calls": 0, "authenticated_account_calls": 0}
     prereg = {"source_manifest_sha256": source["sha256"], "paper_start_utc": start, "cutoff_utc": cutoff,
               "policy": {**counters, "virtual_cash_per_profile": 3000}, "deadline_mono": 600}
     prereg_binding = write(run / "capture/preregistration.json", prereg)
     receipt = {"source_manifest_sha256": source["sha256"], "preregistration_sha256": prereg_binding["sha256"],
-               "state": "COMPLETE", "reason": "DEADLINE", "pid": 123, "paper_start_utc": start,
-               "cutoff_utc": cutoff, "actual_end_utc": cutoff, "utc": cutoff, "events": 2,
+               "state": state, "reason": reason, "pid": 123, "paper_start_utc": start,
+               "cutoff_utc": cutoff, "actual_end_utc": end, "utc": end, "events": 2,
                "profiles": [{"id": identity} for identity in sorted(replay.EXPECTED_IDS)],
                "ledger_sha256": {identity: "0" * 64 for identity in replay.EXPECTED_IDS},
                "terminal_censoring": {identity: [] for identity in replay.EXPECTED_IDS}, **counters}
     write(run / "capture/receipt.json", receipt)
     marker = {"schema": "BTC_NEXT12_COLLECTION_CLOSED_V1", "worker_pid": 123,
               "source_manifest_sha256": source["sha256"], "fixed_cutoff_utc": cutoff,
-              "state_at_collection_close": "COMPLETE", **{key: True for key in
+              "state_at_collection_close": state, **{key: True for key in
               ("collection_closed", "network_closed", "producers_exited", "snapshot_publisher_closed", "finalization_only_no_more_http")}}
     write(run / "capture/COLLECTION_CLOSED.json", marker)
     operator = {"pid": 123, "creation_epoch": 100, "boot_epoch": 1, "owned_job_before_startup_gate": True,
@@ -54,12 +55,15 @@ def preflight_fixture(root):
           "source_manifest_sha256": source["sha256"], "exit_code": 0, "forced_closure": False,
           "retained_handle_exit_observed": True, "owned_job_closed": True, "owned_children_at_parent_exit": []})
     audit = {"schema": "LANE_II_READONLY_CAPTURE_AUDIT_V1", "status": "PASS_RETAINED_CAPTURE_INTEGRITY_ONLY",
-             "problem_counts": {}, "events_checked": 2, "execution": {"state": "COMPLETE"},
+             "problem_counts": {}, "events_checked": 2, "execution": {"state": state},
              "input_bindings": [replay.binding(run / "capture/receipt.json"), replay.binding(run / "capture/COLLECTION_CLOSED.json")]}
     write(root / "audit.json", audit)
     paths = {"receipt": run / "capture/receipt.json", "preregistration": run / "capture/preregistration.json",
              "collection_closed": run / "capture/COLLECTION_CLOSED.json", "worker_exit": run / "exit.json",
              "worker_identity": run / "operator.json", "raw_audit": root / "audit.json", "source_manifest": candidate / "SOURCE_MANIFEST.json"}
+    if stopped:
+        paths["stop_request"] = run / "capture/STOP"
+        write(paths["stop_request"], {"schema": "LANE_II_COORDINATOR_STOP_V1", "utc": end, "reason": "CPU_PERSISTENT"})
     write(root / "supervisor.json", {"schema": "LANE_II_PROSPECTIVE_SUPERVISOR_RESULT_V1", "receipt": receipt,
           "worker_exit_code": 0, "forced_closure": False, "bindings": {key: replay.binding(path) for key, path in paths.items()},
           "capture_audit": {"status": "PASS_RETAINED_NEXT12_CAPTURE_INTEGRITY_ONLY", "problems": [], "events_checked": 2}})
@@ -75,6 +79,19 @@ class PreflightTests(unittest.TestCase):
             result = replay.preflight(*args, expected_manifest_sha256=digest)
             self.assertEqual(result["receipt"]["state"], "COMPLETE")
             self.assertFalse(args[-1].exists())
+
+    def test_stopped_endpoint_requires_the_exact_supervisor_stop_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args, digest = preflight_fixture(Path(directory), stopped=True)
+            result = replay.preflight(*args, expected_manifest_sha256=digest)
+            stop = args[1] / "capture/STOP"
+            self.assertEqual(result["sources"]["stop_request"], replay.binding(stop))
+            self.assertEqual(result["decision_bound"], replay.stamp("2026-11-08T12:03:00Z"))
+            changed = replay.load(stop)
+            changed["utc"] = "2026-11-08T12:02:59Z"
+            write(stop, changed)
+            with self.assertRaisesRegex(ValueError, "EXACT_ARTIFACT_BINDINGS"):
+                replay.preflight(*args, expected_manifest_sha256=digest)
 
     def test_legacy_failed_endpoint_is_refused_even_with_audit_pass(self):
         with tempfile.TemporaryDirectory() as directory:

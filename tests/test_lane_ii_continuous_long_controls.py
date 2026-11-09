@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from scripts.lane_ii_continuous.capture_checkpoint import CheckpointWriter
 from scripts.lane_ii_continuous.common import atomic_json, binding, utc
+from scripts.lane_ii_continuous.long_closeout import ledger_budget
 from scripts.lane_ii_continuous.long_gate import assess_window, verified_hours
 from scripts.lane_ii_continuous.long_qualification import LongRun, continuation_start, fixed_plan
 from scripts.lane_ii_continuous.long_status import dashboard, due_slot, health
@@ -13,6 +14,26 @@ from tests.test_lane_ii_continuous_capture_checkpoint import Fixture, START
 
 
 class FixedLongWindowTests(unittest.TestCase):
+    def test_closeout_ledger_budget_scales_with_the_frozen_interval(self):
+        for seconds, expected_mib in [(900, 64), (28800, 512), (86400, 1536)]:
+            with self.subTest(seconds=seconds):
+                receipt = {'paper_start_utc': utc(START), 'cutoff_utc': utc(START + seconds)}
+                self.assertEqual(ledger_budget(receipt), expected_mib * 2**20)
+        with self.assertRaisesRegex(ValueError, 'LONG_LEDGER_DURATION_BOUND'):
+            ledger_budget({'paper_start_utc': utc(START), 'cutoff_utc': utc(START + 86401)})
+
+    def test_dashboard_keeps_verified_hours_across_restarts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            supervisor = LongRun.__new__(LongRun)
+            attempts = [{'path': str(root / f'attempt-{index:03}'), 'start_epoch': start}
+                        for index, start in enumerate((START, START + 3900), 1)]
+            supervisor.data = {'phase': 'eight-hour', 'attempts': {'eight-hour': attempts}}
+            atomic_json(supervisor.evidence_dir(attempts[0]) / 'replay' / 'hours' / f'{START + 3600}.json', {})
+            atomic_json(supervisor.evidence_dir(attempts[1]) / 'replay' / 'hours' / f'{START + 7200}.json', {})
+            atomic_json(supervisor.evidence_dir(attempts[1]) / 'replay' / 'hours' / f'{START + 10800}.json', {})
+            self.assertEqual(supervisor.verified_hour_epochs(), {START + 3600, START + 10800})
+
     def test_verified_crash_predecessor_reaches_owned_start_gate_with_same_cutoff(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
