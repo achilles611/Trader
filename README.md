@@ -28,9 +28,15 @@ Use this as a paper-trading and research bot first.
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install -r requirements.lock
 Copy-Item .env.example .env
 ```
+
+`requirements.txt` remains the human-edited dependency intent. CI and normal
+reproducible installs use `requirements.lock`; regenerate it in an isolated
+Python 3.12 environment with `pip-compile --strip-extras
+--output-file requirements.lock requirements.txt` after reviewing dependency
+changes.
 
 ## Commands
 

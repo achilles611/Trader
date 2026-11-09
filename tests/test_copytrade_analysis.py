@@ -9,7 +9,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.copytrade.analysis import CandidateAnalysisPipeline, _config_fingerprint, _copyability, _walk_forward_evidence
-from src.copytrade.config import AnalysisConfig, ArtifactConfig, CandidateConfig, CopyTradeConfig, PaperExecutionConfig, RiskConfig, SizingConfig
+from src.copytrade.config import AnalysisConfig, ArtifactConfig, CandidateConfig, CopyTradeConfig, FinalistRequirementsConfig, PaperExecutionConfig, PrefilterConfig, RiskConfig, SizingConfig
+from src.copytrade.contracts import PHASE_A_EVIDENCE_SCHEMA_VERSION
 from src.copytrade.discovery import DiscoveryPipeline
 from src.copytrade.hyperliquid import BackfillCoverage
 from src.copytrade.models import AnalysisRun, CandidateAnalysis, CandidateScore, DiscoveryObservation, RawFill, as_utc, utc_now
@@ -45,7 +46,8 @@ def config(root: Path) -> CopyTradeConfig:
                                    require_positive_expectancy=False, require_positive_follower_expectancy=False,
                                    activity_max_age_days=30),
         analysis=AnalysisConfig(default_workers=2, retry_attempts=2, retry_initial_seconds=0, history_days=90,
-                                min_discovery_activity=1, shadow_finalist_count=2),
+                                min_discovery_activity=1, shadow_finalist_count=2, market_evidence_enabled=False),
+        finalist_requirements=FinalistRequirementsConfig(minimum_confidence_score=0, require_copyability_evidence=False),
     )
 
 
@@ -105,6 +107,55 @@ class PhaseBAnalysisTests(unittest.TestCase):
             analysis = service.database.get_candidate_analysis(STALE)
             self.assertEqual(analysis.lifecycle_status, "prefilter_rejected")  # type: ignore[union-attr]
             self.assertIn("inactive", analysis.prefilter_reasons)  # type: ignore[union-attr]
+
+    def test_prefilter_distinguishes_legacy_absence_from_measured_zero_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cfg = replace(config(root), prefilter=PrefilterConfig(
+                min_activity_observations=1, min_distinct_active_days=1, min_distinct_symbols=1,
+            ))
+            service = CopyTradeService(cfg)
+            seed_candidates(service, [GOOD])
+            # This is a pre-v2 discovery row: it has a safe activity count,
+            # but no measured temporal/symbol dimensions.  Missing dimensions
+            # must not be fabricated as factual zeros.
+            with service.database._connect() as connection:  # type: ignore[attr-defined]
+                connection.execute(
+                    "UPDATE copy_discovery_candidates SET metadata_json=? WHERE wallet=?",
+                    (json.dumps({"latest_activity_observations": 680, "latest_sources": ["legacy"]}), GOOD),
+                )
+            legacy = CandidateAnalysisPipeline(service).run(limit=10, cheap_only=True)
+            legacy_analysis = service.database.get_candidate_analysis(GOOD)
+            self.assertEqual(legacy["cheap_rejected"], 1)
+            self.assertIn("phase_a_refresh_required", legacy_analysis.prefilter_reasons)  # type: ignore[union-attr]
+            self.assertNotIn("insufficient_activity", legacy_analysis.prefilter_reasons)  # type: ignore[union-attr]
+            self.assertNotIn("insufficient_temporal_diversity", legacy_analysis.prefilter_reasons)  # type: ignore[union-attr]
+            self.assertNotIn("insufficient_symbol_diversity", legacy_analysis.prefilter_reasons)  # type: ignore[union-attr]
+            configuration = json.loads(service.database.get_analysis_run(str(legacy["run_id"]))["configuration_json"])
+            manifest = configuration["candidate_manifest"][0]
+            self.assertEqual(manifest["phase_a_evidence"]["contract_status"], "legacy_or_incomplete")
+
+            # A complete v2 payload with zeros is different: those are actual
+            # measurements and should trigger the corresponding cheap gates.
+            current_metadata = {
+                "evidence_schema_version": PHASE_A_EVIDENCE_SCHEMA_VERSION,
+                "latest_activity_observations": 10,
+                "cheap_stats": {
+                    "distinct_observed_events": 10, "distinct_active_days": 0, "distinct_active_hours": 1,
+                    "observation_span_hours": 0.0, "distinct_symbols": 0, "symbols": [],
+                    "approximate_observed_notional": 0.0, "independent_source_count": 1,
+                    "first_observed_activity": None, "last_observed_activity": None,
+                },
+            }
+            with service.database._connect() as connection:  # type: ignore[attr-defined]
+                connection.execute("UPDATE copy_discovery_candidates SET metadata_json=? WHERE wallet=?", (json.dumps(current_metadata), GOOD))
+                connection.execute("DELETE FROM copy_candidate_analyses WHERE wallet=?", (GOOD,))
+            current = CandidateAnalysisPipeline(service).run(limit=10, cheap_only=True)
+            current_analysis = service.database.get_candidate_analysis(GOOD)
+            self.assertEqual(current["cheap_rejected"], 1)
+            self.assertIn("insufficient_temporal_diversity", current_analysis.prefilter_reasons)  # type: ignore[union-attr]
+            self.assertIn("insufficient_symbol_diversity", current_analysis.prefilter_reasons)  # type: ignore[union-attr]
+            self.assertNotIn("phase_a_refresh_required", current_analysis.prefilter_reasons)  # type: ignore[union-attr]
 
     def test_analysis_is_resumable_forceable_and_isolated_from_execution_tables(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -201,8 +252,18 @@ class PhaseBAnalysisTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 pipeline.run(limit=10)
             run_id = service.database.latest_resumable_analysis_run()["run_id"]  # type: ignore[index]
+            # A subsequent Quick Scan must not alter an in-flight Phase-B
+            # decision.  If resume re-read this mutable row, it would reject
+            # the candidate for missing v2 evidence instead of using the saved
+            # manifest snapshot.
+            with service.database._connect() as connection:  # type: ignore[attr-defined]
+                connection.execute(
+                    "UPDATE copy_discovery_candidates SET metadata_json=? WHERE wallet=?",
+                    (json.dumps({"latest_activity_observations": 680}), GOOD),
+                )
             result = pipeline.run(limit=999, status="all", workers=1, resume=True)
             self.assertEqual(result["run_id"], run_id)
+            self.assertEqual(result["eligible"], 1)
             with patch("src.copytrade.cli.CopyTradeConfig.from_yaml", return_value=cfg), patch("src.copytrade.cli._print") as printed:
                 from src.copytrade.cli import run_copytrade_command
                 import argparse
@@ -238,6 +299,36 @@ class PhaseBAnalysisTests(unittest.TestCase):
             self.assertEqual(pipeline.shadow_finalists()[0]["score"], prior_score)
             service.set_status(GOOD, "muted")
             self.assertEqual(pipeline.shadow_finalists(), [])
+
+    def test_status_does_not_rewrite_persisted_finalist_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            seed_candidates(service, [GOOD])
+
+            def backfill(wallet: str, _start: object) -> dict[str, object]:
+                service.database.insert_raw_fills(fills(wallet))
+                return {"new_raw_fills": 2}
+
+            pipeline = CandidateAnalysisPipeline(service, backfill_wallet=backfill)
+            pipeline.run(limit=10)
+            with service.database._connect() as connection:  # type: ignore[attr-defined]
+                before = [tuple(row) for row in connection.execute(
+                    """SELECT analysis_run_id, config_fingerprint, wallet, recommendation_schema_version,
+                       finalist_eligible, finalist_rejection_reasons_json, diversification_penalty,
+                       final_selection_score, selection_rank, evaluated_at
+                       FROM copy_analysis_finalist_recommendations ORDER BY wallet"""
+                ).fetchall()]
+            self.assertTrue(before)
+            pipeline.status()
+            pipeline.status()
+            with service.database._connect() as connection:  # type: ignore[attr-defined]
+                after = [tuple(row) for row in connection.execute(
+                    """SELECT analysis_run_id, config_fingerprint, wallet, recommendation_schema_version,
+                       finalist_eligible, finalist_rejection_reasons_json, diversification_penalty,
+                       final_selection_score, selection_rank, evaluated_at
+                       FROM copy_analysis_finalist_recommendations ORDER BY wallet"""
+                ).fetchall()]
+            self.assertEqual(after, before)
 
     def test_window_coverage_requires_contiguous_proven_segments(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -392,7 +483,7 @@ class PhaseBAnalysisTests(unittest.TestCase):
             with patch("src.copytrade.analytics.utc_now", return_value=end + timedelta(days=120)):
                 repeated = pipeline._analyze_wallet(
                     GOOD, summary["coverage"], run_id=result["run_id"],
-                    config_fingerprint=_config_fingerprint(service.config.snapshot()), required_start=start, required_end=end,
+                    config_fingerprint=_config_fingerprint(service.config.research_snapshot()), required_start=start, required_end=end,
                 )
             self.assertEqual(repeated["score"]["total"], summary["score"]["total"])
             self.assertEqual(repeated["diversification_input"], summary["diversification_input"])
@@ -404,7 +495,7 @@ class PhaseBAnalysisTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             service = CopyTradeService(config(Path(temp)))
             seed_candidates(service, [GOOD, FAILED])
-            fingerprint = _config_fingerprint(service.config.snapshot())
+            fingerprint = _config_fingerprint(service.config.research_snapshot())
             old_fingerprint = "old-config"
             def qualified(wallet: str, run_id: str, score_value: float, score_fingerprint: str) -> None:
                 service.database.start_analysis_run(AnalysisRun(run_id, utc_now(), {"fixture": True}))
@@ -431,6 +522,17 @@ class PhaseBAnalysisTests(unittest.TestCase):
             self.assertEqual(count, 1)
             current = service.database.phase_b_qualified_scores(config_fingerprint=fingerprint)
             self.assertEqual([(score.target_wallet, score.total_score) for score in current], [(GOOD, 60.0)])
+            # A later legacy/research score is visible separately but cannot
+            # create a hybrid candidate row with Phase B provenance/config.
+            service.database.upsert_candidate_score(CandidateScore(
+                GOOD, utc_now() + timedelta(seconds=1), 999, {"legacy": 1}, {}, True,
+            ))
+            candidate = service.database.list_analysis_candidates(wallets=[GOOD], limit=1)[0]
+            self.assertEqual((candidate["total_score"], candidate["score_provenance"], candidate["score_analysis_run_id"]),
+                             (60.0, "phase_b", "analysis_authoritative"))
+            self.assertEqual(candidate["candidate_config_fingerprint"], fingerprint)
+            self.assertEqual((candidate["legacy_total_score"], candidate["legacy_score_reasons"]), (999.0, []))
+            self.assertEqual([(score.target_wallet, score.total_score) for score in service.database.latest_legacy_scores()], [(GOOD, 999.0)])
             pipeline = CandidateAnalysisPipeline(service)
             finalist_wallets = [item["wallet"] for item in pipeline.shadow_finalists()]
             self.assertEqual(finalist_wallets, [GOOD])
@@ -466,6 +568,27 @@ class PhaseBAnalysisTests(unittest.TestCase):
             outcome = pipeline._retry_backfill(GOOD, start, end)
             self.assertEqual((outcome[1], outcome[3]), (1, None))
             self.assertIn("known_incomplete", pipeline._cheap_prefilter(candidate, start, end))
+
+    def test_default_backfill_and_callback_always_receive_immutable_required_end(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = CopyTradeService(config(Path(temp)))
+            service.import_wallets([GOOD])
+            start = FILL_AT
+            end = FILL_AT + timedelta(minutes=10)
+            service.database.insert_raw_fills(fills(GOOD))
+            captured: list[tuple[object, object]] = []
+            def service_backfill(wallet: str, *, start: object, end: object) -> dict[str, object]:
+                captured.append((start, end))
+                return {"new_raw_fills": 0}
+            service.backfill_for_analysis = service_backfill  # type: ignore[method-assign]
+            CandidateAnalysisPipeline(service)._default_backfill(GOOD, start, end)
+            self.assertEqual(captured[0][1], end)
+            callback_bounds: list[tuple[object, object]] = []
+            def callback(wallet: str, requested_start: object, requested_end: object) -> dict[str, object]:
+                callback_bounds.append((requested_start, requested_end))
+                return {"new_raw_fills": 0}
+            CandidateAnalysisPipeline(service, backfill_wallet=callback)._retry_backfill(GOOD, start, end)
+            self.assertEqual(callback_bounds, [(start, end)])
 
     def test_copy_rank_selected_is_canonical_phase_b_finalists(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

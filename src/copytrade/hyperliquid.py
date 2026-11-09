@@ -10,6 +10,7 @@ import requests
 
 from .config import SourceConfig
 from .models import ConnectionState, RawFill, TraderSnapshot, as_utc, stable_id, utc_now
+from .rate_limit import HyperliquidInfoRateLimiter, shared_hyperliquid_info_limiter
 
 
 class HyperliquidAPIError(RuntimeError):
@@ -31,24 +32,42 @@ class BackfillCoverage:
 class HyperliquidPublicAdapter:
     """Unauthenticated Hyperliquid public information and websocket adapter."""
 
-    def __init__(self, config: SourceConfig, session: requests.Session | None = None) -> None:
+    def __init__(
+        self, config: SourceConfig, session: requests.Session | None = None,
+        limiter: HyperliquidInfoRateLimiter | None = None,
+    ) -> None:
         self.config = config
         self.session = session or requests.Session()
+        # Every adapter for an endpoint shares one process-wide allowance.  A
+        # caller may inject a limiter for a bounded test or a deliberately
+        # configured service instance.
+        self.limiter = limiter or shared_hyperliquid_info_limiter(config.info_url)
         self.last_backfill_coverage: BackfillCoverage | None = None
 
     def info(self, payload: dict[str, Any]) -> Any:
-        response = self.session.post(
-            self.config.info_url, json=payload, headers={"Content-Type": "application/json"},
-            timeout=self.config.request_timeout_seconds,
-        )
+        reservation = self.limiter.acquire(payload)
         try:
+            response = self.session.post(
+                self.config.info_url, json=payload, headers={"Content-Type": "application/json"},
+                timeout=self.config.request_timeout_seconds,
+            )
+            if response.status_code == 429:
+                self.limiter.register_429(getattr(response, "headers", {}).get("Retry-After"))
+                # This is telemetry for the caller's retry policy; the adapter
+                # never retries internally, so it cannot multiply Phase-B
+                # retries or circumvent the shared cooldown.
+                self.limiter.record_retry()
             response.raise_for_status()
+            decoded = response.json()
         except requests.RequestException as exc:
             raise HyperliquidAPIError(f"Hyperliquid info request failed: {exc}") from exc
-        try:
-            return response.json()
         except ValueError as exc:
             raise HyperliquidAPIError("Hyperliquid info endpoint returned non-JSON content.") from exc
+        finally:
+            # Failed requests retain their conservative reservation for the
+            # minute; valid JSON settles it to Hyperliquid's actual weight.
+            self.limiter.settle(reservation, locals().get("decoded"))
+        return decoded
 
     def fetch_user_fills(self, wallet: str, *, aggregate_by_time: bool = False) -> list[RawFill]:
         payload = {"type": "userFills", "user": wallet.lower(), "aggregateByTime": aggregate_by_time}
@@ -218,7 +237,7 @@ class HyperliquidWatcher:
     ) -> dict[str, int]:
         target_wallets = [wallet.lower() for wallet in wallets]
         if not target_wallets:
-            raise ValueError("No approved copy-trade targets to watch.")
+            raise ValueError("No Active paper-entry or exit-only copy-trade wallets to watch.")
         if len(set(target_wallets)) > 10:
             raise ValueError("Hyperliquid allows at most 10 unique users across user-specific websocket subscriptions.")
         deadline = asyncio.get_running_loop().time() + duration_seconds if duration_seconds else None

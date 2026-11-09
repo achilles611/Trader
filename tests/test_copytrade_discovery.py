@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from datetime import timedelta
 from pathlib import Path
@@ -16,6 +18,7 @@ from src.copytrade.discovery import (
     HyperCoreNodeTradeDiscoveryProvider,
     IterableNodeTradeTransport,
     LocalNodeTradeFileTransport,
+    RequesterPaysS3NodeTradeTransport,
     parse_activity_age,
 )
 from src.copytrade.models import DiscoveryObservation, TargetStatus, as_utc, utc_now
@@ -125,6 +128,178 @@ class CopytradeDiscoveryTests(unittest.TestCase):
                 }
             self.assertEqual(formats, {"node_fills", "node_fills_by_block"})
 
+    def test_production_node_fills_by_block_wallet_fill_pairs_keep_all_valid_events(self) -> None:
+        """Regression for production HyperCore events encoded as ``[wallet, fill]``."""
+        with tempfile.TemporaryDirectory() as temp:
+            database = CopyTradeDatabase(config(Path(temp)).artifacts.database_path)
+            database.initialize()
+            block_time = timestamp(T0)
+            first = fill(T0, fill_id="paired-first", include_time=False)
+            second = fill(T0 + timedelta(minutes=1), fill_id="paired-second")
+            # The fills deliberately omit user. The outer event is authoritative
+            # only as a user override; it never fabricates another required field.
+            first.pop("user")
+            second.pop("user")
+            provider = HyperCoreNodeTradeDiscoveryProvider(IterableNodeTradeTransport([{
+                "block_number": 123, "block_time": block_time,
+                "events": [[BUYER, first], [SELLER, second]],
+            }]))
+            summary = DiscoveryPipeline(database).run(provider, limit=10, min_activity=1, max_activity_age=None)
+            self.assertEqual(summary.status, "completed")
+            self.assertEqual((summary.valid_events, summary.normalized_observations), (2, 2))
+            self.assertEqual({row["wallet"] for row in database.list_discovery_candidates()}, {BUYER, SELLER})
+            with database._connect() as connection:  # type: ignore[attr-defined]
+                rows = connection.execute(
+                    "SELECT wallet, recent_activity_at, metadata_json FROM copy_discovery_observations ORDER BY wallet"
+                ).fetchall()
+            self.assertEqual(as_utc(rows[0]["recent_activity_at"]), as_utc(T0))
+            self.assertEqual(as_utc(rows[1]["recent_activity_at"]), as_utc(T0 + timedelta(minutes=1)))
+            self.assertEqual(json.loads(rows[0]["metadata_json"])["block_event_index"], 0)
+
+    def test_malformed_block_event_is_quarantined_without_discarding_valid_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = CopyTradeDatabase(config(Path(temp)).artifacts.database_path)
+            database.initialize()
+            good_first = fill(T0, fill_id="good-first")
+            good_second = fill(T0, SELLER, fill_id="good-second")
+            broken = fill(T0, THIRD, fill_id="bad-price")
+            broken["px"] = "not-a-number"
+            provider = HyperCoreNodeTradeDiscoveryProvider(IterableNodeTradeTransport([{
+                "block_number": 456, "block_time": timestamp(T0),
+                "events": [[BUYER, good_first], [THIRD, broken], [SELLER, good_second]],
+            }]))
+            summary = DiscoveryPipeline(database).run(provider, limit=10, min_activity=1, max_activity_age=None)
+            self.assertEqual(summary.status, "completed_with_warnings")
+            self.assertEqual((summary.valid_events, summary.malformed_events, summary.unsupported_records), (2, 1, 0))
+            self.assertEqual({row["wallet"] for row in database.list_discovery_candidates()}, {BUYER, SELLER})
+            run = database.list_discovery_runs()[0]
+            self.assertEqual((run["malformed_events"], run["fatal_source_errors"]), (1, 0))
+            with database._connect() as connection:  # type: ignore[attr-defined]
+                rejection = connection.execute(
+                    "SELECT category, event_index, raw_record_json FROM copy_discovery_rejections WHERE run_id=?",
+                    (summary.run_id,),
+                ).fetchone()
+            self.assertEqual((rejection["category"], rejection["event_index"]), ("malformed_event", 1))
+            self.assertEqual(json.loads(rejection["raw_record_json"])[1]["tid"], "bad-price")
+
+    def test_invalid_outer_wallet_is_counted_and_does_not_register_a_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = CopyTradeDatabase(config(Path(temp)).artifacts.database_path)
+            database.initialize()
+            missing_user = fill(T0, fill_id="invalid-wallet")
+            missing_user.pop("user")
+            provider = HyperCoreNodeTradeDiscoveryProvider(IterableNodeTradeTransport([{
+                "block_number": 999, "block_time": timestamp(T0), "events": [["not-a-wallet", missing_user]],
+            }]))
+            summary = DiscoveryPipeline(database).run(provider, limit=10, min_activity=1, max_activity_age=None)
+            self.assertEqual((summary.valid_events, summary.invalid_wallets, summary.wallets_seen), (1, 1, 0))
+            self.assertEqual(summary.status, "completed_with_warnings")
+            self.assertEqual(database.list_discovery_candidates(), [])
+
+    def test_unsupported_nested_event_is_counted_without_failing_its_block(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = CopyTradeDatabase(config(Path(temp)).artifacts.database_path)
+            database.initialize()
+            provider = HyperCoreNodeTradeDiscoveryProvider(IterableNodeTradeTransport([{
+                "block_number": 777, "block_time": timestamp(T0),
+                "events": [[BUYER, fill(T0, BUYER, fill_id="supported")], "not-a-fill", [SELLER, fill(T0, SELLER, fill_id="also-supported")]],
+            }]))
+            summary = DiscoveryPipeline(database).run(provider, limit=10, min_activity=1, max_activity_age=None)
+            self.assertEqual((summary.valid_events, summary.malformed_events, summary.unsupported_records), (2, 0, 1))
+            self.assertEqual(summary.status, "completed_with_warnings")
+            self.assertEqual({row["wallet"] for row in database.list_discovery_candidates()}, {BUYER, SELLER})
+
+    def test_duplicate_within_one_file_and_multi_fill_transaction_are_distinguished(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            database = CopyTradeDatabase(config(root).artifacts.database_path)
+            database.initialize()
+            repeated = fill(T0, BUYER, fill_id="same-file")
+            same_transaction_first = fill(T0, BUYER, fill_id="")
+            same_transaction_second = fill(T0, BUYER, fill_id="")
+            for payload in (same_transaction_first, same_transaction_second):
+                payload.pop("tid")
+                payload["hash"] = "one-transaction"
+            provider = HyperCoreNodeTradeDiscoveryProvider(IterableNodeTradeTransport([
+                repeated, repeated,
+                {"block_number": 1000, "block_time": timestamp(T0),
+                 "events": [[BUYER, same_transaction_first], [BUYER, same_transaction_second]]},
+            ]))
+            summary = DiscoveryPipeline(database).run(provider, limit=10, min_activity=1, max_activity_age=None)
+            self.assertEqual((summary.valid_events, summary.normalized_observations, summary.duplicate_events), (4, 4, 1))
+            with database._connect() as connection:  # type: ignore[attr-defined]
+                ids = [row[0] for row in connection.execute("SELECT evidence_id FROM copy_discovery_observations ORDER BY evidence_id").fetchall()]
+            self.assertEqual(len(ids), 3)
+            self.assertEqual(len(set(ids)), 3)
+
+    def test_fallback_event_id_is_deterministic_for_overlapping_block_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = CopyTradeDatabase(config(Path(temp)).artifacts.database_path)
+            database.initialize()
+            no_identifier = fill(T0, BUYER, fill_id="")
+            no_identifier.pop("tid")
+            record = {"block_number": 314, "block_time": timestamp(T0), "events": [[BUYER, no_identifier]]}
+            provider = HyperCoreNodeTradeDiscoveryProvider(IterableNodeTradeTransport([record, record]))
+            summary = DiscoveryPipeline(database).run(provider, limit=10, min_activity=1, max_activity_age=None)
+            self.assertEqual((summary.normalized_observations, summary.duplicate_events), (2, 1))
+
+    def test_corrupt_empty_and_unsupported_sources_fail_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name, text, message in (
+                ("corrupt.jsonl", json.dumps(fill(T0)) + "\n{broken", "Malformed JSONL"),
+                ("empty.jsonl", "", "contained no JSON records"),
+                ("unsupported.jsonl", json.dumps({"valid": "json"}) + "\n", "Unsupported HyperCore discovery schema"),
+            ):
+                path = root / name
+                path.write_text(text, encoding="utf-8")
+                database = CopyTradeDatabase(root / f"{name}.sqlite3")
+                database.initialize()
+                provider = HyperCoreNodeTradeDiscoveryProvider(LocalNodeTradeFileTransport([path]))
+                with self.assertRaisesRegex(DiscoveryProviderError, message):
+                    DiscoveryPipeline(database).run(provider, limit=10, min_activity=1, max_activity_age=None)
+                run = database.list_discovery_runs()[0]
+                self.assertEqual((run["status"], run["fatal_source_errors"]), ("failed", 1))
+                self.assertEqual(database.list_discovery_candidates(), [])
+
+    def test_lz4_source_is_supported_or_reports_a_safe_missing_dependency_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            compressed = root / "fills.jsonl.lz4"
+            try:
+                import lz4.frame
+            except ImportError:
+                compressed.write_bytes(b"placeholder")
+                with self.assertRaisesRegex(DiscoveryProviderError, "requires the lz4 dependency"):
+                    next(LocalNodeTradeFileTransport([compressed]).iter_trades())
+                return
+            with lz4.frame.open(compressed, "wt", encoding="utf-8") as stream:
+                stream.write(json.dumps(fill(T0)) + "\n")
+            database = CopyTradeDatabase(config(root).artifacts.database_path)
+            database.initialize()
+            summary = DiscoveryPipeline(database).run(
+                HyperCoreNodeTradeDiscoveryProvider(LocalNodeTradeFileTransport([compressed])),
+                limit=10, min_activity=1, max_activity_age=None,
+            )
+            self.assertEqual(summary.wallets_seen, 1)
+            with patch.dict(sys.modules, {"lz4": None, "lz4.frame": None}):
+                with self.assertRaisesRegex(DiscoveryProviderError, "requires the lz4 dependency"):
+                    next(LocalNodeTradeFileTransport([compressed]).iter_trades())
+
+    def test_requester_pays_failure_does_not_expose_underlying_credential_text(self) -> None:
+        class FailingClient:
+            def get_object(self, **kwargs):
+                self.request = kwargs
+                raise RuntimeError("credential=should-not-be-reported")
+
+        client = FailingClient()
+        with patch.dict(sys.modules, {"boto3": SimpleNamespace(client=lambda _service: client)}):
+            with self.assertRaises(DiscoveryProviderError) as raised:
+                next(RequesterPaysS3NodeTradeTransport(["s3://bucket/private-object"]).iter_trades())
+        self.assertIn("RequestPayer=requester", str(raised.exception))
+        self.assertNotIn("should-not-be-reported", str(raised.exception))
+        self.assertEqual(client.request["RequestPayer"], "requester")
+
     def test_unsupported_valid_schema_fails_without_creating_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             database = CopyTradeDatabase(config(Path(temp)).artifacts.database_path)
@@ -167,6 +342,27 @@ class CopytradeDiscoveryTests(unittest.TestCase):
             run = database.list_discovery_runs()[0]
             self.assertEqual((run["eligible_wallets"], run["limit_deferred_wallets"]), (4, 2))
             self.assertEqual(len(database.list_discovery_candidates()), 2)
+
+    def test_stage_a_statistics_are_persisted_from_deduplicated_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = CopyTradeDatabase(config(Path(temp)).artifacts.database_path)
+            database.initialize()
+            first = fill(T0, BUYER, fill_id="stats-one")
+            second = fill(T0 + timedelta(days=1, hours=2), BUYER, fill_id="stats-two")
+            second["coin"] = "BTC"
+            summary = DiscoveryPipeline(database).run(
+                HyperCoreNodeTradeDiscoveryProvider(IterableNodeTradeTransport([first, second])),
+                limit=10, min_activity=2, max_activity_age=None,
+            )
+            self.assertEqual(summary.eligible_wallets, 1)
+            candidate = database.list_discovery_candidates()[0]
+            metadata = json.loads(candidate["metadata_json"])
+            self.assertEqual(metadata["evidence_schema_version"], 2)
+            stats = metadata["cheap_stats"]
+            self.assertEqual((stats["distinct_observed_events"], stats["distinct_active_days"], stats["distinct_active_hours"]), (2, 2, 2))
+            self.assertEqual((stats["distinct_symbols"], stats["symbols"], stats["independent_source_count"]), (2, ["BTC", "ETH"], 1))
+            self.assertGreater(stats["approximate_observed_notional"], 0)
+            self.assertGreater(stats["observation_span_hours"], 24)
 
     def test_recency_filter_rejects_stale_activity_and_keeps_newest_activity(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -238,14 +434,14 @@ class CopytradeDiscoveryTests(unittest.TestCase):
             database.initialize()
 
             def records():
-                for index in range(1_200):
+                for index in range(5_000):
                     yield fill(T0, f"0x{index + 1000:040x}", fill_id=f"large-{index}")
 
             provider = HyperCoreNodeTradeDiscoveryProvider(IterableNodeTradeTransport(records()))
-            summary = DiscoveryPipeline(database, batch_size=61).run(provider, limit=2_000, min_activity=1, max_activity_age=None)
-            self.assertEqual((summary.wallets_seen, summary.eligible_wallets, summary.new_wallets), (1_200, 1_200, 1_200))
+            summary = DiscoveryPipeline(database, batch_size=61).run(provider, limit=5_000, min_activity=1, max_activity_age=None)
+            self.assertEqual((summary.wallets_seen, summary.eligible_wallets, summary.new_wallets), (5_000, 5_000, 5_000))
             with database._connect() as connection:  # type: ignore[attr-defined]
-                self.assertEqual(connection.execute("SELECT COUNT(*) FROM copy_discovery_observations").fetchone()[0], 1_200)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM copy_discovery_observations").fetchone()[0], 5_000)
 
     def test_copy_discover_cli_file_source_is_repeatable_and_writes_complete_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

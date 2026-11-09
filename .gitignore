@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .env
+aws secret key.txt
 .venv/
 artifacts/
 logs/
@@ -9,3 +10,17 @@ models/
 reports/
 viz/
 run_archives/
+
+# Generated dependencies and build outputs are reproduced by CI/release jobs.
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+*.tsbuildinfo
+.build/
+build/
+*.spec
+*.exe
+*.pyz
+*.pkg
+work/

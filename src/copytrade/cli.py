@@ -11,6 +11,7 @@ from .analytics import campaign_return_series
 from .analysis import CandidateAnalysisPipeline, _config_fingerprint
 from .backtest import CopyTradeBacktester
 from .config import CopyTradeConfig
+from .control_center import serve_control_center
 from .dashboard import serve_dashboard
 from .discovery import build_discovery_provider, parse_activity_age
 from .hyperliquid import HyperliquidWatcher
@@ -30,7 +31,7 @@ def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
     importer = command("copy-import", "Import manually researched Hyperliquid wallets from arguments or a text/CSV file.")
     importer.add_argument("--wallet", action="append", default=[], help="0x wallet address; may be specified repeatedly.")
     importer.add_argument("--file", help="Text/CSV list whose first column contains wallet addresses.")
-    importer.add_argument("--approve", action="store_true", help="Mark newly imported targets approved after import.")
+    importer.add_argument("--approve", action="store_true", help="Mark newly imported targets approved for research triage; this does not activate paper monitoring.")
 
     backfill = command("copy-backfill", "Backfill public Hyperliquid fills, account state, and portfolio history.")
     backfill.add_argument("--wallet", required=True, help="Previously imported wallet address.")
@@ -68,13 +69,18 @@ def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
 
     rank = command("copy-rank", "Rank eligible candidates and choose a lower-correlation target set.")
     rank.add_argument("--count", type=int, default=7, help="Maximum selected targets (default: 7).")
+    rank.add_argument("--output", help="Optional path for canonical finalist JSON.")
 
-    approve = command("copy-approve", "Approve a target for paper-mode websocket monitoring.")
+    suitability = command("copy-suitability-report", "Show the stored deterministic suitability evidence for one wallet.")
+    suitability.add_argument("--wallet", required=True, help="Discovered public wallet to inspect; this never changes status.")
+    suitability.add_argument("--output", help="Optional path for the report JSON.")
+
+    approve = command("copy-approve", "Approve a target for research triage; approval does not activate paper monitoring.")
     approve.add_argument("--wallet", required=True)
-    reject = command("copy-reject", "Reject a target from paper-mode websocket monitoring.")
+    reject = command("copy-reject", "Reject a target from research triage; it cannot open new paper sleeves.")
     reject.add_argument("--wallet", required=True)
 
-    watch = command("copy-watch", "Watch approved Hyperliquid wallets and paper-copy new public fills.")
+    watch = command("copy-watch", "Watch Active entry wallets and exit-only wallets with open paper sleeves.")
     watch.add_argument("--duration", type=float, help="Optional bounded duration in seconds for smoke tests.")
 
     backtest = command("copy-backtest", "Replay stored public fills through deterministic paper-copy simulation.")
@@ -91,6 +97,11 @@ def add_copytrade_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
     dashboard = command("copy-dashboard", "Start the local paper-copy FastAPI dashboard.")
     dashboard.add_argument("--host", help="Override dashboard host.")
     dashboard.add_argument("--port", type=int, help="Override dashboard port.")
+
+    control_center = command("copy-control-center", "Start the local paper-only copy-trading control center.")
+    control_center.add_argument("--host", help="Override control-center host.")
+    control_center.add_argument("--port", type=int, help="Override control-center port.")
+    control_center.add_argument("--with-watcher", action="store_true", help="Run the paper watcher in the control-center lifecycle.")
 
     sizing = command("copy-size-demo", "Show the configured 5/10/20 percent sizing classification.")
     sizing.add_argument("--fractions", default="0.03,0.10,0.20", help="Comma-separated target entry fractions to classify against a 10% prior-median demo history.")
@@ -129,6 +140,10 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
             "eligible_wallets": summary.eligible_wallets, "limit_deferred_wallets": summary.limit_deferred_wallets,
             "new_candidates": summary.new_wallets, "existing_refreshed": summary.existing_wallets_refreshed,
             "filtered": summary.filtered_wallets, "queued_for_analysis": summary.queued_for_analysis,
+            "valid_events": summary.valid_events, "normalized_observations": summary.normalized_observations,
+            "duplicate_events": summary.duplicate_events, "invalid_wallets": summary.invalid_wallets,
+            "malformed_events": summary.malformed_events, "unsupported_records": summary.unsupported_records,
+            "fatal_source_errors": summary.fatal_source_errors,
             "errors": summary.errors,
         }
         if args.output:
@@ -179,18 +194,34 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
         return 0
     if command == "copy-rank":
         pipeline = CandidateAnalysisPipeline(service)
-        fingerprint = _config_fingerprint(config.snapshot())
+        fingerprint = _config_fingerprint(config.research_snapshot())
         phase_b_scores = service.database.phase_b_qualified_scores(config_fingerprint=fingerprint)
-        finalists = pipeline.shadow_finalists(count=args.count)
-        _print({
+        # Ranking is an explicit operator command, unlike analysis status.
+        finalists = pipeline.shadow_finalists(count=args.count, persist=True)
+        payload = {
             "ranked_phase_b": [_score_payload(score) for score in phase_b_scores],
             "selected": finalists,
             "shadow_finalists": finalists,
             "current_config_fingerprint": fingerprint,
             "stale_qualified_candidates": service.database.count_stale_qualified_candidates(fingerprint),
-            "legacy_scores": [_score_payload(score) for score in service.database.latest_scores()],
+            "legacy_scores": [_score_payload(score) for score in service.database.latest_legacy_scores()],
             "legacy_scores_label": "research_compatibility_only",
-        })
+        }
+        if getattr(args, "output", None):
+            output = Path(args.output)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(dumps(payload, indent=2, default=str), encoding="utf-8")
+            payload["output"] = str(output)
+        _print(payload)
+        return 0
+    if command == "copy-suitability-report":
+        payload = CandidateAnalysisPipeline(service).suitability_report(args.wallet)
+        if args.output:
+            output = Path(args.output)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(dumps(payload, indent=2, default=str), encoding="utf-8")
+            payload["output"] = str(output)
+        _print(payload)
         return 0
     if command in {"copy-approve", "copy-reject"}:
         service.set_status(args.wallet, "approved" if command == "copy-approve" else "rejected")
@@ -199,8 +230,8 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
     if command == "copy-watch":
         watcher = HyperliquidWatcher(service.adapter)
         async def watch() -> dict[str, int]:
-            return await watcher.run(service.approved_wallets(), service.ingest_watched_fills, service.ingest_watched_state,
-                                     service.ingest_market_update, service.reconcile_approved_wallets,
+            return await watcher.run(service.monitored_execution_wallets(), service.ingest_watched_fills, service.ingest_watched_state,
+                                     service.ingest_market_update, service.reconcile_monitored_wallets,
                                      duration_seconds=args.duration)
         reconciled = asyncio.run(watch())
         _print({"health": watcher.health.as_dict(), "mode": config.mode, "reconciled_fills": reconciled})
@@ -245,6 +276,10 @@ def run_copytrade_command(args: argparse.Namespace) -> int:
             config = replace(config, artifacts=replace(config.artifacts, dashboard_host=args.host or config.artifacts.dashboard_host, dashboard_port=args.port or config.artifacts.dashboard_port))
         serve_dashboard(config, service.database)
         return 0
+    if command == "copy-control-center":
+        serve_control_center(config, service.database, host=args.host, port=args.port,
+                             with_watcher=args.with_watcher, service=service)
+        return 0
     if command == "copy-size-demo":
         fractions = [float(item.strip()) for item in args.fractions.split(",") if item.strip()]
         classifier = TargetSizeClassifier(config.sizing)
@@ -264,6 +299,9 @@ def _score_payload(score: Any) -> dict[str, Any]:
         "reasons": score.reasons, "provenance": getattr(score, "provenance", "legacy"),
         "analysis_run_id": getattr(score, "analysis_run_id", None),
         "config_fingerprint": getattr(score, "config_fingerprint", None),
+        "confidence_score": getattr(score, "confidence_score", 0.0),
+        "hard_gates": getattr(score, "hard_gates", ()),
+        "score_version": getattr(score, "score_version", None),
     }
 
 
