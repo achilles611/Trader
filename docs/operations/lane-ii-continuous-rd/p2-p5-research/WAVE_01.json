@@ -1,0 +1,480 @@
+{
+  "schema": "LANE_II_P2_P5_EXPERIMENT_V1",
+  "id": "p2-p5-wave-01",
+  "models": [
+    {
+      "family": "P2",
+      "parent_id": "5m-P2",
+      "arms": [
+        {
+          "id": "seed",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.12
+          }
+        },
+        {
+          "id": "execution-tight",
+          "overrides": {
+            "spread_max": 0.015,
+            "maximum_round_trip_friction_fraction": 0.09
+          }
+        },
+        {
+          "id": "spread-tighter",
+          "overrides": {
+            "spread_max": 0.015,
+            "maximum_round_trip_friction_fraction": 0.12
+          }
+        },
+        {
+          "id": "spread-wider",
+          "overrides": {
+            "maximum_round_trip_friction_fraction": 0.12
+          }
+        },
+        {
+          "id": "friction-tighter",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.09
+          }
+        },
+        {
+          "id": "friction-wider",
+          "overrides": {
+            "spread_max": 0.02
+          }
+        },
+        {
+          "id": "target-lower",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.12,
+            "profit_target_fraction": 0.3
+          }
+        },
+        {
+          "id": "target-higher",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.12,
+            "profit_target_fraction": 0.5
+          }
+        },
+        {
+          "id": "stake-lower",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.12,
+            "budget": 4.5
+          }
+        },
+        {
+          "id": "stake-higher",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.12,
+            "budget": 6.6
+          }
+        },
+        {
+          "id": "stop-tighter",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.12,
+            "stop": 0.2
+          }
+        },
+        {
+          "id": "stop-wider",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.12,
+            "stop": 0.3
+          }
+        },
+        {
+          "id": "persistence-shorter",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.12,
+            "agreement_seconds": 3
+          }
+        },
+        {
+          "id": "persistence-longer",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.12,
+            "agreement_seconds": 7
+          }
+        },
+        {
+          "id": "history-shorter",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.12,
+            "history_seconds": 8
+          }
+        },
+        {
+          "id": "history-longer",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.12,
+            "history_seconds": 12
+          }
+        },
+        {
+          "id": "timing-earlier",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.12,
+            "entry_elapsed_min": 20,
+            "entry_elapsed_max": 80
+          }
+        },
+        {
+          "id": "timing-later",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.12,
+            "entry_elapsed_min": 40,
+            "entry_elapsed_max": 100
+          }
+        },
+        {
+          "id": "spot-move-lower",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.12,
+            "minimum_spot30": 0.2
+          }
+        },
+        {
+          "id": "spot-move-higher",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.12,
+            "minimum_spot30": 0.3
+          }
+        },
+        {
+          "id": "depth-lower",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.12,
+            "depth_fraction": 0.1
+          }
+        },
+        {
+          "id": "depth-higher",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.12,
+            "depth_fraction": 0.2
+          }
+        },
+        {
+          "id": "headroom-lower",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.12,
+            "target_cash_headroom_fraction": 0.4
+          }
+        },
+        {
+          "id": "headroom-higher",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.12,
+            "target_cash_headroom_fraction": 0.6
+          }
+        },
+        {
+          "id": "confirmation-tight",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.12,
+            "agreement_seconds": 7,
+            "minimum_score_magnitude": 0.45
+          }
+        }
+      ]
+    },
+    {
+      "family": "P5",
+      "parent_id": "5m-P5__confluence",
+      "arms": [
+        {
+          "id": "seed",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.2,
+            "profit_target_fraction": 1.0
+          }
+        },
+        {
+          "id": "execution-tight",
+          "overrides": {
+            "spread_max": 0.015,
+            "maximum_round_trip_friction_fraction": 0.15,
+            "profit_target_fraction": 1.0
+          }
+        },
+        {
+          "id": "spread-tighter",
+          "overrides": {
+            "spread_max": 0.015,
+            "maximum_round_trip_friction_fraction": 0.2,
+            "profit_target_fraction": 1.0
+          }
+        },
+        {
+          "id": "spread-wider",
+          "overrides": {
+            "maximum_round_trip_friction_fraction": 0.2,
+            "profit_target_fraction": 1.0
+          }
+        },
+        {
+          "id": "friction-tighter",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.15,
+            "profit_target_fraction": 1.0
+          }
+        },
+        {
+          "id": "friction-wider",
+          "overrides": {
+            "spread_max": 0.02,
+            "profit_target_fraction": 1.0
+          }
+        },
+        {
+          "id": "target-lower",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.2
+          }
+        },
+        {
+          "id": "target-higher",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.2,
+            "profit_target_fraction": 1.2
+          }
+        },
+        {
+          "id": "stake-lower",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.2,
+            "profit_target_fraction": 1.0,
+            "budget": 7.5,
+            "high_confidence_budget": 11.25
+          }
+        },
+        {
+          "id": "stake-higher",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.2,
+            "profit_target_fraction": 1.0,
+            "budget": 11.0,
+            "high_confidence_budget": 16.5
+          }
+        },
+        {
+          "id": "stop-tighter",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.2,
+            "profit_target_fraction": 1.0,
+            "stop": 0.3
+          }
+        },
+        {
+          "id": "stop-wider",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.2,
+            "profit_target_fraction": 1.0,
+            "stop": 0.4
+          }
+        },
+        {
+          "id": "persistence-shorter",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.2,
+            "profit_target_fraction": 1.0,
+            "agreement_seconds": 3
+          }
+        },
+        {
+          "id": "persistence-longer",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.2,
+            "profit_target_fraction": 1.0,
+            "agreement_seconds": 7
+          }
+        },
+        {
+          "id": "history-shorter",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.2,
+            "profit_target_fraction": 1.0,
+            "history_seconds": 8
+          }
+        },
+        {
+          "id": "history-longer",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.2,
+            "profit_target_fraction": 1.0,
+            "history_seconds": 12
+          }
+        },
+        {
+          "id": "timing-earlier",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.2,
+            "profit_target_fraction": 1.0,
+            "entry_remaining_max": 135
+          }
+        },
+        {
+          "id": "timing-later",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.2,
+            "profit_target_fraction": 1.0,
+            "entry_remaining_max": 105
+          }
+        },
+        {
+          "id": "payout-multiple-lower",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.2,
+            "profit_target_fraction": 1.0,
+            "minimum_total_payout_multiple": 1.8
+          }
+        },
+        {
+          "id": "payout-multiple-higher",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.2,
+            "profit_target_fraction": 1.0,
+            "minimum_total_payout_multiple": 2.2
+          }
+        },
+        {
+          "id": "proxy-margin-lower",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.2,
+            "profit_target_fraction": 1.0,
+            "minimum_proxy_margin": 0.02
+          }
+        },
+        {
+          "id": "proxy-margin-higher",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.2,
+            "profit_target_fraction": 1.0,
+            "minimum_proxy_margin": 0.04
+          }
+        },
+        {
+          "id": "depth-lower",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.2,
+            "profit_target_fraction": 1.0,
+            "depth_fraction": 0.075
+          }
+        },
+        {
+          "id": "depth-higher",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.2,
+            "profit_target_fraction": 1.0,
+            "depth_fraction": 0.125
+          }
+        },
+        {
+          "id": "confluence-tight",
+          "overrides": {
+            "spread_max": 0.02,
+            "maximum_round_trip_friction_fraction": 0.2,
+            "profit_target_fraction": 1.0,
+            "agreement_seconds": 7,
+            "minimum_score_magnitude": 0.45
+          }
+        }
+      ]
+    }
+  ],
+  "protocol": {
+    "purpose": "PAPER_RESEARCH_DISCOVERY_AND_FRESH_VALIDATION_DESIGN",
+    "retained_block_role": "DISCOVERY_AND_IMPLEMENTATION_REHEARSAL",
+    "baseline_controls": [
+      "5m-P2",
+      "5m-P5__confluence"
+    ],
+    "cash_control": "ZERO_RETURN_REFERENCE",
+    "discovery_accounts_are_nonadditive": true,
+    "agreement": {
+      "mode": "SHADOW_ONLY",
+      "family_scope": "WITHIN_FAMILY",
+      "arms": [
+        "baseline",
+        "seed",
+        "execution-tight"
+      ],
+      "minimum_votes": 2,
+      "maximum_span_seconds": 5,
+      "match_keys": [
+        "contract",
+        "direction"
+      ],
+      "information_set": "CAUSAL_ENTRY_INTENTS_AT_OR_BEFORE_AGREEMENT_TIME",
+      "counting_unit": "FIRST_AGREEMENT_PER_CONTRACT_AND_DIRECTION"
+    },
+    "metrics": [
+      "net_vs_matched_parent",
+      "net_vs_cash",
+      "closed_trades",
+      "fill_coverage",
+      "modeled_fees",
+      "marked_drawdown",
+      "peak_open_basis",
+      "contribution_by_market_day"
+    ],
+    "fresh_validation": {
+      "calendar": "PENDING_SEPARATE_PREOBSERVATION_REGISTRATION",
+      "block_unit": "DISJOINT_MARKET_DAY",
+      "fixed_final_look": true,
+      "power_and_multiplicity": "REGISTER_BEFORE_OBSERVATION",
+      "execution_stress": [
+        "additional_tick",
+        "additional_delay",
+        "reduced_depth"
+      ],
+      "concentration_check": "LEAVE_BEST_BLOCK_OUT"
+    },
+    "execution_authority": "OFFLINE_SIMULATION_ONLY"
+  }
+}
