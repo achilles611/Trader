@@ -162,5 +162,58 @@ class ExperimentTests(unittest.TestCase):
                 research.run(self.plan_path, self.root / 'result', self.root / 'STATUS.json', 1)
 
 
+class FreshWaveTests(unittest.TestCase):
+    def test_fresh_window_binds_the_prelaunch_preregistration_and_exact_cutoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'operator.json'
+            registration = {
+                'schema': research.FRESH_SCHEMA, 'registered_utc': '2026-11-10T01:40:00Z',
+                'paper_start_utc': '2026-11-10T01:45:00Z', 'cutoff_utc': '2026-11-10T02:15:00Z',
+                'wave_manifest_sha256': 'wave', 'candidate_manifest_sha256': 'candidate',
+            }
+            registration_ref = {'sha256': 'prereg'}
+            operator = {'creation_utc': '2026-11-10T01:41:00Z', 'wave_preregistration_sha256': 'prereg'}
+            atomic_json(path, operator)
+            sources = {'candidate_manifest': {'sha256': 'candidate'}, 'worker_identity': binding(path)}
+            window = {key: registration[key] for key in ('paper_start_utc', 'cutoff_utc')}
+            receipt = {**window, 'actual_end_utc': '2026-11-10T02:15:01Z',
+                       'state': 'COMPLETE', 'reason': 'DEADLINE',
+                       'real_orders': 0, 'model_api_calls': 0, 'authenticated_account_calls': 0}
+            check = research.verify_fresh_window
+            self.assertEqual(check(registration, registration_ref, {'sha256': 'wave'}, window, receipt, sources),
+                             research.retained.stamp(window['cutoff_utc']))
+            with self.assertRaisesRegex(ValueError, 'FRESH_PREREGISTERED_WINDOW_NOT_OBSERVED'):
+                check({**registration, 'registered_utc': '2026-11-10T01:41:01Z'}, registration_ref,
+                      {'sha256': 'wave'}, window, receipt, sources)
+            with self.assertRaisesRegex(ValueError, 'FRESH_PREREGISTERED_WINDOW_NOT_OBSERVED'):
+                check(registration, {'sha256': 'substituted'}, {'sha256': 'wave'}, window, receipt, sources)
+            with self.assertRaisesRegex(ValueError, 'FRESH_PREREGISTERED_WINDOW_NOT_OBSERVED'):
+                check(registration, registration_ref, {'sha256': 'wave'}, window,
+                      {**receipt, 'actual_end_utc': '2026-11-10T02:14:59Z'}, sources)
+            with self.assertRaisesRegex(ValueError, 'FRESH_WAVE_REQUIRES_FULL_PAPER_ONLY_COMPLETION'):
+                check(registration, registration_ref, {'sha256': 'wave'}, window,
+                      {**receipt, 'authenticated_account_calls': 1}, sources)
+
+    def test_fresh_book_callback_uses_logged_evaluation_time_and_restores_journal_clock(self):
+        engine = research.FreshStudyReplay.__new__(research.FreshStudyReplay)
+        engine.clock = 104.0
+        data = {'received_wall': 100.0, 'evaluation_wall': 102.0}
+        with patch.object(research.retained.StudyReplay, 'admit_book',
+                          side_effect=lambda value: self.assertEqual((engine.clock, value), (102.0, data))) as admit:
+            engine.admit_book(data)
+            self.assertEqual(engine.clock, 104.0)
+            for invalid in (None, 99.0, 105.0, float('nan')):
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, 'FRESH_BOOK_CALLBACK_CLOCK_BINDING'):
+                    engine.admit_book({**data, 'evaluation_wall': invalid})
+            self.assertEqual(admit.call_count, 1)
+
+    def test_fresh_status_cannot_overwrite_frozen_inputs(self):
+        base = Path('fixture')
+        candidate, study, prereg, wave, output = (base / name for name in ('candidate', 'study', 'prereg', 'wave', 'out'))
+        for status in (prereg, wave, candidate / 'SOURCE_MANIFEST.json', study / 'operator.json', output / 'RESULT.json'):
+            with self.subTest(status=status), self.assertRaisesRegex(ValueError, 'FRESH_STATUS_MUST_BE_OUTSIDE'):
+                research.fresh_paths(candidate, study, prereg, wave, output, status)
+
+
 if __name__ == '__main__':
     unittest.main()

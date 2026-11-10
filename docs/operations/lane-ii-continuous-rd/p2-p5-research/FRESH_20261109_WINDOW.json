@@ -1,0 +1,20 @@
+{
+  "asset": "BTC",
+  "label_tail_seconds": 0,
+  "candidate_manifest_sha256": "2f356b0035245dfa6315ce35e653324210db11bdad8f7e29b418f45018f889b3",
+  "controls": [
+    "5m-P2",
+    "5m-P5__confluence"
+  ],
+  "evidence_role": "FRESH_SINGLE_WINDOW_VALIDATION",
+  "contract_seconds": 300,
+  "registered_utc": "2026-11-09T18:40:49.719092-07:00",
+  "local_registration_sha256": "ecf942cc2c6d87ab6fd24020e4c888de9e9f7cf2ed91861bd6e60e18a567df9d",
+  "cutoff_utc": "2026-11-09T22:45:00-07:00",
+  "paper_only": true,
+  "wave_manifest_sha256": "0d2cebeebe92b6d6bbc9809b95c82604bc855a5ea8bdbe786cc8ed2614ecf48a",
+  "paper_start_utc": "2026-11-09T18:45:00-07:00",
+  "comparison": "REALIZED_NET_AFTER_MODELED_FEES_VS_MATCHED_BASELINE_WITH_CENSORING",
+  "schema": "LANE_II_P2_P5_FRESH_PUBLIC_WINDOW_V1",
+  "shadow_variants": 50
+}
