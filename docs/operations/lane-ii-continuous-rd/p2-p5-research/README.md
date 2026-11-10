@@ -24,9 +24,31 @@ The shadow agreement compares three peers within each family, its baseline, seed
 
 ## Next evidence
 
-Use one public-data tape and only the P2 and P5 paper research roster. Register fresh calendar windows, disjoint market-day blocks, exact source and control hashes, power, multiplicity, and a fixed final look before observing results. Compare net P&L after fees with both the matched parent and cash. Report closed trades, fills, peak open basis, marked drawdown, and each market day's contribution. Repeat comparisons with adverse tick, delay, and depth stress. Test whether the result survives removal of its best block before advancing a variant.
+Use one public-data tape and only the P2 and P5 paper research roster. Register fresh calendar windows, disjoint market-day blocks, exact source and control hashes, power, multiplicity, and a fixed final look before observing results. Compare net P&L after fees with both the matched parent and cash. Report closed trades, fills, peak open basis, marked drawdown, and each market day's contribution. Repeat comparisons with adverse tick, delay, and depth stress. Favor a parameter neighborhood whose gains persist across blocks and adjacent arms. Freeze the finalists before a separate confirmation window and test whether each result survives removal of its best block.
 
 Wave 01 is a research design and can rehearse against sealed historical evidence. The fresh calendar and confirmation release are separate gates. The operational 8-hour/24-hour qualification and the shared paper campaign retain their own roster and evidence requirements.
+
+### Offline rehearsal on Atlas
+
+Use the retained baseline result and the same Python executable bound in its source manifest. The runner binds the Wave 01 file at preparation and checks it again at replay. Use a fresh external output directory.
+
+```powershell
+python -I -B scripts/lane_ii_continuous/long_research.py prepare --baseline $RetainedBaseline --experiment docs/operations/lane-ii-continuous-rd/p2-p5-research/WAVE_01.json --output $PreparedPlan
+python -I -B scripts/lane_ii_continuous/offline.py -- scripts/lane_ii_continuous/long_research.py run --plan $PreparedPlan --output $FreshReplayDirectory --status $StatusFile --maximum-seconds 600
+```
+
+`RESULT.json` binds the compact `ENTRY_EVENTS.json` trace. The trace supplies entry intents, cancellations, and fills for the shadow agreement analysis.
+
+### Wave 01 rehearsal result
+
+The offline rehearsal completed all 50 arms and both baselines on the original 140,310-event discovery tape. Both baselines reproduced the recorded financial events, decisions, and terminal inventory. All 185 tests passed, including the scope, exact binding, and network-denial checks.
+
+| Family | Seed | Leading closed arm on this tape |
+| --- | --- | --- |
+| P2 | +$4.49678, four closes and $1.34636 max marked drawdown | Three-second persistence earned **+$5.87329** with five closes, one additional filled contract and the same $1.34636 max marked drawdown. The later window earned +$5.28943 across five closes. |
+| P5 | +$11.69237 on one close, with $2.48780 max marked drawdown | The larger stake earned **+$12.75530** on the seed's same single opportunity, with $2.72375 max marked drawdown. Keep the original stake in the seed and treat the larger-stake arm as sizing sensitivity. |
+
+The P2 earlier window and P5 120% target each ended with one open position and sit outside the closed-arm rankings. The three shadow peers agreed on 13 distinct P2 contract and direction pairs and two P5 pairs. Four P2 pairs and one P5 pair had a subsequent fill by a peer. This measures intent overlap and follow-through. The rehearsal uses the same discovery block as the initial study.
 
 ## P1 diagnosis
 
